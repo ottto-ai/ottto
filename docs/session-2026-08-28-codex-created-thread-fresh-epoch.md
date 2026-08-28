@@ -33,8 +33,12 @@ transport ordering, replay-ledger settlement, or safe unusable data.
 
 The parser still requires the exact provider-owned child-to-parent edge from
 the local state sidecar and a complete parent ownership ledger bound to the
-opened parent rollout. Before the first ownership signature, it retains at most
-64 records in memory.
+opened parent rollout. Unsigned records before the first divergent ownership
+signature are ignored rather than buffered: ownership has not yet been proved,
+so replaying them could attribute copied parent content to the child. Once a
+divergent signature has been observed, the parser retains at most 64 records in
+memory while it waits for the usage receipt. Unsigned records after a matched
+parent prefix keep the existing copied-prefix behavior.
 
 If the child starts by matching the parent, the existing copied-prefix proof is
 unchanged. If it diverges before any parent signature matches, the parser waits
@@ -43,11 +47,17 @@ only when:
 
 `total_token_usage == last_token_usage`
 
-That equality is a bounded provider-native receipt that the child's cumulative
-counter began with this response, so no physical predecessor usage exists in
-the file. A missing last-response record, a zero checkpoint, a divergent
-cumulative total, an absent or conflicting sidecar edge, an incomplete parent
-ledger, or a buffer overflow still fails closed.
+The candidate ownership signature must also be absent from the entire complete
+parent signature ledger. This prevents a copied parent's first response—which
+also legitimately has `total_token_usage == last_token_usage`—from being
+mistaken for a fresh child epoch when an earlier copied signature is missing or
+divergent. The equality plus ledger exclusion is the bounded provider-native
+receipt that the child's cumulative counter began with this response, so no
+physical predecessor usage exists in the file. A signature found anywhere in
+the parent ledger, a missing last-response record, a zero checkpoint, a
+divergent cumulative total, an absent or conflicting sidecar edge, an
+incomplete parent ledger, or a post-divergence buffer overflow still fails
+closed.
 
 ## Replay decision
 

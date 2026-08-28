@@ -6920,7 +6920,9 @@ impl SnapshotAccumulator {
                             && self.codex_trusted_sidecar_boundary
                             && expected.and_then(|values| values.first()) != Some(&signature) =>
                     {
-                        if codex_usage_starts_fresh_epoch(value) {
+                        let absent_from_parent = expected
+                            .is_some_and(|values| !values.iter().any(|value| value == &signature));
+                        if codex_usage_starts_fresh_epoch(value) && absent_from_parent {
                             self.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
                             self.codex_owned_record_seen = true;
                             true
@@ -6937,12 +6939,14 @@ impl SnapshotAccumulator {
                             false
                         }
                     }
-                    Some(_)
+                    Some(signature)
                         if self.codex_created_thread_start_diverged
                             && self.codex_parent_signature_index == 0
                             && self.codex_trusted_sidecar_boundary =>
                     {
-                        if codex_usage_starts_fresh_epoch(value) {
+                        let absent_from_parent = expected
+                            .is_some_and(|values| !values.iter().any(|value| value == &signature));
+                        if codex_usage_starts_fresh_epoch(value) && absent_from_parent {
                             self.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
                             self.codex_owned_record_seen = true;
                             true
@@ -6991,7 +6995,8 @@ impl SnapshotAccumulator {
                     None => {
                         if self.codex_parent_signature_index > 0
                             || (self.codex_trusted_sidecar_boundary
-                                && self.codex_parent_signature_index == 0)
+                                && self.codex_parent_signature_index == 0
+                                && self.codex_created_thread_start_diverged)
                         {
                             self.buffer_codex_boundary_record(value);
                         }
@@ -31807,6 +31812,42 @@ mod tests {
         .expect("parse Codex parent-prefix fixture")
     }
 
+    fn parse_trusted_created_thread_test(
+        name: &str,
+        child_id: &str,
+        parent_id: &str,
+        child_values: &[Value],
+        parent_values: &[Value],
+    ) -> (PathBuf, ParsedJsonlFile) {
+        let root = temp_dir(name);
+        let path = root.join(format!("rollout-{child_id}.jsonl"));
+        let mut body = child_values
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        body.push('\n');
+        fs::write(&path, body).expect("write trusted created-thread fixture");
+
+        let mut metadata = CodexTitleMetadata::default();
+        metadata
+            .spawn_parents
+            .insert(child_id.to_string(), parent_id.to_string());
+        let ledgers = BTreeMap::from([(
+            parent_id.to_string(),
+            CodexParentOwnershipLedger {
+                signatures: parent_values
+                    .iter()
+                    .filter_map(codex_ownership_signature)
+                    .collect(),
+                complete: true,
+                opened_object_identity: String::new(),
+            },
+        )]);
+        let parsed = parse_codex_test_with_metadata_and_ledgers(&path, &metadata, ledgers);
+        (root, parsed)
+    }
+
     #[test]
     fn codex_legacy_full_fork_excludes_inherited_usage_activity_and_posture() {
         let values = vec![
@@ -32265,6 +32306,149 @@ mod tests {
         );
         let _ = fs::remove_file(mismatch);
         let _ = fs::remove_file(inherited_only);
+    }
+
+    #[test]
+    fn codex_created_thread_fresh_checkpoint_copied_from_parent_fails_closed() {
+        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child_id = "01a03e97-49cf-7460-9fd7-f7dbfd2f05e4";
+        let parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
+            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-first-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+        ];
+        let child = vec![
+            json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":child_id,"thread_source":"agent_created_thread","source":"vscode"}}),
+            // The copied first response also has total == last. Its signature
+            // appears later in the complete parent ledger because the copied
+            // first turn signature is missing from this physical child file.
+            parent[2].clone(),
+        ];
+
+        let (root, parsed) = parse_trusted_created_thread_test(
+            "codex-created-thread-copied-fresh-checkpoint",
+            child_id,
+            parent_id,
+            &child,
+            &parent,
+        );
+        assert!(parsed.snapshots.is_empty());
+        assert!(parsed.zero_snapshot_usage_evidence);
+        assert!(parsed.recognized_usage_drop_count > 0);
+        assert_eq!(
+            parsed.state_only_blocked_session_id.as_deref(),
+            Some(child_id)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_created_thread_unsigned_preamble_does_not_poison_parent_prefix() {
+        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child_id = "01a03e98-49cf-7460-9fd7-f7dbfd2f05e4";
+        let parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
+            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-first-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+        ];
+        let mut child = vec![json!({
+            "timestamp":"2026-08-02T08:20:00Z",
+            "type":"session_meta",
+            "payload":{"id":child_id,"thread_source":"agent_created_thread","source":"vscode"}
+        })];
+        for sequence in 0..70 {
+            child.push(json!({
+                "timestamp":"2026-08-02T08:20:01Z",
+                "type":"event_msg",
+                "payload":{"type":"task_started","sequence":sequence}
+            }));
+        }
+        child.extend([
+            parent[1].clone(),
+            parent[2].clone(),
+            json!({"timestamp":"2026-08-02T08:20:02Z","type":"turn_context","payload":{"turn_id":"child-first-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:20:03Z",
+                None,
+                (130, 100, 15, 3),
+                Some((30, 20, 5, 1)),
+            ),
+        ]);
+
+        let (root, parsed) = parse_trusted_created_thread_test(
+            "codex-created-thread-long-unsigned-preamble",
+            child_id,
+            parent_id,
+            &child,
+            &parent,
+        );
+        assert!(parsed.complete(), "{parsed:#?}");
+        assert_eq!(parsed.recognized_usage_drop_count, 0);
+        let item = parsed.snapshots.into_iter().next().expect("child snapshot");
+        assert_eq!(
+            (
+                item.input_tokens,
+                item.cache_read_tokens,
+                item.output_tokens,
+                item.reasoning_output_tokens,
+                item.request_count,
+            ),
+            (30, 20, 5, 1, 1)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_created_thread_preproof_unsigned_records_are_not_replayed() {
+        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
+            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-first-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+        ];
+        let child = vec![
+            json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":child_id,"thread_source":"agent_created_thread","source":"vscode"}}),
+            // This unsigned record precedes any proof that the file starts a
+            // fresh epoch. Replaying it would attribute parent content to the
+            // child when the later usage checkpoint is admitted.
+            json!({"timestamp":"2026-08-02T08:20:01Z","type":"compacted","payload":{"replacement_history":[]}}),
+            json!({"timestamp":"2026-08-02T08:20:02Z","type":"turn_context","payload":{"turn_id":"fresh-child-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:20:03Z",
+                None,
+                (12, 8, 2, 1),
+                Some((12, 8, 2, 1)),
+            ),
+        ];
+
+        let (root, parsed) = parse_trusted_created_thread_test(
+            "codex-created-thread-preproof-unsigned",
+            child_id,
+            parent_id,
+            &child,
+            &parent,
+        );
+        assert!(parsed.complete(), "{parsed:#?}");
+        let item = parsed.snapshots.into_iter().next().expect("child snapshot");
+        assert_eq!((item.input_tokens, item.request_count), (12, 1));
+        assert_eq!(item.compaction_count.unwrap_or_default(), 0);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
