@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 341,
-  "content_sha256": "82e13a2943a08f1ef7bdb392ef61aac3ecbe75d0a2e880d8f7dcc708005545fd",
+  "content_sha256": "e5defcd79a7d3429f5b008997e0af2f6984a6aecb6bac2fddb3335e8c8267460",
   "files": [
     {
       "executable": false,
@@ -657,7 +657,7 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/backfill.rs",
-      "sha256": "982cfa4292e45a6da6b1cd20229aeb5c27ffa0c4bfe706d1552ca740f7cade2d",
+      "sha256": "183e3d7e804a0cd43d7a448e907965a86f383f72955b0a7affa32a74df7013dd",
       "size_bytes": 37421
     },
     {
@@ -874,8 +874,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "cb3463204cb25cb8ca7f6285f8c898678487d38411474010d5c6bfcc24fb3c9e",
-      "size_bytes": 1487870
+      "sha256": "7bfc50e8d8d30055e3120c5038e5eff929c59513495213d72e7827f26e014c18",
+      "size_bytes": 1502335
     },
     {
       "executable": false,
@@ -1385,8 +1385,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-08-09-codex-session-exclusive-usage.md",
-      "sha256": "ccf55fb337e816f70d6798eee7962dd08887f1d4d21258fbf33f5555e9c92e4a",
-      "size_bytes": 5810
+      "sha256": "35f36891eb7878219d21182dd9e8dd575427dec038ea0073010bf1c20e5c5d4d",
+      "size_bytes": 6031
     },
     {
       "executable": false,
@@ -1483,8 +1483,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-08-28-codex-created-thread-fresh-epoch.md",
-      "sha256": "8b3302f59e5b0f0fa9dd5a5320c822eceb419d7a4f67c08694cc23b8a42f183a",
-      "size_bytes": 6231
+      "sha256": "0ab0fd4802dbaeaed4002cfb4cbdf7f0a19c4a7b6af95e7328a4c7e4f049280a",
+      "size_bytes": 8600
     },
     {
       "executable": false,
@@ -1847,21 +1847,21 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-golden.json",
-      "sha256": "7d45980801a072470c30d69ae753af28e3deb925ae6361a9a4e6ae013ef36a93",
+      "sha256": "cf6288d630f150a71df9ca534edd71d973fd701bef449dfbbc6a9637416df9e8",
       "size_bytes": 3045
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-manifest.json",
-      "sha256": "d9aa4dc5da1e97905d77ffb1d555b41d611885ed97489219ea0c4582e882e26e",
+      "sha256": "b5b7be6c6e4d3c2ac01a1252f1bc1eaa4a3f46c9b192cd447a10ff184101cccd",
       "size_bytes": 1767
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-max-fractional.json",
-      "sha256": "3ae2e6908176424b5d43040a43e4755e1187f41101afb0845fa7c5aa54b87571",
+      "sha256": "261418f2acdca9a22c487609d4ea15e74f705c82d3a19dfe77611c19fbc37269",
       "size_bytes": 65507
     },
     {
@@ -1882,7 +1882,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "0250a00766066c75bb2dfce189dc39ba8a4c71a429566c488f392bb1c3df8688",
+      "sha256": "cb766b1cb1571fe25f5b9e343ef21daba863d45af9bd6ea76de6509ad22767eb",
       "size_bytes": 218514
     },
     {
@@ -2390,7 +2390,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-28T18:20:51+00:00",
+  "generated_at": "2026-08-28T19:38:58+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 342,
   "public_roots": [
@@ -2426,5 +2426,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "a635ee44829cb46a226cd314a80874864c1c6350"
+  "source_commit": "65d79c9e9721914e24f3144e057a4832df7ef714"
 }

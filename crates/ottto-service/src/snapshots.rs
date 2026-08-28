@@ -221,7 +221,13 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // complete gap-free/non-retrograde ordinal+timestamp stream. Legacy copied
 // prefixes may diverge only before a later observed parent signature; parent
 // ledger EOF is never treated as provider-final extent.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v35";
+// codex v36 removes the created-thread history_base/ordinal authorization
+// shortcuts and requires the native witness for every such paginated shape.
+// It also binds the first record to the sidecar creation time within five
+// seconds and, when Codex exposes them, corroborates the opened file against
+// its state-row rollout path/times and thread-history byte/ordinal extent.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v36";
+const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // claude_code v30: retain the exact response ids for counted transcript usage
 // in local memory. Account attribution can then prove that every billed request
 // appears in one-account local OTLP evidence while safely tolerating auxiliary
@@ -5802,6 +5808,7 @@ fn claude_usage_is_progressive_after(current: &UsageTotals, previous: &UsageTota
 struct CodexTitleMetadata {
     titles: BTreeMap<String, CodexTitleCandidate>,
     state_threads: BTreeMap<String, CodexStateThread>,
+    rollout_extents: BTreeMap<String, CodexRolloutExtent>,
     spawn_parents: BTreeMap<String, String>,
     spawn_parent_conflicts: BTreeSet<String>,
     /// True only when an existing state DB could not be read completely. A
@@ -5829,6 +5836,13 @@ struct CodexStateThread {
     created_at: Option<String>,
     updated_at: Option<String>,
     model: Option<String>,
+    rollout_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CodexRolloutExtent {
+    next_byte_offset: u64,
+    next_ordinal: u64,
 }
 
 /// Claude Code sidecar title metadata read from the Claude desktop app's
@@ -6547,6 +6561,9 @@ struct SnapshotAccumulator {
     // Provider state-row creation time for the trusted child edge. Fresh-file
     // timestamps must not precede this physical spawn witness.
     codex_sidecar_child_created_at_nanos: Option<i128>,
+    // Codex's independently projected EOF ordinal, when thread_history_1 is
+    // available. The native stream must end at the same ordinal boundary.
+    codex_sidecar_projected_next_ordinal: Option<u64>,
     // Marks the stricter created-thread prefix path so unsigned records at the
     // ownership boundary are never replayed as child-owned.
     codex_trusted_sidecar_boundary: bool,
@@ -6558,6 +6575,7 @@ struct SnapshotAccumulator {
     // gap-free ordinal stream. These fields bind the first task/turn to that
     // envelope and reject retrograde timestamps anywhere in the opened file.
     codex_native_created_thread_valid: bool,
+    codex_created_thread_native_only: bool,
     codex_native_created_thread_header_nanos: Option<i128>,
     codex_native_created_thread_last_nanos: Option<i128>,
     codex_native_created_thread_task_turn_id: Option<String>,
@@ -6709,12 +6727,14 @@ impl SnapshotAccumulator {
             codex_parent_ownership_ledgers: None,
             codex_sidecar_parent: None,
             codex_sidecar_child_created_at_nanos: None,
+            codex_sidecar_projected_next_ordinal: None,
             codex_trusted_sidecar_boundary: false,
             codex_parent_session_ref: None,
             codex_parent_signatures: None,
             codex_parent_ledger_identity_used: None,
             codex_parent_signature_index: 0,
             codex_native_created_thread_valid: true,
+            codex_created_thread_native_only: false,
             codex_native_created_thread_header_nanos: None,
             codex_native_created_thread_last_nanos: None,
             codex_native_created_thread_task_turn_id: None,
@@ -6783,7 +6803,12 @@ impl SnapshotAccumulator {
         }
     }
 
-    fn seed_codex_sidecar_parent(&mut self, path: &Path, metadata: &CodexTitleMetadata) {
+    fn seed_codex_sidecar_parent(
+        &mut self,
+        path: &Path,
+        file_metadata: &fs::Metadata,
+        metadata: &CodexTitleMetadata,
+    ) {
         if metadata.state_census_incomplete || metadata.sidecar_census_incomplete {
             return;
         }
@@ -6793,11 +6818,16 @@ impl SnapshotAccumulator {
         let Some((parent, _, _)) = metadata.family_position(child.as_str()) else {
             return;
         };
-        self.codex_sidecar_child_created_at_nanos = metadata
-            .state_threads
-            .get(child.as_str())
+        let thread = metadata.state_threads.get(child.as_str());
+        let rollout_extent = metadata.rollout_extents.get(child.as_str()).copied();
+        if !codex_sidecar_rollout_file_matches(path, file_metadata, thread, rollout_extent) {
+            return;
+        }
+        self.codex_sidecar_child_created_at_nanos = thread
             .and_then(|thread| thread.created_at.as_deref())
             .and_then(rfc3339_unix_nanos);
+        self.codex_sidecar_projected_next_ordinal =
+            rollout_extent.map(|extent| extent.next_ordinal);
         self.codex_sidecar_parent = Some((child, parent));
     }
 
@@ -6853,17 +6883,6 @@ impl SnapshotAccumulator {
                 self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
                 return;
             }
-            if let (Some(_), Some(start)) = (trusted_parent.as_ref(), exact_start) {
-                self.codex_ordinal_expected = Some(0);
-                self.codex_ownership_boundary = CodexOwnershipBoundary::Ordinal { start };
-                return;
-            }
-            if trusted_parent.is_some() && has_history_base {
-                // The provider states that inherited history is external to
-                // this physical file, so every local record is child-owned.
-                self.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
-                return;
-            }
             if let Some(header_nanos) = trusted_parent.as_ref().and_then(|_| {
                 codex_native_created_thread_header(
                     value,
@@ -6875,6 +6894,16 @@ impl SnapshotAccumulator {
                 self.codex_native_created_thread_header_nanos = Some(header_nanos);
                 self.codex_native_created_thread_last_nanos = Some(header_nanos);
                 self.codex_ownership_boundary = CodexOwnershipBoundary::NativeCreatedThread;
+                return;
+            }
+            if has_history_base || exact_start.is_some() {
+                // Created-thread pagination markers are file-controlled and
+                // cannot authorize AllLocal/Ordinal by themselves. This shape
+                // has exactly one admission gate: the complete native witness
+                // above. A malformed native envelope must not fall through to
+                // the legacy copied-prefix state machine.
+                self.codex_created_thread_native_only = true;
+                self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
                 return;
             }
             let parent_ledger = trusted_parent.as_deref().and_then(|parent_id| {
@@ -7170,6 +7199,10 @@ impl SnapshotAccumulator {
                     && self.codex_ordinal_sequence_valid
                     && self.codex_owned_record_seen
                     && self.codex_ordinal_expected.is_some_and(|next| next > 1)
+                    && self
+                        .codex_sidecar_projected_next_ordinal
+                        .map(|expected| self.codex_ordinal_expected == Some(expected))
+                        .unwrap_or(true)
                     && self.codex_native_created_thread_task_turn_id.is_some()
                     && self.codex_native_created_thread_first_turn_bound
             }
@@ -7180,7 +7213,8 @@ impl SnapshotAccumulator {
     }
 
     fn codex_parent_resolution_pending(&self) -> bool {
-        self.codex_parent_session_ref.is_some()
+        !self.codex_created_thread_native_only
+            && self.codex_parent_session_ref.is_some()
             && self.codex_parent_signatures.is_none()
             && matches!(
                 self.codex_ownership_boundary,
@@ -9981,7 +10015,11 @@ fn parse_opened_jsonl_file(
     accumulator.codex_parent_ownership_ledgers = codex_parent_ownership_ledgers;
     if source == SnapshotSource::Codex && context_curve_enabled {
         if let Some(metadata) = codex_title_metadata {
-            accumulator.seed_codex_sidecar_parent(path, metadata);
+            let file_metadata = reader
+                .get_ref()
+                .metadata()
+                .with_context(|| format!("read opened JSONL metadata {}", path.display()))?;
+            accumulator.seed_codex_sidecar_parent(path, &file_metadata, metadata);
         }
     }
     let mut recognized_usage_drop_count = 0;
@@ -11020,6 +11058,7 @@ fn codex_native_created_thread_header(
         || u64_at(value, &["ordinal"]) != Some(0)
         || string_at(meta, &["thread_source"]).as_deref() != Some("agent_created_thread")
         || string_at(meta, &["history_mode"]).as_deref() != Some("paginated")
+        || u64_at(meta, &["subagent_history_start_ordinal"]).is_some()
         || !id.eq_ignore_ascii_case(expected_session_id)
         || !session_id.eq_ignore_ascii_case(expected_session_id)
     {
@@ -11031,7 +11070,107 @@ fn codex_native_created_thread_header(
     let record_nanos = string_at(value, &["timestamp"])
         .as_deref()
         .and_then(rfc3339_unix_nanos)?;
-    (meta_nanos >= sidecar_created_at_nanos && record_nanos >= meta_nanos).then_some(record_nanos)
+    (meta_nanos >= sidecar_created_at_nanos
+        && record_nanos >= meta_nanos
+        && timestamps_within_nanos(
+            record_nanos,
+            sidecar_created_at_nanos,
+            CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS,
+        ))
+    .then_some(record_nanos)
+}
+
+fn codex_sidecar_rollout_file_matches(
+    path: &Path,
+    file_metadata: &fs::Metadata,
+    thread: Option<&CodexStateThread>,
+    rollout_extent: Option<CodexRolloutExtent>,
+) -> bool {
+    if rollout_extent.is_some_and(|extent| extent.next_byte_offset != file_metadata.len()) {
+        return false;
+    }
+    let Some(thread) = thread else {
+        return true;
+    };
+    let Some(rollout_path) = thread.rollout_path.as_deref() else {
+        return true;
+    };
+    if rollout_path.is_empty() || !paths_resolve_to_same_file(path, Path::new(rollout_path)) {
+        return false;
+    }
+    let Ok(sidecar_path_metadata) = fs::metadata(rollout_path) else {
+        return false;
+    };
+    if !metadata_describes_same_file(file_metadata, &sidecar_path_metadata) {
+        return false;
+    }
+
+    if let (Some(sidecar_created), Ok(file_created)) = (
+        thread.created_at.as_deref().and_then(rfc3339_unix_nanos),
+        file_metadata.created(),
+    ) {
+        let Some(file_created) = system_time_unix_nanos_i128(file_created) else {
+            return false;
+        };
+        if !timestamps_within_nanos(
+            file_created,
+            sidecar_created,
+            CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS,
+        ) {
+            return false;
+        }
+    }
+
+    if let Some(sidecar_updated) = thread.updated_at.as_deref().and_then(rfc3339_unix_nanos) {
+        let Some(file_modified) = file_metadata
+            .modified()
+            .ok()
+            .and_then(system_time_unix_nanos_i128)
+        else {
+            return false;
+        };
+        if !timestamps_within_nanos(
+            file_modified,
+            sidecar_updated,
+            CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS,
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+fn paths_resolve_to_same_file(left: &Path, right: &Path) -> bool {
+    left == right
+        || fs::canonicalize(left)
+            .ok()
+            .zip(fs::canonicalize(right).ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+#[cfg(unix)]
+fn metadata_describes_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn metadata_describes_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+}
+
+fn system_time_unix_nanos_i128(value: SystemTime) -> Option<i128> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i128::try_from(duration.as_nanos()).ok())
+}
+
+fn timestamps_within_nanos(left: i128, right: i128, tolerance: i128) -> bool {
+    if left >= right {
+        left - right <= tolerance
+    } else {
+        right - left <= tolerance
+    }
 }
 
 fn codex_legacy_trigger_turn(value: &Value) -> bool {
@@ -12985,9 +13124,10 @@ impl CodexTitleMetadata {
     fn session_sidecar_fingerprint(&self, source_session_id: &str) -> String {
         let title = self.titles.get(source_session_id);
         let thread = self.state_threads.get(source_session_id);
+        let extent = self.rollout_extents.get(source_session_id);
         let family = self.family_position(source_session_id);
         sha256_hex(&[
-            "codex_session_sidecar:v2",
+            "codex_session_sidecar:v3",
             source_session_id,
             title.map(|value| value.title.as_str()).unwrap_or(""),
             title.map(|value| value.source.as_str()).unwrap_or(""),
@@ -13010,6 +13150,17 @@ impl CodexTitleMetadata {
             thread
                 .and_then(|value| value.model.as_deref())
                 .unwrap_or(""),
+            thread
+                .and_then(|value| value.rollout_path.as_deref())
+                .unwrap_or(""),
+            &extent
+                .map(|value| value.next_byte_offset)
+                .unwrap_or_default()
+                .to_string(),
+            &extent
+                .map(|value| value.next_ordinal)
+                .unwrap_or_default()
+                .to_string(),
             family
                 .as_ref()
                 .map(|(parent, _, _)| parent.as_str())
@@ -13059,6 +13210,12 @@ impl CodexTitleMetadata {
             );
             if title_census.is_err() || state_census.is_err() || spawn_census.is_err() {
                 metadata.state_census_incomplete = true;
+                metadata.sidecar_census_incomplete = true;
+            }
+
+            let history_path = codex_dir.join("thread_history_1.sqlite");
+            legacy_sidecar_parts.push(sidecar_stat_fingerprint(&history_path));
+            if load_codex_rollout_extents(&history_path, &mut metadata.rollout_extents).is_err() {
                 metadata.sidecar_census_incomplete = true;
             }
 
@@ -13290,7 +13447,7 @@ fn load_codex_sqlite_state_threads(
     }
 
     let sql = format!(
-        "SELECT id, {}, {}, {}, {}, {}, {}, {}, {} FROM threads WHERE tokens_used > 0",
+        "SELECT id, {}, {}, {}, {}, {}, {}, {}, {}, {} FROM threads WHERE tokens_used > 0",
         sqlite_select_expr(&columns, "title", "NULL"),
         sqlite_select_expr(&columns, "tokens_used", "0"),
         sqlite_select_expr(&columns, "archived", "0"),
@@ -13299,6 +13456,7 @@ fn load_codex_sqlite_state_threads(
         sqlite_select_expr(&columns, "created_at_ms", "NULL"),
         sqlite_select_expr(&columns, "updated_at_ms", "NULL"),
         sqlite_select_expr(&columns, "model", "NULL"),
+        sqlite_select_expr(&columns, "rollout_path", "NULL"),
     );
     let mut statement = connection
         .prepare(sql.as_str())
@@ -13311,6 +13469,7 @@ fn load_codex_sqlite_state_threads(
         let created_at = codex_state_timestamp(row.get(6)?, row.get(4)?);
         let updated_at = codex_state_timestamp(row.get(7)?, row.get(5)?);
         let model: Option<String> = row.get(8)?;
+        let rollout_path: Option<String> = row.get(9)?;
         Ok((
             id,
             CodexStateThread {
@@ -13320,6 +13479,7 @@ fn load_codex_sqlite_state_threads(
                 created_at,
                 updated_at,
                 model,
+                rollout_path,
             },
         ))
     })?;
@@ -13331,6 +13491,58 @@ fn load_codex_sqlite_state_threads(
     for (id, thread) in loaded {
         state_threads.insert(id, thread);
     }
+    Ok(())
+}
+
+fn load_codex_rollout_extents(
+    path: &Path,
+    rollout_extents: &mut BTreeMap<String, CodexRolloutExtent>,
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context("open Codex thread-history database")?;
+    let columns = sqlite_table_columns(&connection, "thread_history_projection_state")?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+    if !columns.contains("thread_id")
+        || !columns.contains("next_rollout_byte_offset")
+        || !columns.contains("next_rollout_ordinal")
+    {
+        return Err(anyhow::anyhow!(
+            "Codex thread-history database has an incomplete projection schema"
+        ));
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT thread_id, next_rollout_byte_offset, next_rollout_ordinal \
+             FROM thread_history_projection_state",
+        )
+        .context("prepare Codex rollout-extent census")?;
+    let rows = statement.query_map([], |row| {
+        let thread_id: String = row.get(0)?;
+        let next_byte_offset: i64 = row.get(1)?;
+        let next_ordinal: i64 = row.get(2)?;
+        Ok((thread_id, next_byte_offset, next_ordinal))
+    })?;
+    let mut loaded = BTreeMap::new();
+    for row in rows {
+        let (thread_id, next_byte_offset, next_ordinal) =
+            row.context("read Codex rollout-extent census row")?;
+        let next_byte_offset =
+            u64::try_from(next_byte_offset).context("negative Codex rollout byte offset")?;
+        let next_ordinal = u64::try_from(next_ordinal).context("negative Codex rollout ordinal")?;
+        loaded.insert(
+            thread_id,
+            CodexRolloutExtent {
+                next_byte_offset,
+                next_ordinal,
+            },
+        );
+    }
+    rollout_extents.extend(loaded);
     Ok(())
 }
 
@@ -31936,6 +32148,24 @@ mod tests {
         child_values: &[Value],
         parent_values: &[Value],
     ) -> (PathBuf, ParsedJsonlFile) {
+        parse_trusted_created_thread_test_with_extent(
+            name,
+            child_id,
+            parent_id,
+            child_values,
+            parent_values,
+            None,
+        )
+    }
+
+    fn parse_trusted_created_thread_test_with_extent(
+        name: &str,
+        child_id: &str,
+        parent_id: &str,
+        child_values: &[Value],
+        parent_values: &[Value],
+        projected_next_ordinal: Option<u64>,
+    ) -> (PathBuf, ParsedJsonlFile) {
         let root = temp_dir(name);
         let path = root.join(format!("rollout-{child_id}.jsonl"));
         let mut body = child_values
@@ -31962,6 +32192,17 @@ mod tests {
                 ..CodexStateThread::default()
             },
         );
+        if let Some(next_ordinal) = projected_next_ordinal {
+            metadata.rollout_extents.insert(
+                child_id.to_string(),
+                CodexRolloutExtent {
+                    next_byte_offset: fs::metadata(&path)
+                        .expect("stat trusted created-thread fixture")
+                        .len(),
+                    next_ordinal,
+                },
+            );
+        }
         let ledgers = BTreeMap::from([(
             parent_id.to_string(),
             CodexParentOwnershipLedger {
@@ -32722,7 +32963,7 @@ mod tests {
             ),
         ];
         let child = vec![
-            json!({"timestamp":"2026-08-02T08:20:00.500Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-02T08:20:00Z","thread_source":"agent_created_thread","history_mode":"paginated","source":"vscode"}}),
+            json!({"timestamp":"2026-08-02T08:20:00.500Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-02T08:20:00Z","thread_source":"agent_created_thread","history_mode":"paginated","history_base":{"cursor":"external"},"source":"vscode"}}),
             json!({"timestamp":"2026-08-02T08:20:00.501Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"01a03e99-5000-7000-8000-000000000001","trace_id":"0123456789abcdef0123456789abcdef","started_at":1_785_658_800_u64}}),
             json!({"timestamp":"2026-08-02T08:20:01Z","ordinal":2,"type":"turn_context","payload":{"turn_id":"01a03e99-5000-7000-8000-000000000001","model":"gpt-5.6-sol"}}),
             json!({"timestamp":"2026-08-02T08:20:02Z","ordinal":3,"type":"compacted","payload":{"replacement_history":[]}}),
@@ -32746,6 +32987,137 @@ mod tests {
         assert_eq!((item.input_tokens, item.request_count), (12, 1));
         assert_eq!(item.compaction_count, Some(1));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_created_thread_history_base_requires_the_complete_native_witness() {
+        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
+            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-first-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+        ];
+        let child = vec![
+            json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":child_id,"session_id":child_id,"thread_source":"agent_created_thread","history_mode":"paginated","history_base":{"cursor":"file-controlled"}}}),
+            json!({"timestamp":"2026-08-02T08:19:59Z","type":"turn_context","payload":{"turn_id":"forged-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:19:58Z",
+                None,
+                (30, 8, 12, 1),
+                Some((30, 8, 12, 1)),
+            ),
+        ];
+
+        let (root, parsed) = parse_trusted_created_thread_test(
+            "codex-created-thread-history-base-native-only",
+            child_id,
+            parent_id,
+            &child,
+            &parent,
+        );
+        assert!(parsed.snapshots.is_empty(), "{parsed:#?}");
+        assert!(parsed.zero_snapshot_usage_evidence);
+        assert_eq!(parsed.recognized_usage_drop_count, 1);
+        assert_eq!(parsed.ownership_incomplete_file_count, 1);
+        assert_eq!(parsed.dropped_usage_record_count, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_created_thread_projected_extent_must_match_native_eof() {
+        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let turn_id = "01a03e99-5000-7000-8000-000000000001";
+        let parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
+            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-first-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+        ];
+        let child = vec![
+            json!({"timestamp":"2026-08-02T08:20:00.500Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-02T08:20:00Z","thread_source":"agent_created_thread","history_mode":"paginated"}}),
+            json!({"timestamp":"2026-08-02T08:20:00.501Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":turn_id,"trace_id":"0123456789abcdef0123456789abcdef","started_at":1_785_658_800_u64}}),
+            json!({"timestamp":"2026-08-02T08:20:01Z","ordinal":2,"type":"turn_context","payload":{"turn_id":turn_id,"model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:20:03Z",
+                Some(3),
+                (12, 8, 2, 1),
+                Some((12, 8, 2, 1)),
+            ),
+        ];
+
+        let (root, parsed) = parse_trusted_created_thread_test_with_extent(
+            "codex-created-thread-projected-extent",
+            child_id,
+            parent_id,
+            &child,
+            &parent,
+            Some(5),
+        );
+        assert!(parsed.snapshots.is_empty(), "{parsed:#?}");
+        assert!(parsed.zero_snapshot_usage_evidence);
+        assert_eq!(parsed.ownership_incomplete_file_count, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_created_thread_sidecar_path_times_and_byte_extent_cross_check_file() {
+        let path = temp_file("codex-created-thread-sidecar-file-cross-check");
+        fs::write(&path, b"{}\n").expect("write sidecar file fixture");
+        let file_metadata = fs::metadata(&path).expect("stat sidecar file fixture");
+
+        let wrong_path = CodexStateThread {
+            rollout_path: Some(path.with_extension("other").to_string_lossy().to_string()),
+            ..CodexStateThread::default()
+        };
+        assert!(!codex_sidecar_rollout_file_matches(
+            &path,
+            &file_metadata,
+            Some(&wrong_path),
+            None,
+        ));
+
+        let stale_mtime = CodexStateThread {
+            rollout_path: Some(path.to_string_lossy().to_string()),
+            updated_at: Some("2000-01-01T00:00:00Z".to_string()),
+            ..CodexStateThread::default()
+        };
+        assert!(!codex_sidecar_rollout_file_matches(
+            &path,
+            &file_metadata,
+            Some(&stale_mtime),
+            None,
+        ));
+
+        assert!(!codex_sidecar_rollout_file_matches(
+            &path,
+            &file_metadata,
+            None,
+            Some(CodexRolloutExtent {
+                next_byte_offset: file_metadata.len() + 1,
+                next_ordinal: 1,
+            }),
+        ));
+        assert!(codex_sidecar_rollout_file_matches(
+            &path,
+            &file_metadata,
+            None,
+            Some(CodexRolloutExtent {
+                next_byte_offset: file_metadata.len(),
+                next_ordinal: 1,
+            }),
+        ));
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -32779,6 +33151,7 @@ mod tests {
             ("native-ordinal-gap", valid.clone()),
             ("native-retrograde-time", valid.clone()),
             ("native-turn-mismatch", valid.clone()),
+            ("native-spawn-delay", valid.clone()),
         ] {
             match name {
                 "native-ordinal-gap" => child[3]["ordinal"] = json!(4),
@@ -32786,6 +33159,7 @@ mod tests {
                 "native-turn-mismatch" => {
                     child[2]["payload"]["turn_id"] = json!("01a03e99-5000-7000-8000-000000000002")
                 }
+                "native-spawn-delay" => child[0]["timestamp"] = json!("2026-08-02T08:20:10.500Z"),
                 _ => unreachable!(),
             }
             let (root, parsed) =
