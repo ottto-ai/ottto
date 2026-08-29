@@ -21,7 +21,7 @@ pub const CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION: u16 = 19;
 /// v21 adds daemon-authored workspace targets and target-bound setup. The base
 /// protocol remains unchanged so older clients continue to use every unrelated
 /// command during a rolling local-runtime upgrade.
-pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 21;
+pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 22;
 pub const CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
 pub const CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
@@ -3090,6 +3090,12 @@ pub struct CodexAccountTargetDescriptorV1 {
     pub account_label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_label: Option<String>,
+    /// The plan the provider claims for this exact target, e.g. `pro`. Present
+    /// only where the credential actually claims it: a workspace merely observed
+    /// in the ID token has no claimed plan, and guessing one from a sibling
+    /// workspace would state something the provider never said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
     pub durability: CodexAccountTargetDurabilityV1,
     #[serde(default)]
     pub is_current: bool,
@@ -4028,19 +4034,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_account_commands_fail_closed_on_v20_protocol_version() {
-        let request = serde_json::json!({
-            "request_id": "req_codex_account",
-            "protocol_version": 20,
-            "client_kind": "companion_app",
-            "command": "codex_accounts_status"
-        });
-        let error = serde_json::from_value::<LocalControlRequest>(request)
-            .expect_err("v20 client must get an explicit incompatibility signal");
-        assert!(error
-            .to_string()
-            .contains("unsupported local control protocol_version 20; expected 21"));
-        assert_eq!(CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION, 21);
+    fn codex_account_commands_fail_closed_on_every_older_protocol_version() {
+        // Each superseded version is rejected by name, so a stale companion says
+        // "update Ottto" instead of quietly rendering a payload it cannot read.
+        for stale in [20, 21] {
+            let request = serde_json::json!({
+                "request_id": "req_codex_account",
+                "protocol_version": stale,
+                "client_kind": "companion_app",
+                "command": "codex_accounts_status"
+            });
+            let error = serde_json::from_value::<LocalControlRequest>(request)
+                .expect_err("a superseded client must get an explicit incompatibility signal");
+            assert!(error.to_string().contains(&format!(
+                "unsupported local control protocol_version {stale}; expected 22"
+            )));
+        }
+        assert_eq!(CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION, 22);
     }
 
     #[test]
@@ -4064,6 +4074,7 @@ mod tests {
                 workspace_identifier_hash: Some("b".repeat(64)),
                 account_label: "Codex account".to_string(),
                 workspace_label: Some("Singular".to_string()),
+                plan_type: None,
                 durability: CodexAccountTargetDurabilityV1::ObservedOnly,
                 is_current: false,
                 connectable: true,

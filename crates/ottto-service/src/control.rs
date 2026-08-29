@@ -14084,6 +14084,7 @@ mod tests {
                     workspace_identifier_hash: Some(workspace_hash.clone()),
                     account_label: "Codex account".to_string(),
                     workspace_label: Some("Singular".to_string()),
+                    plan_type: None,
                     durability: ottto_protocol::CodexAccountTargetDurabilityV1::ObservedOnly,
                     is_current: false,
                     connectable: true,

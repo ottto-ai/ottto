@@ -31,8 +31,13 @@ appear twice, and the duplicate offers to connect a subscription that is already
 connected. Aliases are collected across all candidates, so a workspace seen as
 non-default on one credential still collapses onto the slot that connected it.
 
-`account_label` carries the signed-in email from the ID token so two connected
-Codex accounts are distinguishable on screen. It is the only raw provider string
+`account_label` carries the signed-in email from the ID token, and `plan_type`
+the plan the provider claims, so two connected Codex accounts are
+distinguishable on screen. A plan is attached only where it is actually claimed:
+`chatgpt_plan_type` describes the workspace its credential is signed into, and
+an organization that names its own plan keeps that one. A workspace merely
+observed in the token has no plan of its own and is left blank rather than
+inheriting a sibling's. It is the only raw provider string
 in this payload: `codex_accounts_status` answers the local Unix socket only and
 is never uploaded, and raw account ids, workspace ids, and token material stay
 absent. Credentials that claim no email fall back to a generic label.

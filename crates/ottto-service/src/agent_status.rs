@@ -192,6 +192,11 @@ struct CodexWorkspaceTargetEvidence {
     /// Signed-in account name from the id_token `email` claim, sanitized through
     /// `safe_display_label`. Local-control display only; never uploaded.
     account_label: Option<String>,
+    /// Plan the credential claims via `chatgpt_plan_type`. It describes the
+    /// workspace the credential is signed into, so it is carried only on the
+    /// `is_default` evidence row; the other organizations in the same token have
+    /// no claimed plan of their own.
+    plan_type: Option<String>,
     is_default: bool,
     observed_at: String,
 }
@@ -1211,6 +1216,52 @@ fn derive_codex_account_target_coverage(
         account_labels.get(account_hash?).cloned()
     };
 
+    // A credential's `chatgpt_plan_type` describes the workspace it is signed
+    // into, so it is keyed by the target that credential binds - never spread
+    // across the account's other workspaces, whose plans the token never claims.
+    let mut plan_by_workspace = BTreeMap::<String, String>::new();
+    for candidate in candidates {
+        let Some((_, binding_workspace_hash)) = candidate
+            .binding
+            .as_ref()
+            .or(candidate.slot.registered_binding.as_ref())
+        else {
+            continue;
+        };
+        for evidence in candidate
+            .workspace_targets
+            .iter()
+            .filter(|evidence| evidence.is_default)
+        {
+            if let Some(plan) = evidence.plan_type.as_deref() {
+                plan_by_workspace
+                    .entry(binding_workspace_hash.clone())
+                    .or_insert_with(|| plan.to_string());
+            }
+        }
+    }
+    for candidate in candidates {
+        if let Some(plan) = candidate.snapshot.account.as_ref().and_then(|account| {
+            account
+                .plan_type
+                .as_deref()
+                .and_then(|plan| safe_display_label(Some(plan)))
+        }) {
+            if let Some((_, binding_workspace_hash)) = candidate
+                .binding
+                .as_ref()
+                .or(candidate.slot.registered_binding.as_ref())
+            {
+                plan_by_workspace
+                    .entry(binding_workspace_hash.clone())
+                    .or_insert(plan);
+            }
+        }
+    }
+    let plan_for = |workspace_hash: Option<&str>| -> Option<String> {
+        plan_by_workspace.get(workspace_hash?).cloned()
+    };
+
     for candidate in candidates.iter().filter(|candidate| {
         candidate.slot.ownership == CodexAccountSlotOwnershipV1::Managed
             && candidate.status.relationship
@@ -1228,6 +1279,7 @@ fn derive_codex_account_target_coverage(
                     workspace_identifier_hash: Some(workspace_hash.clone()),
                     workspace_label: None,
                     account_label: account_label_for(Some(account_hash.as_str())),
+                    plan_type: plan_for(Some(workspace_hash.as_str())),
                 },
                 CodexAccountTargetDurabilityV1::Durable,
                 false,
@@ -1253,12 +1305,16 @@ fn derive_codex_account_target_coverage(
                 &mut by_target,
                 codex_account_target_descriptor(
                     CodexAccountTargetIdentity {
-                        account_identifier_hash: evidence.account_identifier_hash.clone(),
-                        workspace_identifier_hash: workspace_hash,
-                        workspace_label: evidence.workspace_label.clone(),
                         account_label: evidence.account_label.clone().or_else(|| {
                             account_label_for(evidence.account_identifier_hash.as_deref())
                         }),
+                        plan_type: evidence
+                            .plan_type
+                            .clone()
+                            .or_else(|| plan_for(workspace_hash.as_deref())),
+                        account_identifier_hash: evidence.account_identifier_hash.clone(),
+                        workspace_identifier_hash: workspace_hash,
+                        workspace_label: evidence.workspace_label.clone(),
                     },
                     if is_current {
                         CodexAccountTargetDurabilityV1::Current
@@ -1286,6 +1342,7 @@ fn derive_codex_account_target_coverage(
                         workspace_identifier_hash: Some(workspace_hash.clone()),
                         workspace_label: None,
                         account_label: account_label_for(Some(account_hash.as_str())),
+                        plan_type: plan_for(Some(workspace_hash.as_str())),
                     },
                     CodexAccountTargetDurabilityV1::Current,
                     true,
@@ -1363,6 +1420,7 @@ struct CodexAccountTargetIdentity {
     workspace_identifier_hash: Option<String>,
     workspace_label: Option<String>,
     account_label: Option<String>,
+    plan_type: Option<String>,
 }
 
 fn codex_account_target_descriptor(
@@ -1377,6 +1435,7 @@ fn codex_account_target_descriptor(
         workspace_identifier_hash,
         workspace_label,
         account_label,
+        plan_type,
     } = identity;
     let target_id = codex_account_target_id(
         account_identifier_hash.as_deref(),
@@ -1389,6 +1448,7 @@ fn codex_account_target_descriptor(
         workspace_identifier_hash,
         account_label: account_label.unwrap_or_else(|| CODEX_GENERIC_ACCOUNT_LABEL.to_string()),
         workspace_label,
+        plan_type,
         durability,
         is_current,
         connectable: false,
@@ -1444,6 +1504,7 @@ fn upsert_codex_account_target(
     {
         existing.account_label = incoming.account_label;
     }
+    existing.plan_type = existing.plan_type.take().or(incoming.plan_type);
     existing.observed_at = existing.observed_at.take().or(incoming.observed_at);
     match (existing.durability, incoming.durability) {
         (CodexAccountTargetDurabilityV1::Durable, _) => {}
@@ -8781,6 +8842,9 @@ fn codex_workspace_target_evidence_from_id_token(
         .as_deref()
         .and_then(|value| billing_identity_hash("openai", "account", value));
     let account_label = safe_display_label(first_json_string(&claims, &["email"]).as_deref());
+    let claimed_plan_type = safe_display_label(
+        first_json_string(auth_claim, &["chatgpt_plan_type", "plan_type"]).as_deref(),
+    );
     Some(
         codex_organizations(auth_claim)
             .into_iter()
@@ -8792,6 +8856,16 @@ fn codex_workspace_target_evidence_from_id_token(
                     .and_then(|value| billing_identity_hash("openai", "workspace", value)),
                 workspace_label: safe_display_label(organization.label.as_deref()),
                 account_label: account_label.clone(),
+                plan_type: organization
+                    .plan_type
+                    .clone()
+                    .and_then(|plan| safe_display_label(Some(plan.as_str())))
+                    .or_else(|| {
+                        organization
+                            .is_default
+                            .then(|| claimed_plan_type.clone())
+                            .flatten()
+                    }),
                 is_default: organization.is_default,
                 observed_at: observed_at.to_string(),
             })
@@ -12964,12 +13038,100 @@ for line in sys.stdin:
                 "https://api.openai.com/auth": {
                     "chatgpt_user_id": "raw-account-123",
                     "chatgpt_account_id": chatgpt_account_id,
+                    "chatgpt_plan_type": "pro",
                     "organizations": organizations
                 }
             })
             .to_string(),
         );
         format!("{header}.{payload}.raw-secret-signature")
+    }
+
+    #[test]
+    fn codex_plan_type_names_the_signed_in_workspace_and_is_not_guessed_for_the_others() {
+        // `chatgpt_plan_type` describes the workspace the credential is signed
+        // into. Spreading it across the account's other workspaces would state a
+        // plan the provider never claimed for them.
+        let token = codex_split_identity_token(
+            "raw-workspace-binding",
+            serde_json::json!([
+                {"id": "raw-org-singular", "title": "Singular", "is_default": true},
+                {"id": "raw-org-deprecated", "title": "Singular Deprecated", "is_default": false}
+            ]),
+        );
+        let evidence =
+            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
+        let account_hash =
+            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
+        let binding_workspace_hash =
+            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
+                .expect("workspace hash");
+        let mut candidate = codex_candidate_for_test(
+            "codex_slot_durable",
+            CodexAccountSlotOwnershipV1::Managed,
+            &account_hash,
+            &binding_workspace_hash,
+            5,
+        );
+        candidate.workspace_targets = evidence;
+
+        let coverage =
+            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
+
+        let connected = coverage
+            .targets
+            .iter()
+            .find(|target| target.workspace_label.as_deref() == Some("Singular"))
+            .expect("connected workspace");
+        assert_eq!(connected.plan_type.as_deref(), Some("pro"));
+        let observed = coverage
+            .targets
+            .iter()
+            .find(|target| target.workspace_label.as_deref() == Some("Singular Deprecated"))
+            .expect("observed workspace");
+        assert_eq!(
+            observed.plan_type, None,
+            "an unconnected workspace has no claimed plan of its own"
+        );
+    }
+
+    #[test]
+    fn codex_target_plan_type_comes_from_the_organization_when_the_token_claims_one() {
+        // A membership that names its own plan keeps it, rather than inheriting
+        // the credential's account-level plan.
+        let token = codex_split_identity_token(
+            "raw-workspace-binding",
+            serde_json::json!([
+                {"id": "raw-org-singular", "title": "Singular", "is_default": true},
+                {"id": "raw-org-team", "title": "Team", "is_default": false, "plan_type": "business"}
+            ]),
+        );
+        let evidence =
+            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
+        let account_hash =
+            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
+        let binding_workspace_hash =
+            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
+                .expect("workspace hash");
+        let mut candidate = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            &account_hash,
+            &binding_workspace_hash,
+            5,
+        );
+        candidate.workspace_targets = evidence;
+
+        let coverage =
+            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
+        let team = coverage
+            .targets
+            .iter()
+            .find(|target| target.workspace_label.as_deref() == Some("Team"))
+            .expect("team workspace");
+        assert_eq!(team.plan_type.as_deref(), Some("business"));
     }
 
     #[test]
@@ -13016,6 +13178,7 @@ for line in sys.stdin:
             Some(binding_workspace_hash.as_str()),
             "the binding identity stays canonical so persisted slots keep resolving"
         );
+        assert_eq!(target.plan_type.as_deref(), Some("pro"));
     }
 
     #[test]
