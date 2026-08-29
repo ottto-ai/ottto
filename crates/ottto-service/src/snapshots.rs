@@ -8098,7 +8098,16 @@ impl SnapshotAccumulator {
             .clone()
             .or_else(|| {
                 (self.source == SnapshotSource::Codex)
-                    .then(|| codex_session_id_from_path(path))
+                    .then(|| {
+                        // Prefer the identity the seeding/header evidence already
+                        // bound for this exact file. `codex_session_id_from_path`
+                        // is deliberately evidence-free and returns `None` for a
+                        // timestamp-shaped name, so without this the ambiguous
+                        // grammar would degrade to the raw `rollout-` file stem.
+                        self.codex_resolved_path_identity
+                            .clone()
+                            .or_else(|| codex_session_id_from_path(path))
+                    })
                     .flatten()
             })
             .or_else(|| {

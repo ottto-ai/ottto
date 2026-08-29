@@ -202,6 +202,16 @@ unambiguous direct edge. Each affected child is parsed and contributes its own
 usage-drop, ownership-incomplete-file, and dropped-record counter, making the
 loss visible in census health rather than silently hiding it.
 
+One naming residual is accepted rather than guessed away. When a rollout name is
+grammar ambiguous, carries no `session_meta` identity at all, and neither
+candidate has any trusted state/census evidence, no evidence exists to select
+between the two readings. Such a file keeps the shared last-resort file-stem
+session id instead of silently adopting the shortened candidate. This cannot
+admit a created thread — that path requires created evidence, whose presence
+makes the same file `AmbiguousFork` — and the stem cannot alias any state row,
+so it cannot double-count against the inclusive state fallback. It costs
+attribution continuity for a file that carries no identity evidence anywhere.
+
 The remaining open case is DELIBERATE whole-file self-forgery against the
 machine operator's own billing telemetry. An operator who can rewrite the
 rollout can also choose an in-window first timestamp, preserve/pad byte size and
@@ -237,10 +247,14 @@ exists to distinguish with another revision. UUID-key canonicalization does not
 justify another parser/replay revision: shipped Codex state, rollout, and
 thread-history identifiers are consistently lowercase already, so no real
 shipped corpus shape changes admission. A read-only live check on 2026-08-29
-found 1,881 `state_5.sqlite` thread ids and 714 thread-history projection ids.
-Both sources had zero non-lowercase ids, zero non-exact-UUID-shaped ids, and
-zero timestamp-prefixed identities; the live `threads` table contained all
-three required classification columns. Thus the missing-schema and ambiguous
+found 1,883 `state_5.sqlite` thread ids and 716 thread-history projection ids
+(a point-in-time read of a live growing store; earlier samples saw 1,868/701
+and 1,871/704). Both sources had zero non-lowercase ids, zero
+non-exact-UUID-shaped ids, and zero timestamp-prefixed identities; the live
+`threads` table contained all three required classification columns. A sweep of
+the 1,848 live `rollout-*.jsonl` names found zero whose identity remainder
+itself begins with a second timestamp shape, so no real file is grammar
+ambiguous. Thus the missing-schema and ambiguous
 legacy-grammar fixes change only adversarial/damaged shapes in this unreleased
 DRAFT, while the real-corpus justification for keeping v36/v6 remains intact.
 The case-alias outcome likewise remains part of the same unreleased derivation.
