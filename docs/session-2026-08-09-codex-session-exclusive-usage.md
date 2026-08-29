@@ -13,8 +13,11 @@ derived cost across every fork.
   closed.
 - Legacy subagent forks exclude records until the first provider-native
   `inter_agent_communication_metadata` record with `trigger_turn=true`.
-- No-history subagents and paginated files whose inherited prefix lives behind
-  `history_base` treat their physical local records as owned.
+- No-history subagents and ordinary paginated files whose inherited prefix
+  lives behind `history_base` treat their physical local records as owned.
+  `thread_source=agent_created_thread` is stricter as of v36: neither
+  `history_base` nor `subagent_history_start_ordinal` authorizes ownership;
+  that shape requires the complete created-thread native witness.
 - Legacy ordinary user forks and new-id resumes use a persisted, content-free
   parent prepass. A non-empty ordered turn/usage-signature prefix must match a
   complete parent ledger; the first divergent signature begins child-owned

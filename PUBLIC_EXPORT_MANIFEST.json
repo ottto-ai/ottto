@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 341,
-  "content_sha256": "6406c4b0334df9c5641a4d673afd422f18db48a4c61fc97456525e422c2e2ded",
+  "content_sha256": "0bdb166ecb6e5d551000eeb5a7c6b78cbc38f0d436318aec05c8a1e8a47a0ecc",
   "files": [
     {
       "executable": false,
@@ -657,8 +657,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/backfill.rs",
-      "sha256": "929b344f5a7d056ec09b4cf72924d1d7ff7289a855057f196126459a36369784",
-      "size_bytes": 37421
+      "sha256": "a46273464b0d11f34ada8aa8fdc7cac17f7ede0bfd70c5e0e2135c283d94923e",
+      "size_bytes": 40031
     },
     {
       "executable": false,
@@ -846,22 +846,22 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_audit.rs",
-      "sha256": "6892b512b74ab9a7646935971ea075907f2d5e625e4c5df0e93bad6314151e48",
-      "size_bytes": 45031
+      "sha256": "fddab7e75369d12cedcc17c56e1d9ed4991faa668f537fcec3fa186576610ea2",
+      "size_bytes": 45273
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "83b4443121ff3f79eea56b3828d218ffe67b37ac550be644fbac4cdae4332daa",
-      "size_bytes": 98748
+      "sha256": "85a5bc076b16c367f48a22d2324bc07c734c9679d37406b969417ed4235cc8f6",
+      "size_bytes": 98852
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "7aff305b592aa9104463c3b99da98a5666411f5a541a167ead666b99ffef2c0f",
-      "size_bytes": 323598
+      "sha256": "829d2cf9177a3ceb52848ec22a0a250448e32a944b6d65cbbef4e5cb929cc3d4",
+      "size_bytes": 327745
     },
     {
       "executable": false,
@@ -874,8 +874,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "2db0e502a79ec1e62e105b83b74a94f49e3b1f7858a1145bb7b65e95514a6483",
-      "size_bytes": 1468439
+      "sha256": "5089fb00b52d4d7e58489aaec5b258d57e08f400fe1f3b6d7aea6b60079c6f87",
+      "size_bytes": 1582887
     },
     {
       "executable": false,
@@ -1385,8 +1385,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-08-09-codex-session-exclusive-usage.md",
-      "sha256": "ccf55fb337e816f70d6798eee7962dd08887f1d4d21258fbf33f5555e9c92e4a",
-      "size_bytes": 5810
+      "sha256": "35f36891eb7878219d21182dd9e8dd575427dec038ea0073010bf1c20e5c5d4d",
+      "size_bytes": 6031
     },
     {
       "executable": false,
@@ -1483,8 +1483,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-08-28-codex-created-thread-fresh-epoch.md",
-      "sha256": "1740bd965470933ac15ed44eaea6fe8ac0084cde377ea0b41495d2427bb03c2c",
-      "size_bytes": 3502
+      "sha256": "361d5cc472261664562f43825a08c8beab229c9c23b0cecee51f5fea026e51bf",
+      "size_bytes": 25590
     },
     {
       "executable": false,
@@ -1847,21 +1847,21 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-golden.json",
-      "sha256": "ed555126a9d6f5f3000804655f8a1ca7144237695028146c90fa0d7f5cd487cc",
+      "sha256": "cf6288d630f150a71df9ca534edd71d973fd701bef449dfbbc6a9637416df9e8",
       "size_bytes": 3045
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-manifest.json",
-      "sha256": "e68387428a0d6b24cbda90407eb848471caba68cad36d9969dd46899cd4c9c10",
+      "sha256": "b5b7be6c6e4d3c2ac01a1252f1bc1eaa4a3f46c9b192cd447a10ff184101cccd",
       "size_bytes": 1767
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-max-fractional.json",
-      "sha256": "9af99b0b06568ac37c2437f5c1e9fd1eff8567d38c25c4c0b1c93945cf249729",
+      "sha256": "261418f2acdca9a22c487609d4ea15e74f705c82d3a19dfe77611c19fbc37269",
       "size_bytes": 65507
     },
     {
@@ -1882,7 +1882,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "7c1cd0d7e321b6b277f4daa05ff5a0ea20cac90699f0cf19fa1ebd6529380e83",
+      "sha256": "cb766b1cb1571fe25f5b9e343ef21daba863d45af9bd6ea76de6509ad22767eb",
       "size_bytes": 218514
     },
     {
@@ -2390,7 +2390,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-28T17:05:00+00:00",
+  "generated_at": "2026-08-29T02:25:38+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 342,
   "public_roots": [
@@ -2426,5 +2426,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ce867e2dd3addc8a4f815eec47b0269ab51c62a4"
+  "source_commit": "ae5109e313740501fda7c314f049d5bc2fb10af9"
 }
