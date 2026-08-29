@@ -189,6 +189,14 @@ struct CodexWorkspaceTargetEvidence {
     account_identifier_hash: Option<String>,
     workspace_identifier_hash: Option<String>,
     workspace_label: Option<String>,
+    /// Signed-in account name from the id_token `email` claim, sanitized through
+    /// `safe_display_label`. Local-control display only; never uploaded.
+    account_label: Option<String>,
+    /// Plan the credential claims via `chatgpt_plan_type`. It describes the
+    /// workspace the credential is signed into, so it is carried only on the
+    /// `is_default` evidence row; the other organizations in the same token have
+    /// no claimed plan of their own.
+    plan_type: Option<String>,
     is_default: bool,
     observed_at: String,
 }
@@ -1132,11 +1140,127 @@ fn apply_codex_candidate_statuses(
     }
 }
 
+/// Shown when the credential does not claim an email for the account.
+const CODEX_GENERIC_ACCOUNT_LABEL: &str = "Codex account";
+
 fn derive_codex_account_target_coverage(
     status: &CodexAccountsStatusV1,
     candidates: &[CodexSlotCandidate],
 ) -> CodexAccountTargetCoverageV1 {
     let mut by_target = BTreeMap::<String, CodexAccountTargetDescriptorV1>::new();
+
+    // The provider names one workspace in two identifier spaces. A credential is
+    // bound by `chatgpt_account_id`, which is what a durable slot registers, while
+    // the same credential's id_token lists `organizations[].id`. Hashing both
+    // yields two identities for a single workspace, so the current login and every
+    // durable connection would render twice - and the duplicate would offer to
+    // "keep limits available" for a subscription that is already connected, which
+    // is how one subscription ends up occupying two slots and counting twice.
+    //
+    // The organization a credential is actually signed into is the one flagged
+    // `is_default`, so alias that organization's hash onto the binding hash before
+    // any upsert. Aliases are collected across every candidate, so a workspace
+    // observed as non-default on one credential still collapses onto the binding of
+    // the slot that connected it.
+    let mut workspace_alias = BTreeMap::<String, String>::new();
+    for candidate in candidates {
+        let Some((_, binding_workspace_hash)) = candidate
+            .binding
+            .as_ref()
+            .or(candidate.slot.registered_binding.as_ref())
+        else {
+            continue;
+        };
+        for evidence in candidate
+            .workspace_targets
+            .iter()
+            .filter(|evidence| evidence.is_default)
+        {
+            let Some(observed) = evidence.workspace_identifier_hash.as_deref() else {
+                continue;
+            };
+            if observed == binding_workspace_hash {
+                continue;
+            }
+            workspace_alias.insert(observed.to_string(), binding_workspace_hash.clone());
+        }
+    }
+    let canonical_workspace_hash = |hash: Option<&str>| -> Option<String> {
+        let hash = hash?;
+        Some(
+            workspace_alias
+                .get(hash)
+                .cloned()
+                .unwrap_or_else(|| hash.to_string()),
+        )
+    };
+
+    // Both Codex accounts otherwise render as the same generic string, which makes
+    // two connected identities impossible to tell apart. The id_token already
+    // carries the signed-in email, and this status is local-control only - it is
+    // never uploaded - so the account can name itself on this Mac.
+    let mut account_labels = BTreeMap::<String, String>::new();
+    for candidate in candidates {
+        for evidence in &candidate.workspace_targets {
+            if let (Some(account_hash), Some(label)) = (
+                evidence.account_identifier_hash.as_deref(),
+                evidence.account_label.as_deref(),
+            ) {
+                account_labels
+                    .entry(account_hash.to_string())
+                    .or_insert_with(|| label.to_string());
+            }
+        }
+    }
+    let account_label_for = |account_hash: Option<&str>| -> Option<String> {
+        account_labels.get(account_hash?).cloned()
+    };
+
+    // A credential's `chatgpt_plan_type` describes the workspace it is signed
+    // into, so it is keyed by the target that credential binds - never spread
+    // across the account's other workspaces, whose plans the token never claims.
+    let mut plan_by_workspace = BTreeMap::<String, String>::new();
+    for candidate in candidates {
+        let Some((_, binding_workspace_hash)) = candidate
+            .binding
+            .as_ref()
+            .or(candidate.slot.registered_binding.as_ref())
+        else {
+            continue;
+        };
+        for evidence in candidate
+            .workspace_targets
+            .iter()
+            .filter(|evidence| evidence.is_default)
+        {
+            if let Some(plan) = evidence.plan_type.as_deref() {
+                plan_by_workspace
+                    .entry(binding_workspace_hash.clone())
+                    .or_insert_with(|| plan.to_string());
+            }
+        }
+    }
+    for candidate in candidates {
+        if let Some(plan) = candidate.snapshot.account.as_ref().and_then(|account| {
+            account
+                .plan_type
+                .as_deref()
+                .and_then(|plan| safe_display_label(Some(plan)))
+        }) {
+            if let Some((_, binding_workspace_hash)) = candidate
+                .binding
+                .as_ref()
+                .or(candidate.slot.registered_binding.as_ref())
+            {
+                plan_by_workspace
+                    .entry(binding_workspace_hash.clone())
+                    .or_insert(plan);
+            }
+        }
+    }
+    let plan_for = |workspace_hash: Option<&str>| -> Option<String> {
+        plan_by_workspace.get(workspace_hash?).cloned()
+    };
 
     for candidate in candidates.iter().filter(|candidate| {
         candidate.slot.ownership == CodexAccountSlotOwnershipV1::Managed
@@ -1150,9 +1274,13 @@ fn derive_codex_account_target_coverage(
         upsert_codex_account_target(
             &mut by_target,
             codex_account_target_descriptor(
-                Some(account_hash.clone()),
-                Some(workspace_hash.clone()),
-                None,
+                CodexAccountTargetIdentity {
+                    account_identifier_hash: Some(account_hash.clone()),
+                    workspace_identifier_hash: Some(workspace_hash.clone()),
+                    workspace_label: None,
+                    account_label: account_label_for(Some(account_hash.as_str())),
+                    plan_type: plan_for(Some(workspace_hash.as_str())),
+                },
                 CodexAccountTargetDurabilityV1::Durable,
                 false,
                 Some(projected_codex_target_health(candidate.status.state)),
@@ -1164,20 +1292,30 @@ fn derive_codex_account_target_coverage(
     for candidate in candidates {
         let from_default_home = candidate.slot.ownership == CodexAccountSlotOwnershipV1::Default;
         for evidence in &candidate.workspace_targets {
+            let workspace_hash =
+                canonical_workspace_hash(evidence.workspace_identifier_hash.as_deref());
             let is_current = from_default_home
-                && candidate
-                    .binding
-                    .as_ref()
-                    .map_or(evidence.is_default, |(_, workspace_hash)| {
-                        evidence.workspace_identifier_hash.as_deref()
-                            == Some(workspace_hash.as_str())
-                    });
+                && candidate.binding.as_ref().map_or(
+                    evidence.is_default,
+                    |(_, binding_workspace_hash)| {
+                        workspace_hash.as_deref() == Some(binding_workspace_hash.as_str())
+                    },
+                );
             upsert_codex_account_target(
                 &mut by_target,
                 codex_account_target_descriptor(
-                    evidence.account_identifier_hash.clone(),
-                    evidence.workspace_identifier_hash.clone(),
-                    evidence.workspace_label.clone(),
+                    CodexAccountTargetIdentity {
+                        account_label: evidence.account_label.clone().or_else(|| {
+                            account_label_for(evidence.account_identifier_hash.as_deref())
+                        }),
+                        plan_type: evidence
+                            .plan_type
+                            .clone()
+                            .or_else(|| plan_for(workspace_hash.as_deref())),
+                        account_identifier_hash: evidence.account_identifier_hash.clone(),
+                        workspace_identifier_hash: workspace_hash,
+                        workspace_label: evidence.workspace_label.clone(),
+                    },
                     if is_current {
                         CodexAccountTargetDurabilityV1::Current
                     } else {
@@ -1199,9 +1337,13 @@ fn derive_codex_account_target_coverage(
             upsert_codex_account_target(
                 &mut by_target,
                 codex_account_target_descriptor(
-                    Some(account_hash.clone()),
-                    Some(workspace_hash.clone()),
-                    None,
+                    CodexAccountTargetIdentity {
+                        account_identifier_hash: Some(account_hash.clone()),
+                        workspace_identifier_hash: Some(workspace_hash.clone()),
+                        workspace_label: None,
+                        account_label: account_label_for(Some(account_hash.as_str())),
+                        plan_type: plan_for(Some(workspace_hash.as_str())),
+                    },
                     CodexAccountTargetDurabilityV1::Current,
                     true,
                     Some(projected_codex_target_health(default.status.state)),
@@ -1270,15 +1412,31 @@ fn derive_codex_account_target_coverage(
     }
 }
 
-fn codex_account_target_descriptor(
+/// How one Codex target names itself. `account_label` distinguishes two connected
+/// Codex identities and falls back to the generic string when the credential did
+/// not claim an email.
+struct CodexAccountTargetIdentity {
     account_identifier_hash: Option<String>,
     workspace_identifier_hash: Option<String>,
     workspace_label: Option<String>,
+    account_label: Option<String>,
+    plan_type: Option<String>,
+}
+
+fn codex_account_target_descriptor(
+    identity: CodexAccountTargetIdentity,
     durability: CodexAccountTargetDurabilityV1,
     is_current: bool,
     health: Option<CodexAccountTargetHealthV1>,
     observed_at: Option<String>,
 ) -> CodexAccountTargetDescriptorV1 {
+    let CodexAccountTargetIdentity {
+        account_identifier_hash,
+        workspace_identifier_hash,
+        workspace_label,
+        account_label,
+        plan_type,
+    } = identity;
     let target_id = codex_account_target_id(
         account_identifier_hash.as_deref(),
         workspace_identifier_hash.as_deref(),
@@ -1288,8 +1446,9 @@ fn codex_account_target_descriptor(
         target_id,
         account_identifier_hash,
         workspace_identifier_hash,
-        account_label: "Codex account".to_string(),
+        account_label: account_label.unwrap_or_else(|| CODEX_GENERIC_ACCOUNT_LABEL.to_string()),
         workspace_label,
+        subscription_product: plan_type.map(chatgpt_subscription_product),
         durability,
         is_current,
         connectable: false,
@@ -1340,6 +1499,15 @@ fn upsert_codex_account_target(
         .take()
         .or(incoming.workspace_identifier_hash);
     existing.workspace_label = existing.workspace_label.take().or(incoming.workspace_label);
+    if existing.account_label == CODEX_GENERIC_ACCOUNT_LABEL
+        && incoming.account_label != CODEX_GENERIC_ACCOUNT_LABEL
+    {
+        existing.account_label = incoming.account_label;
+    }
+    existing.subscription_product = existing
+        .subscription_product
+        .take()
+        .or(incoming.subscription_product);
     existing.observed_at = existing.observed_at.take().or(incoming.observed_at);
     match (existing.durability, incoming.durability) {
         (CodexAccountTargetDurabilityV1::Durable, _) => {}
@@ -8325,7 +8493,8 @@ fn codex_credit_balance_from_credits_snapshot(
 ) -> Option<AgentCreditBalance> {
     let remaining = json_u64(credits, &["balance", "remaining", "credits"]);
     let unlimited = json_bool(credits, &["unlimited"]);
-    let has_credits = json_bool(credits, &["hasCredits", "has_credits"]).unwrap_or(false);
+    let has_credits_claim = json_bool(credits, &["hasCredits", "has_credits"]);
+    let has_credits = has_credits_claim.unwrap_or(false);
     // `credits` sits beside `primary`/`secondary` on the rate-limit snapshot; the
     // sibling `spend_control_reached`, `rate_limit_reached_type`, and `limit_id`
     // fields (e.g. `limitId: "codex"`) live on that container. Mirror the OAuth
@@ -8339,6 +8508,14 @@ fn codex_credit_balance_from_credits_snapshot(
         && !has_credits
         && spend_control_reached != Some(true)
     {
+        return None;
+    }
+    if codex_credits_do_not_apply(
+        has_credits_claim,
+        unlimited,
+        remaining,
+        spend_control_reached,
+    ) {
         return None;
     }
     // A reached spend control means the account is spend-capped even if a nominal
@@ -8364,6 +8541,26 @@ fn codex_credit_balance_from_credits_snapshot(
         limit_id,
         ..Default::default()
     })
+}
+
+/// `hasCredits: false` is the provider stating that the credits program does not
+/// apply to this account, not that the balance ran out. A nominal `balance: "0"`
+/// rides along with that claim, so mapping it through the balance rules invents a
+/// red "0 left / exhausted" meter for a concept the account does not have. Suppress
+/// the row only when the provider explicitly disowns credits and nothing positive
+/// is being reported: an absent claim keeps the old behaviour, an `unlimited` grant
+/// or a reached spend control still has something true to say, and a positive
+/// balance is never hidden even when the two signals disagree.
+fn codex_credits_do_not_apply(
+    has_credits_claim: Option<bool>,
+    unlimited: Option<bool>,
+    remaining: Option<u64>,
+    spend_control_reached: Option<bool>,
+) -> bool {
+    has_credits_claim == Some(false)
+        && unlimited != Some(true)
+        && spend_control_reached != Some(true)
+        && remaining.unwrap_or(0) == 0
 }
 
 fn codex_credit_balance_status(
@@ -8573,7 +8770,8 @@ fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
     };
     let remaining = json_u64(credits, &["balance", "remaining", "credits"]);
     let unlimited = json_bool(credits, &["unlimited"]);
-    let has_credits = json_bool(credits, &["has_credits", "hasCredits"]).unwrap_or(false);
+    let has_credits_claim = json_bool(credits, &["has_credits", "hasCredits"]);
+    let has_credits = has_credits_claim.unwrap_or(false);
     let spend_control_reached =
         json_bool(container, &["spend_control_reached", "spendControlReached"]);
     let rate_limit_reached_type = first_json_string(
@@ -8581,10 +8779,16 @@ fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
         &["rate_limit_reached_type", "rateLimitReachedType"],
     );
     let limit_id = first_json_string(container, &["limit_id", "limitId"]);
-    if remaining.is_none()
+    if (remaining.is_none()
         && unlimited.is_none()
         && !has_credits
-        && spend_control_reached != Some(true)
+        && spend_control_reached != Some(true))
+        || codex_credits_do_not_apply(
+            has_credits_claim,
+            unlimited,
+            remaining,
+            spend_control_reached,
+        )
     {
         if let Some(monthly) = codex_monthly_credit_limit_from_snapshot(container) {
             balances.push(monthly);
@@ -8640,6 +8844,10 @@ fn codex_workspace_target_evidence_from_id_token(
         .or_else(|| first_json_string(&claims, &["sub"]))
         .as_deref()
         .and_then(|value| billing_identity_hash("openai", "account", value));
+    let account_label = safe_display_label(first_json_string(&claims, &["email"]).as_deref());
+    let claimed_plan_type = safe_display_label(
+        first_json_string(auth_claim, &["chatgpt_plan_type", "plan_type"]).as_deref(),
+    );
     Some(
         codex_organizations(auth_claim)
             .into_iter()
@@ -8650,6 +8858,17 @@ fn codex_workspace_target_evidence_from_id_token(
                     .as_deref()
                     .and_then(|value| billing_identity_hash("openai", "workspace", value)),
                 workspace_label: safe_display_label(organization.label.as_deref()),
+                account_label: account_label.clone(),
+                plan_type: organization
+                    .plan_type
+                    .clone()
+                    .and_then(|plan| safe_display_label(Some(plan.as_str())))
+                    .or_else(|| {
+                        organization
+                            .is_default
+                            .then(|| claimed_plan_type.clone())
+                            .flatten()
+                    }),
                 is_default: organization.is_default,
                 observed_at: observed_at.to_string(),
             })
@@ -12809,6 +13028,306 @@ for line in sys.stdin:
         );
     }
 
+    /// The shipped fixture gave `chatgpt_account_id` and the default organization
+    /// the SAME raw id, which is the one case where the two identifier spaces
+    /// coincide. Real provider tokens never do that, so every coverage test passed
+    /// while the live current login rendered twice. This token keeps them distinct.
+    fn codex_split_identity_token(chatgpt_account_id: &str, organizations: Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "email": "private.person@example.test",
+                "sub": "raw-account-123",
+                "https://api.openai.com/auth": {
+                    "chatgpt_user_id": "raw-account-123",
+                    "chatgpt_account_id": chatgpt_account_id,
+                    "chatgpt_plan_type": "pro",
+                    "organizations": organizations
+                }
+            })
+            .to_string(),
+        );
+        format!("{header}.{payload}.raw-secret-signature")
+    }
+
+    #[test]
+    fn codex_plan_type_names_the_signed_in_workspace_and_is_not_guessed_for_the_others() {
+        // `chatgpt_plan_type` describes the workspace the credential is signed
+        // into. Spreading it across the account's other workspaces would state a
+        // plan the provider never claimed for them.
+        let token = codex_split_identity_token(
+            "raw-workspace-binding",
+            serde_json::json!([
+                {"id": "raw-org-singular", "title": "Singular", "is_default": true},
+                {"id": "raw-org-deprecated", "title": "Singular Deprecated", "is_default": false}
+            ]),
+        );
+        let evidence =
+            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
+        let account_hash =
+            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
+        let binding_workspace_hash =
+            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
+                .expect("workspace hash");
+        let mut candidate = codex_candidate_for_test(
+            "codex_slot_durable",
+            CodexAccountSlotOwnershipV1::Managed,
+            &account_hash,
+            &binding_workspace_hash,
+            5,
+        );
+        candidate.workspace_targets = evidence;
+
+        let coverage =
+            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
+
+        let connected = coverage
+            .targets
+            .iter()
+            .find(|target| target.workspace_label.as_deref() == Some("Singular"))
+            .expect("connected workspace");
+        assert_eq!(
+            connected.subscription_product.as_deref(),
+            Some("chatgpt_pro")
+        );
+        let observed = coverage
+            .targets
+            .iter()
+            .find(|target| target.workspace_label.as_deref() == Some("Singular Deprecated"))
+            .expect("observed workspace");
+        assert_eq!(
+            observed.subscription_product, None,
+            "an unconnected workspace has no claimed plan of its own"
+        );
+    }
+
+    #[test]
+    fn codex_target_plan_type_comes_from_the_organization_when_the_token_claims_one() {
+        // A membership that names its own plan keeps it, rather than inheriting
+        // the credential's account-level plan.
+        let token = codex_split_identity_token(
+            "raw-workspace-binding",
+            serde_json::json!([
+                {"id": "raw-org-singular", "title": "Singular", "is_default": true},
+                {"id": "raw-org-team", "title": "Team", "is_default": false, "plan_type": "business"}
+            ]),
+        );
+        let evidence =
+            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
+        let account_hash =
+            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
+        let binding_workspace_hash =
+            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
+                .expect("workspace hash");
+        let mut candidate = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            &account_hash,
+            &binding_workspace_hash,
+            5,
+        );
+        candidate.workspace_targets = evidence;
+
+        let coverage =
+            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
+        let team = coverage
+            .targets
+            .iter()
+            .find(|target| target.workspace_label.as_deref() == Some("Team"))
+            .expect("team workspace");
+        assert_eq!(
+            team.subscription_product.as_deref(),
+            Some("chatgpt_business")
+        );
+    }
+
+    #[test]
+    fn codex_current_login_is_one_target_when_binding_and_default_org_ids_differ() {
+        // Live shape: the credential is bound by `chatgpt_account_id`, and its only
+        // organization is the default one, named "Personal", carrying a different id.
+        let token = codex_split_identity_token(
+            "raw-workspace-binding",
+            serde_json::json!([
+                {"id": "raw-org-personal", "title": "Personal", "is_default": true}
+            ]),
+        );
+        let evidence =
+            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
+        let account_hash =
+            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
+        let binding_workspace_hash =
+            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
+                .expect("workspace hash");
+        let mut candidate = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            &account_hash,
+            &binding_workspace_hash,
+            5,
+        );
+        candidate.workspace_targets = evidence;
+
+        let coverage =
+            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
+
+        // One workspace, so one row. Before the alias the binding and the default
+        // organization produced two, and the duplicate offered to connect a
+        // subscription that was already the current login.
+        assert_eq!(coverage.targets.len(), 1);
+        assert_eq!(coverage.current_targets, 1);
+        let target = &coverage.targets[0];
+        assert!(target.is_current);
+        assert_eq!(target.durability, CodexAccountTargetDurabilityV1::Current);
+        assert_eq!(target.workspace_label.as_deref(), Some("Personal"));
+        assert_eq!(
+            target.workspace_identifier_hash.as_deref(),
+            Some(binding_workspace_hash.as_str()),
+            "the binding identity stays canonical so persisted slots keep resolving"
+        );
+        assert_eq!(target.subscription_product.as_deref(), Some("chatgpt_pro"));
+    }
+
+    #[test]
+    fn codex_durable_slot_absorbs_its_default_org_and_keeps_the_others_connectable() {
+        // Live shape for the managed slot: signed into "Singular" (the default org)
+        // while the token also lists two workspaces it could switch into.
+        let token = codex_split_identity_token(
+            "raw-workspace-binding",
+            serde_json::json!([
+                {"id": "raw-org-singular", "title": "Singular", "is_default": true},
+                {"id": "raw-org-deprecated", "title": "Singular Deprecated", "is_default": false},
+                {"id": "raw-org-personal", "title": "Personal", "is_default": false}
+            ]),
+        );
+        let evidence =
+            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
+        let account_hash =
+            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
+        let binding_workspace_hash =
+            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
+                .expect("workspace hash");
+        let mut durable = codex_candidate_for_test(
+            "codex_slot_durable",
+            CodexAccountSlotOwnershipV1::Managed,
+            &account_hash,
+            &binding_workspace_hash,
+            5,
+        );
+        durable.workspace_targets = evidence;
+
+        let coverage =
+            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[durable]);
+
+        assert_eq!(coverage.targets.len(), 3, "three workspaces, not four rows");
+        let connected = coverage
+            .targets
+            .iter()
+            .find(|target| target.durability == CodexAccountTargetDurabilityV1::Durable)
+            .expect("durable target");
+        assert_eq!(
+            connected.workspace_label.as_deref(),
+            Some("Singular"),
+            "the durable row names the workspace it is signed into"
+        );
+        assert!(
+            !connected.connectable,
+            "an already durable workspace must not offer to keep limits available again"
+        );
+        for label in ["Singular Deprecated", "Personal"] {
+            let observed = coverage
+                .targets
+                .iter()
+                .find(|target| target.workspace_label.as_deref() == Some(label))
+                .expect("observed workspace target");
+            assert_eq!(
+                observed.durability,
+                CodexAccountTargetDurabilityV1::ObservedOnly
+            );
+            assert!(observed.connectable);
+        }
+    }
+
+    #[test]
+    fn codex_targets_name_the_account_from_the_id_token_email() {
+        let token = codex_split_identity_token(
+            "raw-workspace-binding",
+            serde_json::json!([
+                {"id": "raw-org-personal", "title": "Personal", "is_default": true},
+                {"id": "raw-org-other", "title": "Other", "is_default": false}
+            ]),
+        );
+        let evidence =
+            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
+        let account_hash =
+            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
+        let binding_workspace_hash =
+            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
+                .expect("workspace hash");
+        let mut candidate = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            &account_hash,
+            &binding_workspace_hash,
+            5,
+        );
+        candidate.workspace_targets = evidence;
+
+        let coverage =
+            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
+
+        assert!(
+            coverage
+                .targets
+                .iter()
+                .all(|target| target.account_label == "private.person@example.test"),
+            "every row of one account names that account, including the bound one"
+        );
+    }
+
+    #[test]
+    fn codex_target_account_label_falls_back_when_the_token_claims_no_email() {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "sub": "raw-account-123",
+                "https://api.openai.com/auth": {
+                    "chatgpt_user_id": "raw-account-123",
+                    "chatgpt_account_id": "raw-workspace-binding",
+                    "organizations": [
+                        {"id": "raw-org-personal", "title": "Personal", "is_default": true}
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        let token = format!("{header}.{payload}.raw-secret-signature");
+        let evidence =
+            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
+        let account_hash =
+            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
+        let binding_workspace_hash =
+            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
+                .expect("workspace hash");
+        let mut candidate = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            &account_hash,
+            &binding_workspace_hash,
+            5,
+        );
+        candidate.workspace_targets = evidence;
+
+        let coverage =
+            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
+        assert_eq!(coverage.targets[0].account_label, "Codex account");
+    }
+
     #[test]
     fn codex_workspace_target_coverage_collapses_durable_current_composite() {
         let token = codex_workspace_target_token(serde_json::json!([
@@ -12916,11 +13435,12 @@ for line in sys.stdin:
         let wire = serde_json::to_string(&status).expect("serialize Codex account status");
         assert!(wire.contains("Personal"));
         assert!(wire.contains("Singular"));
+        // Raw provider identifiers and credential material never appear, whatever
+        // else the payload carries.
         for forbidden in [
             "raw-account-123",
             "raw-workspace-default",
             "raw-workspace-singular",
-            "private.person@example.test",
             "raw-secret-signature",
         ] {
             assert!(
@@ -12928,6 +13448,24 @@ for line in sys.stdin:
                 "serialized raw identity: {forbidden}"
             );
         }
+        // The signed-in email is the one exception, and only as the human-readable
+        // account name: two connected Codex accounts are otherwise indistinguishable
+        // on screen. This status answers `codex_accounts_status` over the local Unix
+        // socket and is never uploaded, so the name stays on this Mac. If that ever
+        // stops being true, this assertion is the thing that has to be revisited
+        // first.
+        let named = status
+            .target_coverage
+            .targets
+            .iter()
+            .filter(|target| target.account_label == "private.person@example.test")
+            .count();
+        assert_eq!(named, status.target_coverage.targets.len());
+        assert_eq!(
+            wire.matches("private.person@example.test").count(),
+            named,
+            "the email appears as the account name and nowhere else"
+        );
     }
 
     #[test]
@@ -13832,13 +14370,61 @@ for line in sys.stdin:
         assert_eq!(windows[0].used_percent, Some(30));
         assert_eq!(windows[0].left_percent, Some(70));
 
+        // `has_credits: false` says the credits program does not apply to this
+        // account; the `balance: "0"` beside it is filler, not a spent balance. This
+        // test used to assert a single Exhausted row, which is how a red
+        // "credits - 0 left - exhausted" meter reached the UI for an account that
+        // has no credits at all. Nothing true can be said here, so say nothing.
+        assert!(credits.is_empty());
+    }
+
+    #[test]
+    fn codex_usage_parser_keeps_exhausted_credits_when_the_account_has_a_credits_program() {
+        // Same zero balance, opposite meaning: the provider claims the program
+        // applies, so zero really is spent and the row has to stay.
+        let json = serde_json::json!({
+            "limit_id": "codex",
+            "primary": {"used_percent": 30.0, "window_minutes": 10080, "resets_at": 1784963503_u64},
+            "credits": {"has_credits": true, "unlimited": false, "balance": "0"}
+        });
+
+        let credits = codex_usage_credit_balances(&json);
+
         assert_eq!(credits.len(), 1);
-        assert_eq!(credits[0].remaining, Some(0));
         assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
+        assert_eq!(credits[0].remaining, Some(0));
         assert_eq!(credits[0].limit_id.as_deref(), Some("codex"));
-        // Explicit JSON nulls stay absent rather than becoming Some(false)/Some("").
-        assert_eq!(credits[0].spend_control_reached, None);
-        assert_eq!(credits[0].rate_limit_reached_type, None);
+    }
+
+    #[test]
+    fn codex_usage_parser_keeps_disowned_credits_that_still_say_something_true() {
+        // `has_credits: false` never hides a positive balance, an unlimited grant,
+        // or a reached spend control - suppression is only for the empty case.
+        for credits_value in [
+            serde_json::json!({"has_credits": false, "unlimited": true, "balance": "0"}),
+            serde_json::json!({"has_credits": false, "unlimited": false, "balance": "12"}),
+        ] {
+            let json = serde_json::json!({
+                "limit_id": "codex",
+                "primary": {"used_percent": 1.0, "window_minutes": 10080},
+                "credits": credits_value.clone()
+            });
+            assert_eq!(
+                codex_usage_credit_balances(&json).len(),
+                1,
+                "kept for {credits_value}"
+            );
+        }
+
+        let spend_capped = serde_json::json!({
+            "limit_id": "codex",
+            "primary": {"used_percent": 1.0, "window_minutes": 10080},
+            "spend_control_reached": true,
+            "credits": {"has_credits": false, "unlimited": false, "balance": "0"}
+        });
+        let credits = codex_usage_credit_balances(&spend_capped);
+        assert_eq!(credits.len(), 1);
+        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
     }
 
     #[test]

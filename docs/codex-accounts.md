@@ -21,6 +21,33 @@ setup blockers. A membership without both hashes remains visible as
 Clients pass the opaque id back through `codex_account_prepare_target` and do
 not send identity hashes selected or reconstructed from UI state.
 
+One workspace is named two ways by the provider: a credential is bound by
+`chatgpt_account_id`, which is what a durable slot registers, while the same
+credential's ID token lists `organizations[].id`. Those are different identifier
+spaces, so the organization flagged `is_default` - the one the credential is
+actually signed into - is aliased onto the binding identity before targets are
+assembled. Without that alias the current login and every durable connection
+appear twice, and the duplicate offers to connect a subscription that is already
+connected. Aliases are collected across all candidates, so a workspace seen as
+non-default on one credential still collapses onto the slot that connected it.
+
+`account_label` carries the signed-in email from the ID token, and
+`subscription_product` the plan the provider claims, in the same `chatgpt_pro`
+vocabulary the rest of the status uses, so two connected Codex accounts are
+distinguishable on screen. A plan is attached only where it is actually claimed:
+`chatgpt_plan_type` describes the workspace its credential is signed into, and
+an organization that names its own plan keeps that one. A workspace merely
+observed in the token has no plan of its own and is left blank rather than
+inheriting a sibling's. It is the only raw provider string
+in this payload: `codex_accounts_status` answers the local Unix socket only and
+is never uploaded, and raw account ids, workspace ids, and token material stay
+absent. Credentials that claim no email fall back to a generic label.
+
+`hasCredits: false` states that the credits program does not apply to an
+account, not that a balance ran out. The `balance: "0"` the provider sends
+alongside it is filler, so no credit row is emitted for that case; a positive
+balance, an `unlimited` grant, and a reached spend control are all still shown.
+
 ## Connecting another subscription
 
 Authenticated local control creates one opaque, owner-only Codex home and
