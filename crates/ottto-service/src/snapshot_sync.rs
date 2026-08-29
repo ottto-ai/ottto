@@ -3936,6 +3936,84 @@ mod tests {
     }
 
     #[test]
+    fn collision_suppressed_codex_rollout_is_not_upload_reachable() {
+        let root = test_dir("collision-suppressed-codex-upload");
+        let codex_dir = root.join(".codex");
+        let sessions_dir = codex_dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("create collision upload fixture");
+        let session_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let alias = session_id.to_ascii_uppercase();
+        let database = rusqlite::Connection::open(codex_dir.join("state_5.sqlite"))
+            .expect("open collision upload state");
+        database
+            .execute_batch(
+                "CREATE TABLE threads (\
+                    id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                    thread_source TEXT, first_user_message TEXT\
+                );",
+            )
+            .expect("create collision upload table");
+        for (id, title) in [(session_id, "Lower"), (alias.as_str(), "Upper")] {
+            database
+                .execute(
+                    "INSERT INTO threads VALUES (?1, ?2, 1, 'agent_created_thread', NULL)",
+                    rusqlite::params![id, title],
+                )
+                .expect("insert collision upload row");
+        }
+        drop(database);
+        std::fs::write(
+            sessions_dir.join(format!("rollout-{session_id}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-08-29T12:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"session_id\":\"{session_id}\",\"history_mode\":\"paginated\",\"history_base\":{{\"cursor\":\"file-controlled\"}}}}}}\n\
+                 {{\"timestamp\":\"2026-08-29T12:00:01Z\",\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"collision-turn\",\"model\":\"gpt-5.6-sol\"}}}}\n\
+                 {{\"timestamp\":\"2026-08-29T12:00:02Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":30,\"cached_input_tokens\":8,\"output_tokens\":12,\"reasoning_output_tokens\":1}},\"last_token_usage\":{{\"input_tokens\":30,\"cached_input_tokens\":8,\"output_tokens\":12,\"reasoning_output_tokens\":1}},\"model\":\"gpt-5.6-sol\"}}}}}}\n"
+            ),
+        )
+        .expect("write collision upload rollout");
+
+        let mut index = ScanIndex::default();
+        let scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions_dir),
+            &mut index,
+            "2026-08-29T12:30:00Z",
+            183,
+            10,
+            true,
+        )
+        .expect("scan collision upload fixture");
+        assert_eq!(scan.discovered_file_count, 1);
+        assert_eq!(scan.scanned_file_count, 1);
+        assert_eq!(scan.scanned_session_count, 0);
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.recognized_usage_drop_count, 1);
+        assert_eq!(scan.ownership_incomplete_file_count, 1);
+        assert_eq!(scan.dropped_usage_record_count, 1);
+
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let mut upload_calls = 0;
+        let result = upload_resumable_batches(
+            &scan.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |snapshot| snapshot.snapshot_fingerprint.as_str(),
+            |batch| {
+                upload_calls += 1;
+                Ok(accepted_batch(batch.len()))
+            },
+            |_| Ok(()),
+        )
+        .expect("empty suppressed workset settles without upload");
+        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!(upload_calls, 0);
+        assert_eq!(accepted, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     #[serial]
     fn claude_refresh_hook_coalesces_and_raii_releases() {
         reset_claude_refresh_activity();

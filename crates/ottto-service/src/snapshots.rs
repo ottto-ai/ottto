@@ -5816,10 +5816,23 @@ struct CodexTitleMetadata {
     state_created_threads: BTreeSet<String>,
     spawn_parents: BTreeMap<String, String>,
     spawn_parent_conflicts: BTreeSet<String>,
+    /// Resolved identity keys for which distinct raw sidecar ids collapsed to
+    /// the same UUID key. These scoped conflicts block only their own rollout;
+    /// trusted classification for unrelated keys remains usable.
+    identity_conflicts: BTreeSet<String>,
     /// True only when an existing state DB could not be read completely. A
     /// missing DB means there is no state-only source and is complete-empty.
     state_census_incomplete: bool,
     sidecar_census_incomplete: bool,
+    /// An unreadable or structurally incomplete detail source has no
+    /// trustworthy key scope. It blocks already-classified created identities;
+    /// the separate classification flag below determines source-wide scope.
+    state_census_unscoped_incomplete: bool,
+    sidecar_census_unscoped_incomplete: bool,
+    /// The created-thread classification query itself failed before it could
+    /// identify a trustworthy key scope. Any rollout could be an omitted
+    /// created row, so this one failure class blocks every Codex candidate.
+    created_thread_census_unscoped_incomplete: bool,
     legacy_sidecar_fingerprint: String,
     /// The old index retained only config file stats, not content or affected
     /// session ids. Presence therefore requires one conservative corrective
@@ -6561,6 +6574,9 @@ struct SnapshotAccumulator {
     // Trusted state-row created-thread classification bound to this opened
     // rollout by its provider session id. Generic spawn edges cannot set it.
     codex_sidecar_created_thread: bool,
+    // The rollout-path identity is collision-ambiguous, or a required census
+    // failed without a key scope. It must never enter a generic ownership arm.
+    codex_sidecar_identity_ambiguous: bool,
     // Trusted, content-free child -> parent edge loaded from Codex's local
     // state DB before the rollout is parsed. It is lineage evidence for the
     // native witness, distinct from the classification bit above.
@@ -6730,6 +6746,7 @@ impl SnapshotAccumulator {
             codex_legacy_bootstrap_valid: true,
             codex_parent_ownership_ledgers: None,
             codex_sidecar_created_thread: false,
+            codex_sidecar_identity_ambiguous: false,
             codex_sidecar_parent: None,
             codex_sidecar_child_created_at_nanos: None,
             codex_sidecar_projected_next_ordinal: None,
@@ -6813,18 +6830,34 @@ impl SnapshotAccumulator {
         file_metadata: &fs::Metadata,
         metadata: &CodexTitleMetadata,
     ) {
-        if metadata.state_census_incomplete || metadata.sidecar_census_incomplete {
-            return;
-        }
         let Some(child) = codex_session_id_from_path(path) else {
+            // A provider rollout whose identity cannot be resolved while the
+            // trusted state contains created-thread suspects cannot safely be
+            // treated as an ordinary file.
+            self.codex_sidecar_identity_ambiguous = !metadata.state_created_threads.is_empty()
+                || metadata.created_thread_census_unscoped_incomplete;
             return;
         };
+        // Retain a successfully loaded classification even when an optional
+        // title/detail/projection census is unhealthy. Those incomplete facts
+        // make a created candidate ambiguous, but they do not reclassify an
+        // unrelated ordinary rollout. Only failure of the classification
+        // query itself has genuinely source-wide scope.
+        self.codex_sidecar_created_thread = metadata.state_created_threads.contains(child.as_str());
+        self.codex_sidecar_identity_ambiguous =
+            metadata.identity_conflicts.contains(child.as_str())
+                || metadata.created_thread_census_unscoped_incomplete
+                || (self.codex_sidecar_created_thread
+                    && (metadata.state_census_unscoped_incomplete
+                        || metadata.sidecar_census_unscoped_incomplete));
+        if self.codex_sidecar_identity_ambiguous {
+            return;
+        }
         // Bind the state-row declaration before validating the optional
         // lineage/file cross-checks. A state-declared created thread whose
         // sidecar conflicts with the opened rollout is still a created thread
         // for admission purposes and must fail closed, never fall through to
         // an ordinary ownership branch.
-        self.codex_sidecar_created_thread = metadata.state_created_threads.contains(child.as_str());
         let thread = metadata.state_threads.get(child.as_str());
         let rollout_extent = metadata.rollout_extents.get(child.as_str()).copied();
         if !codex_sidecar_rollout_file_matches(path, file_metadata, thread, rollout_extent) {
@@ -6863,7 +6896,7 @@ impl SnapshotAccumulator {
         let state_declares_created_thread = self.codex_sidecar_created_thread;
         let is_created_thread = rollout_declares_created_thread || state_declares_created_thread;
         let forked_from_id =
-            canonical_codex_session_id_option(string_at(meta, &["forked_from_id"]));
+            resolve_codex_identity_option(codex_identity_at(meta, &["forked_from_id"]));
         self.codex_parent_session_ref = forked_from_id.clone();
         let has_history_base = meta.get("history_base").is_some_and(|base| !base.is_null());
         let exact_start = u64_at(meta, &["subagent_history_start_ordinal"]);
@@ -6872,14 +6905,22 @@ impl SnapshotAccumulator {
             || has_history_base
             || exact_start.is_some();
 
+        if self.codex_sidecar_identity_ambiguous {
+            self.codex_is_fork = true;
+            self.codex_created_thread_native_only = true;
+            self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+            return;
+        }
+
         if is_created_thread {
             // Every provider-created thread has exactly one admission path:
             // the complete native creation witness below. In particular,
             // file-controlled pagination markers and the legacy parent-prefix
             // state machine can never authorize this shape.
             self.codex_created_thread_native_only = true;
-            let source_session_id = canonical_codex_session_id_option(
-                string_at(meta, &["id"]).or_else(|| string_at(meta, &["session_id"])),
+            let source_session_id = resolve_codex_identity_option(
+                codex_identity_at(meta, &["id"])
+                    .or_else(|| codex_identity_at(meta, &["session_id"])),
             );
             let trusted_parent = self
                 .codex_sidecar_parent
@@ -7100,7 +7141,9 @@ impl SnapshotAccumulator {
                     .and_then(|value| u64::try_from(value.div_euclid(1_000_000_000)).ok());
                 let valid = string_eq_at(value, &["type"], "event_msg")
                     && string_eq_at(value, &["payload", "type"], "task_started")
-                    && turn_id.as_deref().is_some_and(is_uuid_like)
+                    && turn_id
+                        .as_deref()
+                        .is_some_and(codex_identity_is_uuid_shaped)
                     && trace_id.as_deref().is_some_and(|value| {
                         value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
                     })
@@ -7653,7 +7696,7 @@ impl SnapshotAccumulator {
         let Some(session_id) = session_id else {
             return;
         };
-        let session_id = canonical_codex_session_id(session_id.as_str());
+        let session_id = resolve_codex_identity(session_id.as_str());
         if let Some((parent, root, depth)) = metadata.family_position(session_id.as_str()) {
             self.origin.thread_source = Some("subagent".to_string());
             self.origin.source_subagent = Some(true);
@@ -7936,7 +7979,7 @@ impl SnapshotAccumulator {
             return Vec::new();
         };
         let source_session_id = if self.source == SnapshotSource::Codex {
-            canonical_codex_session_id(source_session_id.as_str())
+            resolve_codex_identity(source_session_id.as_str())
         } else {
             source_session_id
         };
@@ -8677,7 +8720,7 @@ fn validated_codex_parent_ownership_ledgers(
     let mut validated = BTreeMap::new();
     let mut conflicts = BTreeSet::new();
     for (session_id, ledger) in &index.codex_parent_ownership_ledgers {
-        let session_id = canonical_codex_session_id(session_id.as_str());
+        let session_id = resolve_codex_identity(session_id.as_str());
         if !ledger.scan_complete
             || ledger.signatures.is_empty()
             || ledger.opened_object_identity.is_empty()
@@ -8712,7 +8755,7 @@ fn current_codex_parent_opened_identity(
     frozen_census_paths: &BTreeSet<String>,
     session_id: &str,
 ) -> Option<String> {
-    let session_id = canonical_codex_session_id(session_id);
+    let session_id = resolve_codex_identity(session_id);
     let mut matching_paths = frozen_census_paths.iter().filter_map(|key| {
         let path = PathBuf::from(key);
         (codex_session_id_from_path(&path).as_deref() == Some(session_id.as_str())).then_some(path)
@@ -9235,7 +9278,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         codex_parent_resolution_retry_required |= parsed_file.codex_parent_resolution_pending;
         let parse_complete = parsed_file.complete();
         if let Some(parent_session_ref) = parsed_file.codex_parent_session_ref.as_ref() {
-            let parent_session_ref = canonical_codex_session_id(parent_session_ref.as_str());
+            let parent_session_ref = resolve_codex_identity(parent_session_ref.as_str());
             if index.codex_parent_ownership_refs.len() < MAX_CODEX_PARENT_LEDGER_REFS
                 || index
                     .codex_parent_ownership_refs
@@ -9245,7 +9288,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
             }
         }
         if let Some((session_id, ledger)) = parsed_file.codex_parent_ownership_ledger.as_ref() {
-            let session_id = canonical_codex_session_id(session_id.as_str());
+            let session_id = resolve_codex_identity(session_id.as_str());
             let ledger_is_unique_current_parent = ledger.scan_complete
                 && current_codex_parent_opened_identity(
                     &codex_parent_validation_roots,
@@ -9270,7 +9313,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
             }
         }
         if let Some(session_id) = parsed_file.state_only_blocked_session_id.as_ref() {
-            let session_id = canonical_codex_session_id(session_id.as_str());
+            let session_id = resolve_codex_identity(session_id.as_str());
             codex_state_only_blocked_session_ids.insert(session_id.clone());
             index
                 .codex_state_only_blocked_session_ids
@@ -9291,7 +9334,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
                     == Some("session_exclusive_reported_usage:v1")
                 {
                     index.codex_state_only_blocked_session_ids.remove(
-                        canonical_codex_session_id(snapshot.source_session_id.as_str()).as_str(),
+                        resolve_codex_identity(snapshot.source_session_id.as_str()).as_str(),
                     );
                 }
             }
@@ -9520,7 +9563,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
 }
 
 fn apply_codex_state_evidence(item: &mut SnapshotItem, metadata: &CodexTitleMetadata) {
-    let source_session_id = canonical_codex_session_id(item.source_session_id.as_str());
+    let source_session_id = resolve_codex_identity(item.source_session_id.as_str());
     let Some(thread) = metadata.state_threads.get(source_session_id.as_str()) else {
         return;
     };
@@ -9541,11 +9584,11 @@ fn append_codex_state_only_snapshots(
 ) -> (usize, usize) {
     let blocked_session_ids = blocked_session_ids
         .union(&index.codex_state_only_blocked_session_ids)
-        .map(|session_id| canonical_codex_session_id(session_id.as_str()))
+        .map(|session_id| resolve_codex_identity(session_id.as_str()))
         .collect::<BTreeSet<_>>();
     let covered_session_ids: BTreeSet<String> = snapshots
         .iter()
-        .map(|snapshot| canonical_codex_session_id(snapshot.source_session_id.as_str()))
+        .map(|snapshot| resolve_codex_identity(snapshot.source_session_id.as_str()))
         .collect();
     // Sessions whose rollout was parsed into a snapshot in a PRIOR scan run.
     // The incremental scan skips unchanged rollout files, so they are absent
@@ -11073,10 +11116,10 @@ fn codex_native_created_thread_header(
     sidecar_created_at_nanos: Option<i128>,
 ) -> Option<i128> {
     let meta = codex_session_meta_payload(value)?;
-    let expected_session_id = canonical_codex_session_id(expected_session_id?);
+    let expected_session_id = resolve_codex_identity(expected_session_id?);
     let sidecar_created_at_nanos = sidecar_created_at_nanos?;
-    let id = canonical_codex_session_id(string_at(meta, &["id"])?.as_str());
-    let session_id = canonical_codex_session_id(string_at(meta, &["session_id"])?.as_str());
+    let id = resolve_codex_identity(codex_identity_at(meta, &["id"])?.as_str());
+    let session_id = resolve_codex_identity(codex_identity_at(meta, &["session_id"])?.as_str());
     if !string_eq_at(value, &["type"], "session_meta")
         || u64_at(value, &["ordinal"]) != Some(0)
         || string_at(meta, &["thread_source"]).as_deref() != Some("agent_created_thread")
@@ -11215,8 +11258,8 @@ fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulato
     if accumulator.codex_session_meta_seen {
         return;
     }
-    accumulator.source_session_id = canonical_codex_session_id_option(
-        string_at(meta, &["id"]).or_else(|| string_at(meta, &["session_id"])),
+    accumulator.source_session_id = resolve_codex_identity_option(
+        codex_identity_at(meta, &["id"]).or_else(|| codex_identity_at(meta, &["session_id"])),
     )
     .or_else(|| accumulator.source_session_id.clone());
     accumulator.origin.thread_source = string_at(meta, &["thread_source"]);
@@ -11225,9 +11268,9 @@ fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulato
             accumulator.origin.source = Some(text.to_string());
         } else if src.is_object() {
             accumulator.origin.source_subagent = Some(src.get("subagent").is_some());
-            accumulator.origin.parent_session_ref = canonical_codex_session_id_option(
-                string_at(src, &["subagent", "thread_spawn", "parent_thread_id"])
-                    .or_else(|| string_at(meta, &["parent_thread_id"])),
+            accumulator.origin.parent_session_ref = resolve_codex_identity_option(
+                codex_identity_at(src, &["subagent", "thread_spawn", "parent_thread_id"])
+                    .or_else(|| codex_identity_at(meta, &["parent_thread_id"])),
             );
             accumulator.codex_agent_label =
                 string_at(src, &["subagent", "thread_spawn", "agent_path"])
@@ -11259,11 +11302,11 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
 
 fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     if accumulator.source_session_id.is_none() {
-        accumulator.source_session_id = canonical_codex_session_id_option(
-            string_at(value, &["session_meta", "payload", "id"])
-                .or_else(|| string_at(value, &["payload", "id"]))
-                .or_else(|| string_at(value, &["session_id"]))
-                .or_else(|| string_at(value, &["sessionId"])),
+        accumulator.source_session_id = resolve_codex_identity_option(
+            codex_identity_at(value, &["session_meta", "payload", "id"])
+                .or_else(|| codex_identity_at(value, &["payload", "id"]))
+                .or_else(|| codex_identity_at(value, &["session_id"]))
+                .or_else(|| codex_identity_at(value, &["sessionId"])),
         );
     }
     // Raw session-origin (siblings of `id` in session_meta.payload). The
@@ -11283,8 +11326,8 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             } else if src.is_object() {
                 // Codex subagent form: source = { "subagent": { "thread_spawn": .. } }.
                 accumulator.origin.source_subagent = Some(src.get("subagent").is_some());
-                accumulator.origin.parent_session_ref = canonical_codex_session_id_option(
-                    string_at(src, &["subagent", "thread_spawn", "parent_thread_id"]),
+                accumulator.origin.parent_session_ref = resolve_codex_identity_option(
+                    codex_identity_at(src, &["subagent", "thread_spawn", "parent_thread_id"]),
                 );
             }
         }
@@ -13129,7 +13172,7 @@ impl BoundedCandidateSelection {
 
 impl CodexTitleMetadata {
     fn family_position(&self, child: &str) -> Option<(String, String, u64)> {
-        let child = canonical_codex_session_id(child);
+        let child = resolve_codex_identity(child);
         if self.spawn_parent_conflicts.contains(child.as_str()) {
             return None;
         }
@@ -13151,7 +13194,7 @@ impl CodexTitleMetadata {
     }
 
     fn session_sidecar_fingerprint(&self, source_session_id: &str) -> String {
-        let source_session_id = canonical_codex_session_id(source_session_id);
+        let source_session_id = resolve_codex_identity(source_session_id);
         let title = self.titles.get(source_session_id.as_str());
         let thread = self.state_threads.get(source_session_id.as_str());
         let extent = self.rollout_extents.get(source_session_id.as_str());
@@ -13241,29 +13284,72 @@ impl CodexTitleMetadata {
 
             let state_path = codex_dir.join("state_5.sqlite");
             legacy_sidecar_parts.push(sidecar_stat_fingerprint(&state_path));
-            let title_census = load_codex_sqlite_titles(&state_path, &mut metadata.titles);
-            let state_census =
-                load_codex_sqlite_state_threads(&state_path, &mut metadata.state_threads);
+            let state_conflicts_before = metadata.identity_conflicts.len();
+            let title_census = load_codex_sqlite_titles(
+                &state_path,
+                &mut metadata.titles,
+                &mut metadata.identity_conflicts,
+            );
+            let state_census = load_codex_sqlite_state_threads(
+                &state_path,
+                &mut metadata.state_threads,
+                &mut metadata.identity_conflicts,
+            );
             let spawn_census = load_codex_sqlite_spawn_edges(
                 &state_path,
                 &mut metadata.state_created_threads,
                 &mut metadata.spawn_parents,
                 &mut metadata.spawn_parent_conflicts,
+                &mut metadata.identity_conflicts,
             );
-            if title_census.is_err() || state_census.is_err() || spawn_census.is_err() {
+            let title_census_incomplete = title_census.is_err();
+            let state_census_incomplete = state_census.is_err();
+            let spawn_census_incomplete = spawn_census.is_err();
+            if title_census_incomplete || state_census_incomplete || spawn_census_incomplete {
+                metadata.state_census_incomplete = true;
+                metadata.sidecar_census_incomplete = true;
+                metadata.state_census_unscoped_incomplete = true;
+                metadata.sidecar_census_unscoped_incomplete = true;
+            }
+            if spawn_census_incomplete {
+                metadata.created_thread_census_unscoped_incomplete = true;
+            }
+            if metadata.identity_conflicts.len() != state_conflicts_before {
                 metadata.state_census_incomplete = true;
                 metadata.sidecar_census_incomplete = true;
             }
 
             let history_path = codex_dir.join("thread_history_1.sqlite");
             legacy_sidecar_parts.push(sidecar_stat_fingerprint(&history_path));
-            if load_codex_rollout_extents(&history_path, &mut metadata.rollout_extents).is_err() {
+            let history_conflicts_before = metadata.identity_conflicts.len();
+            if load_codex_rollout_extents(
+                &history_path,
+                &mut metadata.rollout_extents,
+                &mut metadata.identity_conflicts,
+            )
+            .is_err()
+            {
+                metadata.sidecar_census_incomplete = true;
+                metadata.sidecar_census_unscoped_incomplete = true;
+            }
+            if metadata.identity_conflicts.len() != history_conflicts_before {
                 metadata.sidecar_census_incomplete = true;
             }
 
             let index_path = codex_dir.join("session_index.jsonl");
             legacy_sidecar_parts.push(sidecar_stat_fingerprint(&index_path));
-            if load_codex_session_index_titles(&index_path, &mut metadata.titles).is_err() {
+            let index_conflicts_before = metadata.identity_conflicts.len();
+            if load_codex_session_index_titles(
+                &index_path,
+                &mut metadata.titles,
+                &mut metadata.identity_conflicts,
+            )
+            .is_err()
+            {
+                metadata.sidecar_census_incomplete = true;
+                metadata.sidecar_census_unscoped_incomplete = true;
+            }
+            if metadata.identity_conflicts.len() != index_conflicts_before {
                 metadata.sidecar_census_incomplete = true;
             }
         }
@@ -13416,6 +13502,7 @@ fn codex_logs2_span_field(prefix: &str, key: &str) -> Option<String> {
 fn load_codex_session_index_titles(
     path: &Path,
     titles: &mut BTreeMap<String, CodexTitleCandidate>,
+    identity_conflicts: &mut BTreeSet<String>,
 ) -> Result<()> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -13426,14 +13513,16 @@ fn load_codex_session_index_titles(
     let mut raw_ids_by_key = BTreeMap::new();
     let mut invalid_shape = false;
     let report = read_bounded_jsonl_lines(BufReader::new(file), MAX_JSONL_LINE_BYTES, |value| {
-        let Some(id) = string_at(value, &["id"]) else {
+        let Some(id) = codex_identity_at(value, &["id"]) else {
             invalid_shape = true;
             return;
         };
-        let Ok(id) = canonical_codex_identity_key(&mut raw_ids_by_key, id.as_str()) else {
-            invalid_shape = true;
+        let id = record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, id.as_str());
+        if identity_conflicts.contains(id.as_str()) {
+            parsed.remove(id.as_str());
+            titles.remove(id.as_str());
             return;
-        };
+        }
         insert_codex_sidecar_title(
             &mut parsed,
             id,
@@ -13455,6 +13544,7 @@ fn load_codex_session_index_titles(
 fn load_codex_sqlite_titles(
     path: &Path,
     titles: &mut BTreeMap<String, CodexTitleCandidate>,
+    identity_conflicts: &mut BTreeSet<String>,
 ) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -13473,7 +13563,12 @@ fn load_codex_sqlite_titles(
     }
     let mut raw_ids_by_key = BTreeMap::new();
     for (raw_id, title) in loaded {
-        let id = canonical_codex_identity_key(&mut raw_ids_by_key, raw_id.as_str())?;
+        let id =
+            record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id.as_str());
+        if identity_conflicts.contains(id.as_str()) {
+            titles.remove(id.as_str());
+            continue;
+        }
         insert_codex_sidecar_title(titles, id, Some(title), "session_index", false);
     }
     Ok(())
@@ -13482,6 +13577,7 @@ fn load_codex_sqlite_titles(
 fn load_codex_sqlite_state_threads(
     path: &Path,
     state_threads: &mut BTreeMap<String, CodexStateThread>,
+    identity_conflicts: &mut BTreeSet<String>,
 ) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -13536,24 +13632,29 @@ fn load_codex_sqlite_state_threads(
     let mut raw_ids_by_key = BTreeMap::new();
     for row in rows {
         let (raw_id, thread) = row.context("read Codex state thread census row")?;
-        let id = canonical_codex_identity_key(&mut raw_ids_by_key, raw_id.as_str())?;
+        let id =
+            record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id.as_str());
+        if identity_conflicts.contains(id.as_str()) {
+            loaded.remove(id.as_str());
+            state_threads.remove(id.as_str());
+            continue;
+        }
         if loaded
-            .insert(id, thread.clone())
+            .insert(id.clone(), thread.clone())
             .is_some_and(|existing| existing != thread)
         {
-            return Err(anyhow::anyhow!(
-                "conflicting Codex state rows share one session identity"
-            ));
+            loaded.remove(id.as_str());
+            state_threads.remove(id.as_str());
+            identity_conflicts.insert(id);
         }
     }
     for (id, thread) in loaded {
         if state_threads
-            .insert(id, thread.clone())
+            .insert(id.clone(), thread.clone())
             .is_some_and(|existing| existing != thread)
         {
-            return Err(anyhow::anyhow!(
-                "conflicting Codex state roots share one session identity"
-            ));
+            state_threads.remove(id.as_str());
+            identity_conflicts.insert(id);
         }
     }
     Ok(())
@@ -13562,6 +13663,7 @@ fn load_codex_sqlite_state_threads(
 fn load_codex_rollout_extents(
     path: &Path,
     rollout_extents: &mut BTreeMap<String, CodexRolloutExtent>,
+    identity_conflicts: &mut BTreeSet<String>,
 ) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -13597,7 +13699,16 @@ fn load_codex_rollout_extents(
     for row in rows {
         let (raw_thread_id, next_byte_offset, next_ordinal) =
             row.context("read Codex rollout-extent census row")?;
-        let thread_id = canonical_codex_identity_key(&mut raw_ids_by_key, raw_thread_id.as_str())?;
+        let thread_id = record_codex_identity_key(
+            &mut raw_ids_by_key,
+            identity_conflicts,
+            raw_thread_id.as_str(),
+        );
+        if identity_conflicts.contains(thread_id.as_str()) {
+            loaded.remove(thread_id.as_str());
+            rollout_extents.remove(thread_id.as_str());
+            continue;
+        }
         let next_byte_offset =
             u64::try_from(next_byte_offset).context("negative Codex rollout byte offset")?;
         let next_ordinal = u64::try_from(next_ordinal).context("negative Codex rollout ordinal")?;
@@ -13606,22 +13717,21 @@ fn load_codex_rollout_extents(
             next_ordinal,
         };
         if loaded
-            .insert(thread_id, extent)
+            .insert(thread_id.clone(), extent)
             .is_some_and(|existing| existing != extent)
         {
-            return Err(anyhow::anyhow!(
-                "conflicting Codex rollout extents share one session identity"
-            ));
+            loaded.remove(thread_id.as_str());
+            rollout_extents.remove(thread_id.as_str());
+            identity_conflicts.insert(thread_id);
         }
     }
     for (thread_id, extent) in loaded {
         if rollout_extents
-            .insert(thread_id, extent)
+            .insert(thread_id.clone(), extent)
             .is_some_and(|existing| existing != extent)
         {
-            return Err(anyhow::anyhow!(
-                "conflicting Codex rollout roots share one session identity"
-            ));
+            rollout_extents.remove(thread_id.as_str());
+            identity_conflicts.insert(thread_id);
         }
     }
     Ok(())
@@ -13632,6 +13742,7 @@ fn load_codex_sqlite_spawn_edges(
     state_created_threads: &mut BTreeSet<String>,
     spawn_parents: &mut BTreeMap<String, String>,
     spawn_parent_conflicts: &mut BTreeSet<String>,
+    identity_conflicts: &mut BTreeSet<String>,
 ) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -13661,8 +13772,17 @@ fn load_codex_sqlite_spawn_edges(
         for row in rows {
             let (raw_child, first_user_message) =
                 row.context("read Codex created-thread census row")?;
-            let child =
-                canonical_codex_identity_key(&mut raw_created_ids_by_key, raw_child.as_str())?;
+            let child = record_codex_identity_key(
+                &mut raw_created_ids_by_key,
+                identity_conflicts,
+                raw_child.as_str(),
+            );
+            if identity_conflicts.contains(child.as_str()) {
+                state_created_threads.remove(child.as_str());
+                spawn_parents.remove(child.as_str());
+                spawn_parent_conflicts.insert(child);
+                continue;
+            }
             state_created_threads.insert(child.clone());
             if let Some(parent) = first_user_message
                 .as_deref()
@@ -13687,9 +13807,26 @@ fn load_codex_sqlite_spawn_edges(
     for row in rows {
         loaded.push(row.context("read Codex spawn-edge census row")?);
     }
-    for (parent, child) in loaded {
-        let parent = canonical_codex_session_id(parent.as_str());
-        let child = canonical_codex_session_id(child.as_str());
+    let mut raw_parent_ids_by_key = BTreeMap::new();
+    let mut raw_child_ids_by_key = BTreeMap::new();
+    for (raw_parent, raw_child) in loaded {
+        let parent = record_codex_identity_key(
+            &mut raw_parent_ids_by_key,
+            identity_conflicts,
+            raw_parent.as_str(),
+        );
+        let child = record_codex_identity_key(
+            &mut raw_child_ids_by_key,
+            identity_conflicts,
+            raw_child.as_str(),
+        );
+        if identity_conflicts.contains(child.as_str())
+            || identity_conflicts.contains(parent.as_str())
+        {
+            spawn_parents.remove(child.as_str());
+            spawn_parent_conflicts.insert(child);
+            continue;
+        }
         if !parent.is_empty() && !child.is_empty() && parent != child {
             record_codex_spawn_parent(spawn_parents, spawn_parent_conflicts, child, parent);
         }
@@ -13703,8 +13840,8 @@ fn record_codex_spawn_parent(
     child: String,
     parent: String,
 ) {
-    let child = canonical_codex_session_id(child.as_str());
-    let parent = canonical_codex_session_id(parent.as_str());
+    let child = resolve_codex_identity(child.as_str());
+    let parent = resolve_codex_identity(parent.as_str());
     if spawn_parent_conflicts.contains(child.as_str()) {
         return;
     }
@@ -13736,36 +13873,35 @@ fn codex_created_thread_parent(child: &str, first_user_message: &str) -> Option<
     let (parent, input_and_close) = remainder.split_once(SOURCE_CLOSE_AND_INPUT_OPEN)?;
     if !input_and_close.ends_with(CLOSE)
         || input_and_close[..input_and_close.len() - CLOSE.len()].contains(CLOSE)
-        || !is_uuid_like(parent)
-        || !is_uuid_like(child)
-        || canonical_codex_session_id(parent) == canonical_codex_session_id(child)
+        || !codex_identity_is_uuid_shaped(parent)
+        || !codex_identity_is_uuid_shaped(child)
+        || resolve_codex_identity(parent) == resolve_codex_identity(child)
     {
         return None;
     }
-    Some(canonical_codex_session_id(parent))
+    Some(resolve_codex_identity(parent))
 }
 
-/// Record one raw identifier at a sidecar-ingress boundary and reject two
-/// distinct raw rows that collapse to one canonical UUID key. A single
-/// uppercase/mixed-case row is accepted and normalized; duplicate aliases are
-/// ambiguous database evidence and make that census fail closed.
-fn canonical_codex_identity_key(
+/// Record one raw identifier at a sidecar-ingress boundary. A single
+/// uppercase/mixed-case UUID row is accepted and normalized; distinct raw rows
+/// that collapse to the same key are retained in `identity_conflicts` so that
+/// key fails closed while unrelated census entries remain usable.
+fn record_codex_identity_key(
     raw_ids_by_key: &mut BTreeMap<String, String>,
+    identity_conflicts: &mut BTreeSet<String>,
     raw_id: &str,
-) -> Result<String> {
-    let key = canonical_codex_session_id(raw_id);
+) -> String {
+    let key = resolve_codex_identity(raw_id);
     if raw_ids_by_key
         .get(key.as_str())
         .is_some_and(|existing| existing != raw_id)
     {
-        return Err(anyhow::anyhow!(
-            "distinct Codex sidecar ids collapse to one canonical UUID identity"
-        ));
+        identity_conflicts.insert(key.clone());
     }
     raw_ids_by_key
         .entry(key.clone())
         .or_insert_with(|| raw_id.to_string());
-    Ok(key)
+    key
 }
 
 fn sqlite_table_columns(connection: &Connection, table_name: &str) -> Result<BTreeSet<String>> {
@@ -14244,11 +14380,10 @@ fn insert_codex_sidecar_title(
     source: &str,
     overwrite: bool,
 ) {
-    let id = id.trim();
     if id.is_empty() {
         return;
     }
-    let id = canonical_codex_session_id(id);
+    let id = resolve_codex_identity(id.as_str());
     let Some(title) = title.and_then(|value| normalize_display_title(value, source)) else {
         return;
     };
@@ -15300,14 +15435,14 @@ fn quarantine_invalid_scan_index(path: &Path) -> Result<ScanIndex> {
 fn canonicalize_codex_identity_set(values: &mut BTreeSet<String>) {
     *values = std::mem::take(values)
         .into_iter()
-        .map(|value| canonical_codex_session_id(value.as_str()))
+        .map(|value| resolve_codex_identity(value.as_str()))
         .collect();
 }
 
 fn canonicalize_codex_identity_map<T: PartialEq>(values: &mut BTreeMap<String, T>) -> bool {
     let mut canonical = BTreeMap::new();
     for (raw_key, value) in std::mem::take(values) {
-        let key = canonical_codex_session_id(raw_key.as_str());
+        let key = resolve_codex_identity(raw_key.as_str());
         if canonical
             .get(key.as_str())
             .is_some_and(|existing| existing != &value)
@@ -16295,7 +16430,7 @@ fn is_codex_tool_call_name(lowered: &str) -> bool {
 
 fn looks_like_raw_identifier(value: &str) -> bool {
     let trimmed = value.trim();
-    if is_uuid_like(trimmed) {
+    if codex_identity_is_uuid_shaped(trimmed) {
         return true;
     }
     let lowered = trimmed.to_ascii_lowercase();
@@ -16313,7 +16448,7 @@ fn looks_like_raw_identifier(value: &str) -> bool {
     !has_space && ascii_token && has_digit && trimmed.len() >= 24
 }
 
-fn is_uuid_like(value: &str) -> bool {
+fn codex_identity_is_uuid_shaped(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 36 {
         return false;
@@ -16335,33 +16470,50 @@ fn is_uuid_like(value: &str) -> bool {
     true
 }
 
-/// Canonical comparison key for Codex session/thread identities.
+/// Resolve one raw Codex session/thread identity to its comparison key.
 ///
 /// Codex UUIDs are ASCII hex and are semantically case-insensitive. Restrict
 /// normalization to the exact hyphenated UUID shape so arbitrary provider or
 /// future non-UUID identifiers remain byte-exact and cannot acquire aliases
 /// through Unicode or general-purpose case folding.
-fn canonical_codex_session_id(value: &str) -> String {
-    if is_uuid_like(value) {
+fn resolve_codex_identity(value: &str) -> String {
+    if codex_identity_is_uuid_shaped(value) {
         value.to_ascii_lowercase()
     } else {
         value.to_string()
     }
 }
 
-fn canonical_codex_session_id_option(value: Option<String>) -> Option<String> {
-    value.map(|value| canonical_codex_session_id(value.as_str()))
+fn resolve_codex_identity_option(value: Option<String>) -> Option<String> {
+    value.map(|value| resolve_codex_identity(value.as_str()))
 }
 
+/// Resolve the provider filename grammar to the same raw identity consumed by
+/// state rows and rollout headers. Current rollouts use
+/// `rollout-YYYY-MM-DDTHH-MM-SS-<identity>.jsonl`; legacy rollouts use
+/// `rollout-<identity>.jsonl`. The entire identity remainder is preserved, so
+/// near-UUID and future provider identifiers never acquire suffix aliases.
 fn codex_session_id_from_path(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
-    if stem.len() >= 36 {
-        let suffix = &stem[stem.len() - 36..];
-        if is_uuid_like(suffix) {
-            return Some(canonical_codex_session_id(suffix));
-        }
+    let mut raw_identity = stem.strip_prefix("rollout-")?;
+    let bytes = raw_identity.as_bytes();
+    let timestamp_prefix = bytes.len() > 20
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && bytes[10] == b'T'
+        && bytes[11..13].iter().all(u8::is_ascii_digit)
+        && bytes[13] == b'-'
+        && bytes[14..16].iter().all(u8::is_ascii_digit)
+        && bytes[16] == b'-'
+        && bytes[17..19].iter().all(u8::is_ascii_digit)
+        && bytes[19] == b'-';
+    if timestamp_prefix {
+        raw_identity = &raw_identity[20..];
     }
-    None
+    (!raw_identity.is_empty()).then(|| resolve_codex_identity(raw_identity))
 }
 
 /// Where a Claude Code subagent transcript sits inside its parent session's
@@ -16808,6 +16960,20 @@ fn string_at(value: &Value, path: &[&str]) -> Option<String> {
     }
     match current {
         Value::String(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        _ => None,
+    }
+}
+
+/// Read provider identity bytes without the display/config normalization in
+/// `string_at`. Empty is absent; every other string, including leading or
+/// trailing whitespace and Unicode, reaches `resolve_codex_identity` intact.
+fn codex_identity_at(value: &Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    match current {
+        Value::String(value) if !value.is_empty() => Some(value.clone()),
         _ => None,
     }
 }
@@ -32291,6 +32457,29 @@ mod tests {
         .expect("parse Codex parent-prefix fixture")
     }
 
+    fn scan_codex_test_root_with_curve(
+        root: &Path,
+        context_curve_enabled: bool,
+    ) -> (SourceScanResult, ScanIndex) {
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots_with_limit_and_attribution_and_curve(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root.to_path_buf()),
+            &mut index,
+            "2026-08-29T12:30:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+            None,
+            None,
+            &[],
+            false,
+            context_curve_enabled,
+        )
+        .expect("scan Codex production-path fixture");
+        (scan, index)
+    }
+
     fn parse_trusted_created_thread_test_with_curve(
         name: &str,
         child_id: &str,
@@ -33558,7 +33747,7 @@ mod tests {
         assert!(!metadata.state_census_incomplete);
         assert!(!metadata.sidecar_census_incomplete);
         for (state_child_id, rollout_child_id, name, _) in &cases {
-            let child_id = canonical_codex_session_id(rollout_child_id);
+            let child_id = resolve_codex_identity(rollout_child_id);
             assert!(
                 metadata.state_created_threads.contains(child_id.as_str()),
                 "{name}"
@@ -33614,15 +33803,15 @@ mod tests {
     fn codex_uuid_identity_is_canonical_but_non_uuid_identity_remains_byte_exact() {
         let lowercase = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let mixed = "01A03e99-49CF-7460-9Fd7-F7dBfD2F05E4";
-        assert_eq!(canonical_codex_session_id(mixed), lowercase);
+        assert_eq!(resolve_codex_identity(mixed), lowercase);
 
         let non_uuid = "Provider-Session-Case-Sensitive";
         let other_non_uuid = "provider-session-case-sensitive";
-        assert_eq!(canonical_codex_session_id(non_uuid), non_uuid);
-        assert_eq!(canonical_codex_session_id(other_non_uuid), other_non_uuid);
+        assert_eq!(resolve_codex_identity(non_uuid), non_uuid);
+        assert_eq!(resolve_codex_identity(other_non_uuid), other_non_uuid);
         assert_ne!(
-            canonical_codex_session_id(non_uuid),
-            canonical_codex_session_id(other_non_uuid)
+            resolve_codex_identity(non_uuid),
+            resolve_codex_identity(other_non_uuid)
         );
 
         let mut metadata = CodexTitleMetadata::default();
@@ -33664,6 +33853,351 @@ mod tests {
     }
 
     #[test]
+    fn codex_identity_path_state_and_header_resolution_are_identical_for_generated_shapes() {
+        let uuid = "01A03E99-49CF-7460-9FD7-F7DBFD2F05E4";
+        let mut shapes = vec![
+            uuid.to_string(),
+            uuid[..35].to_string(),
+            format!("x{uuid}"),
+            format!("{uuid}x"),
+            uuid.replace('-', ""),
+            format!("{{{uuid}}}"),
+            format!("urn:uuid:{uuid}"),
+            format!("{uuid} "),
+            format!("{uuid}\n"),
+            "Session-İ-Σ-東京".to_string(),
+            "Provider-Session-Case-Sensitive".to_string(),
+        ];
+        for length in 1..=96 {
+            let generated = (0..length)
+                .map(|index| match index % 7 {
+                    0 => 'G',
+                    1 => char::from(b'a' + (index % 26) as u8),
+                    2 => char::from(b'0' + (index % 10) as u8),
+                    3 => '-',
+                    4 => '_',
+                    5 => ':',
+                    _ => 'Z',
+                })
+                .collect::<String>();
+            shapes.push(generated);
+        }
+
+        for raw in shapes {
+            let state_key = resolve_codex_identity(raw.as_str());
+            let header = json!({"id": raw});
+            let header_raw = codex_identity_at(&header, &["id"]).expect("raw header identity");
+            assert_eq!(header_raw, raw);
+            assert_eq!(resolve_codex_identity(header_raw.as_str()), state_key);
+
+            for stem in [
+                format!("rollout-{raw}.jsonl"),
+                format!("rollout-2026-08-29T12-00-00-{raw}.jsonl"),
+            ] {
+                assert_eq!(
+                    codex_session_id_from_path(Path::new(stem.as_str())),
+                    Some(state_key.clone()),
+                    "raw={raw:?} path={stem:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_created_thread_near_and_non_uuid_production_join_fails_closed() {
+        let uuid = "01A03E99-49CF-7460-9FD7-F7DBFD2F05E4";
+        let cases = [
+            ("35-char", uuid[..35].to_string()),
+            ("37-char-leading", format!("x{uuid}")),
+            ("37-char-trailing", format!("{uuid}x")),
+            ("missing-hyphens", uuid.replace('-', "")),
+            ("braced", format!("{{{uuid}}}")),
+            ("urn", format!("urn:uuid:{uuid}")),
+            ("trailing-space", format!("{uuid} ")),
+            ("trailing-newline", format!("{uuid}\n")),
+            ("unicode", "Session-İ-Σ-東京".to_string()),
+            ("plain", "Provider-Session-Case-Sensitive".to_string()),
+        ];
+
+        for (name, raw_id) in cases {
+            let home = temp_dir(format!("codex-created-thread-identity-{name}").as_str());
+            let codex_dir = home.join(".codex");
+            let sessions_dir = codex_dir.join("sessions");
+            fs::create_dir_all(&sessions_dir).expect("create identity fixture sessions");
+            let database = Connection::open(codex_dir.join("state_5.sqlite"))
+                .expect("open identity fixture state");
+            database
+                .execute_batch(
+                    "CREATE TABLE threads (\
+                        id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                        thread_source TEXT, first_user_message TEXT\
+                    );",
+                )
+                .expect("create identity fixture table");
+            database
+                .execute(
+                    "INSERT INTO threads VALUES (?1, 'Created', 1, 'agent_created_thread', NULL)",
+                    [raw_id.as_str()],
+                )
+                .expect("insert state-created identity");
+
+            let path = sessions_dir.join(format!("rollout-{raw_id}.jsonl"));
+            let values = [
+                json!({"timestamp":"2026-08-29T12:00:00Z","type":"session_meta","payload":{"id":raw_id,"session_id":raw_id,"history_mode":"paginated","history_base":{"cursor":"file-controlled"},"source":"cli"}}),
+                json!({"timestamp":"2026-08-29T12:00:01Z","type":"turn_context","payload":{"turn_id":"identity-turn","model":"gpt-5.6-sol"}}),
+                codex_test_token_line(
+                    "2026-08-29T12:00:02Z",
+                    None,
+                    (30, 8, 12, 1),
+                    Some((30, 8, 12, 1)),
+                ),
+            ];
+            fs::write(
+                &path,
+                values
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n",
+            )
+            .expect("write identity rollout");
+
+            let expected_key = resolve_codex_identity(raw_id.as_str());
+            assert_eq!(
+                codex_session_id_from_path(&path),
+                Some(expected_key.clone())
+            );
+            for context_curve_enabled in [true, false] {
+                let (scan, index) =
+                    scan_codex_test_root_with_curve(&sessions_dir, context_curve_enabled);
+                assert_eq!(scan.discovered_file_count, 1, "{name}");
+                assert_eq!(scan.scanned_file_count, 1, "{name}");
+                assert_eq!(scan.scanned_session_count, 0, "{name}");
+                assert!(scan.snapshots.is_empty(), "{name}: {scan:#?}");
+                assert!(scan.state_census_complete, "{name}");
+                assert!(scan.sidecar_census_complete, "{name}");
+                assert_eq!(scan.recognized_usage_drop_count, 1, "{name}");
+                assert_eq!(scan.ownership_incomplete_file_count, 1, "{name}");
+                assert_eq!(scan.dropped_usage_record_count, 1, "{name}");
+                assert!(
+                    index
+                        .codex_state_only_blocked_session_ids
+                        .contains(expected_key.as_str()),
+                    "{name}"
+                );
+            }
+
+            database
+                .execute(
+                    "UPDATE threads SET thread_source = 'user' WHERE id = ?1",
+                    [raw_id.as_str()],
+                )
+                .expect("turn identity into ordinary control");
+            drop(database);
+            for context_curve_enabled in [true, false] {
+                let (scan, index) =
+                    scan_codex_test_root_with_curve(&sessions_dir, context_curve_enabled);
+                assert!(scan.census_complete, "{name}: {scan:#?}");
+                assert_eq!(scan.scanned_session_count, 1, "{name}");
+                assert_eq!(scan.snapshots.len(), 1, "{name}");
+                assert_eq!(scan.snapshots[0].source_session_id, raw_id, "{name}");
+                assert_eq!(scan.snapshots[0].input_tokens, 30, "{name}");
+                assert_eq!(scan.snapshots[0].cache_read_tokens, 8, "{name}");
+                assert_eq!(scan.snapshots[0].output_tokens, 12, "{name}");
+                assert_eq!(scan.snapshots[0].reasoning_output_tokens, 1, "{name}");
+                assert_eq!(scan.snapshots[0].request_count, 1, "{name}");
+                assert_eq!(scan.recognized_usage_drop_count, 0, "{name}");
+                assert_eq!(scan.ownership_incomplete_file_count, 0, "{name}");
+                assert_eq!(scan.dropped_usage_record_count, 0, "{name}");
+                assert!(
+                    !index
+                        .codex_state_only_blocked_session_ids
+                        .contains(expected_key.as_str()),
+                    "{name}"
+                );
+            }
+            let _ = fs::remove_dir_all(home);
+        }
+    }
+
+    #[test]
+    fn codex_created_thread_collision_production_join_is_scoped_and_fail_closed() {
+        let home = temp_dir("codex-created-thread-collision-production");
+        let codex_dir = home.join(".codex");
+        let collision_root = codex_dir.join("collision-sessions");
+        let control_root = codex_dir.join("control-sessions");
+        fs::create_dir_all(&collision_root).expect("create collision root");
+        fs::create_dir_all(&control_root).expect("create control root");
+        let collided = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let collided_alias = collided.to_ascii_uppercase();
+        let healthy_created = "01a03e9a-49cf-7460-9fd7-f7dbfd2f05e4";
+        let ordinary = "01a03e9b-49cf-7460-9fd7-f7dbfd2f05e4";
+        let database =
+            Connection::open(codex_dir.join("state_5.sqlite")).expect("open collision state");
+        database
+            .execute_batch(
+                "CREATE TABLE threads (\
+                    id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                    thread_source TEXT, first_user_message TEXT\
+                );",
+            )
+            .expect("create collision table");
+        for (id, title, source) in [
+            (collided, "Collision Lower", "agent_created_thread"),
+            (
+                collided_alias.as_str(),
+                "Collision Upper",
+                "agent_created_thread",
+            ),
+            (healthy_created, "Healthy Created", "agent_created_thread"),
+            (ordinary, "Ordinary", "user"),
+        ] {
+            database
+                .execute(
+                    "INSERT INTO threads VALUES (?1, ?2, 1, ?3, NULL)",
+                    rusqlite::params![id, title, source],
+                )
+                .expect("insert collision census row");
+        }
+        drop(database);
+
+        let rollout_body = |id: &str, input_tokens: u64| {
+            [
+                json!({"timestamp":"2026-08-29T12:00:00Z","type":"session_meta","payload":{"id":id,"session_id":id,"history_mode":"paginated","history_base":{"cursor":"file-controlled"},"source":"cli"}}),
+                json!({"timestamp":"2026-08-29T12:00:01Z","type":"turn_context","payload":{"turn_id":format!("turn-{id}"),"model":"gpt-5.6-sol"}}),
+                codex_test_token_line(
+                    "2026-08-29T12:00:02Z",
+                    None,
+                    (input_tokens, 8, 12, 1),
+                    Some((input_tokens, 8, 12, 1)),
+                ),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n"
+        };
+        fs::write(
+            collision_root.join(format!("rollout-{collided}.jsonl")),
+            rollout_body(collided, 30),
+        )
+        .expect("write collided rollout");
+        fs::write(
+            control_root.join(format!("rollout-{healthy_created}.jsonl")),
+            rollout_body(healthy_created, 40),
+        )
+        .expect("write healthy created rollout");
+        fs::write(
+            control_root.join(format!("rollout-{ordinary}.jsonl")),
+            rollout_body(ordinary, 12),
+        )
+        .expect("write ordinary rollout");
+
+        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&collision_root));
+        assert!(metadata.state_census_incomplete);
+        assert!(metadata.sidecar_census_incomplete);
+        assert!(!metadata.state_census_unscoped_incomplete);
+        assert!(!metadata.sidecar_census_unscoped_incomplete);
+        assert_eq!(
+            metadata.identity_conflicts,
+            BTreeSet::from([collided.to_string()])
+        );
+        assert!(metadata.state_created_threads.contains(healthy_created));
+        assert!(metadata.state_threads.contains_key(healthy_created));
+        assert!(metadata.state_threads.contains_key(ordinary));
+
+        for context_curve_enabled in [true, false] {
+            let (collision_scan, collision_index) =
+                scan_codex_test_root_with_curve(&collision_root, context_curve_enabled);
+            assert_eq!(collision_scan.discovered_file_count, 1);
+            assert_eq!(collision_scan.scanned_file_count, 1);
+            assert_eq!(collision_scan.scanned_session_count, 0);
+            assert!(collision_scan.snapshots.is_empty());
+            assert!(!collision_scan.census_complete);
+            assert!(!collision_scan.state_census_complete);
+            assert!(!collision_scan.sidecar_census_complete);
+            assert_eq!(collision_scan.recognized_usage_drop_count, 1);
+            assert_eq!(collision_scan.ownership_incomplete_file_count, 1);
+            assert_eq!(collision_scan.dropped_usage_record_count, 1);
+            assert!(collision_index
+                .codex_state_only_blocked_session_ids
+                .contains(collided));
+
+            let (control_scan, control_index) =
+                scan_codex_test_root_with_curve(&control_root, context_curve_enabled);
+            assert_eq!(control_scan.discovered_file_count, 2);
+            assert_eq!(control_scan.scanned_file_count, 2);
+            assert_eq!(control_scan.scanned_session_count, 1);
+            assert_eq!(control_scan.snapshots.len(), 1);
+            assert_eq!(control_scan.snapshots[0].source_session_id, ordinary);
+            assert_eq!(control_scan.snapshots[0].input_tokens, 12);
+            assert_eq!(control_scan.recognized_usage_drop_count, 1);
+            assert_eq!(control_scan.ownership_incomplete_file_count, 1);
+            assert_eq!(control_scan.dropped_usage_record_count, 1);
+            assert!(control_index
+                .codex_state_only_blocked_session_ids
+                .contains(healthy_created));
+            assert!(!control_index
+                .codex_state_only_blocked_session_ids
+                .contains(ordinary));
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_created_thread_unscoped_classification_census_failure_fails_closed() {
+        let home = temp_dir("codex-created-thread-unscoped-census-failure");
+        let codex_dir = home.join(".codex");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create unscoped census root");
+        fs::write(codex_dir.join("state_5.sqlite"), b"not a sqlite database")
+            .expect("write corrupt classification census");
+        let session_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let values = [
+            json!({"timestamp":"2026-08-29T12:00:00Z","type":"session_meta","payload":{"id":session_id,"session_id":session_id,"history_mode":"paginated","history_base":{"cursor":"file-controlled"},"source":"cli"}}),
+            json!({"timestamp":"2026-08-29T12:00:01Z","type":"turn_context","payload":{"turn_id":"unscoped-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-29T12:00:02Z",
+                None,
+                (30, 8, 12, 1),
+                Some((30, 8, 12, 1)),
+            ),
+        ];
+        fs::write(
+            sessions_dir.join(format!("rollout-{session_id}.jsonl")),
+            values
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write unscoped census rollout");
+
+        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
+        assert!(metadata.created_thread_census_unscoped_incomplete);
+        for context_curve_enabled in [true, false] {
+            let (scan, index) =
+                scan_codex_test_root_with_curve(&sessions_dir, context_curve_enabled);
+            assert_eq!(scan.discovered_file_count, 1);
+            assert_eq!(scan.scanned_file_count, 1);
+            assert_eq!(scan.scanned_session_count, 0);
+            assert!(scan.snapshots.is_empty());
+            assert!(!scan.state_census_complete);
+            assert!(!scan.sidecar_census_complete);
+            assert_eq!(scan.recognized_usage_drop_count, 1);
+            assert_eq!(scan.ownership_incomplete_file_count, 1);
+            assert_eq!(scan.dropped_usage_record_count, 1);
+            assert!(index
+                .codex_state_only_blocked_session_ids
+                .contains(session_id));
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn codex_sidecar_uuid_alias_collision_marks_the_census_incomplete() {
         let home = temp_dir("codex-sidecar-uuid-alias-collision");
         let codex_dir = home.join(".codex");
@@ -33689,22 +34223,45 @@ mod tests {
             .expect("seed colliding state rows");
         drop(database);
 
-        assert!(load_codex_sqlite_state_threads(
+        let collision_key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let mut state_threads = BTreeMap::new();
+        let mut state_conflicts = BTreeSet::new();
+        load_codex_sqlite_state_threads(
             &codex_dir.join("state_5.sqlite"),
-            &mut BTreeMap::new()
+            &mut state_threads,
+            &mut state_conflicts,
         )
-        .is_err());
-        assert!(load_codex_sqlite_spawn_edges(
+        .expect("a scoped collision retains unrelated state rows");
+        assert!(state_threads.is_empty());
+        assert_eq!(state_conflicts, BTreeSet::from([collision_key.to_string()]));
+
+        let mut created_threads = BTreeSet::new();
+        let mut spawn_parents = BTreeMap::new();
+        let mut spawn_conflicts = BTreeSet::new();
+        let mut identity_conflicts = BTreeSet::new();
+        load_codex_sqlite_spawn_edges(
             &codex_dir.join("state_5.sqlite"),
-            &mut BTreeSet::new(),
-            &mut BTreeMap::new(),
-            &mut BTreeSet::new()
+            &mut created_threads,
+            &mut spawn_parents,
+            &mut spawn_conflicts,
+            &mut identity_conflicts,
         )
-        .is_err());
+        .expect("a scoped collision retains unrelated created classifications");
+        assert!(created_threads.is_empty());
+        assert_eq!(
+            identity_conflicts,
+            BTreeSet::from([collision_key.to_string()])
+        );
 
         let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
         assert!(metadata.state_census_incomplete);
         assert!(metadata.sidecar_census_incomplete);
+        assert!(!metadata.state_census_unscoped_incomplete);
+        assert!(!metadata.sidecar_census_unscoped_incomplete);
+        assert_eq!(
+            metadata.identity_conflicts,
+            BTreeSet::from([collision_key.to_string()])
+        );
         let _ = fs::remove_dir_all(home);
     }
 

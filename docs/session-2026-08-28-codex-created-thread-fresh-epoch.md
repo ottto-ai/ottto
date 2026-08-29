@@ -76,11 +76,21 @@ precision, and birth times are within the five-second creation tolerance.
 Created-thread classification is the OR of two independently retained inputs:
 the trusted state-row declaration and the rollout declaration. A trusted state
 declaration cannot be withdrawn by the rollout it governs. The complete input
-product is below. Session/thread identity is canonicalized at every state,
-thread-history, spawn-edge, rollout-path/header, blocker, ownership-map, and
-fingerprint boundary: an exactly hyphenated UUID becomes lowercase ASCII, while
-every non-UUID identifier remains byte-exact. Distinct sidecar rows that collapse
-to one UUID key make that census incomplete rather than selecting either row.
+product is below. One resolver owns every state, thread-history, spawn-edge,
+rollout-path/header, blocker, ownership-map, ledger, membership-set, and
+fingerprint boundary: an exactly 36-byte, ASCII-hex, hyphenated UUID becomes
+lowercase ASCII, while every other identifier remains byte-exact (including
+Unicode and leading/trailing whitespace). The path ingress parses the provider
+grammar `rollout-<timestamp>-<identity>.jsonl` (and legacy
+`rollout-<identity>.jsonl`) and resolves the complete identity remainder; it
+never strips a UUID-looking suffix from a larger identifier. Distinct sidecar
+rows that collapse to one UUID key make that key ambiguous. The key remains in
+a durable in-memory blocker set while non-colliding state classifications remain
+available. A read/schema failure in the created-thread classification query has
+no trustworthy key scope and blocks every Codex rollout. An incomplete
+title/state-detail/history census blocks identities already classified as
+created, but does not change an unrelated ordinary rollout's compatibility
+classification.
 
 | Trusted state row | Rollout `thread_source` | Classification / admission result |
 | --- | --- | --- |
@@ -89,8 +99,14 @@ to one UUID key make that census incomplete rather than selecting either row.
 | Declares created thread | Other string | Created thread plus classification conflict; `AmbiguousFork` |
 | Declares created thread | Malformed/non-string | Created thread plus classification conflict; `AmbiguousFork` |
 | Semantically matching created row whose raw UUID casing differs from the rollout key | Any rollout value | Canonicalized to the same state-created identity, then handled exactly as the corresponding state-declares-created row above |
+| Matching created row and rollout use the same non-UUID/near-UUID bytes | Any rollout value | Byte-exactly resolves to the same key, then follows the corresponding state-declares-created row above; no UUID suffix alias exists |
+| State/sidecar rows contain distinct raw UUID aliases for this resolved key | Any rollout value | Key-scoped census ambiguity; `AmbiguousFork`, with no generic branch evaluated |
+| Created-thread classification census fails without an identity scope | Any rollout value | Source-wide identity ambiguity; `AmbiguousFork`, with no generic branch evaluated |
+| Title/state-detail/history census is incomplete, but created classification is complete | Any rollout value | State-created identity is `AmbiguousFork`; unrelated ordinary identity retains its ordinary compatibility result |
+| Rollout path cannot resolve while trusted created-thread suspects exist | Any rollout value | Identity ambiguity; `AmbiguousFork`, with no generic branch evaluated |
 | Does not declare this session | Declares `agent_created_thread` | Created thread from rollout evidence; native admission still requires an independent trusted matching child/parent edge and the complete witness |
 | Does not declare this session | Omitted, malformed, or another value | Not classified as created; ordinary compatibility branches apply |
+| Ordinary non-created state/header/path all use the same non-UUID bytes | Omitted, malformed, or another non-created value | Ordinary compatibility branches apply unchanged; byte-exact identity alone does not manufacture created ownership |
 
 The state declaration is bound by the rollout path's provider session id;
 created rows for unrelated session ids and generic `thread_spawn_edges` never
@@ -102,6 +118,11 @@ fixes the ownership state once. The complete admission/fallback enumeration is:
 | Native JSONL usage, curve capability present | Rollout declares created thread, any state declaration agrees, and the trusted sidecar child/parent edge plus complete native header/task/turn witness, gap-free non-retrograde stream through projected EOF, and complete/lossless parse all hold | Usage admitted; curve emitted |
 | Native JSONL usage, curve capability absent | Identical ownership gates to capability-present | Usage admitted; curve omitted |
 | State/rollout classification disagreement | State declaration wins classification, while an omitted, malformed, or different rollout marker proves conflict | `AmbiguousFork`; no generic branch is evaluated |
+| Census incomplete from a known UUID-alias collision | The collided resolved key is retained as a blocker; non-colliding map/set entries remain classified | Collided file is `AmbiguousFork`; unrelated ordinary compatibility and trusted created classification remain unchanged |
+| Created-thread classification census incomplete without a trustworthy key scope | No identity can prove it is outside the missing classification census | Every Codex file is `AmbiguousFork` until a complete classification census is available |
+| Title/state-detail/history census incomplete with complete classification | Missing corroboration can weaken only an already-classified created candidate | Created identity is `AmbiguousFork`; unrelated ordinary identity remains ordinary |
+| Non-UUID/near-UUID path identity | Complete filename identity remainder and raw header/state bytes resolve through the same byte-exact key | Matching state-created suspect follows native-only admission or `AmbiguousFork`; matching ordinary file remains ordinary |
+| Unresolvable/ambiguous path identity with created-thread suspects | No trustworthy state-to-file join exists | `AmbiguousFork`; header-controlled generic admission is unreachable |
 | `history_base` or `subagent_history_start_ordinal` marker | Cannot authorize `AllLocal` or `Ordinal`; the latter is also rejected by the native header | Native admission or `AmbiguousFork` |
 | No pagination marker with a complete parent ledger | `AwaitingParentPrefix` / `AwaitingLegacyTrigger` are unreachable; must independently satisfy the complete native witness | Native admission or `AmbiguousFork` |
 | Transcript `forked_from_id` | Must agree with the trusted sidecar parent and still satisfy the complete native witness | Native admission or `AmbiguousFork` |
@@ -124,6 +145,9 @@ only for explicitly non-created-thread legacy sources.
 | No-marker child with matched parent A, omitted parent B, then copied parent C | Identical fail-closed result | Legacy parent-prefix machine is unreachable | One copied usage drop plus one ownership-incomplete file |
 | State-proven created thread with rollout marker absent | Identical fail-closed result | State classification prevents `history_base -> AllLocal` | One copied usage drop plus one ownership-incomplete file |
 | State-proven created thread with conflicting/malformed rollout marker | Identical fail-closed result | Classification conflict is `AmbiguousFork` | One copied usage drop plus one ownership-incomplete file |
+| Live lower/uppercase UUID-alias collision for the rollout key, marker absent, `history_base` present | Identical fail-closed result | Key-scoped census ambiguity is `AmbiguousFork`; no snapshot or upload work item | One copied usage drop plus one ownership-incomplete file; non-colliding sessions retain classification |
+| Matching state/path/header identity is 35/37 characters, unhyphenated, braced, `urn:uuid:`, whitespace-suffixed, Unicode, or plain non-UUID | Identical fail-closed result for state-created suspects | Complete filename remainder and raw header/state bytes join byte-exactly; no generic admission | One copied usage drop plus one ownership-incomplete file |
+| Same near-/non-UUID corpus with an ordinary non-created state row | Identical compatibility result | Ordinary `history_base` behavior is unchanged | One ordinary snapshot with exact `30/8/12/1/1` usage |
 | Created-thread `history_base` with missing native ordinals/task structure and retrograde copied usage | Identical fail-closed result | Fails closed; no child snapshot | One dropped usage record plus one ownership-incomplete file |
 | Native stream with ordinal gap/restart | Identical fail-closed result | Whole file fails closed | Final native validation suppresses tentative usage |
 | Native stream with retrograde timestamp | Identical fail-closed result | Whole file fails closed | Final native validation suppresses tentative usage |
@@ -194,7 +218,11 @@ checks, projected final-ordinal mismatch, R1/R2/truncated-parent shapes, native
 ordinal/chronology/turn failures, malformed crash tails, ordinary pagination
 non-acquisition, state-loaded absent/conflicting/malformed rollout markers,
 UUID case aliases in both state-to-rollout directions, canonical-key collision
-failure, non-UUID byte-exact identity, generic-edge/unrelated-row
-non-acquisition, and the five corpus shapes. Durable production replay state is
+failure through the production scanner, every requested near-/non-UUID shape
+through the production join, generated path/state/header identity equivalence,
+ordinary byte-exact negative controls, upload-unreachability for a suppressed
+collision file, generic-edge/unrelated-row non-acquisition, and the five corpus
+shapes. The collision probe also proves non-colliding created and ordinary rows
+retain their respective classifications. Durable production replay state is
 also exercised from recorded v2, v3, v4, and v5 through persisted v6
 completion.
