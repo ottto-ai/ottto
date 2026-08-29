@@ -1448,7 +1448,7 @@ fn codex_account_target_descriptor(
         workspace_identifier_hash,
         account_label: account_label.unwrap_or_else(|| CODEX_GENERIC_ACCOUNT_LABEL.to_string()),
         workspace_label,
-        plan_type,
+        subscription_product: plan_type.map(chatgpt_subscription_product),
         durability,
         is_current,
         connectable: false,
@@ -1504,7 +1504,10 @@ fn upsert_codex_account_target(
     {
         existing.account_label = incoming.account_label;
     }
-    existing.plan_type = existing.plan_type.take().or(incoming.plan_type);
+    existing.subscription_product = existing
+        .subscription_product
+        .take()
+        .or(incoming.subscription_product);
     existing.observed_at = existing.observed_at.take().or(incoming.observed_at);
     match (existing.durability, incoming.durability) {
         (CodexAccountTargetDurabilityV1::Durable, _) => {}
@@ -13084,14 +13087,17 @@ for line in sys.stdin:
             .iter()
             .find(|target| target.workspace_label.as_deref() == Some("Singular"))
             .expect("connected workspace");
-        assert_eq!(connected.plan_type.as_deref(), Some("pro"));
+        assert_eq!(
+            connected.subscription_product.as_deref(),
+            Some("chatgpt_pro")
+        );
         let observed = coverage
             .targets
             .iter()
             .find(|target| target.workspace_label.as_deref() == Some("Singular Deprecated"))
             .expect("observed workspace");
         assert_eq!(
-            observed.plan_type, None,
+            observed.subscription_product, None,
             "an unconnected workspace has no claimed plan of its own"
         );
     }
@@ -13131,7 +13137,10 @@ for line in sys.stdin:
             .iter()
             .find(|target| target.workspace_label.as_deref() == Some("Team"))
             .expect("team workspace");
-        assert_eq!(team.plan_type.as_deref(), Some("business"));
+        assert_eq!(
+            team.subscription_product.as_deref(),
+            Some("chatgpt_business")
+        );
     }
 
     #[test]
@@ -13178,7 +13187,7 @@ for line in sys.stdin:
             Some(binding_workspace_hash.as_str()),
             "the binding identity stays canonical so persisted slots keep resolving"
         );
-        assert_eq!(target.plan_type.as_deref(), Some("pro"));
+        assert_eq!(target.subscription_product.as_deref(), Some("chatgpt_pro"));
     }
 
     #[test]

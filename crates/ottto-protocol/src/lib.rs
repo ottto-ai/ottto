@@ -3090,12 +3090,14 @@ pub struct CodexAccountTargetDescriptorV1 {
     pub account_label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_label: Option<String>,
-    /// The plan the provider claims for this exact target, e.g. `pro`. Present
-    /// only where the credential actually claims it: a workspace merely observed
-    /// in the ID token has no claimed plan, and guessing one from a sibling
-    /// workspace would state something the provider never said.
+    /// The subscription the provider claims for this exact target, in the same
+    /// `chatgpt_pro` product vocabulary the rest of the status uses, so clients
+    /// render it exactly as they render every other plan. Present only where the
+    /// credential actually claims it: a workspace merely observed in the ID token
+    /// has no claimed plan, and guessing one from a sibling workspace would state
+    /// something the provider never said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_type: Option<String>,
+    pub subscription_product: Option<String>,
     pub durability: CodexAccountTargetDurabilityV1,
     #[serde(default)]
     pub is_current: bool,
@@ -4074,7 +4076,7 @@ mod tests {
                 workspace_identifier_hash: Some("b".repeat(64)),
                 account_label: "Codex account".to_string(),
                 workspace_label: Some("Singular".to_string()),
-                plan_type: None,
+                subscription_product: None,
                 durability: CodexAccountTargetDurabilityV1::ObservedOnly,
                 is_current: false,
                 connectable: true,
