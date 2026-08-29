@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 341,
-  "content_sha256": "0bdb166ecb6e5d551000eeb5a7c6b78cbc38f0d436318aec05c8a1e8a47a0ecc",
+  "content_sha256": "42235fb78ee44b110e29a1cb14129cc6c8ab039c1cdcaf4ad84d20906bc426be",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "fc93a118d918d02ce87f0f4d320260a31b0c36c375445385785a74a798bd060f",
-      "size_bytes": 764080
+      "sha256": "d987c1327de8adfd90d92cdceaa7bce66ba62839d16068cd6f9c420b2def23de",
+      "size_bytes": 782540
     },
     {
       "executable": false,
@@ -930,8 +930,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/codex-accounts.md",
-      "sha256": "780969e882cd8dc95b9c5dbe4a6f9ca361aeec20d68686558c765afb12dcfa14",
-      "size_bytes": 5555
+      "sha256": "2c960a4c1d78fcd90227894e158f0d99b3dd66aff59553aac329fefb2546b82f",
+      "size_bytes": 6957
     },
     {
       "executable": false,
@@ -2390,7 +2390,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-29T02:25:38+00:00",
+  "generated_at": "2026-08-29T16:22:59+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 342,
   "public_roots": [
@@ -2426,5 +2426,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ae5109e313740501fda7c314f049d5bc2fb10af9"
+  "source_commit": "2d559ae74192f13ce29059c143cad18b48a5348c"
 }
