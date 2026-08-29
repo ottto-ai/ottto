@@ -82,15 +82,25 @@ fingerprint boundary: an exactly 36-byte, ASCII-hex, hyphenated UUID becomes
 lowercase ASCII, while every other identifier remains byte-exact (including
 Unicode and leading/trailing whitespace). The path ingress parses the provider
 grammar `rollout-<timestamp>-<identity>.jsonl` (and legacy
-`rollout-<identity>.jsonl`) and resolves the complete identity remainder; it
-never strips a UUID-looking suffix from a larger identifier. Distinct sidecar
-rows that collapse to one UUID key make that key ambiguous. The key remains in
-a durable in-memory blocker set while non-colliding state classifications remain
-available. A read/schema failure in the created-thread classification query has
-no trustworthy key scope and blocks every Codex rollout. An incomplete
-title/state-detail/history census blocks identities already classified as
-created, but does not change an unrelated ordinary rollout's compatibility
-classification.
+`rollout-<identity>.jsonl`) without guessing between them. If the legacy
+identity itself begins `YYYY-MM-DDTHH-MM-SS-`, ingress preserves both the full
+legacy remainder and the possible modern remainder until trusted state/census
+evidence or the first authoritative header selects exactly one. Both candidates,
+or no supported candidate when created-thread evidence is present, is
+`AmbiguousFork`; every unresolved candidate is also retained in the inclusive
+state-fallback blocker. The parser never strips a UUID-looking suffix from a
+larger identifier. Distinct sidecar rows that collapse to one UUID key make that
+key ambiguous. The key remains in a durable in-memory blocker set while
+non-colliding state classifications remain available.
+
+An existing `state_5.sqlite` is a complete created-thread classification source
+only when `threads` contains all required columns: `id`, `thread_source`, and
+`first_user_message`, and the fixed classification query and every selected row
+decode successfully. A missing table/column and a query/read/decode failure are
+the same unscoped incomplete result and block every Codex rollout. Unknown extra
+columns are additive and accepted. An incomplete title/state-detail/history
+census blocks identities already classified as created, but does not change an
+unrelated ordinary rollout's compatibility classification.
 
 | Trusted state row | Rollout `thread_source` | Classification / admission result |
 | --- | --- | --- |
@@ -101,6 +111,10 @@ classification.
 | Semantically matching created row whose raw UUID casing differs from the rollout key | Any rollout value | Canonicalized to the same state-created identity, then handled exactly as the corresponding state-declares-created row above |
 | Matching created row and rollout use the same non-UUID/near-UUID bytes | Any rollout value | Byte-exactly resolves to the same key, then follows the corresponding state-declares-created row above; no UUID suffix alias exists |
 | State/sidecar rows contain distinct raw UUID aliases for this resolved key | Any rollout value | Key-scoped census ambiguity; `AmbiguousFork`, with no generic branch evaluated |
+| Readable state DB is missing `threads`, `id`, `thread_source`, or `first_user_message`, or a classification row cannot decode | Any rollout value | Source-wide identity ambiguity; `AmbiguousFork`. This closes the reproduced former `history_base -> AllLocal` admission of exact `30/8/12/1/1` usage |
+| Complete required state schema also has unknown future columns | Any rollout value | Additive columns do not make the census incomplete; classification follows the matching ordinary/created row normally |
+| Legacy filename identity starts with the modern timestamp grammar and exactly the full legacy candidate has trusted evidence | Any rollout value | The full byte-exact legacy identity is selected. This closes the reproduced former shortened-key `history_base -> AllLocal` admission of exact `30/8/12/1/1` usage |
+| Both filename grammar candidates have trusted evidence and either is created/conflicted, or no candidate can be selected while created classification is incomplete | Any rollout value | Multi-key identity ambiguity; `AmbiguousFork`, and inclusive state fallback is blocked for every candidate |
 | Created-thread classification census fails without an identity scope | Any rollout value | Source-wide identity ambiguity; `AmbiguousFork`, with no generic branch evaluated |
 | Title/state-detail/history census is incomplete, but created classification is complete | Any rollout value | State-created identity is `AmbiguousFork`; unrelated ordinary identity retains its ordinary compatibility result |
 | Rollout path cannot resolve while trusted created-thread suspects exist | Any rollout value | Identity ambiguity; `AmbiguousFork`, with no generic branch evaluated |
@@ -122,6 +136,7 @@ fixes the ownership state once. The complete admission/fallback enumeration is:
 | Created-thread classification census incomplete without a trustworthy key scope | No identity can prove it is outside the missing classification census | Every Codex file is `AmbiguousFork` until a complete classification census is available |
 | Title/state-detail/history census incomplete with complete classification | Missing corroboration can weaken only an already-classified created candidate | Created identity is `AmbiguousFork`; unrelated ordinary identity remains ordinary |
 | Non-UUID/near-UUID path identity | Complete filename identity remainder and raw header/state bytes resolve through the same byte-exact key | Matching state-created suspect follows native-only admission or `AmbiguousFork`; matching ordinary file remains ordinary |
+| Timestamp-shaped legacy/current filename overlap | Both complete candidate identities survive parsing; state/census and the first authoritative header must support exactly one whenever either candidate is created/conflicted | Unique candidate follows its normal classification; otherwise `AmbiguousFork`, with every candidate blocked from state fallback |
 | Unresolvable/ambiguous path identity with created-thread suspects | No trustworthy state-to-file join exists | `AmbiguousFork`; header-controlled generic admission is unreachable |
 | `history_base` or `subagent_history_start_ordinal` marker | Cannot authorize `AllLocal` or `Ordinal`; the latter is also rejected by the native header | Native admission or `AmbiguousFork` |
 | No pagination marker with a complete parent ledger | `AwaitingParentPrefix` / `AwaitingLegacyTrigger` are unreachable; must independently satisfy the complete native witness | Native admission or `AmbiguousFork` |
@@ -145,7 +160,11 @@ only for explicitly non-created-thread legacy sources.
 | No-marker child with matched parent A, omitted parent B, then copied parent C | Identical fail-closed result | Legacy parent-prefix machine is unreachable | One copied usage drop plus one ownership-incomplete file |
 | State-proven created thread with rollout marker absent | Identical fail-closed result | State classification prevents `history_base -> AllLocal` | One copied usage drop plus one ownership-incomplete file |
 | State-proven created thread with conflicting/malformed rollout marker | Identical fail-closed result | Classification conflict is `AmbiguousFork` | One copied usage drop plus one ownership-incomplete file |
+| Readable state DB missing a required created-thread classification table/column, or carrying an undecodable row | Identical fail-closed result | Source-wide census incompleteness is `AmbiguousFork`; empty is never inferred | Exact probe: zero snapshots, one usage drop, one ownership-incomplete file, one dropped record |
+| Required state schema plus an unknown future column | Identical compatibility result | Additive schema growth remains complete | Ordinary control emits exact `30/8/12/1/1` usage with zero loss counters |
+| Legacy identity begins `YYYY-MM-DDTHH-MM-SS-` | Identical fail-closed result for the state-created probe | Full and shortened candidates are retained; the full state/header match wins | Legacy probe suppressed with one/one/one counters; modern timestamped ordinary control remains admitted |
 | Live lower/uppercase UUID-alias collision for the rollout key, marker absent, `history_base` present | Identical fail-closed result | Key-scoped census ambiguity is `AmbiguousFork`; no snapshot or upload work item | One copied usage drop plus one ownership-incomplete file; non-colliding sessions retain classification |
+| Collided identity named as parent by N direct created children | Identical fail-closed result | Each direct child loses its trusted parent edge; unrelated files and a grandchild with its own unambiguous direct edge are not identity aliases | N usage drops, N ownership-incomplete files, and N dropped records; the production regression proves N=3 |
 | Matching state/path/header identity is 35/37 characters, unhyphenated, braced, `urn:uuid:`, whitespace-suffixed, Unicode, or plain non-UUID | Identical fail-closed result for state-created suspects | Complete filename remainder and raw header/state bytes join byte-exactly; no generic admission | One copied usage drop plus one ownership-incomplete file |
 | Same near-/non-UUID corpus with an ordinary non-created state row | Identical compatibility result | Ordinary `history_base` behavior is unchanged | One ordinary snapshot with exact `30/8/12/1/1` usage |
 | Created-thread `history_base` with missing native ordinals/task structure and retrograde copied usage | Identical fail-closed result | Fails closed; no child snapshot | One dropped usage record plus one ownership-incomplete file |
@@ -172,6 +191,16 @@ timestamps are the one enumerated compatibility case, not a failure signal:
 they occur naturally in all five target files (22, 4, 4, 6, and 7 adjacent
 equal pairs), so the honest chronology rule is non-retrograde rather than
 strictly increasing.
+
+A parent-key collision has a bounded identity scope but an unbounded direct-edge
+availability cost: every direct created child whose edge names that key is
+ambiguous. There is no safe tighter bound in the available data because the
+parent bytes are the child's required independent lineage witness. The loader
+does not cap the number of such rows, so the logical bound is N direct children.
+It does not reclassify unrelated sessions or alias a grandchild's independently
+unambiguous direct edge. Each affected child is parsed and contributes its own
+usage-drop, ownership-incomplete-file, and dropped-record counter, making the
+loss visible in census health rather than silently hiding it.
 
 The remaining open case is DELIBERATE whole-file self-forgery against the
 machine operator's own billing telemetry. An operator who can rewrite the
@@ -207,9 +236,14 @@ unit; no released daemon ever ran v36/v6 and no released v36/v6 completion
 exists to distinguish with another revision. UUID-key canonicalization does not
 justify another parser/replay revision: shipped Codex state, rollout, and
 thread-history identifiers are consistently lowercase already, so no real
-shipped corpus shape changes admission. The case-alias outcome exists only for
-adversarial/damaged local evidence and remains part of this unreleased DRAFT
-v36/v6 derivation.
+shipped corpus shape changes admission. A read-only live check on 2026-08-29
+found 1,881 `state_5.sqlite` thread ids and 714 thread-history projection ids.
+Both sources had zero non-lowercase ids, zero non-exact-UUID-shaped ids, and
+zero timestamp-prefixed identities; the live `threads` table contained all
+three required classification columns. Thus the missing-schema and ambiguous
+legacy-grammar fixes change only adversarial/damaged shapes in this unreleased
+DRAFT, while the real-corpus justification for keeping v36/v6 remains intact.
+The case-alias outcome likewise remains part of the same unreleased derivation.
 
 Focused regressions run the full matrix with the curve capability present and
 absent, including `history_base`, the no-marker internal parent omission, valid
@@ -219,10 +253,13 @@ ordinal/chronology/turn failures, malformed crash tails, ordinary pagination
 non-acquisition, state-loaded absent/conflicting/malformed rollout markers,
 UUID case aliases in both state-to-rollout directions, canonical-key collision
 failure through the production scanner, every requested near-/non-UUID shape
-through the production join, generated path/state/header identity equivalence,
+through the production join, exact-length right-hyphen/non-hex and
+timestamp-prefixed legacy families in the generated path/state/header property,
+missing-table/column/row-decode failures, additive future-column growth,
 ordinary byte-exact negative controls, upload-unreachability for a suppressed
 collision file, generic-edge/unrelated-row non-acquisition, and the five corpus
-shapes. The collision probe also proves non-colliding created and ordinary rows
-retain their respective classifications. Durable production replay state is
-also exercised from recorded v2, v3, v4, and v5 through persisted v6
-completion.
+shapes. The collision probes also prove non-colliding created and ordinary rows
+retain their respective classifications and that three direct children produce
+three independent loss-counter increments in both modes. Durable production
+replay state is also exercised from recorded v2, v3, v4, and v5 through
+persisted v6 completion.
