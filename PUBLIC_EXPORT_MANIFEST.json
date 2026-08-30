@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 343,
-  "content_sha256": "bc2f57acc67c9b8d4b3d756c51e639788efb181dc9f7581c72477655487f2886",
+  "content_sha256": "35fcf6996f39acbbafb207945b7019013b4e496ec1eace5708f7fe926eaa9e07",
   "files": [
     {
       "executable": false,
@@ -853,15 +853,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "e5b95d4f4fd2e8457552db1b788e29787eef04a97eb7d1ccc71aeabe623e1e56",
-      "size_bytes": 99562
+      "sha256": "93eea8f16b34b73aca5cf8720bcdd78a9f093f1db9d1c2f809aa2a0e3177557c",
+      "size_bytes": 108210
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "77a600a30a087c59b61b3e1652dfb24ecd109b409aa696a269ceffa39531c191",
-      "size_bytes": 327858
+      "sha256": "5c936def672e5506cf0920646927fad43463724d6ab2c2418439afbe1a93a904",
+      "size_bytes": 341182
     },
     {
       "executable": false,
@@ -1492,6 +1492,13 @@
       "path": "docs/session-2026-08-30-envelope-ack-witness.md",
       "sha256": "cba649de560bfc571d91d48c1cddc8a2d2db4f145a0dc8411f5f4dcd872a37ae",
       "size_bytes": 1862
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-08-30-replay-manifest-window.md",
+      "sha256": "76f149e9002ed1668c7fed65d8fe663d2544c08b9d29d8ebca58da32801aca2a",
+      "size_bytes": 2614
     },
     {
       "executable": false,
@@ -2397,9 +2404,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-30T12:02:00+00:00",
+  "generated_at": "2026-08-30T13:44:16+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 343,
+  "output_file_count": 344,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2433,5 +2440,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d9ae4f32676175c5217342d9427dcf9a95b3ecc7"
+  "source_commit": "53df2765baac673028378975f95f536330b2044f"
 }

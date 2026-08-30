@@ -1980,6 +1980,46 @@ mod tests {
         )
     }
 
+    fn read_complete_http_request(stream: &mut std::net::TcpStream) -> String {
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(bytes_read) => {
+                    request.extend_from_slice(&buffer[..bytes_read]);
+                    let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    });
+                    if content_length.is_some_and(|length| request.len() >= header_end + 4 + length)
+                    {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&request).to_string()
+    }
+
     #[test]
     fn attribution_private_label_capability_defaults_off_for_older_backends() {
         let old_backend: ActivityHintResponse =
@@ -2007,6 +2047,24 @@ mod tests {
             admitted.session_context_curve_contract.as_deref(),
             Some("session_context_curve:v1")
         );
+    }
+
+    #[test]
+    fn activity_hint_requires_a_unsigned_backfill_window() {
+        let missing = activity_hint_json("").replace("\"backfill_window_days\":183,", "");
+        assert!(serde_json::from_str::<ActivityHintResponse>(&missing).is_err());
+
+        let string_value = activity_hint_json("").replace(
+            "\"backfill_window_days\":183",
+            "\"backfill_window_days\":\"183\"",
+        );
+        assert!(serde_json::from_str::<ActivityHintResponse>(&string_value).is_err());
+
+        let negative = activity_hint_json("").replace(
+            "\"backfill_window_days\":183",
+            "\"backfill_window_days\":-1",
+        );
+        assert!(serde_json::from_str::<ActivityHintResponse>(&negative).is_err());
     }
 
     #[test]
@@ -2259,7 +2317,7 @@ mod tests {
     #[test]
     fn status_payload_uses_safe_error_fields() {
         let status = SnapshotStatusRequest {
-            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            schema_version: crate::snapshots::SNAPSHOT_STATUS_SCHEMA_VERSION,
             source: "codex".to_string(),
             machine_id: "otm_test".to_string(),
             enabled: true,
@@ -2308,6 +2366,137 @@ mod tests {
         let serialized = serde_json::to_string(&status).expect("serialize");
         assert!(!serialized.contains(".codex"));
         assert!(!serialized.contains("/Users/"));
+    }
+
+    fn terminal_status_request_with_manifest_window(window_days: i64) -> SnapshotStatusRequest {
+        let window_end = time::OffsetDateTime::parse(
+            "2026-08-30T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("window end");
+        let window_start = window_end - time::Duration::days(window_days);
+        SnapshotStatusRequest {
+            schema_version: crate::snapshots::SNAPSHOT_STATUS_SCHEMA_VERSION,
+            source: "codex".to_string(),
+            machine_id: "otm_test".to_string(),
+            enabled: true,
+            disabled_reason: None,
+            last_scan_started_at: Some("2026-08-30T12:00:00Z".to_string()),
+            last_scan_finished_at: Some("2026-08-30T12:01:00Z".to_string()),
+            last_success_at: Some("2026-08-30T12:01:00Z".to_string()),
+            last_error_code: None,
+            last_error_message: None,
+            last_uploaded_count: 1,
+            last_scanned_session_count: 1,
+            last_scanned_file_count: 1,
+            last_zero_snapshot_confirmed_count: 0,
+            last_zero_snapshot_usage_evidence_count: 0,
+            last_dropped_usage_record_count: 0,
+            last_ownership_incomplete_file_count: 0,
+            last_backfill_window_days: window_days as u64,
+            last_backfill_file_limit: 10_000,
+            last_discovered_file_count: 1,
+            last_skipped_file_count_due_to_limit: 0,
+            last_scan_cap_hit: false,
+            last_semantic_noop_count: 0,
+            last_census_complete: true,
+            last_symlink_rejected_count: 0,
+            last_unreadable_path_count: 0,
+            last_oversized_file_count: 0,
+            last_disappeared_file_count: 0,
+            last_malformed_json_line_count: 0,
+            last_invalid_utf8_line_count: 0,
+            last_over_line_cap_count: 0,
+            last_recognized_usage_drop_count: 0,
+            consecutive_failures: 0,
+            next_retry_at: None,
+            collector_version: Some("0.1.120".to_string()),
+            parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
+            manifest: Some(SnapshotSourceManifest {
+                contract_version: crate::snapshots::SNAPSHOT_MANIFEST_CONTRACT_VERSION,
+                scope: crate::snapshots::SNAPSHOT_MANIFEST_SCOPE,
+                source: "codex".to_string(),
+                window_start: window_start
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .expect("window start"),
+                window_end: "2026-08-30T12:00:00Z".to_string(),
+                entity_count: 1,
+                rolling_hash: "b".repeat(64),
+            }),
+        }
+    }
+
+    #[test]
+    fn backend_422_contract_rejects_replay_width_but_accepts_negotiated_manifest_window() {
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind contract fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let captured_server = captured.clone();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept status request");
+                let request = read_complete_http_request(&mut stream);
+                let body = request
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body)
+                    .unwrap_or("");
+                let value: serde_json::Value = serde_json::from_str(body).expect("status JSON");
+                captured_server
+                    .lock()
+                    .expect("capture status fixture")
+                    .push(value.clone());
+                let manifest = &value["manifest"];
+                let start = time::OffsetDateTime::parse(
+                    manifest["window_start"].as_str().expect("window start"),
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .expect("parse start");
+                let end = time::OffsetDateTime::parse(
+                    manifest["window_end"].as_str().expect("window end"),
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .expect("parse end");
+                let too_wide = end - start > time::Duration::days(183);
+                let (status, response_body) = if too_wide {
+                    (
+                        "422 Unprocessable Entity",
+                        r#"{"detail":"manifest window exceeds the server backfill policy ceiling"}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"accepted":true,"source":"codex","machine_id":"otm_test","disabled":false,"disabled_reason":null}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                use std::io::Write;
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write fixture response");
+            }
+        });
+
+        let client = SnapshotApiClient::new(format!("http://{address}"));
+        let legacy = terminal_status_request_with_manifest_window(730);
+        let rejected = client
+            .report_status("relay", &legacy)
+            .expect_err("the backend contract rejects the replay scan width");
+        assert!(rejected.to_string().contains("status_family=http_4xx"));
+
+        let corrected = terminal_status_request_with_manifest_window(183);
+        let accepted = client
+            .report_status("relay", &corrected)
+            .expect("negotiated evidence window is accepted");
+        assert!(accepted.accepted);
+        let requests = captured.lock().expect("captured fixture requests");
+        assert_eq!(requests[0]["last_backfill_window_days"], 730);
+        assert_eq!(requests[1]["last_backfill_window_days"], 183);
     }
 
     fn entity_ref(session: &str, fingerprint: &str, occurrence_count: u64) -> SnapshotEntityRef {

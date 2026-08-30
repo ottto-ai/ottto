@@ -53,10 +53,16 @@ const SNAPSHOT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 // freshness promise is a check-in within five minutes — beat well inside it so
 // receipt age stays bounded no matter how long a cycle runs.
 const COLLECTOR_CHECKIN_INTERVAL: Duration = Duration::from_secs(2 * 60);
-// Backfill horizon carried on non-terminal receipts. Only meaningful when a
-// receipt seeds a brand-new status row (fresh onboarding, before the first
-// terminal report); terminal reports carry the activity-hint-authorized value.
-const CHECKIN_BACKFILL_WINDOW_DAYS: u64 = 183;
+// The backend status/manifest contract accepts a negotiated semantic evidence
+// window of at most 183 days. Historical replay may traverse a wider local
+// corpus, but it must never widen this receipt contract: the manifest is
+// recomputed from semantic activity inside the negotiated window.
+const MAX_SNAPSHOT_STATUS_WINDOW_DAYS: u64 = 183;
+// Backfill horizon carried on manifest-free non-terminal receipts. Only
+// meaningful when a receipt seeds a brand-new status row (fresh onboarding,
+// before the first terminal report); manifest-bearing receipts derive this
+// value from the exact cached window instead.
+const CHECKIN_BACKFILL_WINDOW_DAYS: u64 = MAX_SNAPSHOT_STATUS_WINDOW_DAYS;
 const LOCAL_HEALTH_PROJECTION_INTERVAL: Duration = Duration::from_secs(60);
 const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: i64 = 15;
 // Match the backend's accepted entity count while retaining a separate byte
@@ -891,9 +897,17 @@ impl SyncCounts {
         }
     }
 
-    fn from_scan_result(scan_result: &SourceScanResult, uploaded_count: u64) -> Self {
+    fn from_scan_result(
+        scan_result: &SourceScanResult,
+        uploaded_count: u64,
+        receipt_window_days: u64,
+    ) -> Self {
         Self {
-            backfill_window_days: scan_result.backfill_window_days,
+            // Scan coverage and receipt evidence are deliberately different
+            // during replay. The counters below describe the wider traversal;
+            // this field and the manifest describe only the server-negotiated
+            // semantic activity window.
+            backfill_window_days: receipt_window_days,
             backfill_file_limit: scan_result.backfill_file_limit as u64,
             discovered_file_count: scan_result.discovered_file_count as u64,
             skipped_file_count_due_to_limit: scan_result.skipped_file_count_due_to_limit as u64,
@@ -918,6 +932,66 @@ impl SyncCounts {
             uploaded_count,
         }
     }
+}
+
+fn validated_receipt_window_days(negotiated_window_days: u64) -> Result<u64> {
+    if !(1..=MAX_SNAPSHOT_STATUS_WINDOW_DAYS).contains(&negotiated_window_days) {
+        return Err(anyhow!(
+            "snapshot status evidence window is outside the supported 1..={MAX_SNAPSHOT_STATUS_WINDOW_DAYS} day range"
+        ));
+    }
+    Ok(negotiated_window_days)
+}
+
+fn scan_request_window_days(
+    receipt_window_days: u64,
+    backfill_pending: bool,
+    curve_replay_pending: bool,
+) -> u64 {
+    if backfill_pending || curve_replay_pending {
+        // The scanner applies its own local safety ceiling. `u64::MAX` means
+        // "walk the complete replay range", not "claim this width upstream".
+        u64::MAX
+    } else {
+        receipt_window_days
+    }
+}
+
+fn snapshot_manifest_window(
+    census_window_end: &str,
+    receipt_window_days: u64,
+) -> Result<(String, String)> {
+    let receipt_window_days = validated_receipt_window_days(receipt_window_days)?;
+    let window_end = OffsetDateTime::parse(census_window_end, &Rfc3339)
+        .context("parse snapshot manifest window end")?;
+    let window_start = window_end
+        .checked_sub(TimeDuration::days(receipt_window_days as i64))
+        .ok_or_else(|| anyhow!("snapshot manifest window overflow"))?;
+    Ok((
+        window_start
+            .format(&Rfc3339)
+            .context("format snapshot manifest window start")?,
+        window_end
+            .format(&Rfc3339)
+            .context("format snapshot manifest window end")?,
+    ))
+}
+
+fn snapshot_manifest_window_days(manifest: &SnapshotSourceManifest) -> Result<u64> {
+    let window_start = OffsetDateTime::parse(&manifest.window_start, &Rfc3339)
+        .context("parse cached snapshot manifest window start")?;
+    let window_end = OffsetDateTime::parse(&manifest.window_end, &Rfc3339)
+        .context("parse cached snapshot manifest window end")?;
+    let window_seconds = (window_end - window_start).whole_seconds();
+    let day_seconds = 24 * 60 * 60;
+    if window_seconds <= 0 || window_seconds % day_seconds != 0 {
+        return Err(anyhow!(
+            "cached snapshot manifest window is not a positive whole-day interval"
+        ));
+    }
+    let window_days = u64::try_from(window_seconds / day_seconds)
+        .context("convert cached snapshot manifest window days")?;
+    validated_receipt_window_days(window_days)
 }
 
 #[derive(Debug)]
@@ -1699,6 +1773,11 @@ fn sync_source(
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     let mut activity_hint = client.get_activity_hint(&relay_token)?;
+    // Treat the activity hint as the only authority for the semantic evidence
+    // window. Missing/malformed hints already fail JSON decoding; zero and
+    // future out-of-contract widths fail here before any scan or receipt can
+    // manufacture a fallback policy.
+    let receipt_window_days = validated_receipt_window_days(activity_hint.backfill_window_days)?;
     let context_curve_enabled = source != SnapshotSource::Pi
         && activity_hint.session_context_curve_contract.as_deref()
             == Some(CONTEXT_CURVE_CONTRACT_VERSION);
@@ -1773,7 +1852,7 @@ fn sync_source(
                 source,
                 machine_id,
                 scan_started_at: &scan_started_at,
-                counts: SyncCounts::for_policy(activity_hint.backfill_window_days),
+                counts: SyncCounts::for_policy(receipt_window_days),
                 state: CollectorState::Disabled(Some("disabled_by_admin".to_string())),
             },
         )?;
@@ -1940,11 +2019,7 @@ fn sync_source(
         &roots,
         &mut index,
         &scan_started_at,
-        if backfill_pending || curve_replay_pending {
-            u64::MAX
-        } else {
-            activity_hint.backfill_window_days
-        },
+        scan_request_window_days(receipt_window_days, backfill_pending, curve_replay_pending),
         upload_policy.session_artifacts_enabled,
         attribution_context.as_ref(),
         (source == SnapshotSource::ClaudeCode).then_some(support_dir),
@@ -1964,7 +2039,7 @@ fn sync_source(
                     source,
                     machine_id,
                     scan_started_at: &scan_started_at,
-                    counts: SyncCounts::for_policy(activity_hint.backfill_window_days),
+                    counts: SyncCounts::for_policy(receipt_window_days),
                     state: CollectorState::Error {
                         code: "scan_error",
                         message: "local snapshot scan failed",
@@ -2109,21 +2184,8 @@ fn sync_source(
         // publishable until every discovered path was read completely.
         withdraw_source_manifest(&upload_destination_namespace, source);
     }
-    let manifest_window_end = OffsetDateTime::parse(&scan_result.census_window_end, &Rfc3339)
-        .context("parse snapshot manifest window end")?;
-    let manifest_window_days = scan_result.backfill_window_days;
-    if manifest_window_days == 0 || manifest_window_days > i64::MAX as u64 {
-        return Err(anyhow!("snapshot manifest window must be non-empty"));
-    }
-    let manifest_window_start = manifest_window_end
-        .checked_sub(TimeDuration::days(manifest_window_days as i64))
-        .ok_or_else(|| anyhow!("snapshot manifest window overflow"))?;
-    let manifest_window_start = manifest_window_start
-        .format(&Rfc3339)
-        .context("format snapshot manifest window start")?;
-    let manifest_window_end = manifest_window_end
-        .format(&Rfc3339)
-        .context("format snapshot manifest window end")?;
+    let (manifest_window_start, manifest_window_end) =
+        snapshot_manifest_window(&scan_result.census_window_end, receipt_window_days)?;
     // A bounded traversal may span process restarts. Its manifest is scoped to
     // the first tick's pinned census boundary, so every post-scan terminal
     // receipt must identify that same logical scan start rather than the later
@@ -2276,7 +2338,11 @@ fn sync_source(
                     source,
                     machine_id,
                     scan_started_at: terminal_scan_started_at,
-                    counts: SyncCounts::from_scan_result(&scan_result, accepted),
+                    counts: SyncCounts::from_scan_result(
+                        &scan_result,
+                        accepted,
+                        receipt_window_days,
+                    ),
                     // `server_error` is the closest code the receipt contract
                     // carries; the loss report is where the shed is named
                     // precisely.
@@ -2298,7 +2364,11 @@ fn sync_source(
                     source,
                     machine_id,
                     scan_started_at: terminal_scan_started_at,
-                    counts: SyncCounts::from_scan_result(&scan_result, accepted),
+                    counts: SyncCounts::from_scan_result(
+                        &scan_result,
+                        accepted,
+                        receipt_window_days,
+                    ),
                     state: CollectorState::Disabled(
                         disabled_reason.or_else(|| Some("disabled_by_admin".to_string())),
                     ),
@@ -2431,7 +2501,11 @@ fn sync_source(
                     source,
                     machine_id,
                     scan_started_at: terminal_scan_started_at,
-                    counts: SyncCounts::from_scan_result(&scan_result, accepted),
+                    counts: SyncCounts::from_scan_result(
+                        &scan_result,
+                        accepted,
+                        receipt_window_days,
+                    ),
                     state,
                 },
             );
@@ -2524,7 +2598,7 @@ fn sync_source(
                 source,
                 machine_id,
                 scan_started_at: terminal_scan_started_at,
-                counts: SyncCounts::from_scan_result(&scan_result, accepted),
+                counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days),
                 state: CollectorState::Error {
                     code: "server_error",
                     message: "backend deferred conflicting snapshot entities",
@@ -2543,7 +2617,7 @@ fn sync_source(
             source,
             machine_id,
             scan_started_at: terminal_scan_started_at,
-            counts: SyncCounts::from_scan_result(&scan_result, accepted),
+            counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days),
             state: CollectorState::Success,
         },
     )?;
@@ -3272,13 +3346,18 @@ fn report_status(
             ),
         };
     let manifest = cached_source_manifest(destination_namespace, status.source);
-    if manifest
-        .as_ref()
-        .is_some_and(|manifest| manifest.window_end != status.scan_started_at)
-    {
-        return Err(anyhow!(
-            "snapshot manifest window end does not match terminal scan start"
-        ));
+    if let Some(manifest) = manifest.as_ref() {
+        if manifest.window_end != status.scan_started_at {
+            return Err(anyhow!(
+                "snapshot manifest window end does not match terminal scan start"
+            ));
+        }
+        let manifest_window_days = snapshot_manifest_window_days(manifest)?;
+        if manifest_window_days != status.counts.backfill_window_days {
+            return Err(anyhow!(
+                "snapshot manifest window does not match terminal receipt evidence window"
+            ));
+        }
     }
     let request = SnapshotStatusRequest {
         schema_version: SNAPSHOT_STATUS_SCHEMA_VERSION,
@@ -3349,6 +3428,12 @@ fn report_checkin_status(
     machine_id: &str,
     scan_started_at: Option<&str>,
 ) -> Result<()> {
+    let manifest = cached_source_manifest(destination_namespace, source);
+    let receipt_window_days = manifest
+        .as_ref()
+        .map(snapshot_manifest_window_days)
+        .transpose()?
+        .unwrap_or(CHECKIN_BACKFILL_WINDOW_DAYS);
     let request = SnapshotStatusRequest {
         schema_version: SNAPSHOT_STATUS_SCHEMA_VERSION,
         source: source.api_slug().to_string(),
@@ -3367,7 +3452,7 @@ fn report_checkin_status(
         last_zero_snapshot_usage_evidence_count: 0,
         last_dropped_usage_record_count: 0,
         last_ownership_incomplete_file_count: 0,
-        last_backfill_window_days: CHECKIN_BACKFILL_WINDOW_DAYS,
+        last_backfill_window_days: receipt_window_days,
         last_backfill_file_limit: 0,
         last_discovered_file_count: 0,
         last_skipped_file_count_due_to_limit: 0,
@@ -3390,7 +3475,7 @@ fn report_checkin_status(
         // cheapest cadence the server gets it on, and a check-in that says
         // "alive" while the entity sets disagree is exactly the state the
         // manifest exists to expose.
-        manifest: cached_source_manifest(destination_namespace, source),
+        manifest,
     };
     client.report_status(relay_token, &request)?;
     Ok(())
@@ -3915,6 +4000,21 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+
+    struct SourceManifestTestGuard;
+
+    impl SourceManifestTestGuard {
+        fn new() -> Self {
+            clear_source_manifests_for_test();
+            Self
+        }
+    }
+
+    impl Drop for SourceManifestTestGuard {
+        fn drop(&mut self) {
+            clear_source_manifests_for_test();
+        }
+    }
 
     fn test_fingerprints(count: usize) -> Vec<String> {
         (0..count).map(|index| format!("{index:064x}")).collect()
@@ -5689,8 +5789,9 @@ mod tests {
     }
 
     #[test]
-    #[serial(source_cadences)]
+    #[serial(source_cadences, source_manifests)]
     fn the_cadence_tier_never_reaches_the_wire_or_any_identity() {
+        let _source_manifests = SourceManifestTestGuard::new();
         clear_cadence_state_for_test();
         // The cadence tier and the scan trigger are implementation state. If either
         // entered an identity, every session on a machine would re-mint its content
@@ -7180,7 +7281,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(source_manifests)]
     fn collector_status_report_mints_fresh_relay_token() {
+        let _source_manifests = SourceManifestTestGuard::new();
         let captured = Arc::new(Mutex::new(Vec::new()));
         let api_base_url = snapshot_status_server(captured.clone());
         let client = SnapshotApiClient::new(api_base_url);
@@ -7219,7 +7322,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(source_manifests)]
     fn settled_zero_snapshot_usage_evidence_reports_persistent_parse_error() {
+        let _source_manifests = SourceManifestTestGuard::new();
         let captured = Arc::new(Mutex::new(Vec::new()));
         let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
         let device = LocalDeviceBinding {
@@ -7254,7 +7359,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(source_manifests)]
     fn healthy_sibling_upload_does_not_hide_dropped_usage_record() {
+        let _source_manifests = SourceManifestTestGuard::new();
         let captured = Arc::new(Mutex::new(Vec::new()));
         let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
         let device = LocalDeviceBinding {
@@ -7290,7 +7397,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(source_manifests)]
     fn cycle_start_checkin_posts_in_progress_receipt() {
+        let _source_manifests = SourceManifestTestGuard::new();
         let captured = Arc::new(Mutex::new(Vec::new()));
         let api_base_url = snapshot_status_server(captured.clone());
         let client = SnapshotApiClient::new(api_base_url);
@@ -7327,7 +7436,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(source_manifests)]
     fn heartbeat_checkin_posts_liveness_only_receipt() {
+        let _source_manifests = SourceManifestTestGuard::new();
         let captured = Arc::new(Mutex::new(Vec::new()));
         let api_base_url = snapshot_status_server(captured.clone());
         let client = SnapshotApiClient::new(api_base_url);
@@ -7362,7 +7473,7 @@ mod tests {
     #[test]
     #[serial(source_manifests)]
     fn receipts_carry_the_scan_index_manifest_once_a_scan_has_published_one() {
-        clear_source_manifests_for_test();
+        let _source_manifests = SourceManifestTestGuard::new();
         let device = LocalDeviceBinding {
             device_id: "device_test".to_string(),
             machine_id: Some("otm_test".to_string()),
@@ -7393,7 +7504,9 @@ mod tests {
         index
             .codex_state_only_snapshot_fingerprints
             .insert("session-1".to_string(), "a".repeat(64));
-        let manifest = index.manifest(SnapshotSource::Codex, 183);
+        let mut manifest = index.manifest(SnapshotSource::Codex, 30);
+        manifest.window_start = "2099-12-02T00:00:00Z".to_string();
+        manifest.window_end = "2100-01-01T00:00:00Z".to_string();
         publish_source_manifest(
             destination_namespace,
             SnapshotSource::Codex,
@@ -7423,8 +7536,9 @@ mod tests {
             // uploaded from outside the scan window.
             assert!(requests[1].contains("\"contract_version\":\"snapshot_manifest:v2\""));
             assert!(requests[1].contains("\"scope\":\"semantic_activity_window\""));
-            assert!(requests[1].contains("\"window_start\":\"2000-01-01T00:00:00Z\""));
+            assert!(requests[1].contains("\"window_start\":\"2099-12-02T00:00:00Z\""));
             assert!(requests[1].contains("\"window_end\":\"2100-01-01T00:00:00Z\""));
+            assert!(requests[1].contains("\"last_backfill_window_days\":30"));
             assert!(!requests[1].contains("\"window_days\""));
             assert!(!requests[1].contains("\"server_accepted_entity_count\""));
         }
@@ -7499,13 +7613,12 @@ mod tests {
         let new_namespace = snapshot_upload_destination_namespace(&switched, "device-secret");
         publish_source_manifest(&new_namespace, SnapshotSource::Codex, manifest.clone());
         assert!(cached_source_manifest(destination_namespace, SnapshotSource::Codex).is_none());
-        clear_source_manifests_for_test();
     }
 
     #[test]
     #[serial(source_manifests)]
     fn incomplete_census_withdraws_only_its_stale_source_manifest() {
-        clear_source_manifests_for_test();
+        let _source_manifests = SourceManifestTestGuard::new();
         let destination = "destination";
         let codex = ScanIndex::default().manifest(SnapshotSource::Codex, 183);
         let claude = ScanIndex::default().manifest(SnapshotSource::ClaudeCode, 183);
@@ -7519,13 +7632,12 @@ mod tests {
             cached_source_manifest(destination, SnapshotSource::ClaudeCode),
             Some(claude)
         );
-        clear_source_manifests_for_test();
     }
 
     #[test]
     #[serial(source_manifests)]
     fn poisoned_manifest_cache_recovers_publish_read_and_withdraw() {
-        clear_source_manifests_for_test();
+        let _source_manifests = SourceManifestTestGuard::new();
         let poisoned = std::thread::spawn(|| {
             let _manifests = source_manifests()
                 .lock()
@@ -7544,13 +7656,12 @@ mod tests {
         );
         withdraw_source_manifest(destination, SnapshotSource::Codex);
         assert!(cached_source_manifest(destination, SnapshotSource::Codex).is_none());
-        clear_source_manifests_for_test();
     }
 
     #[test]
     #[serial(source_manifests)]
     fn terminal_incomplete_error_and_disabled_receipts_carry_explicit_withdrawal_shape() {
-        clear_source_manifests_for_test();
+        let _source_manifests = SourceManifestTestGuard::new();
         let device = LocalDeviceBinding {
             device_id: "device_test".to_string(),
             machine_id: Some("otm_test".to_string()),
@@ -7599,13 +7710,12 @@ mod tests {
             // Nonterminal + absent manifest remains liveness-only/unknown.
             assert!(!request.contains("\"manifest\""));
         }
-        clear_source_manifests_for_test();
     }
 
     #[test]
     #[serial(source_manifests)]
     fn completed_upload_save_failure_cannot_leave_the_stale_manifest_cached() {
-        clear_source_manifests_for_test();
+        let _source_manifests = SourceManifestTestGuard::new();
         let destination = "destination";
         publish_source_manifest(
             destination,
@@ -7629,7 +7739,6 @@ mod tests {
         .expect_err("post-ACK index save must fail at the invalid target");
 
         assert!(cached_source_manifest(destination, SnapshotSource::Codex).is_none());
-        clear_source_manifests_for_test();
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -7640,6 +7749,214 @@ mod tests {
         // headroom, and faster than the sync loop's own sleep.
         assert!(COLLECTOR_CHECKIN_INTERVAL <= Duration::from_secs(4 * 60));
         assert!(COLLECTOR_CHECKIN_INTERVAL < SNAPSHOT_SYNC_INTERVAL);
+    }
+
+    #[test]
+    fn backfill_and_curve_replay_keep_report_width_at_current_hint() {
+        let receipt_window_days = validated_receipt_window_days(183).expect("valid hint");
+        assert_eq!(
+            scan_request_window_days(receipt_window_days, false, false),
+            receipt_window_days,
+            "after replay the scan returns to the current policy width"
+        );
+
+        for (replay_name, backfill_pending, curve_replay_pending) in
+            [("backfill", true, false), ("curve", false, true)]
+        {
+            assert_eq!(
+                scan_request_window_days(
+                    receipt_window_days,
+                    backfill_pending,
+                    curve_replay_pending,
+                ),
+                u64::MAX,
+                "{replay_name} replay requests the scanner's broad local range"
+            );
+
+            for source in [
+                SnapshotSource::Codex,
+                SnapshotSource::ClaudeCode,
+                SnapshotSource::Pi,
+            ] {
+                let root = test_dir(&format!(
+                    "{replay_name}-replay-window-{}",
+                    source.api_slug()
+                ));
+                std::fs::create_dir_all(&root).expect("create empty source root");
+                let mut index = ScanIndex::default();
+                let result = crate::snapshots::scan_source_roots(
+                    source,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    "2026-08-30T12:00:00Z",
+                    scan_request_window_days(
+                        receipt_window_days,
+                        backfill_pending,
+                        curve_replay_pending,
+                    ),
+                )
+                .expect("broad replay scan");
+                assert_eq!(
+                    result.backfill_window_days,
+                    crate::snapshots::BACKFILL_WINDOW_DAYS,
+                    "the local scanner keeps its 730-day replay ceiling"
+                );
+                let counts = SyncCounts::from_scan_result(&result, 0, receipt_window_days);
+                assert_eq!(
+                    counts.backfill_window_days, receipt_window_days,
+                    "{replay_name} terminal status reports the exact hint"
+                );
+                let (window_start, window_end) =
+                    snapshot_manifest_window(&result.census_window_end, receipt_window_days)
+                        .expect("policy-width replay manifest");
+                let manifest = index
+                    .manifest_for_window(source, &window_start, &window_end)
+                    .expect("replay manifest");
+                assert_eq!(
+                    snapshot_manifest_window_days(&manifest).unwrap(),
+                    receipt_window_days,
+                    "{replay_name} terminal manifest reports the exact hint"
+                );
+                assert!(counts.census_complete);
+                let _ = std::fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    #[test]
+    fn replay_scan_discovers_session_older_than_policy_window() {
+        let root = test_dir("replay-discovers-beyond-policy-window");
+        std::fs::create_dir_all(&root).expect("create replay root");
+        let path = root.join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"replay-session\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-01-01T00:01:00Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"usage\":{\"input\":12,\"output\":4}}}\n"
+            ),
+        )
+        .expect("write old replay fixture");
+        let old_mtime = OffsetDateTime::parse("2026-01-01T00:02:00Z", &Rfc3339)
+            .expect("old fixture mtime")
+            .unix_timestamp() as u64;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open old replay fixture")
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(old_mtime),
+                ),
+            )
+            .expect("set old replay fixture mtime");
+
+        let mut policy_index = ScanIndex::default();
+        let policy_scan = crate::snapshots::scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut policy_index,
+            "2026-08-30T12:00:00Z",
+            scan_request_window_days(183, false, false),
+        )
+        .expect("policy-width scan");
+        assert_eq!(policy_scan.discovered_file_count, 0);
+        assert!(policy_scan.snapshots.is_empty());
+
+        let mut replay_index = ScanIndex::default();
+        let replay_scan = crate::snapshots::scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut replay_index,
+            "2026-08-30T12:00:00Z",
+            scan_request_window_days(183, true, false),
+        )
+        .expect("wide replay scan");
+        assert_eq!(replay_scan.backfill_window_days, 730);
+        assert_eq!(replay_scan.discovered_file_count, 1);
+        assert_eq!(replay_scan.scanned_file_count, 1);
+        assert_eq!(replay_scan.snapshots.len(), 1);
+        assert_eq!(replay_scan.snapshots[0].source_session_id, "replay-session");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replay_terminal_report_uses_the_latest_hint_on_each_page() {
+        let root = test_dir("replay-current-hint");
+        std::fs::create_dir_all(&root).expect("create replay root");
+        let mut index = ScanIndex::default();
+        let result = crate::snapshots::scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-30T12:00:00Z",
+            scan_request_window_days(183, false, true),
+        )
+        .expect("broad replay scan");
+        assert_eq!(result.backfill_window_days, 730);
+
+        for current_hint in [183, 30, 90] {
+            assert_eq!(
+                scan_request_window_days(current_hint, false, true),
+                u64::MAX,
+                "a changed hint must not narrow the in-progress replay scan"
+            );
+            let counts = SyncCounts::from_scan_result(&result, 0, current_hint);
+            assert_eq!(counts.backfill_window_days, current_hint);
+            let (window_start, window_end) =
+                snapshot_manifest_window(&result.census_window_end, current_hint)
+                    .expect("current-hint manifest window");
+            let manifest = index
+                .manifest_for_window(SnapshotSource::Codex, &window_start, &window_end)
+                .expect("current-hint manifest");
+            assert_eq!(
+                snapshot_manifest_window_days(&manifest).unwrap(),
+                current_hint
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replay_manifest_folds_only_entities_inside_the_negotiated_semantic_window() {
+        let inside = "a".repeat(64);
+        let replay_only = "b".repeat(64);
+        let mut index = ScanIndex::default();
+        index
+            .file_snapshot_fingerprints
+            .insert("inside.jsonl".to_string(), BTreeSet::from([inside.clone()]));
+        index.file_snapshot_fingerprints.insert(
+            "replay-only.jsonl".to_string(),
+            BTreeSet::from([replay_only.clone()]),
+        );
+        index.snapshot_activity_at = BTreeMap::from([
+            (inside, Some("2026-08-29T00:00:00Z".to_string())),
+            (replay_only, Some("2025-08-29T00:00:00Z".to_string())),
+        ]);
+        let (window_start, window_end) =
+            snapshot_manifest_window("2026-08-30T12:00:00Z", 183).expect("manifest window");
+
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
+            let manifest = index
+                .manifest_for_window(source, &window_start, &window_end)
+                .expect("source-generic semantic manifest");
+            assert_eq!(manifest.entity_count, 1);
+            assert_eq!(snapshot_manifest_window_days(&manifest).unwrap(), 183);
+        }
+    }
+
+    #[test]
+    fn invalid_or_future_receipt_window_hints_fail_closed() {
+        assert!(validated_receipt_window_days(0).is_err());
+        assert_eq!(validated_receipt_window_days(1).unwrap(), 1);
+        assert_eq!(validated_receipt_window_days(183).unwrap(), 183);
+        assert!(validated_receipt_window_days(184).is_err());
+        assert!(validated_receipt_window_days(u64::MAX).is_err());
     }
 
     struct EnvVarGuard {
