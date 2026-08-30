@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 343,
-  "content_sha256": "cc58b2c785d48a05da419b3469b1dcc418d74ce0369fa21730c55b4559b4d4a0",
+  "content_sha256": "c0ce451db213a641bf4c799175cc7769fa5e386e23b0504eba4eeb56932d1ff5",
   "files": [
     {
       "executable": false,
@@ -853,15 +853,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "e5b95d4f4fd2e8457552db1b788e29787eef04a97eb7d1ccc71aeabe623e1e56",
-      "size_bytes": 99562
+      "sha256": "93eea8f16b34b73aca5cf8720bcdd78a9f093f1db9d1c2f809aa2a0e3177557c",
+      "size_bytes": 108210
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "77a600a30a087c59b61b3e1652dfb24ecd109b409aa696a269ceffa39531c191",
-      "size_bytes": 327858
+      "sha256": "ef68364577f19a3dbd932d454453865bd4f0036590520d93014b5c231bbc50cc",
+      "size_bytes": 358587
     },
     {
       "executable": false,
@@ -1492,6 +1492,13 @@
       "path": "docs/session-2026-08-30-envelope-ack-witness.md",
       "sha256": "cba649de560bfc571d91d48c1cddc8a2d2db4f145a0dc8411f5f4dcd872a37ae",
       "size_bytes": 1862
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-08-30-replay-manifest-window.md",
+      "sha256": "23af25c560d5c77e677e74e6d47bd4bf124208bb0c6a47a45bd418d5f02bb21c",
+      "size_bytes": 3372
     },
     {
       "executable": false,
@@ -2397,9 +2404,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-30T13:28:39+00:00",
+  "generated_at": "2026-08-30T16:07:21+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 343,
+  "output_file_count": 344,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2433,5 +2440,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "7940e4e5f51f58f28b7369db59c092c8f8cca4e9"
+  "source_commit": "c36a4d9a65c68210cc0a4ee2fd6a0d77a7c40485"
 }
