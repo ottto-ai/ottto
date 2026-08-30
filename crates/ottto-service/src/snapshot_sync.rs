@@ -2181,12 +2181,15 @@ fn sync_source(
             census_complete,
             &census_window_end,
         );
-        if index.claude_usage_authority_pending_count() > 0 {
+        if index.account_claude_usage_authority_census_health(&mut scan_result) {
             // These revisions were fully readable, but uploading them would
             // demote a previously proven usage authority. They remain pending
             // local work: healthy siblings may settle, while this census and
             // any historical replay stay non-terminal until a complete family
-            // pass reconstructs the exact witness.
+            // pass reconstructs the exact witness. Exhausted families are not
+            // pending here: the helper accounts each held entity through the
+            // backend-admitted ownership-incomplete status counter while
+            // allowing a complete-with-named-loss census.
             scan_result.census_complete = false;
             scan_result.scan_cap_hit = true;
             index.mark_bounded_sweep_unsettled();

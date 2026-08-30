@@ -19,12 +19,25 @@ The daemon now distinguishes that state from backend poison quarantine:
 - A content-free family quarantine binds the proven-witness digest to every
   known member's exact scan fingerprint. The weaker revision is removed at the
   network boundary and is never counted as accepted or backend-quarantined.
-- Retry is bounded to a deterministic six-to-twelve-hour family deadline. A
-  changed member revision or mismatched witness bypasses the deadline; a due
-  pass reparses every member so reconstruction sees one complete family.
+- Retry uses a deterministic six-to-twelve-hour family deadline. The durable
+  budget is four failed complete-family reconstructions: the initial failure
+  plus three retries. This gives transient sidecar lag three recovery windows
+  and bounds an unchanged family's non-terminal lifetime to 18-36 hours.
+- A changed member revision, changed membership set, or mismatched witness
+  bypasses the deadline and reparses every current family member, including
+  unchanged quarantined siblings outside the ordinary bounded page. The retry
+  record is updated only after that full-family parse.
 - Healthy unrelated entities continue to upload. The held family remains
-  pending, makes the source census non-terminal, and preserves the existing
-  clean-follow-up rule until a complete pass restores authority.
+  pending and makes the source census non-terminal only while retry budget
+  remains. Exhaustion transitions durably to the explicit
+  `unproven_terminal` disposition: weaker bodies remain held, the retained
+  authority witness remains intact, and every affected entity is reported in
+  status as `last_ownership_incomplete_file_count`.
+- `last_ownership_incomplete_file_count` is the existing schema-v5,
+  backend-admitted ownership-loss counter introduced by the ottto#379 lineage
+  (`65d79c9e`). Terminal loss is added after the filesystem census, matching
+  v6 loss-accounting semantics: `last_census_complete` can be true alongside a
+  nonzero named loss instead of deadlocking or silently dropping the family.
 - On successful reconstruction, the authoritative revision uploads normally,
   the local family quarantine clears, and the terminal census may complete.
 

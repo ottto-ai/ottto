@@ -351,6 +351,10 @@ pub const SNAPSHOT_QUARANTINE_RETRY_SECONDS: u64 = 6 * 60 * 60;
 const CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION: &str =
     "claude_usage_authority_quarantine:v1";
 const CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS: u64 = 6 * 60 * 60;
+/// One initial failed reconstruction plus three deterministic 6-12 hour
+/// retries. This gives transient sidecar lag three recovery windows while
+/// bounding an unchanged family's non-terminal lifetime to 18-36 hours.
+const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES: u8 = 4;
 
 /// What the manifest counts, declared on the wire rather than assumed.
 ///
@@ -2041,6 +2045,18 @@ struct ClaudeUsageFamilyPending {
     invalid: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ClaudeUsageAuthorityQuarantineDisposition {
+    #[default]
+    RetryPending,
+    UnprovenTerminal,
+}
+
+fn initial_claude_usage_authority_failure_count() -> u8 {
+    1
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ClaudeUsageAuthorityQuarantineRecord {
     contract: String,
@@ -2052,6 +2068,14 @@ struct ClaudeUsageAuthorityQuarantineRecord {
     /// contain no transcript content and let a changed revision bypass the
     /// timer while unchanged failures observe bounded retry cadence.
     member_source_file_fingerprints: BTreeMap<String, String>,
+    /// Consecutive complete-family reconstruction failures for this retained
+    /// witness. Older v1 records predate the field but already represent the
+    /// initial failure, so deserialize them as one rather than granting an
+    /// unbounded fresh budget after upgrade.
+    #[serde(default = "initial_claude_usage_authority_failure_count")]
+    failed_reconstruction_count: u8,
+    #[serde(default)]
+    disposition: ClaudeUsageAuthorityQuarantineDisposition,
     retry_after_unix_seconds: u64,
 }
 
@@ -2161,6 +2185,15 @@ fn claude_usage_authority_deadline_is_bounded(
     record.contract == CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION
         && sha256_hex_is_well_formed(&record.proven_witness_fingerprint)
         && !record.member_source_file_fingerprints.is_empty()
+        && (1..=MAX_CLAUDE_USAGE_AUTHORITY_FAILURES).contains(&record.failed_reconstruction_count)
+        && match record.disposition {
+            ClaudeUsageAuthorityQuarantineDisposition::RetryPending => {
+                record.failed_reconstruction_count < MAX_CLAUDE_USAGE_AUTHORITY_FAILURES
+            }
+            ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal => {
+                record.failed_reconstruction_count == MAX_CLAUDE_USAGE_AUTHORITY_FAILURES
+            }
+        }
         && record
             .member_source_file_fingerprints
             .values()
@@ -3239,29 +3272,43 @@ pub fn apply_claude_reported_usage_with_index(
             member_source_file_fingerprints
                 .insert(item.source_session_id.clone(), revision_fingerprint.clone());
         }
-        let replacement = ClaudeUsageAuthorityQuarantineRecord {
-            contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
-            proven_witness_fingerprint: proven_witness_fingerprint.clone(),
-            member_source_file_fingerprints,
-            retry_after_unix_seconds: claude_usage_authority_retry_deadline(
-                root_session_id,
-                proven_witness_fingerprint,
-            ),
-        };
-        let retain_existing = index
-            .claude_usage_authority_quarantine
-            .get(root_session_id)
-            .is_some_and(|existing| {
-                existing.contract == replacement.contract
-                    && existing.proven_witness_fingerprint == replacement.proven_witness_fingerprint
-                    && existing.member_source_file_fingerprints
-                        == replacement.member_source_file_fingerprints
-                    && existing.retry_after_unix_seconds > now
-            });
+        let existing = index.claude_usage_authority_quarantine.get(root_session_id);
+        let same_binding = existing.is_some_and(|existing| {
+            existing.contract == CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION
+                && existing.proven_witness_fingerprint == *proven_witness_fingerprint
+                && existing.member_source_file_fingerprints == member_source_file_fingerprints
+        });
+        let retain_existing = existing.is_some_and(|existing| {
+            same_binding
+                && (existing.disposition
+                    == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+                    || existing.retry_after_unix_seconds > now)
+        });
         if !retain_existing {
-            index
-                .claude_usage_authority_quarantine
-                .insert(root_session_id.clone(), replacement);
+            let failed_reconstruction_count = existing
+                .map(|existing| existing.failed_reconstruction_count.saturating_add(1))
+                .unwrap_or_else(initial_claude_usage_authority_failure_count)
+                .min(MAX_CLAUDE_USAGE_AUTHORITY_FAILURES);
+            let disposition = if failed_reconstruction_count == MAX_CLAUDE_USAGE_AUTHORITY_FAILURES
+            {
+                ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+            } else {
+                ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+            };
+            index.claude_usage_authority_quarantine.insert(
+                root_session_id.clone(),
+                ClaudeUsageAuthorityQuarantineRecord {
+                    contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
+                    proven_witness_fingerprint: proven_witness_fingerprint.clone(),
+                    member_source_file_fingerprints,
+                    failed_reconstruction_count,
+                    disposition,
+                    retry_after_unix_seconds: claude_usage_authority_retry_deadline(
+                        root_session_id,
+                        proven_witness_fingerprint,
+                    ),
+                },
+            );
         }
     }
 
@@ -9521,12 +9568,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         })
         .collect::<Vec<_>>();
 
-    let legacy_sidecar_fingerprint = match source {
-        SnapshotSource::Codex => codex_title_metadata.legacy_sidecar_fingerprint.as_str(),
-        SnapshotSource::ClaudeCode => claude_title_metadata.legacy_sidecar_fingerprint.as_str(),
-        SnapshotSource::Pi => "",
-    };
-    for candidate in &mut files {
+    let prepare_candidate_context = |candidate: &mut CandidateFile| {
         // Sidecar contribution is path-derived and can be computed before the
         // transcript opens. Transcript identity itself is filled from the
         // exact opened object below, never from discovery metadata.
@@ -9599,6 +9641,9 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         // the exact opened-object fingerprint replaces it immediately before
         // candidate comparison and parsing.
         candidate.source_file_fingerprint = sidecar_fingerprint;
+    };
+    for candidate in &mut files {
+        prepare_candidate_context(candidate);
     }
     let mut snapshots = Vec::new();
     let mut scanned_file_count = 0;
@@ -9607,56 +9652,173 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
     let mut codex_state_only_blocked_session_ids = BTreeSet::new();
     let mut codex_parent_resolution_retry_required = false;
     let mut pending_finalization = Vec::new();
-    for mut candidate in files {
-        let opened_file = match open_candidate_file(source, &mut candidate) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                census.disappeared_file_count += 1;
-                continue;
-            }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::InvalidData
-                    && candidate.size_bytes > max_jsonl_file_bytes(source) =>
+    let claude_authority_preflight =
+        source == SnapshotSource::ClaudeCode && !index.claude_usage_authority_quarantine.is_empty();
+    let mut identified_candidates = if claude_authority_preflight {
+        files
+            .into_iter()
+            .filter_map(|candidate| {
+                open_and_identify_scan_candidate(
+                    source,
+                    candidate,
+                    &mut census,
+                    census_unix_seconds,
+                    backfill_window_days,
+                )
+                .map(|(candidate, _)| candidate)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        files
+    };
+    let mut forced_claude_family_reparses = if source == SnapshotSource::ClaudeCode {
+        identified_candidates
+            .iter()
+            .filter_map(|candidate| {
+                index.claude_usage_authority_candidate_requires_family_reparse(candidate)
+            })
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let claude_family_membership_is_authoritative = source == SnapshotSource::ClaudeCode
+        && index.traversal.as_ref().is_some_and(|traversal| {
+            traversal.pending_directories.is_empty()
+                && traversal.counts.directory_entry_cap_exceeded_count == 0
+                && traversal.counts.symlink_rejected_count == 0
+                && traversal.counts.unreadable_path_count == 0
+                && traversal.counts.disappeared_file_count == 0
+        });
+    if claude_family_membership_is_authoritative {
+        let current_members_by_root = index
+            .traversal
+            .as_ref()
+            .into_iter()
+            .flat_map(|traversal| traversal.observed_index_keys.iter())
+            .filter_map(|index_key| claude_index_path_family_member(Path::new(index_key)))
+            .fold(
+                BTreeMap::<String, BTreeSet<String>>::new(),
+                |mut by_root, (root_session_id, source_session_id)| {
+                    by_root
+                        .entry(root_session_id)
+                        .or_default()
+                        .insert(source_session_id);
+                    by_root
+                },
+            );
+        for (root_session_id, record) in &index.claude_usage_authority_quarantine {
+            let current_members = current_members_by_root
+                .get(root_session_id)
+                .cloned()
+                .unwrap_or_default();
+            if current_members
+                != record
+                    .member_source_file_fingerprints
+                    .keys()
+                    .cloned()
+                    .collect()
             {
-                census.oversized_file_count += 1;
-                continue;
+                forced_claude_family_reparses.insert(root_session_id.clone());
             }
-            Err(_) => {
-                census.unreadable_path_count += 1;
-                continue;
-            }
+        }
+    }
+    if !forced_claude_family_reparses.is_empty() {
+        let already_identified = identified_candidates
+            .iter()
+            .map(|candidate| local_index_key(&candidate.path))
+            .collect::<BTreeSet<_>>();
+        let family_index_keys = if claude_family_membership_is_authoritative {
+            index
+                .traversal
+                .as_ref()
+                .map(|traversal| traversal.observed_index_keys.clone())
+                .unwrap_or_default()
+        } else {
+            index.files.keys().cloned().collect()
         };
-        if !opened_candidate_is_within_frozen_window(
-            &candidate,
+        let scan_roots = index
+            .traversal
+            .as_ref()
+            .map(|traversal| traversal.scan_roots.clone())
+            .unwrap_or_default();
+        let missing_family_paths = family_index_keys
+            .into_iter()
+            .filter(|index_key| !already_identified.contains(index_key))
+            .filter_map(|index_key| {
+                let path = PathBuf::from(&index_key);
+                let (root_session_id, _) = claude_index_path_family_member(&path)?;
+                forced_claude_family_reparses
+                    .contains(&root_session_id)
+                    .then_some(path)
+            })
+            .collect::<BTreeSet<_>>();
+        if let Some(traversal) = index.traversal.as_mut() {
+            traversal
+                .pending_candidates
+                .retain(|pending| !missing_family_paths.contains(&pending.path));
+        }
+        for path in missing_family_paths {
+            let Some(scan_root) = scan_roots
+                .iter()
+                .filter(|root| path.starts_with(root))
+                .max_by_key(|root| root.components().count())
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(mut candidate) = candidate_from_traversal_path(
+                source,
+                ScanTraversalPath {
+                    scan_root,
+                    path,
+                    census_member: true,
+                    watcher_hint: false,
+                },
+                &mut census,
+                census_unix_seconds,
+                backfill_window_days,
+            ) else {
+                continue;
+            };
+            prepare_candidate_context(&mut candidate);
+            if let Some(opened) = open_and_identify_scan_candidate(
+                source,
+                candidate,
+                &mut census,
+                census_unix_seconds,
+                backfill_window_days,
+            ) {
+                identified_candidates.push(opened.0);
+            }
+        }
+    }
+    for mut candidate in identified_candidates {
+        let preflight_source_file_fingerprint =
+            claude_authority_preflight.then(|| candidate.source_file_fingerprint.clone());
+        prepare_candidate_context(&mut candidate);
+        let Some((candidate, opened_file)) = open_and_identify_scan_candidate(
+            source,
+            candidate,
+            &mut census,
             census_unix_seconds,
             backfill_window_days,
-        ) {
-            // The path can be atomically replaced after directory/candidate
-            // stat but before the no-follow open. Eligibility follows the
-            // exact opened object, not stale discovery metadata; otherwise an
-            // object outside the frozen lookback can enter this generation.
-            census
-                .removed_index_keys
-                .insert(local_index_key(&candidate.path));
+        ) else {
+            continue;
+        };
+        if preflight_source_file_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| fingerprint != &candidate.source_file_fingerprint)
+        {
+            // A quarantined candidate changed after the family prepass. Do not
+            // parse a mixed family or refresh its retry record; keep this
+            // generation non-terminal and retry the new exact object together.
+            census.disappeared_file_count += 1;
             continue;
         }
-        let session_sidecar_fingerprint = std::mem::take(&mut candidate.source_file_fingerprint);
-        candidate.legacy_source_file_fingerprint = source_file_fingerprint_with_context(
-            &candidate.path,
-            candidate.size_bytes,
-            candidate.modified_unix_seconds,
-            source.parser_version(),
-            legacy_sidecar_fingerprint,
-        );
-        candidate.source_file_fingerprint = scan_file_fingerprint_with_opened_identity(
-            &candidate.path,
-            candidate.size_bytes,
-            candidate.modified_unix_nanos,
-            source.scan_identity_version(),
-            &session_sidecar_fingerprint,
-            &candidate.opened_object_identity,
-        );
-        let mut decision = index.candidate_decision(&candidate);
+        let mut decision = claude_index_path_family_member(&candidate.path)
+            .filter(|(root_session_id, _)| forced_claude_family_reparses.contains(root_session_id))
+            .map(|_| CandidateDecision::Parse)
+            .unwrap_or_else(|| index.candidate_decision(&candidate));
         if source == SnapshotSource::Codex
             && decision == CandidateDecision::Skip
             && codex_session_id_candidates_from_path(&candidate.path)
@@ -15982,6 +16144,56 @@ fn open_candidate_file(
     Ok(file)
 }
 
+fn open_and_identify_scan_candidate(
+    source: SnapshotSource,
+    mut candidate: CandidateFile,
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+) -> Option<(CandidateFile, File)> {
+    let opened_file = match open_candidate_file(source, &mut candidate) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            census.disappeared_file_count += 1;
+            return None;
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::InvalidData
+                && candidate.size_bytes > max_jsonl_file_bytes(source) =>
+        {
+            census.oversized_file_count += 1;
+            return None;
+        }
+        Err(_) => {
+            census.unreadable_path_count += 1;
+            return None;
+        }
+    };
+    if !opened_candidate_is_within_frozen_window(
+        &candidate,
+        census_unix_seconds,
+        backfill_window_days,
+    ) {
+        // The path can be atomically replaced after directory/candidate stat
+        // but before the no-follow open. Eligibility follows the exact opened
+        // object, not stale discovery metadata.
+        census
+            .removed_index_keys
+            .insert(local_index_key(&candidate.path));
+        return None;
+    }
+    let session_sidecar_fingerprint = std::mem::take(&mut candidate.source_file_fingerprint);
+    candidate.source_file_fingerprint = scan_file_fingerprint_with_opened_identity(
+        &candidate.path,
+        candidate.size_bytes,
+        candidate.modified_unix_nanos,
+        source.scan_identity_version(),
+        &session_sidecar_fingerprint,
+        &candidate.opened_object_identity,
+    );
+    Some((candidate, opened_file))
+}
+
 #[cfg(unix)]
 fn open_candidate_beneath_root(candidate: &CandidateFile) -> std::io::Result<File> {
     let relative = candidate
@@ -16244,7 +16456,32 @@ impl ScanIndex {
     }
 
     pub(crate) fn claude_usage_authority_pending_count(&self) -> usize {
-        self.claude_usage_authority_quarantine.len()
+        self.claude_usage_authority_quarantine
+            .values()
+            .filter(|record| {
+                record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+            })
+            .count()
+    }
+
+    pub(crate) fn claude_usage_authority_terminal_entity_count(&self) -> usize {
+        self.claude_usage_authority_quarantine
+            .values()
+            .filter(|record| {
+                record.disposition == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+            })
+            .map(|record| record.member_source_file_fingerprints.len())
+            .fold(0_usize, usize::saturating_add)
+    }
+
+    pub(crate) fn account_claude_usage_authority_census_health(
+        &self,
+        scan_result: &mut SourceScanResult,
+    ) -> bool {
+        scan_result.ownership_incomplete_file_count = scan_result
+            .ownership_incomplete_file_count
+            .saturating_add(self.claude_usage_authority_terminal_entity_count());
+        self.claude_usage_authority_pending_count() > 0
     }
 
     pub fn prepare_historical_replay(&mut self, generation: String) {
@@ -16777,26 +17014,15 @@ impl ScanIndex {
         let Some(entry) = self.files.get(&key) else {
             return CandidateDecision::Parse;
         };
-        if let Some((root_session_id, source_session_id)) =
-            claude_index_path_family_member(&candidate.path)
-        {
-            if let Some(record) = self.claude_usage_authority_quarantine.get(&root_session_id) {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|duration| duration.as_secs())
-                    .unwrap_or_default();
-                let witness_matches = self
-                    .claude_usage_family_witnesses
-                    .get(&root_session_id)
-                    .is_some_and(|witness| {
-                        claude_usage_family_witness_fingerprint(witness)
-                            == record.proven_witness_fingerprint
-                    });
-                let revision_matches = record
-                    .member_source_file_fingerprints
-                    .get(&source_session_id)
-                    == Some(&candidate.source_file_fingerprint);
-                if !witness_matches || !revision_matches || record.retry_after_unix_seconds <= now {
+        if let Some((root_session_id, _)) = claude_index_path_family_member(&candidate.path) {
+            if self
+                .claude_usage_authority_quarantine
+                .contains_key(&root_session_id)
+            {
+                if self
+                    .claude_usage_authority_candidate_requires_family_reparse(candidate)
+                    .is_some()
+                {
                     return CandidateDecision::Parse;
                 }
                 return CandidateDecision::Skip;
@@ -16864,6 +17090,36 @@ impl ScanIndex {
         } else {
             CandidateDecision::Skip
         }
+    }
+
+    fn claude_usage_authority_candidate_requires_family_reparse(
+        &self,
+        candidate: &CandidateFile,
+    ) -> Option<String> {
+        let (root_session_id, source_session_id) =
+            claude_index_path_family_member(&candidate.path)?;
+        let record = self
+            .claude_usage_authority_quarantine
+            .get(&root_session_id)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let witness_matches = self
+            .claude_usage_family_witnesses
+            .get(&root_session_id)
+            .is_some_and(|witness| {
+                claude_usage_family_witness_fingerprint(witness)
+                    == record.proven_witness_fingerprint
+            });
+        let revision_matches = record
+            .member_source_file_fingerprints
+            .get(&source_session_id)
+            == Some(&candidate.source_file_fingerprint);
+        let retry_due = record.disposition
+            == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+            && record.retry_after_unix_seconds <= now;
+        (!witness_matches || !revision_matches || retry_due).then_some(root_session_id)
     }
 
     fn last_snapshot_fingerprint(&self, candidate: &CandidateFile) -> Option<String> {
@@ -19643,6 +19899,8 @@ mod tests {
                     root_session_id.to_string(),
                     current_revision,
                 )]),
+                failed_reconstruction_count: 1,
+                disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
                 retry_after_unix_seconds: claude_usage_authority_retry_deadline(
                     root_session_id,
                     &witness_fingerprint,
@@ -19678,6 +19936,168 @@ mod tests {
         assert_eq!(
             loaded.candidate_decision(&candidate),
             CandidateDecision::Parse
+        );
+        let terminal = loaded
+            .claude_usage_authority_quarantine
+            .get_mut(root_session_id)
+            .expect("loaded authority quarantine");
+        terminal.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
+        terminal.disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
+        assert_eq!(
+            loaded.candidate_decision(&candidate),
+            CandidateDecision::Skip,
+            "terminal loss does not retry unchanged evidence forever"
+        );
+        assert_eq!(
+            loaded.candidate_decision(&changed),
+            CandidateDecision::Parse,
+            "terminal loss still retries immediately after family evolution"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_authority_family_evolution_reparses_every_quarantined_sibling() {
+        let root_session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let root = temp_dir("claude-authority-family-evolution");
+        let write_member = |agent_id: Option<&str>| {
+            let path = match agent_id {
+                Some(agent_id) => root
+                    .join(root_session_id)
+                    .join("subagents")
+                    .join(format!("agent-{agent_id}.jsonl")),
+                None => root.join(format!("{root_session_id}.jsonl")),
+            };
+            fs::create_dir_all(path.parent().expect("member parent"))
+                .expect("create family directory");
+            let request_id = agent_id.unwrap_or("root");
+            fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    json!({
+                        "timestamp": "2026-08-23T18:20:00Z",
+                        "type": "assistant",
+                        "sessionId": root_session_id,
+                        "agentId": agent_id,
+                        "isSidechain": agent_id.is_some(),
+                        "requestId": format!("request-{request_id}"),
+                        "message": {
+                            "id": format!("message-{request_id}"),
+                            "model": "claude-haiku-4-5",
+                            "usage": {"input_tokens": 10, "output_tokens": 1}
+                        }
+                    })
+                ),
+            )
+            .expect("write family member");
+            path
+        };
+        write_member(None);
+        let revised_member = write_member(Some("0000000000000001"));
+        write_member(Some("0000000000000002"));
+
+        let mut index = ScanIndex::default();
+        let initial = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-23T18:30:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("index initial family");
+        assert_eq!(initial.scanned_file_count, 3);
+        let members = index
+            .files
+            .iter()
+            .filter_map(|(index_key, entry)| {
+                let (family_root, member) = claude_index_path_family_member(Path::new(index_key))?;
+                (family_root == root_session_id)
+                    .then(|| (member, entry.source_file_fingerprint.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(members.len(), 3);
+        let witness = ClaudeUsageFamilyWitness {
+            evidence_fingerprint: "provider-evidence".to_string(),
+            member_request_id_fingerprints: members
+                .keys()
+                .map(|member| (member.clone(), "requests".to_string()))
+                .collect(),
+            member_occurrence_fingerprints: members
+                .keys()
+                .map(|member| (member.clone(), "occurrences".to_string()))
+                .collect(),
+            assigned_request_id_fingerprints: members
+                .keys()
+                .map(|member| (member.clone(), "assigned".to_string()))
+                .collect(),
+            legacy_excluded_request_id_hashes: BTreeMap::new(),
+            legacy_exclusion_evidence_fingerprint: None,
+            legacy_owner_roots: BTreeSet::new(),
+        };
+        let witness_fingerprint = claude_usage_family_witness_fingerprint(&witness);
+        index
+            .claude_usage_family_witnesses
+            .insert(root_session_id.to_string(), witness);
+        index.claude_usage_authority_quarantine.insert(
+            root_session_id.to_string(),
+            ClaudeUsageAuthorityQuarantineRecord {
+                contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
+                proven_witness_fingerprint: witness_fingerprint,
+                member_source_file_fingerprints: members,
+                failed_reconstruction_count: 1,
+                disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+                retry_after_unix_seconds: u64::MAX,
+            },
+        );
+
+        let unchanged = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-23T18:31:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan unchanged quarantined family");
+        assert_eq!(unchanged.scanned_file_count, 0);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&revised_member)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, b"{}\n"))
+            .expect("revise one family member");
+        let revised = scan_source_roots_with_artifacts(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-23T18:31:30Z",
+            BACKFILL_WINDOW_DAYS,
+            true,
+        )
+        .expect("scan revised quarantined family");
+        assert_eq!(revised.scanned_file_count, 3);
+        assert_eq!(
+            revised.snapshots.len(),
+            3,
+            "one revision change reparses the changed member and every unchanged sibling"
+        );
+
+        write_member(Some("0000000000000003"));
+        let evolved = scan_source_roots_with_artifacts(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-23T18:32:00Z",
+            BACKFILL_WINDOW_DAYS,
+            true,
+        )
+        .expect("scan expanded quarantined family");
+        assert_eq!(evolved.scanned_file_count, 4);
+        assert_eq!(
+            evolved.snapshots.len(),
+            4,
+            "one membership change reparses the new member and every unchanged sibling"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -27094,9 +27514,14 @@ mod tests {
         );
         let quarantine = index
             .claude_usage_authority_quarantine
-            .get_mut(&root_session_id)
+            .get(&root_session_id)
             .expect("family is durably quarantined");
         assert_eq!(quarantine.member_source_file_fingerprints.len(), 7);
+        assert_eq!(quarantine.failed_reconstruction_count, 1);
+        assert_eq!(
+            quarantine.disposition,
+            ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+        );
         assert_eq!(
             quarantine
                 .member_source_file_fingerprints
@@ -27105,7 +27530,67 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             fixture_hashes.into_iter().map(str::to_string).collect()
         );
-        quarantine.retry_after_unix_seconds = 0;
+
+        let mut exhausted_index = index.clone();
+        for expected_failure_count in 2..=MAX_CLAUDE_USAGE_AUTHORITY_FAILURES {
+            exhausted_index
+                .claude_usage_authority_quarantine
+                .get_mut(&root_session_id)
+                .expect("family remains accounted while retrying")
+                .retry_after_unix_seconds = 0;
+            let mut still_unproven = weaker_revision.clone();
+            let held = apply_claude_reported_usage_with_index(
+                &mut still_unproven,
+                &missing_api,
+                &missing_trace,
+                &mut exhausted_index,
+                true,
+                "2026-08-23T18:46:00Z",
+            );
+            assert_eq!(held.quarantined_entity_count(), 7);
+            let record = exhausted_index
+                .claude_usage_authority_quarantine
+                .get(&root_session_id)
+                .expect("unproven family remains explicitly accounted");
+            assert_eq!(record.failed_reconstruction_count, expected_failure_count);
+            assert_eq!(
+                record.disposition,
+                if expected_failure_count == MAX_CLAUDE_USAGE_AUTHORITY_FAILURES {
+                    ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+                } else {
+                    ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+                }
+            );
+        }
+        assert_eq!(exhausted_index.claude_usage_authority_pending_count(), 0);
+        assert_eq!(
+            exhausted_index.claude_usage_authority_terminal_entity_count(),
+            7
+        );
+        let health_root = temp_dir("claude-authority-terminal-health");
+        let mut health_index = ScanIndex::default();
+        let mut terminal_health = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&health_root),
+            &mut health_index,
+            "2026-08-23T18:47:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan healthy empty source");
+        assert!(terminal_health.census_complete);
+        assert!(!exhausted_index.account_claude_usage_authority_census_health(&mut terminal_health));
+        assert!(
+            terminal_health.census_complete,
+            "named terminal loss completes the census instead of deadlocking it"
+        );
+        assert_eq!(terminal_health.ownership_incomplete_file_count, 7);
+        let _ = fs::remove_dir_all(health_root);
+
+        index
+            .claude_usage_authority_quarantine
+            .get_mut(&root_session_id)
+            .expect("original family remains retryable")
+            .retry_after_unix_seconds = 0;
 
         let mut reconstructed_revision = weaker_revision;
         let recovered = apply_claude_reported_usage_with_index(
