@@ -19,6 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION: u64 = 5;
+pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION: u64 = 6;
+
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -664,7 +667,16 @@ impl SnapshotBatchResponse {
                 item.source_session_id.clone(),
                 item.snapshot_fingerprint.clone(),
             );
-            let proof = (version, snapshot_upload_body_witness(item));
+            let public_version = match version {
+                SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION => {
+                    SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION
+                }
+                SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION => {
+                    SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION
+                }
+                _ => unreachable!("the supported-version filter is exhaustive"),
+            };
+            let proof = (public_version, snapshot_upload_body_witness(item));
             if expected
                 .insert(key, proof.clone())
                 .is_some_and(|previous| previous != proof)
