@@ -7717,6 +7717,8 @@ mod tests {
             subscription_period_last_checked_at: None,
             account_identifier_hash: Some(account_hash.to_string()),
             organization_identifier_hash: Some(organization_hash.to_string()),
+            superseded_account_identifier_hash: None,
+            superseded_organization_identifier_hash: None,
             credential_fingerprint_hash: None,
             billing_identity_evidence: Some("provider_account_id".to_string()),
             claude_quota_access_state: None,

@@ -1360,6 +1360,12 @@ pub struct AgentAccountStatus {
     pub account_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub organization_identifier_hash: Option<String>,
+    /// Hashes this same account and organization produced under the previous
+    /// derivation scheme. See `AgentStatusPlanObservation` for the contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_organization_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_fingerprint_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1416,6 +1422,20 @@ pub struct AgentStatusPlanObservation {
     pub account_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub organization_identifier_hash: Option<String>,
+    /// The hashes THIS SAME account and workspace produced under the previous
+    /// derivation scheme, when the collector can still compute both from the
+    /// live credential.
+    ///
+    /// Changing what a hash is derived from silently orphans every identity a
+    /// server already stored: the old and new digests conflict on every field,
+    /// so nothing downstream can tell that one account became two. Only the
+    /// collector holds the raw values, so only it can assert the equivalence.
+    /// A consumer may use these to recognize a stored identity as this one and
+    /// adopt the current hashes; it must never treat them as a second account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_organization_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_fingerprint_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4287,6 +4307,8 @@ mod tests {
                 subscription_period_last_checked_at: None,
                 account_identifier_hash: Some(account_identifier_hash.to_string()),
                 organization_identifier_hash: Some(organization_identifier_hash.to_string()),
+                superseded_account_identifier_hash: None,
+                superseded_organization_identifier_hash: None,
                 credential_fingerprint_hash: None,
                 billing_identity_evidence: Some("provider_account_id".to_string()),
                 claude_quota_access_state: Some(ClaudeQuotaAccessState::Full),
@@ -5022,6 +5044,8 @@ mod tests {
                 subscription_period_last_checked_at: None,
                 account_identifier_hash: Some("abc123hash".to_string()),
                 organization_identifier_hash: Some("def456hash".to_string()),
+                superseded_account_identifier_hash: None,
+                superseded_organization_identifier_hash: None,
                 credential_fingerprint_hash: None,
                 billing_identity_evidence: Some("provider_account_id".to_string()),
                 claude_quota_access_state: Some(ClaudeQuotaAccessState::Full),
@@ -5094,6 +5118,8 @@ mod tests {
                 organization_id: Some("org_private".to_string()),
                 account_identifier_hash: Some("abc123hash".to_string()),
                 organization_identifier_hash: Some("def456hash".to_string()),
+                superseded_account_identifier_hash: None,
+                superseded_organization_identifier_hash: None,
                 credential_fingerprint_hash: None,
                 billing_identity_evidence: Some("provider_account_id".to_string()),
                 billing_identity_confidence: AgentStatusConfidence::High,

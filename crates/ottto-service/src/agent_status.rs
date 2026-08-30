@@ -165,6 +165,16 @@ pub(crate) struct CodexStrongIdentity {
     pub(crate) account_identifier_hash: String,
     pub(crate) workspace_identifier_hash: String,
     pub(crate) raw_workspace_id: String,
+    /// What THIS SAME account and workspace hashed to before the derivation
+    /// changed: the account was keyed on `chatgpt_account_id` rather than the
+    /// user id, and the organization on `organizations[].id` under the
+    /// `organization` kind rather than the workspace id under `workspace`.
+    ///
+    /// Every server that stored the old digests sees an unrelated account once
+    /// the new ones arrive, because the two conflict on every field. Only this
+    /// collector holds the raw values, so only it can say they are one account.
+    pub(crate) superseded_account_identifier_hash: Option<String>,
+    pub(crate) superseded_organization_identifier_hash: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1702,6 +1712,8 @@ fn collect_codex_status_for_home(
         subscription_period_last_checked_at: None,
         account_identifier_hash: None,
         organization_identifier_hash: None,
+        superseded_account_identifier_hash: None,
+        superseded_organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
         claude_quota_access_state: None,
@@ -1788,6 +1800,10 @@ fn collect_codex_status_for_home(
                         Some(identity.account_identifier_hash.clone());
                     account.organization_identifier_hash =
                         Some(identity.workspace_identifier_hash.clone());
+                    account.superseded_account_identifier_hash =
+                        identity.superseded_account_identifier_hash.clone();
+                    account.superseded_organization_identifier_hash =
+                        identity.superseded_organization_identifier_hash.clone();
                     account.billing_identity_evidence = billing_identity_evidence_for(
                         &account.account_identifier_hash,
                         &account.organization_identifier_hash,
@@ -3507,6 +3523,8 @@ fn degraded_claude_slot_snapshot(
         subscription_period_last_checked_at: None,
         account_identifier_hash: Some(account_hash),
         organization_identifier_hash: Some(organization_hash),
+        superseded_account_identifier_hash: None,
+        superseded_organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence: Some("provider_account_id".to_string()),
         claude_quota_access_state: Some(access_state),
@@ -5158,6 +5176,8 @@ fn claude_desktop_builder_plan_observation(
         organization_id,
         account_identifier_hash,
         organization_identifier_hash,
+        superseded_account_identifier_hash: None,
+        superseded_organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence,
         billing_identity_confidence: AgentStatusConfidence::High,
@@ -7297,6 +7317,8 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
         subscription_period_last_checked_at: None,
         account_identifier_hash: None,
         organization_identifier_hash: None,
+        superseded_account_identifier_hash: None,
+        superseded_organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
         claude_quota_access_state: None,
@@ -7403,6 +7425,10 @@ fn append_current_plan_observation(snapshot: &mut AgentStatusSnapshot) {
         organization_id: account.organization_id.clone(),
         account_identifier_hash: account.account_identifier_hash.clone(),
         organization_identifier_hash: account.organization_identifier_hash.clone(),
+        superseded_account_identifier_hash: account.superseded_account_identifier_hash.clone(),
+        superseded_organization_identifier_hash: account
+            .superseded_organization_identifier_hash
+            .clone(),
         credential_fingerprint_hash: account.credential_fingerprint_hash.clone(),
         billing_identity_evidence: account.billing_identity_evidence.clone(),
         billing_identity_confidence: account.billing_identity_confidence.clone(),
@@ -7448,6 +7474,8 @@ fn append_pi_route_plan_observations(snapshot: &mut AgentStatusSnapshot) {
             organization_id: None,
             account_identifier_hash: detail.account_identifier_hash.clone(),
             organization_identifier_hash: detail.organization_identifier_hash.clone(),
+            superseded_account_identifier_hash: None,
+            superseded_organization_identifier_hash: None,
             credential_fingerprint_hash: detail.credential_fingerprint_hash.clone(),
             billing_identity_evidence: detail.billing_identity_evidence.clone(),
             billing_identity_confidence: detail.billing_identity_confidence.clone(),
@@ -7586,6 +7614,8 @@ fn not_installed_snapshot(
         subscription_period_last_checked_at: None,
         account_identifier_hash: None,
         organization_identifier_hash: None,
+        superseded_account_identifier_hash: None,
+        superseded_organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
         claude_quota_access_state: None,
@@ -7625,6 +7655,8 @@ fn parse_codex_account_text(text: &str) -> Option<AgentAccountStatus> {
             subscription_period_last_checked_at: None,
             account_identifier_hash: None,
             organization_identifier_hash: None,
+            superseded_account_identifier_hash: None,
+            superseded_organization_identifier_hash: None,
             credential_fingerprint_hash: None,
             billing_identity_evidence: None,
             claude_quota_access_state: None,
@@ -7659,6 +7691,8 @@ fn parse_codex_account_text(text: &str) -> Option<AgentAccountStatus> {
         subscription_period_last_checked_at: None,
         account_identifier_hash: None,
         organization_identifier_hash: None,
+        superseded_account_identifier_hash: None,
+        superseded_organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
         claude_quota_access_state: None,
@@ -7785,6 +7819,8 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
         subscription_period_last_checked_at,
         account_identifier_hash: None,
         organization_identifier_hash: None,
+        superseded_account_identifier_hash: None,
+        superseded_organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
         claude_quota_access_state: None,
@@ -7861,10 +7897,30 @@ fn validated_codex_identity(
             return None;
         }
     }
+    let superseded_account_identifier_hash =
+        billing_identity_hash("openai", "account", &raw_workspace_id);
+    let superseded_organization_identifier_hash = credentials
+        .id_token
+        .as_deref()
+        .and_then(structurally_valid_live_codex_jwt_claims)
+        .as_ref()
+        .and_then(|id_claims| id_claims.get("https://api.openai.com/auth"))
+        .map(codex_organizations)
+        .and_then(|organizations| {
+            organizations
+                .into_iter()
+                .find(|organization| organization.is_default)
+                .and_then(|organization| organization.id)
+        })
+        .and_then(|organization_id| {
+            billing_identity_hash("openai", "organization", &organization_id)
+        });
     Some(CodexStrongIdentity {
         account_identifier_hash: billing_identity_hash("openai", "account", &account_id)?,
         workspace_identifier_hash: billing_identity_hash("openai", "workspace", &raw_workspace_id)?,
         raw_workspace_id,
+        superseded_account_identifier_hash,
+        superseded_organization_identifier_hash,
     })
 }
 
@@ -8923,6 +8979,8 @@ fn codex_workspace_observations_from_id_token(
                     // materializing a misleading subscription profile.
                     account_identifier_hash: None,
                     organization_identifier_hash: None,
+                    superseded_account_identifier_hash: None,
+                    superseded_organization_identifier_hash: None,
                     credential_fingerprint_hash: None,
                     billing_identity_evidence: None,
                     billing_identity_confidence: AgentStatusConfidence::Low,
@@ -9010,6 +9068,8 @@ fn merge_codex_accounts(
         organization_identifier_hash: auth_account
             .organization_identifier_hash
             .or(existing.organization_identifier_hash),
+        superseded_account_identifier_hash: None,
+        superseded_organization_identifier_hash: None,
         credential_fingerprint_hash: auth_account
             .credential_fingerprint_hash
             .or(existing.credential_fingerprint_hash),
@@ -9149,6 +9209,8 @@ fn parse_claude_auth_json(value: &Value) -> AgentAccountStatus {
         subscription_period_last_checked_at: None,
         account_identifier_hash,
         organization_identifier_hash,
+        superseded_account_identifier_hash: None,
+        superseded_organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence,
         claude_quota_access_state: None,
@@ -10786,6 +10848,8 @@ fn unsupported_account(provider: &str) -> AgentAccountStatus {
         subscription_period_last_checked_at: None,
         account_identifier_hash: None,
         organization_identifier_hash: None,
+        superseded_account_identifier_hash: None,
+        superseded_organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
         claude_quota_access_state: None,
@@ -13812,6 +13876,154 @@ for line in sys.stdin:
             true,
         )
         .is_none());
+    }
+
+    fn synthetic_codex_jwt_with_organizations(
+        user: &str,
+        workspace: &str,
+        account_label: &str,
+        plan: &str,
+        expires_at: i64,
+        organizations: Value,
+    ) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "iss": "https://auth.openai.com",
+                "aud": "synthetic-client",
+                "exp": expires_at,
+                "email": account_label,
+                "https://api.openai.com/auth": {
+                    "chatgpt_user_id": user,
+                    "chatgpt_account_id": workspace,
+                    "chatgpt_plan_type": plan,
+                    "organizations": organizations
+                }
+            })
+            .to_string(),
+        );
+        format!("{header}.{payload}.synthetic-signature")
+    }
+
+    #[test]
+    fn codex_identity_carries_the_hashes_it_produced_before_the_derivation_changed() {
+        // The account used to be keyed on `chatgpt_account_id` and the
+        // organization on `organizations[].id` under the `organization` kind.
+        // Both moved, so a server holding the old digests sees an unrelated
+        // account and prices it as a second subscription. These two fields are
+        // the only thing that can join them again: nothing downstream holds the
+        // raw values, so nothing downstream can derive the equivalence itself.
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+        let organizations = serde_json::json!([
+            {"id": "synthetic-org-default", "title": "Personal", "is_default": true},
+            {"id": "synthetic-org-other", "title": "Other", "is_default": false}
+        ]);
+        let credentials = CodexAuthCredentials {
+            access_token: Some(synthetic_codex_access_jwt_with_profile_email(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+            )),
+            id_token: Some(synthetic_codex_jwt_with_organizations(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+                organizations,
+            )),
+            account_id: Some("synthetic-workspace".to_string()),
+        };
+        let provider_account = serde_json::json!({
+            "account": {"type": "chatgpt", "email": "synthetic-account", "planType": "pro"}
+        });
+        let rate_limits = serde_json::json!({
+            "rateLimits": {"limitId": "codex", "planType": "pro"}
+        });
+
+        let identity = validated_codex_identity(
+            &credentials,
+            Some(&provider_account),
+            Some(&rate_limits),
+            true,
+        )
+        .expect("identity");
+
+        assert_eq!(
+            identity.account_identifier_hash,
+            billing_identity_hash("openai", "account", "synthetic-user").expect("account hash"),
+            "the account is keyed on the user id now"
+        );
+        assert_eq!(
+            identity.superseded_account_identifier_hash,
+            billing_identity_hash("openai", "account", "synthetic-workspace"),
+            "and was keyed on the workspace id before"
+        );
+        assert_eq!(
+            identity.workspace_identifier_hash,
+            billing_identity_hash("openai", "workspace", "synthetic-workspace")
+                .expect("workspace hash"),
+        );
+        assert_eq!(
+            identity.superseded_organization_identifier_hash,
+            billing_identity_hash("openai", "organization", "synthetic-org-default"),
+            "the DEFAULT organization is the one the credential was signed into"
+        );
+        assert_ne!(
+            identity.superseded_organization_identifier_hash,
+            billing_identity_hash("openai", "organization", "synthetic-org-other"),
+            "a non-default organization never supplies the superseded identity"
+        );
+        // Superseded hashes must never collide with current ones, or a consumer
+        // adopting them would rewrite an identity onto itself.
+        assert_ne!(
+            Some(identity.account_identifier_hash.clone()),
+            identity.superseded_account_identifier_hash
+        );
+        assert_ne!(
+            Some(identity.workspace_identifier_hash.clone()),
+            identity.superseded_organization_identifier_hash
+        );
+    }
+
+    #[test]
+    fn codex_identity_omits_the_superseded_organization_when_no_default_is_claimed() {
+        // No default organization means nothing to key the old organization
+        // hash on. Emitting one from a non-default membership would invite a
+        // consumer to merge two genuinely different workspaces.
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+        let credentials = CodexAuthCredentials {
+            access_token: Some(synthetic_codex_access_jwt_with_profile_email(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+            )),
+            id_token: Some(synthetic_codex_jwt_with_organizations(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+                serde_json::json!([{"id": "synthetic-org-other", "title": "Other"}]),
+            )),
+            account_id: Some("synthetic-workspace".to_string()),
+        };
+        let provider_account = serde_json::json!({
+            "account": {"type": "chatgpt", "email": "synthetic-account", "planType": "pro"}
+        });
+
+        let identity = validated_codex_identity(&credentials, Some(&provider_account), None, true)
+            .expect("identity");
+
+        assert_eq!(identity.superseded_organization_identifier_hash, None);
+        assert!(
+            identity.superseded_account_identifier_hash.is_some(),
+            "the account side does not depend on organizations at all"
+        );
     }
 
     #[test]
@@ -19463,6 +19675,8 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
                 organization_id: None,
                 account_identifier_hash: hash.map(ToString::to_string),
                 organization_identifier_hash: None,
+                superseded_account_identifier_hash: None,
+                superseded_organization_identifier_hash: None,
                 credential_fingerprint_hash: None,
                 billing_identity_evidence: None,
                 billing_identity_confidence: confidence.clone(),
@@ -19501,6 +19715,8 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             subscription_period_last_checked_at: None,
             account_identifier_hash: Some("resolved".to_string()),
             organization_identifier_hash: None,
+            superseded_account_identifier_hash: None,
+            superseded_organization_identifier_hash: None,
             credential_fingerprint_hash: None,
             billing_identity_evidence: None,
             claude_quota_access_state: None,
