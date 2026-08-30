@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 343,
-  "content_sha256": "a39365fa1b44916cab893df78d429aa338d1ac92fe7f601ddd66d9ad1684a5b3",
+  "content_sha256": "c0ce451db213a641bf4c799175cc7769fa5e386e23b0504eba4eeb56932d1ff5",
   "files": [
     {
       "executable": false,
@@ -580,8 +580,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "210ba77bd2516dd71374a268a88b54b61a101d76a4aeb99049453d79dcdd311b",
-      "size_bytes": 248473
+      "sha256": "fcdf07750e05d1c3fc28112b7e5e7e0191d7c97c2ca918e511d321c17d51c21b",
+      "size_bytes": 251186
     },
     {
       "executable": false,
@@ -2404,7 +2404,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-30T14:32:30+00:00",
+  "generated_at": "2026-08-30T16:07:21+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 344,
   "public_roots": [
@@ -2440,5 +2440,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "46a7353274e909da12357eb7c9810122dcc628ba"
+  "source_commit": "c36a4d9a65c68210cc0a4ee2fd6a0d77a7c40485"
 }
