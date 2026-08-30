@@ -348,6 +348,9 @@ pub(crate) const POLICY_NEUTRAL_COMPONENTS: [&str; 4] = [
 pub const SNAPSHOT_MANIFEST_CONTRACT_VERSION: &str = "snapshot_manifest:v2";
 pub const SNAPSHOT_QUARANTINE_CONTRACT_VERSION: &str = "snapshot_quarantine:v1";
 pub const SNAPSHOT_QUARANTINE_RETRY_SECONDS: u64 = 6 * 60 * 60;
+const CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION: &str =
+    "claude_usage_authority_quarantine:v1";
+const CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS: u64 = 6 * 60 * 60;
 
 /// What the manifest counts, declared on the wire rather than assumed.
 ///
@@ -1766,6 +1769,14 @@ pub struct ScanIndex {
     claude_usage_family_witnesses: BTreeMap<String, ClaudeUsageFamilyWitness>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     claude_usage_family_pending: BTreeMap<String, ClaudeUsageFamilyPending>,
+    /// Families whose current transcript revision could not reconstruct a
+    /// previously proven session-exclusive usage witness. Unlike backend
+    /// poison quarantine, these revisions are not settled and never enter the
+    /// upload or manifest set. The prior witness and the current content-free
+    /// pending proof remain durable so a later complete family scan can
+    /// re-prove authority without trusting the older body itself.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    claude_usage_authority_quarantine: BTreeMap<String, ClaudeUsageAuthorityQuarantineRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_desktop_store_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1868,6 +1879,7 @@ impl Default for ScanIndex {
             claude_account_family_pending: BTreeMap::new(),
             claude_usage_family_witnesses: BTreeMap::new(),
             claude_usage_family_pending: BTreeMap::new(),
+            claude_usage_authority_quarantine: BTreeMap::new(),
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
@@ -2027,6 +2039,138 @@ struct ClaudeUsageFamilyPending {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     member_occurrences: BTreeMap<String, BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>>,
     invalid: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClaudeUsageAuthorityQuarantineRecord {
+    contract: String,
+    /// Exact content-free digest of the last proven family witness. The
+    /// witness itself remains in `claude_usage_family_witnesses`; this binding
+    /// prevents a stale quarantine from being paired with a different proof.
+    proven_witness_fingerprint: String,
+    /// Exact scan fingerprints for every currently known family member. These
+    /// contain no transcript content and let a changed revision bypass the
+    /// timer while unchanged failures observe bounded retry cadence.
+    member_source_file_fingerprints: BTreeMap<String, String>,
+    retry_after_unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeUsageAuthorityDisposition {
+    quarantined_source_session_ids: BTreeSet<String>,
+}
+
+impl ClaudeUsageAuthorityDisposition {
+    pub(crate) fn quarantined_fingerprints(&self, snapshots: &[SnapshotItem]) -> BTreeSet<String> {
+        snapshots
+            .iter()
+            .filter(|snapshot| {
+                self.quarantined_source_session_ids
+                    .contains(&snapshot.source_session_id)
+            })
+            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+            .collect()
+    }
+
+    pub(crate) fn retain_uploadable(&self, snapshots: &mut Vec<SnapshotItem>) {
+        snapshots.retain(|snapshot| {
+            !self
+                .quarantined_source_session_ids
+                .contains(&snapshot.source_session_id)
+        });
+    }
+
+    pub(crate) fn quarantined_entity_count(&self) -> usize {
+        self.quarantined_source_session_ids.len()
+    }
+}
+
+fn claude_usage_family_witness_fingerprint(witness: &ClaudeUsageFamilyWitness) -> String {
+    let mut digest = Sha256::new();
+    update_length_prefixed(&mut digest, b"ottto:claude-usage-family-durable-witness:v1");
+    update_length_prefixed(&mut digest, witness.evidence_fingerprint.as_bytes());
+    update_length_prefixed(&mut digest, b"member_request_id_fingerprints");
+    for (member, fingerprint) in &witness.member_request_id_fingerprints {
+        update_length_prefixed(&mut digest, member.as_bytes());
+        update_length_prefixed(&mut digest, fingerprint.as_bytes());
+    }
+    update_length_prefixed(&mut digest, b"member_occurrence_fingerprints");
+    for (member, fingerprint) in &witness.member_occurrence_fingerprints {
+        update_length_prefixed(&mut digest, member.as_bytes());
+        update_length_prefixed(&mut digest, fingerprint.as_bytes());
+    }
+    update_length_prefixed(&mut digest, b"assigned_request_id_fingerprints");
+    for (member, fingerprint) in &witness.assigned_request_id_fingerprints {
+        update_length_prefixed(&mut digest, member.as_bytes());
+        update_length_prefixed(&mut digest, fingerprint.as_bytes());
+    }
+    update_length_prefixed(&mut digest, b"legacy_excluded_request_id_hashes");
+    for (member, excluded) in &witness.legacy_excluded_request_id_hashes {
+        update_length_prefixed(&mut digest, member.as_bytes());
+        for request_hash in excluded {
+            update_length_prefixed(&mut digest, request_hash.as_bytes());
+        }
+    }
+    update_length_prefixed(&mut digest, b"legacy_exclusion_evidence_fingerprint");
+    update_length_prefixed(
+        &mut digest,
+        witness
+            .legacy_exclusion_evidence_fingerprint
+            .as_deref()
+            .unwrap_or("none")
+            .as_bytes(),
+    );
+    update_length_prefixed(&mut digest, b"legacy_owner_roots");
+    for root in &witness.legacy_owner_roots {
+        update_length_prefixed(&mut digest, root.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn claude_usage_authority_retry_deadline(
+    root_session_id: &str,
+    proven_witness_fingerprint: &str,
+) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let digest = Sha256::digest(
+        [
+            root_session_id.as_bytes(),
+            proven_witness_fingerprint.as_bytes(),
+        ]
+        .concat(),
+    );
+    let jitter = u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("sha256 prefix is exactly eight bytes"),
+    ) % CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS;
+    now.saturating_add(CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS)
+        .saturating_add(jitter)
+}
+
+fn claude_usage_authority_deadline_is_bounded(
+    record: &ClaudeUsageAuthorityQuarantineRecord,
+) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    record.contract == CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION
+        && sha256_hex_is_well_formed(&record.proven_witness_fingerprint)
+        && !record.member_source_file_fingerprints.is_empty()
+        && record
+            .member_source_file_fingerprints
+            .values()
+            .all(|fingerprint| sha256_hex_is_well_formed(fingerprint))
+        && record.retry_after_unix_seconds
+            <= now.saturating_add(CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS.saturating_mul(2))
+}
+
+fn sha256_hex_is_well_formed(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 // Historical paging may retain occurrence witnesses until a complete family
@@ -2713,7 +2857,7 @@ pub fn apply_claude_reported_usage_with_index(
     index: &mut ScanIndex,
     census_complete: bool,
     census_window_end: &str,
-) {
+) -> ClaudeUsageAuthorityDisposition {
     accumulate_claude_usage_family_pending(
         snapshots,
         &mut index.claude_usage_family_pending,
@@ -2736,6 +2880,16 @@ pub fn apply_claude_reported_usage_with_index(
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
+    let witness_fingerprints_before = index
+        .claude_usage_family_witnesses
+        .iter()
+        .map(|(root_session_id, witness)| {
+            (
+                root_session_id.clone(),
+                claude_usage_family_witness_fingerprint(witness),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     if census_complete && reports_healthy {
         let legacy_exclusions = derive_claude_legacy_usage_exclusions(
             &complete_families,
@@ -2802,7 +2956,10 @@ pub fn apply_claude_reported_usage_with_index(
         index
             .claude_usage_family_witnesses
             .retain(|root_session_id, _| {
-                proven.contains_key(root_session_id) || reconstructed.contains_key(root_session_id)
+                complete_families.contains_key(root_session_id)
+                    && (proven.contains_key(root_session_id)
+                        || reconstructed.contains_key(root_session_id)
+                        || witness_roots_before.contains(root_session_id))
             });
         for (root_session_id, family) in &proven {
             index
@@ -2810,7 +2967,13 @@ pub fn apply_claude_reported_usage_with_index(
                 .insert(root_session_id.clone(), family.witness.clone());
         }
     } else if census_complete {
-        index.claude_usage_family_witnesses.clear();
+        // Report availability is not evidence that a previously proven
+        // family became unowned. Retain exact witnesses for families still
+        // present in the complete filesystem census; changed revisions are
+        // held below until the reports can be reconstructed again.
+        index
+            .claude_usage_family_witnesses
+            .retain(|root_session_id, _| complete_families.contains_key(root_session_id));
     } else if reports_healthy {
         reconstructed = index
             .claude_usage_family_witnesses
@@ -3023,6 +3186,85 @@ pub fn apply_claude_reported_usage_with_index(
         ));
     }
 
+    let mut disposition = ClaudeUsageAuthorityDisposition::default();
+    let mut demoting_members_by_root = BTreeMap::<String, BTreeSet<String>>::new();
+    for item in snapshots.iter() {
+        let root_session_id = claude_snapshot_family_root(item);
+        if witness_roots_before.contains(&root_session_id)
+            && item.usage_accounting_contract.as_deref()
+                != Some("session_exclusive_reported_usage:v1")
+        {
+            demoting_members_by_root
+                .entry(root_session_id)
+                .or_default()
+                .insert(item.source_session_id.clone());
+            disposition
+                .quarantined_source_session_ids
+                .insert(item.source_session_id.clone());
+        }
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    for root_session_id in demoting_members_by_root.keys() {
+        let Some(proven_witness_fingerprint) = witness_fingerprints_before.get(root_session_id)
+        else {
+            continue;
+        };
+        let mut member_source_file_fingerprints = index
+            .files
+            .iter()
+            .filter_map(|(index_key, entry)| {
+                let (root, member) = claude_index_path_family_member(Path::new(index_key))?;
+                (root == *root_session_id && !entry.source_file_fingerprint.is_empty())
+                    .then(|| (member, entry.source_file_fingerprint.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for item in snapshots
+            .iter()
+            .filter(|item| claude_snapshot_family_root(item) == *root_session_id)
+        {
+            // File-backed Claude snapshots always have a source fingerprint.
+            // The body fingerprint is a fail-closed fallback for a malformed
+            // legacy entry: it deliberately cannot match the next file
+            // candidate, which makes that family reparse every pass instead
+            // of silently settling a held revision without durable retry
+            // state.
+            let revision_fingerprint = item
+                .source_file_fingerprint
+                .as_ref()
+                .unwrap_or(&item.snapshot_fingerprint);
+            member_source_file_fingerprints
+                .insert(item.source_session_id.clone(), revision_fingerprint.clone());
+        }
+        let replacement = ClaudeUsageAuthorityQuarantineRecord {
+            contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
+            proven_witness_fingerprint: proven_witness_fingerprint.clone(),
+            member_source_file_fingerprints,
+            retry_after_unix_seconds: claude_usage_authority_retry_deadline(
+                root_session_id,
+                proven_witness_fingerprint,
+            ),
+        };
+        let retain_existing = index
+            .claude_usage_authority_quarantine
+            .get(root_session_id)
+            .is_some_and(|existing| {
+                existing.contract == replacement.contract
+                    && existing.proven_witness_fingerprint == replacement.proven_witness_fingerprint
+                    && existing.member_source_file_fingerprints
+                        == replacement.member_source_file_fingerprints
+                    && existing.retry_after_unix_seconds > now
+            });
+        if !retain_existing {
+            index
+                .claude_usage_authority_quarantine
+                .insert(root_session_id.clone(), replacement);
+        }
+    }
+
     if census_complete {
         let invalidated_witness_roots = witness_roots_before
             .difference(
@@ -3051,8 +3293,72 @@ pub fn apply_claude_reported_usage_with_index(
                 entry.source_file_fingerprint.clear();
             }
         }
-        index.claude_usage_family_pending.clear();
+
+        index
+            .claude_usage_family_pending
+            .retain(|root_session_id, _| {
+                index
+                    .claude_usage_authority_quarantine
+                    .contains_key(root_session_id)
+            });
     }
+
+    let current_authority_by_root = snapshots.iter().fold(
+        BTreeMap::<String, BTreeMap<String, bool>>::new(),
+        |mut by_root, item| {
+            by_root
+                .entry(claude_snapshot_family_root(item))
+                .or_default()
+                .insert(
+                    item.source_session_id.clone(),
+                    item.usage_accounting_contract.as_deref()
+                        == Some("session_exclusive_reported_usage:v1"),
+                );
+            by_root
+        },
+    );
+    let resolved_quarantines = index
+        .claude_usage_authority_quarantine
+        .keys()
+        .filter(|root_session_id| {
+            if demoting_members_by_root.contains_key(*root_session_id) {
+                return false;
+            }
+            let expected_members =
+                if let Some(complete_members) = complete_families.get(*root_session_id) {
+                    complete_members.clone()
+                } else if !census_complete {
+                    let Some(witness) = index.claude_usage_family_witnesses.get(*root_session_id)
+                    else {
+                        return false;
+                    };
+                    witness
+                        .member_request_id_fingerprints
+                        .keys()
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                } else {
+                    // Only a complete census proves that the old family vanished.
+                    return true;
+                };
+            let empty_members = confirmed_empty_claude_family_members(index, root_session_id);
+            let current = current_authority_by_root
+                .get(*root_session_id)
+                .cloned()
+                .unwrap_or_default();
+            expected_members.iter().all(|member| {
+                empty_members.contains(member) || current.get(member).copied() == Some(true)
+            })
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for root_session_id in resolved_quarantines {
+        index
+            .claude_usage_authority_quarantine
+            .remove(&root_session_id);
+        index.claude_usage_family_pending.remove(&root_session_id);
+    }
+    disposition
 }
 
 fn accumulate_claude_usage_family_pending(
@@ -15937,6 +16243,10 @@ impl ScanIndex {
         self.bounded_sweep_had_unsettled_upload = true;
     }
 
+    pub(crate) fn claude_usage_authority_pending_count(&self) -> usize {
+        self.claude_usage_authority_quarantine.len()
+    }
+
     pub fn prepare_historical_replay(&mut self, generation: String) {
         if self.historical_replay_generation.as_ref() == Some(&generation) {
             return;
@@ -16024,7 +16334,22 @@ impl ScanIndex {
                     && index
                         .quarantined_snapshot_fingerprints
                         .values()
-                        .all(snapshot_quarantine_deadline_is_bounded) =>
+                        .all(snapshot_quarantine_deadline_is_bounded)
+                    && index
+                        .claude_usage_authority_quarantine
+                        .values()
+                        .all(claude_usage_authority_deadline_is_bounded)
+                    && index.claude_usage_authority_quarantine.iter().all(
+                        |(root_session_id, quarantine)| {
+                            index
+                                .claude_usage_family_witnesses
+                                .get(root_session_id)
+                                .is_some_and(|witness| {
+                                    claude_usage_family_witness_fingerprint(witness)
+                                        == quarantine.proven_witness_fingerprint
+                                })
+                        },
+                    ) =>
             {
                 if index.canonicalize_codex_identity_keys() {
                     Ok(index)
@@ -16392,6 +16717,7 @@ impl ScanIndex {
             claude_account_family_pending: self.claude_account_family_pending.clone(),
             claude_usage_family_witnesses: self.claude_usage_family_witnesses.clone(),
             claude_usage_family_pending: self.claude_usage_family_pending.clone(),
+            claude_usage_authority_quarantine: self.claude_usage_authority_quarantine.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
             claude_desktop_store_sweep_had_errors: self.claude_desktop_store_sweep_had_errors,
@@ -16451,6 +16777,31 @@ impl ScanIndex {
         let Some(entry) = self.files.get(&key) else {
             return CandidateDecision::Parse;
         };
+        if let Some((root_session_id, source_session_id)) =
+            claude_index_path_family_member(&candidate.path)
+        {
+            if let Some(record) = self.claude_usage_authority_quarantine.get(&root_session_id) {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or_default();
+                let witness_matches = self
+                    .claude_usage_family_witnesses
+                    .get(&root_session_id)
+                    .is_some_and(|witness| {
+                        claude_usage_family_witness_fingerprint(witness)
+                            == record.proven_witness_fingerprint
+                    });
+                let revision_matches = record
+                    .member_source_file_fingerprints
+                    .get(&source_session_id)
+                    == Some(&candidate.source_file_fingerprint);
+                if !witness_matches || !revision_matches || record.retry_after_unix_seconds <= now {
+                    return CandidateDecision::Parse;
+                }
+                return CandidateDecision::Skip;
+            }
+        }
         if self.upload_context_fingerprint != self.active_upload_context_fingerprint {
             return CandidateDecision::Parse;
         }
@@ -19242,6 +19593,94 @@ mod tests {
             index.candidate_decision(&candidate),
             CandidateDecision::Parse
         );
+    }
+
+    #[test]
+    fn claude_authority_quarantine_is_durable_and_retries_on_change_or_deadline() {
+        let root_session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let root = temp_dir("claude-authority-quarantine-retry");
+        let transcript = root.join(format!("{root_session_id}.jsonl"));
+        fs::write(&transcript, "{}\n").expect("write authority retry transcript");
+        let current_revision = "a".repeat(64);
+        let witness = ClaudeUsageFamilyWitness {
+            evidence_fingerprint: "provider-evidence".to_string(),
+            member_request_id_fingerprints: BTreeMap::from([(
+                root_session_id.to_string(),
+                "requests".to_string(),
+            )]),
+            member_occurrence_fingerprints: BTreeMap::from([(
+                root_session_id.to_string(),
+                "occurrences".to_string(),
+            )]),
+            assigned_request_id_fingerprints: BTreeMap::from([(
+                root_session_id.to_string(),
+                "assigned".to_string(),
+            )]),
+            legacy_excluded_request_id_hashes: BTreeMap::new(),
+            legacy_exclusion_evidence_fingerprint: None,
+            legacy_owner_roots: BTreeSet::new(),
+        };
+        let witness_fingerprint = claude_usage_family_witness_fingerprint(&witness);
+        let mut candidate = test_candidate(transcript.clone());
+        candidate.source_file_fingerprint = current_revision.clone();
+        let mut entry = manifest_index_entry(Some(&"b".repeat(64)));
+        entry.size_bytes = candidate.size_bytes;
+        entry.modified_unix_seconds = candidate.modified_unix_seconds;
+        entry.modified_unix_nanos = Some(candidate.modified_unix_nanos);
+        entry.source_file_fingerprint = current_revision.clone();
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string());
+        let mut index = ScanIndex::default();
+        index.files.insert(local_index_key(&transcript), entry);
+        index
+            .claude_usage_family_witnesses
+            .insert(root_session_id.to_string(), witness);
+        index.claude_usage_authority_quarantine.insert(
+            root_session_id.to_string(),
+            ClaudeUsageAuthorityQuarantineRecord {
+                contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
+                proven_witness_fingerprint: witness_fingerprint.clone(),
+                member_source_file_fingerprints: BTreeMap::from([(
+                    root_session_id.to_string(),
+                    current_revision,
+                )]),
+                retry_after_unix_seconds: claude_usage_authority_retry_deadline(
+                    root_session_id,
+                    &witness_fingerprint,
+                ),
+            },
+        );
+
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Skip
+        );
+        let index_path = root.join("scan-index.json");
+        index
+            .save(&index_path)
+            .expect("persist authority quarantine");
+        let mut loaded = ScanIndex::load(&index_path).expect("reload authority quarantine");
+        assert_eq!(
+            loaded.candidate_decision(&candidate),
+            CandidateDecision::Skip
+        );
+
+        let mut changed = candidate.clone();
+        changed.source_file_fingerprint = "d".repeat(64);
+        assert_eq!(
+            loaded.candidate_decision(&changed),
+            CandidateDecision::Parse
+        );
+        loaded
+            .claude_usage_authority_quarantine
+            .get_mut(root_session_id)
+            .expect("loaded authority quarantine")
+            .retry_after_unix_seconds = 0;
+        assert_eq!(
+            loaded.candidate_decision(&candidate),
+            CandidateDecision::Parse
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -26455,7 +26894,7 @@ mod tests {
         unhealthy_trace.malformed_lines = 1;
         let (unhealthy_root, _, mut unhealthy_reparse) = claude_account_family_fixture();
         let mut unhealthy_child = vec![unhealthy_reparse.remove(1)];
-        apply_claude_reported_usage_with_index(
+        let disposition = apply_claude_reported_usage_with_index(
             &mut unhealthy_child,
             &api_report,
             &unhealthy_trace,
@@ -26464,8 +26903,233 @@ mod tests {
             "2026-08-02T07:12:00Z",
         );
         assert_eq!(unhealthy_child[0].usage_accounting_contract, None);
+        assert_eq!(disposition.quarantined_entity_count(), 1);
+        let mut uploadable = unhealthy_child;
+        disposition.retain_uploadable(&mut uploadable);
+        assert!(
+            uploadable.is_empty(),
+            "the demoting body never reaches upload"
+        );
+        assert!(
+            index.claude_usage_family_witnesses.contains_key(&parent),
+            "reconstruction failure retains the last exact proven witness"
+        );
+        assert!(index
+            .claude_usage_authority_quarantine
+            .contains_key(&parent));
         let _ = fs::remove_dir_all(unhealthy_root);
         let _ = fs::remove_dir_all(reparsed_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_seven_entity_authority_demotion_cohort_reproves_before_upload() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshot-audit/claude-authority-demotion-cohort.v1.json"
+        ))
+        .expect("parse exact production cohort fixture");
+        assert_eq!(fixture["contract"], "claude_authority_demotion_cohort:v1");
+        assert_eq!(
+            fixture["reject_reason"],
+            "usage_accounting_authority_downgrade"
+        );
+        assert!(sha256_hex_is_well_formed(
+            fixture["root_session_id_sha256"]
+                .as_str()
+                .expect("fixture root session hash")
+        ));
+        let root_session_id = "11111111-2222-3333-4444-555555555555".to_string();
+        let members = fixture["members"]
+            .as_array()
+            .expect("fixture family members");
+        assert_eq!(members.len(), 7);
+
+        let root = temp_dir("claude-authority-demotion-seven");
+        let mut items = Vec::new();
+        let mut index = ScanIndex::default();
+        let mut api_rows = Vec::new();
+        let mut trace_rows = Vec::new();
+        for (offset, member) in members.iter().enumerate() {
+            assert!(sha256_hex_is_well_formed(
+                member["source_session_id_sha256"]
+                    .as_str()
+                    .expect("fixture source session hash")
+            ));
+            let source_session_id = if offset == 0 {
+                root_session_id.clone()
+            } else {
+                format!("{root_session_id}_agent-{offset:016x}")
+            };
+            let rejected_fingerprint = member["rejected_snapshot_fingerprint"]
+                .as_str()
+                .expect("fixture rejected fingerprint");
+            assert!(sha256_hex_is_well_formed(rejected_fingerprint));
+            let agent_id = source_session_id.strip_prefix(&format!("{root_session_id}_agent-"));
+            let path = match agent_id {
+                Some(agent_id) => root
+                    .join(&root_session_id)
+                    .join("subagents")
+                    .join(format!("agent-{agent_id}.jsonl")),
+                None => root.join(format!("{root_session_id}.jsonl")),
+            };
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("create exact cohort member directory");
+            }
+            let request_id = format!("cohort-request-{offset}");
+            let line = json!({
+                "timestamp": format!("2026-08-23T18:20:{offset:02}Z"),
+                "type": "assistant",
+                "sessionId": root_session_id,
+                "agentId": agent_id,
+                "isSidechain": agent_id.is_some(),
+                "requestId": request_id,
+                "message": {
+                    "id": format!("cohort-message-{offset}"),
+                    "model": "claude-haiku-4-5",
+                    "usage": {"input_tokens": 10, "output_tokens": 1}
+                }
+            });
+            fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&line).expect("serialize cohort transcript row")
+                ),
+            )
+            .expect("write exact cohort member");
+            let mut parsed = parse_claude_code_jsonl_file(
+                &path,
+                "2026-08-23T18:40:00Z",
+                rejected_fingerprint.to_string(),
+            )
+            .expect("parse exact cohort member");
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].source_session_id, source_session_id);
+            items.append(&mut parsed);
+
+            let mut entry = manifest_index_entry(None);
+            entry.source_file_fingerprint = rejected_fingerprint.to_string();
+            index.files.insert(local_index_key(&path), entry);
+            api_rows.push(complete_api_row(
+                &root_session_id,
+                &request_id,
+                (offset + 1) as u64,
+                10,
+                1,
+                0,
+            ));
+            trace_rows.push(complete_trace_row(
+                &root_session_id,
+                &request_id,
+                agent_id.unwrap_or_default(),
+            ));
+        }
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(root_session_id.clone(), api_rows)]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(root_session_id.clone(), trace_rows)]),
+            ..Default::default()
+        };
+
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-23T18:40:00Z",
+        );
+        assert!(items.iter().all(|item| {
+            item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
+        }));
+        let proven_witness = index
+            .claude_usage_family_witnesses
+            .get(&root_session_id)
+            .cloned()
+            .expect("seed exact proven family witness");
+
+        let mut weaker_revision = items.clone();
+        for (item, member) in weaker_revision.iter_mut().zip(members) {
+            item.snapshot_fingerprint = member["rejected_snapshot_fingerprint"]
+                .as_str()
+                .expect("fixture rejected fingerprint")
+                .to_string();
+        }
+        let missing_api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+        let missing_trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        let disposition = apply_claude_reported_usage_with_index(
+            &mut weaker_revision,
+            &missing_api,
+            &missing_trace,
+            &mut index,
+            true,
+            "2026-08-23T18:45:00Z",
+        );
+        assert_eq!(disposition.quarantined_entity_count(), 7);
+        assert!(weaker_revision
+            .iter()
+            .all(|item| item.usage_accounting_contract.is_none()));
+        let rejected_hashes = weaker_revision
+            .iter()
+            .map(|item| item.snapshot_fingerprint.as_str())
+            .collect::<BTreeSet<_>>();
+        let fixture_hashes = members
+            .iter()
+            .map(|member| {
+                member["rejected_snapshot_fingerprint"]
+                    .as_str()
+                    .expect("fixture rejected fingerprint")
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(rejected_hashes, fixture_hashes);
+        let mut uploadable = weaker_revision.clone();
+        disposition.retain_uploadable(&mut uploadable);
+        assert!(uploadable.is_empty(), "all seven demoting bodies are held");
+        assert_eq!(
+            index.claude_usage_family_witnesses.get(&root_session_id),
+            Some(&proven_witness),
+            "the exact proven ownership witness survives reconstruction failure"
+        );
+        let quarantine = index
+            .claude_usage_authority_quarantine
+            .get_mut(&root_session_id)
+            .expect("family is durably quarantined");
+        assert_eq!(quarantine.member_source_file_fingerprints.len(), 7);
+        assert_eq!(
+            quarantine
+                .member_source_file_fingerprints
+                .values()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            fixture_hashes.into_iter().map(str::to_string).collect()
+        );
+        quarantine.retry_after_unix_seconds = 0;
+
+        let mut reconstructed_revision = weaker_revision;
+        let recovered = apply_claude_reported_usage_with_index(
+            &mut reconstructed_revision,
+            &api_report,
+            &trace_report,
+            &mut index,
+            false,
+            "2026-08-23T18:50:00Z",
+        );
+        assert_eq!(recovered.quarantined_entity_count(), 0);
+        assert!(reconstructed_revision.iter().all(|item| {
+            item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
+        }));
+        let mut uploadable = reconstructed_revision;
+        recovered.retain_uploadable(&mut uploadable);
+        assert_eq!(uploadable.len(), 7, "re-proven revisions reach upload");
+        assert!(!index
+            .claude_usage_authority_quarantine
+            .contains_key(&root_session_id));
+        assert!(!index
+            .claude_usage_family_pending
+            .contains_key(&root_session_id));
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -26739,7 +27403,7 @@ mod tests {
             "child-fp-3".to_string(),
         )
         .expect("reparse unproven child");
-        apply_claude_reported_usage_with_index(
+        let unproven_disposition = apply_claude_reported_usage_with_index(
             &mut unproven,
             &child_only_report,
             &child_only_trace,
@@ -26749,6 +27413,7 @@ mod tests {
         );
         assert_eq!(unproven[0].request_count, 2);
         assert_eq!(unproven[0].usage_accounting_contract, None);
+        assert_eq!(unproven_disposition.quarantined_entity_count(), 1);
         assert_eq!(
             unproven[0]
                 .context_curve
@@ -26765,11 +27430,12 @@ mod tests {
             true,
             "2026-08-02T07:12:30Z",
         );
-        assert!(!index.claude_usage_family_witnesses.contains_key(child));
+        assert!(index.claude_usage_family_witnesses.contains_key(child));
+        assert!(index.claude_usage_authority_quarantine.contains_key(child));
         assert!(index
             .files
             .get(&local_index_key(&child_path))
-            .is_some_and(|entry| entry.source_file_fingerprint.is_empty()));
+            .is_some_and(|entry| !entry.source_file_fingerprint.is_empty()));
         let _ = fs::remove_dir_all(root);
     }
 

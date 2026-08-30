@@ -2107,6 +2107,8 @@ fn sync_source(
     // This must precede upload-policy stripping: parent/root references are
     // identity evidence needed locally even when the org disables attribution
     // labels on the wire.
+    let mut claude_authority_disposition =
+        crate::snapshots::ClaudeUsageAuthorityDisposition::default();
     if source == SnapshotSource::ClaudeCode {
         let census_complete = scan_result.census_complete;
         let mut session_ids = claude_evidence_session_ids(&scan_result.snapshots)
@@ -2171,7 +2173,7 @@ fn sync_source(
             }
         }
         let census_window_end = scan_result.census_window_end.clone();
-        crate::snapshots::apply_claude_reported_usage_with_index(
+        claude_authority_disposition = crate::snapshots::apply_claude_reported_usage_with_index(
             &mut scan_result.snapshots,
             &api_report,
             &trace_report,
@@ -2179,6 +2181,17 @@ fn sync_source(
             census_complete,
             &census_window_end,
         );
+        if index.claude_usage_authority_pending_count() > 0 {
+            // These revisions were fully readable, but uploading them would
+            // demote a previously proven usage authority. They remain pending
+            // local work: healthy siblings may settle, while this census and
+            // any historical replay stay non-terminal until a complete family
+            // pass reconstructs the exact witness.
+            scan_result.census_complete = false;
+            scan_result.scan_cap_hit = true;
+            index.mark_bounded_sweep_unsettled();
+            backfill_succeeded = false;
+        }
     }
 
     apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
@@ -2256,6 +2269,17 @@ fn sync_source(
         );
     }
 
+    // Keep the full local scan available to active-session/context-posture
+    // consumers above, then remove only authority-demoting revisions at the
+    // network boundary. They are not backend poison and are not counted as
+    // accepted/quarantined upload settlement.
+    let deferred_local_authority_entity_count =
+        claude_authority_disposition.quarantined_entity_count();
+    let locally_held_fingerprints =
+        claude_authority_disposition.quarantined_fingerprints(&scan_result.snapshots);
+    claude_authority_disposition.retain_uploadable(&mut scan_result.snapshots);
+    let deferred_local_authority_count = index.claude_usage_authority_pending_count();
+
     let mut accepted = 0;
     let upload_result = upload_resumable_batches_with_body_witness(
         &scan_result.snapshots,
@@ -2320,9 +2344,46 @@ fn sync_source(
     let mut upload_fully_settled = true;
     let mut deferred_entity_conflict_count = None;
     match upload_result {
-        Ok(ResumableUploadResult::Completed) => clear_shed_streak(source),
+        Ok(ResumableUploadResult::Completed) => {
+            clear_shed_streak(source);
+            if deferred_local_authority_count > 0 {
+                let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
+                accepted_fingerprints
+                    .retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
+                let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
+                server_quarantine
+                    .retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
+                index = index.committable_subset(
+                    &committed_index,
+                    &accepted_fingerprints,
+                    &server_quarantine,
+                );
+                index.mark_bounded_sweep_unsettled();
+                backfill_succeeded = false;
+                upload_fully_settled = false;
+                eprintln!(
+                    "local snapshot sync retained {deferred_local_authority_count} Claude usage \
+                     family/families ({deferred_local_authority_entity_count} revised \
+                     entity/entities this pass) with unproven authority; healthy siblings settled \
+                     and the retained revisions remain pending for bounded retry"
+                );
+            }
+        }
         Ok(ResumableUploadResult::Conflicted { count }) => {
             clear_shed_streak(source);
+            if deferred_local_authority_count > 0 {
+                let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
+                accepted_fingerprints
+                    .retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
+                let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
+                server_quarantine
+                    .retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
+                index = index.committable_subset(
+                    &committed_index,
+                    &accepted_fingerprints,
+                    &server_quarantine,
+                );
+            }
             // Accepted siblings are safe to commit, but a retryable conflict
             // is not proof that a broad historical replay is complete. Force
             // one clean follow-up sweep and leave the destination's backfill
@@ -2345,11 +2406,16 @@ fn sync_source(
             // the next cycle replays the whole scan, which is today's behaviour
             // and the reason a shed request produces an identical re-upload every
             // five minutes forever.
-            let accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
+            let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
+            accepted_fingerprints
+                .retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
+            let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
+            server_quarantine
+                .retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
             let mut committable = index.committable_subset(
                 &committed_index,
                 &accepted_fingerprints,
-                &upload_progress.quarantined_fingerprints,
+                &server_quarantine,
             );
             committable.mark_bounded_sweep_unsettled();
             // `committable_subset` also retains an older quarantine witness for
