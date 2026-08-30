@@ -25,7 +25,7 @@ pub const CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION: u16 = 23;
 /// v21 adds daemon-authored workspace targets and target-bound setup. The base
 /// protocol remains unchanged so older clients continue to use every unrelated
 /// command during a rolling local-runtime upgrade.
-pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 22;
+pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 23;
 pub const CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
 pub const CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
@@ -2525,6 +2525,7 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         LocalControlCommand::CodexAccountsStatus
         | LocalControlCommand::CodexAccountPrepare { .. }
         | LocalControlCommand::CodexAccountPrepareTarget { .. }
+        | LocalControlCommand::CodexAccountPrepareOpen { .. }
         | LocalControlCommand::CodexAccountReconnect { .. }
         | LocalControlCommand::CodexAccountCheck { .. }
         | LocalControlCommand::CodexAccountStopWaiting { .. }
@@ -3529,6 +3530,18 @@ pub enum LocalControlCommand {
         expected_account_identifier_hash: String,
         expected_workspace_identifier_hash: String,
     },
+    /// v23 open prepare, for a workspace the client cannot name in advance.
+    ///
+    /// Other ChatGPT workspaces are not enumerable - the ID token names only the
+    /// signed-in one and `account/read` carries no workspace list - so the only
+    /// honest way to add one is to let the provider's own picker choose and
+    /// adopt whatever comes back. The daemon reserves a home, and registers the
+    /// slot only once the sign-in yields an identity that is not already
+    /// connected.
+    CodexAccountPrepareOpen {
+        schema_version: u16,
+        operation_id: String,
+    },
     /// v21 target-bound prepare. The daemon resolves `target_id` from its own
     /// current projection and persists the exact composite binding atomically.
     CodexAccountPrepareTarget {
@@ -4116,6 +4129,11 @@ mod tests {
                 "expected_workspace_identifier_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             }),
             serde_json::json!({
+                "command": "codex_account_prepare_open",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
                 "command": "codex_account_prepare_target",
                 "schema_version": 1,
                 "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
@@ -4210,7 +4228,7 @@ mod tests {
     fn codex_account_commands_fail_closed_on_every_older_protocol_version() {
         // Each superseded version is rejected by name, so a stale companion says
         // "update Ottto" instead of quietly rendering a payload it cannot read.
-        for stale in [20, 21] {
+        for stale in [20, 21, 22] {
             let request = serde_json::json!({
                 "request_id": "req_codex_account",
                 "protocol_version": stale,
@@ -4220,10 +4238,10 @@ mod tests {
             let error = serde_json::from_value::<LocalControlRequest>(request)
                 .expect_err("a superseded client must get an explicit incompatibility signal");
             assert!(error.to_string().contains(&format!(
-                "unsupported local control protocol_version {stale}; expected 22"
+                "unsupported local control protocol_version {stale}; expected 23"
             )));
         }
-        assert_eq!(CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION, 22);
+        assert_eq!(CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION, 23);
     }
 
     #[test]
