@@ -30073,12 +30073,18 @@ mod tests {
             .expect_err("generic entity ACK cannot settle curve evidence");
         response(
             Some(SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION),
+            Some(snapshot_upload_body_witness(&item)),
+        )
+        .validate_entity_ack(&request)
+        .expect_err("internal envelope proof cannot replace the public ACK version");
+        response(
+            Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION),
             Some("0".repeat(64)),
         )
         .validate_entity_ack(&request)
         .expect_err("mismatched durable proof cannot settle curve evidence");
         response(
-            snapshot_upload_body_witness_version(&item),
+            Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION),
             Some(snapshot_upload_body_witness(&item)),
         )
         .validate_entity_ack(&request)

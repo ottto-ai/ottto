@@ -2,13 +2,13 @@
 
 ## Problem
 
-Ottto 0.1.119 serializes every local session snapshot with a
-`semantic_envelope`, but its resumable uploader still identified additive body
-witnesses with the pre-envelope versions (`v3`-`v6`). The backend correctly
-settled those same wire bodies in the envelope domain (`v9`-`v12`) and returned
-that exact proof in the entity ACK. The daemon rejected the otherwise valid
-HTTP 200 response because the witness version did not match, so its historical
-census cursor could not advance even though the backend accepted the page.
+Ottto 0.1.120 serializes every local session snapshot with a
+`semantic_envelope` and identifies additive body witnesses internally with
+versions `v9`-`v12`. The backend durably stores that envelope-domain witness,
+then intentionally projects it onto the released public ACK vocabulary
+`v3`-`v6`. The daemon incorrectly required the internal version in the public
+response, so it rejected otherwise valid HTTP 200 responses and could not
+advance its historical census cursor.
 
 This was visible as all of the following at once:
 
@@ -19,17 +19,17 @@ This was visible as all of the following at once:
 
 ## Fix
 
-The uploader now derives its body-witness version from the wire domain it
-actually sends:
+The uploader continues deriving its body-witness version from the envelope
+domain it sends:
 
 - tool-only evidence: `v9` / exclusive `v10`;
 - context-curve evidence: `v11` / exclusive `v12`.
 
-The digest projection stays unchanged; only the domain version advances. ACK
-shape validation accepts both legacy `v3`-`v6` and envelope `v9`-`v12` proofs,
-while context-curve settlement still requires the exact expected version and
-digest. Reserved non-proof versions `v7` and `v8` remain invalid in this ACK
-contract.
+For ACK validation, the daemon now maps envelope `v9`-`v12` to the public
+proof versions `v3`-`v6` before requiring an exact version and digest match.
+Reserved non-proof versions `v7` and `v8` remain invalid. The Codex historical
+replay revision advances to `codex_session_exclusive_usage:v7`, forcing one
+fresh census so lineage newly recovered by the current parser is uploaded.
 
 ## Verification
 
