@@ -3125,7 +3125,12 @@ pub struct CodexAccountTargetDescriptorV1 {
     pub connectable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<CodexAccountTargetHealthV1>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Always serialized, empty included. Omitting it saved a few bytes and
+    /// cost the entire Codex accounts panel: a client decoding this list as
+    /// required fails on every healthy target, and one failed target fails the
+    /// whole status. A list that is part of the contract is cheaper to send
+    /// than to explain.
+    #[serde(default)]
     pub setup_blockers: Vec<CodexAccountTargetSetupBlockerV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<Rfc3339Timestamp>,
@@ -4053,6 +4058,58 @@ mod tests {
             request["client_kind"] = serde_json::json!("companion_app");
             serde_json::from_value::<LocalControlRequest>(request).expect("Codex account command");
         }
+    }
+
+    #[test]
+    fn codex_target_always_serializes_setup_blockers_even_when_empty() {
+        // Skipping this list when empty took the whole Codex accounts panel
+        // down for two releases: the companion decoded it as required, so the
+        // healthy case - no blockers - failed, and one failed target failed the
+        // entire status. Every target must carry the key.
+        let status = CodexAccountsStatusV1 {
+            schema_version: CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+            setup_operation: Default::default(),
+            default_slot: CodexAccountSlotDescriptorV1 {
+                slot_id: "default".to_string(),
+                ownership: CodexAccountSlotOwnershipV1::Default,
+                collection: Default::default(),
+            },
+            managed_slots: Vec::new(),
+            target_coverage: CodexAccountTargetCoverageV1 {
+                targets: vec![CodexAccountTargetDescriptorV1 {
+                    target_id: "codex_account_target_healthy".to_string(),
+                    account_identifier_hash: Some("a".repeat(64)),
+                    workspace_identifier_hash: Some("b".repeat(64)),
+                    account_label: "owner@example.test".to_string(),
+                    workspace_label: Some("Personal".to_string()),
+                    subscription_product: Some("chatgpt_pro".to_string()),
+                    durability: CodexAccountTargetDurabilityV1::Current,
+                    is_current: true,
+                    connectable: true,
+                    health: Some(CodexAccountTargetHealthV1::Healthy),
+                    setup_blockers: Vec::new(),
+                    observed_at: None,
+                }],
+                observed_targets: 1,
+                durable_targets: 0,
+                current_targets: 1,
+                connectable_targets: 1,
+                blocked_targets: 0,
+            },
+            capacity: CodexAccountCapacityV1 {
+                max_slots: 10,
+                used_slots: 1,
+                remaining_slots: 9,
+            },
+        };
+
+        let wire = serde_json::to_value(&status).expect("serialize");
+        let target = &wire["target_coverage"]["targets"][0];
+        assert!(
+            target.get("setup_blockers").is_some(),
+            "an empty blocker list must still be sent: {target}"
+        );
+        assert_eq!(target["setup_blockers"], serde_json::json!([]));
     }
 
     #[test]
