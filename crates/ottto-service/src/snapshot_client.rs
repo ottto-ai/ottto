@@ -1,7 +1,7 @@
 use crate::snapshots::{
     snapshot_upload_body_witness, snapshot_upload_body_witness_version, SnapshotBatchRequest,
-    SnapshotSource, SnapshotSourceManifest, SNAPSHOT_BODY_WITNESS_CONTEXT_CURVE_VERSION,
-    SNAPSHOT_BODY_WITNESS_EXCLUSIVE_CONTEXT_CURVE_VERSION, SNAPSHOT_ENTITY_ACK_CONTRACT,
+    SnapshotSource, SnapshotSourceManifest, SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION,
+    SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION, SNAPSHOT_ENTITY_ACK_CONTRACT,
 };
 use anyhow::{anyhow, Result};
 use flate2::write::GzEncoder;
@@ -655,8 +655,8 @@ impl SnapshotBatchResponse {
                 .filter(|version| {
                     matches!(
                         *version,
-                        SNAPSHOT_BODY_WITNESS_CONTEXT_CURVE_VERSION
-                            | SNAPSHOT_BODY_WITNESS_EXCLUSIVE_CONTEXT_CURVE_VERSION
+                        SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION
+                            | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION
                     )
                 })
                 .ok_or_else(|| anyhow!("context curve has no supported body witness version"))?;
@@ -831,7 +831,7 @@ fn validate_snapshot_entity_ref(reference: &SnapshotEntityRef) -> Result<()> {
     ) {
         (None, None) => {}
         (Some(version), Some(digest))
-            if matches!(version, 3..=6)
+            if matches!(version, 3..=6 | 9..=12)
                 && digest.len() == 64
                 && digest
                     .bytes()

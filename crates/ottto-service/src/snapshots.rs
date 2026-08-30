@@ -4735,29 +4735,32 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
     )
 }
 
-pub(crate) const SNAPSHOT_BODY_WITNESS_TOOL_VERSION: u64 = 3;
-pub(crate) const SNAPSHOT_BODY_WITNESS_EXCLUSIVE_TOOL_VERSION: u64 = 4;
-pub(crate) const SNAPSHOT_BODY_WITNESS_CONTEXT_CURVE_VERSION: u64 = 5;
-pub(crate) const SNAPSHOT_BODY_WITNESS_EXCLUSIVE_CONTEXT_CURVE_VERSION: u64 = 6;
+pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION: u64 = 9;
+pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION: u64 = 10;
+pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION: u64 = 11;
+pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION: u64 = 12;
 
 /// Backend-compatible, hash-neutral witness version for additive snapshot-body
-/// evidence. Curve-bearing bodies use v5/v6; legacy tool-only bodies use v3/v4.
-/// Semantic identity remains owned exclusively by the component/content hashes.
+/// evidence. Every current wire item carries a semantic envelope, so curve-bearing
+/// bodies use v11/v12 and tool-only bodies use v9/v10. The digest projection is
+/// unchanged from legacy v3-v6; the version records which semantic identity domain
+/// the backend durably settled. Semantic identity remains owned exclusively by the
+/// component/content hashes.
 pub(crate) fn snapshot_upload_body_witness_version(item: &SnapshotItem) -> Option<u64> {
     let exclusive =
         item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1");
     if item.context_curve.is_some() {
         return Some(if exclusive {
-            SNAPSHOT_BODY_WITNESS_EXCLUSIVE_CONTEXT_CURVE_VERSION
+            SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION
         } else {
-            SNAPSHOT_BODY_WITNESS_CONTEXT_CURVE_VERSION
+            SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION
         });
     }
     if item.tool_usage.is_some() || item.tool_usage_truncated {
         return Some(if exclusive {
-            SNAPSHOT_BODY_WITNESS_EXCLUSIVE_TOOL_VERSION
+            SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION
         } else {
-            SNAPSHOT_BODY_WITNESS_TOOL_VERSION
+            SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION
         });
     }
     None
@@ -29900,11 +29903,11 @@ mod tests {
             })
         };
         let body_witnesses = json!({
-            "codex_curve_only_v5": witness(codex.clone(), None, false),
-            "claude_curve_only_v5": witness(claude.clone(), None, false),
-            "curve_with_empty_tool_usage_v5": witness(codex.clone(), Some(Vec::new()), false),
-            "curve_with_truncated_only_v5": witness(codex.clone(), None, true),
-            "curve_with_both_tool_fields_v5": witness(
+            "codex_curve_only_v11": witness(codex.clone(), None, false),
+            "claude_curve_only_v11": witness(claude.clone(), None, false),
+            "curve_with_empty_tool_usage_v11": witness(codex.clone(), Some(Vec::new()), false),
+            "curve_with_truncated_only_v11": witness(codex.clone(), None, true),
+            "curve_with_both_tool_fields_v11": witness(
                 codex.clone(),
                 Some(vec![SnapshotToolUsage { name: "Read".to_string(), count: 2 }]),
                 true,
@@ -30069,7 +30072,7 @@ mod tests {
             .validate_entity_ack(&request)
             .expect_err("generic entity ACK cannot settle curve evidence");
         response(
-            Some(SNAPSHOT_BODY_WITNESS_CONTEXT_CURVE_VERSION),
+            Some(SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION),
             Some("0".repeat(64)),
         )
         .validate_entity_ack(&request)
