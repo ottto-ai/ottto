@@ -4929,6 +4929,148 @@ mod tests {
     }
 
     #[test]
+    fn curve_ack_retry_checkpoints_released_witness_then_becomes_noop() {
+        let root = test_dir("curve-ack-retry-checkpoint");
+        std::fs::create_dir_all(&root).expect("create curve snapshot fixture root");
+        let path = root.join("curve-session.jsonl");
+        std::fs::write(
+            &path,
+            "{\"timestamp\":\"2026-08-30T12:00:00Z\",\"sessionId\":\"curve-session\",\"requestId\":\"req-1\",\"message\":{\"id\":\"msg-1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":42,\"output_tokens\":1}}}\n",
+        )
+        .expect("write curve snapshot fixture");
+        let mut index = ScanIndex::default();
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-30T12:05:00Z",
+            183,
+            10,
+            true,
+        )
+        .expect("scan curve snapshot fixture");
+        assert_eq!(scan.snapshots.len(), 1);
+        let item = &mut scan.snapshots[0];
+        item.context_curve = Some(crate::snapshots::SnapshotContextCurve {
+            contract_version: CONTEXT_CURVE_CONTRACT_VERSION.to_string(),
+            parser_revision: "claude_code_jsonl:v28".to_string(),
+            ownership_revision: "claude_owned_request_start_proof:v1".to_string(),
+            sampling_revision: "context_curve_sampling:v1".to_string(),
+            coverage: "complete".to_string(),
+            total_owned_request_count: 1,
+            retained_point_count: 1,
+            total_compaction_boundary_count: 0,
+            retained_boundary_count: 0,
+            points: vec![crate::snapshots::SnapshotContextCurvePoint {
+                owned_request_ordinal: 1,
+                observed_at: "2026-08-30T12:00:00Z".to_string(),
+                effective_input_tokens: 42,
+                model_window_index: 0,
+                segment_ordinal: 0,
+                retention_flags: 1,
+                compaction_before_request_boundary_index: None,
+                compaction_after_request_boundary_index: None,
+            }],
+            boundaries: Vec::new(),
+            model_windows: vec![crate::snapshots::SnapshotContextCurveModelWindow {
+                model_window_index: 0,
+                model: "claude-opus-4-8".to_string(),
+                context_window_tokens: None,
+                evidence_kind: "unavailable".to_string(),
+                evidence_revision: "claude_transcript_model:v1".to_string(),
+            }],
+        });
+        let items = scan.snapshots;
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+
+        let first = upload_resumable_batches_with_body_witness(
+            &items,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |snapshot| snapshot.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |_| Err(anyhow!("response lost after durable remote write")),
+            |_| Ok(()),
+        );
+        first.expect_err("lost response cannot advance local checkpoint");
+        assert!(progress.accepted_fingerprints.is_empty());
+
+        let mut retry_calls = 0;
+        upload_resumable_batches_with_body_witness(
+            &items,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |snapshot| snapshot.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |batch| {
+                retry_calls += 1;
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "claude_code".to_string(),
+                    machine_id: "machine".to_string(),
+                    collector_version: None,
+                    snapshots: batch,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                let uploaded = &request.snapshots[0];
+                let response = crate::snapshot_client::SnapshotBatchResponse {
+                    accepted: 1,
+                    sessions_reconciled: 0,
+                    session_ids: Vec::new(),
+                    disabled: false,
+                    disabled_reason: None,
+                    entity_ack_contract: Some(
+                        crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string(),
+                    ),
+                    accepted_entities: Vec::new(),
+                    unchanged_entities: vec![crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: uploaded.source_session_id.clone(),
+                        snapshot_fingerprint: uploaded.snapshot_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: Some(5),
+                        body_witness_digest: Some(snapshot_upload_body_witness(uploaded)),
+                        head_etag: None,
+                        head_challenge: None,
+                    }],
+                    rejected_entities: Vec::new(),
+                    conflict_entities: Vec::new(),
+                };
+                response.validate_entity_ack(&request)?;
+                Ok(response)
+            },
+            |_| Ok(()),
+        )
+        .expect("released v5 unchanged ACK settles curve checkpoint");
+        assert_eq!(retry_calls, 1);
+        assert!(progress.contains_body(
+            &items[0].snapshot_fingerprint,
+            &snapshot_upload_body_witness(&items[0])
+        ));
+
+        let mut noop_calls = 0;
+        upload_resumable_batches_with_body_witness(
+            &items,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |snapshot| snapshot.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |_| {
+                noop_calls += 1;
+                Ok(accepted_batch(1))
+            },
+            |_| Ok(()),
+        )
+        .expect("settled curve is a durable no-op");
+        assert_eq!(noop_calls, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
         let poison_scope = &unique_poison_scope();
         let root = test_dir("snapshot-replay-generation-progress");

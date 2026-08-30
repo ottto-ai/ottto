@@ -12,13 +12,14 @@
 //! re-parses files that changed — so one cycle's snapshots are a *delta*.
 //! [`update_context_posture_cache`] folds that delta into the persisted cache
 //! (upsert by session id; a re-parsed session's row is complete, so newer rows
-//! replace older ones wholesale) and prunes rows outside the retention window.
+//! replace older ones wholesale), removes sessions whose reparse clears all
+//! posture evidence, and prunes rows outside the retention window.
 //!
 //! Everything here is measured (token counts, session counts). The daemon has
 //! no pricing, so the summary deliberately carries no dollar figures; the
 //! backend/web derives cost views from the uploaded snapshots instead.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -97,9 +98,24 @@ pub fn update_context_posture_cache(
     snapshots: &[SnapshotItem],
     now: OffsetDateTime,
 ) -> Result<()> {
+    let mut existing = read_context_posture_cache(support_dir);
+    let projected = snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                cache_row_from_snapshot(item),
+            )
+        })
+        .collect::<Vec<_>>();
+    let cleared_session_ids = projected
+        .iter()
+        .filter_map(|(session_id, row)| row.is_none().then_some(session_id.clone()))
+        .collect::<BTreeSet<_>>();
+    existing.retain(|row| !cleared_session_ids.contains(&row.session_id));
     let merged = merge_context_posture_rows(
-        read_context_posture_cache(support_dir),
-        snapshots.iter().filter_map(cache_row_from_snapshot),
+        existing,
+        projected.into_iter().filter_map(|(_, row)| row),
         now,
     );
 
@@ -134,8 +150,8 @@ pub fn claude_context_posture_summary(
 
 /// Project a scanned session onto its cache row. Only rows with posture
 /// evidence qualify (`compaction_count` is `Some` even at 0 on a parsed
-/// transcript), so a Codex state-only item — or a future regression that stops
-/// deriving posture — contributes nothing rather than a fake empty row.
+/// transcript). The caller treats `None` as a session tombstone, which removes
+/// any older posture row rather than preserving disproven evidence.
 ///
 /// This does NOT by itself make the cache Claude-only: `snapshots.rs` derives
 /// posture for Codex too, so keeping this cache's `claude_code.json` contract
@@ -799,6 +815,41 @@ mod tests {
         assert_eq!(summary.sessions_analyzed, 1);
         assert_eq!(summary.typical_first_turn_tokens, Some(72_000));
         assert_eq!(summary.reread_tokens, Some(9_000));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cache_reparse_without_posture_removes_stale_session_row() {
+        let dir = temp_support_dir("context-posture-tombstone");
+        let now = test_now();
+        update_context_posture_cache(
+            &dir,
+            &[snapshot_item(
+                "legacy-successor",
+                "2026-07-11T09:00:00Z",
+                (Some(895_010), Some(895_010), Some(1)),
+                900_000,
+                Some("claude-opus-4-8"),
+            )],
+            now,
+        )
+        .expect("seed stale posture");
+        assert_eq!(read_context_posture_cache(&dir).len(), 1);
+
+        update_context_posture_cache(
+            &dir,
+            &[snapshot_item(
+                "legacy-successor",
+                "2026-07-12T09:00:00Z",
+                (None, None, None),
+                900_000,
+                Some("claude-opus-4-8"),
+            )],
+            now,
+        )
+        .expect("apply fail-closed posture tombstone");
+        assert!(read_context_posture_cache(&dir).is_empty());
+        assert_eq!(claude_context_posture_summary(&dir, now), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
