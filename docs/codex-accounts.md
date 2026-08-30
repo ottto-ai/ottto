@@ -43,6 +43,20 @@ in this payload: `codex_accounts_status` answers the local Unix socket only and
 is never uploaded, and raw account ids, workspace ids, and token material stay
 absent. Credentials that claim no email fall back to a generic label.
 
+A strongly bound identity also carries `superseded_account_identifier_hash` and
+`superseded_organization_identifier_hash`: what this same account and workspace
+hashed to before the derivation changed. The account was keyed on
+`chatgpt_account_id` rather than the user id, and the organization on
+`organizations[].id` under the `organization` kind rather than the workspace id
+under `workspace`. Old and new digests conflict on every field, so a server
+holding the old ones sees an unrelated account and prices it as a second
+subscription. Only this collector holds the raw values, so only it can assert
+the equivalence; the superseded organization comes from the `is_default`
+membership alone, because that is the one the credential is signed into. A
+consumer may use the pair to recognize a stored identity as this one and adopt
+the current hashes. It must never treat them as a second account, and it must
+never merge on a non-default membership.
+
 `hasCredits: false` states that the credits program does not apply to an
 account, not that a balance ran out. The `balance: "0"` the provider sends
 alongside it is filler, so no credit row is emitted for that case; a positive
