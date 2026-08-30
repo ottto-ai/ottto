@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 343,
-  "content_sha256": "35fcf6996f39acbbafb207945b7019013b4e496ec1eace5708f7fe926eaa9e07",
+  "content_sha256": "a39365fa1b44916cab893df78d429aa338d1ac92fe7f601ddd66d9ad1684a5b3",
   "files": [
     {
       "executable": false,
@@ -860,8 +860,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "5c936def672e5506cf0920646927fad43463724d6ab2c2418439afbe1a93a904",
-      "size_bytes": 341182
+      "sha256": "ef68364577f19a3dbd932d454453865bd4f0036590520d93014b5c231bbc50cc",
+      "size_bytes": 358587
     },
     {
       "executable": false,
@@ -1497,8 +1497,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-08-30-replay-manifest-window.md",
-      "sha256": "76f149e9002ed1668c7fed65d8fe663d2544c08b9d29d8ebca58da32801aca2a",
-      "size_bytes": 2614
+      "sha256": "23af25c560d5c77e677e74e6d47bd4bf124208bb0c6a47a45bd418d5f02bb21c",
+      "size_bytes": 3372
     },
     {
       "executable": false,
@@ -2404,7 +2404,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-30T13:44:16+00:00",
+  "generated_at": "2026-08-30T14:32:30+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 344,
   "public_roots": [
@@ -2440,5 +2440,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "53df2765baac673028378975f95f536330b2044f"
+  "source_commit": "46a7353274e909da12357eb7c9810122dcc628ba"
 }
