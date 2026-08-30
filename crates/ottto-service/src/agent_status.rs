@@ -1159,19 +1159,23 @@ fn derive_codex_account_target_coverage(
 ) -> CodexAccountTargetCoverageV1 {
     let mut by_target = BTreeMap::<String, CodexAccountTargetDescriptorV1>::new();
 
-    // The provider names one workspace in two identifier spaces. A credential is
-    // bound by `chatgpt_account_id`, which is what a durable slot registers, while
-    // the same credential's id_token lists `organizations[].id`. Hashing both
-    // yields two identities for a single workspace, so the current login and every
-    // durable connection would render twice - and the duplicate would offer to
-    // "keep limits available" for a subscription that is already connected, which
-    // is how one subscription ends up occupying two slots and counting twice.
+    // OpenAI has TWO unrelated workspace namespaces, and only one of them carries
+    // subscriptions:
     //
-    // The organization a credential is actually signed into is the one flagged
-    // `is_default`, so alias that organization's hash onto the binding hash before
-    // any upsert. Aliases are collected across every candidate, so a workspace
-    // observed as non-default on one credential still collapses onto the binding of
-    // the slot that connected it.
+    // - `platform.openai.com` organizations govern API keys. They are what the
+    //   id_token's `organizations[]` claim lists.
+    // - `chatgpt.com` workspaces carry ChatGPT/Codex subscriptions. The signed-in
+    //   one is `chatgpt_account_id`, which is what a durable slot registers and
+    //   what `forced_chatgpt_workspace_id` pins.
+    //
+    // Only the second is a subscription. The two id spaces differ even when the
+    // names match: preparing a target from an `organizations[].id` and then signing
+    // into the same-named ChatGPT workspace returns `identity_mismatch`.
+    //
+    // The default organization is the one this credential is pointed at, so its
+    // TITLE is a usable name for the workspace the credential is signed into, and
+    // its hash is aliased onto the binding so the row does not render twice. That
+    // is a naming convenience only - the binding hash stays the identity.
     let mut workspace_alias = BTreeMap::<String, String>::new();
     for candidate in candidates {
         let Some((_, binding_workspace_hash)) = candidate
@@ -1301,7 +1305,22 @@ fn derive_codex_account_target_coverage(
 
     for candidate in candidates {
         let from_default_home = candidate.slot.ownership == CodexAccountSlotOwnershipV1::Default;
-        for evidence in &candidate.workspace_targets {
+        // Non-default organizations are platform orgs this credential is NOT
+        // signed into. They are not subscriptions, they are frequently not even
+        // sign-in-able - one observed live is absent from the ChatGPT workspace
+        // picker entirely - and offering them as connectable targets sends the
+        // owner through a login that can only end in `identity_mismatch`.
+        //
+        // Other ChatGPT workspaces are not enumerable: the id_token names only the
+        // signed-in one, and `account/read` returns type, email, and plan with no
+        // workspace list. So there is no honest target row to emit for them, and
+        // connecting another workspace has to be an unbound flow that lets the
+        // provider's own picker decide.
+        for evidence in candidate
+            .workspace_targets
+            .iter()
+            .filter(|evidence| evidence.is_default)
+        {
             let workspace_hash =
                 canonical_workspace_hash(evidence.workspace_identifier_hash.as_deref());
             let is_current = from_default_home
@@ -13127,6 +13146,27 @@ for line in sys.stdin:
         }
     }
 
+    fn codex_workspace_target_token_for(
+        account: &str,
+        workspace: &str,
+        organizations: Value,
+    ) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "email": "private.person@example.test",
+                "sub": account,
+                "https://api.openai.com/auth": {
+                    "chatgpt_user_id": account,
+                    "chatgpt_account_id": workspace,
+                    "organizations": organizations
+                }
+            })
+            .to_string(),
+        );
+        format!("{header}.{payload}.raw-secret-signature")
+    }
+
     fn codex_workspace_target_token(organizations: Value) -> String {
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
         let payload = URL_SAFE_NO_PAD.encode(
@@ -13142,69 +13182,6 @@ for line in sys.stdin:
             .to_string(),
         );
         format!("{header}.{payload}.raw-secret-signature")
-    }
-
-    #[test]
-    fn codex_workspace_target_coverage_exposes_all_id_token_organizations() {
-        let token = codex_workspace_target_token(serde_json::json!([
-            {"id": "raw-workspace-default", "title": "Personal", "is_default": true},
-            {"id": "raw-workspace-singular", "title": "Singular", "is_default": false},
-            {"id": "raw-workspace-research", "title": "Research", "is_default": false}
-        ]));
-        let evidence =
-            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
-                .expect("target evidence");
-        let account_hash =
-            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
-        let default_workspace_hash =
-            billing_identity_hash("openai", "workspace", "raw-workspace-default")
-                .expect("workspace hash");
-        let mut candidate = codex_candidate_for_test(
-            "default",
-            CodexAccountSlotOwnershipV1::Default,
-            &account_hash,
-            &default_workspace_hash,
-            5,
-        );
-        candidate.workspace_targets = evidence;
-
-        let status = empty_codex_accounts_status();
-        let coverage = derive_codex_account_target_coverage(&status, &[candidate]);
-
-        assert_eq!(coverage.observed_targets, 3);
-        assert_eq!(coverage.current_targets, 1);
-        assert_eq!(coverage.connectable_targets, 3);
-        assert_eq!(coverage.targets.len(), 3);
-        let current = coverage
-            .targets
-            .iter()
-            .find(|target| target.workspace_label.as_deref() == Some("Personal"))
-            .expect("default workspace target");
-        assert_eq!(current.durability, CodexAccountTargetDurabilityV1::Current);
-        assert!(current.is_current);
-        assert!(current.connectable);
-        for label in ["Singular", "Research"] {
-            let observed = coverage
-                .targets
-                .iter()
-                .find(|target| target.workspace_label.as_deref() == Some(label))
-                .expect("observed workspace target");
-            assert_eq!(
-                observed.durability,
-                CodexAccountTargetDurabilityV1::ObservedOnly
-            );
-            assert!(!observed.is_current);
-            assert!(observed.connectable);
-        }
-        assert_eq!(
-            coverage
-                .targets
-                .iter()
-                .filter_map(|target| target.workspace_identifier_hash.as_deref())
-                .collect::<BTreeSet<_>>()
-                .len(),
-            3
-        );
     }
 
     /// The shipped fixture gave `chatgpt_account_id` and the default organization
@@ -13230,14 +13207,17 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_plan_type_names_the_signed_in_workspace_and_is_not_guessed_for_the_others() {
-        // `chatgpt_plan_type` describes the workspace the credential is signed
-        // into. Spreading it across the account's other workspaces would state a
-        // plan the provider never claimed for them.
+    fn codex_target_coverage_ignores_platform_orgs_that_are_not_the_signed_in_workspace() {
+        // `organizations[]` lists platform.openai.com organizations, which govern
+        // API keys. Only the one flagged `is_default` corresponds to the
+        // chatgpt.com workspace this credential is signed into, and only that
+        // workspace carries a subscription. The rest are not connectable: one seen
+        // live is not even offered by the ChatGPT workspace picker.
         let token = codex_split_identity_token(
             "raw-workspace-binding",
             serde_json::json!([
-                {"id": "raw-org-singular", "title": "Singular", "is_default": true},
+                {"id": "raw-org-personal", "title": "Personal", "is_default": true},
+                {"id": "raw-org-singular", "title": "Singular", "is_default": false},
                 {"id": "raw-org-deprecated", "title": "Singular Deprecated", "is_default": false}
             ]),
         );
@@ -13250,8 +13230,8 @@ for line in sys.stdin:
             billing_identity_hash("openai", "workspace", "raw-workspace-binding")
                 .expect("workspace hash");
         let mut candidate = codex_candidate_for_test(
-            "codex_slot_durable",
-            CodexAccountSlotOwnershipV1::Managed,
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
             &account_hash,
             &binding_workspace_hash,
             5,
@@ -13261,30 +13241,74 @@ for line in sys.stdin:
         let coverage =
             derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
 
-        let connected = coverage
-            .targets
-            .iter()
-            .find(|target| target.workspace_label.as_deref() == Some("Singular"))
-            .expect("connected workspace");
         assert_eq!(
-            connected.subscription_product.as_deref(),
-            Some("chatgpt_pro")
+            coverage.targets.len(),
+            1,
+            "one signed-in workspace, one row"
         );
-        let observed = coverage
-            .targets
-            .iter()
-            .find(|target| target.workspace_label.as_deref() == Some("Singular Deprecated"))
-            .expect("observed workspace");
-        assert_eq!(
-            observed.subscription_product, None,
-            "an unconnected workspace has no claimed plan of its own"
+        let target = &coverage.targets[0];
+        assert!(target.is_current);
+        assert_eq!(target.workspace_label.as_deref(), Some("Personal"));
+        assert_eq!(target.subscription_product.as_deref(), Some("chatgpt_pro"));
+        assert!(
+            coverage
+                .targets
+                .iter()
+                .all(|target| target.workspace_label.as_deref() != Some("Singular Deprecated")),
+            "a platform org the owner cannot sign into must never be offered"
         );
     }
 
     #[test]
-    fn codex_target_plan_type_comes_from_the_organization_when_the_token_claims_one() {
-        // A membership that names its own plan keeps it, rather than inheriting
-        // the credential's account-level plan.
+    fn codex_durable_slot_is_one_row_and_platform_orgs_add_nothing() {
+        let token = codex_split_identity_token(
+            "raw-workspace-binding",
+            serde_json::json!([
+                {"id": "raw-org-singular", "title": "Singular", "is_default": true},
+                {"id": "raw-org-deprecated", "title": "Singular Deprecated", "is_default": false},
+                {"id": "raw-org-personal", "title": "Personal", "is_default": false}
+            ]),
+        );
+        let evidence =
+            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
+        let account_hash =
+            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
+        let binding_workspace_hash =
+            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
+                .expect("workspace hash");
+        let mut durable = codex_candidate_for_test(
+            "codex_slot_durable",
+            CodexAccountSlotOwnershipV1::Managed,
+            &account_hash,
+            &binding_workspace_hash,
+            5,
+        );
+        durable.workspace_targets = evidence;
+
+        let coverage =
+            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[durable]);
+
+        assert_eq!(coverage.targets.len(), 1);
+        let connected = &coverage.targets[0];
+        assert_eq!(
+            connected.durability,
+            CodexAccountTargetDurabilityV1::Durable
+        );
+        assert_eq!(connected.workspace_label.as_deref(), Some("Singular"));
+        assert_eq!(
+            connected.subscription_product.as_deref(),
+            Some("chatgpt_pro")
+        );
+        assert!(!connected.connectable, "already connected");
+        assert_eq!(coverage.connectable_targets, 0);
+    }
+
+    #[test]
+    fn codex_non_default_platform_org_adds_no_row_even_when_it_claims_a_plan() {
+        // A platform organization naming its own plan is still a platform
+        // organization. A claimed plan must not smuggle it back in as a
+        // subscription the owner could connect.
         let token = codex_split_identity_token(
             "raw-workspace-binding",
             serde_json::json!([
@@ -13311,15 +13335,16 @@ for line in sys.stdin:
 
         let coverage =
             derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
-        let team = coverage
+
+        assert_eq!(coverage.targets.len(), 1);
+        assert_eq!(
+            coverage.targets[0].workspace_label.as_deref(),
+            Some("Singular")
+        );
+        assert!(coverage
             .targets
             .iter()
-            .find(|target| target.workspace_label.as_deref() == Some("Team"))
-            .expect("team workspace");
-        assert_eq!(
-            team.subscription_product.as_deref(),
-            Some("chatgpt_business")
-        );
+            .all(|target| target.workspace_label.as_deref() != Some("Team")));
     }
 
     #[test]
@@ -13367,67 +13392,6 @@ for line in sys.stdin:
             "the binding identity stays canonical so persisted slots keep resolving"
         );
         assert_eq!(target.subscription_product.as_deref(), Some("chatgpt_pro"));
-    }
-
-    #[test]
-    fn codex_durable_slot_absorbs_its_default_org_and_keeps_the_others_connectable() {
-        // Live shape for the managed slot: signed into "Singular" (the default org)
-        // while the token also lists two workspaces it could switch into.
-        let token = codex_split_identity_token(
-            "raw-workspace-binding",
-            serde_json::json!([
-                {"id": "raw-org-singular", "title": "Singular", "is_default": true},
-                {"id": "raw-org-deprecated", "title": "Singular Deprecated", "is_default": false},
-                {"id": "raw-org-personal", "title": "Personal", "is_default": false}
-            ]),
-        );
-        let evidence =
-            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
-                .expect("target evidence");
-        let account_hash =
-            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
-        let binding_workspace_hash =
-            billing_identity_hash("openai", "workspace", "raw-workspace-binding")
-                .expect("workspace hash");
-        let mut durable = codex_candidate_for_test(
-            "codex_slot_durable",
-            CodexAccountSlotOwnershipV1::Managed,
-            &account_hash,
-            &binding_workspace_hash,
-            5,
-        );
-        durable.workspace_targets = evidence;
-
-        let coverage =
-            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[durable]);
-
-        assert_eq!(coverage.targets.len(), 3, "three workspaces, not four rows");
-        let connected = coverage
-            .targets
-            .iter()
-            .find(|target| target.durability == CodexAccountTargetDurabilityV1::Durable)
-            .expect("durable target");
-        assert_eq!(
-            connected.workspace_label.as_deref(),
-            Some("Singular"),
-            "the durable row names the workspace it is signed into"
-        );
-        assert!(
-            !connected.connectable,
-            "an already durable workspace must not offer to keep limits available again"
-        );
-        for label in ["Singular Deprecated", "Personal"] {
-            let observed = coverage
-                .targets
-                .iter()
-                .find(|target| target.workspace_label.as_deref() == Some(label))
-                .expect("observed workspace target");
-            assert_eq!(
-                observed.durability,
-                CodexAccountTargetDurabilityV1::ObservedOnly
-            );
-            assert!(observed.connectable);
-        }
     }
 
     #[test]
@@ -13551,9 +13515,12 @@ for line in sys.stdin:
 
     #[test]
     fn codex_workspace_target_coverage_keeps_unconfirmed_identity_blocked() {
+        // Only the signed-in workspace can be a subscription, so it is the only
+        // one whose missing identity is worth surfacing. A non-default platform
+        // organization with no id is not a blocked subscription, it is not a
+        // subscription at all.
         let token = codex_workspace_target_token(serde_json::json!([
-            {"id": "raw-workspace-default", "title": "Personal", "is_default": true},
-            {"title": "Identity pending", "is_default": false}
+            {"title": "Identity pending", "is_default": true}
         ]));
         let evidence =
             codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
@@ -13589,10 +13556,19 @@ for line in sys.stdin:
 
     #[test]
     fn codex_workspace_target_status_serialization_never_leaks_raw_identity() {
+        // Two candidates, each signed into its own workspace, so both labels
+        // reach the wire: a non-default platform organization would contribute
+        // no row at all.
         let token = codex_workspace_target_token(serde_json::json!([
-            {"id": "raw-workspace-default", "title": "Personal", "is_default": true},
-            {"id": "raw-workspace-singular", "title": "Singular", "is_default": false}
+            {"id": "raw-workspace-default", "title": "Personal", "is_default": true}
         ]));
+        let singular_token = codex_workspace_target_token_for(
+            "raw-account-456",
+            "raw-workspace-singular",
+            serde_json::json!([
+                {"id": "raw-workspace-singular", "title": "Singular", "is_default": true}
+            ]),
+        );
         let evidence =
             codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
                 .expect("target evidence");
@@ -13608,8 +13584,24 @@ for line in sys.stdin:
             5,
         );
         candidate.workspace_targets = evidence;
+        let singular_account_hash =
+            billing_identity_hash("openai", "account", "raw-account-456").expect("account hash");
+        let singular_workspace_hash =
+            billing_identity_hash("openai", "workspace", "raw-workspace-singular")
+                .expect("workspace hash");
+        let mut singular = codex_candidate_for_test(
+            "codex_slot_singular",
+            CodexAccountSlotOwnershipV1::Managed,
+            &singular_account_hash,
+            &singular_workspace_hash,
+            5,
+        );
+        singular.workspace_targets =
+            codex_workspace_target_evidence_from_id_token(&singular_token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
         let mut status = empty_codex_accounts_status();
-        status.target_coverage = derive_codex_account_target_coverage(&status, &[candidate]);
+        status.target_coverage =
+            derive_codex_account_target_coverage(&status, &[candidate, singular]);
 
         let wire = serde_json::to_string(&status).expect("serialize Codex account status");
         assert!(wire.contains("Personal"));
@@ -13618,6 +13610,7 @@ for line in sys.stdin:
         // else the payload carries.
         for forbidden in [
             "raw-account-123",
+            "raw-account-456",
             "raw-workspace-default",
             "raw-workspace-singular",
             "raw-secret-signature",
