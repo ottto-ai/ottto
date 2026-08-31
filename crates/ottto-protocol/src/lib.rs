@@ -17,6 +17,10 @@ pub const CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 18;
 /// Command-scoped version for mutations that bind a daemon-authored anchor
 /// target to an exact account+organization pair.
 pub const CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION: u16 = 19;
+/// Command-scoped version for provider-owned Claude browser authentication.
+/// The v18/v19 prepare and reconnect commands retain their terminal-only side
+/// effects; only explicit v23 commands may start `claude auth login`.
+pub const CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION: u16 = 23;
 /// Command-scoped version for the machine-local Codex durable-account registry.
 /// v21 adds daemon-authored workspace targets and target-bound setup. The base
 /// protocol remains unchanged so older clients continue to use every unrelated
@@ -2514,6 +2518,10 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         | LocalControlCommand::ClaudeAccountReconnectTarget { .. } => {
             CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION
         }
+        LocalControlCommand::ClaudeAccountStartBrowserLogin { .. }
+        | LocalControlCommand::ClaudeAccountStartBrowserReconnect { .. } => {
+            CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION
+        }
         LocalControlCommand::CodexAccountsStatus
         | LocalControlCommand::CodexAccountPrepare { .. }
         | LocalControlCommand::CodexAccountPrepareTarget { .. }
@@ -2556,9 +2564,10 @@ pub enum ClaudeAccountUpkeepConsentState {
     Granted,
 }
 
-/// Daemon-owned observation state for one customer-owned Claude Code login.
-/// Ottto prepares and registers the exact directory, but never starts,
-/// completes, or cancels `/login` and never owns the Claude process.
+/// Daemon-owned observation state for one provider-owned Claude Code login.
+/// Legacy setup only prepares and registers the exact directory. Explicit v23
+/// browser-auth commands may supervise the official CLI login process, but
+/// Claude owns the browser ceremony, credentials, callback, and persistence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeAccountSetupOperationState {
@@ -2585,6 +2594,63 @@ pub enum ClaudeAccountSetupOperationKind {
     ReconnectRegisteredSlot,
 }
 
+/// Safe, local-only progress for an explicitly requested provider-owned Claude
+/// browser login. This is nested in an additive optional field so older strict
+/// clients can ignore the entire contract without decoding new enum values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeBrowserAuthPhaseV1 {
+    Prepared,
+    Launching,
+    WaitingForProvider,
+    Validating,
+    Reading,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeBrowserAuthOutcomeV1 {
+    Complete,
+    AlreadyConnected,
+    IdentityMismatch,
+    BrowserFallbackRequired,
+    LoginFailed,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeBrowserAuthIdentityMismatchV1 {
+    Account,
+    Organization,
+    AccountAndOrganization,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeBrowserAuthOperationV1 {
+    pub phase: ClaudeBrowserAuthPhaseV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ClaudeBrowserAuthOutcomeV1>,
+    #[serde(default)]
+    pub retryable: bool,
+    /// Retrying a terminal browser ceremony requires a freshly generated
+    /// operation id. Replaying the terminal id is read-only and can never
+    /// relaunch or rebind its original root.
+    #[serde(default)]
+    pub retry_requires_new_operation_id: bool,
+    #[serde(default)]
+    pub terminal_fallback_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_mismatch: Option<ClaudeBrowserAuthIdentityMismatchV1>,
+    /// Opaque canonical local slot selected for an `already_connected`
+    /// resolution. Never an account identifier, provider identifier, or path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_slot_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeAccountSetupOperationV1 {
     #[serde(default)]
@@ -2609,6 +2675,10 @@ pub struct ClaudeAccountSetupOperationV1 {
     /// Exact copyable command returned only by authenticated local control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_command: Option<String>,
+    /// Additive v23 provider-owned browser-login progress. Absent for every
+    /// legacy v18/v19 operation and from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_auth: Option<ClaudeBrowserAuthOperationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -2932,6 +3002,15 @@ pub struct ClaudeAccountsStatusV1 {
     #[serde(default)]
     pub anchor_transitions: Vec<ClaudeAccountAnchorTransitionV1>,
     pub capacity: ClaudeAccountCapacityV1,
+    /// Presence is the capability bit for the additive v23 browser flow.
+    /// Older daemons omit it; older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_auth_supported: Option<bool>,
+    /// Identifier-free count of unclaimed provisional roots retained for safe
+    /// browser-auth retry. Advanced UI may show the count, never identities,
+    /// root aliases, paths, or destructive account actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_provisional_login_count: Option<u16>,
 }
 
 /// Provider-owned Codex sign-in observation for one daemon-created home. The
@@ -3425,6 +3504,21 @@ pub enum LocalControlCommand {
     ClaudeAccountStopWaiting {
         schema_version: u16,
         operation_id: String,
+    },
+    /// v23 explicit provider-owned browser login. `target_id` is present for
+    /// a known daemon-selected composite and absent for generic discovery.
+    ClaudeAccountStartBrowserLogin {
+        schema_version: u16,
+        operation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+    },
+    /// v23 provider-owned browser reauthentication for one exact durable root.
+    ClaudeAccountStartBrowserReconnect {
+        schema_version: u16,
+        operation_id: String,
+        slot_id: String,
+        target_id: String,
     },
     /// Read machine-local Codex durable-account state.
     CodexAccountsStatus,
@@ -4578,6 +4672,102 @@ mod tests {
             target.command,
             LocalControlCommand::ClaudeAccountPrepareTarget { .. }
         ));
+    }
+
+    #[test]
+    fn claude_browser_auth_commands_are_isolated_to_protocol_v23() {
+        let login = serde_json::json!({
+            "request_id": "req_browser_login",
+            "protocol_version": CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION,
+            "command": "claude_account_start_browser_login",
+            "schema_version": 1,
+            "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
+        });
+        let request = serde_json::from_value::<LocalControlRequest>(login.clone())
+            .expect("generic browser login accepts v23");
+        assert!(matches!(
+            request.command,
+            LocalControlCommand::ClaudeAccountStartBrowserLogin {
+                target_id: None,
+                ..
+            }
+        ));
+
+        let reconnect = serde_json::json!({
+            "request_id": "req_browser_reconnect",
+            "protocol_version": CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION,
+            "command": "claude_account_start_browser_reconnect",
+            "schema_version": 1,
+            "operation_id": "claude_setup_fedcba9876543210fedcba9876543210",
+            "slot_id": "claude_slot_0123456789abcdef0123456789abcdef",
+            "target_id": "claude_anchor_target_0123456789abcdef0123456789abcdef"
+        });
+        assert!(matches!(
+            serde_json::from_value::<LocalControlRequest>(reconnect)
+                .expect("browser reconnect accepts v23")
+                .command,
+            LocalControlCommand::ClaudeAccountStartBrowserReconnect { .. }
+        ));
+
+        for older in [
+            LOCAL_CONTROL_PROTOCOL_VERSION,
+            CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION,
+        ] {
+            let mut stale = login.clone();
+            stale["protocol_version"] = serde_json::json!(older);
+            let error = serde_json::from_value::<LocalControlRequest>(stale)
+                .expect_err("older protocol must not start provider login");
+            assert!(error.to_string().contains("expected 23"));
+        }
+    }
+
+    #[test]
+    fn claude_browser_auth_metadata_is_additive_and_safe() {
+        let wire = serde_json::json!({
+            "kind": "connect_managed_account",
+            "state": "waiting_for_user_login",
+            "operation_id": "claude_setup_0123456789abcdef0123456789abcdef",
+            "slot_id": "claude_slot_0123456789abcdef0123456789abcdef",
+            "browser_auth": {
+                "phase": "waiting_for_provider",
+                "retryable": false,
+                "terminal_fallback_available": false
+            }
+        });
+        let operation = serde_json::from_value::<ClaudeAccountSetupOperationV1>(wire)
+            .expect("additive browser metadata decodes");
+        assert_eq!(
+            operation.browser_auth.expect("browser metadata").phase,
+            ClaudeBrowserAuthPhaseV1::WaitingForProvider
+        );
+        assert_eq!(CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION, 23);
+    }
+
+    #[test]
+    fn claude_browser_auth_v23_fixture_is_exact_and_sanitized() {
+        let raw = include_str!("../../../fixtures/control/claude-browser-auth-operation-v23.json");
+        let operation = serde_json::from_str::<ClaudeBrowserAuthOperationV1>(raw)
+            .expect("v23 browser auth fixture");
+        assert_eq!(
+            operation.outcome,
+            Some(ClaudeBrowserAuthOutcomeV1::LoginFailed)
+        );
+        assert!(operation.retryable);
+        assert!(operation.retry_requires_new_operation_id);
+        assert!(!operation.terminal_fallback_available);
+        let canonical = serde_json::to_string_pretty(&operation).expect("canonical fixture") + "\n";
+        assert_eq!(canonical, raw);
+        for forbidden in [
+            "access_token",
+            "refresh_token",
+            "config_dir",
+            "account_identifier_hash",
+            "organization_identifier_hash",
+            "/Users/",
+        ] {
+            assert!(!raw.contains(forbidden), "fixture leaked {forbidden}");
+        }
     }
 
     #[test]

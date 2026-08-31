@@ -237,6 +237,10 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
                 if !still_registered {
                     return Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin);
                 }
+                if crate::claude_browser_auth::collection_suppression(&descriptor.slot_id).is_some()
+                {
+                    return Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin);
+                }
                 if crate::agent_status::claude_oauth_usage_network_disabled() {
                     return Err(ClaudeConfigSlotUpkeepResultV1::CollectionPaused);
                 }

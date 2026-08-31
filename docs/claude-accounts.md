@@ -14,8 +14,12 @@ app sometimes shows a plan without numbers or a "Partial view" badge.
 - **Claude Code credential slots.** The normal terminal login is the default
   slot. Ottto can also collect from explicitly registered
   `CLAUDE_CONFIG_DIR` paths, up to ten slots total. Running `/login` without a
-  custom config directory still replaces the default terminal account. Ottto
-  never runs `/login`, calls a token/refresh endpoint, or writes a credential.
+  custom config directory still replaces the default terminal account. When
+  you explicitly choose **Keep limits available**, Ottto may start the resolved
+  official Claude CLI with `auth login --claudeai` for one exact isolated root.
+  Claude owns the browser, callback, credential, and persistence. Ottto never
+  constructs an OAuth URL, receives a password or code, captures provider
+  output, or writes credential material itself.
 - **The desktop app login.** Separate from the terminal login. Chat sessions
   in the app run under whichever account the app is signed into - which can
   be a different account than the terminal, at the same time.
@@ -118,28 +122,58 @@ or organization can never use this rule.
 
 ## Connecting another account
 
-Authenticated local control can prepare a private managed directory and return
-one exact command of the form `CLAUDE_CONFIG_DIR='<path>' claude`. Ottto never
-runs or types `/login`: the customer opens official Claude Code with that
-command and completes `/login` there. A check then validates only that exact
-registered slot and completes only after fresh session, weekly, and at least one
-model-scoped limit are attributed to the same strong account identity. Credits
-are reported when available but are not required for completion.
+Choose **Keep limits available** on an observed account, or **Keep another
+account's limits available** when Ottto has evidence of another account. The
+daemon creates one private provisional root and starts the resolved official
+Claude CLI directly with `auth login --claudeai`. Claude opens and owns the
+browser sign-in. The root does not count as an account, consume registered-slot
+capacity, participate in collection, or upload anything until local evidence
+proves both the account and organization.
 
-Prepare is idempotent by opaque operation id, including across daemon restarts.
-Stop Waiting stops only Ottto's observation; it does not terminate Claude Code,
-delete a registration, or erase credentials. A queued check cannot silently
-resume a stopped operation. Replaying prepare for the same operation explicitly
-resumes it on the same path. Removing a managed registration also preserves its
+Strong identity admission is atomic. A new account-and-organization binding
+promotes that exact root to one registered durable connection. If the same
+binding already exists, Ottto reports **Already connected**, keeps the existing
+account row, and retains the provisional root in a bounded reusable quarantine;
+it never deletes or logs out provider credentials automatically. A successful
+identity admission remains saved even when quota reading is paused or the
+provider is temporarily unavailable. Limits appear once a usable exact-slot
+reading succeeds.
+
+Retained provisional roots are not accounts and never appear as connection or
+usage rows. Authenticated v23 local status exposes only an identifier-free
+count for the app's Advanced section; it exposes no root id, path, service
+alias, account hash, organization hash, logout, or delete action.
+
+Older local-service versions retain the legacy path: authenticated local
+control prepares a private managed directory and returns one exact command of
+the form `CLAUDE_CONFIG_DIR='<path>' claude`. The app offers **Finish in
+Terminal** only for that compatibility path or the browser flow's exact
+`browser_fallback_required` outcome, and only when the daemon resolves an
+installed official Claude executable. Login failure, timeout, identity mismatch,
+or a missing executable use a fresh browser operation instead. The customer
+completes the official provider sign-in there.
+
+Browser setup is idempotent by opaque operation id, including across daemon
+restarts. The daemon persists lifecycle and exact-root identity, never adopts a
+process from a prior daemon instance by PID, and does not relaunch during crash
+recovery. A small supervisor and its provider child share separate
+process-lifetime evidence plus one owned process group; the child retains that
+evidence even if the supervisor crashes. Recovery cannot release the global
+ceremony or reuse its root until the old provider process has exited. **Stop waiting**
+asks that supervisor, with a daemon-owned process-group fallback, to terminate
+only its owned Claude process; it never
+deletes a credential. A retry uses a fresh operation id and may safely reuse
+the retained exact root. Removing a managed registration also preserves its
 directory; customers remain in control of credential deletion.
 
-When an already registered custom slot reaches `needs_login`, Reconnect starts
-a new persisted observation for that exact opaque slot and returns the same
-carefully quoted `CLAUDE_CONFIG_DIR='<exact path>' claude` launch command. It
-does not create another config directory or registration. Spaces, quotes,
+When an already registered custom slot reaches `needs_login`, **Sign in again**
+starts browser authentication for that exact opaque slot on a v23 daemon. It
+does not create another config directory or registration. An old daemon or the
+exact `browser_fallback_required` outcome may return the same carefully quoted
+`CLAUDE_CONFIG_DIR='<exact path>' claude` Terminal fallback. Spaces, quotes,
 shell metacharacters, Unicode spelling, and a trailing slash remain data in the
 exact stored string; reconnect never normalizes or substitutes a sibling slot.
-The customer opens official Claude Code and types `/login`. Reconnect refuses
+Reconnect refuses
 the default slot, an unknown or removed registration, a weak/missing account
 binding, and a login that resolves to a different strong account. Stop Waiting
 and daemon restart retain the same operation/slot binding. After completion,
@@ -228,8 +262,9 @@ recover. Background upkeep cannot promise an indefinitely fresh login.
 - Remember `/login` replaces the terminal account rather than adding one.
   After switching, the previous account's terminal readings stop refreshing
   and will show their age honestly.
-- For another account, use the exact managed-slot command returned by Ottto;
-  do not run `/login` in the default terminal slot unless replacing it is your
-  intent.
+- For another account, use **Keep limits available** in the Ottto app. Use the
+  exact managed-slot Terminal command only when Ottto explicitly presents it as
+  fallback; do not run `/login` in the default terminal slot unless replacing
+  it is your intent.
 - The badge and the "not verified" label are not errors. They are Ottto
   telling you exactly how much it can prove.

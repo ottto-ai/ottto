@@ -291,6 +291,40 @@ impl FileClaudeConfigSlotSettingsStore {
         )
     }
 
+    /// Admit a previously-created provisional managed root under its already
+    /// journaled opaque slot id. Browser authentication persists strong local
+    /// identity under this id before this atomic registry exposure.
+    pub fn register_managed_path_with_slot_id(
+        &self,
+        schema_version: u16,
+        slot_id: String,
+        config_dir: String,
+    ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
+        validate_opaque_slot_id(&slot_id)?;
+        validate_managed_claude_auth_root(&config_dir)?;
+        self.transact(schema_version, move |settings| {
+            if let Some(existing) = settings.registered_slots.iter().find(|candidate| {
+                candidate.slot_id == slot_id || candidate.config_dir == config_dir
+            }) {
+                if existing.slot_id == slot_id
+                    && existing.config_dir == config_dir
+                    && existing.ownership == ClaudeConfigSlotOwnership::Managed
+                {
+                    return Ok(());
+                }
+                return Err(ClaudeConfigSlotSettingsError::Invalid(
+                    "provisional Claude admission conflicts with an existing slot".to_string(),
+                ));
+            }
+            settings.registered_slots.push(PersistedClaudeConfigSlotV1 {
+                slot_id,
+                ownership: ClaudeConfigSlotOwnership::Managed,
+                config_dir,
+            });
+            Ok(())
+        })
+    }
+
     /// Create and register one private managed directory as a single
     /// daemon-owned transaction. Repeating an operation id returns the same
     /// slot and exact launch command, repairing a missing empty directory but
@@ -317,6 +351,47 @@ impl FileClaudeConfigSlotSettingsStore {
         target_id: Option<String>,
         expected_account_identifier_hash: Option<String>,
         expected_organization_identifier_hash: Option<String>,
+    ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
+        self.prepare_managed_account_target_with_reusable_root(
+            schema_version,
+            operation_id,
+            target_id,
+            expected_account_identifier_hash,
+            expected_organization_identifier_hash,
+            None,
+        )
+    }
+
+    /// Prepare a managed operation in one previously daemon-created,
+    /// unregistered root. The exact string is retained so its provider-owned
+    /// Keychain namespace can be reused without moving or rewriting it.
+    pub fn prepare_managed_account_target_in_reusable_root(
+        &self,
+        schema_version: u16,
+        operation_id: String,
+        target_id: Option<String>,
+        expected_account_identifier_hash: Option<String>,
+        expected_organization_identifier_hash: Option<String>,
+        reusable_config_dir: String,
+    ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
+        self.prepare_managed_account_target_with_reusable_root(
+            schema_version,
+            operation_id,
+            target_id,
+            expected_account_identifier_hash,
+            expected_organization_identifier_hash,
+            Some(reusable_config_dir),
+        )
+    }
+
+    fn prepare_managed_account_target_with_reusable_root(
+        &self,
+        schema_version: u16,
+        operation_id: String,
+        target_id: Option<String>,
+        expected_account_identifier_hash: Option<String>,
+        expected_organization_identifier_hash: Option<String>,
+        reusable_config_dir: Option<String>,
     ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
         validate_setup_operation_id(&operation_id)?;
         validate_expected_account_hash(expected_account_identifier_hash.as_deref())?;
@@ -432,16 +507,40 @@ impl FileClaudeConfigSlotSettingsStore {
                 "at most {MAX_REGISTERED_CLAUDE_CONFIG_SLOTS} registered config dirs are allowed"
             )));
         }
-        let slot_id = generate_opaque_slot_id()?;
         let managed_root = self.managed_accounts_root()?;
         ensure_managed_directory(&managed_root)?;
-        let config_dir_path = managed_root.join(&slot_id);
-        let config_dir = config_dir_path.to_str().ok_or_else(|| {
-            ClaudeConfigSlotSettingsError::State(
-                "managed Claude account root is not valid UTF-8".to_string(),
-            )
-        })?;
-        validate_registered_config_dir(config_dir)?;
+        let slot_id = generate_opaque_slot_id()?;
+        let config_dir_path = if let Some(config_dir) = reusable_config_dir {
+            let candidate = PathBuf::from(&config_dir);
+            if candidate.parent() != Some(managed_root.as_path())
+                || persisted
+                    .registered_slots
+                    .iter()
+                    .any(|slot| slot.config_dir == config_dir)
+                || persisted
+                    .setup_operations
+                    .iter()
+                    .chain(persisted.reconnect_operations.iter())
+                    .any(|operation| operation.config_dir == config_dir)
+            {
+                return Err(ClaudeConfigSlotSettingsError::Invalid(
+                    "reusable Claude root is not an unregistered direct managed child".to_string(),
+                ));
+            }
+            ensure_managed_directory(&candidate)?;
+            candidate
+        } else {
+            managed_root.join(&slot_id)
+        };
+        let config_dir = config_dir_path
+            .to_str()
+            .ok_or_else(|| {
+                ClaudeConfigSlotSettingsError::State(
+                    "managed Claude account root is not valid UTF-8".to_string(),
+                )
+            })?
+            .to_string();
+        validate_registered_config_dir(&config_dir)?;
         let created_sequence = next_operation_sequence(&persisted);
         persisted
             .setup_operations
@@ -450,7 +549,7 @@ impl FileClaudeConfigSlotSettingsStore {
                 created_sequence,
                 operation_id: operation_id.clone(),
                 slot_id,
-                config_dir: config_dir.to_string(),
+                config_dir,
                 state: ClaudeAccountSetupOperationState::Preparing,
                 target_id,
                 requested_expected_account_identifier_hash: expected_account_identifier_hash
@@ -1725,6 +1824,50 @@ fn verify_private_directory_descriptor(path: &Path) -> Result<(), ClaudeConfigSl
     Ok(())
 }
 
+/// Revalidate the exact daemon-managed root immediately before an
+/// authentication subprocess can write provider-owned state into it.
+pub fn validate_managed_claude_auth_root(
+    config_dir: &str,
+) -> Result<(), ClaudeConfigSlotSettingsError> {
+    validate_registered_config_dir(config_dir)?;
+    let candidate = Path::new(config_dir);
+    let expected_parent = crate::default_support_dir().join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME);
+    if candidate.parent() != Some(expected_parent.as_path()) {
+        return Err(ClaudeConfigSlotSettingsError::Invalid(
+            "Claude authentication root is not a direct managed child".to_string(),
+        ));
+    }
+    verify_private_directory_descriptor(candidate)
+}
+
+/// Create or revalidate the deterministic owner-only provisional root for one
+/// generic browser-auth operation. It is deliberately not added to the slot
+/// registry; only a later strong account+organization admission may register
+/// this exact raw path.
+pub fn prepare_managed_claude_provisional_root(
+    operation_id: &str,
+) -> Result<(String, String), ClaudeConfigSlotSettingsError> {
+    validate_setup_operation_id(operation_id)?;
+    let suffix = operation_id
+        .strip_prefix("claude_setup_")
+        .expect("validated operation prefix");
+    let root_id = format!("claude_slot_{suffix}");
+    validate_opaque_slot_id(&root_id)?;
+    let managed_parent = crate::default_support_dir().join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME);
+    ensure_managed_directory(&managed_parent)?;
+    let root = managed_parent.join(&root_id);
+    create_managed_slot_directory(&root)?;
+    let config_dir = root
+        .to_str()
+        .ok_or_else(|| {
+            ClaudeConfigSlotSettingsError::State(
+                "managed Claude provisional root is not valid UTF-8".to_string(),
+            )
+        })?
+        .to_string();
+    Ok((root_id, config_dir))
+}
+
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -1746,6 +1889,7 @@ fn operation_allows_reconnect_successor(
     matches!(
         operation.state,
         ClaudeAccountSetupOperationState::Complete
+            | ClaudeAccountSetupOperationState::SetupStopped
             | ClaudeAccountSetupOperationState::SetupFailed
             | ClaudeAccountSetupOperationState::IdentityMismatch
     )
@@ -1864,6 +2008,16 @@ fn launch_command(config_dir: &str) -> String {
     )
 }
 
+/// Safe legacy fallback for one exact daemon-owned Claude root. The command
+/// opens the official interactive CLI; the customer still types `/login` and
+/// Ottto never receives provider credentials or one-time codes.
+pub fn claude_legacy_launch_command(
+    config_dir: &str,
+) -> Result<String, ClaudeConfigSlotSettingsError> {
+    validate_managed_claude_auth_root(config_dir)?;
+    Ok(launch_command(config_dir))
+}
+
 fn status_contract(persisted: &PersistedClaudeConfigSlotSettingsV1) -> ClaudeAccountsStatusV1 {
     status_contract_with_selected_operation(persisted, None)
 }
@@ -1934,6 +2088,7 @@ fn status_contract_with_selected_operation(
                 account_identifier_hash: operation.account_identifier_hash.clone(),
                 organization_identifier_hash: operation.organization_identifier_hash.clone(),
                 launch_command,
+                browser_auth: None,
                 message: operation.message.clone(),
             }
         })
@@ -1948,6 +2103,7 @@ fn status_contract_with_selected_operation(
             account_identifier_hash: None,
             organization_identifier_hash: None,
             launch_command: None,
+            browser_auth: None,
             message: None,
         });
     ClaudeAccountsStatusV1 {
@@ -1970,6 +2126,8 @@ fn status_contract_with_selected_operation(
             used_slots: used_slots as u8,
             remaining_slots: (MAX_CLAUDE_ACCOUNT_SLOTS - used_slots) as u8,
         },
+        browser_auth_supported: None,
+        retained_provisional_login_count: None,
     }
 }
 
@@ -2011,6 +2169,59 @@ mod tests {
                 .service_name(),
             "Claude Code-credentials-f6139299"
         );
+    }
+
+    #[test]
+    fn reusable_managed_root_preserves_exact_keychain_namespace_without_consuming_capacity() {
+        let path = temp_path("reusable-managed-root");
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let first_id = "claude_setup_10101010101010101010101010101010";
+        let first = store
+            .prepare_managed_account(1, first_id.to_string(), None)
+            .expect("prepare first root");
+        let first_slot = first.setup_operation.slot_id.clone().expect("first slot");
+        let exact_root = first
+            .setup_operation
+            .launch_command
+            .as_deref()
+            .and_then(|_| {
+                first
+                    .managed_slots
+                    .iter()
+                    .find(|slot| slot.slot_id == first_slot)
+                    .and_then(|slot| slot.config_dir.clone())
+            })
+            .expect("exact root");
+        let service = ClaudeConfigDirSlot::registered(exact_root.clone())
+            .expect("registered root")
+            .service_name();
+        store.remove(1, &first_slot).expect("unregister first root");
+
+        let reused = store
+            .prepare_managed_account_target_in_reusable_root(
+                1,
+                "claude_setup_20202020202020202020202020202020".to_string(),
+                None,
+                None,
+                None,
+                exact_root.clone(),
+            )
+            .expect("reuse preserved provider root");
+        let reused_slot = reused
+            .setup_operation
+            .slot_id
+            .as_deref()
+            .expect("reused slot");
+        assert_ne!(reused_slot, first_slot);
+        let descriptor = reused
+            .managed_slots
+            .iter()
+            .find(|slot| slot.slot_id == reused_slot)
+            .expect("reused descriptor");
+        assert_eq!(descriptor.config_dir.as_deref(), Some(exact_root.as_str()));
+        assert_eq!(descriptor.service_name, service);
+        assert_eq!(reused.capacity.used_slots, 2);
+        let _ = fs::remove_dir_all(path.parent().expect("support root"));
     }
 
     #[test]

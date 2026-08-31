@@ -2145,6 +2145,12 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         }
         LocalControlCommand::ClaudeAccountCheck { .. } => "claude_account_check",
         LocalControlCommand::ClaudeAccountStopWaiting { .. } => "claude_account_stop_waiting",
+        LocalControlCommand::ClaudeAccountStartBrowserLogin { .. } => {
+            "claude_account_start_browser_login"
+        }
+        LocalControlCommand::ClaudeAccountStartBrowserReconnect { .. } => {
+            "claude_account_start_browser_reconnect"
+        }
         LocalControlCommand::CodexAccountsStatus => "codex_accounts_status",
         LocalControlCommand::CodexAccountPrepare { .. } => "codex_account_prepare",
         LocalControlCommand::CodexAccountPrepareTarget { .. } => "codex_account_prepare_target",
