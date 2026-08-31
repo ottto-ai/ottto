@@ -23,6 +23,17 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    ClaudeAuthSupervisor {
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        config_dir: String,
+        #[arg(long)]
+        control_fd: i32,
+        #[arg(long)]
+        ready_fd: i32,
+    },
     Status {
         #[arg(long)]
         json: bool,
@@ -140,6 +151,21 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Command::Status { json: true }) {
+        Command::ClaudeAuthSupervisor {
+            operation_id,
+            config_dir,
+            control_fd,
+            ready_fd,
+        } => {
+            let code = ottto_service::claude_browser_auth::run_auth_supervisor(
+                &operation_id,
+                &config_dir,
+                control_fd,
+                ready_fd,
+            )
+            .map_err(anyhow::Error::msg)?;
+            std::process::exit(code);
+        }
         Command::McpInventory { agent } => {
             let value = match agent.as_deref() {
                 Some(agent) => ottto_service::mcp_inventory::dump_inventory(agent)?,
@@ -221,6 +247,7 @@ fn main() -> Result<()> {
                 if ottto_service::control::recover_pending_device_credential_at_startup().is_err() {
                     eprintln!("pending relay credential recovery deferred");
                 }
+                ottto_service::claude_browser_auth::recover_at_startup();
                 let token = load_or_create_control_token()?;
                 let daemon = LocalDaemon::new(
                     local_machine(),
@@ -254,6 +281,7 @@ fn main() -> Result<()> {
             if ottto_service::control::recover_pending_device_credential_at_startup().is_err() {
                 eprintln!("pending relay credential recovery deferred");
             }
+            ottto_service::claude_browser_auth::recover_at_startup();
             let token = load_or_create_control_token()?;
             let daemon = LocalDaemon::new(
                 local_machine(),

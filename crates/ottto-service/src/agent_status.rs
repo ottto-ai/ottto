@@ -2503,6 +2503,19 @@ fn collect_claude_status_snapshots(
         slot_states.insert(descriptor.slot_id, capacity_exceeded_status(&captured_at));
     }
     for descriptor in custom_descriptors {
+        match crate::claude_browser_auth::collection_suppression(&descriptor.slot_id) {
+            Some(
+                crate::claude_browser_auth::ClaudeCollectionSuppression::HideProvisionalTarget,
+            ) => continue,
+            Some(
+                crate::claude_browser_auth::ClaudeCollectionSuppression::PreserveCanonicalReconnect
+                | crate::claude_browser_auth::ClaudeCollectionSuppression::PreserveWhileStateUnavailable,
+            ) => {
+                slot_states.insert(descriptor.slot_id.clone(), descriptor.collection.clone());
+                continue;
+            }
+            None => {}
+        }
         let upkeep = crate::claude_upkeep::observe_registered_slot_upkeep(
             &descriptor,
             upkeep_consent,
@@ -2877,6 +2890,9 @@ fn ordered_claude_slot_descriptors(
         .managed_slots
         .iter()
         .chain(status.external_slots.iter())
+        .filter(|descriptor| {
+            !crate::claude_browser_auth::is_provisional_target_slot(&descriptor.slot_id)
+        })
         .cloned()
         .collect::<Vec<_>>();
     custom.sort_by(|left, right| left.slot_id.cmp(&right.slot_id));
@@ -2911,6 +2927,16 @@ pub(crate) fn collect_registered_claude_slot_status(
     let Some(descriptor) = descriptor else {
         return ClaudeSlotProbeFailure::IdentityUnknown.status(&captured_at);
     };
+    match crate::claude_browser_auth::collection_suppression(slot_id) {
+        Some(crate::claude_browser_auth::ClaudeCollectionSuppression::HideProvisionalTarget) => {
+            return ClaudeSlotProbeFailure::IdentityUnknown.status(&captured_at);
+        }
+        Some(
+            crate::claude_browser_auth::ClaudeCollectionSuppression::PreserveCanonicalReconnect
+            | crate::claude_browser_auth::ClaudeCollectionSuppression::PreserveWhileStateUnavailable,
+        ) => return descriptor.collection,
+        None => {}
+    }
     let upkeep = crate::claude_upkeep::observe_registered_slot_upkeep(
         &descriptor,
         upkeep_consent,
@@ -2952,6 +2978,95 @@ pub(crate) fn collect_registered_claude_slot_status(
     apply_claude_upkeep_observation(&mut status, upkeep.status);
     let _ = persist_one_claude_slot_collection_state(slot_id, &status);
     status
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeLocalIdentityFailure {
+    IdentityUnknown,
+    CredentialUnavailable,
+    IdentityMismatch,
+    ConcurrentMutation,
+}
+
+pub(crate) struct ClaudeLocalIdentityProof {
+    pub(crate) account_identifier_hash: String,
+    pub(crate) organization_identifier_hash: String,
+    pub(crate) collection: ClaudeConfigSlotCollectionStatusV1,
+}
+
+/// Secret-free witness for one exact Claude authentication namespace. The
+/// digest covers provider-owned identity bytes plus credential material in
+/// memory, but persists neither. Browser-auth recovery requires this witness
+/// to differ from the pre-login baseline before accepting a ceremony.
+pub(crate) fn claude_auth_ceremony_witness(config_dir: &str) -> Result<String, ()> {
+    ottto_core::validate_managed_claude_auth_root(config_dir).map_err(|_| ())?;
+    let slot = ClaudeConfigDirSlot::registered(config_dir.to_string()).map_err(|_| ())?;
+    let mut digest = Sha256::new();
+    digest.update(b"ottto:claude-auth-ceremony-witness:v1\0");
+    match std::fs::read(slot.identity_path(&home_dir())) {
+        Ok(body) => {
+            digest.update(b"identity\0");
+            digest.update(Sha256::digest(body));
+        }
+        Err(_) => digest.update(b"identity-absent\0"),
+    }
+    match read_claude_oauth_credential_for_slot(&slot) {
+        Some(credential) => {
+            digest.update(b"credential\0");
+            if let Some(token) = credential.access_token.as_deref() {
+                digest.update(Sha256::digest(token.as_bytes()));
+            } else {
+                digest.update(b"access-absent\0");
+            }
+            digest.update([u8::from(credential.has_refresh_token)]);
+            if let Some(expires) = credential.access_expires_at.as_deref() {
+                digest.update(expires.as_bytes());
+            }
+            if let Some(deadline) = credential.relogin_required_at.as_deref() {
+                digest.update(deadline.as_bytes());
+            }
+        }
+        None => digest.update(b"credential-absent\0"),
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+/// Prove only the provider-owned local identity for one exact root. This does
+/// not consult upkeep consent, call the usage endpoint, read quota, persist a
+/// slot, or upload anything. Generic browser-auth roots remain provisional
+/// until the caller atomically admits this strong composite.
+pub(crate) fn verify_claude_local_identity(
+    slot_id: &str,
+    config_dir: &str,
+    observed_at: &str,
+) -> Result<ClaudeLocalIdentityProof, ClaudeLocalIdentityFailure> {
+    let descriptor = ClaudeConfigDirSlot::registered(config_dir.to_string())
+        .map_err(|_| ClaudeLocalIdentityFailure::IdentityUnknown)?
+        .descriptor(slot_id.to_string(), ClaudeConfigSlotOwnership::Managed);
+    let resolved = resolve_registered_claude_slot(descriptor).map_err(|failure| match failure {
+        ClaudeSlotProbeFailure::IdentityUnknown => ClaudeLocalIdentityFailure::IdentityUnknown,
+        ClaudeSlotProbeFailure::CredentialUnavailable => {
+            ClaudeLocalIdentityFailure::CredentialUnavailable
+        }
+        ClaudeSlotProbeFailure::IdentityMismatch => ClaudeLocalIdentityFailure::IdentityMismatch,
+        ClaudeSlotProbeFailure::ConcurrentMutation => {
+            ClaudeLocalIdentityFailure::ConcurrentMutation
+        }
+    })?;
+    let mut collection = fresh_slot_status(
+        observed_at,
+        &resolved.account_identifier_hash,
+        &resolved.organization_identifier_hash,
+        false,
+        false,
+        false,
+    );
+    apply_credential_metadata(&mut collection, &resolved.credential);
+    Ok(ClaudeLocalIdentityProof {
+        account_identifier_hash: resolved.account_identifier_hash,
+        organization_identifier_hash: resolved.organization_identifier_hash,
+        collection,
+    })
 }
 
 fn resolve_registered_claude_slot(
@@ -18444,6 +18559,7 @@ exit 1
                 account_identifier_hash: None,
                 organization_identifier_hash: None,
                 launch_command: None,
+                browser_auth: None,
                 message: None,
             },
             default_slot: ClaudeConfigDirSlot::Default
@@ -18458,6 +18574,8 @@ exit 1
                 used_slots: 6,
                 remaining_slots: 4,
             },
+            browser_auth_supported: None,
+            retained_provisional_login_count: None,
         };
 
         for switched_to in [0, 1, 4, 2, 0] {

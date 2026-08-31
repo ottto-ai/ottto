@@ -26,10 +26,11 @@ pub use claude_account::{
     default_claude_cli_config_path, CLAUDE_CLI_CONFIG_FILE_NAME,
 };
 pub use claude_config_slots::{
-    ClaudeConfigDirSlot, ClaudeConfigSlotSettingsError, FileClaudeConfigSlotSettingsStore,
-    CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME, CLAUDE_MANAGED_ACCOUNTS_DIR_NAME,
-    CLAUDE_OAUTH_KEYCHAIN_SERVICE, MAX_CLAUDE_ACCOUNT_SLOTS, MAX_CLAUDE_CONFIG_DIR_BYTES,
-    MAX_REGISTERED_CLAUDE_CONFIG_SLOTS,
+    claude_legacy_launch_command, prepare_managed_claude_provisional_root,
+    validate_managed_claude_auth_root, ClaudeConfigDirSlot, ClaudeConfigSlotSettingsError,
+    FileClaudeConfigSlotSettingsStore, CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME,
+    CLAUDE_MANAGED_ACCOUNTS_DIR_NAME, CLAUDE_OAUTH_KEYCHAIN_SERVICE, MAX_CLAUDE_ACCOUNT_SLOTS,
+    MAX_CLAUDE_CONFIG_DIR_BYTES, MAX_REGISTERED_CLAUDE_CONFIG_SLOTS,
 };
 pub use claude_statusline::{
     append_claude_statusline_context_history, claude_statusline_cache_path,

@@ -745,6 +745,32 @@ fn handle_command(
                 &operation_id,
             )?)
         }
+        LocalControlCommand::ClaudeAccountStartBrowserLogin {
+            schema_version,
+            operation_id,
+            target_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(start_claude_browser_login(
+                schema_version,
+                operation_id,
+                target_id,
+            )?)
+        }
+        LocalControlCommand::ClaudeAccountStartBrowserReconnect {
+            schema_version,
+            operation_id,
+            slot_id,
+            target_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(start_claude_browser_reconnect(
+                schema_version,
+                operation_id,
+                &slot_id,
+                target_id,
+            )?)
+        }
         LocalControlCommand::CodexAccountsStatus => {
             require_authorized_local_client(daemon, &authorization)?;
             to_value(load_codex_account_settings()?)
@@ -1046,13 +1072,136 @@ fn load_claude_config_slot_settings(
         .load()
         .map_err(claude_config_slot_settings_error)
         .map(crate::agent_status::annotate_claude_accounts_status)
+        .map(crate::claude_browser_auth::annotate_status)
 }
 
 fn complete_claude_registry_mutation(
     status: ottto_protocol::ClaudeAccountsStatusV1,
 ) -> ottto_protocol::ClaudeAccountsStatusV1 {
     crate::snapshot_sync::spawn_claude_agent_status_refresh("registry_mutation");
-    crate::agent_status::annotate_claude_accounts_status(status)
+    crate::claude_browser_auth::annotate_status(
+        crate::agent_status::annotate_claude_accounts_status(status),
+    )
+}
+
+fn claude_setup_operation_is_terminal(status: &ottto_protocol::ClaudeAccountsStatusV1) -> bool {
+    matches!(
+        status.setup_operation.state,
+        ottto_protocol::ClaudeAccountSetupOperationState::Complete
+            | ottto_protocol::ClaudeAccountSetupOperationState::SetupStopped
+            | ottto_protocol::ClaudeAccountSetupOperationState::SetupFailed
+            | ottto_protocol::ClaudeAccountSetupOperationState::IdentityMismatch
+    )
+}
+
+fn active_claude_browser_replay(
+    store: &FileClaudeConfigSlotSettingsStore,
+    operation_id: &str,
+    mode: crate::claude_browser_auth::BrowserLoginMode,
+) -> Result<Option<ottto_protocol::ClaudeAccountsStatusV1>, LocalApiError> {
+    store
+        .setup_operation_if_exists(operation_id)
+        .map_err(claude_config_slot_settings_error)
+        .map(|status| {
+            status.and_then(|status| {
+                crate::claude_browser_auth::active_replay_is_sealed(&status, operation_id, mode)
+                    .then(|| {
+                        crate::claude_browser_auth::annotate_status(
+                            crate::agent_status::annotate_claude_accounts_status(status),
+                        )
+                    })
+            })
+        })
+}
+
+fn start_claude_browser_login(
+    schema_version: u16,
+    operation_id: String,
+    target_id: Option<String>,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    let current = crate::claude_browser_auth::annotate_status(
+        crate::agent_status::annotate_claude_accounts_status(
+            store.load().map_err(claude_config_slot_settings_error)?,
+        ),
+    );
+    let mode = if target_id.is_some() {
+        crate::claude_browser_auth::BrowserLoginMode::Target
+    } else {
+        crate::claude_browser_auth::BrowserLoginMode::Generic
+    };
+    crate::claude_browser_auth::preflight_browser_binding(
+        &operation_id,
+        mode,
+        None,
+        target_id.as_deref(),
+    )
+    .map_err(LocalApiError::LocalOperationFailed)?;
+    if let Some(replay) =
+        crate::claude_browser_auth::terminal_replay(current.clone(), &operation_id)
+    {
+        return Ok(replay);
+    }
+    if target_id.is_some() {
+        if let Some(replay) = active_claude_browser_replay(
+            &store,
+            &operation_id,
+            crate::claude_browser_auth::BrowserLoginMode::Target,
+        )? {
+            return Ok(replay);
+        }
+    }
+    let status = if let Some(target_id) = target_id {
+        prepare_claude_account_target_mode(schema_version, operation_id.clone(), target_id, true)?
+    } else {
+        crate::claude_browser_auth::prepare_generic(current, &operation_id)
+            .map_err(LocalApiError::LocalOperationFailed)?
+    };
+    crate::claude_browser_auth::start(complete_claude_registry_mutation(status), mode)
+        .map_err(LocalApiError::LocalOperationFailed)
+}
+
+fn start_claude_browser_reconnect(
+    schema_version: u16,
+    operation_id: String,
+    slot_id: &str,
+    target_id: String,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    let current = crate::claude_browser_auth::annotate_status(
+        crate::agent_status::annotate_claude_accounts_status(
+            store.load().map_err(claude_config_slot_settings_error)?,
+        ),
+    );
+    crate::claude_browser_auth::preflight_browser_binding(
+        &operation_id,
+        crate::claude_browser_auth::BrowserLoginMode::Reconnect,
+        Some(slot_id),
+        Some(&target_id),
+    )
+    .map_err(LocalApiError::LocalOperationFailed)?;
+    if let Some(replay) = crate::claude_browser_auth::terminal_replay(current, &operation_id) {
+        return Ok(replay);
+    }
+    if let Some(replay) = active_claude_browser_replay(
+        &store,
+        &operation_id,
+        crate::claude_browser_auth::BrowserLoginMode::Reconnect,
+    )? {
+        return Ok(replay);
+    }
+    let status = reconnect_claude_account_target_mode(
+        schema_version,
+        operation_id,
+        slot_id,
+        target_id,
+        true,
+    )?;
+    crate::claude_browser_auth::start(
+        complete_claude_registry_mutation(status),
+        crate::claude_browser_auth::BrowserLoginMode::Reconnect,
+    )
+    .map_err(LocalApiError::LocalOperationFailed)
 }
 
 fn set_claude_account_upkeep_consent(
@@ -1097,18 +1246,98 @@ fn prepare_claude_account(
     target_id: Option<String>,
     expected_account_identifier_hash: Option<String>,
     expected_organization_identifier_hash: Option<String>,
+    browser_mode: Option<crate::claude_browser_auth::BrowserLoginMode>,
 ) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
     let store = FileClaudeConfigSlotSettingsStore::default();
-    store
-        .prepare_managed_account_target(
+    let _registry_guard = browser_mode
+        .map(|_| crate::claude_browser_auth::registry_mutation_guard(&operation_id))
+        .transpose()
+        .map_err(LocalApiError::LocalOperationFailed)?;
+    crate::claude_browser_auth::preflight_legacy_binding(&operation_id, target_id.as_deref())
+        .map_err(LocalApiError::LocalOperationFailed)?;
+    let acquired = crate::claude_browser_auth::claim_ceremony(&operation_id)
+        .map_err(LocalApiError::LocalOperationFailed)?;
+    let reusable_root = if target_id.is_some() {
+        crate::claude_browser_auth::claim_reusable_root(&operation_id)
+            .map_err(LocalApiError::LocalOperationFailed)?
+    } else {
+        None
+    };
+    if let Some(mode) = browser_mode {
+        if let Err(error) = crate::claude_browser_auth::persist_registry_mutation_fence(
+            &operation_id,
+            mode,
+            None,
+            reusable_root.as_deref(),
+            target_id.as_deref(),
+            expected_account_identifier_hash.as_deref(),
+            expected_organization_identifier_hash.as_deref(),
+        ) {
+            crate::claude_browser_auth::release_reusable_root_claim(&operation_id);
+            if acquired {
+                crate::claude_browser_auth::release_ceremony(&operation_id);
+            }
+            return Err(LocalApiError::LocalOperationFailed(error));
+        }
+    }
+    let result = if let Some(config_dir) = reusable_root {
+        store.prepare_managed_account_target_in_reusable_root(
             schema_version,
-            operation_id,
+            operation_id.clone(),
+            target_id,
+            expected_account_identifier_hash,
+            expected_organization_identifier_hash,
+            config_dir,
+        )
+    } else {
+        store.prepare_managed_account_target(
+            schema_version,
+            operation_id.clone(),
             target_id,
             expected_account_identifier_hash,
             expected_organization_identifier_hash,
         )
-        .map_err(claude_config_slot_settings_error)
-        .map(complete_claude_registry_mutation)
+    }
+    .map_err(claude_config_slot_settings_error)
+    .map(complete_claude_registry_mutation);
+    if result.is_err() {
+        recover_failed_claude_browser_registry_mutation(
+            &store,
+            &operation_id,
+            browser_mode,
+            acquired,
+        );
+    } else if result
+        .as_ref()
+        .is_ok_and(claude_setup_operation_is_terminal)
+        && (acquired || !crate::claude_browser_auth::has_browser_operation(&operation_id))
+    {
+        crate::claude_browser_auth::release_ceremony(&operation_id);
+    }
+    result
+}
+
+fn recover_failed_claude_browser_registry_mutation(
+    store: &FileClaudeConfigSlotSettingsStore,
+    operation_id: &str,
+    browser_mode: Option<crate::claude_browser_auth::BrowserLoginMode>,
+    acquired: bool,
+) {
+    let fence_aborted = browser_mode.is_some()
+        && store
+            .setup_operation_if_exists(operation_id)
+            .is_ok_and(|operation| operation.is_none())
+        && crate::claude_browser_auth::abort_registry_mutation_fence(operation_id).is_ok();
+    if browser_mode.is_some() && !fence_aborted {
+        // The exact reusable-root claim is part of recovery authority. Never
+        // release it on a transient core mutation or lookup failure.
+        crate::claude_browser_auth::resume_operation_recovery(operation_id);
+    } else {
+        crate::claude_browser_auth::release_reusable_root_claim(operation_id);
+    }
+    if acquired && (browser_mode.is_none() || fence_aborted) {
+        crate::claude_browser_auth::release_ceremony(operation_id);
+    }
 }
 
 fn prepare_claude_account_legacy(
@@ -1122,7 +1351,11 @@ fn prepare_claude_account_legacy(
         .map_err(claude_config_slot_settings_error)?
         .is_some()
     {
-        return store
+        crate::claude_browser_auth::preflight_legacy_binding(&operation_id, None)
+            .map_err(LocalApiError::LocalOperationFailed)?;
+        let acquired = crate::claude_browser_auth::claim_ceremony(&operation_id)
+            .map_err(LocalApiError::LocalOperationFailed)?;
+        let result = store
             .replay_legacy_managed_account_setup(
                 schema_version,
                 &operation_id,
@@ -1130,6 +1363,16 @@ fn prepare_claude_account_legacy(
             )
             .map_err(claude_config_slot_settings_error)
             .map(complete_claude_registry_mutation);
+        let terminal = result
+            .as_ref()
+            .is_ok_and(claude_setup_operation_is_terminal);
+        if (acquired && result.is_err())
+            || (terminal
+                && (acquired || !crate::claude_browser_auth::has_browser_operation(&operation_id)))
+        {
+            crate::claude_browser_auth::release_ceremony(&operation_id);
+        }
+        return result;
     }
 
     let expected_organization_identifier_hash = expected_account_identifier_hash
@@ -1164,6 +1407,7 @@ fn prepare_claude_account_legacy(
         None,
         expected_account_identifier_hash,
         expected_organization_identifier_hash,
+        None,
     )
 }
 
@@ -1171,6 +1415,15 @@ fn prepare_claude_account_target(
     schema_version: u16,
     operation_id: String,
     target_id: String,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    prepare_claude_account_target_mode(schema_version, operation_id, target_id, false)
+}
+
+fn prepare_claude_account_target_mode(
+    schema_version: u16,
+    operation_id: String,
+    target_id: String,
+    browser_fence: bool,
 ) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
     let store = FileClaudeConfigSlotSettingsStore::default();
     if let Some(existing) = store
@@ -1190,6 +1443,7 @@ fn prepare_claude_account_target(
             existing
                 .setup_operation
                 .expected_organization_identifier_hash,
+            browser_fence.then_some(crate::claude_browser_auth::BrowserLoginMode::Target),
         );
     }
     let current = crate::agent_status::annotate_claude_accounts_status(
@@ -1223,6 +1477,7 @@ fn prepare_claude_account_target(
         Some(target_id),
         Some(target.account_identifier_hash.clone()),
         Some(organization_hash),
+        browser_fence.then_some(crate::claude_browser_auth::BrowserLoginMode::Target),
     )
 }
 
@@ -1233,6 +1488,26 @@ fn reconnect_claude_account(
     target_id: Option<String>,
     expected_account_identifier_hash: String,
     expected_organization_identifier_hash: Option<String>,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    reconnect_claude_account_mode(
+        schema_version,
+        operation_id,
+        slot_id,
+        target_id,
+        expected_account_identifier_hash,
+        expected_organization_identifier_hash,
+        false,
+    )
+}
+
+fn reconnect_claude_account_mode(
+    schema_version: u16,
+    operation_id: String,
+    slot_id: &str,
+    target_id: Option<String>,
+    expected_account_identifier_hash: String,
+    expected_organization_identifier_hash: Option<String>,
+    browser_fence: bool,
 ) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
     let store = FileClaudeConfigSlotSettingsStore::default();
     let current = crate::agent_status::annotate_claude_accounts_status(
@@ -1273,17 +1548,60 @@ fn reconnect_claude_account(
                 .to_string(),
         ));
     }
-    store
+    let _registry_guard = browser_fence
+        .then(|| crate::claude_browser_auth::registry_mutation_guard(&operation_id))
+        .transpose()
+        .map_err(LocalApiError::LocalOperationFailed)?;
+    crate::claude_browser_auth::preflight_legacy_binding(&operation_id, target_id.as_deref())
+        .map_err(LocalApiError::LocalOperationFailed)?;
+    let acquired = crate::claude_browser_auth::claim_ceremony(&operation_id)
+        .map_err(LocalApiError::LocalOperationFailed)?;
+    if browser_fence {
+        if let Err(error) = crate::claude_browser_auth::persist_registry_mutation_fence(
+            &operation_id,
+            crate::claude_browser_auth::BrowserLoginMode::Reconnect,
+            Some(slot_id),
+            descriptor.config_dir.as_deref(),
+            target_id.as_deref(),
+            Some(&expected_account_identifier_hash),
+            Some(&organization_hash),
+        ) {
+            if acquired {
+                crate::claude_browser_auth::release_ceremony(&operation_id);
+            }
+            return Err(LocalApiError::LocalOperationFailed(error));
+        }
+    }
+    let result = store
         .begin_registered_slot_reconnect_target(
             schema_version,
-            operation_id,
+            operation_id.clone(),
             slot_id,
             target_id,
             expected_account_identifier_hash,
             Some(organization_hash),
         )
         .map_err(claude_config_slot_settings_error)
-        .map(complete_claude_registry_mutation)
+        .map(complete_claude_registry_mutation);
+    let terminal = result
+        .as_ref()
+        .is_ok_and(claude_setup_operation_is_terminal);
+    let fence_aborted = result.is_err()
+        && browser_fence
+        && store
+            .setup_operation_if_exists(&operation_id)
+            .is_ok_and(|operation| operation.is_none())
+        && crate::claude_browser_auth::abort_registry_mutation_fence(&operation_id).is_ok();
+    if result.is_err() && browser_fence && !fence_aborted {
+        crate::claude_browser_auth::resume_operation_recovery(&operation_id);
+    }
+    if (acquired && result.is_err() && (!browser_fence || fence_aborted))
+        || (terminal
+            && (acquired || !crate::claude_browser_auth::has_browser_operation(&operation_id)))
+    {
+        crate::claude_browser_auth::release_ceremony(&operation_id);
+    }
+    result
 }
 
 fn reconnect_claude_account_target(
@@ -1291,6 +1609,16 @@ fn reconnect_claude_account_target(
     operation_id: String,
     slot_id: &str,
     target_id: String,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    reconnect_claude_account_target_mode(schema_version, operation_id, slot_id, target_id, false)
+}
+
+fn reconnect_claude_account_target_mode(
+    schema_version: u16,
+    operation_id: String,
+    slot_id: &str,
+    target_id: String,
+    browser_fence: bool,
 ) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
     let store = FileClaudeConfigSlotSettingsStore::default();
     if let Some(existing) = store
@@ -1302,7 +1630,7 @@ fn reconnect_claude_account_target(
                 "reconnect operation target does not match its original binding".to_string(),
             ));
         }
-        return reconnect_claude_account(
+        return reconnect_claude_account_mode(
             schema_version,
             operation_id,
             slot_id,
@@ -1316,6 +1644,7 @@ fn reconnect_claude_account_target(
             existing
                 .setup_operation
                 .expected_organization_identifier_hash,
+            browser_fence,
         );
     }
     let current = crate::agent_status::annotate_claude_accounts_status(
@@ -1334,27 +1663,40 @@ fn reconnect_claude_account_target(
             "Claude reconnect target is not a registered anchor".to_string(),
         ));
     }
-    reconnect_claude_account(
+    reconnect_claude_account_mode(
         schema_version,
         operation_id,
         slot_id,
         Some(target_id),
         target.account_identifier_hash.clone(),
         target.organization_identifier_hash.clone(),
+        browser_fence,
     )
 }
 
-fn check_claude_account(
+pub(crate) fn check_claude_account(
     schema_version: u16,
     operation_id: &str,
     expected_account_identifier_hash: Option<&str>,
 ) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
-    check_claude_account_with_collector(
+    let result = check_claude_account_with_collector(
         schema_version,
         operation_id,
         expected_account_identifier_hash,
         crate::agent_status::collect_registered_claude_slot_status,
-    )
+    );
+    if result.as_ref().is_ok_and(|status| {
+        matches!(
+            status.setup_operation.state,
+            ClaudeAccountSetupOperationState::Complete
+                | ClaudeAccountSetupOperationState::SetupStopped
+                | ClaudeAccountSetupOperationState::SetupFailed
+                | ClaudeAccountSetupOperationState::IdentityMismatch
+        )
+    }) {
+        crate::claude_browser_auth::release_ceremony(operation_id);
+    }
+    result
 }
 
 fn check_claude_account_with_collector<F>(
@@ -1626,10 +1968,24 @@ fn stop_waiting_for_claude_account(
     schema_version: u16,
     operation_id: &str,
 ) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
-    FileClaudeConfigSlotSettingsStore::default()
+    if crate::claude_browser_auth::request_cancel(operation_id)
+        .map_err(LocalApiError::LocalOperationFailed)?
+    {
+        return FileClaudeConfigSlotSettingsStore::default()
+            .load()
+            .map_err(claude_config_slot_settings_error)
+            .map(crate::agent_status::annotate_claude_accounts_status)
+            .map(crate::claude_browser_auth::annotate_status);
+    }
+    let result = FileClaudeConfigSlotSettingsStore::default()
         .stop_waiting(schema_version, operation_id)
         .map_err(claude_config_slot_settings_error)
         .map(crate::agent_status::annotate_claude_accounts_status)
+        .map(crate::claude_browser_auth::annotate_status);
+    if result.is_ok() {
+        crate::claude_browser_auth::release_ceremony(operation_id);
+    }
+    result
 }
 
 fn claude_config_slot_settings_error(error: ClaudeConfigSlotSettingsError) -> LocalApiError {
@@ -16609,6 +16965,296 @@ mod tests {
 
     #[test]
     #[serial]
+    fn legacy_v18_and_v19_terminal_replay_release_their_ceremony_claim() {
+        let root = control_test_root("claude-legacy-terminal-replay-claim");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let store = FileClaudeConfigSlotSettingsStore::default();
+
+        let v18 = "claude_setup_44444444444444444444444444444444";
+        store
+            .prepare_managed_account(1, v18.to_string(), None)
+            .expect("v18 prepare");
+        assert!(crate::claude_browser_auth::claim_ceremony(v18).expect("v18 claim"));
+        store
+            .transition_setup_operation_with_binding(
+                1,
+                v18,
+                None,
+                None,
+                ClaudeAccountSetupOperationState::SetupFailed,
+                None,
+                None,
+                Some("terminal v18 fixture"),
+            )
+            .expect("v18 terminal");
+        let replayed =
+            prepare_claude_account_legacy(1, v18.to_string(), None).expect("v18 terminal replay");
+        assert_eq!(
+            replayed.setup_operation.state,
+            ClaudeAccountSetupOperationState::SetupFailed
+        );
+        let after_v18 = "claude_setup_45454545454545454545454545454545";
+        assert!(crate::claude_browser_auth::claim_ceremony(after_v18).expect("v18 claim released"));
+        crate::claude_browser_auth::release_ceremony(after_v18);
+
+        let v19 = "claude_setup_46464646464646464646464646464646";
+        let account = "a".repeat(64);
+        let organization = "b".repeat(64);
+        store
+            .prepare_managed_account_target(
+                1,
+                v19.to_string(),
+                Some("claude_anchor_target_46464646464646464646464646464646".to_string()),
+                Some(account.clone()),
+                Some(organization.clone()),
+            )
+            .expect("v19 prepare");
+        assert!(crate::claude_browser_auth::claim_ceremony(v19).expect("v19 claim"));
+        store
+            .transition_setup_operation_with_binding(
+                1,
+                v19,
+                Some(&account),
+                Some(&organization),
+                ClaudeAccountSetupOperationState::IdentityMismatch,
+                None,
+                None,
+                Some("terminal v19 fixture"),
+            )
+            .expect("v19 terminal");
+        let replayed = prepare_claude_account(
+            1,
+            v19.to_string(),
+            Some("claude_anchor_target_46464646464646464646464646464646".to_string()),
+            Some(account),
+            Some(organization),
+            None,
+        )
+        .expect("v19 terminal replay");
+        assert_eq!(
+            replayed.setup_operation.state,
+            ClaudeAccountSetupOperationState::IdentityMismatch
+        );
+        let after_v19 = "claude_setup_47474747474747474747474747474747";
+        assert!(crate::claude_browser_auth::claim_ceremony(after_v19).expect("v19 claim released"));
+        crate::claude_browser_auth::release_ceremony(after_v19);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn active_v23_reconnect_same_id_replay_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = control_test_root("claude-browser-reconnect-active-replay");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let managed_parent = root.join(ottto_core::CLAUDE_MANAGED_ACCOUNTS_DIR_NAME);
+        let managed = managed_parent.join("claude_slot_48484848484848484848484848484848");
+        fs::create_dir_all(&managed).expect("managed root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("support mode");
+        fs::set_permissions(&managed_parent, fs::Permissions::from_mode(0o700))
+            .expect("managed parent mode");
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o700)).expect("managed mode");
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let registered = store
+            .register_managed_path(1, managed.to_string_lossy().into_owned())
+            .expect("register");
+        let slot_id = registered.managed_slots[0].slot_id.clone();
+        let account = "a".repeat(64);
+        let organization = "b".repeat(64);
+        crate::agent_status::persist_one_claude_slot_collection_state(
+            &slot_id,
+            &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                account_identifier_hash: Some(account.clone()),
+                organization_identifier_hash: Some(organization.clone()),
+                ..Default::default()
+            },
+        )
+        .expect("strong binding");
+        let operation_id = "claude_setup_48484848484848484848484848484848";
+        let target_id = "claude_anchor_target_48484848484848484848484848484848";
+        store
+            .begin_registered_slot_reconnect_target(
+                1,
+                operation_id.to_string(),
+                &slot_id,
+                Some(target_id.to_string()),
+                account.clone(),
+                Some(organization.clone()),
+            )
+            .expect("core reconnect");
+        fs::write(
+            root.join("claude-browser-auth-state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "active_operation_id": operation_id,
+                "operations": [{
+                    "operation_id": operation_id,
+                    "slot_id": slot_id.clone(),
+                    "config_dir": managed.to_string_lossy(),
+                    "ceremony_baseline": "baseline",
+                    "mode": "reconnect",
+                    "target_id": target_id,
+                    "expected_account_identifier_hash": account,
+                    "expected_organization_identifier_hash": organization,
+                    "phase": "waiting_for_provider",
+                    "cancel_requested": false,
+                    "started_unix_seconds": 1,
+                    "deadline_unix_seconds": u64::MAX,
+                    "fallback_completed": false
+                }],
+                "quarantined_roots": []
+            }))
+            .expect("sidecar json"),
+        )
+        .expect("active sidecar");
+
+        let state_path = root.join("claude-browser-auth-state.json");
+        let core_path = root.join(ottto_core::CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME);
+        let core_before = fs::read(&core_path).expect("core before replay");
+        let sidecar_before = fs::read(&state_path).expect("sidecar before replay");
+        let worker_lock = crate::claude_browser_auth::registry_mutation_guard(operation_id)
+            .expect("worker operation lock");
+
+        let replayed = start_claude_browser_reconnect(
+            1,
+            operation_id.to_string(),
+            &slot_id,
+            target_id.to_string(),
+        )
+        .expect("active replay");
+        assert_eq!(
+            replayed.setup_operation.state,
+            ClaudeAccountSetupOperationState::WaitingForUserLogin
+        );
+        assert_eq!(
+            replayed
+                .setup_operation
+                .browser_auth
+                .as_ref()
+                .map(|browser| browser.phase),
+            Some(ottto_protocol::ClaudeBrowserAuthPhaseV1::WaitingForProvider)
+        );
+        assert_eq!(
+            fs::read(&core_path).expect("core after replay"),
+            core_before
+        );
+        assert_eq!(
+            fs::read(&state_path).expect("sidecar after replay"),
+            sidecar_before
+        );
+        assert!(crate::claude_browser_auth::claim_ceremony(
+            "claude_setup_49494949494949494949494949494949"
+        )
+        .is_err());
+        drop(worker_lock);
+        crate::claude_browser_auth::release_ceremony(operation_id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn active_v23_target_replay_bypasses_worker_operation_lock_without_writes() {
+        let root = control_test_root("claude-browser-target-active-replay-lock");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let account = "a".repeat(64);
+        let organization = "b".repeat(64);
+        crate::agent_status::persist_one_claude_slot_collection_state(
+            "default",
+            &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                account_identifier_hash: Some(account),
+                organization_identifier_hash: Some(organization),
+                observed_at: Some("2026-08-31T00:00:00Z".to_string()),
+                has_account_windows: true,
+                has_scoped_limits: true,
+                ..Default::default()
+            },
+        )
+        .expect("default identity");
+        let target_id = load_claude_config_slot_settings()
+            .expect("discover target")
+            .anchor_coverage
+            .accounts
+            .into_iter()
+            .find(|candidate| {
+                candidate.durability == ottto_protocol::ClaudeAccountAnchorDurabilityV1::DefaultOnly
+            })
+            .and_then(|candidate| candidate.target_id)
+            .expect("target");
+        let operation_id = "claude_setup_50505050505050505050505050505050";
+        let prepared = prepare_claude_account_target_mode(
+            1,
+            operation_id.to_string(),
+            target_id.clone(),
+            true,
+        )
+        .expect("sealed target");
+        let slot_id = prepared.setup_operation.slot_id.clone().expect("slot");
+        let config_dir = prepared
+            .managed_slots
+            .iter()
+            .find(|slot| slot.slot_id == slot_id)
+            .and_then(|slot| slot.config_dir.clone())
+            .expect("target root");
+        let state_path = root.join("claude-browser-auth-state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).expect("sidecar state"))
+                .expect("sidecar json");
+        state["operations"][0]["phase"] = serde_json::json!("waiting_for_provider");
+        state["operations"][0]["slot_id"] = serde_json::json!(slot_id.clone());
+        state["operations"][0]["config_dir"] = serde_json::json!(config_dir);
+        state["operations"][0]["ceremony_baseline"] = serde_json::json!("baseline");
+        fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&state).expect("sidecar body"),
+        )
+        .expect("active sidecar");
+        let core_path = root.join(ottto_core::CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME);
+        let core_before = fs::read(&core_path).expect("core before replay");
+        let sidecar_before = fs::read(&state_path).expect("sidecar before replay");
+        let worker_lock = crate::claude_browser_auth::registry_mutation_guard(operation_id)
+            .expect("worker operation lock");
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let replay_operation_id = operation_id.to_string();
+        let replay_target_id = target_id.clone();
+        let replay = thread::spawn(move || {
+            let result = start_claude_browser_login(1, replay_operation_id, Some(replay_target_id));
+            result_tx.send(result).expect("send replay");
+        });
+        let replayed = result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("active replay must not wait for the worker lock")
+            .expect("active replay");
+        assert_eq!(
+            replayed.setup_operation.slot_id.as_deref(),
+            Some(slot_id.as_str())
+        );
+        assert_eq!(
+            replayed
+                .setup_operation
+                .browser_auth
+                .as_ref()
+                .map(|browser| browser.phase),
+            Some(ottto_protocol::ClaudeBrowserAuthPhaseV1::WaitingForProvider)
+        );
+        assert_eq!(
+            fs::read(&core_path).expect("core after replay"),
+            core_before
+        );
+        assert_eq!(
+            fs::read(&state_path).expect("sidecar after replay"),
+            sidecar_before
+        );
+        drop(worker_lock);
+        replay.join().expect("replay thread");
+        crate::claude_browser_auth::release_ceremony(operation_id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
     fn claude_account_check_orchestrates_full_partial_pause_and_rotation_without_fanout() {
         let root = control_test_root("claude-account-check-orchestration");
         let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
@@ -16874,6 +17520,200 @@ mod tests {
 
     #[test]
     #[serial]
+    fn transient_core_lookup_failure_preserves_exact_reusable_claim_for_recovery() {
+        let root = control_test_root("claude-target-transient-core-failure");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let seed_id = "claude_setup_17171717171717171717171717171717";
+        crate::claude_browser_auth::prepare_generic(store.load().expect("registry"), seed_id)
+            .expect("seed reusable root");
+        assert!(crate::claude_browser_auth::request_cancel(seed_id).expect("cancel seed"));
+
+        let operation_id = "claude_setup_18181818181818181818181818181818";
+        assert!(crate::claude_browser_auth::claim_ceremony(operation_id).expect("claim ceremony"));
+        let reusable = crate::claude_browser_auth::claim_reusable_root(operation_id)
+            .expect("claim reusable")
+            .expect("one reusable root");
+        crate::claude_browser_auth::persist_registry_mutation_fence(
+            operation_id,
+            crate::claude_browser_auth::BrowserLoginMode::Target,
+            None,
+            Some(&reusable),
+            Some("claude_anchor_target_18181818181818181818181818181818"),
+            Some(&"a".repeat(64)),
+            Some(&"b".repeat(64)),
+        )
+        .expect("target fence");
+        let status_before_failure = store.load().expect("pre-failure registry");
+        let settings_path = root.join(ottto_core::CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME);
+        fs::create_dir(&settings_path).expect("inject core read/write failure");
+
+        recover_failed_claude_browser_registry_mutation(
+            &store,
+            operation_id,
+            Some(crate::claude_browser_auth::BrowserLoginMode::Target),
+            true,
+        );
+        assert!(crate::claude_browser_auth::has_browser_operation(
+            operation_id
+        ));
+        let sidecar_only = crate::claude_browser_auth::annotate_status(status_before_failure);
+        assert_eq!(sidecar_only.retained_provisional_login_count, None);
+        assert!(crate::claude_browser_auth::claim_ceremony(
+            "claude_setup_19191919191919191919191919191919"
+        )
+        .is_err());
+
+        fs::remove_dir(&settings_path).expect("restore core store");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < deadline
+            && crate::claude_browser_auth::has_browser_operation(operation_id)
+        {
+            thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(!crate::claude_browser_auth::has_browser_operation(
+            operation_id
+        ));
+        let retry_id = "claude_setup_19191919191919191919191919191919";
+        assert!(crate::claude_browser_auth::claim_ceremony(retry_id).expect("retry ceremony"));
+        assert_eq!(
+            crate::claude_browser_auth::claim_reusable_root(retry_id)
+                .expect("retry root")
+                .as_deref(),
+            Some(reusable.as_str())
+        );
+        crate::claude_browser_auth::release_reusable_root_claim(retry_id);
+        crate::claude_browser_auth::release_ceremony(retry_id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn concurrent_same_id_target_replay_uses_one_exact_root_without_ledger_leak() {
+        for reusable_count in [1usize, 2] {
+            let root =
+                control_test_root(&format!("claude-target-concurrent-replay-{reusable_count}"));
+            let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+            let store = FileClaudeConfigSlotSettingsStore::default();
+            for index in 0..reusable_count {
+                let blocker_id = format!("claude_setup_{:032x}", 0x280usize + index);
+                if index > 0 {
+                    assert!(crate::claude_browser_auth::claim_reusable_root(&blocker_id)
+                        .expect("temporarily claim earlier root")
+                        .is_some());
+                }
+                let seed_id = format!("claude_setup_{:032x}", 0x200usize + index);
+                crate::claude_browser_auth::prepare_generic(
+                    store.load().expect("registry"),
+                    &seed_id,
+                )
+                .expect("seed reusable root");
+                assert!(crate::claude_browser_auth::request_cancel(&seed_id).expect("cancel seed"));
+                if index > 0 {
+                    crate::claude_browser_auth::release_reusable_root_claim(&blocker_id);
+                }
+            }
+            let account_hash = "a".repeat(64);
+            let organization_hash = "b".repeat(64);
+            crate::agent_status::persist_one_claude_slot_collection_state(
+                "default",
+                &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                    account_identifier_hash: Some(account_hash),
+                    organization_identifier_hash: Some(organization_hash),
+                    observed_at: Some("2026-08-31T00:00:00Z".to_string()),
+                    has_account_windows: true,
+                    has_scoped_limits: true,
+                    ..Default::default()
+                },
+            )
+            .expect("default identity");
+            let discovered = load_claude_config_slot_settings().expect("discover target");
+            let target_id = discovered
+                .anchor_coverage
+                .accounts
+                .iter()
+                .find(|account| {
+                    account.durability
+                        == ottto_protocol::ClaudeAccountAnchorDurabilityV1::DefaultOnly
+                })
+                .and_then(|account| account.target_id.clone())
+                .expect("target");
+            let operation_id = format!("claude_setup_{:032x}", 0x300usize + reusable_count);
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let barrier = Arc::clone(&barrier);
+                let operation_id = operation_id.clone();
+                let target_id = target_id.clone();
+                workers.push(thread::spawn(move || {
+                    barrier.wait();
+                    prepare_claude_account_target_mode(1, operation_id, target_id, true)
+                        .expect("concurrent target replay")
+                }));
+            }
+            barrier.wait();
+            let first = workers.remove(0).join().expect("first replay");
+            let second = workers.remove(0).join().expect("second replay");
+            assert_eq!(
+                first.setup_operation.slot_id,
+                second.setup_operation.slot_id
+            );
+            let slot_id = first.setup_operation.slot_id.clone().expect("slot");
+            let first_root = first
+                .managed_slots
+                .iter()
+                .find(|slot| slot.slot_id == slot_id)
+                .and_then(|slot| slot.config_dir.clone())
+                .expect("first root");
+            let second_root = second
+                .managed_slots
+                .iter()
+                .find(|slot| slot.slot_id == slot_id)
+                .and_then(|slot| slot.config_dir.clone())
+                .expect("second root");
+            assert_eq!(first_root, second_root);
+            assert_eq!(
+                crate::claude_browser_auth::collection_suppression(&slot_id),
+                Some(
+                    crate::claude_browser_auth::ClaudeCollectionSuppression::HideProvisionalTarget
+                )
+            );
+            let during = crate::claude_browser_auth::annotate_status(
+                store.load().expect("status during target"),
+            );
+            assert_eq!(
+                during.retained_provisional_login_count.unwrap_or(0) as usize,
+                reusable_count - 1
+            );
+            assert!(
+                crate::claude_browser_auth::request_cancel(&operation_id).expect("cancel target")
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline
+                && crate::claude_browser_auth::has_browser_operation(&operation_id)
+                && crate::claude_browser_auth::annotate_status(
+                    store.load().expect("poll target cancellation"),
+                )
+                .retained_provisional_login_count
+                .unwrap_or(0) as usize
+                    != reusable_count
+            {
+                thread::sleep(std::time::Duration::from_millis(25));
+            }
+            let after = crate::claude_browser_auth::annotate_status(
+                store.load().expect("status after target"),
+            );
+            assert_eq!(
+                after.retained_provisional_login_count.unwrap_or(0) as usize,
+                reusable_count
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    #[serial]
     fn claude_account_check_is_singleflight_and_stop_wins_inflight_finalization() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let root = control_test_root("claude-account-check-singleflight");
@@ -17008,6 +17848,40 @@ mod tests {
                 },
             );
 
+            assert!(!response.ok);
+            assert_eq!(
+                response.error.expect("error").code,
+                CliErrorCode::LocalAuthFailed
+            );
+        }
+    }
+
+    #[test]
+    fn claude_browser_auth_commands_reject_bad_control_token() {
+        for command in [
+            LocalControlCommand::ClaudeAccountStartBrowserLogin {
+                schema_version: ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                operation_id: "claude_setup_a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0".to_string(),
+                target_id: None,
+            },
+            LocalControlCommand::ClaudeAccountStartBrowserReconnect {
+                schema_version: ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                operation_id: "claude_setup_b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".to_string(),
+                slot_id: "claude_slot_b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".to_string(),
+                target_id: "claude_target_b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".to_string(),
+            },
+        ] {
+            let response = handle_request(
+                &daemon(),
+                LocalControlRequest {
+                    request_id: "req_claude_browser_bad_token".to_string(),
+                    protocol_version: ottto_protocol::CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION,
+                    token: Some("bad-token".to_string()),
+                    client_kind: Some(LocalClientKind::Cli),
+                    client_install_owner: None,
+                    command,
+                },
+            );
             assert!(!response.ok);
             assert_eq!(
                 response.error.expect("error").code,
