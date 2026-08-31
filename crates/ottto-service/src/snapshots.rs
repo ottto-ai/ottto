@@ -12381,6 +12381,70 @@ fn python_regex_unicode_whitespace(ch: char) -> bool {
     )
 }
 
+/// Characters that CPython 3.13's Unicode 15.1 tables treat as unassigned but
+/// Rust 1.88's Unicode 16 tables treat as cased. Protecting both sides of each
+/// newly assigned pair also keeps their Cased property from changing Python's
+/// contextual Final_Sigma result. The older U+0264 and U+019B lowercase peers
+/// of U+A7CB and U+A7DC stay unprotected because Python 3.13 already cases them.
+fn python_3_13_unicode_15_1_unassigned_cased(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{1c89}'
+            | '\u{1c8a}'
+            | '\u{a7cb}'
+            | '\u{a7cc}'
+            | '\u{a7cd}'
+            | '\u{a7da}'
+            | '\u{a7db}'
+            | '\u{a7dc}'
+            | '\u{10d50}'..='\u{10d65}'
+            | '\u{10d70}'..='\u{10d85}'
+    )
+}
+
+/// Apply Rust's whole-string Unicode lowercase while pinning the backend's
+/// CPython 3.13 / Unicode 15.1 behavior for characters assigned casing later.
+fn python_3_13_lowercase(value: &str) -> String {
+    let mut protected = String::with_capacity(value.len());
+    let mut restores = Vec::with_capacity(value.chars().count());
+    for ch in value.chars() {
+        if python_3_13_unicode_15_1_unassigned_cased(ch) {
+            // NUL is uncased and not Case_Ignorable, matching an unassigned
+            // Unicode 15.1 scalar's effect on Final_Sigma context.
+            protected.push('\0');
+            restores.push(Some(ch));
+        } else {
+            protected.push(ch);
+            restores.push(None);
+        }
+    }
+
+    let lowered = protected.to_lowercase();
+    let mut lowered_chars = lowered.chars();
+    let mut compatible = String::with_capacity(lowered.len());
+    for (protected_ch, restore) in protected.chars().zip(restores) {
+        let lowered_ch = lowered_chars
+            .next()
+            .expect("whole-string lowercase preserves at least one scalar per input scalar");
+        if let Some(original) = restore {
+            debug_assert_eq!(lowered_ch, '\0');
+            compatible.push(original);
+        } else {
+            compatible.push(lowered_ch);
+            // U+0130 is the sole default lowercase expansion in these tables.
+            if protected_ch == '\u{0130}' {
+                compatible.push(
+                    lowered_chars
+                        .next()
+                        .expect("U+0130 lowercase includes COMBINING DOT ABOVE"),
+                );
+            }
+        }
+    }
+    debug_assert!(lowered_chars.next().is_none());
+    compatible
+}
+
 /// Match the backend selector identity exactly: Python `strip().lower()`, then
 /// replace each run matching Unicode-aware `[\s\-]+` with one underscore, then
 /// enforce the normalized 128-code-point bound. There is deliberately no
@@ -12392,9 +12456,13 @@ fn normalized_claude_attribution_mcp_tool_name(value: &str) -> Option<String> {
         return None;
     }
 
+    // Lowercase the whole stripped string before separator substitution, exactly
+    // like the backend's `value.strip().lower()`. Whole-string conversion is
+    // required for contextual Unicode mappings such as Greek Final_Sigma.
+    let value = python_3_13_lowercase(value);
     let mut normalized = String::with_capacity(value.len());
     let mut in_separator_run = false;
-    for ch in value.chars().flat_map(char::to_lowercase) {
+    for ch in value.chars() {
         if python_regex_unicode_whitespace(ch) || ch == '-' {
             if !in_separator_run {
                 normalized.push('_');
@@ -24271,6 +24339,77 @@ mod tests {
                     .usage
                     .request_count,
                 2
+            );
+        }
+    }
+
+    #[test]
+    fn claude_attribution_mcp_tool_pins_python_lowercase_compatibility() {
+        // CPython applies Unicode SpecialCasing to the whole string. These are
+        // pinned outputs from backend normalize_selector_value under Python
+        // 3.13.5 / Unicode 15.1, including Final_Sigma and the sole default
+        // multi-scalar lowercase expansion (U+0130).
+        for (raw, expected) in [
+            ("ΟΣ", "ος"),
+            ("ΟΣ ", "ος"),
+            ("ΣΑΣ", "σας"),
+            ("Σ", "σ"),
+            ("AΣ-A", "aς_a"),
+            ("AΣ_A", "aς_a"),
+            ("AΣ A", "aς_a"),
+            ("İ", "i\u{0307}"),
+            ("ß", "ß"),
+        ] {
+            assert_eq!(
+                normalized_claude_attribution_mcp_tool_name(raw).as_deref(),
+                Some(expected),
+                "Python lowercase parity failed for {raw:?}"
+            );
+        }
+
+        // Rust 1.88 uses Unicode 16 while CPython 3.13 uses Unicode 15.1.
+        // Pin every newly mapped Unicode 16 uppercase scalar that the backend
+        // still treats as unassigned and therefore leaves byte-identical.
+        let unicode_16_uppercase_additions =
+            ['\u{1c89}', '\u{a7cb}', '\u{a7cc}', '\u{a7da}', '\u{a7dc}']
+                .into_iter()
+                .chain('\u{10d50}'..='\u{10d65}');
+        for ch in unicode_16_uppercase_additions {
+            let raw = ch.to_string();
+            assert_eq!(
+                normalized_claude_attribution_mcp_tool_name(&raw).as_deref(),
+                Some(raw.as_str()),
+                "Python 3.13 leaves Unicode 16 addition U+{:04X} unassigned",
+                ch as u32
+            );
+        }
+
+        // Pin all Unicode 16 additions whose newly assigned Cased property can
+        // otherwise change a neighboring sigma's contextual lowercase result.
+        let unicode_16_cased_additions = [
+            '\u{1c89}', '\u{1c8a}', '\u{a7cb}', '\u{a7cc}', '\u{a7cd}', '\u{a7da}', '\u{a7db}',
+            '\u{a7dc}',
+        ]
+        .into_iter()
+        .chain('\u{10d50}'..='\u{10d65}')
+        .chain('\u{10d70}'..='\u{10d85}');
+        for ch in unicode_16_cased_additions {
+            let raw_before = format!("{ch}ΣA");
+            let expected_before = format!("{ch}σa");
+            assert_eq!(
+                normalized_claude_attribution_mcp_tool_name(&raw_before).as_deref(),
+                Some(expected_before.as_str()),
+                "U+{:04X} must be uncased before sigma under Unicode 15.1",
+                ch as u32
+            );
+
+            let raw_after = format!("AΣ{ch}A");
+            let expected_after = format!("aς{ch}a");
+            assert_eq!(
+                normalized_claude_attribution_mcp_tool_name(&raw_after).as_deref(),
+                Some(expected_after.as_str()),
+                "U+{:04X} must be uncased after sigma under Unicode 15.1",
+                ch as u32
             );
         }
     }
