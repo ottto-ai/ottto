@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 345,
-  "content_sha256": "04b12fc6e42779b901c167650785d5c21e6ce44c7ee0449d839fee1d8676d09c",
+  "content_sha256": "3bd1290eaca5da335a4f55adf0481c12dd70f6a763369e5de1b58ac2f23f6767",
   "files": [
     {
       "executable": false,
@@ -881,8 +881,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "e874c023ad63daf187803cdb7ffaddfb51cc54e7c567153d2226bf96ef5f278e",
-      "size_bytes": 1583516
+      "sha256": "0bad82f2a411951a68b0fc413ced72864e9135976ebe02722c9f88f730dfec76",
+      "size_bytes": 1607897
     },
     {
       "executable": false,
@@ -1875,14 +1875,14 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-golden.json",
-      "sha256": "cf6288d630f150a71df9ca534edd71d973fd701bef449dfbbc6a9637416df9e8",
+      "sha256": "0e8fea1a7ae57b5bdcf410c944488e1d741e6b01bc7989829d8e996070df18f4",
       "size_bytes": 3045
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-manifest.json",
-      "sha256": "e9ac2cc83a4c1ed8e3dc5d4f6be435aecc9dfbdf8845af4efc2776b14d0bd68f",
+      "sha256": "f9dcfaf2ee76497ee1d21980a358e161a1762fb0712a9059fa48d9f0583713c9",
       "size_bytes": 1777
     },
     {
@@ -1910,7 +1910,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "cb766b1cb1571fe25f5b9e343ef21daba863d45af9bd6ea76de6509ad22767eb",
+      "sha256": "590072b5fab7b616b366d48b18578b9aba4e551b588555842a4974dbc9ae5fca",
       "size_bytes": 218514
     },
     {
@@ -2418,7 +2418,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-01T13:57:15+00:00",
+  "generated_at": "2026-09-01T14:58:41+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 346,
   "public_roots": [
@@ -2454,5 +2454,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "e9eb63cdf89ebb5afacafbfe7a889458ee80e2b1"
+  "source_commit": "06a4b0afedacc306ec286c847109be15657d0cf3"
 }
