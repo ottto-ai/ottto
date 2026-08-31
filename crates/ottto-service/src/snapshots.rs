@@ -5269,6 +5269,11 @@ pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result
 }
 
 fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), String> {
+    if item.model_usage.len() > MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS {
+        return Err(format!(
+            "snapshot[{index}] has more than {MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS} model_usage rows"
+        ));
+    }
     if item.compaction_timestamps.len() > MAX_COMPACTION_TIMESTAMPS {
         return Err(format!(
             "snapshot[{index}] has more than {MAX_COMPACTION_TIMESTAMPS} compaction_timestamps"
@@ -5310,6 +5315,11 @@ fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), Strin
     let mut bucket_totals = UsageTotals::default();
     let mut bucket_rows: BTreeMap<RowKey, UsageTotals> = BTreeMap::new();
     for (bucket_index, bucket) in item.usage_buckets.iter().enumerate() {
+        if bucket.model_usage.len() > MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS {
+            return Err(format!(
+                "snapshot[{index}].usage_buckets[{bucket_index}] has more than {MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS} model_usage rows"
+            ));
+        }
         if bucket.model_usage.is_empty() {
             return Err(format!(
                 "snapshot[{index}].usage_buckets[{bucket_index}] has no model_usage rows"
@@ -7688,29 +7698,11 @@ impl SnapshotAccumulator {
             .into_values()
             .collect::<Vec<_>>();
         responses.sort_by_key(|response| response.sequence);
-        let retained_attribution_mcp_tool_limit = claude_attribution_mcp_tool_retained_name_limit(
-            responses
-                .iter()
-                .filter(|response| !response.conflict)
-                .map(|response| {
-                    response
-                        .selector
-                        .context
-                        .get(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD)
-                        .map(String::as_str)
-                }),
-        );
-        let mut retained_attribution_mcp_tools = BTreeSet::new();
         for mut response in responses {
             if response.conflict {
                 self.note_dropped_usage();
                 continue;
             }
-            bound_claude_attribution_mcp_tool_cardinality(
-                &mut response.selector,
-                &mut retained_attribution_mcp_tools,
-                retained_attribution_mcp_tool_limit,
-            );
             let effective_input_context = response
                 .computed_effective_input_context
                 .unwrap_or_else(|| response.usage.effective_input_context());
@@ -8303,6 +8295,9 @@ impl SnapshotAccumulator {
         let tool_usage = (self.source == SnapshotSource::ClaudeCode)
             .then(|| bounded_tool_usage_counts(&self.tool_usage_counts));
         let tool_usage_truncated = self.tool_usage_truncated;
+        if self.source == SnapshotSource::ClaudeCode {
+            bound_claude_attribution_mcp_tool_cardinality(&mut self.usage_buckets);
+        }
         // Per-row session-wide aggregation (sum across all buckets keyed by
         // RowKey). Drives the top-level model_usage list and the snapshot
         // totals so the backend validator sees the two reconcile exactly.
@@ -11153,55 +11148,125 @@ fn capture_claude_attribution(value: &Value, selector: &mut SelectorCapture, ena
     }
 }
 
-/// Decide how many named MCP-tool selector rows can be retained while preserving
-/// one unselected row for already-unattributed or overflow usage. The backend
-/// admits at most 100 model-usage rows per session and per hourly bucket. When
-/// every response is attributed and there is no overflow, all 100 names fit;
-/// otherwise 99 named rows plus the unselected fallback fit.
-fn claude_attribution_mcp_tool_retained_name_limit<'a>(
-    tools: impl IntoIterator<Item = Option<&'a str>>,
-) -> usize {
-    let mut distinct = BTreeSet::new();
-    let mut needs_unselected_row = false;
-    for tool in tools {
-        match tool {
-            Some(tool) => {
-                distinct.insert(tool);
-            }
-            None => needs_unselected_row = true,
-        }
-    }
-    if distinct.len() > MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS {
-        needs_unselected_row = true;
-    }
-    MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS - usize::from(needs_unselected_row)
+/// Return the receiver row produced when MCP-tool attribution overflows. The
+/// rest of the complete selector identity is retained; only the MCP-tool
+/// context/source pair becomes unselected.
+fn claude_attribution_mcp_tool_fallback_row(
+    row_key: &RowKey,
+    row: &BucketRowAccumulator,
+) -> (RowKey, BucketRowAccumulator) {
+    let mut fallback_key = row_key.clone();
+    let mut fallback_row = row.clone();
+    fallback_row
+        .selector_context
+        .remove(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD);
+    fallback_row
+        .selector_sources
+        .remove(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD);
+    fallback_key.selector_hash = if fallback_row.selector_context.is_empty() {
+        "base".to_string()
+    } else {
+        let payload = serde_json::to_string(&fallback_row.selector_context)
+            .unwrap_or_else(|_| "{}".to_string());
+        sha256_hex(&[payload.as_str()])[..16].to_string()
+    };
+    (fallback_key, fallback_row)
 }
 
-/// Keep the first receiver-coherent set of normalized names in resolved
-/// provider-response order. Once full, later occurrences of retained names
-/// keep their selector; only later unseen names lose the MCP-tool context/source
-/// pair and merge into the reserved unselected row.
+/// Bound the receiver's complete post-normalization selector-row identities,
+/// not MCP-tool names in isolation. The same global mapping is applied to every
+/// hourly bucket, so both each bucket and their session-wide union stay within
+/// the backend's 100-row admission limit while every usage counter is merged
+/// into an emitted row.
+///
+/// Each distinct identity with the MCP-tool pair removed reserves its own
+/// unselected fallback row. Named identities use only the remaining capacity.
+/// In the pathological case where the pre-tool identities alone exceed the
+/// receiver limit, 99 are retained and the rest merge into one fully
+/// unselected `unknown` row rather than making the entire batch inadmissible.
 fn bound_claude_attribution_mcp_tool_cardinality(
-    selector: &mut SelectorCapture,
-    retained: &mut BTreeSet<String>,
-    retained_name_limit: usize,
+    usage_buckets: &mut BTreeMap<String, UsageBucketState>,
 ) {
-    let Some(tool) = selector
-        .context
-        .get(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD)
-        .cloned()
-    else {
+    let mut distinct_rows = BTreeMap::<RowKey, BucketRowAccumulator>::new();
+    for bucket in usage_buckets.values() {
+        for (row_key, row) in &bucket.rows {
+            distinct_rows
+                .entry(row_key.clone())
+                .or_insert_with(|| row.clone());
+        }
+    }
+    if distinct_rows.len() <= MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS
+        || !distinct_rows.values().any(|row| {
+            row.selector_context
+                .contains_key(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD)
+        })
+    {
         return;
+    }
+
+    let fallback_keys = distinct_rows
+        .iter()
+        .map(|(row_key, row)| claude_attribution_mcp_tool_fallback_row(row_key, row).0)
+        .collect::<BTreeSet<_>>();
+    let collapse_excess_fallbacks = fallback_keys.len() > MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS;
+    let (retained_named_keys, retained_fallback_keys) = if collapse_excess_fallbacks {
+        // Reserve the hundredth identity for a single universal overflow row.
+        // This branch is reached only when the other selector fields already
+        // produce more rows than the receiver admits.
+        let fallback = fallback_keys
+            .into_iter()
+            .take(MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS - 1)
+            .collect();
+        (BTreeSet::new(), fallback)
+    } else {
+        let named_capacity = MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS - fallback_keys.len();
+        let named = distinct_rows
+            .iter()
+            .filter(|(_, row)| {
+                row.selector_context
+                    .contains_key(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD)
+            })
+            .map(|(row_key, _)| row_key.clone())
+            .take(named_capacity)
+            .collect();
+        (named, fallback_keys)
     };
-    if retained.contains(&tool) {
-        return;
+
+    for bucket in usage_buckets.values_mut() {
+        let rows = std::mem::take(&mut bucket.rows);
+        for (row_key, row) in rows {
+            let (fallback_key, fallback_row) =
+                claude_attribution_mcp_tool_fallback_row(&row_key, &row);
+            let (target_key, target_row) = if retained_named_keys.contains(&row_key) {
+                (row_key, row)
+            } else if retained_fallback_keys.contains(&fallback_key) {
+                (fallback_key, fallback_row)
+            } else if collapse_excess_fallbacks {
+                let mut overflow_row = fallback_row;
+                overflow_row.selector_context.clear();
+                overflow_row.selector_sources.clear();
+                overflow_row.reasoning_effort = None;
+                (
+                    RowKey {
+                        model: "unknown".to_string(),
+                        selector_hash: "base".to_string(),
+                        reasoning_effort: None,
+                        auth_mode: None,
+                        billing_channel: None,
+                        billing_provider: None,
+                        gateway_provider: None,
+                        model_provider: None,
+                        subscription_product: None,
+                    },
+                    overflow_row,
+                )
+            } else {
+                (fallback_key, fallback_row)
+            };
+            merge_session_row(&mut bucket.rows, target_key, target_row);
+        }
+        debug_assert!(bucket.rows.len() <= MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS);
     }
-    if retained.len() < retained_name_limit {
-        retained.insert(tool);
-        return;
-    }
-    selector.context.remove(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD);
-    selector.sources.remove(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD);
 }
 
 fn detect_claude_gateway_provider(value: &Value) -> Option<String> {
@@ -12293,25 +12358,44 @@ fn bounded_tool_usage_name(value: &str) -> Option<String> {
     Some(value.chars().take(MAX_TOOL_USAGE_NAME_LENGTH).collect())
 }
 
-/// Match the backend selector identity for admitted Claude MCP-tool labels:
-/// trim, lowercase, then collapse runs of whitespace/hyphens to `_`. Claude's
-/// existing customer-safe identifier filter remains the outer admission gate;
-/// truncation happens after normalization so a long separator run that
-/// normalizes below 128 characters is retained exactly as the backend sees it.
+/// Python's Unicode `str.isspace()` / regular-expression `\s` set. CPython adds
+/// the four information separators U+001C..U+001F to the Unicode White_Space
+/// property, so Rust's `char::is_whitespace` is not sufficient for byte parity.
+/// The complete contract is U+0009..U+000D, U+001C..U+001F, U+0020, U+0085,
+/// U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029, U+202F, U+205F, and U+3000.
+fn python_regex_unicode_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}'..='\u{000d}'
+            | '\u{001c}'..='\u{001f}'
+            | '\u{0020}'
+            | '\u{0085}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+    )
+}
+
+/// Match the backend selector identity exactly: Python `strip().lower()`, then
+/// replace each run matching Unicode-aware `[\s\-]+` with one underscore, then
+/// enforce the normalized 128-code-point bound. There is deliberately no
+/// narrower daemon-only identifier gate: every string the backend normalizes
+/// must reach it under the same normalized bytes.
 fn normalized_claude_attribution_mcp_tool_name(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty()
-        || !value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
-    {
+    let value = value.trim_matches(python_regex_unicode_whitespace);
+    if value.is_empty() {
         return None;
     }
 
     let mut normalized = String::with_capacity(value.len());
     let mut in_separator_run = false;
     for ch in value.chars().flat_map(char::to_lowercase) {
-        if ch.is_whitespace() || ch == '-' {
+        if python_regex_unicode_whitespace(ch) || ch == '-' {
             if !in_separator_run {
                 normalized.push('_');
                 in_separator_run = true;
@@ -24058,7 +24142,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_attribution_mcp_tool_matches_backend_normalization_and_bounds() {
+    fn claude_attribution_mcp_tool_matches_backend_normalization() {
         let long_name = "x".repeat(MAX_TOOL_USAGE_NAME_LENGTH + 20);
         let line = json!({"attributionMcpTool": long_name});
         let mut truncated = SelectorCapture::default();
@@ -24082,10 +24166,58 @@ mod tests {
         );
         assert_eq!(normalized.context[CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD], "a_");
 
-        let invalid = json!({"attributionMcpTool": "tool/name"});
-        let mut rejected = SelectorCapture::default();
-        capture_claude_attribution(&invalid, &mut rejected, true);
-        assert_eq!(rejected, SelectorCapture::default());
+        // Exact ten-row R2 cross-language corpus. These expected values are
+        // direct outputs from backend normalize_selector_value.
+        let parity_rows = vec![
+            ("foo-bar".to_string(), "foo_bar"),
+            ("foo---bar".to_string(), "foo_bar"),
+            ("---Foo---".to_string(), "_foo_"),
+            ("Read-File_V2".to_string(), "read_file_v2"),
+            ("  MIXED-case  ".to_string(), "mixed_case"),
+            ("alpha beta".to_string(), "alpha_beta"),
+            ("\tTabs-\nBreak\t".to_string(), "tabs_break"),
+            ("alpha\u{00a0}-\u{2003}beta".to_string(), "alpha_beta"),
+            ("__A---B__".to_string(), "__a_b__"),
+            (format!("A{}", "-".repeat(128)), "a_"),
+        ];
+        for (raw, expected) in parity_rows {
+            assert_eq!(
+                normalized_claude_attribution_mcp_tool_name(&raw).as_deref(),
+                Some(expected),
+                "backend parity failed for {raw:?}"
+            );
+            let mut selector = SelectorCapture::default();
+            capture_claude_attribution(&json!({"attributionMcpTool": raw}), &mut selector, true);
+            assert_eq!(
+                selector.context[CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD],
+                expected
+            );
+        }
+
+        // Exhaust the documented Python `\s` set, including IDEOGRAPHIC SPACE.
+        let python_whitespace = [
+            '\u{0009}', '\u{000a}', '\u{000b}', '\u{000c}', '\u{000d}', '\u{001c}', '\u{001d}',
+            '\u{001e}', '\u{001f}', '\u{0020}', '\u{0085}', '\u{00a0}', '\u{1680}', '\u{2000}',
+            '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}',
+            '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}',
+            '\u{3000}',
+        ];
+        for whitespace in python_whitespace {
+            assert!(python_regex_unicode_whitespace(whitespace));
+            assert_eq!(
+                normalized_claude_attribution_mcp_tool_name(&format!(
+                    "alpha{whitespace}-{whitespace}beta"
+                ))
+                .as_deref(),
+                Some("alpha_beta")
+            );
+        }
+        assert!(!python_regex_unicode_whitespace('\u{200b}'));
+        assert_eq!(
+            normalized_claude_attribution_mcp_tool_name("tool/name").as_deref(),
+            Some("tool/name"),
+            "the daemon must not impose a narrower gate than the backend"
+        );
 
         // Backend-equivalent selector identities must merge before row hashing
         // and aggregation, not collide later during request admission.
@@ -24109,21 +24241,8 @@ mod tests {
                 selectors.push(selector);
             }
 
-            let retained_limit =
-                claude_attribution_mcp_tool_retained_name_limit(selectors.iter().map(|selector| {
-                    selector
-                        .context
-                        .get(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD)
-                        .map(String::as_str)
-                }));
-            let mut retained = BTreeSet::new();
             let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-            for mut selector in selectors {
-                bound_claude_attribution_mcp_tool_cardinality(
-                    &mut selector,
-                    &mut retained,
-                    retained_limit,
-                );
+            for selector in selectors {
                 accumulator.add_usage_with_selector(
                     Some("claude-opus-4-8".to_string()),
                     UsageTotals {
@@ -24137,7 +24256,6 @@ mod tests {
                     None,
                 );
             }
-            assert_eq!(retained, BTreeSet::from([expected.to_string()]));
             let bucket = accumulator
                 .usage_buckets
                 .values()
@@ -24155,48 +24273,56 @@ mod tests {
                 2
             );
         }
+    }
 
-        // 101 raw distinct values preserve all usage while emitting no more
-        // than the backend's 100 rows at either session or hourly-bucket scope.
-        let mut selectors = (0..=MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS)
-            .map(|index| {
-                let mut selector = SelectorCapture::default();
-                capture_claude_attribution(
-                    &json!({"attributionMcpTool": format!("tool_{index}")}),
-                    &mut selector,
-                    true,
-                );
-                selector
-            })
-            .collect::<Vec<_>>();
-        let retained_limit =
-            claude_attribution_mcp_tool_retained_name_limit(selectors.iter().map(|selector| {
-                selector
-                    .context
-                    .get(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD)
-                    .map(String::as_str)
-            }));
-        assert_eq!(retained_limit, MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS - 1);
-
-        let mut retained = BTreeSet::new();
+    #[test]
+    fn claude_attribution_mcp_tool_caps_complete_selector_identities() {
+        // Exact R2 blocker: 101 normalized tool labels alternate between two
+        // independently varying subagent selectors. A name-only budget emitted
+        // 101 complete rows after its two unselected fallbacks split by agent.
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
         accumulator.source_session_id = Some("claude-mcp-tool-cardinality".to_string());
-        for selector in &mut selectors {
-            bound_claude_attribution_mcp_tool_cardinality(selector, &mut retained, retained_limit);
+        for ordinal in 1..=101_u64 {
+            let mut selector = SelectorCapture::default();
+            capture_claude_attribution(
+                &json!({"attributionMcpTool": format!("tool_{ordinal}")}),
+                &mut selector,
+                true,
+            );
+            selector.insert(
+                "attribution_subagent",
+                format!("agent_{}", (ordinal - 1) % 2),
+                "claude_code_attribution_field",
+            );
             accumulator.add_usage_with_selector(
                 Some("claude-opus-4-8".to_string()),
                 UsageTotals {
-                    input_tokens: 1,
-                    output_tokens: 1,
+                    input_tokens: ordinal,
+                    output_tokens: 2 * ordinal,
+                    cache_read_tokens: 3 * ordinal,
+                    cache_creation_5m_tokens: 4 * ordinal,
+                    cache_creation_1h_tokens: 5 * ordinal,
+                    reasoning_output_tokens: 6 * ordinal,
+                    unattributed_total_tokens: 7 * ordinal,
                     request_count: 1,
                     ..UsageTotals::default()
                 },
-                selector.clone(),
+                selector,
                 Some("2026-08-31T10:00:00Z"),
                 None,
             );
         }
-        assert_eq!(retained.len(), MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS - 1);
+        assert_eq!(
+            accumulator
+                .usage_buckets
+                .values()
+                .next()
+                .expect("one pre-bound bucket")
+                .rows
+                .len(),
+            101,
+            "the alternating subagent dimension makes every input a distinct full identity"
+        );
 
         let path = temp_file("claude-mcp-tool-cardinality");
         let item = accumulator
@@ -24210,14 +24336,45 @@ mod tests {
             item.usage_buckets[0].model_usage.len(),
             MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS
         );
+        validate_snapshot_item(0, &item).expect("bounded rows satisfy wire admission shape");
+
+        let overflow_rows = item
+            .model_usage
+            .iter()
+            .filter(|row| {
+                !row.selector_context
+                    .contains_key(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(overflow_rows.len(), 2);
         assert_eq!(
-            item.model_usage
+            overflow_rows
                 .iter()
                 .map(|row| row.request_count)
                 .sum::<u64>(),
-            (MAX_CLAUDE_ATTRIBUTION_MCP_TOOL_ROWS + 1) as u64,
-            "overflow usage remains counted in the reserved unselected row"
+            3
         );
+        let expected = UsageTotals {
+            input_tokens: 5_151,
+            output_tokens: 10_302,
+            cache_read_tokens: 15_453,
+            cache_creation_5m_tokens: 20_604,
+            cache_creation_1h_tokens: 25_755,
+            reasoning_output_tokens: 30_906,
+            unattributed_total_tokens: 36_057,
+            request_count: 101,
+            ..UsageTotals::default()
+        };
+        for rows in [
+            item.model_usage.as_slice(),
+            item.usage_buckets[0].model_usage.as_slice(),
+        ] {
+            let mut observed = UsageTotals::default();
+            for row in rows {
+                assert!(observed.add(&usage_totals_from_model_usage(row)));
+            }
+            assert!(usage_totals_equal(&observed, &expected));
+        }
     }
 
     #[test]
