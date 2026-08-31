@@ -66,8 +66,8 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // superseded by Claude's generated title.
 // claude_code v11: captured Claude Code work-attribution keys now ride inside
 // selector_context so already-scanned sessions re-emit with subagent, skill,
-// plugin, and MCP server selector rows. `attribution_mcp_tool` stays stripped
-// because it is too high-cardinality for the first contract.
+// plugin, and MCP server selector rows. `attribution_mcp_tool` stayed stripped
+// from that first contract because of its higher cardinality.
 // claude_code v12: each Claude Code session now carries session-level latency
 // aggregates (`avg_duration_ms` / `max_duration_ms`) derived from per-turn
 // wall-clock durations — each assistant API response's first content-block
@@ -244,7 +244,10 @@ const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // same census may exclude a legacy top-level fork's duplicated leading
 // response prefix, but only when exact current API/trace evidence assigns each
 // excluded request to another root; provider graph facts remain untouched.
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v33";
+// v34 emits Claude Code's `attributionMcpTool` as `attribution_mcp_tool` beside
+// the four existing attribution selectors. Tool labels reuse the established
+// Claude tool-usage bounds: 128 characters and 200 distinct values per session.
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v34";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -289,6 +292,9 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // `agent_path`, but those immutable files would otherwise stay indexed under
 // the version that emitted no label.
 pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v31";
+// v28 revisits Claude history once because the v34 MCP-tool selector changes
+// transcript-derived session semantics for operators who enabled attribution
+// capture. Sessions parsed with capture off remain semantic no-ops.
 // v27 adds claude_code_effective_input_context() reconciliation against
 // usage.iterations[] to fix resumed-session first-turn baseline (all-zero
 // top-level fields while iterations carry real prompt), and multi-iteration
@@ -297,7 +303,7 @@ pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v31";
 // v26 deliberately revisits Claude history so every snapshot clears the old
 // safety state and future-captured, trace-owned occurrence unions can mint the
 // reported-usage contract. Historical v31 sidecars remain unproven.
-pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v27";
+pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v28";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
 const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v2";
@@ -312,6 +318,7 @@ pub(crate) const MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES: usize = 129 * 1024;
 pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_USAGE_NAME_LENGTH: usize = 128;
 const MAX_TOOL_USAGE_NAMES: usize = 200;
+const CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD: &str = "attribution_mcp_tool";
 
 /// Hash epoch of the policy-neutral `content_hash`.
 ///
@@ -6426,8 +6433,8 @@ fn claude_workflow_detect_enabled_from(value: Option<&str>) -> bool {
 /// Defaults OFF: only `OTTTO_CLAUDE_ATTRIBUTION_CAPTURE` set to one of
 /// `on`/`1`/`true`/`yes`/`enabled` turns capture on. Approved attribution keys
 /// on `SELECTOR_CONTEXT_ALLOWED` reach `reduced_context`/`selector_hash` and
-/// cross the wire; `attribution_mcp_tool` intentionally stays off the allowlist
-/// for this first contract because of cardinality risk.
+/// cross the wire. MCP tool attribution is included whenever this capture is
+/// enabled; there is no second opt-in.
 fn claude_attribution_capture_enabled() -> bool {
     claude_attribution_capture_enabled_from(
         std::env::var("OTTTO_CLAUDE_ATTRIBUTION_CAPTURE")
@@ -7679,11 +7686,16 @@ impl SnapshotAccumulator {
             .into_values()
             .collect::<Vec<_>>();
         responses.sort_by_key(|response| response.sequence);
+        let mut retained_attribution_mcp_tools = BTreeSet::new();
         for mut response in responses {
             if response.conflict {
                 self.note_dropped_usage();
                 continue;
             }
+            bound_claude_attribution_mcp_tool_cardinality(
+                &mut response.selector,
+                &mut retained_attribution_mcp_tools,
+            );
             let effective_input_context = response
                 .computed_effective_input_context
                 .unwrap_or_else(|| response.usage.effective_input_context());
@@ -8659,6 +8671,7 @@ const SELECTOR_CONTEXT_ALLOWED: &[&str] = &[
     "attribution_skill",
     "attribution_plugin",
     "attribution_mcp_server",
+    "attribution_mcp_tool",
 ];
 
 pub fn scan_source_roots(
@@ -11088,13 +11101,12 @@ fn claude_code_selector_from_line(value: &Value) -> SelectorCapture {
 /// `apply_claude_code_line` and the Codex per-turn `service_tier` discipline.
 ///
 /// CONTRACT BOUNDARY: gated OFF by default via
-/// `claude_attribution_capture_enabled`. When enabled, the approved canonical
+/// `claude_attribution_capture_enabled`. When enabled, all five canonical
 /// snake_case keys below ride inside selector_context after the mirrored
 /// backend `SELECTOR_FIELDS`/`SELECTOR_SOURCE_KEYS` contract is in place.
-///
-/// `attribution_mcp_tool` is captured last and is the highest-cardinality
-/// marker; allowlisting it would explode `selector_hash` row counts, so it stays
-/// stripped in this first contract.
+/// `attribution_mcp_tool` has no separate opt-in: it ships on with the other
+/// four dimensions. Its values reuse Claude tool-usage's identifier filtering,
+/// 128-character truncation, and 200-distinct-values-per-session cap.
 ///
 /// `enabled` is threaded in (read from `claude_attribution_capture_enabled` at
 /// the call site) so the capture logic is unit-testable without process-global
@@ -11112,10 +11124,43 @@ fn capture_claude_attribution(value: &Value, selector: &mut SelectorCapture, ena
         ("attributionMcpTool", "attribution_mcp_tool"),
     ];
     for (raw_key, canonical_key) in ATTRIBUTION_FIELDS {
-        if let Some(attribution) = string_at(value, &[raw_key]) {
+        let attribution = string_at(value, &[raw_key]).and_then(|attribution| {
+            if *canonical_key == CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD {
+                bounded_tool_usage_name(&attribution)
+            } else {
+                Some(attribution)
+            }
+        });
+        if let Some(attribution) = attribution {
             selector.insert(canonical_key, attribution, "claude_code_attribution_field");
         }
     }
+}
+
+/// Keep at most the same 200 distinct per-session names as Claude's existing
+/// tool-usage contract. Encounter order is the resolved provider-response
+/// order. Once full, later occurrences of retained names keep their selector;
+/// only later unseen names lose the MCP-tool context/source pair.
+fn bound_claude_attribution_mcp_tool_cardinality(
+    selector: &mut SelectorCapture,
+    retained: &mut BTreeSet<String>,
+) {
+    let Some(tool) = selector
+        .context
+        .get(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD)
+        .cloned()
+    else {
+        return;
+    };
+    if retained.contains(&tool) {
+        return;
+    }
+    if retained.len() < MAX_TOOL_USAGE_NAMES {
+        retained.insert(tool);
+        return;
+    }
+    selector.context.remove(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD);
+    selector.sources.remove(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD);
 }
 
 fn detect_claude_gateway_provider(value: &Value) -> Option<String> {
@@ -23926,6 +23971,71 @@ mod tests {
                 .map(String::as_str),
             Some("claude_code_attribution_field")
         );
+        assert_eq!(
+            selector
+                .sources
+                .get("attribution_mcp_tool")
+                .map(String::as_str),
+            Some("claude_code_attribution_field")
+        );
+    }
+
+    #[test]
+    fn claude_attribution_mcp_tool_bounds_match_tool_usage_conventions() {
+        let long_name = "x".repeat(MAX_TOOL_USAGE_NAME_LENGTH + 20);
+        let line = json!({"attributionMcpTool": long_name});
+        let mut truncated = SelectorCapture::default();
+        capture_claude_attribution(&line, &mut truncated, true);
+        assert_eq!(
+            truncated.context[CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD]
+                .chars()
+                .count(),
+            MAX_TOOL_USAGE_NAME_LENGTH
+        );
+
+        let invalid = json!({"attributionMcpTool": "tool/name"});
+        let mut rejected = SelectorCapture::default();
+        capture_claude_attribution(&invalid, &mut rejected, true);
+        assert_eq!(rejected, SelectorCapture::default());
+
+        let mut retained = BTreeSet::new();
+        for index in 0..=MAX_TOOL_USAGE_NAMES {
+            let line = json!({"attributionMcpTool": format!("tool_{index}")});
+            let mut selector = SelectorCapture::default();
+            capture_claude_attribution(&line, &mut selector, true);
+            bound_claude_attribution_mcp_tool_cardinality(&mut selector, &mut retained);
+            if index < MAX_TOOL_USAGE_NAMES {
+                assert!(selector
+                    .context
+                    .contains_key(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD));
+                assert!(selector
+                    .sources
+                    .contains_key(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD));
+            } else {
+                assert!(!selector
+                    .context
+                    .contains_key(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD));
+                assert!(!selector
+                    .sources
+                    .contains_key(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD));
+            }
+        }
+        assert_eq!(retained.len(), MAX_TOOL_USAGE_NAMES);
+
+        let mut repeated = SelectorCapture::default();
+        capture_claude_attribution(
+            &json!({"attributionMcpTool": "tool_0"}),
+            &mut repeated,
+            true,
+        );
+        bound_claude_attribution_mcp_tool_cardinality(&mut repeated, &mut retained);
+        assert_eq!(
+            repeated
+                .context
+                .get(CLAUDE_ATTRIBUTION_MCP_TOOL_FIELD)
+                .map(String::as_str),
+            Some("tool_0")
+        );
     }
 
     #[test]
@@ -23933,6 +24043,7 @@ mod tests {
         let line: Value = serde_json::from_str(concat!(
             "{\"type\":\"assistant\",\"attributionAgent\":\"general-purpose\",",
             "\"attributionMcpServer\":\"claude-in-chrome\",",
+            "\"attributionMcpTool\":\"tabs_context_mcp\",",
             "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}"
         ))
         .expect("parse line");
@@ -23940,8 +24051,9 @@ mod tests {
         let mut selector = SelectorCapture::default();
         capture_claude_attribution(&line, &mut selector, false);
 
-        assert!(
-            selector.is_empty(),
+        assert_eq!(
+            selector,
+            SelectorCapture::default(),
             "attribution must not be captured while the opt-in flag is off"
         );
     }
@@ -23967,25 +24079,21 @@ mod tests {
     }
 
     #[test]
-    fn claude_attribution_contract_allows_four_keys_and_strips_tool() {
-        // First attribution contract: four approved attribution keys cross the
-        // wire inside selector_context. The tool-level marker remains stripped
-        // because it is too high-cardinality for the initial selector split.
+    fn claude_attribution_contract_allows_all_five_keys() {
+        // All five attribution keys cross the wire inside selector_context when
+        // attribution capture is enabled; MCP tool has no separate opt-in.
         for key in [
             "attribution_subagent",
             "attribution_skill",
             "attribution_plugin",
             "attribution_mcp_server",
+            "attribution_mcp_tool",
         ] {
             assert!(
                 SELECTOR_CONTEXT_ALLOWED.contains(&key),
-                "{key} must be on SELECTOR_CONTEXT_ALLOWED for daemon v11"
+                "{key} must be on SELECTOR_CONTEXT_ALLOWED"
             );
         }
-        assert!(
-            !SELECTOR_CONTEXT_ALLOWED.contains(&"attribution_mcp_tool"),
-            "attribution_mcp_tool must stay off SELECTOR_CONTEXT_ALLOWED"
-        );
 
         let mut merged = SelectorCapture::default();
         merged.insert("context_bucket", "long".to_string(), "test");
@@ -24015,7 +24123,8 @@ mod tests {
             "claude_code_attribution_field",
         );
 
-        let (_, reduced_context, _) = build_row_identity("claude-opus-4-8", &merged, None);
+        let (_, reduced_context, reduced_sources) =
+            build_row_identity("claude-opus-4-8", &merged, None);
 
         assert_eq!(
             reduced_context.get("context_bucket").map(String::as_str),
@@ -24043,9 +24152,17 @@ mod tests {
                 .map(String::as_str),
             Some("anthropic-skills")
         );
-        assert!(
-            !reduced_context.contains_key("attribution_mcp_tool"),
-            "attribution_mcp_tool must be stripped from emitted selector_context"
+        assert_eq!(
+            reduced_context
+                .get("attribution_mcp_tool")
+                .map(String::as_str),
+            Some("tabs_context_mcp")
+        );
+        assert_eq!(
+            reduced_sources
+                .get("attribution_mcp_tool")
+                .map(String::as_str),
+            Some("claude_code_attribution_field")
         );
     }
 
@@ -35858,6 +35975,10 @@ mod tests {
                     "attribution_mcp_server".to_string(),
                     "claude-in-chrome".to_string(),
                 ),
+                (
+                    "attribution_mcp_tool".to_string(),
+                    "tabs_context_mcp".to_string(),
+                ),
             ]),
             selector_sources: BTreeMap::from([
                 (
@@ -35882,6 +36003,10 @@ mod tests {
                 ),
                 (
                     "attribution_mcp_server".to_string(),
+                    "claude_code_attribution_field".to_string(),
+                ),
+                (
+                    "attribution_mcp_tool".to_string(),
                     "claude_code_attribution_field".to_string(),
                 ),
             ]),
@@ -36104,6 +36229,7 @@ mod tests {
             ("attribution_skill", "design-sync"),
             ("attribution_plugin", "anthropic-skills"),
             ("attribution_mcp_server", "claude-in-chrome"),
+            ("attribution_mcp_tool", "tabs_context_mcp"),
         ] {
             assert!(
                 !first_row.contains_key(key),
@@ -36115,10 +36241,6 @@ mod tests {
                 "{key} must be carried inside the row's selector_context"
             );
         }
-        assert!(
-            item_value["model_usage"][0]["selector_context"]["attribution_mcp_tool"].is_null(),
-            "attribution_mcp_tool must stay out of the first selector_context contract"
-        );
     }
 
     #[test]
