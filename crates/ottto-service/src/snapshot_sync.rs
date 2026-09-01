@@ -1571,6 +1571,7 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
             &client,
             &device,
             &device_secret,
+            support_dir,
             source,
             &machine_id,
             Some(&cycle_started_at),
@@ -1921,6 +1922,7 @@ fn sync_source(
             client,
             device,
             device_secret,
+            support_dir,
             source,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -1981,6 +1983,7 @@ fn sync_source(
             client,
             device,
             device_secret,
+            support_dir,
             source,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -2195,6 +2198,7 @@ fn sync_source(
                 client,
                 device,
                 device_secret,
+                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -2592,6 +2596,7 @@ fn sync_source(
                 client,
                 device,
                 device_secret,
+                support_dir,
                 source,
                 if scan_result.census_complete {
                     TerminalManifestSource::CompleteCensus(&committable)
@@ -2624,6 +2629,7 @@ fn sync_source(
                 client,
                 device,
                 device_secret,
+                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -2763,6 +2769,7 @@ fn sync_source(
                 client,
                 device,
                 device_secret,
+                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -2864,6 +2871,7 @@ fn sync_source(
             client,
             device,
             device_secret,
+            support_dir,
             source,
             if scan_result.census_complete {
                 TerminalManifestSource::CompleteCensus(&index)
@@ -2889,6 +2897,7 @@ fn sync_source(
         client,
         device,
         device_secret,
+        support_dir,
         source,
         if scan_result.census_complete {
             TerminalManifestSource::CompleteCensus(&index)
@@ -3676,12 +3685,10 @@ fn source_kind(source: SnapshotSource) -> SourceKind {
     }
 }
 
-fn report_status(
-    client: &SnapshotApiClient,
-    relay_token: &str,
+fn collector_status_request(
     destination_namespace: &str,
     status: CollectorStatus<'_>,
-) -> Result<()> {
+) -> Result<SnapshotStatusRequest> {
     let finished_at = current_rfc3339();
     let (
         enabled,
@@ -3772,6 +3779,17 @@ fn report_status(
         parser_version: Some(status.source.parser_version().to_string()),
         manifest,
     };
+    Ok(request)
+}
+
+#[cfg(test)]
+fn report_status(
+    client: &SnapshotApiClient,
+    relay_token: &str,
+    destination_namespace: &str,
+    status: CollectorStatus<'_>,
+) -> Result<()> {
+    let request = collector_status_request(destination_namespace, status)?;
     client.report_status(relay_token, &request)?;
     Ok(())
 }
@@ -3807,10 +3825,63 @@ fn refresh_terminal_manifest(
     Ok(())
 }
 
+fn terminal_status_journal_path(
+    support_dir: &Path,
+    destination_namespace: &str,
+    source: SnapshotSource,
+) -> PathBuf {
+    support_dir
+        .join("snapshots")
+        .join("destinations")
+        .join(destination_namespace)
+        .join(format!("{}-terminal-status-v1.json", source.api_slug()))
+}
+
+fn save_terminal_status_journal(path: &Path, request: &SnapshotStatusRequest) -> Result<()> {
+    if request.last_scan_finished_at.is_none() {
+        return Err(anyhow!("terminal status journal requires a finished scan"));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("create terminal status journal directory")?;
+    }
+    let _lock = SnapshotProgressLock::acquire(path)?;
+    let temp_path = unique_progress_sibling(path, "tmp");
+    let mut file = std::fs::File::create(&temp_path).context("create terminal status journal")?;
+    let result = (|| -> Result<()> {
+        serde_json::to_writer_pretty(&mut file, request)
+            .context("write terminal status journal")?;
+        file.sync_all().context("sync terminal status journal")?;
+        std::fs::rename(&temp_path, path).context("replace terminal status journal")?;
+        sync_progress_parent(path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn load_terminal_status_journal(path: &Path) -> Result<Option<SnapshotStatusRequest>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read terminal status journal"),
+    };
+    let request: SnapshotStatusRequest =
+        serde_json::from_slice(&bytes).context("parse terminal status journal")?;
+    if request.schema_version != SNAPSHOT_STATUS_SCHEMA_VERSION
+        || request.last_scan_started_at.is_none()
+        || request.last_scan_finished_at.is_none()
+    {
+        return Err(anyhow!("terminal status journal is not a terminal receipt"));
+    }
+    Ok(Some(request))
+}
+
 fn report_status_with_fresh_relay_token(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
     device_secret: &str,
+    support_dir: &Path,
     source: SnapshotSource,
     manifest_source: TerminalManifestSource<'_>,
     mut status: CollectorStatus<'_>,
@@ -3833,25 +3904,50 @@ fn report_status_with_fresh_relay_token(
         receipt_window_days,
         manifest_source,
     )?;
-    report_status(client, &relay_token, &destination_namespace, status)
+    let request = collector_status_request(&destination_namespace, status)?;
+    let journal_path = terminal_status_journal_path(support_dir, &destination_namespace, source);
+    // Commit the exact typed receipt before it can reach the backend. A later
+    // cycle-start or heartbeat therefore repeats one coherent scan result
+    // instead of combining a fresh start/default counters with an old error.
+    save_terminal_status_journal(&journal_path, &request)?;
+    client.report_status(&relay_token, &request)?;
+    Ok(())
 }
 
-/// Post a non-terminal collector check-in receipt. `last_scan_finished_at` is
-/// deliberately absent: the backend treats that shape as liveness-only — it
-/// bumps the server-received freshness marker (and the scan-start marker when
-/// one is carried) while preserving the previous terminal report's success
-/// evidence, error state, and counters. Terminal reports stay the source of
-/// truth for scan outcomes; this only says "the collector is alive".
+/// Post a collector liveness receipt without corrupting terminal scan truth.
+/// Once a terminal receipt exists, its exact durable typed body is repeated;
+/// before first contact, the legacy unfinished/zero shape is still sufficient.
+/// A new cycle start is deliberately not spliced into an older terminal result:
+/// that hybrid is what produced started-after-finished rows and zeroed loss
+/// counters beside retained `parse_error` state.
+#[allow(clippy::too_many_arguments)]
 fn report_checkin_status(
     client: &SnapshotApiClient,
     relay_token: &str,
     destination_namespace: &str,
+    support_dir: &Path,
     source: SnapshotSource,
     machine_id: &str,
     scan_started_at: Option<&str>,
     receipt_window_days: u64,
 ) -> Result<()> {
     let receipt_window_days = validated_receipt_window_days(receipt_window_days)?;
+    let journal_path = terminal_status_journal_path(support_dir, destination_namespace, source);
+    if let Some(request) = load_terminal_status_journal(&journal_path)? {
+        if request.source != source.api_slug() || request.machine_id != machine_id {
+            return Err(anyhow!(
+                "terminal status journal authority does not match check-in"
+            ));
+        }
+        if request.last_backfill_window_days != receipt_window_days {
+            // A changed server policy needs a fresh terminal scan. Do not mint
+            // a hybrid row by rewriting only the width or zeroing the prior
+            // scan's counters while retaining its error upstream.
+            return Err(anyhow!("terminal status journal evidence window is stale"));
+        }
+        client.report_status(relay_token, &request)?;
+        return Ok(());
+    }
     let manifest = match cached_source_manifest(destination_namespace, source) {
         Some(manifest)
             if receipt_window_days > 0
@@ -3921,6 +4017,7 @@ fn report_checkin_status_with_fresh_relay_token(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
     device_secret: &str,
+    support_dir: &Path,
     source: SnapshotSource,
     machine_id: &str,
     scan_started_at: Option<&str>,
@@ -3932,6 +4029,7 @@ fn report_checkin_status_with_fresh_relay_token(
         client,
         &relay_token,
         &destination_namespace,
+        support_dir,
         source,
         machine_id,
         scan_started_at,
@@ -3978,12 +4076,14 @@ fn collector_checkin_once() -> Result<()> {
         return Err(anyhow!("registered device has no enabled sources"));
     }
     let client = SnapshotApiClient::new(snapshot_api_base_url());
+    let support_dir = default_support_dir();
     let mut failed_sources = Vec::new();
     for source in enabled_sources {
         if report_checkin_status_with_fresh_relay_token(
             &client,
             &device,
             &device_secret,
+            &support_dir,
             source,
             &machine_id,
             None,
@@ -4441,9 +4541,21 @@ mod tests {
 
     struct SourceManifestTestGuard;
 
+    fn test_terminal_status_support_dir() -> &'static Path {
+        static DIR: OnceLock<PathBuf> = OnceLock::new();
+        DIR.get_or_init(|| {
+            std::env::temp_dir().join(format!(
+                "ottto-terminal-status-tests-{}",
+                std::process::id()
+            ))
+        })
+        .as_path()
+    }
+
     impl SourceManifestTestGuard {
         fn new() -> Self {
             clear_source_manifests_for_test();
+            let _ = std::fs::remove_dir_all(test_terminal_status_support_dir());
             Self
         }
     }
@@ -4451,6 +4563,7 @@ mod tests {
     impl Drop for SourceManifestTestGuard {
         fn drop(&mut self) {
             clear_source_manifests_for_test();
+            let _ = std::fs::remove_dir_all(test_terminal_status_support_dir());
         }
     }
 
@@ -6367,6 +6480,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             None,
@@ -8186,6 +8300,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -8230,6 +8345,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Pi,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -8270,6 +8386,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Pi,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -8290,6 +8407,82 @@ mod tests {
 
     #[test]
     #[serial(source_manifests)]
+    fn checkin_repeats_the_exact_journaled_loss_receipt() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server_with_hints(
+            captured.clone(),
+            vec![30, 30],
+        ));
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let mut counts = SyncCounts::for_policy(30);
+        counts.scan_cap_hit = false;
+        counts.census_complete = true;
+        counts.recognized_usage_drop_count = 1_105;
+        counts.dropped_usage_record_count = 1_105;
+        counts.ownership_incomplete_file_count = 1;
+
+        report_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            test_terminal_status_support_dir(),
+            SnapshotSource::Codex,
+            TerminalManifestSource::Withdraw,
+            CollectorStatus {
+                source: SnapshotSource::Codex,
+                machine_id: "otm_test",
+                scan_started_at: "2026-09-01T07:44:00Z",
+                counts,
+                state: CollectorState::Success,
+            },
+        )
+        .expect("persist and emit terminal loss receipt");
+        report_checkin_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            test_terminal_status_support_dir(),
+            SnapshotSource::Codex,
+            "otm_test",
+            Some("2026-09-01T08:12:28Z"),
+        )
+        .expect("repeat coherent receipt for liveness");
+
+        let requests = captured.lock().expect("captured requests").clone();
+        let terminal = http_request_json(&requests[1]);
+        let checkin = http_request_json(&requests[3]);
+        assert_eq!(
+            checkin, terminal,
+            "emitted check-in must equal journaled terminal scan"
+        );
+        assert_eq!(checkin["last_recognized_usage_drop_count"], 1_105);
+        assert_eq!(checkin["last_dropped_usage_record_count"], 1_105);
+        assert_eq!(checkin["last_ownership_incomplete_file_count"], 1);
+        assert_eq!(checkin["last_error_code"], "parse_error");
+        assert_eq!(checkin["last_scan_started_at"], "2026-09-01T07:44:00Z");
+        assert!(checkin["last_scan_finished_at"].is_string());
+
+        let destination = snapshot_upload_destination_namespace(&device, "device-secret");
+        let journal = load_terminal_status_journal(&terminal_status_journal_path(
+            test_terminal_status_support_dir(),
+            &destination,
+            SnapshotSource::Codex,
+        ))
+        .expect("read journal")
+        .expect("journal exists");
+        assert_eq!(
+            serde_json::to_value(journal).expect("journal JSON"),
+            terminal
+        );
+    }
+
+    #[test]
+    #[serial(source_manifests)]
     fn cycle_start_checkin_posts_in_progress_receipt() {
         let _source_manifests = SourceManifestTestGuard::new();
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -8305,6 +8498,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             Some("2026-06-01T10:00:00Z"),
@@ -8344,6 +8538,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             None,
@@ -8383,6 +8578,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             None,
@@ -8415,6 +8611,7 @@ mod tests {
                 &client,
                 &device,
                 "device-secret",
+                test_terminal_status_support_dir(),
                 SnapshotSource::Codex,
                 "otm_test",
                 scan_started_at,
@@ -8446,6 +8643,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -8496,6 +8694,7 @@ mod tests {
             &client,
             &switched,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             None,
@@ -8576,6 +8775,7 @@ mod tests {
                 &client,
                 &device,
                 "device-secret",
+                test_terminal_status_support_dir(),
                 SnapshotSource::Codex,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8822,6 +9022,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -8865,6 +9066,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             Some("2026-08-30T12:00:00Z"),
@@ -8874,6 +9076,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             None,
@@ -8883,6 +9086,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -8935,6 +9139,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -8951,6 +9156,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             None,
@@ -8969,9 +9175,7 @@ mod tests {
         assert!(terminal.get("manifest").is_none());
 
         let heartbeat = http_request_json(&requests[3]);
-        assert_eq!(heartbeat["last_backfill_window_days"], 0);
-        assert!(heartbeat["last_scan_finished_at"].is_null());
-        assert!(heartbeat.get("manifest").is_none());
+        assert_eq!(heartbeat, terminal);
     }
 
     #[test]
@@ -9042,6 +9246,7 @@ mod tests {
                     &client,
                     &device,
                     "device-secret",
+                    test_terminal_status_support_dir(),
                     SnapshotSource::Codex,
                     if publishes_manifest {
                         TerminalManifestSource::CompleteCensus(&index)

@@ -918,7 +918,7 @@ fn validate_snapshot_entity_ref(reference: &SnapshotEntityRef) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotStatusRequest {
     pub schema_version: u16,
     pub source: String,
@@ -2428,8 +2428,8 @@ mod tests {
             collector_version: Some("0.1.0".to_string()),
             parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
             manifest: Some(SnapshotSourceManifest {
-                contract_version: crate::snapshots::SNAPSHOT_MANIFEST_CONTRACT_VERSION,
-                scope: crate::snapshots::SNAPSHOT_MANIFEST_SCOPE,
+                contract_version: crate::snapshots::SNAPSHOT_MANIFEST_CONTRACT_VERSION.to_string(),
+                scope: crate::snapshots::SNAPSHOT_MANIFEST_SCOPE.to_string(),
                 source: "codex".to_string(),
                 window_start: "2026-01-01T00:00:00Z".to_string(),
                 window_end: "2026-07-03T00:00:00Z".to_string(),
@@ -2489,8 +2489,8 @@ mod tests {
             collector_version: Some("0.1.120".to_string()),
             parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
             manifest: Some(SnapshotSourceManifest {
-                contract_version: crate::snapshots::SNAPSHOT_MANIFEST_CONTRACT_VERSION,
-                scope: crate::snapshots::SNAPSHOT_MANIFEST_SCOPE,
+                contract_version: crate::snapshots::SNAPSHOT_MANIFEST_CONTRACT_VERSION.to_string(),
+                scope: crate::snapshots::SNAPSHOT_MANIFEST_SCOPE.to_string(),
                 source: "codex".to_string(),
                 window_start: window_start
                     .format(&time::format_description::well_known::Rfc3339)
