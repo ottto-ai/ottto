@@ -1,0 +1,49 @@
+{
+  "contract": "claude_authority_demotion_cohort:v1",
+  "observed_at": "2026-08-30T18:48:08Z",
+  "source": "claude_code",
+  "root_session_id_sha256": "fcc51877eceb2e829e98e40c59e3a5b70823c1ea5adc4b1d061424ded8d389a8",
+  "retained_collector_version": "0.1.116",
+  "rejected_collector_version": "0.1.120",
+  "rejected_parser_version": "claude_code_jsonl:v33",
+  "rejected_scan_identity_version": "claude_code_jsonl:v27",
+  "reject_reason": "usage_accounting_authority_downgrade",
+  "backfill_sequence_range": [301022, 301028],
+  "members": [
+    {
+      "family_role": "root",
+      "source_session_id_sha256": "fcc51877eceb2e829e98e40c59e3a5b70823c1ea5adc4b1d061424ded8d389a8",
+      "rejected_snapshot_fingerprint": "0ab4ce6fc97b42995ddaf49e535d8af0c06b502de91570094c995e5af7430cbd"
+    },
+    {
+      "family_role": "subagent",
+      "source_session_id_sha256": "652c263df434b530fcb7124e33736f4183b668d5de40dce3d2415889584e7e05",
+      "rejected_snapshot_fingerprint": "0a1a90ad4394d3cd85c0063f158b29379b4e5658a8fc7a6ed3b200e30b536c43"
+    },
+    {
+      "family_role": "subagent",
+      "source_session_id_sha256": "a36720a922a7ab9528b4ed1cc210564760108bdf06d587d7ea9ba366f1ded273",
+      "rejected_snapshot_fingerprint": "57e86358862b4d4f0340a53627358e4eafa948b42db99675fdb8413a99a84e97"
+    },
+    {
+      "family_role": "subagent",
+      "source_session_id_sha256": "83d8502a66b1313fe6137f067b5448b5444694927a68f15ec374468eaa413d5e",
+      "rejected_snapshot_fingerprint": "5ad02a84cc363c43e972014bb00851c9e9418fe6bffab8312035a74c0fa83b40"
+    },
+    {
+      "family_role": "subagent",
+      "source_session_id_sha256": "e94057cec5aff78fd44edb6988d97add2ed23d89e26d46e9947484871adc5c8a",
+      "rejected_snapshot_fingerprint": "515a30d36aa1387758f1fe3a098d0be34bdcfd91b1d179b3afd2b031c191df16"
+    },
+    {
+      "family_role": "subagent",
+      "source_session_id_sha256": "591e21caa16aa55045174e9f3e65fc385900b5f55224413218ce414233da709f",
+      "rejected_snapshot_fingerprint": "06688a1865ff03e0720b1bdc66fe8ccd9593dacfe31e1a08adedb1889c4cced7"
+    },
+    {
+      "family_role": "subagent",
+      "source_session_id_sha256": "dedd477333c89c38a83a883e2708c903ec66cff81e12f9da5a142aaaebd3595d",
+      "rejected_snapshot_fingerprint": "efbf7a8a6a81fd5ba5f19856aba1fd60153b02ad2c37eca5ed973e88a8f9d9f1"
+    }
+  ]
+}
