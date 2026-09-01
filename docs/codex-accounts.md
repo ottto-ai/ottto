@@ -21,6 +21,26 @@ setup blockers. A membership without both hashes remains visible as
 Clients pass the opaque id back through `codex_account_prepare_target` and do
 not send identity hashes selected or reconstructed from UI state.
 
+OpenAI has two unrelated workspace namespaces, and only one of them carries
+subscriptions. `platform.openai.com` organizations govern API keys and are what
+the ID token's `organizations[]` claim lists. `chatgpt.com` workspaces carry
+ChatGPT and Codex subscriptions, and the signed-in one is `chatgpt_account_id`.
+The id spaces differ even where the names match: a target built from an
+`organizations[].id` is rejected with `identity_mismatch` when the same-named
+ChatGPT workspace is signed into, and a platform organization can be absent from
+the ChatGPT workspace picker entirely.
+
+Target coverage therefore describes only workspaces the daemon can prove: the
+signed-in one, and any already-connected durable ones. Other ChatGPT workspaces
+are **not enumerable** — the ID token names only the signed-in workspace, and
+`account/read` returns type, email, and plan with no workspace list. Connecting a
+different workspace is an unbound flow whose selection is made in the provider's
+own picker, not a pick from a list this daemon invented.
+
+The default organization's TITLE is still used to name the signed-in workspace,
+and its hash is aliased onto the binding so one workspace does not render twice.
+That is naming only; the binding hash remains the identity.
+
 One workspace is named two ways by the provider: a credential is bound by
 `chatgpt_account_id`, which is what a durable slot registers, while the same
 credential's ID token lists `organizations[].id`. Those are different identifier
