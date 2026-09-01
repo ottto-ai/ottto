@@ -35,6 +35,7 @@ mod collector_version_tests {
 
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 6;
 pub const SNAPSHOT_ENTITY_ACK_CONTRACT: &str = "snapshot_entity_ack:v1";
+pub const SNAPSHOT_HEAD_CAS_CONTRACT: &str = "snapshot_head_etag:v1";
 // SnapshotStatusRequest endpoint stayed at v5; only the batch endpoint
 // cut over to v6 in this change. Backend's AgentSessionSnapshotStatusRequest
 // is still Literal[5] (backend/app/schemas/agent_session_snapshots.py).
@@ -1179,6 +1180,12 @@ pub struct SnapshotSemanticEnvelope {
     /// The epoch `content_hash` was computed at. Present on every item so the
     /// server never has to guess which projection produced a hash.
     pub hash_epoch: u16,
+    /// Opaque predecessor authorization returned only after the backend proved
+    /// these exact bytes own the current head. Legacy reconciliation never
+    /// borrows a settled sibling's token: an absent token is an explicit CAS
+    /// bootstrap that admits only an exact repeat or a genuinely missing head.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_head_etag: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1188,41 +1195,76 @@ struct SnapshotItemWire<'a> {
     semantic_envelope: SnapshotSemanticEnvelope,
 }
 
+/// Normal batch wire with optional optimistic-head enforcement. Reconciliation
+/// uses the same write endpoint and entity ACKs as every upload; this wrapper
+/// only activates the backend's existing CAS discipline for an isolated legacy
+/// page.
+pub(crate) struct SnapshotBatchWireRequest<'a> {
+    request: &'a SnapshotBatchRequest,
+    enforce_head_cas: bool,
+}
+
+impl SnapshotBatchRequest {
+    pub(crate) fn wire_with_head_cas(&self) -> SnapshotBatchWireRequest<'_> {
+        SnapshotBatchWireRequest {
+            request: self,
+            enforce_head_cas: true,
+        }
+    }
+}
+
+fn serialize_snapshot_batch<S: Serializer>(
+    request: &SnapshotBatchRequest,
+    enforce_head_cas: bool,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let source = snapshot_source_from_api_slug(&request.source)
+        .ok_or_else(|| serde::ser::Error::custom("unsupported snapshot source"))?;
+    let snapshots = request
+        .snapshots
+        .iter()
+        .map(|snapshot| {
+            let semantic_envelope =
+                snapshot_semantic_envelope(source, snapshot, request.upload_policy);
+            let encoded =
+                serde_json::to_vec(&semantic_envelope).map_err(serde::ser::Error::custom)?;
+            if encoded.len() > MAX_SEMANTIC_ENVELOPE_BYTES {
+                return Err(serde::ser::Error::custom(format!(
+                    "semantic_envelope exceeds {MAX_SEMANTIC_ENVELOPE_BYTES} bytes"
+                )));
+            }
+            Ok(SnapshotItemWire {
+                snapshot,
+                semantic_envelope,
+            })
+        })
+        .collect::<Result<Vec<_>, S::Error>>()?;
+    let mut state = serializer.serialize_struct("SnapshotBatchRequest", 8)?;
+    state.serialize_field("schema_version", &request.schema_version)?;
+    state.serialize_field("source", &request.source)?;
+    state.serialize_field("machine_id", &request.machine_id)?;
+    state.serialize_field("collector_version", &request.collector_version)?;
+    // Daemon-first capability declaration. Older backends use a
+    // forward-tolerant ingest model and ignore it; capable backends echo it
+    // and may return a complete per-entity outcome partition.
+    state.serialize_field("entity_ack_contract", SNAPSHOT_ENTITY_ACK_CONTRACT)?;
+    if enforce_head_cas {
+        state.serialize_field("head_cas_contract", SNAPSHOT_HEAD_CAS_CONTRACT)?;
+    }
+    state.serialize_field("snapshots", &snapshots)?;
+    state.serialize_field("client_report", &request.client_report)?;
+    state.end()
+}
+
 impl Serialize for SnapshotBatchRequest {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let source = snapshot_source_from_api_slug(&self.source)
-            .ok_or_else(|| serde::ser::Error::custom("unsupported snapshot source"))?;
-        let snapshots = self
-            .snapshots
-            .iter()
-            .map(|snapshot| {
-                let semantic_envelope =
-                    snapshot_semantic_envelope(source, snapshot, self.upload_policy);
-                let encoded =
-                    serde_json::to_vec(&semantic_envelope).map_err(serde::ser::Error::custom)?;
-                if encoded.len() > MAX_SEMANTIC_ENVELOPE_BYTES {
-                    return Err(serde::ser::Error::custom(format!(
-                        "semantic_envelope exceeds {MAX_SEMANTIC_ENVELOPE_BYTES} bytes"
-                    )));
-                }
-                Ok(SnapshotItemWire {
-                    snapshot,
-                    semantic_envelope,
-                })
-            })
-            .collect::<Result<Vec<_>, S::Error>>()?;
-        let mut state = serializer.serialize_struct("SnapshotBatchRequest", 7)?;
-        state.serialize_field("schema_version", &self.schema_version)?;
-        state.serialize_field("source", &self.source)?;
-        state.serialize_field("machine_id", &self.machine_id)?;
-        state.serialize_field("collector_version", &self.collector_version)?;
-        // Daemon-first capability declaration. Older backends use a
-        // forward-tolerant ingest model and ignore it; capable backends echo it
-        // and may return a complete per-entity outcome partition.
-        state.serialize_field("entity_ack_contract", SNAPSHOT_ENTITY_ACK_CONTRACT)?;
-        state.serialize_field("snapshots", &snapshots)?;
-        state.serialize_field("client_report", &self.client_report)?;
-        state.end()
+        serialize_snapshot_batch(self, false, serializer)
+    }
+}
+
+impl Serialize for SnapshotBatchWireRequest<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_snapshot_batch(self.request, self.enforce_head_cas, serializer)
     }
 }
 
@@ -5388,6 +5430,7 @@ pub(crate) fn snapshot_semantic_envelope(
         revision_v2_hash: snapshot_revision_v2_hash(source, item, upload_policy, &component_hashes),
         content_hash: snapshot_content_hash(source, &item.source_session_id, &component_hashes),
         hash_epoch: SNAPSHOT_CONTENT_HASH_EPOCH,
+        base_head_etag: None,
         component_hashes,
     }
 }
@@ -32273,6 +32316,8 @@ mod tests {
                     occurrence_count: 1,
                     body_witness_version: version,
                     body_witness_digest: digest,
+                    head_etag: None,
+                    head_challenge: None,
                 }],
                 unchanged_entities: Vec::new(),
                 rejected_entities: Vec::new(),
@@ -39474,6 +39519,28 @@ mod tests {
         assert_eq!(content_hash.len(), 64);
         assert!(content_hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(envelope["hash_epoch"], SNAPSHOT_CONTENT_HASH_EPOCH);
+    }
+
+    #[test]
+    fn legacy_reconcile_wire_uses_explicit_head_cas_bootstrap_without_a_sibling_token() {
+        let request = valid_v6_batch_request();
+        let ordinary = serde_json::to_value(&request).expect("serialize ordinary batch");
+        let reconcile = serde_json::to_value(request.wire_with_head_cas())
+            .expect("serialize normal CAS-fenced reconciliation batch");
+
+        assert!(ordinary.get("head_cas_contract").is_none());
+        assert_eq!(
+            reconcile["head_cas_contract"],
+            json!(SNAPSHOT_HEAD_CAS_CONTRACT)
+        );
+        let envelope = &reconcile["snapshots"][0]["semantic_envelope"];
+        assert!(
+            envelope.get("base_head_etag").is_none(),
+            "a pre-head-token legacy index must bootstrap instead of borrowing the settled sibling's etag"
+        );
+        assert!(envelope.get("conflict_head_challenge").is_none());
+        assert!(envelope.get("rescan_from_revision_hash").is_none());
+        assert!(envelope.get("forced_full_rescan").is_none());
     }
 
     #[test]

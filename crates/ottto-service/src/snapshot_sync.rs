@@ -2412,13 +2412,14 @@ fn sync_source(
     let deferred_local_authority_count = index.claude_usage_authority_pending_count();
 
     let mut accepted = 0;
-    let upload_result = upload_resumable_batches_with_body_witness(
+    let upload_result = upload_resumable_batches_with_body_witness_partitioned(
         &scan_result.snapshots,
         source.api_slug(),
         &mut upload_progress,
         &mut accepted,
         |snapshot| snapshot.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
+        |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
         |snapshots| {
             // A first Codex/Claude scan can spend several minutes parsing local
             // history and retroactive backfill before the first upload. Relay
@@ -2437,20 +2438,30 @@ fn sync_source(
                 upload_policy,
                 client_report: client_report.report().clone(),
             };
+            let reconcile_class = request.snapshots.iter().all(|snapshot| {
+                legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
+            });
+            debug_assert!(
+                reconcile_class
+                    || request.snapshots.iter().all(|snapshot| {
+                        !legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
+                    }),
+                "legacy reconciliation must stay isolated at a batch boundary"
+            );
             if let Err(reason) = validate_snapshot_batch_request(&request) {
                 return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
                     reason,
                 }));
             }
             let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
-            let response = client.upload_batch(&upload_relay_token, &request)?;
-            response.validate_entity_ack(&request)?;
+            let response = client.upload_batch(&upload_relay_token, &request, reconcile_class)?;
+            response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
             let request_fingerprints = request
                 .snapshots
                 .iter()
                 .map(|snapshot| snapshot.snapshot_fingerprint.clone())
                 .collect::<BTreeSet<_>>();
-            require_existing_entity_ack_for_legacy_reconciliation(
+            require_normal_write_ack_for_legacy_reconciliation(
                 &response,
                 &request_fingerprints,
                 &legacy_reconciliation_pending,
@@ -3059,7 +3070,15 @@ impl std::fmt::Display for SnapshotBatchResponseRejected {
 
 impl std::error::Error for SnapshotBatchResponseRejected {}
 
-fn require_existing_entity_ack_for_legacy_reconciliation(
+/// Legacy ambiguity is resolved by the normal upload/quarantine machine. The
+/// deployed handler's exact-repeat contract is deliberately truthful: it
+/// commits the source-freshness acceptance UPSERT, but skips the
+/// bronze snapshot, payload, reconciliation revision, accepted-log sequence,
+/// archive occurrence, and entity-head writes. Consequently an exact repeat
+/// has zero census-membership delta. A genuinely missing head creates exactly
+/// one new/updated census member; a divergent body is fenced by head CAS and
+/// remains quarantined with zero census delta until an explicit resolution.
+fn require_normal_write_ack_for_legacy_reconciliation(
     response: &crate::snapshot_client::SnapshotBatchResponse,
     request_fingerprints: &BTreeSet<String>,
     legacy_pending: &BTreeSet<String>,
@@ -3198,6 +3217,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn upload_resumable_batches_with_body_witness<T, Fingerprint, BodyWitness, Upload, Persist>(
     items: &[T],
     poison_scope: &str,
@@ -3205,6 +3225,45 @@ fn upload_resumable_batches_with_body_witness<T, Fingerprint, BodyWitness, Uploa
     accepted: &mut u64,
     fingerprint: Fingerprint,
     body_witness: BodyWitness,
+    upload: Upload,
+    persist: Persist,
+) -> Result<ResumableUploadResult>
+where
+    T: Clone + Serialize,
+    Fingerprint: Fn(&T) -> &str,
+    BodyWitness: Fn(&T) -> String,
+    Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
+{
+    upload_resumable_batches_with_body_witness_partitioned(
+        items,
+        poison_scope,
+        progress,
+        accepted,
+        fingerprint,
+        body_witness,
+        |_| false,
+        upload,
+        persist,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upload_resumable_batches_with_body_witness_partitioned<
+    T,
+    Fingerprint,
+    BodyWitness,
+    BatchClass,
+    Upload,
+    Persist,
+>(
+    items: &[T],
+    poison_scope: &str,
+    progress: &mut SnapshotUploadProgress,
+    accepted: &mut u64,
+    fingerprint: Fingerprint,
+    body_witness: BodyWitness,
+    batch_class: BatchClass,
     mut upload: Upload,
     mut persist: Persist,
 ) -> Result<ResumableUploadResult>
@@ -3212,6 +3271,7 @@ where
     T: Clone + Serialize,
     Fingerprint: Fn(&T) -> &str,
     BodyWitness: Fn(&T) -> String,
+    BatchClass: Fn(&T) -> bool,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
@@ -3283,15 +3343,19 @@ where
     let mut batches = VecDeque::new();
     let mut batch = Vec::new();
     let mut batch_bytes = 2usize;
+    let mut current_batch_class = None;
     for (index, body, _) in pending_by_fingerprint.into_values() {
         let item_bytes = body.len().saturating_add(1);
+        let item_batch_class = batch_class(&items[index]);
         if !batch.is_empty()
             && (batch.len() == SNAPSHOT_BATCH_LIMIT
-                || batch_bytes.saturating_add(item_bytes) > SNAPSHOT_BATCH_MAX_BYTES)
+                || batch_bytes.saturating_add(item_bytes) > SNAPSHOT_BATCH_MAX_BYTES
+                || current_batch_class != Some(item_batch_class))
         {
             batches.push_back((std::mem::take(&mut batch), false));
             batch_bytes = 2;
         }
+        current_batch_class = Some(item_batch_class);
         batch.push(index);
         batch_bytes = batch_bytes.saturating_add(item_bytes);
     }
@@ -4673,6 +4737,8 @@ mod tests {
                         occurrence_count: 1,
                         body_witness_version: None,
                         body_witness_digest: None,
+                        head_etag: None,
+                        head_challenge: None,
                     }],
                 })
             },
@@ -4915,6 +4981,8 @@ mod tests {
             occurrence_count: 1,
             body_witness_version: None,
             body_witness_digest: None,
+            head_etag: None,
+            head_challenge: None,
         }
     }
 
@@ -5039,6 +5107,8 @@ mod tests {
                         occurrence_count: 1,
                         body_witness_version: None,
                         body_witness_digest: None,
+                        head_etag: None,
+                        head_challenge: None,
                     }],
                     unchanged_entities: Vec::new(),
                     rejected_entities: vec![crate::snapshot_client::SnapshotEntityRejection {
@@ -7243,6 +7313,72 @@ mod tests {
     }
 
     #[test]
+    fn divergent_legacy_reconcile_is_batch_isolated_and_lands_in_bounded_quarantine() {
+        let ordinary = "a".repeat(64);
+        let divergent_reconcile = "b".repeat(64);
+        let reconcile_class = BTreeSet::from([divergent_reconcile.clone()]);
+        let mut progress = test_upload_progress();
+        progress.quarantine([divergent_reconcile.as_str()]);
+        progress
+            .quarantined_fingerprints
+            .get_mut(&divergent_reconcile)
+            .expect("legacy retry is armed")
+            .retry_after_unix_seconds = 0;
+        assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
+
+        let mut accepted = 0;
+        let mut observed_classes = Vec::new();
+        let result = upload_resumable_batches_with_body_witness_partitioned(
+            &[ordinary.clone(), divergent_reconcile.clone()],
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |item| item.clone(),
+            |item| reconcile_class.contains(item),
+            |batch| {
+                let is_reconcile = batch
+                    .iter()
+                    .all(|fingerprint| reconcile_class.contains(fingerprint));
+                assert!(
+                    is_reconcile
+                        || batch
+                            .iter()
+                            .all(|fingerprint| !reconcile_class.contains(fingerprint)),
+                    "ordinary and CAS-bootstrap reconciliation must never share one request"
+                );
+                observed_classes.push(is_reconcile);
+                if is_reconcile {
+                    let mut response = entity_ack_batch(&[], &[], &batch);
+                    for entity in &mut response.conflict_entities {
+                        entity.head_challenge = Some("c".repeat(64));
+                    }
+                    Ok(response)
+                } else {
+                    Ok(entity_ack_batch(&batch, &[], &[]))
+                }
+            },
+            |_| Ok(()),
+        )
+        .expect("a normal entity conflict is a closed-machine result");
+
+        assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
+        assert_eq!(observed_classes, vec![false, true]);
+        assert_eq!(accepted, 1);
+        assert!(progress.accepted_fingerprints.contains(&ordinary));
+        let quarantined = progress
+            .quarantined_fingerprints
+            .get(&divergent_reconcile)
+            .expect("divergent reconcile remains quarantined");
+        assert_eq!(
+            quarantined.disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        assert_eq!(quarantined.failed_reconstruction_count, 2);
+        assert!(quarantined.retry_after_unix_seconds > current_unix_seconds());
+    }
+
+    #[test]
     fn durable_ack_dominates_stale_index_quarantine_after_restart() {
         let fingerprint = "c".repeat(64);
         let mut index_quarantine = BTreeMap::new();
@@ -7329,7 +7465,7 @@ mod tests {
 
         let mut disabled = accepted_batch(0);
         disabled.disabled = true;
-        assert!(require_existing_entity_ack_for_legacy_reconciliation(
+        assert!(require_normal_write_ack_for_legacy_reconciliation(
             &disabled,
             &request_fingerprints,
             &legacy_pending,
@@ -7337,7 +7473,7 @@ mod tests {
         .is_err());
 
         let missing_contract = accepted_batch(1);
-        assert!(require_existing_entity_ack_for_legacy_reconciliation(
+        assert!(require_normal_write_ack_for_legacy_reconciliation(
             &missing_contract,
             &request_fingerprints,
             &legacy_pending,
@@ -7361,7 +7497,7 @@ mod tests {
                 fingerprint.as_str(),
             )))
             .expect("exact fingerprint-bound entity ACK");
-        require_existing_entity_ack_for_legacy_reconciliation(
+        require_normal_write_ack_for_legacy_reconciliation(
             &exact,
             &request_fingerprints,
             &legacy_pending,
