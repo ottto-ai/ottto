@@ -1571,7 +1571,6 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
             &client,
             &device,
             &device_secret,
-            support_dir,
             source,
             &machine_id,
             Some(&cycle_started_at),
@@ -3860,6 +3859,7 @@ fn save_terminal_status_journal(path: &Path, request: &SnapshotStatusRequest) ->
     result
 }
 
+#[cfg(test)]
 fn load_terminal_status_journal(path: &Path) -> Result<Option<SnapshotStatusRequest>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -3914,40 +3914,29 @@ fn report_status_with_fresh_relay_token(
     Ok(())
 }
 
-/// Post a collector liveness receipt without corrupting terminal scan truth.
-/// Once a terminal receipt exists, its exact durable typed body is repeated;
-/// before first contact, the legacy unfinished/zero shape is still sufficient.
-/// A new cycle start is deliberately not spliced into an older terminal result:
-/// that hybrid is what produced started-after-finished rows and zeroed loss
-/// counters beside retained `parse_error` state.
-#[allow(clippy::too_many_arguments)]
+/// Post a non-terminal collector check-in receipt. `last_scan_finished_at` is
+/// deliberately absent: the backend treats that shape as liveness-only — it
+/// bumps the server-received freshness marker (and the scan-start marker when
+/// one is carried) while preserving the previous terminal report's success
+/// evidence, error state, and counters. Terminal reports stay the source of
+/// truth for scan outcomes; this only says "the collector is alive".
+///
+/// This body must stay byte-identical to the shape the backend classifies as a
+/// check-in (`last_scan_finished_at is None && enabled && last_error_code is
+/// None && next_retry_at is None && consecutive_failures == 0`). Replaying a
+/// journaled terminal receipt here would silently retire check-in receipts,
+/// make the cycle-start in-progress marker dead code, and flip manifest
+/// preservation to invalidation on every heartbeat while an error is retained.
 fn report_checkin_status(
     client: &SnapshotApiClient,
     relay_token: &str,
     destination_namespace: &str,
-    support_dir: &Path,
     source: SnapshotSource,
     machine_id: &str,
     scan_started_at: Option<&str>,
     receipt_window_days: u64,
 ) -> Result<()> {
     let receipt_window_days = validated_receipt_window_days(receipt_window_days)?;
-    let journal_path = terminal_status_journal_path(support_dir, destination_namespace, source);
-    if let Some(request) = load_terminal_status_journal(&journal_path)? {
-        if request.source != source.api_slug() || request.machine_id != machine_id {
-            return Err(anyhow!(
-                "terminal status journal authority does not match check-in"
-            ));
-        }
-        if request.last_backfill_window_days != receipt_window_days {
-            // A changed server policy needs a fresh terminal scan. Do not mint
-            // a hybrid row by rewriting only the width or zeroing the prior
-            // scan's counters while retaining its error upstream.
-            return Err(anyhow!("terminal status journal evidence window is stale"));
-        }
-        client.report_status(relay_token, &request)?;
-        return Ok(());
-    }
     let manifest = match cached_source_manifest(destination_namespace, source) {
         Some(manifest)
             if receipt_window_days > 0
@@ -4017,7 +4006,6 @@ fn report_checkin_status_with_fresh_relay_token(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
     device_secret: &str,
-    support_dir: &Path,
     source: SnapshotSource,
     machine_id: &str,
     scan_started_at: Option<&str>,
@@ -4029,7 +4017,6 @@ fn report_checkin_status_with_fresh_relay_token(
         client,
         &relay_token,
         &destination_namespace,
-        support_dir,
         source,
         machine_id,
         scan_started_at,
@@ -4076,14 +4063,12 @@ fn collector_checkin_once() -> Result<()> {
         return Err(anyhow!("registered device has no enabled sources"));
     }
     let client = SnapshotApiClient::new(snapshot_api_base_url());
-    let support_dir = default_support_dir();
     let mut failed_sources = Vec::new();
     for source in enabled_sources {
         if report_checkin_status_with_fresh_relay_token(
             &client,
             &device,
             &device_secret,
-            &support_dir,
             source,
             &machine_id,
             None,
@@ -6480,7 +6465,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             None,
@@ -8407,7 +8391,7 @@ mod tests {
 
     #[test]
     #[serial(source_manifests)]
-    fn checkin_repeats_the_exact_journaled_loss_receipt() {
+    fn terminal_receipt_is_journaled_before_post_and_liveness_stays_liveness() {
         let _source_manifests = SourceManifestTestGuard::new();
         let captured = Arc::new(Mutex::new(Vec::new()));
         let client = SnapshotApiClient::new(snapshot_status_server_with_hints(
@@ -8446,27 +8430,24 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             Some("2026-09-01T08:12:28Z"),
         )
-        .expect("repeat coherent receipt for liveness");
+        .expect("post a liveness receipt");
 
         let requests = captured.lock().expect("captured requests").clone();
         let terminal = http_request_json(&requests[1]);
-        let checkin = http_request_json(&requests[3]);
-        assert_eq!(
-            checkin, terminal,
-            "emitted check-in must equal journaled terminal scan"
-        );
-        assert_eq!(checkin["last_recognized_usage_drop_count"], 1_105);
-        assert_eq!(checkin["last_dropped_usage_record_count"], 1_105);
-        assert_eq!(checkin["last_ownership_incomplete_file_count"], 1);
-        assert_eq!(checkin["last_error_code"], "parse_error");
-        assert_eq!(checkin["last_scan_started_at"], "2026-09-01T07:44:00Z");
-        assert!(checkin["last_scan_finished_at"].is_string());
+        assert_eq!(terminal["last_recognized_usage_drop_count"], 1_105);
+        assert_eq!(terminal["last_dropped_usage_record_count"], 1_105);
+        assert_eq!(terminal["last_ownership_incomplete_file_count"], 1);
+        assert_eq!(terminal["last_error_code"], "parse_error");
+        assert_eq!(terminal["last_scan_started_at"], "2026-09-01T07:44:00Z");
+        assert!(terminal["last_scan_finished_at"].is_string());
 
+        // The durable journal holds exactly the body that was committed before
+        // the POST: one coherent scan result - timestamps, counters, cap state
+        // and error all from the same `SourceScanResult`.
         let destination = snapshot_upload_destination_namespace(&device, "device-secret");
         let journal = load_terminal_status_journal(&terminal_status_journal_path(
             test_terminal_status_support_dir(),
@@ -8479,6 +8460,22 @@ mod tests {
             serde_json::to_value(journal).expect("journal JSON"),
             terminal
         );
+
+        // The liveness beat that follows it is NOT the terminal body. Its wire
+        // shape is exactly what the backend classifies as a check-in receipt,
+        // so the terminal report stays the single source of scan truth.
+        let checkin = http_request_json(&requests[3]);
+        assert_ne!(checkin, terminal);
+        assert!(checkin["last_scan_finished_at"].is_null());
+        assert!(checkin["last_error_code"].is_null());
+        assert!(checkin["last_error_message"].is_null());
+        assert!(checkin["next_retry_at"].is_null());
+        assert_eq!(checkin["enabled"], true);
+        assert_eq!(checkin["consecutive_failures"], 0);
+        assert_eq!(checkin["last_scan_cap_hit"], false);
+        assert_eq!(checkin["last_scan_started_at"], "2026-09-01T08:12:28Z");
+        assert_eq!(checkin["last_recognized_usage_drop_count"], 0);
+        assert_eq!(checkin["last_dropped_usage_record_count"], 0);
     }
 
     #[test]
@@ -8498,7 +8495,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             Some("2026-06-01T10:00:00Z"),
@@ -8538,7 +8534,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             None,
@@ -8578,7 +8573,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             None,
@@ -8611,7 +8605,6 @@ mod tests {
                 &client,
                 &device,
                 "device-secret",
-                test_terminal_status_support_dir(),
                 SnapshotSource::Codex,
                 "otm_test",
                 scan_started_at,
@@ -8694,7 +8687,6 @@ mod tests {
             &client,
             &switched,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             None,
@@ -9066,7 +9058,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             Some("2026-08-30T12:00:00Z"),
@@ -9076,7 +9067,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             None,
@@ -9156,7 +9146,6 @@ mod tests {
             &client,
             &device,
             "device-secret",
-            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             None,
@@ -9175,7 +9164,9 @@ mod tests {
         assert!(terminal.get("manifest").is_none());
 
         let heartbeat = http_request_json(&requests[3]);
-        assert_eq!(heartbeat, terminal);
+        assert_eq!(heartbeat["last_backfill_window_days"], 0);
+        assert!(heartbeat["last_scan_finished_at"].is_null());
+        assert!(heartbeat.get("manifest").is_none());
     }
 
     #[test]

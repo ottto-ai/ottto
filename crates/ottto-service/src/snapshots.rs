@@ -9954,6 +9954,16 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
             .unwrap_or_else(|| index.candidate_decision(&candidate));
         if source == SnapshotSource::Codex
             && decision == CandidateDecision::Skip
+            // A terminal disposition at this exact file fingerprint and parser
+            // generation means the previous traversal already parsed this
+            // object to completion and disclosed its loss. Parsing is
+            // deterministic over unchanged bytes, so a reparse would rebuild
+            // the same lossy ledger, be rejected again, and re-arm this
+            // override forever - an unbounded full reread of a multi-hundred-MB
+            // parent every cycle. The child stays fail-closed on the missing
+            // prefix evidence; only a new fingerprint or generation re-opens
+            // the file (`candidate_decision`, `terminal_jsonl_loss`).
+            && index.terminal_jsonl_loss(&candidate).is_none()
             && codex_session_id_candidates_from_path(&candidate.path)
                 .iter()
                 .any(|session_id| {
@@ -22533,16 +22543,24 @@ mod tests {
     }
 
     #[test]
-    fn retryable_lossy_line_classes_quarantine_the_whole_file_entity() {
+    fn every_lossy_line_class_is_quarantined_or_terminally_disclosed() {
         let session = "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n";
         let usage = "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n";
-        let cases = ["invalid-utf8", "recognized-drop"];
+        // `over-line-cap` stays in this case list deliberately. It is no longer
+        // retryable-quarantined - it is terminal-with-disclosed-loss - so it is
+        // asserted here against its new contract instead of being deleted.
+        let cases = ["invalid-utf8", "over-line-cap", "recognized-drop"];
         for case in cases {
             let root = temp_dir(case);
             let path = root.join("session.jsonl");
             let mut bytes = format!("{session}{usage}").into_bytes();
             match case {
                 "invalid-utf8" => bytes.extend_from_slice(&[0xff, b'\n']),
+                "over-line-cap" => {
+                    bytes.extend_from_slice(b"{\"ignored\":\"");
+                    bytes.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
+                    bytes.extend_from_slice(b"\"}\n");
+                }
                 "recognized-drop" => bytes.extend_from_slice(
                     b"{\"type\":\"message_end\",\"message\":{\"usage\":{\"input\":\"invalid\"}}}\n",
                 ),
@@ -22560,14 +22578,101 @@ mod tests {
                 true,
             )
             .expect("lossy file is isolated");
-            assert!(!scan.census_complete, "{case}");
-            assert!(scan.snapshots.is_empty(), "{case}");
-            assert!(index.files.is_empty(), "{case}");
             match case {
-                "invalid-utf8" => assert_eq!(scan.invalid_utf8_line_count, 1),
-                "recognized-drop" => assert_eq!(scan.recognized_usage_drop_count, 1),
+                "invalid-utf8" => {
+                    assert!(!scan.census_complete, "{case}");
+                    assert!(scan.snapshots.is_empty(), "{case}");
+                    assert!(index.files.is_empty(), "{case}");
+                    assert_eq!(scan.invalid_utf8_line_count, 1);
+                }
+                "over-line-cap" => {
+                    // Terminal, disclosed, and committed: the loss is not
+                    // recoverable by any later retry of the same bytes.
+                    assert!(scan.census_complete, "{case}");
+                    assert_eq!(scan.over_line_cap_count, 1);
+                    assert_eq!(scan.recognized_usage_drop_count, 1);
+                    assert_eq!(scan.dropped_usage_record_count, 1);
+                    assert_eq!(scan.snapshots.len(), 1, "healthy siblings still commit");
+                    assert_eq!(index.files.len(), 1, "{case}");
+                }
+                "recognized-drop" => {
+                    assert!(!scan.census_complete, "{case}");
+                    assert!(scan.snapshots.is_empty(), "{case}");
+                    assert!(index.files.is_empty(), "{case}");
+                    assert_eq!(scan.recognized_usage_drop_count, 1);
+                }
                 _ => unreachable!(),
             }
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    /// `terminal_line_loss_count` applies to every source, but the oversized
+    /// Codex envelope salvage does not: for Claude Code and Pi the whole
+    /// physical line - ordinal, timestamp and payload - is gone. Assert that
+    /// non-Codex shape directly instead of inferring it from the Codex case.
+    #[test]
+    fn over_line_cap_is_terminal_with_disclosed_loss_for_non_codex_sources() {
+        let claude = "{\"type\":\"assistant\",\"sessionId\":\"019e2700-5555-7000-9000-555555555555\",\"uuid\":\"019e2700-5555-7000-9000-5555555555a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n";
+        let pi = concat!(
+            "{\"type\":\"session\",\"session_id\":\"019e2700-6666-7000-9000-666666666666\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+            "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n",
+        );
+        for (source, name, healthy) in [
+            (SnapshotSource::ClaudeCode, "over-cap-claude", claude),
+            (SnapshotSource::Pi, "over-cap-pi", pi),
+        ] {
+            let root = temp_dir(name);
+            let path = root.join("session.jsonl");
+            let mut bytes = healthy.as_bytes().to_vec();
+            bytes.extend_from_slice(b"{\"type\":\"assistant\",\"ignored\":\"");
+            bytes.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
+            bytes.extend_from_slice(b"\"}\n");
+            fs::write(&path, bytes).expect("write over-cap fixture");
+
+            let mut index = ScanIndex::default();
+            let mut first = scan_source_roots_with_limit(
+                source,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T08:02:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("over-cap line reaches a terminal disclosed result");
+            assert!(first.census_complete, "{name}");
+            assert!(!first.scan_cap_hit, "{name}");
+            assert_eq!(first.scanned_file_count, 1, "{name}");
+            assert_eq!(first.over_line_cap_count, 1, "{name}");
+            assert_eq!(first.recognized_usage_drop_count, 1, "{name}");
+            assert_eq!(first.dropped_usage_record_count, 1, "{name}");
+            assert_eq!(
+                first.snapshots.len(),
+                1,
+                "{name}: healthy sibling lines still commit"
+            );
+            finalize_scan_after_policy(source, &mut first, &mut index);
+
+            let second = scan_source_roots_with_limit(
+                source,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T08:07:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("unchanged terminal file uses its disposition");
+            assert_eq!(
+                second.scanned_file_count, 0,
+                "{name}: unchanged terminal file is not reparsed"
+            );
+            assert!(second.census_complete, "{name}");
+            assert_eq!(second.over_line_cap_count, 1, "{name}");
+            assert_eq!(second.recognized_usage_drop_count, 1, "{name}");
+            assert_eq!(second.dropped_usage_record_count, 1, "{name}");
+            assert!(second.snapshots.is_empty(), "{name}");
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -22670,6 +22775,143 @@ mod tests {
         .expect("upgraded disposition settles");
         assert_eq!(settled.scanned_file_count, 0);
         assert_eq!(settled.dropped_usage_record_count, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Mirrors the exact live M4 shape that the single-file synthetic fixture
+    /// above cannot express: the oversized physical lines live in the PARENT
+    /// rollout, and its subagent children start at `subagent_history_start_ordinal`
+    /// 11 rather than 1. The parent is therefore a `codex_parent_ownership_refs`
+    /// member whose ledger can never be `scan_complete`, which is what used to
+    /// re-arm the child->parent reparse override on every traversal and re-read
+    /// a 127 MB rollout forever.
+    #[test]
+    fn oversized_parent_of_ordinal_subagent_children_is_read_once() {
+        let root = temp_dir("terminal-oversized-parent");
+        let parent_id = "019e2700-2222-7000-9000-222222222222";
+        let child_ids = [
+            "019e2700-3333-7000-9000-333333333333",
+            "019e2700-4444-7000-9000-444444444444",
+        ];
+
+        let oversized_line = |ordinal: u64, timestamp: &str, bytes: usize| {
+            let mut line = format!(
+                "{{\"timestamp\":\"{timestamp}\",\"type\":\"response_item\",\"ordinal\":{ordinal},\"payload\":{{\"type\":\"message\",\"content\":[{{\"type\":\"input_image\",\"image_url\":\""
+            )
+            .into_bytes();
+            line.extend(std::iter::repeat_n(b'x', bytes));
+            line.extend_from_slice(b"\"}]}}\n");
+            line
+        };
+
+        let parent_path = root.join(format!("rollout-2026-07-22T08-00-00-{parent_id}.jsonl"));
+        let mut parent_bytes = format!(
+            "{{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{{\"id\":\"{parent_id}\",\"session_id\":\"{parent_id}\"}}}}\n"
+        )
+        .into_bytes();
+        parent_bytes.extend_from_slice(&oversized_line(
+            1,
+            "2026-07-22T08:00:01Z",
+            21 * 1024 * 1024,
+        ));
+        parent_bytes.extend_from_slice(
+            (codex_test_token_line(
+                "2026-07-22T08:00:02Z",
+                Some(2),
+                (40, 0, 8, 0),
+                Some((40, 0, 8, 0)),
+            )
+            .to_string()
+                + "\n")
+                .as_bytes(),
+        );
+        fs::write(&parent_path, parent_bytes).expect("write oversized parent rollout");
+
+        for (offset, child_id) in child_ids.iter().enumerate() {
+            let path = root.join(format!(
+                "rollout-2026-07-22T08-1{offset}-00-{child_id}.jsonl"
+            ));
+            let mut bytes = format!(
+                "{{\"timestamp\":\"2026-07-22T08:10:00Z\",\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{{\"id\":\"{child_id}\",\"session_id\":\"{child_id}\",\"thread_source\":\"subagent\",\"forked_from_id\":\"{parent_id}\",\"subagent_history_start_ordinal\":11,\"source\":{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"{parent_id}\"}}}}}}}}}}\n"
+            )
+            .into_bytes();
+            for ordinal in 1..=10_u64 {
+                bytes.extend_from_slice(
+                    format!(
+                        "{{\"timestamp\":\"2026-07-22T08:10:{ordinal:02}Z\",\"type\":\"response_item\",\"ordinal\":{ordinal},\"payload\":{{\"type\":\"message\",\"content\":[]}}}}\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            // Children carry oversized image rows too; the Codex envelope
+            // salvage keeps their ordinal chain gap-free.
+            bytes.extend_from_slice(&oversized_line(
+                11,
+                "2026-07-22T08:10:11Z",
+                MAX_JSONL_LINE_BYTES + 1,
+            ));
+            bytes.extend_from_slice(
+                (codex_test_token_line(
+                    "2026-07-22T08:10:12Z",
+                    Some(12),
+                    (12, 0, 4, 0),
+                    Some((12, 0, 4, 0)),
+                )
+                .to_string()
+                    + "\n")
+                    .as_bytes(),
+            );
+            fs::write(&path, bytes).expect("write ordinal subagent child rollout");
+        }
+
+        let mut index = ScanIndex::default();
+        let mut observed = Vec::new();
+        for cycle in 0..4 {
+            let mut scan = scan_source_roots_with_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T09:00:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap_or_else(|error| panic!("cycle {cycle} traversal: {error}"));
+            assert!(scan.census_complete, "cycle {cycle} census");
+            assert!(!scan.scan_cap_hit, "cycle {cycle} cap hit");
+            assert_eq!(
+                scan.ownership_incomplete_file_count, 0,
+                "cycle {cycle} ownership"
+            );
+            // Loss stays disclosed on every cycle, including the ones that
+            // read nothing: three oversized physical lines, one dropped
+            // potential usage record each.
+            assert_eq!(scan.over_line_cap_count, 3, "cycle {cycle} over cap");
+            assert_eq!(
+                scan.recognized_usage_drop_count, 3,
+                "cycle {cycle} recognized drop"
+            );
+            assert_eq!(
+                scan.dropped_usage_record_count, 3,
+                "cycle {cycle} dropped usage"
+            );
+            observed.push((scan.scanned_file_count, scan.snapshots.len()));
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+        }
+        assert_eq!(
+            observed,
+            vec![(3, 3), (0, 0), (0, 0), (0, 0)],
+            "the oversized parent must be read exactly once, not once per cycle"
+        );
+        assert!(
+            index.codex_parent_ownership_refs.contains(parent_id),
+            "children still resolve their parent reference"
+        );
+        assert!(
+            !index.codex_parent_ownership_ledgers.contains_key(parent_id),
+            "a lossy parent must not publish a scan-complete ownership ledger"
+        );
+        assert_eq!(index.terminal_jsonl_dispositions.len(), 3);
         let _ = fs::remove_dir_all(root);
     }
 
