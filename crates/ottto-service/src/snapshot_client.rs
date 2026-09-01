@@ -709,7 +709,7 @@ impl SnapshotBatchResponse {
         Ok(())
     }
 
-    fn validate_entity_ack_identities<'a>(
+    pub(crate) fn validate_entity_ack_identities<'a>(
         &self,
         identities: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Result<()> {
@@ -902,12 +902,6 @@ pub struct SnapshotStatusRequest {
     /// absence is liveness-only/unknown. Never fabricated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<SnapshotSourceManifest>,
-    /// Identity-only reconciliation for a pre-ledger scan checkpoint. The
-    /// status endpoint already owns source/machine authentication and server
-    /// head state; this additive probe avoids resending transcript-derived
-    /// snapshot bodies merely to discover whether they settled.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub settlement_probe: Option<SnapshotSettlementProbe>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -917,25 +911,6 @@ pub struct SnapshotStatusResponse {
     pub machine_id: String,
     pub disabled: bool,
     pub disabled_reason: Option<String>,
-    #[serde(default)]
-    pub settlement_ack: Option<SnapshotSettlementAck>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SnapshotSettlementProbe {
-    pub contract: String,
-    pub snapshot_fingerprints: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SnapshotSettlementAck {
-    pub contract: String,
-    #[serde(default)]
-    pub accepted_snapshot_fingerprints: Vec<String>,
-    #[serde(default)]
-    pub superseded_snapshot_fingerprints: Vec<String>,
-    #[serde(default)]
-    pub missing_snapshot_fingerprints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2391,7 +2366,6 @@ mod tests {
                 entity_count: 3,
                 rolling_hash: "b".repeat(64),
             }),
-            settlement_probe: None,
         };
         let serialized = serde_json::to_string(&status).expect("serialize");
         assert!(!serialized.contains(".codex"));
@@ -2455,7 +2429,6 @@ mod tests {
                 entity_count: 1,
                 rolling_hash: "b".repeat(64),
             }),
-            settlement_probe: None,
         }
     }
 

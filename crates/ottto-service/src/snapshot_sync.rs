@@ -13,8 +13,8 @@ use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
     LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
-    RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotSettlementProbe,
-    SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
+    RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusRequest,
+    UploadFailureDiagnostics, UploadShed,
 };
 use crate::snapshots::{
     apply_upload_policy, collector_version, context_curve_derivation_revision,
@@ -25,8 +25,7 @@ use crate::snapshots::{
     SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
     SourceScanResult, CONTEXT_CURVE_CONTRACT_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
     MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
-    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_SETTLEMENT_PROBE_CONTRACT_VERSION,
-    SNAPSHOT_STATUS_SCHEMA_VERSION,
+    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -78,6 +77,11 @@ const SNAPSHOT_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
 const SNAPSHOT_ADAPTIVE_SPLIT_LIMIT: usize = 6;
 const SNAPSHOT_ADAPTIVE_ATTEMPT_LIMIT: usize = SNAPSHOT_BATCH_LIMIT + 4;
 const SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
+// A pre-ledger checkpoint with ambiguous settlement is re-entered through the
+// existing entity-ACK upload machine. Arm at most one normal 50-entity page per
+// five-minute source cycle; the scan-index cursor and quarantine map resume the
+// remaining identities across restarts.
+const LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
 const SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION: u16 = 3;
 static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
 static CLAUDE_REFRESH_ACTIVITY: OnceLock<Mutex<ClaudeRefreshActivity>> = OnceLock::new();
@@ -2120,36 +2124,25 @@ fn sync_source(
     let curve_replay_pending =
         context_curve_enabled && index.context_curve_replay_needed(&replay_generation);
     let historical_replay_pending = backfill_pending || curve_replay_pending;
+    let mut legacy_reconciliation_pending = BTreeSet::new();
     if !historical_replay_pending && index.legacy_settlement_ledger_needs_migration() {
-        let requested = index.legacy_settlement_probe_fingerprints();
-        let rearmed = if requested.is_empty() {
-            Some(0)
-        } else {
-            reconcile_legacy_snapshot_settlement(
-                client,
-                &relay_token,
-                source,
-                machine_id,
-                receipt_window_days,
-                &mut index,
-                &requested,
-            )?
-        };
-        if let Some(rearmed) = rearmed {
-            // The accepted-ledger migration or exact server ACK is durable
-            // before the disposable upload ledger can claim any retry.
+        let (armed, changed) = index.prepare_legacy_settlement_reconciliation(
+            source,
+            LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE,
+        );
+        legacy_reconciliation_pending =
+            index.legacy_settlement_reconciliation_pending_fingerprints();
+        if changed {
+            // The bounded cursor and armed identities are durable before the
+            // disposable upload ledger can lease this cycle's retry page.
             index.save(&index_path)?;
-            if rearmed > 0 {
+            if !armed.is_empty() {
                 eprintln!(
-                    "ottto-service: re-armed {rearmed} manifest-present snapshot revision(s) proven missing by identity-only settlement reconciliation for {}",
+                    "ottto-service: re-armed {} ambiguous legacy snapshot revision(s) through the existing entity-ACK contract for {}; remaining revisions resume on later source cycles",
+                    armed.len(),
                     source.api_slug()
                 );
             }
-        } else {
-            eprintln!(
-                "ottto-service: legacy snapshot settlement reconciliation is pending for {}; no snapshot body was re-armed",
-                source.api_slug()
-            );
         }
     }
     if prepare_upload_progress_for_cycle(
@@ -2163,6 +2156,11 @@ fn sync_source(
         // identical entities and gives overlapping writers a CAS boundary.
         upload_progress.save(&upload_progress_path)?;
     }
+    let active_legacy_reconciliation = upload_progress
+        .active_quarantine_retries
+        .intersection(&legacy_reconciliation_pending)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     if historical_replay_pending {
         index.prepare_historical_replay(replay_generation.clone());
     }
@@ -2337,6 +2335,13 @@ fn sync_source(
         );
     }
     finalize_scan_after_policy(source, &mut scan_result, &mut index);
+    // A parsed file can emit several legacy siblings. Only the persisted
+    // migration lease may re-enter an ambiguous old identity this cycle; new
+    // fingerprints and ordinary changed entities continue through normally.
+    scan_result.snapshots.retain(|snapshot| {
+        !legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
+            || active_legacy_reconciliation.contains(&snapshot.snapshot_fingerprint)
+    });
     // A long-lived poison item can keep upload progress around while unrelated
     // files continue changing. Drop quarantine revisions no longer represented
     // by the authoritative current index before any early upload error can
@@ -2440,6 +2445,16 @@ fn sync_source(
             let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
             let response = client.upload_batch(&upload_relay_token, &request)?;
             response.validate_entity_ack(&request)?;
+            let request_fingerprints = request
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                .collect::<BTreeSet<_>>();
+            require_existing_entity_ack_for_legacy_reconciliation(
+                &response,
+                &request_fingerprints,
+                &legacy_reconciliation_pending,
+            )?;
             // Clear only what this accepted request carried. A failed upload
             // leaves the counters in place so the losses are reported on the
             // next batch instead of vanishing with the request that died.
@@ -2758,6 +2773,7 @@ fn sync_source(
 
     index.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
     index.record_accepted_snapshot_fingerprints(&upload_progress.accepted_fingerprints);
+    index.finish_legacy_settlement_reconciliation();
     settle_context_curve_replay_state(
         &mut index,
         context_curve_enabled,
@@ -3042,6 +3058,32 @@ impl std::fmt::Display for SnapshotBatchResponseRejected {
 }
 
 impl std::error::Error for SnapshotBatchResponseRejected {}
+
+fn require_existing_entity_ack_for_legacy_reconciliation(
+    response: &crate::snapshot_client::SnapshotBatchResponse,
+    request_fingerprints: &BTreeSet<String>,
+    legacy_pending: &BTreeSet<String>,
+) -> Result<()> {
+    let carries_legacy_reconciliation = request_fingerprints
+        .iter()
+        .any(|fingerprint| legacy_pending.contains(fingerprint));
+    if !carries_legacy_reconciliation {
+        return Ok(());
+    }
+    if response.disabled {
+        return Err(anyhow!(
+            "disabled snapshot response cannot settle legacy reconciliation"
+        ));
+    }
+    if response.entity_ack_contract.as_deref()
+        != Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT)
+    {
+        return Err(anyhow!(
+            "legacy snapshot reconciliation requires the exact entity ACK contract"
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SnapshotEntityConflictDeferred {
@@ -3665,95 +3707,9 @@ fn report_status(
         collector_version: Some(collector_version()),
         parser_version: Some(status.source.parser_version().to_string()),
         manifest,
-        settlement_probe: None,
     };
     client.report_status(relay_token, &request)?;
     Ok(())
-}
-
-fn reconcile_legacy_snapshot_settlement(
-    client: &SnapshotApiClient,
-    relay_token: &str,
-    source: SnapshotSource,
-    machine_id: &str,
-    receipt_window_days: u64,
-    index: &mut ScanIndex,
-    requested: &BTreeSet<String>,
-) -> Result<Option<usize>> {
-    let request = SnapshotStatusRequest {
-        schema_version: SNAPSHOT_STATUS_SCHEMA_VERSION,
-        source: source.api_slug().to_string(),
-        machine_id: machine_id.to_string(),
-        enabled: true,
-        disabled_reason: None,
-        last_scan_started_at: None,
-        last_scan_finished_at: None,
-        last_success_at: None,
-        last_error_code: None,
-        last_error_message: None,
-        last_uploaded_count: 0,
-        last_scanned_session_count: 0,
-        last_scanned_file_count: 0,
-        last_zero_snapshot_confirmed_count: 0,
-        last_zero_snapshot_usage_evidence_count: 0,
-        last_dropped_usage_record_count: 0,
-        last_ownership_incomplete_file_count: 0,
-        last_snapshot_unproven_terminal_count: 0,
-        last_snapshot_superseded_terminal_count: 0,
-        last_backfill_window_days: receipt_window_days,
-        last_backfill_file_limit: 0,
-        last_discovered_file_count: 0,
-        last_skipped_file_count_due_to_limit: 0,
-        last_scan_cap_hit: false,
-        last_semantic_noop_count: 0,
-        last_census_complete: false,
-        last_symlink_rejected_count: 0,
-        last_unreadable_path_count: 0,
-        last_oversized_file_count: 0,
-        last_disappeared_file_count: 0,
-        last_malformed_json_line_count: 0,
-        last_invalid_utf8_line_count: 0,
-        last_over_line_cap_count: 0,
-        last_recognized_usage_drop_count: 0,
-        consecutive_failures: 0,
-        next_retry_at: None,
-        collector_version: Some(collector_version()),
-        parser_version: Some(source.parser_version().to_string()),
-        manifest: None,
-        settlement_probe: Some(SnapshotSettlementProbe {
-            contract: SNAPSHOT_SETTLEMENT_PROBE_CONTRACT_VERSION.to_string(),
-            snapshot_fingerprints: requested.iter().cloned().collect(),
-        }),
-    };
-    let response = client.report_status(relay_token, &request)?;
-    if response.source != source.api_slug() || response.machine_id != machine_id {
-        return Err(anyhow!(
-            "snapshot settlement probe ACK source or machine does not match request"
-        ));
-    }
-    let Some(ack) = response.settlement_ack else {
-        return Ok(None);
-    };
-    if ack.contract != SNAPSHOT_SETTLEMENT_PROBE_CONTRACT_VERSION {
-        return Err(anyhow!(
-            "snapshot settlement probe ACK uses an unsupported contract"
-        ));
-    }
-    let accepted = ack
-        .accepted_snapshot_fingerprints
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let superseded = ack
-        .superseded_snapshot_fingerprints
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let missing = ack
-        .missing_snapshot_fingerprints
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    index
-        .apply_legacy_settlement_probe(source, requested, &accepted, &superseded, &missing)
-        .map(Some)
 }
 
 fn current_receipt_window_days(client: &SnapshotApiClient, relay_token: &str) -> Result<u64> {
@@ -3892,7 +3848,6 @@ fn report_checkin_status(
         // "alive" while the entity sets disagree is exactly the state the
         // manifest exists to expose.
         manifest,
-        settlement_probe: None,
     };
     client.report_status(relay_token, &request)?;
     Ok(())
@@ -7241,7 +7196,9 @@ mod tests {
             "the fired deadline must be replaced by a future deadline"
         );
         assert!(
-            index.legacy_settlement_probe_fingerprints().is_empty(),
+            index
+                .legacy_settlement_reconciliation_pending_fingerprints()
+                .is_empty(),
             "the current-schema manifest revision stays armed rather than becoming unproven"
         );
         let _ = std::fs::remove_dir_all(root);
@@ -7327,81 +7284,89 @@ mod tests {
         index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
         assert_eq!(index.snapshot_superseded_terminal_count(), 1);
         assert!(!index
-            .legacy_settlement_probe_fingerprints()
+            .legacy_settlement_reconciliation_pending_fingerprints()
             .contains(&stale));
         assert!(!progress.retain_current_quarantines(&BTreeSet::from(["a".repeat(64)])));
     }
 
     #[test]
-    fn legacy_settlement_reconciliation_posts_identities_only_and_arms_only_missing() {
-        let accepted = "a".repeat(64);
-        let superseded = "b".repeat(64);
-        let missing = "c".repeat(64);
-        let requested = BTreeSet::from([accepted.clone(), superseded.clone(), missing.clone()]);
-        let captured = Arc::new(Mutex::new(String::new()));
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind settlement fixture");
-        let address = listener.local_addr().expect("settlement fixture address");
-        let captured_server = captured.clone();
-        let accepted_server = accepted.clone();
-        let superseded_server = superseded.clone();
-        let missing_server = missing.clone();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept settlement probe");
-            *captured_server.lock().expect("capture settlement probe") =
-                read_complete_http_request(&mut stream);
-            let body = serde_json::json!({
-                "accepted": true,
-                "source": "codex",
-                "machine_id": "otm_test",
-                "disabled": false,
-                "disabled_reason": null,
-                "settlement_ack": {
-                    "contract": SNAPSHOT_SETTLEMENT_PROBE_CONTRACT_VERSION,
-                    "accepted_snapshot_fingerprints": [accepted_server],
-                    "superseded_snapshot_fingerprints": [superseded_server],
-                    "missing_snapshot_fingerprints": [missing_server]
-                }
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write settlement ACK");
-        });
+    fn legacy_reconciliation_is_fail_closed_until_exact_existing_entity_ack() {
+        let fingerprint = "a".repeat(64);
+        let request_fingerprints = BTreeSet::from([fingerprint.clone()]);
+        let legacy_pending = request_fingerprints.clone();
+        let mut progress = test_upload_progress();
+        progress.quarantine([fingerprint.as_str()]);
+        progress
+            .quarantined_fingerprints
+            .get_mut(&fingerprint)
+            .expect("armed legacy identity")
+            .retry_after_unix_seconds = 0;
+        progress.prepare_quarantine_retries(&BTreeMap::new());
 
-        let client = SnapshotApiClient::new(format!("http://{address}"));
-        let mut index = ScanIndex::default();
-        let rearmed = reconcile_legacy_snapshot_settlement(
-            &client,
-            "relay-token",
-            SnapshotSource::Codex,
-            "otm_test",
-            183,
-            &mut index,
-            &requested,
-        )
-        .expect("identity-only settlement probe")
-        .expect("server returned settlement ACK");
-        assert_eq!(rearmed, 1);
-        let request = captured.lock().expect("read settlement request").clone();
-        let request_json = http_request_json(&request);
-        assert!(request_json.get("snapshots").is_none());
-        assert_eq!(
-            request_json["settlement_probe"]["snapshot_fingerprints"]
-                .as_array()
-                .expect("probe identities")
-                .len(),
-            3
+        let rejected_bool = serde_json::from_value::<crate::snapshot_client::SnapshotBatchResponse>(
+            serde_json::json!({
+                "accepted": false,
+                "sessions_reconciled": 0,
+                "session_ids": [],
+                "disabled": false
+            }),
         );
-        assert!(index
-            .quarantined_snapshot_fingerprints
-            .contains_key(&missing));
-        assert_eq!(index.snapshot_superseded_terminal_count(), 1);
-        assert_eq!(index.snapshot_unproven_terminal_count(), 0);
+        assert!(rejected_bool.is_err(), "accepted:false is not a batch ACK");
+        let rejected_status = serde_json::from_value::<
+            crate::snapshot_client::SnapshotStatusResponse,
+        >(serde_json::json!({
+            "accepted": false,
+            "source": "codex",
+            "machine_id": "otm_test",
+            "disabled": false,
+            "disabled_reason": null,
+            "settlement_ack": {
+                "accepted_snapshot_fingerprints": [fingerprint.clone()]
+            }
+        }))
+        .expect("forward-tolerant status receipt");
+        assert!(!rejected_status.accepted);
+
+        let mut disabled = accepted_batch(0);
+        disabled.disabled = true;
+        assert!(require_existing_entity_ack_for_legacy_reconciliation(
+            &disabled,
+            &request_fingerprints,
+            &legacy_pending,
+        )
+        .is_err());
+
+        let missing_contract = accepted_batch(1);
+        assert!(require_existing_entity_ack_for_legacy_reconciliation(
+            &missing_contract,
+            &request_fingerprints,
+            &legacy_pending,
+        )
+        .is_err());
+
+        let partial = entity_ack_batch(&[], &[], &[]);
+        assert!(partial
+            .validate_entity_ack_identities(std::iter::once((
+                format!("session-{fingerprint}").as_str(),
+                fingerprint.as_str(),
+            )))
+            .is_err());
+        assert!(progress.quarantined_fingerprints.contains_key(&fingerprint));
+        assert!(progress.active_quarantine_retries.contains(&fingerprint));
+
+        let exact = entity_ack_batch(std::slice::from_ref(&fingerprint), &[], &[]);
+        exact
+            .validate_entity_ack_identities(std::iter::once((
+                format!("session-{fingerprint}").as_str(),
+                fingerprint.as_str(),
+            )))
+            .expect("exact fingerprint-bound entity ACK");
+        require_existing_entity_ack_for_legacy_reconciliation(
+            &exact,
+            &request_fingerprints,
+            &legacy_pending,
+        )
+        .expect("deployed entity ACK contract is sufficient");
     }
 
     #[test]
