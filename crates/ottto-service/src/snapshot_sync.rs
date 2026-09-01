@@ -117,6 +117,11 @@ struct SnapshotUploadProgress {
     quarantined_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
     #[serde(skip)]
     active_quarantine_witness: Option<SnapshotQuarantineWitness>,
+    /// Runtime leases for quarantine entries selected this cycle. The durable
+    /// record stays armed with its next future deadline until an exact ACK
+    /// clears it; this set only bypasses suppression for the current request.
+    #[serde(skip)]
+    active_quarantine_retries: BTreeSet<String>,
 }
 
 impl SnapshotUploadProgress {
@@ -133,6 +138,7 @@ impl SnapshotUploadProgress {
             accepted_body_witnesses: BTreeMap::new(),
             quarantined_fingerprints: BTreeMap::new(),
             active_quarantine_witness: Some(active_quarantine_witness),
+            active_quarantine_retries: BTreeSet::new(),
         }
     }
 
@@ -197,17 +203,27 @@ impl SnapshotUploadProgress {
             }
         };
         progress.active_quarantine_witness = Some(active_quarantine_witness);
+        progress.active_quarantine_retries.clear();
         Ok(progress)
     }
 
     fn prepare_quarantine_retries(
         &mut self,
         index_quarantine: &BTreeMap<String, SnapshotQuarantineRecord>,
-    ) {
+    ) -> bool {
+        self.active_quarantine_retries.clear();
+        // The upload ledger is saved immediately after an exact ACK, before
+        // the index can retire its older quarantine. On crash/restart that ACK
+        // is the stronger fact and must not be overwritten by restoring the
+        // stale index-owned obligation.
+        self.quarantined_fingerprints
+            .retain(|fingerprint, _| !self.accepted_fingerprints.contains(fingerprint));
         for (fingerprint, record) in index_quarantine {
-            self.quarantined_fingerprints
-                .entry(fingerprint.clone())
-                .or_insert_with(|| record.clone());
+            if !self.accepted_fingerprints.contains(fingerprint) {
+                self.quarantined_fingerprints
+                    .entry(fingerprint.clone())
+                    .or_insert_with(|| record.clone());
+            }
         }
         let now = current_unix_seconds();
         let active = self
@@ -232,8 +248,22 @@ impl SnapshotUploadProgress {
             .take(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
             .map(|(_, _, fingerprint)| fingerprint)
             .collect::<BTreeSet<_>>();
-        self.quarantined_fingerprints
-            .retain(|fingerprint, _| !retry.contains(fingerprint));
+        for fingerprint in &retry {
+            let upload_body_witness = self
+                .quarantined_fingerprints
+                .get(fingerprint)
+                .and_then(|record| record.upload_body_witness.clone());
+            self.quarantined_fingerprints.insert(
+                fingerprint.clone(),
+                SnapshotQuarantineRecord {
+                    witness: active.clone(),
+                    retry_after_unix_seconds: quarantine_retry_after(fingerprint),
+                    upload_body_witness,
+                },
+            );
+        }
+        self.active_quarantine_retries = retry;
+        !self.active_quarantine_retries.is_empty()
     }
 
     /// Rearm every current entity exactly once for a new historical replay.
@@ -255,11 +285,15 @@ impl SnapshotUploadProgress {
 
     #[cfg(test)]
     fn contains(&self, fingerprint: &str) -> bool {
-        self.accepted_fingerprints.contains(fingerprint)
-            || self.quarantined_fingerprints.contains_key(fingerprint)
+        !self.active_quarantine_retries.contains(fingerprint)
+            && (self.accepted_fingerprints.contains(fingerprint)
+                || self.quarantined_fingerprints.contains_key(fingerprint))
     }
 
     fn contains_body(&self, fingerprint: &str, body_witness: &str) -> bool {
+        if self.active_quarantine_retries.contains(fingerprint) {
+            return false;
+        }
         self.accepted_body_witnesses
             .get(fingerprint)
             .is_some_and(|accepted| accepted == body_witness)
@@ -280,6 +314,8 @@ impl SnapshotUploadProgress {
         self.accepted_fingerprints.insert(fingerprint.to_string());
         self.accepted_body_witnesses
             .insert(fingerprint.to_string(), body_witness.to_string());
+        self.quarantined_fingerprints.remove(fingerprint);
+        self.active_quarantine_retries.remove(fingerprint);
     }
 
     #[cfg(test)]
@@ -302,12 +338,17 @@ impl SnapshotUploadProgress {
                 upload_body_witness: Some(body_witness.to_string()),
             },
         );
+        self.accepted_fingerprints.remove(fingerprint);
+        self.accepted_body_witnesses.remove(fingerprint);
+        self.active_quarantine_retries.remove(fingerprint);
     }
 
     fn retain_current_quarantines(&mut self, current: &BTreeSet<String>) -> bool {
         let before = self.quarantined_fingerprints.len();
         self.quarantined_fingerprints
             .retain(|fingerprint, _| current.contains(fingerprint));
+        self.active_quarantine_retries
+            .retain(|fingerprint| current.contains(fingerprint));
         self.quarantined_fingerprints.len() != before
     }
 
@@ -2029,6 +2070,20 @@ fn sync_source(
     let curve_replay_pending =
         context_curve_enabled && index.context_curve_replay_needed(&replay_generation);
     let historical_replay_pending = backfill_pending || curve_replay_pending;
+    if !historical_replay_pending {
+        let rearmed = index.rearm_unaccepted_manifest_revisions(source);
+        if rearmed > 0 {
+            // Make repair durable before the disposable upload ledger claims
+            // any due work. A crash now leaves every unproven manifest entry
+            // armed, and resetting traversal heals the 0.1.121 empty-terminal
+            // scan shape on the next start as well as this one.
+            index.save(&index_path)?;
+            eprintln!(
+                "ottto-service: re-armed {rearmed} manifest-present snapshot revision(s) with no durable ACK or retry obligation for {}",
+                source.api_slug()
+            );
+        }
+    }
     if prepare_upload_progress_for_cycle(
         &mut upload_progress,
         &index,
@@ -2631,6 +2686,7 @@ fn sync_source(
     }
 
     index.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
+    index.record_accepted_snapshot_fingerprints(&upload_progress.accepted_fingerprints);
     settle_context_curve_replay_state(
         &mut index,
         context_curve_enabled,
@@ -2765,14 +2821,15 @@ fn prepare_upload_progress_for_cycle(
     historical_replay_pending: bool,
 ) -> bool {
     if !historical_replay_pending {
-        upload_progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
-        return false;
+        return upload_progress
+            .prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
     }
 
     let same_index_replay = index.historical_replay_generation_matches(replay_generation);
-    let progress_changed = upload_progress.prepare_historical_replay(replay_generation);
+    let mut progress_changed = upload_progress.prepare_historical_replay(replay_generation);
     if same_index_replay {
-        upload_progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+        progress_changed |=
+            upload_progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
     }
     progress_changed
 }
@@ -6757,7 +6814,11 @@ mod tests {
             .expect("load after repair");
         repaired.prepare_quarantine_retries(&BTreeMap::new());
         assert!(!repaired.contains(&fingerprint));
-        assert!(repaired.quarantined_fingerprints.is_empty());
+        assert!(repaired.active_quarantine_retries.contains(&fingerprint));
+        assert!(repaired
+            .quarantined_fingerprints
+            .get(&fingerprint)
+            .is_some_and(|record| record.retry_after_unix_seconds > current_unix_seconds()));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -6807,6 +6868,164 @@ mod tests {
         assert_eq!(accepted, 1);
     }
 
+    /// Regression for the live 0.1.121 strand: the quarantine deadline became
+    /// due after a settled sibling had already advanced the shared backend
+    /// head, but an independently backed-off terminal-unhealthy traversal
+    /// yielded no upload item. A vacuous completed upload must not let the
+    /// disposable ledger erase the index-owned retry obligation.
+    #[test]
+    fn due_quarantine_empty_scan_rearms_instead_of_clearing_the_obligation() {
+        let root = test_dir("due-quarantine-terminal-unhealthy-empty-scan");
+        let session_path = root.join("session.jsonl");
+        std::fs::create_dir_all(&root).expect("create retry fixture root");
+        std::fs::write(
+            &session_path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-08-31T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1788163201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write manifest-present source revision");
+        let mut index = ScanIndex::default();
+        let mut first_scan = crate::snapshots::scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-09-01T02:00:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+        )
+        .expect("seed manifest-present revision");
+        crate::snapshots::finalize_scan_after_policy(
+            SnapshotSource::Pi,
+            &mut first_scan,
+            &mut index,
+        );
+        let fingerprint = first_scan.snapshots[0].snapshot_fingerprint.clone();
+        let mut quarantine = crate::snapshots::snapshot_quarantine_record(SnapshotSource::Pi);
+        quarantine.retry_after_unix_seconds = 0;
+        quarantine.upload_body_witness = Some(fingerprint.clone());
+        index
+            .quarantined_snapshot_fingerprints
+            .insert(fingerprint.clone(), quarantine);
+        let collected_at = "2026-09-01T03:27:03Z";
+        index.install_terminal_unhealthy_traversal_for_retry_test(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            u64::try_from(
+                OffsetDateTime::parse(collected_at, &time::format_description::well_known::Rfc3339)
+                    .expect("fixture time")
+                    .unix_timestamp(),
+            )
+            .expect("positive fixture time")
+            .saturating_add(60 * 60),
+        );
+
+        let mut progress = SnapshotUploadProgress::new(
+            format!("{:064x}", 42),
+            snapshot_quarantine_witness(SnapshotSource::Pi),
+        );
+        progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+        let scan = crate::snapshots::scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            collected_at,
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+        )
+        .expect("independently backed-off terminal traversal returns a scan receipt");
+        assert!(scan.snapshots.is_empty());
+        assert!(!scan.census_complete);
+        let mut accepted = 0;
+        let mut upload_calls = 0;
+        let result = upload_resumable_batches(
+            &scan.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            |_| {
+                upload_calls += 1;
+                Ok(accepted_batch(0))
+            },
+            |_| Ok(()),
+        )
+        .expect("an empty bounded scan is a vacuous completed upload");
+        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!((upload_calls, accepted), (0, 0));
+
+        index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        let retained = index
+            .quarantined_snapshot_fingerprints
+            .get(&fingerprint)
+            .expect("an empty scan must leave the retry armed");
+        assert!(
+            retained.retry_after_unix_seconds > current_unix_seconds(),
+            "the fired deadline must be replaced by a future deadline"
+        );
+        assert_eq!(
+            index.rearm_unaccepted_manifest_revisions(SnapshotSource::Pi),
+            0,
+            "the manifest revision stays armed rather than becoming unproven"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn due_retry_uploads_only_the_quarantined_revision_after_its_sibling_settled() {
+        let settled_sibling = "d".repeat(64);
+        let retry = "e".repeat(64);
+        let mut progress = test_upload_progress();
+        progress.record([settled_sibling.as_str()]);
+        progress.quarantine([retry.as_str()]);
+        progress
+            .quarantined_fingerprints
+            .get_mut(&retry)
+            .expect("retry quarantine")
+            .retry_after_unix_seconds = 0;
+        assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
+
+        let mut accepted = 0;
+        let mut uploaded = Vec::new();
+        let result = upload_resumable_batches(
+            &[settled_sibling.clone(), retry.clone()],
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |batch| {
+                uploaded.push(batch.clone());
+                Ok(entity_ack_batch(&batch, &[], &[]))
+            },
+            |_| Ok(()),
+        )
+        .expect("the later revision retries after its sibling settled");
+
+        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!(uploaded, vec![vec![retry.clone()]]);
+        assert_eq!(accepted, 1);
+        assert!(progress.accepted_fingerprints.contains(&settled_sibling));
+        assert!(progress.accepted_fingerprints.contains(&retry));
+        assert!(progress.quarantined_fingerprints.is_empty());
+    }
+
+    #[test]
+    fn durable_ack_dominates_stale_index_quarantine_after_restart() {
+        let fingerprint = "c".repeat(64);
+        let mut index_quarantine = BTreeMap::new();
+        let mut stale = crate::snapshots::snapshot_quarantine_record(SnapshotSource::Codex);
+        stale.retry_after_unix_seconds = 0;
+        stale.upload_body_witness = Some(fingerprint.clone());
+        index_quarantine.insert(fingerprint.clone(), stale);
+
+        let mut progress = test_upload_progress();
+        progress.record([fingerprint.as_str()]);
+        assert!(!progress.prepare_quarantine_retries(&index_quarantine));
+        assert!(progress.accepted_fingerprints.contains(&fingerprint));
+        assert!(!progress.quarantined_fingerprints.contains_key(&fingerprint));
+        assert!(!progress.active_quarantine_retries.contains(&fingerprint));
+    }
+
     #[test]
     fn upload_progress_prunes_quarantine_revisions_absent_from_current_index() {
         let current = "a".repeat(64);
@@ -6841,16 +7060,26 @@ mod tests {
             );
         }
         progress.prepare_quarantine_retries(&BTreeMap::new());
-        assert_eq!(progress.quarantined_fingerprints.len(), 5);
+        assert_eq!(
+            progress.active_quarantine_retries.len(),
+            SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE
+        );
+        assert_eq!(
+            progress.quarantined_fingerprints.len(),
+            SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE + 5,
+            "leased retries remain durably armed until exact ACK settlement"
+        );
         let first_deferred = format!("{SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE:064x}");
+        let last_leased = format!("{:064x}", SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE - 1);
         assert_eq!(
             progress
-                .quarantined_fingerprints
-                .keys()
-                .next()
+                .active_quarantine_retries
+                .iter()
+                .next_back()
                 .map(String::as_str),
-            Some(first_deferred.as_str())
+            Some(last_leased.as_str())
         );
+        assert!(!progress.active_quarantine_retries.contains(&first_deferred));
     }
 
     #[test]

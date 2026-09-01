@@ -355,6 +355,7 @@ const CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS: u64 = 6 * 60 * 60;
 /// retries. This gives transient sidecar lag three recovery windows while
 /// bounding an unchanged family's non-terminal lifetime to 18-36 hours.
 const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES: u8 = 4;
+const SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION: &str = "snapshot_unproven_retry:v1";
 
 /// What the manifest counts, declared on the wire rather than assumed.
 ///
@@ -1848,6 +1849,11 @@ pub struct ScanIndex {
     /// file mtime or the collector observation clock.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub snapshot_activity_at: BTreeMap<String, Option<String>>,
+    /// Exact entity ACK identities known durable at the backend. Older indexes
+    /// deserialize this empty, which deliberately makes the startup integrity
+    /// sweep conservatively re-arm their manifest entries once.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    accepted_snapshot_fingerprints: BTreeSet<String>,
     /// Rejected entities are quarantined under the exact daemon/parser/wire
     /// contract that produced the rejection. They are excluded from the
     /// server-agreement manifest while that witness is current, but are
@@ -1901,6 +1907,7 @@ impl Default for ScanIndex {
             confirmed_empty_files: BTreeSet::new(),
             file_snapshot_fingerprints: BTreeMap::new(),
             snapshot_activity_at: BTreeMap::new(),
+            accepted_snapshot_fingerprints: BTreeSet::new(),
             quarantined_snapshot_fingerprints: BTreeMap::new(),
             active_quarantine_witness: None,
             active_upload_context_fingerprint: None,
@@ -16502,6 +16509,101 @@ impl ScanIndex {
         self.confirmed_empty_files.clear();
         self.file_snapshot_fingerprints.clear();
         self.snapshot_activity_at.clear();
+        self.accepted_snapshot_fingerprints.clear();
+        self.quarantined_snapshot_fingerprints.clear();
+    }
+
+    /// Close the durable retry state machine before scanning. Any manifest
+    /// identity without either exact ACK proof or a quarantine record is an
+    /// unproven obligation, never an implicit success. The synthetic witness
+    /// differs from the active wire contract so unchanged files are reparsed
+    /// immediately, while its future deadline keeps the obligation armed if a
+    /// terminal-unhealthy traversal yields no candidate again.
+    pub(crate) fn rearm_unaccepted_manifest_revisions(&mut self, source: SnapshotSource) -> usize {
+        let current = self.current_snapshot_fingerprints();
+        let unarmed = current
+            .difference(&self.accepted_snapshot_fingerprints)
+            .filter(|fingerprint| {
+                !self
+                    .quarantined_snapshot_fingerprints
+                    .contains_key(*fingerprint)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if unarmed.is_empty() {
+            return 0;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let mut witness = snapshot_quarantine_witness(source);
+        witness.contract = SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION.to_string();
+        for fingerprint in &unarmed {
+            self.quarantined_snapshot_fingerprints.insert(
+                fingerprint.clone(),
+                SnapshotQuarantineRecord {
+                    witness: witness.clone(),
+                    retry_after_unix_seconds: now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS),
+                    upload_body_witness: None,
+                },
+            );
+        }
+        // The lost-obligation production shape has an empty terminal-unhealthy
+        // traversal whose independent retry is not due. Reset only traversal
+        // discovery; existing file/entity checkpoints remain the source of the
+        // forced reparse decisions above.
+        self.traversal = None;
+        self.bounded_sweep_had_unsettled_upload = true;
+        unarmed.len()
+    }
+
+    pub(crate) fn record_accepted_snapshot_fingerprints(&mut self, accepted: &BTreeSet<String>) {
+        self.accepted_snapshot_fingerprints
+            .extend(accepted.iter().cloned());
+        let current = self.current_snapshot_fingerprints();
+        self.accepted_snapshot_fingerprints.retain(|fingerprint| {
+            current.contains(fingerprint)
+                && !self
+                    .quarantined_snapshot_fingerprints
+                    .contains_key(fingerprint)
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_terminal_unhealthy_traversal_for_retry_test(
+        &mut self,
+        source: SnapshotSource,
+        roots: &[PathBuf],
+        backfill_window_days: u64,
+        retry_not_before_unix_seconds: u64,
+    ) {
+        self.traversal = Some(ScanTraversalCheckpoint {
+            context_fingerprint: scan_traversal_context_fingerprint(
+                source,
+                roots,
+                self,
+                backfill_window_days,
+            ),
+            census_window_end: "2026-09-01T03:27:03Z".to_string(),
+            scan_roots: Vec::new(),
+            pending_directories: VecDeque::new(),
+            pending_candidates: VecDeque::new(),
+            observed_index_keys: BTreeSet::new(),
+            codex_rollout_paths: BTreeSet::new(),
+            reconciliation_upper_bound: None,
+            reconciliation_after: None,
+            reconciliation_started: false,
+            watcher_hint_seen: false,
+            codex_parent_resolution_retry_required: false,
+            unhealthy_retry_attempt: 1,
+            unhealthy_retry_not_before_unix_seconds: Some(retry_not_before_unix_seconds),
+            counts: ScanTraversalCounts {
+                disappeared_file_count: 1,
+                ..ScanTraversalCounts::default()
+            },
+        });
     }
 
     pub(crate) fn historical_replay_generation_matches(&self, generation: &str) -> bool {
@@ -16568,6 +16670,15 @@ impl ScanIndex {
                         .snapshot_activity_at
                         .values()
                         .all(valid_snapshot_activity)
+                    && index
+                        .accepted_snapshot_fingerprints
+                        .iter()
+                        .all(|fingerprint| {
+                            fingerprint.len() == 64
+                                && fingerprint.bytes().all(|byte| {
+                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                })
+                        })
                     && index
                         .quarantined_snapshot_fingerprints
                         .values()
@@ -16926,6 +17037,12 @@ impl ScanIndex {
                 retained_quarantine.insert(fingerprint.clone(), witness.clone());
             }
         }
+        let mut accepted_snapshot_fingerprints = previous.accepted_snapshot_fingerprints.clone();
+        accepted_snapshot_fingerprints.extend(accepted.iter().cloned());
+        accepted_snapshot_fingerprints.retain(|fingerprint| {
+            committable_fingerprints.contains(fingerprint)
+                && !retained_quarantine.contains_key(fingerprint)
+        });
         let mut snapshot_activity_at = BTreeMap::new();
         for fingerprint in committable_fingerprints {
             if let Some(activity_at) = self
@@ -16975,6 +17092,7 @@ impl ScanIndex {
             confirmed_empty_files,
             file_snapshot_fingerprints,
             snapshot_activity_at,
+            accepted_snapshot_fingerprints,
             quarantined_snapshot_fingerprints: retained_quarantine.clone(),
             active_quarantine_witness: self.active_quarantine_witness.clone(),
             active_upload_context_fingerprint: self.active_upload_context_fingerprint.clone(),
@@ -16998,6 +17116,12 @@ impl ScanIndex {
             .filter(|(fingerprint, _)| current.contains(*fingerprint))
             .map(|(fingerprint, witness)| (fingerprint.clone(), witness.clone()))
             .collect();
+        self.accepted_snapshot_fingerprints.retain(|fingerprint| {
+            current.contains(fingerprint)
+                && !self
+                    .quarantined_snapshot_fingerprints
+                    .contains_key(fingerprint)
+        });
     }
 
     fn remove_file_entry(&mut self, key: &str) {
@@ -19263,6 +19387,63 @@ mod tests {
             &far_future,
             original_now
         ));
+    }
+
+    #[test]
+    fn startup_integrity_sweep_rearms_a_manifest_present_unaccepted_revision() {
+        let root = temp_dir("scan-index-rearm-stranded-revision");
+        let path = root.join("codex-scan-index-v3.json");
+        let accepted = "a".repeat(64);
+        let stranded = "b".repeat(64);
+        let mut index = ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "same-session-siblings.jsonl".to_string(),
+                BTreeSet::from([accepted.clone(), stranded.clone()]),
+            )]),
+            accepted_snapshot_fingerprints: BTreeSet::from([accepted.clone()]),
+            traversal: Some(terminal_unhealthy_traversal("terminal-red".to_string())),
+            ..ScanIndex::default()
+        };
+
+        assert_eq!(
+            index.rearm_unaccepted_manifest_revisions(SnapshotSource::Codex),
+            1
+        );
+        assert!(
+            index.traversal.is_none(),
+            "the empty traversal is restarted"
+        );
+        assert!(!index
+            .quarantined_snapshot_fingerprints
+            .contains_key(&accepted));
+        let repair = index
+            .quarantined_snapshot_fingerprints
+            .get(&stranded)
+            .expect("the unaccepted manifest revision is armed");
+        assert_eq!(
+            repair.witness.contract,
+            SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION
+        );
+        assert!(
+            repair.retry_after_unix_seconds
+                > SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock")
+                    .as_secs()
+        );
+        index.save(&path).expect("persist repaired retry state");
+
+        let mut restarted = ScanIndex::load(&path).expect("reload repaired index");
+        assert_eq!(
+            restarted.rearm_unaccepted_manifest_revisions(SnapshotSource::Codex),
+            0,
+            "a restart sees an armed obligation instead of duplicating it"
+        );
+        assert!(restarted
+            .quarantined_snapshot_fingerprints
+            .contains_key(&stranded));
+        assert!(restarted.accepted_snapshot_fingerprints.contains(&accepted));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
