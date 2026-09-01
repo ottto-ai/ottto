@@ -35,6 +35,7 @@ mod collector_version_tests {
 
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 6;
 pub const SNAPSHOT_ENTITY_ACK_CONTRACT: &str = "snapshot_entity_ack:v1";
+pub const SNAPSHOT_HEAD_CAS_CONTRACT: &str = "snapshot_head_etag:v1";
 // SnapshotStatusRequest endpoint stayed at v5; only the batch endpoint
 // cut over to v6 in this change. Backend's AgentSessionSnapshotStatusRequest
 // is still Literal[5] (backend/app/schemas/agent_session_snapshots.py).
@@ -355,6 +356,9 @@ const CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS: u64 = 6 * 60 * 60;
 /// retries. This gives transient sidecar lag three recovery windows while
 /// bounding an unchanged family's non-terminal lifetime to 18-36 hours.
 const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES: u8 = 4;
+const SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION: &str = "snapshot_unproven_retry:v1";
+const SNAPSHOT_ACCEPTED_LEDGER_VERSION: u8 = 1;
+pub(crate) const MAX_SNAPSHOT_RECONSTRUCTION_FAILURES: u8 = 4;
 
 /// What the manifest counts, declared on the wire rather than assumed.
 ///
@@ -1176,6 +1180,12 @@ pub struct SnapshotSemanticEnvelope {
     /// The epoch `content_hash` was computed at. Present on every item so the
     /// server never has to guess which projection produced a hash.
     pub hash_epoch: u16,
+    /// Opaque predecessor authorization returned only after the backend proved
+    /// these exact bytes own the current head. Legacy reconciliation never
+    /// borrows a settled sibling's token: an absent token is an explicit CAS
+    /// bootstrap that admits only an exact repeat or a genuinely missing head.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_head_etag: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1185,41 +1195,76 @@ struct SnapshotItemWire<'a> {
     semantic_envelope: SnapshotSemanticEnvelope,
 }
 
+/// Normal batch wire with optional optimistic-head enforcement. Reconciliation
+/// uses the same write endpoint and entity ACKs as every upload; this wrapper
+/// only activates the backend's existing CAS discipline for an isolated legacy
+/// page.
+pub(crate) struct SnapshotBatchWireRequest<'a> {
+    request: &'a SnapshotBatchRequest,
+    enforce_head_cas: bool,
+}
+
+impl SnapshotBatchRequest {
+    pub(crate) fn wire_with_head_cas(&self) -> SnapshotBatchWireRequest<'_> {
+        SnapshotBatchWireRequest {
+            request: self,
+            enforce_head_cas: true,
+        }
+    }
+}
+
+fn serialize_snapshot_batch<S: Serializer>(
+    request: &SnapshotBatchRequest,
+    enforce_head_cas: bool,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let source = snapshot_source_from_api_slug(&request.source)
+        .ok_or_else(|| serde::ser::Error::custom("unsupported snapshot source"))?;
+    let snapshots = request
+        .snapshots
+        .iter()
+        .map(|snapshot| {
+            let semantic_envelope =
+                snapshot_semantic_envelope(source, snapshot, request.upload_policy);
+            let encoded =
+                serde_json::to_vec(&semantic_envelope).map_err(serde::ser::Error::custom)?;
+            if encoded.len() > MAX_SEMANTIC_ENVELOPE_BYTES {
+                return Err(serde::ser::Error::custom(format!(
+                    "semantic_envelope exceeds {MAX_SEMANTIC_ENVELOPE_BYTES} bytes"
+                )));
+            }
+            Ok(SnapshotItemWire {
+                snapshot,
+                semantic_envelope,
+            })
+        })
+        .collect::<Result<Vec<_>, S::Error>>()?;
+    let mut state = serializer.serialize_struct("SnapshotBatchRequest", 8)?;
+    state.serialize_field("schema_version", &request.schema_version)?;
+    state.serialize_field("source", &request.source)?;
+    state.serialize_field("machine_id", &request.machine_id)?;
+    state.serialize_field("collector_version", &request.collector_version)?;
+    // Daemon-first capability declaration. Older backends use a
+    // forward-tolerant ingest model and ignore it; capable backends echo it
+    // and may return a complete per-entity outcome partition.
+    state.serialize_field("entity_ack_contract", SNAPSHOT_ENTITY_ACK_CONTRACT)?;
+    if enforce_head_cas {
+        state.serialize_field("head_cas_contract", SNAPSHOT_HEAD_CAS_CONTRACT)?;
+    }
+    state.serialize_field("snapshots", &snapshots)?;
+    state.serialize_field("client_report", &request.client_report)?;
+    state.end()
+}
+
 impl Serialize for SnapshotBatchRequest {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let source = snapshot_source_from_api_slug(&self.source)
-            .ok_or_else(|| serde::ser::Error::custom("unsupported snapshot source"))?;
-        let snapshots = self
-            .snapshots
-            .iter()
-            .map(|snapshot| {
-                let semantic_envelope =
-                    snapshot_semantic_envelope(source, snapshot, self.upload_policy);
-                let encoded =
-                    serde_json::to_vec(&semantic_envelope).map_err(serde::ser::Error::custom)?;
-                if encoded.len() > MAX_SEMANTIC_ENVELOPE_BYTES {
-                    return Err(serde::ser::Error::custom(format!(
-                        "semantic_envelope exceeds {MAX_SEMANTIC_ENVELOPE_BYTES} bytes"
-                    )));
-                }
-                Ok(SnapshotItemWire {
-                    snapshot,
-                    semantic_envelope,
-                })
-            })
-            .collect::<Result<Vec<_>, S::Error>>()?;
-        let mut state = serializer.serialize_struct("SnapshotBatchRequest", 7)?;
-        state.serialize_field("schema_version", &self.schema_version)?;
-        state.serialize_field("source", &self.source)?;
-        state.serialize_field("machine_id", &self.machine_id)?;
-        state.serialize_field("collector_version", &self.collector_version)?;
-        // Daemon-first capability declaration. Older backends use a
-        // forward-tolerant ingest model and ignore it; capable backends echo it
-        // and may return a complete per-entity outcome partition.
-        state.serialize_field("entity_ack_contract", SNAPSHOT_ENTITY_ACK_CONTRACT)?;
-        state.serialize_field("snapshots", &snapshots)?;
-        state.serialize_field("client_report", &self.client_report)?;
-        state.end()
+        serialize_snapshot_batch(self, false, serializer)
+    }
+}
+
+impl Serialize for SnapshotBatchWireRequest<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_snapshot_batch(self.request, self.enforce_head_cas, serializer)
     }
 }
 
@@ -1602,6 +1647,10 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -1848,6 +1897,17 @@ pub struct ScanIndex {
     /// file mtime or the collector observation clock.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub snapshot_activity_at: BTreeMap<String, Option<String>>,
+    /// Exact entity ACK identities known durable at the backend. Older indexes
+    /// deserialize this empty. The separate version bit distinguishes that
+    /// legacy absence from a current, authoritatively empty ledger.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    accepted_snapshot_fingerprints: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    accepted_snapshot_fingerprint_ledger_version: u8,
+    /// Restart-stable lexicographic cursor for bounded re-entry of ambiguous
+    /// pre-ledger entities through the existing snapshot entity-ACK contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_settlement_reconcile_after_fingerprint: Option<String>,
     /// Rejected entities are quarantined under the exact daemon/parser/wire
     /// contract that produced the rejection. They are excluded from the
     /// server-agreement manifest while that witness is current, but are
@@ -1901,6 +1961,9 @@ impl Default for ScanIndex {
             confirmed_empty_files: BTreeSet::new(),
             file_snapshot_fingerprints: BTreeMap::new(),
             snapshot_activity_at: BTreeMap::new(),
+            accepted_snapshot_fingerprints: BTreeSet::new(),
+            accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_VERSION,
+            legacy_settlement_reconcile_after_fingerprint: None,
             quarantined_snapshot_fingerprints: BTreeMap::new(),
             active_quarantine_witness: None,
             active_upload_context_fingerprint: None,
@@ -1929,6 +1992,23 @@ pub struct SnapshotQuarantineRecord {
     /// correction with the same semantic fingerprint bypasses quarantine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_body_witness: Option<String>,
+    #[serde(default = "initial_snapshot_reconstruction_failure_count")]
+    pub failed_reconstruction_count: u8,
+    #[serde(default)]
+    pub disposition: SnapshotQuarantineDisposition,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotQuarantineDisposition {
+    #[default]
+    RetryPending,
+    UnprovenTerminal,
+    SupersededTerminal,
+}
+
+const fn initial_snapshot_reconstruction_failure_count() -> u8 {
+    1
 }
 
 pub fn snapshot_quarantine_witness(source: SnapshotSource) -> SnapshotQuarantineWitness {
@@ -1951,6 +2031,8 @@ pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineR
         witness: snapshot_quarantine_witness(source),
         retry_after_unix_seconds: now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS),
         upload_body_witness: None,
+        failed_reconstruction_count: initial_snapshot_reconstruction_failure_count(),
+        disposition: SnapshotQuarantineDisposition::RetryPending,
     }
 }
 
@@ -1967,8 +2049,21 @@ fn snapshot_quarantine_deadline_is_bounded_at(record: &SnapshotQuarantineRecord,
     // Anything further out is corrupt state or evidence the wall clock moved
     // backwards. In either case local state must never become a permanent
     // authority that fences a repaired backend forever.
-    record.retry_after_unix_seconds
-        <= now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2))
+    match record.disposition {
+        SnapshotQuarantineDisposition::RetryPending => {
+            record.failed_reconstruction_count < MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+                && record.retry_after_unix_seconds
+                    <= now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2))
+        }
+        SnapshotQuarantineDisposition::UnprovenTerminal => {
+            record.failed_reconstruction_count == MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+                && record.retry_after_unix_seconds == 0
+        }
+        SnapshotQuarantineDisposition::SupersededTerminal => {
+            record.failed_reconstruction_count <= MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+                && record.retry_after_unix_seconds == 0
+        }
+    }
 }
 
 fn scan_index_schema_version() -> u16 {
@@ -5335,6 +5430,7 @@ pub(crate) fn snapshot_semantic_envelope(
         revision_v2_hash: snapshot_revision_v2_hash(source, item, upload_policy, &component_hashes),
         content_hash: snapshot_content_hash(source, &item.source_session_id, &component_hashes),
         hash_epoch: SNAPSHOT_CONTENT_HASH_EPOCH,
+        base_head_etag: None,
         component_hashes,
     }
 }
@@ -16484,6 +16580,10 @@ impl ScanIndex {
         self.claude_usage_authority_pending_count() > 0
     }
 
+    pub(crate) fn legacy_settlement_ledger_needs_migration(&self) -> bool {
+        self.accepted_snapshot_fingerprint_ledger_version != SNAPSHOT_ACCEPTED_LEDGER_VERSION
+    }
+
     pub fn prepare_historical_replay(&mut self, generation: String) {
         if self.historical_replay_generation.as_ref() == Some(&generation) {
             return;
@@ -16502,6 +16602,191 @@ impl ScanIndex {
         self.confirmed_empty_files.clear();
         self.file_snapshot_fingerprints.clear();
         self.snapshot_activity_at.clear();
+        self.accepted_snapshot_fingerprints.clear();
+        self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
+        self.legacy_settlement_reconcile_after_fingerprint = None;
+        // A replay re-enters terminal entities that are still present because
+        // the file index above is empty and must be rebuilt. Keep the terminal
+        // record until that scan proves a replacement ACK or re-quarantine.
+        // If its source is absent, retaining it is the only replay-safe way to
+        // preserve the explicit disclosure and counter.
+        self.quarantined_snapshot_fingerprints.retain(|_, record| {
+            matches!(
+                record.disposition,
+                SnapshotQuarantineDisposition::UnprovenTerminal
+                    | SnapshotQuarantineDisposition::SupersededTerminal
+            )
+        });
+    }
+
+    /// Arm at most `limit` ambiguous pre-ledger identities for re-entry through
+    /// the already-deployed snapshot entity-ACK upload contract. The cursor and
+    /// each armed quarantine record are persisted before scanning, so a restart
+    /// resumes instead of rebuilding one unbounded request.
+    pub(crate) fn prepare_legacy_settlement_reconciliation(
+        &mut self,
+        source: SnapshotSource,
+        limit: usize,
+    ) -> (BTreeSet<String>, bool) {
+        if self.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {
+            return (BTreeSet::new(), false);
+        }
+        let current = self.current_snapshot_fingerprints();
+        if self.legacy_settlement_reconcile_after_fingerprint.is_none()
+            && self.traversal.is_none()
+            && !self.bounded_sweep_had_unsettled_upload
+            && self.quarantined_snapshot_fingerprints.is_empty()
+        {
+            self.accepted_snapshot_fingerprints = current;
+            self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
+            return (BTreeSet::new(), true);
+        }
+
+        let pending = self.legacy_settlement_reconciliation_pending_fingerprints();
+        if pending.is_empty() {
+            self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
+            self.legacy_settlement_reconcile_after_fingerprint = None;
+            return (BTreeSet::new(), true);
+        }
+        let unarmed = pending
+            .iter()
+            .filter(|fingerprint| {
+                !self
+                    .quarantined_snapshot_fingerprints
+                    .contains_key(*fingerprint)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if unarmed.is_empty() || limit == 0 {
+            return (BTreeSet::new(), false);
+        }
+        let after = self
+            .legacy_settlement_reconcile_after_fingerprint
+            .as_deref();
+        let selected =
+            unarmed
+                .iter()
+                .filter(|fingerprint| after.map_or(true, |cursor| fingerprint.as_str() > cursor))
+                .chain(unarmed.iter().filter(|fingerprint| {
+                    after.is_some_and(|cursor| fingerprint.as_str() <= cursor)
+                }))
+                .take(limit)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+        let mut witness = snapshot_quarantine_witness(source);
+        witness.contract = SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION.to_string();
+        for fingerprint in &selected {
+            self.quarantined_snapshot_fingerprints.insert(
+                fingerprint.clone(),
+                SnapshotQuarantineRecord {
+                    witness: witness.clone(),
+                    retry_after_unix_seconds: 0,
+                    upload_body_witness: None,
+                    failed_reconstruction_count: 0,
+                    disposition: SnapshotQuarantineDisposition::RetryPending,
+                },
+            );
+        }
+        // The lost-obligation production shape has an empty terminal-unhealthy
+        // traversal whose independent retry is not due. Reset only traversal
+        // discovery; existing file/entity checkpoints remain the source of the
+        // forced reparse decisions above.
+        if !selected.is_empty() {
+            self.legacy_settlement_reconcile_after_fingerprint = selected.last().cloned();
+            self.traversal = None;
+            self.bounded_sweep_had_unsettled_upload = true;
+        }
+        (selected, true)
+    }
+
+    pub(crate) fn legacy_settlement_reconciliation_pending_fingerprints(&self) -> BTreeSet<String> {
+        if self.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {
+            return BTreeSet::new();
+        }
+        self.current_snapshot_fingerprints()
+            .difference(&self.accepted_snapshot_fingerprints)
+            .filter(|fingerprint| {
+                self.quarantined_snapshot_fingerprints
+                    .get(*fingerprint)
+                    .map_or(true, |record| {
+                        record.disposition == SnapshotQuarantineDisposition::RetryPending
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn finish_legacy_settlement_reconciliation(&mut self) {
+        if self
+            .legacy_settlement_reconciliation_pending_fingerprints()
+            .is_empty()
+        {
+            self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
+            self.legacy_settlement_reconcile_after_fingerprint = None;
+        }
+    }
+
+    pub(crate) fn snapshot_unproven_terminal_count(&self) -> usize {
+        self.quarantined_snapshot_fingerprints
+            .values()
+            .filter(|record| record.disposition == SnapshotQuarantineDisposition::UnprovenTerminal)
+            .count()
+    }
+
+    pub(crate) fn snapshot_superseded_terminal_count(&self) -> usize {
+        self.quarantined_snapshot_fingerprints
+            .values()
+            .filter(|record| {
+                record.disposition == SnapshotQuarantineDisposition::SupersededTerminal
+            })
+            .count()
+    }
+
+    pub(crate) fn record_accepted_snapshot_fingerprints(&mut self, accepted: &BTreeSet<String>) {
+        self.accepted_snapshot_fingerprints
+            .extend(accepted.iter().cloned());
+        let current = self.current_snapshot_fingerprints();
+        self.accepted_snapshot_fingerprints.retain(|fingerprint| {
+            current.contains(fingerprint)
+                && !self
+                    .quarantined_snapshot_fingerprints
+                    .contains_key(fingerprint)
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_terminal_unhealthy_traversal_for_retry_test(
+        &mut self,
+        source: SnapshotSource,
+        roots: &[PathBuf],
+        backfill_window_days: u64,
+        retry_not_before_unix_seconds: u64,
+    ) {
+        self.traversal = Some(ScanTraversalCheckpoint {
+            context_fingerprint: scan_traversal_context_fingerprint(
+                source,
+                roots,
+                self,
+                backfill_window_days,
+            ),
+            census_window_end: "2026-09-01T03:27:03Z".to_string(),
+            scan_roots: Vec::new(),
+            pending_directories: VecDeque::new(),
+            pending_candidates: VecDeque::new(),
+            observed_index_keys: BTreeSet::new(),
+            codex_rollout_paths: BTreeSet::new(),
+            reconciliation_upper_bound: None,
+            reconciliation_after: None,
+            reconciliation_started: false,
+            watcher_hint_seen: false,
+            codex_parent_resolution_retry_required: false,
+            unhealthy_retry_attempt: 1,
+            unhealthy_retry_not_before_unix_seconds: Some(retry_not_before_unix_seconds),
+            counts: ScanTraversalCounts {
+                disappeared_file_count: 1,
+                ..ScanTraversalCounts::default()
+            },
+        });
     }
 
     pub(crate) fn historical_replay_generation_matches(&self, generation: &str) -> bool {
@@ -16541,7 +16826,8 @@ impl ScanIndex {
             .get(fingerprint)
             .zip(self.active_quarantine_witness.as_ref())
             .is_some_and(|(persisted, active)| {
-                &persisted.witness != active || persisted.retry_after_unix_seconds <= now
+                persisted.disposition == SnapshotQuarantineDisposition::RetryPending
+                    && (&persisted.witness != active || persisted.retry_after_unix_seconds <= now)
             })
     }
 
@@ -16568,6 +16854,26 @@ impl ScanIndex {
                         .snapshot_activity_at
                         .values()
                         .all(valid_snapshot_activity)
+                    && index
+                        .accepted_snapshot_fingerprints
+                        .iter()
+                        .all(|fingerprint| {
+                            fingerprint.len() == 64
+                                && fingerprint.bytes().all(|byte| {
+                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                })
+                        })
+                    && index.accepted_snapshot_fingerprint_ledger_version
+                        <= SNAPSHOT_ACCEPTED_LEDGER_VERSION
+                    && index
+                        .legacy_settlement_reconcile_after_fingerprint
+                        .as_deref()
+                        .map_or(true, |fingerprint| {
+                            fingerprint.len() == 64
+                                && fingerprint.bytes().all(|byte| {
+                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                })
+                        })
                     && index
                         .quarantined_snapshot_fingerprints
                         .values()
@@ -16926,6 +17232,12 @@ impl ScanIndex {
                 retained_quarantine.insert(fingerprint.clone(), witness.clone());
             }
         }
+        let mut accepted_snapshot_fingerprints = previous.accepted_snapshot_fingerprints.clone();
+        accepted_snapshot_fingerprints.extend(accepted.iter().cloned());
+        accepted_snapshot_fingerprints.retain(|fingerprint| {
+            committable_fingerprints.contains(fingerprint)
+                && !retained_quarantine.contains_key(fingerprint)
+        });
         let mut snapshot_activity_at = BTreeMap::new();
         for fingerprint in committable_fingerprints {
             if let Some(activity_at) = self
@@ -16975,6 +17287,18 @@ impl ScanIndex {
             confirmed_empty_files,
             file_snapshot_fingerprints,
             snapshot_activity_at,
+            accepted_snapshot_fingerprints,
+            accepted_snapshot_fingerprint_ledger_version: self
+                .accepted_snapshot_fingerprint_ledger_version
+                .max(previous.accepted_snapshot_fingerprint_ledger_version),
+            legacy_settlement_reconcile_after_fingerprint: self
+                .legacy_settlement_reconcile_after_fingerprint
+                .clone()
+                .or_else(|| {
+                    previous
+                        .legacy_settlement_reconcile_after_fingerprint
+                        .clone()
+                }),
             quarantined_snapshot_fingerprints: retained_quarantine.clone(),
             active_quarantine_witness: self.active_quarantine_witness.clone(),
             active_upload_context_fingerprint: self.active_upload_context_fingerprint.clone(),
@@ -16993,11 +17317,38 @@ impl ScanIndex {
             .flat_map(BTreeSet::iter)
             .chain(self.codex_state_only_snapshot_fingerprints.values())
             .collect::<BTreeSet<_>>();
+        let replay_safe_absent_terminals = self
+            .quarantined_snapshot_fingerprints
+            .iter()
+            .filter(|(fingerprint, record)| {
+                !current.contains(*fingerprint)
+                    && matches!(
+                        record.disposition,
+                        SnapshotQuarantineDisposition::UnprovenTerminal
+                            | SnapshotQuarantineDisposition::SupersededTerminal
+                    )
+            })
+            .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
+            .collect::<BTreeMap<_, _>>();
         self.quarantined_snapshot_fingerprints = quarantined
             .iter()
-            .filter(|(fingerprint, _)| current.contains(*fingerprint))
+            .filter(|(fingerprint, record)| {
+                current.contains(*fingerprint)
+                    || record.disposition == SnapshotQuarantineDisposition::SupersededTerminal
+            })
             .map(|(fingerprint, witness)| (fingerprint.clone(), witness.clone()))
             .collect();
+        for (fingerprint, record) in replay_safe_absent_terminals {
+            self.quarantined_snapshot_fingerprints
+                .entry(fingerprint)
+                .or_insert(record);
+        }
+        self.accepted_snapshot_fingerprints.retain(|fingerprint| {
+            current.contains(fingerprint)
+                && !self
+                    .quarantined_snapshot_fingerprints
+                    .contains_key(fingerprint)
+        });
     }
 
     fn remove_file_entry(&mut self, key: &str) {
@@ -19246,6 +19597,8 @@ mod tests {
             retry_after_unix_seconds: original_now
                 + SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2),
             upload_body_witness: None,
+            failed_reconstruction_count: 1,
+            disposition: SnapshotQuarantineDisposition::RetryPending,
         };
         assert!(snapshot_quarantine_deadline_is_bounded_at(
             &record,
@@ -19263,6 +19616,172 @@ mod tests {
             &far_future,
             original_now
         ));
+    }
+
+    fn legacy_shaped_index(mut index: ScanIndex) -> ScanIndex {
+        let mut value = serde_json::to_value(&index).expect("serialize current index");
+        let object = value.as_object_mut().expect("scan index object");
+        object.remove("accepted_snapshot_fingerprints");
+        object.remove("accepted_snapshot_fingerprint_ledger_version");
+        index = serde_json::from_value(value).expect("deserialize exact pre-ledger index shape");
+        assert!(index.accepted_snapshot_fingerprints.is_empty());
+        assert!(index.legacy_settlement_ledger_needs_migration());
+        index
+    }
+
+    #[test]
+    fn legacy_0_1_121_fully_settled_history_is_not_rearmed() {
+        let accepted = "a".repeat(64);
+        let settled_sibling = "b".repeat(64);
+        let mut legacy = legacy_shaped_index(ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "same-session-siblings.jsonl".to_string(),
+                BTreeSet::from([accepted.clone(), settled_sibling.clone()]),
+            )]),
+            ..ScanIndex::default()
+        });
+
+        let (armed, changed) =
+            legacy.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+        assert!(armed.is_empty());
+        assert!(changed);
+        assert!(!legacy.legacy_settlement_ledger_needs_migration());
+        assert_eq!(
+            legacy.accepted_snapshot_fingerprints,
+            BTreeSet::from([accepted, settled_sibling])
+        );
+        assert!(legacy.quarantined_snapshot_fingerprints.is_empty());
+    }
+
+    #[test]
+    fn legacy_0_1_121_unfinished_strand_rearms_in_persisted_bounded_pages() {
+        let root = temp_dir("scan-index-rearm-stranded-revision");
+        let path = root.join("codex-scan-index-v3.json");
+        let accepted = "a".repeat(64);
+        let stranded = "b".repeat(64);
+        let mut index = legacy_shaped_index(ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "same-session-siblings.jsonl".to_string(),
+                BTreeSet::from([accepted.clone(), stranded.clone()]),
+            )]),
+            traversal: Some(terminal_unhealthy_traversal("terminal-red".to_string())),
+            ..ScanIndex::default()
+        });
+
+        let (first_page, changed) =
+            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 1);
+        assert!(changed);
+        assert_eq!(first_page, BTreeSet::from([accepted.clone()]));
+        assert!(
+            index.traversal.is_none(),
+            "the empty traversal is restarted"
+        );
+        let first = index
+            .quarantined_snapshot_fingerprints
+            .get(&accepted)
+            .expect("the first bounded identity is armed");
+        assert_eq!(
+            first.witness.contract,
+            SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION
+        );
+        assert_eq!(first.retry_after_unix_seconds, 0);
+        assert_eq!(
+            index.legacy_settlement_reconcile_after_fingerprint,
+            Some(accepted.clone())
+        );
+        index.save(&path).expect("persist repaired retry state");
+
+        let mut restarted = ScanIndex::load(&path).expect("reload repaired index");
+        let (second_page, changed) =
+            restarted.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 1);
+        assert!(changed);
+        assert_eq!(second_page, BTreeSet::from([stranded.clone()]));
+        assert!(restarted
+            .quarantined_snapshot_fingerprints
+            .contains_key(&stranded));
+        assert_eq!(
+            restarted.legacy_settlement_reconciliation_pending_fingerprints(),
+            BTreeSet::from([accepted, stranded])
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_reconciliation_bounds_real_scale_and_resumes_from_persisted_cursor() {
+        let root = temp_dir("scan-index-bounded-legacy-reconciliation");
+        let path = root.join("codex-scan-index-v3.json");
+        let fingerprints = (0..2_247)
+            .map(|value| format!("{value:064x}"))
+            .collect::<BTreeSet<_>>();
+        let mut index = legacy_shaped_index(ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "real-scale-session-set.jsonl".to_string(),
+                fingerprints.clone(),
+            )]),
+            traversal: Some(terminal_unhealthy_traversal("terminal-red".to_string())),
+            ..ScanIndex::default()
+        });
+
+        let (first, changed) =
+            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+        assert!(changed);
+        assert_eq!(first.len(), 50);
+        assert_eq!(index.quarantined_snapshot_fingerprints.len(), 50);
+        index.save(&path).expect("persist first bounded cursor");
+
+        let mut restarted = ScanIndex::load(&path).expect("reload first bounded cursor");
+        let (second, changed) =
+            restarted.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+        assert!(changed);
+        assert_eq!(second.len(), 50);
+        assert!(first.is_disjoint(&second));
+        assert_eq!(restarted.quarantined_snapshot_fingerprints.len(), 100);
+        assert_eq!(
+            restarted
+                .legacy_settlement_reconciliation_pending_fingerprints()
+                .len(),
+            fingerprints.len()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn historical_replay_preserves_absent_terminal_disclosure_and_counters() {
+        let root = temp_dir("scan-index-replay-absent-terminals");
+        let path = root.join("codex-scan-index-v3.json");
+        let unproven = "a".repeat(64);
+        let superseded = "b".repeat(64);
+        let mut unproven_record = snapshot_quarantine_record(SnapshotSource::Codex);
+        unproven_record.retry_after_unix_seconds = 0;
+        unproven_record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        unproven_record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        let mut superseded_record = snapshot_quarantine_record(SnapshotSource::Codex);
+        superseded_record.retry_after_unix_seconds = 0;
+        superseded_record.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+        let mut index = ScanIndex {
+            quarantined_snapshot_fingerprints: BTreeMap::from([
+                (unproven.clone(), unproven_record),
+                (superseded.clone(), superseded_record),
+            ]),
+            ..ScanIndex::default()
+        };
+
+        index.prepare_historical_replay("replay-r3".to_string());
+        index.retain_quarantined_fingerprints(&BTreeMap::new());
+        assert_eq!(index.snapshot_unproven_terminal_count(), 1);
+        assert_eq!(index.snapshot_superseded_terminal_count(), 1);
+        index.save(&path).expect("persist replay-safe terminals");
+
+        let restarted = ScanIndex::load(&path).expect("reload replay-safe terminals");
+        assert_eq!(restarted.snapshot_unproven_terminal_count(), 1);
+        assert_eq!(restarted.snapshot_superseded_terminal_count(), 1);
+        assert!(restarted
+            .quarantined_snapshot_fingerprints
+            .contains_key(&unproven));
+        assert!(restarted
+            .quarantined_snapshot_fingerprints
+            .contains_key(&superseded));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -19840,6 +20359,8 @@ mod tests {
                     witness: stale_witness,
                     retry_after_unix_seconds: u64::MAX,
                     upload_body_witness: None,
+                    failed_reconstruction_count: 1,
+                    disposition: SnapshotQuarantineDisposition::RetryPending,
                 },
             )]),
             ..ScanIndex::default()
@@ -20442,6 +20963,8 @@ mod tests {
                 witness: snapshot_quarantine_witness(SnapshotSource::Pi),
                 retry_after_unix_seconds: 0,
                 upload_body_witness: None,
+                failed_reconstruction_count: 1,
+                disposition: SnapshotQuarantineDisposition::RetryPending,
             },
         );
 
@@ -31793,6 +32316,8 @@ mod tests {
                     occurrence_count: 1,
                     body_witness_version: version,
                     body_witness_digest: digest,
+                    head_etag: None,
+                    head_challenge: None,
                 }],
                 unchanged_entities: Vec::new(),
                 rejected_entities: Vec::new(),
@@ -38994,6 +39519,28 @@ mod tests {
         assert_eq!(content_hash.len(), 64);
         assert!(content_hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(envelope["hash_epoch"], SNAPSHOT_CONTENT_HASH_EPOCH);
+    }
+
+    #[test]
+    fn legacy_reconcile_wire_uses_explicit_head_cas_bootstrap_without_a_sibling_token() {
+        let request = valid_v6_batch_request();
+        let ordinary = serde_json::to_value(&request).expect("serialize ordinary batch");
+        let reconcile = serde_json::to_value(request.wire_with_head_cas())
+            .expect("serialize normal CAS-fenced reconciliation batch");
+
+        assert!(ordinary.get("head_cas_contract").is_none());
+        assert_eq!(
+            reconcile["head_cas_contract"],
+            json!(SNAPSHOT_HEAD_CAS_CONTRACT)
+        );
+        let envelope = &reconcile["snapshots"][0]["semantic_envelope"];
+        assert!(
+            envelope.get("base_head_etag").is_none(),
+            "a pre-head-token legacy index must bootstrap instead of borrowing the settled sibling's etag"
+        );
+        assert!(envelope.get("conflict_head_challenge").is_none());
+        assert!(envelope.get("rescan_from_revision_hash").is_none());
+        assert!(envelope.get("forced_full_rescan").is_none());
     }
 
     #[test]

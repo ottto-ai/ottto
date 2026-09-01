@@ -581,6 +581,10 @@ pub struct SnapshotEntityRef {
     pub body_witness_version: Option<u64>,
     #[serde(default)]
     pub body_witness_digest: Option<String>,
+    #[serde(default)]
+    pub head_etag: Option<String>,
+    #[serde(default)]
+    pub head_challenge: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -603,6 +607,14 @@ impl SnapshotBatchResponse {
     /// Reject malformed, short, duplicated, foreign, overlapping, or partial
     /// ACKs before any local checkpoint can advance.
     pub fn validate_entity_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
+        self.validate_entity_ack_with_head_cas(request, false)
+    }
+
+    pub fn validate_entity_ack_with_head_cas(
+        &self,
+        request: &SnapshotBatchRequest,
+        enforce_head_cas: bool,
+    ) -> Result<()> {
         if self.disabled {
             if self.accepted != 0
                 || !self.accepted_entities.is_empty()
@@ -645,7 +657,49 @@ impl SnapshotBatchResponse {
                 item.snapshot_fingerprint.as_str(),
             )
         }))?;
+        self.validate_head_cas_ack(enforce_head_cas)?;
         self.validate_body_witness_ack(request)
+    }
+
+    fn validate_head_cas_ack(&self, enforce_head_cas: bool) -> Result<()> {
+        let all_refs = self
+            .accepted_entities
+            .iter()
+            .chain(&self.unchanged_entities)
+            .chain(&self.conflict_entities);
+        if !enforce_head_cas {
+            if all_refs.clone().any(|reference| {
+                reference.head_etag.is_some() || reference.head_challenge.is_some()
+            }) {
+                return Err(anyhow!(
+                    "snapshot ACK returned head tokens for a request without the head-CAS contract"
+                ));
+            }
+            return Ok(());
+        }
+        for reference in self
+            .accepted_entities
+            .iter()
+            .chain(&self.unchanged_entities)
+        {
+            if !valid_snapshot_head_token(reference.head_etag.as_deref())
+                || reference.head_challenge.is_some()
+            {
+                return Err(anyhow!(
+                    "snapshot head-CAS ACK lacks an exclusive accepted head etag"
+                ));
+            }
+        }
+        for reference in &self.conflict_entities {
+            if reference.head_etag.is_some()
+                || !valid_snapshot_head_token(reference.head_challenge.as_deref())
+            {
+                return Err(anyhow!(
+                    "snapshot head-CAS conflict lacks an exclusive head challenge"
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn validate_body_witness_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
@@ -709,7 +763,7 @@ impl SnapshotBatchResponse {
         Ok(())
     }
 
-    fn validate_entity_ack_identities<'a>(
+    pub(crate) fn validate_entity_ack_identities<'a>(
         &self,
         identities: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Result<()> {
@@ -752,6 +806,8 @@ impl SnapshotBatchResponse {
                 occurrence_count: rejection.occurrence_count,
                 body_witness_version: None,
                 body_witness_digest: None,
+                head_etag: None,
+                head_challenge: None,
             };
             validate_snapshot_entity_ref(&reference)?;
             if !rejection.permanent {
@@ -787,6 +843,15 @@ impl SnapshotBatchResponse {
         }
         Ok(())
     }
+}
+
+fn valid_snapshot_head_token(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn record_snapshot_ack_occurrences(
@@ -872,6 +937,8 @@ pub struct SnapshotStatusRequest {
     pub last_zero_snapshot_usage_evidence_count: u64,
     pub last_dropped_usage_record_count: u64,
     pub last_ownership_incomplete_file_count: u64,
+    pub last_snapshot_unproven_terminal_count: u64,
+    pub last_snapshot_superseded_terminal_count: u64,
     pub last_backfill_window_days: u64,
     pub last_backfill_file_limit: u64,
     pub last_discovered_file_count: u64,
@@ -1095,9 +1162,14 @@ impl SnapshotApiClient {
         &self,
         relay_token: &str,
         request: &SnapshotBatchRequest,
+        enforce_head_cas: bool,
     ) -> Result<SnapshotBatchResponse> {
-        let body = serde_json::to_vec(request)
-            .map_err(|error| anyhow!("serialize snapshot batch failed: {error}"))?;
+        let body = if enforce_head_cas {
+            serde_json::to_vec(&request.wire_with_head_cas())
+        } else {
+            serde_json::to_vec(request)
+        }
+        .map_err(|error| anyhow!("serialize snapshot batch failed: {error}"))?;
         let compressed = snapshot_upload_gzip_enabled()
             .then(|| gzip(&body))
             .flatten();
@@ -2339,6 +2411,8 @@ mod tests {
             last_zero_snapshot_usage_evidence_count: 0,
             last_dropped_usage_record_count: 0,
             last_ownership_incomplete_file_count: 0,
+            last_snapshot_unproven_terminal_count: 0,
+            last_snapshot_superseded_terminal_count: 0,
             last_semantic_noop_count: 7,
             last_census_complete: false,
             last_symlink_rejected_count: 1,
@@ -2393,6 +2467,8 @@ mod tests {
             last_zero_snapshot_usage_evidence_count: 0,
             last_dropped_usage_record_count: 0,
             last_ownership_incomplete_file_count: 0,
+            last_snapshot_unproven_terminal_count: 0,
+            last_snapshot_superseded_terminal_count: 0,
             last_backfill_window_days: window_days as u64,
             last_backfill_file_limit: 10_000,
             last_discovered_file_count: 1,
@@ -2506,6 +2582,8 @@ mod tests {
             occurrence_count,
             body_witness_version: None,
             body_witness_digest: None,
+            head_etag: None,
+            head_challenge: None,
         }
     }
 
@@ -2525,6 +2603,48 @@ mod tests {
             rejected_entities: Vec::new(),
             conflict_entities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn head_cas_ack_accepts_only_etags_for_settled_and_challenges_for_conflicts() {
+        let fingerprint = "a".repeat(64);
+        let mut settled = entity_ack(1, vec![entity_ref("session", &fingerprint, 1)]);
+        settled.accepted_entities[0].head_etag = Some("b".repeat(64));
+        settled
+            .validate_head_cas_ack(true)
+            .expect("accepted CAS identity carries its held-head etag");
+
+        let mut conflicted = entity_ack(0, Vec::new());
+        conflicted.conflict_entities = vec![entity_ref("session", &fingerprint, 1)];
+        conflicted.conflict_entities[0].head_challenge = Some("c".repeat(64));
+        conflicted
+            .validate_head_cas_ack(true)
+            .expect("conflict carries only its non-authorizing challenge");
+
+        conflicted.conflict_entities[0].head_etag = Some("d".repeat(64));
+        conflicted
+            .validate_head_cas_ack(true)
+            .expect_err("a conflict can never disclose an accepted predecessor token");
+    }
+
+    #[test]
+    fn head_cas_ack_fails_closed_on_missing_malformed_or_unsolicited_tokens() {
+        let fingerprint = "a".repeat(64);
+        let missing = entity_ack(1, vec![entity_ref("session", &fingerprint, 1)]);
+        missing
+            .validate_head_cas_ack(true)
+            .expect_err("CAS settlement requires a returned head etag");
+
+        let mut malformed = entity_ack(1, vec![entity_ref("session", &fingerprint, 1)]);
+        malformed.accepted_entities[0].head_etag = Some("NOT-A-DIGEST".to_string());
+        malformed
+            .validate_head_cas_ack(true)
+            .expect_err("head tokens are exact lowercase SHA-256-shaped values");
+
+        malformed.accepted_entities[0].head_etag = Some("b".repeat(64));
+        malformed
+            .validate_head_cas_ack(false)
+            .expect_err("ordinary requests cannot silently adopt unsolicited head state");
     }
 
     #[test]
