@@ -3909,7 +3909,19 @@ fn report_status_with_fresh_relay_token(
     // Commit the exact typed receipt before it can reach the backend. A later
     // cycle-start or heartbeat therefore repeats one coherent scan result
     // instead of combining a fresh start/default counters with an old error.
-    save_terminal_status_journal(&journal_path, &request)?;
+    //
+    // The ordering holds on the success path, but it is best-effort: the
+    // journal is a local diagnostic artifact with no production reader, so a
+    // full disk or an unwritable support dir must not suppress the terminal
+    // report itself. Remote truth never waits on local disk; the failure is
+    // disclosed on the daemon's error log instead.
+    if let Err(error) = save_terminal_status_journal(&journal_path, &request) {
+        eprintln!(
+            "local snapshot terminal status journal write failed for {}: {}",
+            source.api_slug(),
+            safe_error(&error)
+        );
+    }
     client.report_status(&relay_token, &request)?;
     Ok(())
 }
@@ -8476,6 +8488,75 @@ mod tests {
         assert_eq!(checkin["last_scan_started_at"], "2026-09-01T08:12:28Z");
         assert_eq!(checkin["last_recognized_usage_drop_count"], 0);
         assert_eq!(checkin["last_dropped_usage_record_count"], 0);
+    }
+
+    /// The journal is a local diagnostic artifact with no production reader, so
+    /// it must never gate remote truth. An unwritable support dir - a full or
+    /// read-only disk in the field - has to log and continue, with the terminal
+    /// receipt reaching the backend carrying exactly the same counters.
+    #[test]
+    #[serial(source_manifests)]
+    fn terminal_receipt_is_posted_when_the_journal_write_fails() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server_with_hints(
+            captured.clone(),
+            vec![30],
+        ));
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+
+        // Inject the write failure without a test-only seam: the journal's
+        // parent chain runs through a regular file, so `create_dir_all` fails
+        // exactly as it would on an unwritable support directory.
+        let support_dir = test_terminal_status_support_dir().join("blocked-support-dir");
+        std::fs::create_dir_all(test_terminal_status_support_dir())
+            .expect("create terminal status test root");
+        std::fs::write(&support_dir, b"not a directory").expect("block the support dir");
+
+        let mut counts = SyncCounts::for_policy(30);
+        counts.scan_cap_hit = false;
+        counts.census_complete = true;
+        counts.recognized_usage_drop_count = 1_105;
+        counts.dropped_usage_record_count = 1_105;
+        counts.ownership_incomplete_file_count = 1;
+
+        report_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            &support_dir,
+            SnapshotSource::Codex,
+            TerminalManifestSource::Withdraw,
+            CollectorStatus {
+                source: SnapshotSource::Codex,
+                machine_id: "otm_test",
+                scan_started_at: "2026-09-01T07:44:00Z",
+                counts,
+                state: CollectorState::Success,
+            },
+        )
+        .expect("a failed local journal write must not suppress the terminal report");
+
+        let requests = captured.lock().expect("captured requests").clone();
+        let terminal = http_request_json(&requests[1]);
+        assert_eq!(terminal["last_recognized_usage_drop_count"], 1_105);
+        assert_eq!(terminal["last_dropped_usage_record_count"], 1_105);
+        assert_eq!(terminal["last_ownership_incomplete_file_count"], 1);
+        assert_eq!(terminal["last_error_code"], "parse_error");
+        assert_eq!(terminal["last_scan_started_at"], "2026-09-01T07:44:00Z");
+        assert!(terminal["last_scan_finished_at"].is_string());
+        assert_eq!(terminal["last_scan_cap_hit"], false);
+
+        let destination = snapshot_upload_destination_namespace(&device, "device-secret");
+        assert!(
+            !terminal_status_journal_path(&support_dir, &destination, SnapshotSource::Codex)
+                .exists(),
+            "the journal genuinely failed to write; the POST proceeded anyway"
+        );
     }
 
     #[test]
