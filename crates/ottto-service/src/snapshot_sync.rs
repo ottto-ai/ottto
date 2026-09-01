@@ -13,17 +13,19 @@ use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
     LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
-    RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusRequest,
-    UploadFailureDiagnostics, UploadShed,
+    RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotSettlementProbe,
+    SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
 };
 use crate::snapshots::{
     apply_upload_policy, collector_version, context_curve_derivation_revision,
     finalize_scan_after_policy, scan_source_roots_with_attribution_and_claude_effort_and_hints,
     snapshot_quarantine_deadline_is_bounded, snapshot_quarantine_witness,
     snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
-    SnapshotItem, SnapshotQuarantineRecord, SnapshotQuarantineWitness, SnapshotSource,
-    SnapshotSourceManifest, SnapshotUploadPolicy, SourceScanResult, CONTEXT_CURVE_CONTRACT_VERSION,
-    MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION,
+    SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
+    SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
+    SourceScanResult, CONTEXT_CURVE_CONTRACT_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
+    MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
+    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_SETTLEMENT_PROBE_CONTRACT_VERSION,
     SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
@@ -234,7 +236,8 @@ impl SnapshotUploadProgress {
             .quarantined_fingerprints
             .iter()
             .filter(|(_, record)| {
-                &record.witness != active || record.retry_after_unix_seconds <= now
+                record.disposition == SnapshotQuarantineDisposition::RetryPending
+                    && (&record.witness != active || record.retry_after_unix_seconds <= now)
             })
             .map(|(fingerprint, record)| {
                 (
@@ -249,16 +252,19 @@ impl SnapshotUploadProgress {
             .map(|(_, _, fingerprint)| fingerprint)
             .collect::<BTreeSet<_>>();
         for fingerprint in &retry {
-            let upload_body_witness = self
+            let record = self
                 .quarantined_fingerprints
                 .get(fingerprint)
-                .and_then(|record| record.upload_body_witness.clone());
+                .expect("selected quarantine retry exists")
+                .clone();
             self.quarantined_fingerprints.insert(
                 fingerprint.clone(),
                 SnapshotQuarantineRecord {
                     witness: active.clone(),
                     retry_after_unix_seconds: quarantine_retry_after(fingerprint),
-                    upload_body_witness,
+                    upload_body_witness: record.upload_body_witness,
+                    failed_reconstruction_count: record.failed_reconstruction_count,
+                    disposition: record.disposition,
                 },
             );
         }
@@ -330,12 +336,35 @@ impl SnapshotUploadProgress {
             .active_quarantine_witness
             .clone()
             .expect("upload progress always has an active quarantine witness");
+        let failed_reconstruction_count = self
+            .quarantined_fingerprints
+            .get(fingerprint)
+            .filter(|record| {
+                record.witness == witness
+                    && record.upload_body_witness.as_deref() == Some(body_witness)
+            })
+            .map(|record| record.failed_reconstruction_count.saturating_add(1))
+            .unwrap_or(1)
+            .min(MAX_SNAPSHOT_RECONSTRUCTION_FAILURES);
+        let disposition = if failed_reconstruction_count == MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+            SnapshotQuarantineDisposition::UnprovenTerminal
+        } else {
+            SnapshotQuarantineDisposition::RetryPending
+        };
         self.quarantined_fingerprints.insert(
             fingerprint.to_string(),
             SnapshotQuarantineRecord {
                 witness,
-                retry_after_unix_seconds: quarantine_retry_after(fingerprint),
+                retry_after_unix_seconds: if disposition
+                    == SnapshotQuarantineDisposition::UnprovenTerminal
+                {
+                    0
+                } else {
+                    quarantine_retry_after(fingerprint)
+                },
                 upload_body_witness: Some(body_witness.to_string()),
+                failed_reconstruction_count,
+                disposition,
             },
         );
         self.accepted_fingerprints.remove(fingerprint);
@@ -344,12 +373,18 @@ impl SnapshotUploadProgress {
     }
 
     fn retain_current_quarantines(&mut self, current: &BTreeSet<String>) -> bool {
-        let before = self.quarantined_fingerprints.len();
-        self.quarantined_fingerprints
-            .retain(|fingerprint, _| current.contains(fingerprint));
+        let before = self.quarantined_fingerprints.clone();
+        for (fingerprint, record) in &mut self.quarantined_fingerprints {
+            if !current.contains(fingerprint)
+                && record.disposition != SnapshotQuarantineDisposition::SupersededTerminal
+            {
+                record.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+                record.retry_after_unix_seconds = 0;
+            }
+        }
         self.active_quarantine_retries
             .retain(|fingerprint| current.contains(fingerprint));
-        self.quarantined_fingerprints.len() != before
+        self.quarantined_fingerprints != before
     }
 
     fn save(&mut self, path: &Path) -> Result<()> {
@@ -918,6 +953,8 @@ struct SyncCounts {
     over_line_cap_count: u64,
     recognized_usage_drop_count: u64,
     ownership_incomplete_file_count: u64,
+    snapshot_unproven_terminal_count: u64,
+    snapshot_superseded_terminal_count: u64,
     zero_snapshot_confirmed_count: u64,
     zero_snapshot_usage_evidence_count: u64,
     dropped_usage_record_count: u64,
@@ -961,12 +998,25 @@ impl SyncCounts {
             over_line_cap_count: scan_result.over_line_cap_count as u64,
             recognized_usage_drop_count: scan_result.recognized_usage_drop_count as u64,
             ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
+            snapshot_unproven_terminal_count: 0,
+            snapshot_superseded_terminal_count: 0,
             zero_snapshot_confirmed_count: scan_result.zero_snapshot_confirmed_count as u64,
             zero_snapshot_usage_evidence_count: scan_result.zero_snapshot_usage_evidence_count
                 as u64,
             dropped_usage_record_count: scan_result.dropped_usage_record_count,
             uploaded_count,
         }
+    }
+
+    fn with_snapshot_terminal_counts(mut self, index: &ScanIndex) -> Self {
+        self.snapshot_unproven_terminal_count = index.snapshot_unproven_terminal_count() as u64;
+        self.snapshot_superseded_terminal_count = index.snapshot_superseded_terminal_count() as u64;
+        // Mirror #389's disclosed-loss convention: terminal unproven entities
+        // also contribute to the established incomplete-evidence health scalar.
+        self.ownership_incomplete_file_count = self
+            .ownership_incomplete_file_count
+            .saturating_add(self.snapshot_unproven_terminal_count);
+        self
     }
 }
 
@@ -2070,16 +2120,34 @@ fn sync_source(
     let curve_replay_pending =
         context_curve_enabled && index.context_curve_replay_needed(&replay_generation);
     let historical_replay_pending = backfill_pending || curve_replay_pending;
-    if !historical_replay_pending {
-        let rearmed = index.rearm_unaccepted_manifest_revisions(source);
-        if rearmed > 0 {
-            // Make repair durable before the disposable upload ledger claims
-            // any due work. A crash now leaves every unproven manifest entry
-            // armed, and resetting traversal heals the 0.1.121 empty-terminal
-            // scan shape on the next start as well as this one.
+    if !historical_replay_pending && index.legacy_settlement_ledger_needs_migration() {
+        let requested = index.legacy_settlement_probe_fingerprints();
+        let rearmed = if requested.is_empty() {
+            Some(0)
+        } else {
+            reconcile_legacy_snapshot_settlement(
+                client,
+                &relay_token,
+                source,
+                machine_id,
+                receipt_window_days,
+                &mut index,
+                &requested,
+            )?
+        };
+        if let Some(rearmed) = rearmed {
+            // The accepted-ledger migration or exact server ACK is durable
+            // before the disposable upload ledger can claim any retry.
             index.save(&index_path)?;
+            if rearmed > 0 {
+                eprintln!(
+                    "ottto-service: re-armed {rearmed} manifest-present snapshot revision(s) proven missing by identity-only settlement reconciliation for {}",
+                    source.api_slug()
+                );
+            }
+        } else {
             eprintln!(
-                "ottto-service: re-armed {rearmed} manifest-present snapshot revision(s) with no durable ACK or retry obligation for {}",
+                "ottto-service: legacy snapshot settlement reconciliation is pending for {}; no snapshot body was re-armed",
                 source.api_slug()
             );
         }
@@ -2512,7 +2580,8 @@ fn sync_source(
                         &scan_result,
                         accepted,
                         receipt_window_days,
-                    ),
+                    )
+                    .with_snapshot_terminal_counts(&committable),
                     // `server_error` is the closest code the receipt contract
                     // carries; the loss report is where the shed is named
                     // precisely.
@@ -2539,7 +2608,8 @@ fn sync_source(
                         &scan_result,
                         accepted,
                         receipt_window_days,
-                    ),
+                    )
+                    .with_snapshot_terminal_counts(&index),
                     state: CollectorState::Disabled(
                         disabled_reason.or_else(|| Some("disabled_by_admin".to_string())),
                     ),
@@ -2677,7 +2747,8 @@ fn sync_source(
                         &scan_result,
                         accepted,
                         receipt_window_days,
-                    ),
+                    )
+                    .with_snapshot_terminal_counts(&index),
                     state,
                 },
             );
@@ -2776,7 +2847,8 @@ fn sync_source(
                 source,
                 machine_id,
                 scan_started_at: terminal_scan_started_at,
-                counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days),
+                counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
+                    .with_snapshot_terminal_counts(&index),
                 state: CollectorState::Error {
                     code: "server_error",
                     message: "backend deferred conflicting snapshot entities",
@@ -2800,7 +2872,8 @@ fn sync_source(
             source,
             machine_id,
             scan_started_at: terminal_scan_started_at,
-            counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days),
+            counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
+                .with_snapshot_terminal_counts(&index),
             state: CollectorState::Success,
         },
     )?;
@@ -3570,6 +3643,8 @@ fn report_status(
         last_zero_snapshot_usage_evidence_count: status.counts.zero_snapshot_usage_evidence_count,
         last_dropped_usage_record_count: status.counts.dropped_usage_record_count,
         last_ownership_incomplete_file_count: status.counts.ownership_incomplete_file_count,
+        last_snapshot_unproven_terminal_count: status.counts.snapshot_unproven_terminal_count,
+        last_snapshot_superseded_terminal_count: status.counts.snapshot_superseded_terminal_count,
         last_backfill_window_days: status.counts.backfill_window_days,
         last_backfill_file_limit: status.counts.backfill_file_limit,
         last_discovered_file_count: status.counts.discovered_file_count,
@@ -3590,9 +3665,95 @@ fn report_status(
         collector_version: Some(collector_version()),
         parser_version: Some(status.source.parser_version().to_string()),
         manifest,
+        settlement_probe: None,
     };
     client.report_status(relay_token, &request)?;
     Ok(())
+}
+
+fn reconcile_legacy_snapshot_settlement(
+    client: &SnapshotApiClient,
+    relay_token: &str,
+    source: SnapshotSource,
+    machine_id: &str,
+    receipt_window_days: u64,
+    index: &mut ScanIndex,
+    requested: &BTreeSet<String>,
+) -> Result<Option<usize>> {
+    let request = SnapshotStatusRequest {
+        schema_version: SNAPSHOT_STATUS_SCHEMA_VERSION,
+        source: source.api_slug().to_string(),
+        machine_id: machine_id.to_string(),
+        enabled: true,
+        disabled_reason: None,
+        last_scan_started_at: None,
+        last_scan_finished_at: None,
+        last_success_at: None,
+        last_error_code: None,
+        last_error_message: None,
+        last_uploaded_count: 0,
+        last_scanned_session_count: 0,
+        last_scanned_file_count: 0,
+        last_zero_snapshot_confirmed_count: 0,
+        last_zero_snapshot_usage_evidence_count: 0,
+        last_dropped_usage_record_count: 0,
+        last_ownership_incomplete_file_count: 0,
+        last_snapshot_unproven_terminal_count: 0,
+        last_snapshot_superseded_terminal_count: 0,
+        last_backfill_window_days: receipt_window_days,
+        last_backfill_file_limit: 0,
+        last_discovered_file_count: 0,
+        last_skipped_file_count_due_to_limit: 0,
+        last_scan_cap_hit: false,
+        last_semantic_noop_count: 0,
+        last_census_complete: false,
+        last_symlink_rejected_count: 0,
+        last_unreadable_path_count: 0,
+        last_oversized_file_count: 0,
+        last_disappeared_file_count: 0,
+        last_malformed_json_line_count: 0,
+        last_invalid_utf8_line_count: 0,
+        last_over_line_cap_count: 0,
+        last_recognized_usage_drop_count: 0,
+        consecutive_failures: 0,
+        next_retry_at: None,
+        collector_version: Some(collector_version()),
+        parser_version: Some(source.parser_version().to_string()),
+        manifest: None,
+        settlement_probe: Some(SnapshotSettlementProbe {
+            contract: SNAPSHOT_SETTLEMENT_PROBE_CONTRACT_VERSION.to_string(),
+            snapshot_fingerprints: requested.iter().cloned().collect(),
+        }),
+    };
+    let response = client.report_status(relay_token, &request)?;
+    if response.source != source.api_slug() || response.machine_id != machine_id {
+        return Err(anyhow!(
+            "snapshot settlement probe ACK source or machine does not match request"
+        ));
+    }
+    let Some(ack) = response.settlement_ack else {
+        return Ok(None);
+    };
+    if ack.contract != SNAPSHOT_SETTLEMENT_PROBE_CONTRACT_VERSION {
+        return Err(anyhow!(
+            "snapshot settlement probe ACK uses an unsupported contract"
+        ));
+    }
+    let accepted = ack
+        .accepted_snapshot_fingerprints
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let superseded = ack
+        .superseded_snapshot_fingerprints
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let missing = ack
+        .missing_snapshot_fingerprints
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    index
+        .apply_legacy_settlement_probe(source, requested, &accepted, &superseded, &missing)
+        .map(Some)
 }
 
 fn current_receipt_window_days(client: &SnapshotApiClient, relay_token: &str) -> Result<u64> {
@@ -3705,6 +3866,8 @@ fn report_checkin_status(
         last_zero_snapshot_usage_evidence_count: 0,
         last_dropped_usage_record_count: 0,
         last_ownership_incomplete_file_count: 0,
+        last_snapshot_unproven_terminal_count: 0,
+        last_snapshot_superseded_terminal_count: 0,
         last_backfill_window_days: receipt_window_days,
         last_backfill_file_limit: 0,
         last_discovered_file_count: 0,
@@ -3729,6 +3892,7 @@ fn report_checkin_status(
         // "alive" while the entity sets disagree is exactly the state the
         // manifest exists to expose.
         manifest,
+        settlement_probe: None,
     };
     client.report_status(relay_token, &request)?;
     Ok(())
@@ -5039,7 +5203,8 @@ mod tests {
 
         // Model the next authoritative scan replacing the oversized canonical
         // body with a fitting revision. The old fingerprint disappears, so its
-        // quarantine is pruned before the replacement is uploaded and settled.
+        // retry becomes an explicit superseded terminal before the replacement
+        // is uploaded and settled.
         let replacement_fingerprint = format!("{:064x}", SNAPSHOT_BATCH_LIMIT + 1000);
         let mut revised_items = items[1..].to_vec();
         revised_items.push(replacement_fingerprint.clone());
@@ -5067,7 +5232,11 @@ mod tests {
             vec![vec![replacement_fingerprint.clone()]]
         );
         assert_eq!(revision_accepted, 1);
-        assert!(progress.quarantined_fingerprints.is_empty());
+        assert_eq!(progress.quarantined_fingerprints.len(), 1);
+        assert_eq!(
+            progress.quarantined_fingerprints[&conflicted_fingerprint].disposition,
+            SnapshotQuarantineDisposition::SupersededTerminal
+        );
         assert!(progress
             .accepted_fingerprints
             .contains(&replacement_fingerprint));
@@ -5117,6 +5286,112 @@ mod tests {
                 .map(|error| error.count),
             Some(3)
         );
+    }
+
+    #[test]
+    fn unchanged_conflict_is_unproven_terminal_on_fourth_failure_and_body_change_recovers() {
+        let fingerprint = "f".repeat(64);
+        let item = BodyWitnessTestItem {
+            snapshot_fingerprint: fingerprint.clone(),
+            body_revision: "a".to_string(),
+        };
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let mut upload_count = 0;
+
+        for expected_failure_count in 1..=MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+            if expected_failure_count > 1 {
+                progress
+                    .quarantined_fingerprints
+                    .get_mut(&fingerprint)
+                    .expect("retry remains accounted")
+                    .retry_after_unix_seconds = 0;
+                assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
+            }
+            let result = upload_resumable_batches_with_body_witness(
+                std::slice::from_ref(&item),
+                &unique_poison_scope(),
+                &mut progress,
+                &mut accepted,
+                |item| item.snapshot_fingerprint.as_str(),
+                |_| "a".repeat(64),
+                |batch| {
+                    upload_count += 1;
+                    Ok(entity_ack_batch(
+                        &[],
+                        &[],
+                        &[batch[0].snapshot_fingerprint.clone()],
+                    ))
+                },
+                |_| Ok(()),
+            )
+            .expect("conflict remains an explicit outcome");
+            assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
+            let record = &progress.quarantined_fingerprints[&fingerprint];
+            assert_eq!(record.failed_reconstruction_count, expected_failure_count);
+            assert_eq!(
+                record.disposition,
+                if expected_failure_count == MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+                    SnapshotQuarantineDisposition::UnprovenTerminal
+                } else {
+                    SnapshotQuarantineDisposition::RetryPending
+                }
+            );
+        }
+        assert_eq!(upload_count, 4);
+        assert!(!progress.prepare_quarantine_retries(&BTreeMap::new()));
+        let mut terminal_index = ScanIndex::default();
+        terminal_index.file_snapshot_fingerprints.insert(
+            "terminal.jsonl".to_string(),
+            BTreeSet::from([fingerprint.clone()]),
+        );
+        terminal_index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        assert_eq!(terminal_index.snapshot_unproven_terminal_count(), 1);
+        let disclosed = SyncCounts::default().with_snapshot_terminal_counts(&terminal_index);
+        assert_eq!(disclosed.snapshot_unproven_terminal_count, 1);
+        assert_eq!(disclosed.ownership_incomplete_file_count, 1);
+
+        let fifth = upload_resumable_batches_with_body_witness(
+            std::slice::from_ref(&item),
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            |_| "a".repeat(64),
+            |_| panic!("unchanged terminal body must not upload a fifth time"),
+            |_| Ok(()),
+        )
+        .expect("terminal suppression is a completed local pass");
+        assert_eq!(fifth, ResumableUploadResult::Completed);
+        assert_eq!(
+            progress.quarantined_fingerprints[&fingerprint].failed_reconstruction_count,
+            MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+        );
+
+        let corrected = BodyWitnessTestItem {
+            snapshot_fingerprint: fingerprint.clone(),
+            body_revision: "b".to_string(),
+        };
+        let recovered = upload_resumable_batches_with_body_witness(
+            std::slice::from_ref(&corrected),
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            |_| "b".repeat(64),
+            |batch| {
+                Ok(entity_ack_batch(
+                    &[batch[0].snapshot_fingerprint.clone()],
+                    &[],
+                    &[],
+                ))
+            },
+            |_| Ok(()),
+        )
+        .expect("changed body reopens and settles terminal identity");
+        assert_eq!(recovered, ResumableUploadResult::Completed);
+        assert!(!progress.quarantined_fingerprints.contains_key(&fingerprint));
+        assert!(progress.accepted_fingerprints.contains(&fingerprint));
     }
 
     #[test]
@@ -6778,6 +7053,8 @@ mod tests {
                 witness: test_quarantine_witness(),
                 retry_after_unix_seconds: u64::MAX,
                 upload_body_witness: None,
+                failed_reconstruction_count: 1,
+                disposition: SnapshotQuarantineDisposition::RetryPending,
             },
         );
         corrupt.save(&path).expect("persist far-future deadline");
@@ -6963,10 +7240,9 @@ mod tests {
             retained.retry_after_unix_seconds > current_unix_seconds(),
             "the fired deadline must be replaced by a future deadline"
         );
-        assert_eq!(
-            index.rearm_unaccepted_manifest_revisions(SnapshotSource::Pi),
-            0,
-            "the manifest revision stays armed rather than becoming unproven"
+        assert!(
+            index.legacy_settlement_probe_fingerprints().is_empty(),
+            "the current-schema manifest revision stays armed rather than becoming unproven"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -7027,22 +7303,105 @@ mod tests {
     }
 
     #[test]
-    fn upload_progress_prunes_quarantine_revisions_absent_from_current_index() {
+    fn supersede_while_quarantined_records_terminal_counter_and_cannot_rearm() {
         let current = "a".repeat(64);
         let stale = "b".repeat(64);
         let mut progress = test_upload_progress();
         progress.quarantine([current.as_str(), stale.as_str()]);
 
         assert!(progress.retain_current_quarantines(&BTreeSet::from([current.clone()])));
+        assert_eq!(progress.quarantined_fingerprints.len(), 2);
         assert_eq!(
             progress
                 .quarantined_fingerprints
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            [current]
+                .get(&stale)
+                .expect("superseded fingerprint remains explicitly accounted")
+                .disposition,
+            SnapshotQuarantineDisposition::SupersededTerminal
         );
+        let mut index = ScanIndex::default();
+        index.file_snapshot_fingerprints.insert(
+            "current.jsonl".to_string(),
+            BTreeSet::from([current.clone()]),
+        );
+        index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        assert_eq!(index.snapshot_superseded_terminal_count(), 1);
+        assert!(!index
+            .legacy_settlement_probe_fingerprints()
+            .contains(&stale));
         assert!(!progress.retain_current_quarantines(&BTreeSet::from(["a".repeat(64)])));
+    }
+
+    #[test]
+    fn legacy_settlement_reconciliation_posts_identities_only_and_arms_only_missing() {
+        let accepted = "a".repeat(64);
+        let superseded = "b".repeat(64);
+        let missing = "c".repeat(64);
+        let requested = BTreeSet::from([accepted.clone(), superseded.clone(), missing.clone()]);
+        let captured = Arc::new(Mutex::new(String::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind settlement fixture");
+        let address = listener.local_addr().expect("settlement fixture address");
+        let captured_server = captured.clone();
+        let accepted_server = accepted.clone();
+        let superseded_server = superseded.clone();
+        let missing_server = missing.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept settlement probe");
+            *captured_server.lock().expect("capture settlement probe") =
+                read_complete_http_request(&mut stream);
+            let body = serde_json::json!({
+                "accepted": true,
+                "source": "codex",
+                "machine_id": "otm_test",
+                "disabled": false,
+                "disabled_reason": null,
+                "settlement_ack": {
+                    "contract": SNAPSHOT_SETTLEMENT_PROBE_CONTRACT_VERSION,
+                    "accepted_snapshot_fingerprints": [accepted_server],
+                    "superseded_snapshot_fingerprints": [superseded_server],
+                    "missing_snapshot_fingerprints": [missing_server]
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write settlement ACK");
+        });
+
+        let client = SnapshotApiClient::new(format!("http://{address}"));
+        let mut index = ScanIndex::default();
+        let rearmed = reconcile_legacy_snapshot_settlement(
+            &client,
+            "relay-token",
+            SnapshotSource::Codex,
+            "otm_test",
+            183,
+            &mut index,
+            &requested,
+        )
+        .expect("identity-only settlement probe")
+        .expect("server returned settlement ACK");
+        assert_eq!(rearmed, 1);
+        let request = captured.lock().expect("read settlement request").clone();
+        let request_json = http_request_json(&request);
+        assert!(request_json.get("snapshots").is_none());
+        assert_eq!(
+            request_json["settlement_probe"]["snapshot_fingerprints"]
+                .as_array()
+                .expect("probe identities")
+                .len(),
+            3
+        );
+        assert!(index
+            .quarantined_snapshot_fingerprints
+            .contains_key(&missing));
+        assert_eq!(index.snapshot_superseded_terminal_count(), 1);
+        assert_eq!(index.snapshot_unproven_terminal_count(), 0);
     }
 
     #[test]
@@ -7056,6 +7415,8 @@ mod tests {
                     witness: witness.clone(),
                     retry_after_unix_seconds: value as u64,
                     upload_body_witness: None,
+                    failed_reconstruction_count: 1,
+                    disposition: SnapshotQuarantineDisposition::RetryPending,
                 },
             );
         }

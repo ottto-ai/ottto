@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
@@ -356,6 +356,9 @@ const CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS: u64 = 6 * 60 * 60;
 /// bounding an unchanged family's non-terminal lifetime to 18-36 hours.
 const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES: u8 = 4;
 const SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION: &str = "snapshot_unproven_retry:v1";
+pub(crate) const SNAPSHOT_SETTLEMENT_PROBE_CONTRACT_VERSION: &str = "snapshot_settlement_probe:v1";
+const SNAPSHOT_ACCEPTED_LEDGER_VERSION: u8 = 1;
+pub(crate) const MAX_SNAPSHOT_RECONSTRUCTION_FAILURES: u8 = 4;
 
 /// What the manifest counts, declared on the wire rather than assumed.
 ///
@@ -1603,6 +1606,10 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -1850,10 +1857,12 @@ pub struct ScanIndex {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub snapshot_activity_at: BTreeMap<String, Option<String>>,
     /// Exact entity ACK identities known durable at the backend. Older indexes
-    /// deserialize this empty, which deliberately makes the startup integrity
-    /// sweep conservatively re-arm their manifest entries once.
+    /// deserialize this empty. The separate version bit distinguishes that
+    /// legacy absence from a current, authoritatively empty ledger.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     accepted_snapshot_fingerprints: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    accepted_snapshot_fingerprint_ledger_version: u8,
     /// Rejected entities are quarantined under the exact daemon/parser/wire
     /// contract that produced the rejection. They are excluded from the
     /// server-agreement manifest while that witness is current, but are
@@ -1908,6 +1917,7 @@ impl Default for ScanIndex {
             file_snapshot_fingerprints: BTreeMap::new(),
             snapshot_activity_at: BTreeMap::new(),
             accepted_snapshot_fingerprints: BTreeSet::new(),
+            accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_VERSION,
             quarantined_snapshot_fingerprints: BTreeMap::new(),
             active_quarantine_witness: None,
             active_upload_context_fingerprint: None,
@@ -1936,6 +1946,23 @@ pub struct SnapshotQuarantineRecord {
     /// correction with the same semantic fingerprint bypasses quarantine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_body_witness: Option<String>,
+    #[serde(default = "initial_snapshot_reconstruction_failure_count")]
+    pub failed_reconstruction_count: u8,
+    #[serde(default)]
+    pub disposition: SnapshotQuarantineDisposition,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotQuarantineDisposition {
+    #[default]
+    RetryPending,
+    UnprovenTerminal,
+    SupersededTerminal,
+}
+
+const fn initial_snapshot_reconstruction_failure_count() -> u8 {
+    1
 }
 
 pub fn snapshot_quarantine_witness(source: SnapshotSource) -> SnapshotQuarantineWitness {
@@ -1958,6 +1985,8 @@ pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineR
         witness: snapshot_quarantine_witness(source),
         retry_after_unix_seconds: now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS),
         upload_body_witness: None,
+        failed_reconstruction_count: initial_snapshot_reconstruction_failure_count(),
+        disposition: SnapshotQuarantineDisposition::RetryPending,
     }
 }
 
@@ -1974,8 +2003,21 @@ fn snapshot_quarantine_deadline_is_bounded_at(record: &SnapshotQuarantineRecord,
     // Anything further out is corrupt state or evidence the wall clock moved
     // backwards. In either case local state must never become a permanent
     // authority that fences a repaired backend forever.
-    record.retry_after_unix_seconds
-        <= now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2))
+    match record.disposition {
+        SnapshotQuarantineDisposition::RetryPending => {
+            record.failed_reconstruction_count < MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+                && record.retry_after_unix_seconds
+                    <= now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2))
+        }
+        SnapshotQuarantineDisposition::UnprovenTerminal => {
+            record.failed_reconstruction_count == MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+                && record.retry_after_unix_seconds == 0
+        }
+        SnapshotQuarantineDisposition::SupersededTerminal => {
+            record.failed_reconstruction_count <= MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+                && record.retry_after_unix_seconds == 0
+        }
+    }
 }
 
 fn scan_index_schema_version() -> u16 {
@@ -16491,6 +16533,10 @@ impl ScanIndex {
         self.claude_usage_authority_pending_count() > 0
     }
 
+    pub(crate) fn legacy_settlement_ledger_needs_migration(&self) -> bool {
+        self.accepted_snapshot_fingerprint_ledger_version != SNAPSHOT_ACCEPTED_LEDGER_VERSION
+    }
+
     pub fn prepare_historical_replay(&mut self, generation: String) {
         if self.historical_replay_generation.as_ref() == Some(&generation) {
             return;
@@ -16510,18 +16556,30 @@ impl ScanIndex {
         self.file_snapshot_fingerprints.clear();
         self.snapshot_activity_at.clear();
         self.accepted_snapshot_fingerprints.clear();
+        self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
         self.quarantined_snapshot_fingerprints.clear();
     }
 
-    /// Close the durable retry state machine before scanning. Any manifest
-    /// identity without either exact ACK proof or a quarantine record is an
-    /// unproven obligation, never an implicit success. The synthetic witness
-    /// differs from the active wire contract so unchanged files are reparsed
-    /// immediately, while its future deadline keeps the obligation armed if a
-    /// terminal-unhealthy traversal yields no candidate again.
-    pub(crate) fn rearm_unaccepted_manifest_revisions(&mut self, source: SnapshotSource) -> usize {
+    /// Return only legacy manifest identities whose settlement cannot be
+    /// derived locally. In 0.1.121, `file_snapshot_fingerprints` became durable
+    /// only with the scan checkpoint; a checkpoint with no unfinished
+    /// traversal, no unsettled marker, and no quarantine is therefore positive
+    /// settlement evidence. An unfinished traversal is deliberately ambiguous
+    /// and must be reconciled with the server before any body is re-armed.
+    pub(crate) fn legacy_settlement_probe_fingerprints(&mut self) -> BTreeSet<String> {
+        if self.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {
+            return BTreeSet::new();
+        }
         let current = self.current_snapshot_fingerprints();
-        let unarmed = current
+        if self.traversal.is_none()
+            && !self.bounded_sweep_had_unsettled_upload
+            && self.quarantined_snapshot_fingerprints.is_empty()
+        {
+            self.accepted_snapshot_fingerprints = current;
+            self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
+            return BTreeSet::new();
+        }
+        current
             .difference(&self.accepted_snapshot_fingerprints)
             .filter(|fingerprint| {
                 !self
@@ -16529,24 +16587,72 @@ impl ScanIndex {
                     .contains_key(*fingerprint)
             })
             .cloned()
-            .collect::<BTreeSet<_>>();
-        if unarmed.is_empty() {
-            return 0;
+            .collect()
+    }
+
+    /// Apply an exact identity-only server reconciliation. The three outcome
+    /// sets must be a disjoint, complete partition of the requested legacy
+    /// identities; partial or malformed ACKs cannot authorize a body retry.
+    pub(crate) fn apply_legacy_settlement_probe(
+        &mut self,
+        source: SnapshotSource,
+        requested: &BTreeSet<String>,
+        accepted: &BTreeSet<String>,
+        superseded: &BTreeSet<String>,
+        missing: &BTreeSet<String>,
+    ) -> Result<usize> {
+        let mut observed = accepted.clone();
+        if !observed.is_disjoint(superseded) || !observed.is_disjoint(missing) {
+            return Err(anyhow!("snapshot settlement probe outcomes overlap"));
+        }
+        observed.extend(superseded.iter().cloned());
+        if !observed.is_disjoint(missing) {
+            return Err(anyhow!("snapshot settlement probe outcomes overlap"));
+        }
+        observed.extend(missing.iter().cloned());
+        if &observed != requested {
+            return Err(anyhow!(
+                "snapshot settlement probe ACK is not an exact partition"
+            ));
+        }
+        if observed.iter().any(|fingerprint| {
+            fingerprint.len() != 64
+                || !fingerprint
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return Err(anyhow!("snapshot settlement probe ACK is malformed"));
         }
 
+        self.accepted_snapshot_fingerprints
+            .extend(accepted.iter().cloned());
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or_default();
         let mut witness = snapshot_quarantine_witness(source);
         witness.contract = SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION.to_string();
-        for fingerprint in &unarmed {
+        for fingerprint in superseded {
+            self.quarantined_snapshot_fingerprints.insert(
+                fingerprint.clone(),
+                SnapshotQuarantineRecord {
+                    witness: witness.clone(),
+                    retry_after_unix_seconds: 0,
+                    upload_body_witness: None,
+                    failed_reconstruction_count: 0,
+                    disposition: SnapshotQuarantineDisposition::SupersededTerminal,
+                },
+            );
+        }
+        for fingerprint in missing {
             self.quarantined_snapshot_fingerprints.insert(
                 fingerprint.clone(),
                 SnapshotQuarantineRecord {
                     witness: witness.clone(),
                     retry_after_unix_seconds: now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS),
                     upload_body_witness: None,
+                    failed_reconstruction_count: 0,
+                    disposition: SnapshotQuarantineDisposition::RetryPending,
                 },
             );
         }
@@ -16554,9 +16660,28 @@ impl ScanIndex {
         // traversal whose independent retry is not due. Reset only traversal
         // discovery; existing file/entity checkpoints remain the source of the
         // forced reparse decisions above.
-        self.traversal = None;
-        self.bounded_sweep_had_unsettled_upload = true;
-        unarmed.len()
+        if !missing.is_empty() {
+            self.traversal = None;
+            self.bounded_sweep_had_unsettled_upload = true;
+        }
+        self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
+        Ok(missing.len())
+    }
+
+    pub(crate) fn snapshot_unproven_terminal_count(&self) -> usize {
+        self.quarantined_snapshot_fingerprints
+            .values()
+            .filter(|record| record.disposition == SnapshotQuarantineDisposition::UnprovenTerminal)
+            .count()
+    }
+
+    pub(crate) fn snapshot_superseded_terminal_count(&self) -> usize {
+        self.quarantined_snapshot_fingerprints
+            .values()
+            .filter(|record| {
+                record.disposition == SnapshotQuarantineDisposition::SupersededTerminal
+            })
+            .count()
     }
 
     pub(crate) fn record_accepted_snapshot_fingerprints(&mut self, accepted: &BTreeSet<String>) {
@@ -16643,7 +16768,8 @@ impl ScanIndex {
             .get(fingerprint)
             .zip(self.active_quarantine_witness.as_ref())
             .is_some_and(|(persisted, active)| {
-                &persisted.witness != active || persisted.retry_after_unix_seconds <= now
+                persisted.disposition == SnapshotQuarantineDisposition::RetryPending
+                    && (&persisted.witness != active || persisted.retry_after_unix_seconds <= now)
             })
     }
 
@@ -16679,6 +16805,8 @@ impl ScanIndex {
                                     byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
                                 })
                         })
+                    && index.accepted_snapshot_fingerprint_ledger_version
+                        <= SNAPSHOT_ACCEPTED_LEDGER_VERSION
                     && index
                         .quarantined_snapshot_fingerprints
                         .values()
@@ -17093,6 +17221,9 @@ impl ScanIndex {
             file_snapshot_fingerprints,
             snapshot_activity_at,
             accepted_snapshot_fingerprints,
+            accepted_snapshot_fingerprint_ledger_version: self
+                .accepted_snapshot_fingerprint_ledger_version
+                .max(previous.accepted_snapshot_fingerprint_ledger_version),
             quarantined_snapshot_fingerprints: retained_quarantine.clone(),
             active_quarantine_witness: self.active_quarantine_witness.clone(),
             active_upload_context_fingerprint: self.active_upload_context_fingerprint.clone(),
@@ -17113,7 +17244,10 @@ impl ScanIndex {
             .collect::<BTreeSet<_>>();
         self.quarantined_snapshot_fingerprints = quarantined
             .iter()
-            .filter(|(fingerprint, _)| current.contains(*fingerprint))
+            .filter(|(fingerprint, record)| {
+                current.contains(*fingerprint)
+                    || record.disposition == SnapshotQuarantineDisposition::SupersededTerminal
+            })
             .map(|(fingerprint, witness)| (fingerprint.clone(), witness.clone()))
             .collect();
         self.accepted_snapshot_fingerprints.retain(|fingerprint| {
@@ -19370,6 +19504,8 @@ mod tests {
             retry_after_unix_seconds: original_now
                 + SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2),
             upload_body_witness: None,
+            failed_reconstruction_count: 1,
+            disposition: SnapshotQuarantineDisposition::RetryPending,
         };
         assert!(snapshot_quarantine_deadline_is_bounded_at(
             &record,
@@ -19389,24 +19525,68 @@ mod tests {
         ));
     }
 
+    fn legacy_shaped_index(mut index: ScanIndex) -> ScanIndex {
+        let mut value = serde_json::to_value(&index).expect("serialize current index");
+        let object = value.as_object_mut().expect("scan index object");
+        object.remove("accepted_snapshot_fingerprints");
+        object.remove("accepted_snapshot_fingerprint_ledger_version");
+        index = serde_json::from_value(value).expect("deserialize exact pre-ledger index shape");
+        assert!(index.accepted_snapshot_fingerprints.is_empty());
+        assert!(index.legacy_settlement_ledger_needs_migration());
+        index
+    }
+
     #[test]
-    fn startup_integrity_sweep_rearms_a_manifest_present_unaccepted_revision() {
+    fn legacy_0_1_121_fully_settled_history_is_not_rearmed() {
+        let accepted = "a".repeat(64);
+        let settled_sibling = "b".repeat(64);
+        let mut legacy = legacy_shaped_index(ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "same-session-siblings.jsonl".to_string(),
+                BTreeSet::from([accepted.clone(), settled_sibling.clone()]),
+            )]),
+            ..ScanIndex::default()
+        });
+
+        assert!(legacy.legacy_settlement_probe_fingerprints().is_empty());
+        assert!(!legacy.legacy_settlement_ledger_needs_migration());
+        assert_eq!(
+            legacy.accepted_snapshot_fingerprints,
+            BTreeSet::from([accepted, settled_sibling])
+        );
+        assert!(legacy.quarantined_snapshot_fingerprints.is_empty());
+    }
+
+    #[test]
+    fn legacy_0_1_121_unfinished_strand_rearms_only_server_proven_missing_revision() {
         let root = temp_dir("scan-index-rearm-stranded-revision");
         let path = root.join("codex-scan-index-v3.json");
         let accepted = "a".repeat(64);
         let stranded = "b".repeat(64);
-        let mut index = ScanIndex {
+        let mut index = legacy_shaped_index(ScanIndex {
             file_snapshot_fingerprints: BTreeMap::from([(
                 "same-session-siblings.jsonl".to_string(),
                 BTreeSet::from([accepted.clone(), stranded.clone()]),
             )]),
-            accepted_snapshot_fingerprints: BTreeSet::from([accepted.clone()]),
             traversal: Some(terminal_unhealthy_traversal("terminal-red".to_string())),
             ..ScanIndex::default()
-        };
+        });
 
+        let requested = index.legacy_settlement_probe_fingerprints();
         assert_eq!(
-            index.rearm_unaccepted_manifest_revisions(SnapshotSource::Codex),
+            requested,
+            BTreeSet::from([accepted.clone(), stranded.clone()])
+        );
+        assert_eq!(
+            index
+                .apply_legacy_settlement_probe(
+                    SnapshotSource::Codex,
+                    &requested,
+                    &BTreeSet::from([accepted.clone()]),
+                    &BTreeSet::new(),
+                    &BTreeSet::from([stranded.clone()]),
+                )
+                .expect("exact settlement ACK"),
             1
         );
         assert!(
@@ -19434,11 +19614,7 @@ mod tests {
         index.save(&path).expect("persist repaired retry state");
 
         let mut restarted = ScanIndex::load(&path).expect("reload repaired index");
-        assert_eq!(
-            restarted.rearm_unaccepted_manifest_revisions(SnapshotSource::Codex),
-            0,
-            "a restart sees an armed obligation instead of duplicating it"
-        );
+        assert!(restarted.legacy_settlement_probe_fingerprints().is_empty());
         assert!(restarted
             .quarantined_snapshot_fingerprints
             .contains_key(&stranded));
@@ -20021,6 +20197,8 @@ mod tests {
                     witness: stale_witness,
                     retry_after_unix_seconds: u64::MAX,
                     upload_body_witness: None,
+                    failed_reconstruction_count: 1,
+                    disposition: SnapshotQuarantineDisposition::RetryPending,
                 },
             )]),
             ..ScanIndex::default()
@@ -20623,6 +20801,8 @@ mod tests {
                 witness: snapshot_quarantine_witness(SnapshotSource::Pi),
                 retry_after_unix_seconds: 0,
                 upload_body_witness: None,
+                failed_reconstruction_count: 1,
+                disposition: SnapshotQuarantineDisposition::RetryPending,
             },
         );
 
