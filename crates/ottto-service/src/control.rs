@@ -789,6 +789,13 @@ fn handle_command(
                 expected_workspace_identifier_hash,
             )?)
         }
+        LocalControlCommand::CodexAccountPrepareOpen {
+            schema_version,
+            operation_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(prepare_open_codex_account(schema_version, operation_id)?)
+        }
         LocalControlCommand::CodexAccountPrepareTarget {
             schema_version,
             operation_id,
@@ -2015,6 +2022,15 @@ fn prepare_codex_account(
             expected_account_identifier_hash,
             expected_workspace_identifier_hash,
         )
+        .map_err(codex_account_slot_settings_error)
+}
+
+fn prepare_open_codex_account(
+    schema_version: u16,
+    operation_id: String,
+) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    FileCodexAccountSlotSettingsStore::default()
+        .prepare_open_account(schema_version, operation_id)
         .map_err(codex_account_slot_settings_error)
 }
 

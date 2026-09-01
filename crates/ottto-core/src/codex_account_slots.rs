@@ -53,6 +53,14 @@ struct PersistedCodexAccountSlotsV1 {
     /// remains `validating` for backward-compatible clients.
     #[serde(default)]
     verifying_pinned_workspace: bool,
+    /// Slot reserved for an in-flight OPEN setup: its directories exist and the
+    /// provider is being signed into, but nobody knows yet which account and
+    /// workspace will come back, so it cannot be registered. A managed slot
+    /// must always carry a strong binding, and inventing a placeholder one
+    /// would make an unfinished setup look like a connection. It is registered
+    /// on adoption and its tree is removed if the setup is abandoned.
+    #[serde(default)]
+    pending_open_slot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +81,7 @@ impl Default for PersistedCodexAccountSlotsV1 {
             setup_operation: CodexAccountSetupOperationV1::default(),
             setup_preserves_accepted_binding: false,
             verifying_pinned_workspace: false,
+            pending_open_slot_id: None,
         }
     }
 }
@@ -119,6 +128,112 @@ impl FileCodexAccountSlotSettingsStore {
                 })
             })
             .collect())
+    }
+
+    /// Reserve a Codex home for a workspace the owner has not chosen yet.
+    ///
+    /// Other ChatGPT workspaces are not enumerable - the ID token names only the
+    /// signed-in one and `account/read` carries no workspace list - so a caller
+    /// cannot name the target in advance. This reserves a home, lets the owner
+    /// pick in the provider's own picker, and adopts whatever comes back.
+    ///
+    /// The slot is deliberately NOT registered here. A registered slot must
+    /// carry a strong binding, and a placeholder binding would make an
+    /// unfinished sign-in look like a connection and could collide with a real
+    /// one. It is registered on adoption in `finish_validation`; if the setup is
+    /// abandoned the reservation and its tree are removed, so an abandoned
+    /// sign-in never consumes capacity.
+    pub fn prepare_open_account(
+        &self,
+        schema_version: u16,
+        operation_id: String,
+    ) -> Result<CodexAccountsStatusV1, CodexAccountSlotSettingsError> {
+        validate_schema_version(schema_version)?;
+        validate_setup_operation_id(&operation_id)?;
+        let _transaction = self.transaction_lock()?;
+        let mut persisted = self.read_persisted()?;
+        self.validate_persisted(&persisted)?;
+
+        if persisted.setup_operation.operation_id.as_deref() == Some(operation_id.as_str()) {
+            return Ok(status_contract(&persisted));
+        }
+        if matches!(
+            persisted.setup_operation.state,
+            CodexAccountSetupOperationStateV1::WaitingForUserLogin
+                | CodexAccountSetupOperationStateV1::Validating
+        ) || persisted.verifying_pinned_workspace
+        {
+            return Err(CodexAccountSlotSettingsError::Invalid(
+                "another Codex account setup operation is already active".to_string(),
+            ));
+        }
+        // Check capacity before the owner signs in, never after: finishing a
+        // provider login only to be told there was no room is a wasted trip.
+        if persisted.managed_slot_ids.len() >= MAX_MANAGED_CODEX_ACCOUNT_SLOTS {
+            return Err(CodexAccountSlotSettingsError::Invalid(
+                "Codex account-slot capacity has been reached".to_string(),
+            ));
+        }
+        self.discard_pending_open_slot(&mut persisted)?;
+
+        let slot_id = generate_opaque_slot_id()?;
+        ensure_managed_directory(&self.managed_accounts_root()?)?;
+        let slot_root = self.slot_root_unchecked(&slot_id)?;
+        let home = slot_root.join("home");
+        let created_root = create_managed_slot_directory(&slot_root)?;
+        let created_home = match create_managed_slot_directory(&home) {
+            Ok(created) => created,
+            Err(error) => {
+                if created_root {
+                    let _ = fs::remove_dir(&slot_root);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = write_codex_home_config(&home, None) {
+            if created_home {
+                let _ = fs::remove_dir(&home);
+            }
+            if created_root {
+                let _ = fs::remove_dir(&slot_root);
+            }
+            return Err(error);
+        }
+        persisted.pending_open_slot_id = Some(slot_id.clone());
+        persisted.setup_operation = CodexAccountSetupOperationV1 {
+            state: CodexAccountSetupOperationStateV1::WaitingForUserLogin,
+            operation_id: Some(operation_id),
+            slot_id: Some(slot_id),
+            expected_account_identifier_hash: None,
+            expected_workspace_identifier_hash: None,
+            account_identifier_hash: None,
+            workspace_identifier_hash: None,
+            launch_command: Some(codex_login_command(&home)),
+            message: Some(
+                "Complete the official Codex sign-in and pick any workspace you want to keep."
+                    .to_string(),
+            ),
+        };
+        self.write_persisted(&persisted)?;
+        Ok(status_contract(&persisted))
+    }
+
+    /// Remove a reserved-but-unadopted open slot and its tree.
+    fn discard_pending_open_slot(
+        &self,
+        persisted: &mut PersistedCodexAccountSlotsV1,
+    ) -> Result<(), CodexAccountSlotSettingsError> {
+        let Some(slot_id) = persisted.pending_open_slot_id.take() else {
+            return Ok(());
+        };
+        // The operation may not keep pointing at a slot that no longer exists;
+        // validation rejects a setup whose slot is neither registered nor
+        // reserved.
+        if persisted.setup_operation.slot_id.as_deref() == Some(slot_id.as_str()) {
+            persisted.setup_operation.slot_id = None;
+        }
+        self.delete_managed_slot_tree(&slot_id)?;
+        Ok(())
     }
 
     pub fn prepare_managed_account(
@@ -365,18 +480,34 @@ impl FileCodexAccountSlotSettingsStore {
         let mut persisted = self.read_persisted()?;
         self.validate_persisted(&persisted)?;
         require_setup_operation(&persisted, operation_id)?;
-        let matches_expected = persisted
-            .setup_operation
-            .expected_account_identifier_hash
-            .as_deref()
-            == Some(account_identifier_hash.as_str())
+        // An OPEN setup named no target, so there is nothing to mismatch against:
+        // whatever the owner picked in the provider's picker IS the target. It
+        // still has to clear the duplicate check below - adoption may not create
+        // a second connection to a workspace that already has one.
+        let is_open = persisted.setup_operation.slot_id.is_some()
+            && persisted.setup_operation.slot_id == persisted.pending_open_slot_id
+            && persisted
+                .setup_operation
+                .expected_account_identifier_hash
+                .is_none()
             && persisted
                 .setup_operation
                 .expected_workspace_identifier_hash
+                .is_none();
+        let matches_expected = is_open
+            || (persisted
+                .setup_operation
+                .expected_account_identifier_hash
                 .as_deref()
-                == Some(workspace_identifier_hash.as_str());
-        persisted.setup_operation.account_identifier_hash = Some(account_identifier_hash);
-        persisted.setup_operation.workspace_identifier_hash = Some(workspace_identifier_hash);
+                == Some(account_identifier_hash.as_str())
+                && persisted
+                    .setup_operation
+                    .expected_workspace_identifier_hash
+                    .as_deref()
+                    == Some(workspace_identifier_hash.as_str()));
+        persisted.setup_operation.account_identifier_hash = Some(account_identifier_hash.clone());
+        persisted.setup_operation.workspace_identifier_hash =
+            Some(workspace_identifier_hash.clone());
         if !matches_expected {
             persisted.setup_operation.state = CodexAccountSetupOperationStateV1::IdentityMismatch;
             let slot_id = persisted.setup_operation.slot_id.clone().ok_or_else(|| {
@@ -396,8 +527,29 @@ impl FileCodexAccountSlotSettingsStore {
             persisted.setup_operation.message = Some(
                 "That Codex account and workspace already has a durable connection.".to_string(),
             );
+            if is_open {
+                // Nothing was adopted, so the reservation must not linger and
+                // consume capacity.
+                self.discard_pending_open_slot(&mut persisted)?;
+            }
         } else {
             persisted.setup_operation.launch_command = None;
+            if is_open {
+                let slot_id = persisted
+                    .pending_open_slot_id
+                    .take()
+                    .expect("open setup keeps its reserved slot until adoption");
+                persisted.managed_slot_ids.push(slot_id.clone());
+                persisted.managed_slot_ids.sort();
+                persisted.managed_bindings.insert(
+                    slot_id,
+                    PersistedCodexAccountBindingV1 {
+                        account_identifier_hash: account_identifier_hash.clone(),
+                        workspace_identifier_hash: workspace_identifier_hash.clone(),
+                        accepted: false,
+                    },
+                );
+            }
             let slot_id = persisted.setup_operation.slot_id.clone().ok_or_else(|| {
                 CodexAccountSlotSettingsError::State(
                     "setup operation lost its Codex slot binding".to_string(),
@@ -515,17 +667,28 @@ impl FileCodexAccountSlotSettingsStore {
     ) -> Result<CodexAccountsStatusV1, CodexAccountSlotSettingsError> {
         validate_schema_version(schema_version)?;
         validate_setup_operation_id(operation_id)?;
-        self.mutate(|persisted| {
+        let mut pending_open_to_discard: Option<String> = None;
+        let status = self.mutate(|persisted| {
             require_setup_operation(persisted, operation_id)?;
             persisted.setup_operation.state = CodexAccountSetupOperationStateV1::SetupStopped;
             persisted.verifying_pinned_workspace = false;
+            pending_open_to_discard = persisted.pending_open_slot_id.take();
+            if pending_open_to_discard.is_some()
+                && persisted.setup_operation.slot_id == pending_open_to_discard
+            {
+                persisted.setup_operation.slot_id = None;
+            }
             persisted.setup_operation.launch_command = None;
             persisted.setup_operation.message = Some(
                 "Stopped waiting; the Codex home and provider credential were left untouched."
                     .to_string(),
             );
             Ok(())
-        })
+        })?;
+        if let Some(slot_id) = pending_open_to_discard {
+            self.delete_managed_slot_tree(&slot_id)?;
+        }
+        Ok(status)
     }
 
     pub fn remove(
@@ -572,6 +735,7 @@ impl FileCodexAccountSlotSettingsStore {
             .managed_slot_ids
             .iter()
             .any(|candidate| candidate == slot_id)
+            && persisted.pending_open_slot_id.as_deref() != Some(slot_id)
         {
             return Err(CodexAccountSlotSettingsError::Invalid(
                 "unknown managed Codex account slot".to_string(),
@@ -749,12 +913,33 @@ impl FileCodexAccountSlotSettingsStore {
         if let Some(operation_id) = persisted.setup_operation.operation_id.as_deref() {
             validate_setup_operation_id(operation_id)?;
         }
+        if let Some(pending) = persisted.pending_open_slot_id.as_deref() {
+            validate_opaque_slot_id(pending)?;
+            if persisted
+                .managed_slot_ids
+                .iter()
+                .any(|candidate| candidate == pending)
+            {
+                return Err(CodexAccountSlotSettingsError::Invalid(
+                    "a reserved open Codex slot must not also be registered".to_string(),
+                ));
+            }
+            if persisted.setup_operation.slot_id.as_deref() != Some(pending) {
+                return Err(CodexAccountSlotSettingsError::Invalid(
+                    "a reserved open Codex slot must belong to the active setup operation"
+                        .to_string(),
+                ));
+            }
+        }
         if let Some(slot_id) = persisted.setup_operation.slot_id.as_deref() {
             validate_opaque_slot_id(slot_id)?;
+            // An open setup's slot is reserved, not registered: it has no
+            // identity to bind until the owner has signed in.
             if !persisted
                 .managed_slot_ids
                 .iter()
                 .any(|candidate| candidate == slot_id)
+                && persisted.pending_open_slot_id.as_deref() != Some(slot_id)
             {
                 return Err(CodexAccountSlotSettingsError::Invalid(
                     "setup operation references an unregistered Codex slot".to_string(),
@@ -1557,6 +1742,180 @@ fn codex_login_command(home: &Path) -> String {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    const OPEN_OP: &str = "codex_setup_0123456789abcdef0123456789abcdef";
+
+    fn open_account_hash(seed: char) -> String {
+        std::iter::repeat(seed).take(64).collect()
+    }
+
+    #[test]
+    fn open_prepare_reserves_a_home_without_registering_a_slot() {
+        // A registered slot must carry a strong binding. Nobody knows the
+        // identity until the owner has signed in, so the slot must not exist
+        // yet - a placeholder binding would make an unfinished sign-in look
+        // like a connection.
+        let (_root, store) = test_store("open-prepare");
+        let status = store
+            .prepare_open_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                OPEN_OP.to_string(),
+            )
+            .expect("open prepare");
+
+        assert_eq!(
+            status.setup_operation.state,
+            CodexAccountSetupOperationStateV1::WaitingForUserLogin
+        );
+        assert!(status.setup_operation.launch_command.is_some());
+        assert!(status
+            .setup_operation
+            .expected_account_identifier_hash
+            .is_none());
+        assert!(status
+            .setup_operation
+            .expected_workspace_identifier_hash
+            .is_none());
+        assert_eq!(
+            status.capacity.used_slots, 1,
+            "only the default login is connected; a reservation is not a connection"
+        );
+        assert!(status.managed_slots.is_empty());
+    }
+
+    #[test]
+    fn open_setup_adopts_whatever_workspace_the_owner_signed_into() {
+        let (_root, store) = test_store("open-adopt");
+        store
+            .prepare_open_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                OPEN_OP.to_string(),
+            )
+            .expect("open prepare");
+        let account = open_account_hash('a');
+        let workspace = open_account_hash('b');
+
+        let status = store
+            .finish_validation(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                OPEN_OP,
+                account.clone(),
+                workspace.clone(),
+                "raw-workspace-adopted",
+                false,
+            )
+            .expect("adopt");
+
+        assert_eq!(
+            status.capacity.used_slots, 2,
+            "the default login plus the workspace just adopted"
+        );
+        assert_eq!(status.managed_slots.len(), 1);
+        assert_eq!(
+            status.setup_operation.account_identifier_hash.as_deref(),
+            Some(account.as_str())
+        );
+        assert_eq!(
+            status.setup_operation.workspace_identifier_hash.as_deref(),
+            Some(workspace.as_str())
+        );
+        assert_ne!(
+            status.setup_operation.state,
+            CodexAccountSetupOperationStateV1::IdentityMismatch,
+            "an open setup names no target, so it cannot mismatch one"
+        );
+        let bindings = store.registered_bindings().expect("bindings");
+        assert!(bindings.iter().any(|binding| {
+            binding.account_identifier_hash == account
+                && binding.workspace_identifier_hash == workspace
+        }));
+    }
+
+    #[test]
+    fn open_setup_still_refuses_a_workspace_that_is_already_connected() {
+        // Adoption must not become a way around the duplicate rule, and a
+        // refused adoption must not leave its reservation behind consuming
+        // capacity.
+        let (_root, store) = test_store("open-duplicate");
+        store
+            .prepare_open_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                OPEN_OP.to_string(),
+            )
+            .expect("open prepare");
+
+        let status = store
+            .finish_validation(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                OPEN_OP,
+                open_account_hash('a'),
+                open_account_hash('b'),
+                "raw-workspace-dup",
+                true,
+            )
+            .expect("duplicate outcome");
+
+        assert_eq!(
+            status.setup_operation.state,
+            CodexAccountSetupOperationStateV1::DuplicateAccount
+        );
+        assert_eq!(
+            status.capacity.used_slots, 1,
+            "a refused adoption consumes no capacity beyond the default login"
+        );
+        assert!(status.managed_slots.is_empty());
+    }
+
+    #[test]
+    fn abandoning_an_open_setup_leaves_no_slot_behind() {
+        // The target-bound flow leaves its slot in place on stop, which is why
+        // a cancelled setup used to keep occupying capacity. An open setup has
+        // nothing worth keeping, so its reservation is released.
+        let (_root, store) = test_store("open-abandon");
+        store
+            .prepare_open_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                OPEN_OP.to_string(),
+            )
+            .expect("open prepare");
+
+        let status = store
+            .stop_waiting(CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION, OPEN_OP)
+            .expect("stop");
+
+        assert_eq!(
+            status.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupStopped
+        );
+        assert_eq!(status.capacity.used_slots, 1);
+        assert!(status.managed_slots.is_empty());
+
+        // And a fresh open setup is immediately possible afterwards.
+        store
+            .prepare_open_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                "codex_setup_fedcba9876543210fedcba9876543210".to_string(),
+            )
+            .expect("second open prepare");
+    }
+
+    #[test]
+    fn open_prepare_refuses_while_another_setup_is_active() {
+        let (_root, store) = test_store("open-conflict");
+        store
+            .prepare_open_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                OPEN_OP.to_string(),
+            )
+            .expect("open prepare");
+        let error = store
+            .prepare_open_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                "codex_setup_fedcba9876543210fedcba9876543210".to_string(),
+            )
+            .expect_err("second concurrent setup");
+        assert!(format!("{error}").contains("already active"));
+    }
 
     fn test_store(label: &str) -> (PathBuf, FileCodexAccountSlotSettingsStore) {
         let nonce = SystemTime::now()

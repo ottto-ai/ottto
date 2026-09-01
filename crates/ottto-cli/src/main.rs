@@ -2153,6 +2153,7 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         }
         LocalControlCommand::CodexAccountsStatus => "codex_accounts_status",
         LocalControlCommand::CodexAccountPrepare { .. } => "codex_account_prepare",
+        LocalControlCommand::CodexAccountPrepareOpen { .. } => "codex_account_prepare_open",
         LocalControlCommand::CodexAccountPrepareTarget { .. } => "codex_account_prepare_target",
         LocalControlCommand::CodexAccountReconnect { .. } => "codex_account_reconnect",
         LocalControlCommand::CodexAccountCheck { .. } => "codex_account_check",

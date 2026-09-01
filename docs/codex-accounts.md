@@ -30,6 +30,15 @@ The id spaces differ even where the names match: a target built from an
 ChatGPT workspace is signed into, and a platform organization can be absent from
 the ChatGPT workspace picker entirely.
 
+Adding one of those unnameable workspaces is `codex_account_prepare_open`
+(protocol v23). It reserves a Codex home, the owner picks any workspace in the
+provider's own picker, and the daemon adopts whatever comes back. The slot is
+deliberately not registered at reserve time: a registered slot must carry a
+strong binding, and a placeholder would make an unfinished sign-in look like a
+connection. It registers on adoption, still refuses a workspace that already has
+a durable connection, and releases its reservation if the setup is abandoned or
+refused - so an abandoned sign-in never consumes capacity.
+
 Target coverage therefore describes only workspaces the daemon can prove: the
 signed-in one, and any already-connected durable ones. Other ChatGPT workspaces
 are **not enumerable** — the ID token names only the signed-in workspace, and
