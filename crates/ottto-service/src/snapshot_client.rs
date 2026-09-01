@@ -918,11 +918,45 @@ fn validate_snapshot_entity_ref(reference: &SnapshotEntityRef) -> Result<()> {
     Ok(())
 }
 
+/// What a collector-status submission IS, declared by the collector instead of
+/// inferred by the backend from the payload's shape.
+///
+/// The backend used to answer "is this a liveness beat?" by looking at the
+/// wire: `last_scan_finished_at is None` and no error/retry/failure fields. That
+/// inference is a shape coincidence, not a statement of intent, and it silently
+/// re-classifies a receipt the moment the collector's liveness shape changes.
+/// This enum makes the collector say what it means, and the two variants are
+/// produced at exactly two construction sites — one per meaning — never
+/// computed from the fields being sent.
+///
+/// `Deserialize` is not wire-inbound: nothing ever parses a report kind off a
+/// response. It exists because the terminal status journal (ottto#393) writes
+/// the exact `SnapshotStatusRequest` it is about to POST to disk and reads it
+/// back, so every field of that struct — this one included — must survive the
+/// round trip rather than being silently dropped from the replayed receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotStatusReportKind {
+    /// A liveness beat. It asserts only "this collector is alive"; every
+    /// scan-result field it carries is either absent or evidence the backend
+    /// has already accepted. It may never disclose something new.
+    Checkin,
+    /// A scan-result report: a completed traversal, a scan or upload failure, a
+    /// changed loss census, a cap-hit change, or an enabled/disabled
+    /// transition.
+    ScanStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotStatusRequest {
     pub schema_version: u16,
     pub source: String,
     pub machine_id: String,
+    /// Declared submission kind. Additive and optional on the wire contract:
+    /// a backend that predates it ignores the field (its status model is
+    /// forward-tolerant), and one that reads it gets the collector's own
+    /// classification instead of a shape guess.
+    pub report_kind: SnapshotStatusReportKind,
     pub enabled: bool,
     pub disabled_reason: Option<String>,
     pub last_scan_started_at: Option<String>,
@@ -967,6 +1001,179 @@ pub struct SnapshotStatusRequest {
     /// absence is liveness-only/unknown. Never fabricated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<SnapshotSourceManifest>,
+}
+
+impl SnapshotStatusRequest {
+    /// Name the first field that makes a `checkin` declaration false, if any.
+    ///
+    /// This is NOT a classifier: it never decides what a receipt is. It only
+    /// falsifies a claim the collector already made. A liveness beat says "I
+    /// have nothing new"; if the payload beside that claim discloses a scan
+    /// result the backend has not accepted yet, the claim is a lie and the
+    /// receipt must not travel.
+    ///
+    /// The exhaustive destructure is the point: a new wire field cannot be
+    /// added without deciding, at compile time, whether a liveness beat is
+    /// allowed to carry it.
+    fn checkin_contradicting_evidence(&self) -> Option<&'static str> {
+        let Self {
+            schema_version: _,
+            source: _,
+            machine_id: _,
+            report_kind: _,
+            enabled,
+            disabled_reason,
+            // The one clock a beat may legitimately carry. It declares an
+            // in-progress traversal — a cycle-start marker — which is a
+            // liveness statement, not a result.
+            last_scan_started_at: _,
+            last_scan_finished_at,
+            last_success_at,
+            last_error_code,
+            last_error_message,
+            last_uploaded_count,
+            last_scanned_session_count,
+            last_scanned_file_count,
+            last_zero_snapshot_confirmed_count,
+            last_zero_snapshot_usage_evidence_count,
+            last_dropped_usage_record_count,
+            last_ownership_incomplete_file_count,
+            last_snapshot_unproven_terminal_count,
+            last_snapshot_superseded_terminal_count,
+            // Server-negotiated policy width, not scan evidence: the beat
+            // reports back the hint the server just gave it.
+            last_backfill_window_days: _,
+            last_backfill_file_limit,
+            last_discovered_file_count,
+            last_skipped_file_count_due_to_limit,
+            last_scan_cap_hit,
+            last_semantic_noop_count,
+            last_census_complete,
+            last_symlink_rejected_count,
+            last_unreadable_path_count,
+            last_oversized_file_count,
+            last_disappeared_file_count,
+            last_malformed_json_line_count,
+            last_invalid_utf8_line_count,
+            last_over_line_cap_count,
+            last_recognized_usage_drop_count,
+            consecutive_failures,
+            next_retry_at,
+            // Build identity, unrelated to any scan.
+            collector_version: _,
+            parser_version: _,
+            // A cached witness from the last COMPLETED terminal report — the
+            // backend has already accepted it. Repeating it discloses nothing
+            // new, and a beat that says "alive" while the entity sets disagree
+            // is exactly what the manifest exists to expose.
+            manifest: _,
+        } = self;
+        // A collector reporting itself disabled is making a durable state
+        // report, which is the opposite of a liveness beat. The backend
+        // rejects `checkin` + disabled outright; never build one.
+        if !*enabled {
+            return Some("enabled=false");
+        }
+        if disabled_reason.is_some() {
+            return Some("disabled_reason");
+        }
+        if last_scan_finished_at.is_some() {
+            return Some("last_scan_finished_at");
+        }
+        if last_success_at.is_some() {
+            return Some("last_success_at");
+        }
+        if last_error_code.is_some() {
+            return Some("last_error_code");
+        }
+        if last_error_message.is_some() {
+            return Some("last_error_message");
+        }
+        if next_retry_at.is_some() {
+            return Some("next_retry_at");
+        }
+        if *last_scan_cap_hit {
+            return Some("last_scan_cap_hit");
+        }
+        // Completeness is a claim only a real census can make.
+        if *last_census_complete {
+            return Some("last_census_complete");
+        }
+        for (name, value) in [
+            ("last_uploaded_count", *last_uploaded_count),
+            ("last_scanned_session_count", *last_scanned_session_count),
+            ("last_scanned_file_count", *last_scanned_file_count),
+            (
+                "last_zero_snapshot_confirmed_count",
+                *last_zero_snapshot_confirmed_count,
+            ),
+            (
+                "last_zero_snapshot_usage_evidence_count",
+                *last_zero_snapshot_usage_evidence_count,
+            ),
+            (
+                "last_dropped_usage_record_count",
+                *last_dropped_usage_record_count,
+            ),
+            (
+                "last_ownership_incomplete_file_count",
+                *last_ownership_incomplete_file_count,
+            ),
+            (
+                "last_snapshot_unproven_terminal_count",
+                *last_snapshot_unproven_terminal_count,
+            ),
+            (
+                "last_snapshot_superseded_terminal_count",
+                *last_snapshot_superseded_terminal_count,
+            ),
+            ("last_backfill_file_limit", *last_backfill_file_limit),
+            ("last_discovered_file_count", *last_discovered_file_count),
+            (
+                "last_skipped_file_count_due_to_limit",
+                *last_skipped_file_count_due_to_limit,
+            ),
+            ("last_semantic_noop_count", *last_semantic_noop_count),
+            ("last_symlink_rejected_count", *last_symlink_rejected_count),
+            ("last_unreadable_path_count", *last_unreadable_path_count),
+            ("last_oversized_file_count", *last_oversized_file_count),
+            ("last_disappeared_file_count", *last_disappeared_file_count),
+            (
+                "last_malformed_json_line_count",
+                *last_malformed_json_line_count,
+            ),
+            (
+                "last_invalid_utf8_line_count",
+                *last_invalid_utf8_line_count,
+            ),
+            ("last_over_line_cap_count", *last_over_line_cap_count),
+            (
+                "last_recognized_usage_drop_count",
+                *last_recognized_usage_drop_count,
+            ),
+            ("consecutive_failures", *consecutive_failures),
+        ] {
+            if value != 0 {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    /// Refuse to send a receipt whose declared kind its own payload falsifies.
+    ///
+    /// Placed on the single egress so no future caller can route around it.
+    pub fn validate_declared_report_kind(&self) -> Result<()> {
+        if self.report_kind != SnapshotStatusReportKind::Checkin {
+            return Ok(());
+        }
+        match self.checkin_contradicting_evidence() {
+            None => Ok(()),
+            Some(field) => Err(anyhow!(
+                "collector status declared report_kind=checkin while disclosing new scan evidence: {field}"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1246,6 +1453,9 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &SnapshotStatusRequest,
     ) -> Result<SnapshotStatusResponse> {
+        // Every collector-status receipt leaves through here. A `checkin`
+        // declaration that its own payload falsifies never reaches the wire.
+        request.validate_declared_report_kind()?;
         self.agent
             .post(&self.api_url("/api/v1/agent-session-snapshots/status"))
             .set("Accept", "application/json")
@@ -2386,12 +2596,250 @@ mod tests {
         .expect("response"))));
     }
 
+    /// A liveness beat exactly as the collector builds it: no scan outcome of
+    /// any kind, only the server-negotiated width and the build identity.
+    fn clean_checkin_request() -> SnapshotStatusRequest {
+        SnapshotStatusRequest {
+            schema_version: crate::snapshots::SNAPSHOT_STATUS_SCHEMA_VERSION,
+            source: "codex".to_string(),
+            machine_id: "otm_test".to_string(),
+            report_kind: SnapshotStatusReportKind::Checkin,
+            enabled: true,
+            disabled_reason: None,
+            last_scan_started_at: Some("2026-06-01T10:00:00Z".to_string()),
+            last_scan_finished_at: None,
+            last_success_at: None,
+            last_error_code: None,
+            last_error_message: None,
+            last_uploaded_count: 0,
+            last_scanned_session_count: 0,
+            last_scanned_file_count: 0,
+            last_zero_snapshot_confirmed_count: 0,
+            last_zero_snapshot_usage_evidence_count: 0,
+            last_dropped_usage_record_count: 0,
+            last_ownership_incomplete_file_count: 0,
+            last_snapshot_unproven_terminal_count: 0,
+            last_snapshot_superseded_terminal_count: 0,
+            last_backfill_window_days: 183,
+            last_backfill_file_limit: 0,
+            last_discovered_file_count: 0,
+            last_skipped_file_count_due_to_limit: 0,
+            last_scan_cap_hit: false,
+            last_semantic_noop_count: 0,
+            last_census_complete: false,
+            last_symlink_rejected_count: 0,
+            last_unreadable_path_count: 0,
+            last_oversized_file_count: 0,
+            last_disappeared_file_count: 0,
+            last_malformed_json_line_count: 0,
+            last_invalid_utf8_line_count: 0,
+            last_over_line_cap_count: 0,
+            last_recognized_usage_drop_count: 0,
+            consecutive_failures: 0,
+            next_retry_at: None,
+            collector_version: Some("0.1.123".to_string()),
+            parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
+            manifest: None,
+        }
+    }
+
+    #[test]
+    fn report_kind_serializes_as_the_backend_contract_tokens() {
+        let checkin = serde_json::to_string(&clean_checkin_request()).expect("serialize beat");
+        assert!(checkin.contains(r#""report_kind":"checkin""#), "{checkin}");
+        let mut scan = clean_checkin_request();
+        scan.report_kind = SnapshotStatusReportKind::ScanStatus;
+        let scan = serde_json::to_string(&scan).expect("serialize scan status");
+        assert!(scan.contains(r#""report_kind":"scan_status""#), "{scan}");
+    }
+
+    /// The guard is a falsifier, not a classifier: it never picks the kind, it
+    /// only refuses a `checkin` the payload contradicts. Every field a beat may
+    /// not disclose is enumerated here; the exhaustive destructure inside
+    /// `checkin_contradicting_evidence` forces a decision for any field added
+    /// later.
+    #[test]
+    fn a_checkin_may_not_disclose_scan_evidence() {
+        type CheckinMutation = (&'static str, Box<dyn Fn(&mut SnapshotStatusRequest)>);
+
+        clean_checkin_request()
+            .validate_declared_report_kind()
+            .expect("a clean liveness beat is truthful");
+
+        let mutations: Vec<CheckinMutation> = vec![
+            ("enabled=false", Box::new(|r| r.enabled = false)),
+            (
+                "disabled_reason",
+                Box::new(|r| r.disabled_reason = Some("disabled_by_admin".to_string())),
+            ),
+            (
+                "last_scan_finished_at",
+                Box::new(|r| r.last_scan_finished_at = Some("2026-06-01T10:05:00Z".to_string())),
+            ),
+            (
+                "last_success_at",
+                Box::new(|r| r.last_success_at = Some("2026-06-01T10:05:00Z".to_string())),
+            ),
+            (
+                "last_error_code",
+                Box::new(|r| r.last_error_code = Some("parse_error".to_string())),
+            ),
+            (
+                "last_error_message",
+                Box::new(|r| r.last_error_message = Some("scan failed".to_string())),
+            ),
+            (
+                "next_retry_at",
+                Box::new(|r| r.next_retry_at = Some("2026-06-01T10:10:00Z".to_string())),
+            ),
+            (
+                "last_scan_cap_hit",
+                Box::new(|r| r.last_scan_cap_hit = true),
+            ),
+            (
+                "last_census_complete",
+                Box::new(|r| r.last_census_complete = true),
+            ),
+            (
+                "last_uploaded_count",
+                Box::new(|r| r.last_uploaded_count = 1),
+            ),
+            (
+                "last_scanned_session_count",
+                Box::new(|r| r.last_scanned_session_count = 1),
+            ),
+            (
+                "last_scanned_file_count",
+                Box::new(|r| r.last_scanned_file_count = 1),
+            ),
+            (
+                "last_zero_snapshot_confirmed_count",
+                Box::new(|r| r.last_zero_snapshot_confirmed_count = 1),
+            ),
+            (
+                "last_zero_snapshot_usage_evidence_count",
+                Box::new(|r| r.last_zero_snapshot_usage_evidence_count = 1),
+            ),
+            (
+                "last_dropped_usage_record_count",
+                Box::new(|r| r.last_dropped_usage_record_count = 1),
+            ),
+            (
+                "last_ownership_incomplete_file_count",
+                Box::new(|r| r.last_ownership_incomplete_file_count = 1),
+            ),
+            (
+                "last_snapshot_unproven_terminal_count",
+                Box::new(|r| r.last_snapshot_unproven_terminal_count = 1),
+            ),
+            (
+                "last_snapshot_superseded_terminal_count",
+                Box::new(|r| r.last_snapshot_superseded_terminal_count = 1),
+            ),
+            (
+                "last_backfill_file_limit",
+                Box::new(|r| r.last_backfill_file_limit = 1),
+            ),
+            (
+                "last_discovered_file_count",
+                Box::new(|r| r.last_discovered_file_count = 1),
+            ),
+            (
+                "last_skipped_file_count_due_to_limit",
+                Box::new(|r| r.last_skipped_file_count_due_to_limit = 1),
+            ),
+            (
+                "last_semantic_noop_count",
+                Box::new(|r| r.last_semantic_noop_count = 1),
+            ),
+            (
+                "last_symlink_rejected_count",
+                Box::new(|r| r.last_symlink_rejected_count = 1),
+            ),
+            (
+                "last_unreadable_path_count",
+                Box::new(|r| r.last_unreadable_path_count = 1),
+            ),
+            (
+                "last_oversized_file_count",
+                Box::new(|r| r.last_oversized_file_count = 1),
+            ),
+            (
+                "last_disappeared_file_count",
+                Box::new(|r| r.last_disappeared_file_count = 1),
+            ),
+            (
+                "last_malformed_json_line_count",
+                Box::new(|r| r.last_malformed_json_line_count = 1),
+            ),
+            (
+                "last_invalid_utf8_line_count",
+                Box::new(|r| r.last_invalid_utf8_line_count = 1),
+            ),
+            (
+                "last_over_line_cap_count",
+                Box::new(|r| r.last_over_line_cap_count = 1),
+            ),
+            (
+                "last_recognized_usage_drop_count",
+                Box::new(|r| r.last_recognized_usage_drop_count = 1),
+            ),
+            (
+                "consecutive_failures",
+                Box::new(|r| r.consecutive_failures = 1),
+            ),
+        ];
+
+        for (field, mutate) in mutations {
+            let mut beat = clean_checkin_request();
+            mutate(&mut beat);
+            let refused = beat
+                .validate_declared_report_kind()
+                .expect_err("a beat carrying {field} is a false declaration");
+            assert!(
+                refused.to_string().contains(field),
+                "{field} was not named: {refused}"
+            );
+
+            // The SAME payload declared truthfully always travels: the guard
+            // constrains the declaration, never the evidence.
+            let mut honest = beat.clone();
+            honest.report_kind = SnapshotStatusReportKind::ScanStatus;
+            honest
+                .validate_declared_report_kind()
+                .expect("a scan status may disclose anything");
+        }
+    }
+
+    /// A beat legitimately carries the cycle-start clock, the server's own
+    /// width hint, the build identity, and the manifest witness the backend
+    /// already accepted. None of those is new scan evidence.
+    #[test]
+    fn a_checkin_may_carry_already_accepted_liveness_evidence() {
+        let mut beat = clean_checkin_request();
+        beat.last_backfill_window_days = 730;
+        beat.collector_version = Some("9.9.9".to_string());
+        beat.parser_version = Some("whatever".to_string());
+        beat.manifest = Some(SnapshotSourceManifest {
+            contract_version: crate::snapshots::SNAPSHOT_MANIFEST_CONTRACT_VERSION.to_string(),
+            scope: crate::snapshots::SNAPSHOT_MANIFEST_SCOPE.to_string(),
+            source: "codex".to_string(),
+            window_start: "2026-01-01T00:00:00Z".to_string(),
+            window_end: "2026-07-03T00:00:00Z".to_string(),
+            entity_count: 3,
+            rolling_hash: "b".repeat(64),
+        });
+        beat.validate_declared_report_kind()
+            .expect("a beat may repeat accepted evidence");
+    }
+
     #[test]
     fn status_payload_uses_safe_error_fields() {
         let status = SnapshotStatusRequest {
             schema_version: crate::snapshots::SNAPSHOT_STATUS_SCHEMA_VERSION,
             source: "codex".to_string(),
             machine_id: "otm_test".to_string(),
+            report_kind: SnapshotStatusReportKind::ScanStatus,
             enabled: true,
             disabled_reason: None,
             last_scan_started_at: None,
@@ -2453,6 +2901,7 @@ mod tests {
             schema_version: crate::snapshots::SNAPSHOT_STATUS_SCHEMA_VERSION,
             source: "codex".to_string(),
             machine_id: "otm_test".to_string(),
+            report_kind: SnapshotStatusReportKind::ScanStatus,
             enabled: true,
             disabled_reason: None,
             last_scan_started_at: Some("2026-08-30T12:00:00Z".to_string()),
