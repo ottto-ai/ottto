@@ -1082,11 +1082,6 @@ pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 // fail closed when either bound is exceeded.
 const MAX_CODEX_PARENT_LEDGER_SIGNATURES: usize = 4_096;
 const MAX_CODEX_PARENT_LEDGER_REFS: usize = 256;
-// Terminal JSONL dispositions are durable, so they need the same kind of bound
-// the parent-ledger refs already carry. Orphan pruning is the primary control;
-// this cap is the backstop for a corpus that keeps more lossy transcripts live
-// than any index should retain.
-const MAX_TERMINAL_JSONL_DISPOSITIONS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1801,15 +1796,11 @@ pub struct ScanIndex {
     /// Files whose oversized physical lines were skipped once under a bounded
     /// parser generation. The path key plus exact opened-object-derived source
     /// fingerprint prevents both permanent condemnation after replacement and
-    /// repeated work for an unchanged object.
+    /// repeated work for an unchanged object. Keyed identically to `files` and
+    /// retired with it, so this map is a subset of `files`, never its own
+    /// independently growing store - see `prune_terminal_jsonl_dispositions`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     terminal_jsonl_dispositions: BTreeMap<String, TerminalJsonlDisposition>,
-    /// Cumulative number of terminal dispositions dropped by
-    /// `MAX_TERMINAL_JSONL_DISPOSITIONS`. Eviction is not silent: a non-zero
-    /// value is the durable disclosure that some still-present lossy file will
-    /// be reparsed once and re-record its disposition.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    terminal_jsonl_disposition_evictions: u64,
     /// Configured roots that have successfully resolved at least once for this
     /// destination/source index. A root that never existed is optional, but a
     /// root that disappears after contributing an authoritative census must
@@ -1980,7 +1971,6 @@ impl Default for ScanIndex {
             upload_context_fingerprint: None,
             files: BTreeMap::new(),
             terminal_jsonl_dispositions: BTreeMap::new(),
-            terminal_jsonl_disposition_evictions: 0,
             known_configured_scan_roots: BTreeSet::new(),
             legacy_unresolved_root_file_witnesses: BTreeSet::new(),
             codex_state_only_snapshot_fingerprints: BTreeMap::new(),
@@ -10262,8 +10252,9 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
     // Vanished paths are retired from `files` just above - by exact watcher
     // remove/rename hints and by bounded census reconciliation. Terminal
     // dispositions are keyed identically, so retire their orphans in the same
-    // place instead of carrying a renamed or deleted file's record forever, and
-    // bound whatever legitimately survives.
+    // place instead of carrying a renamed or deleted file's record forever.
+    // This keeps the map a subset of `files`, which is the whole bound it
+    // needs.
     index.prune_terminal_jsonl_dispositions();
     if source == SnapshotSource::Codex
         && traversal_discovery_done
@@ -17516,9 +17507,6 @@ impl ScanIndex {
             upload_context_fingerprint: previous.upload_context_fingerprint.clone(),
             files,
             terminal_jsonl_dispositions: previous.terminal_jsonl_dispositions.clone(),
-            terminal_jsonl_disposition_evictions: self
-                .terminal_jsonl_disposition_evictions
-                .max(previous.terminal_jsonl_disposition_evictions),
             known_configured_scan_roots: self.known_configured_scan_roots.clone(),
             legacy_unresolved_root_file_witnesses: self
                 .legacy_unresolved_root_file_witnesses
@@ -17639,8 +17627,7 @@ impl ScanIndex {
         self.file_snapshot_fingerprints.remove(key);
     }
 
-    /// Retire terminal JSONL dispositions whose file is no longer indexed, then
-    /// bound whatever survives.
+    /// Retire terminal JSONL dispositions whose file is no longer indexed.
     ///
     /// A disposition is only ever written together with the `files` entry for
     /// the same key, so a key with no entry means the path was renamed, deleted
@@ -17650,47 +17637,28 @@ impl ScanIndex {
     /// stops this durable map from growing monotonically with every lossy
     /// transcript the user ever moves.
     ///
-    /// The cap is the backstop. It evicts oldest-first by the indexed file's
-    /// modification time with the index key as tie-break, so the same index
-    /// evicts the same records on any machine, and it discloses how many
-    /// records it dropped. The only cost of an eviction is that a still-present
-    /// lossy file is reparsed once and re-records its disposition; disclosed
-    /// loss counters are recomputed from that reparse, never invented.
+    /// This is also the whole bound, and it is structural rather than a cap.
+    /// `record_terminal_jsonl_disposition` is called from exactly one place,
+    /// inside the `parse_complete` block that inserts the `files` entry for the
+    /// same `local_index_key` six lines later, and `remove_file_entry` drops
+    /// both together; bounded census reconciliation removes from `files` alone,
+    /// which is precisely the orphan this retain sweeps. So
+    /// `terminal_jsonl_dispositions` is always a subset of `files` - at most
+    /// one small fixed-shape record per transcript the traversal currently
+    /// observes, alongside the strictly larger `ScanIndexEntry` the same key
+    /// already costs. `committable_subset` preserves that inductively: it
+    /// carries `previous.terminal_jsonl_dispositions` beside a `files` map that
+    /// unions in all of `previous.files`, so a subset stays a subset across a
+    /// partial commit. Whatever bounds `files` therefore bounds this map, and a
+    /// separate cap on a strict subset of `files` could not bound the index. It
+    /// could only evict a live record, which re-arms the child->parent reparse
+    /// override for Codex (re-reading an oversized rollout every cycle) or
+    /// silently drops that file's disclosed terminal loss for every source
+    /// without one.
     fn prune_terminal_jsonl_dispositions(&mut self) {
         let files = &self.files;
         self.terminal_jsonl_dispositions
             .retain(|key, _| files.contains_key(key));
-        let overflow = self
-            .terminal_jsonl_dispositions
-            .len()
-            .saturating_sub(MAX_TERMINAL_JSONL_DISPOSITIONS);
-        if overflow == 0 {
-            return;
-        }
-        let mut ordered = self
-            .terminal_jsonl_dispositions
-            .keys()
-            .map(|key| {
-                (
-                    self.files
-                        .get(key)
-                        .map(|entry| entry.modified_unix_seconds)
-                        .unwrap_or_default(),
-                    key.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        ordered.sort();
-        for (_, key) in ordered.into_iter().take(overflow) {
-            self.terminal_jsonl_dispositions.remove(&key);
-        }
-        self.terminal_jsonl_disposition_evictions = self
-            .terminal_jsonl_disposition_evictions
-            .saturating_add(overflow as u64);
-        eprintln!(
-            "local snapshot scan evicted {overflow} terminal JSONL disposition(s) over the \
-             {MAX_TERMINAL_JSONL_DISPOSITIONS} cap; those files are reparsed once if still present"
-        );
     }
 
     fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
@@ -22824,85 +22792,153 @@ mod tests {
             "a deleted file leaves no durable disposition behind"
         );
         assert!(index.files.is_empty());
-        assert_eq!(index.terminal_jsonl_disposition_evictions, 0);
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Pruning keeps the map proportional to the live corpus; the cap is the
-    /// backstop for a corpus legitimately larger than any index should retain.
-    /// Eviction must be deterministic - oldest indexed file first, so two
-    /// daemons over the same index drop the same records - and disclosed.
+    /// The disposition map is deliberately uncapped: pruning keeps it a subset
+    /// of `files`, and the live indexed-file population is the bound. A corpus
+    /// carrying more lossy transcripts than any fixed cap would allow must
+    /// still settle - every disposition recorded once on the first cycle, then
+    /// nothing re-read and no disclosed loss dropped on any later cycle.
+    ///
+    /// Traversing AFTER recording is the whole point of this test. A 256-record
+    /// cap satisfied a direct `prune_terminal_jsonl_dispositions` assertion and
+    /// still broke this: with that cap restored, both arms below record 300 on
+    /// cycle 0, keep only 256, and then disclose `over_line_cap_count` 256 - not
+    /// 300 - on every later cycle, because an evicted file's `files` entry,
+    /// fingerprint and snapshot fingerprints are all still valid so the
+    /// candidate falls to `Skip` and `terminal_jsonl_loss()` contributes
+    /// nothing. Any cap reintroduced here trips that assertion on cycle 1.
+    ///
+    /// The second, worse consequence of an eviction needs the parent/child
+    /// ordinal shape rather than this independent-session corpus: once
+    /// `terminal_jsonl_loss()` returns `None`, the child->parent reparse
+    /// override re-arms, the oversized rollout is fully re-read, re-records its
+    /// disposition, and the next prune evicts the same key again - forever.
+    /// `oversized_parent_of_ordinal_subagent_children_is_read_once` owns that
+    /// shape and asserts the file is read exactly once.
     #[test]
-    fn terminal_disposition_cap_evicts_oldest_first_and_discloses_the_count() {
-        let disposition = |slot: usize| TerminalJsonlDisposition {
-            source_file_fingerprint: format!("fingerprint-{slot}"),
-            parser_generation: JSONL_TERMINAL_DISPOSITION_GENERATION.to_string(),
-            loss: TerminalJsonlLoss {
-                over_line_cap_count: 1,
-                recognized_usage_drop_count: 1,
-                dropped_usage_record_count: 1,
-            },
+    fn terminal_dispositions_settle_for_a_corpus_larger_than_any_fixed_cap() {
+        use std::io::Write;
+
+        // Comfortably over the 256 records the removed cap allowed.
+        const FILES: usize = 300;
+
+        // The oversized payload is written as a file hole. `read_bounded_jsonl_
+        // lines_impl` copies at most `MAX_JSONL_LINE_BYTES` of the line, marks
+        // it over-cap and then clears the buffer without inspecting the skipped
+        // bytes, so a zero-filled hole is byte-equivalent input for this path
+        // and keeps a 300-file over-cap corpus off disk.
+        let write_over_cap_file = |path: &Path, head: &str, prefix: &str, suffix: &str| {
+            let mut file = File::create(path).expect("create over-cap fixture");
+            file.write_all(head.as_bytes()).expect("write healthy head");
+            file.write_all(prefix.as_bytes())
+                .expect("write oversized line prefix");
+            file.seek(SeekFrom::Current((MAX_JSONL_LINE_BYTES + 1) as i64))
+                .expect("skip the oversized payload hole");
+            file.write_all(suffix.as_bytes())
+                .expect("close the oversized line");
         };
-        let key = |slot: usize| format!("/tmp/ottto/rollout-{slot:04}.jsonl");
-        let overflow = 3usize;
-        let total = MAX_TERMINAL_JSONL_DISPOSITIONS + overflow;
 
-        let mut index = ScanIndex::default();
-        for slot in 0..total {
-            index.files.insert(
-                key(slot),
-                ScanIndexEntry {
-                    size_bytes: 1,
-                    // Deliberately inverse to key order: the assertion below can
-                    // only pass on the modification-time rule, never on the
-                    // incidental `BTreeMap` key order.
-                    modified_unix_seconds: (total - slot) as u64,
-                    modified_unix_nanos: None,
-                    source_file_fingerprint: format!("fingerprint-{slot}"),
-                    last_snapshot_fingerprint: None,
-                    last_upload_body_witness: None,
-                    scan_identity_version: None,
-                },
+        for (source, name) in [
+            (SnapshotSource::Codex, "terminal-disposition-scale-codex"),
+            (
+                SnapshotSource::ClaudeCode,
+                "terminal-disposition-scale-claude",
+            ),
+        ] {
+            let root = temp_dir(name);
+            for slot in 0..FILES {
+                let session_id = format!("019e2701-{slot:04x}-7000-9000-{slot:012x}");
+                match source {
+                    SnapshotSource::Codex => {
+                        let head = format!(
+                            "{{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{{\"id\":\"{session_id}\",\"session_id\":\"{session_id}\"}}}}\n"
+                        );
+                        // The Codex envelope salvage reads `ordinal` and
+                        // `timestamp` out of the prefix, so the ordinal chain
+                        // stays gap-free and the file parses complete.
+                        let prefix = "{\"timestamp\":\"2026-07-22T08:00:01Z\",\"type\":\"response_item\",\"ordinal\":1,\"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"";
+                        let suffix = format!(
+                            "\"}}]}}}}\n{}\n",
+                            codex_test_token_line(
+                                "2026-07-22T08:00:02Z",
+                                Some(2),
+                                (40, 0, 8, 0),
+                                Some((40, 0, 8, 0)),
+                            )
+                        );
+                        write_over_cap_file(
+                            &root.join(format!("rollout-2026-07-22T08-00-00-{session_id}.jsonl")),
+                            &head,
+                            prefix,
+                            &suffix,
+                        );
+                    }
+                    _ => {
+                        let head = format!(
+                            "{{\"type\":\"assistant\",\"sessionId\":\"{session_id}\",\"uuid\":\"019e2702-{slot:04x}-7000-9000-{slot:012x}\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{{\"id\":\"msg_{slot}\",\"model\":\"claude-sonnet-4-6\",\"usage\":{{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}}}\n"
+                        );
+                        write_over_cap_file(
+                            &root.join(format!("{session_id}.jsonl")),
+                            &head,
+                            "{\"type\":\"assistant\",\"ignored\":\"",
+                            "\"}\n",
+                        );
+                    }
+                }
+            }
+
+            let mut index = ScanIndex::default();
+            let mut observed = Vec::new();
+            for cycle in 0..4 {
+                let mut scan = scan_source_roots_with_limit(
+                    source,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    "2026-07-22T09:00:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                    MAX_BACKFILL_FILES_PER_SOURCE,
+                    true,
+                )
+                .unwrap_or_else(|error| panic!("{name} cycle {cycle} traversal: {error}"));
+                assert!(scan.census_complete, "{name} cycle {cycle} census");
+                assert!(!scan.scan_cap_hit, "{name} cycle {cycle} cap hit");
+                assert_eq!(
+                    scan.ownership_incomplete_file_count, 0,
+                    "{name} cycle {cycle} ownership"
+                );
+                // Disclosed loss is recomputed from the dispositions on the
+                // cycles that read nothing. One evicted record would show up
+                // here as a silently smaller number.
+                assert_eq!(
+                    scan.over_line_cap_count, FILES,
+                    "{name} cycle {cycle} over cap"
+                );
+                assert_eq!(
+                    scan.recognized_usage_drop_count, FILES,
+                    "{name} cycle {cycle} recognized drop"
+                );
+                assert_eq!(
+                    scan.dropped_usage_record_count, FILES as u64,
+                    "{name} cycle {cycle} dropped usage"
+                );
+                observed.push((scan.scanned_file_count, scan.snapshots.len()));
+                finalize_scan_after_policy(source, &mut scan, &mut index);
+                assert_eq!(
+                    index.terminal_jsonl_dispositions.len(),
+                    FILES,
+                    "{name} cycle {cycle} retains one disposition per live file"
+                );
+                assert_eq!(index.files.len(), FILES, "{name} cycle {cycle} files");
+            }
+            assert_eq!(
+                observed,
+                vec![(FILES, FILES), (0, 0), (0, 0), (0, 0)],
+                "{name}: an over-cap corpus is read once, not once per cycle"
             );
-            index
-                .terminal_jsonl_dispositions
-                .insert(key(slot), disposition(slot));
+            let _ = fs::remove_dir_all(root);
         }
-        index
-            .terminal_jsonl_dispositions
-            .insert("/tmp/ottto/vanished.jsonl".to_string(), disposition(total));
-
-        index.prune_terminal_jsonl_dispositions();
-
-        assert!(
-            !index
-                .terminal_jsonl_dispositions
-                .contains_key("/tmp/ottto/vanished.jsonl"),
-            "orphans are retired before the cap is consulted"
-        );
-        assert_eq!(
-            index.terminal_jsonl_dispositions.len(),
-            MAX_TERMINAL_JSONL_DISPOSITIONS
-        );
-        assert_eq!(index.terminal_jsonl_disposition_evictions, overflow as u64);
-        for slot in (total - overflow)..total {
-            assert!(
-                !index.terminal_jsonl_dispositions.contains_key(&key(slot)),
-                "slot {slot} carries the oldest indexed mtime and is evicted first"
-            );
-        }
-        assert!(index.terminal_jsonl_dispositions.contains_key(&key(0)));
-        assert!(index
-            .terminal_jsonl_dispositions
-            .contains_key(&key(total - overflow - 1)));
-
-        // At the cap the pass is a no-op: the disclosure counter cannot drift.
-        index.prune_terminal_jsonl_dispositions();
-        assert_eq!(
-            index.terminal_jsonl_dispositions.len(),
-            MAX_TERMINAL_JSONL_DISPOSITIONS
-        );
-        assert_eq!(index.terminal_jsonl_disposition_evictions, overflow as u64);
     }
 
     #[test]
