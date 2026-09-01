@@ -7639,30 +7639,20 @@ fn append_codex_workspace_observations_at(
     let Some(token) = credentials.id_token.as_deref() else {
         return Vec::new();
     };
-    let workspace_targets =
-        codex_workspace_target_evidence_from_id_token(token, &snapshot.captured_at)
-            .unwrap_or_default();
-    let Some(observations) = codex_workspace_observations_from_id_token(
-        token,
-        &snapshot.captured_at,
-        snapshot
-            .model
-            .as_ref()
-            .and_then(|model| model.provider.clone())
-            .as_deref(),
-    ) else {
-        return workspace_targets;
-    };
-    if observations.is_empty() {
-        return workspace_targets;
-    }
-    snapshot.plan_observations.extend(observations);
-    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
-        "codex_workspace_memberships_detected",
-        AgentDiagnosticSeverity::Info,
-        "Codex ID token includes additional OpenAI workspaces; plan is shown only when the token explicitly claims it.",
-    ));
-    workspace_targets
+    // Only workspace TARGETS come out of the ID token. The token's
+    // `organizations[]` claim lists platform.openai.com organizations, which
+    // govern API keys; ChatGPT/Codex subscriptions live in chatgpt.com
+    // workspaces keyed by `chatgpt_account_id`, and the two id spaces differ
+    // even where the names match. A platform organization therefore cannot
+    // witness a subscription, so it no longer contributes a plan observation:
+    // one carrying a plan name used to be uploaded as
+    // `billing_channel: "subscription"` with no account identifier at all,
+    // which the backend materialized into its own priced subscription row keyed
+    // on the account label -- a plan the operator does not pay for, added to the
+    // monthly total. The signed-in workspace's real plan still arrives through
+    // the app-server probe, which reads the subscription rather than inferring
+    // it.
+    codex_workspace_target_evidence_from_id_token(token, &snapshot.captured_at).unwrap_or_default()
 }
 
 fn collection_method_key(method: &AgentStatusCollectionMethod) -> &'static str {
@@ -9061,66 +9051,6 @@ fn codex_workspace_target_evidence_from_id_token(
                     }),
                 is_default: organization.is_default,
                 observed_at: observed_at.to_string(),
-            })
-            .collect(),
-    )
-}
-
-fn codex_workspace_observations_from_id_token(
-    token: &str,
-    observed_at: &str,
-    model_provider: Option<&str>,
-) -> Option<Vec<AgentStatusPlanObservation>> {
-    let payload = token.split('.').nth(1)?;
-    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    let claims: Value = serde_json::from_slice(&decoded).ok()?;
-    let auth_claim = claims.get("https://api.openai.com/auth")?;
-    let email = first_json_string(&claims, &["email"]);
-    Some(
-        codex_organizations(auth_claim)
-            .into_iter()
-            .filter(|organization| !organization.is_default)
-            .filter(|organization| organization.id.is_some() || organization.label.is_some())
-            .map(|organization| {
-                let subscription_product = organization
-                    .plan_type
-                    .clone()
-                    .map(chatgpt_subscription_product);
-                let billing_channel = if subscription_product.is_some() {
-                    "subscription"
-                } else {
-                    "workspace_membership"
-                };
-                AgentStatusPlanObservation {
-                    observed_at: Some(observed_at.to_string()),
-                    evidence_method: Some("id_token_organization".to_string()),
-                    source_session_id: None,
-                    provider: Some("openai".to_string()),
-                    billing_provider: Some("openai".to_string()),
-                    model_provider: model_provider.map(ToString::to_string),
-                    billing_channel: Some(billing_channel.to_string()),
-                    auth_mode: Some("oauth".to_string()),
-                    gateway_provider: None,
-                    subscription_product,
-                    plan_type: organization.plan_type,
-                    account_label: email.clone(),
-                    account_id: None,
-                    organization_label: organization.label,
-                    organization_id: None,
-                    // Do not emit organization hashes for plan-unknown
-                    // memberships. The local app can show the workspace label,
-                    // while backend redaction stores the observation without
-                    // materializing a misleading subscription profile.
-                    account_identifier_hash: None,
-                    organization_identifier_hash: None,
-                    superseded_account_identifier_hash: None,
-                    superseded_organization_identifier_hash: None,
-                    credential_fingerprint_hash: None,
-                    billing_identity_evidence: None,
-                    billing_identity_confidence: AgentStatusConfidence::Low,
-                    confidence: AgentStatusConfidence::Low,
-                    is_current: Some(false),
-                }
             })
             .collect(),
     )
@@ -14519,96 +14449,126 @@ for line in sys.stdin:
         assert!(wire.get("subscription_period_last_checked_at").is_none());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn codex_id_token_workspace_observations_keep_unknown_plans_as_memberships() {
+    fn codex_platform_organizations_never_witness_a_subscription() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `organizations[]` lists platform.openai.com organizations, which
+        // govern API keys. ChatGPT/Codex subscriptions live in chatgpt.com
+        // workspaces keyed by `chatgpt_account_id`, and the id spaces differ
+        // even where the names match -- proven live: a platform organization
+        // absent from the ChatGPT picker entirely, and a target prepared from a
+        // platform organization id titled the same as a ChatGPT workspace
+        // returning `identity_mismatch`.
+        //
+        // "Team Org" below carries a plan name, which used to be uploaded as a
+        // plan observation with `billing_channel: "subscription"` and no account
+        // identifier at all. The backend materialized that into its own priced
+        // subscription row keyed on the account label -- a plan nobody pays for,
+        // added to the operator's monthly total.
+        let root = std::env::temp_dir().join(format!(
+            "ottto-codex-platform-orgs-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        // macOS `temp_dir()` reaches the real directory through a symlinked
+        // `/var`, and the secure reader opens every component with O_NOFOLLOW.
+        // Without canonicalizing, the fixture is refused and the assertions
+        // below would all pass on an untouched snapshot.
+        let root = root.canonicalize().expect("canonical root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
+            .expect("provider home mode");
+
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
         let payload = URL_SAFE_NO_PAD.encode(
-            r#"{
+            serde_json::json!({
                 "email": "codex@example.com",
                 "sub": "account_sub",
                 "https://api.openai.com/auth": {
-                    "chatgpt_account_id": "account_123",
+                    "chatgpt_user_id": "account_sub",
+                    "chatgpt_account_id": "workspace_binding",
                     "chatgpt_plan_type": "Pro",
                     "organizations": [
                         {"id": "org_current", "title": "Current Org", "is_default": true},
-                        {"id": "org_related", "title": "Related Org", "is_default": false}
-                    ]
-                }
-            }"#,
-        );
-        let token = format!("{header}.{payload}.signature");
-
-        let observations = codex_workspace_observations_from_id_token(
-            &token,
-            "2026-06-07T10:00:00Z",
-            Some("openai"),
-        )
-        .expect("observations");
-
-        assert_eq!(observations.len(), 1);
-        let related = &observations[0];
-        assert_eq!(
-            related.evidence_method.as_deref(),
-            Some("id_token_organization")
-        );
-        assert_eq!(
-            related.billing_channel.as_deref(),
-            Some("workspace_membership")
-        );
-        assert_eq!(related.subscription_product, None);
-        assert_eq!(related.plan_type, None);
-        assert_eq!(related.account_label.as_deref(), Some("codex@example.com"));
-        assert_eq!(related.organization_label.as_deref(), Some("Related Org"));
-        assert_eq!(related.account_id, None);
-        assert_eq!(related.organization_id, None);
-        assert_eq!(related.is_current, Some(false));
-        assert_eq!(related.account_identifier_hash, None);
-        assert_eq!(related.organization_identifier_hash, None);
-        assert_eq!(
-            related.billing_identity_confidence,
-            AgentStatusConfidence::Low
-        );
-        assert_eq!(related.confidence, AgentStatusConfidence::Low);
-    }
-
-    #[test]
-    fn codex_id_token_workspace_plans_remain_low_confidence_without_identity() {
-        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
-        let payload = URL_SAFE_NO_PAD.encode(
-            r#"{
-                "email": "codex@example.com",
-                "sub": "account_sub",
-                "https://api.openai.com/auth": {
-                    "chatgpt_account_id": "account_123",
-                    "organizations": [
-                        {"id": "org_current", "title": "Current Org", "is_default": true},
+                        {"id": "org_related", "title": "Related Org", "is_default": false},
                         {"id": "org_team", "title": "Team Org", "subscription_plan": "Team"}
                     ]
                 }
-            }"#,
+            })
+            .to_string(),
         );
-        let token = format!("{header}.{payload}.signature");
-
-        let observations = codex_workspace_observations_from_id_token(
-            &token,
-            "2026-06-07T10:00:00Z",
-            Some("openai"),
+        let id_token = format!("{header}.{payload}.signature");
+        std::fs::write(
+            root.join("auth.json"),
+            serde_json::json!({
+                "tokens": {"id_token": id_token},
+                "account_id": "workspace_binding"
+            })
+            .to_string(),
         )
-        .expect("observations");
+        .expect("auth fixture");
+        // `auth.json` must be exactly 0600 or the secure reader refuses it, the
+        // collector returns early, and every assertion below would pass for the
+        // wrong reason.
+        std::fs::set_permissions(
+            root.join("auth.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("auth mode");
 
-        assert_eq!(observations.len(), 1);
-        let team = &observations[0];
-        assert_eq!(team.billing_channel.as_deref(), Some("subscription"));
-        assert_eq!(team.plan_type.as_deref(), Some("team"));
-        assert_eq!(team.subscription_product.as_deref(), Some("chatgpt_team"));
-        assert_eq!(team.organization_label.as_deref(), Some("Team Org"));
-        assert_eq!(team.account_id, None);
-        assert_eq!(team.organization_id, None);
-        assert_eq!(team.is_current, Some(false));
-        assert_eq!(team.account_identifier_hash, None);
-        assert_eq!(team.billing_identity_evidence, None);
-        assert_eq!(team.billing_identity_confidence, AgentStatusConfidence::Low);
-        assert_eq!(team.confidence, AgentStatusConfidence::Low);
+        let mut snapshot = base_snapshot(
+            SourceKind::Codex,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::AppServer,
+            "2026-09-01T10:00:00Z".to_string(),
+            "2026-09-01T10:15:00Z".to_string(),
+        );
+
+        let targets = append_codex_workspace_observations_at(
+            &mut snapshot,
+            &root,
+            CodexHomeTrust::ProviderDefault,
+        );
+
+        // Prove the fixture was actually read before trusting any absence.
+        assert!(
+            !snapshot
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "codex_credential_read_failed"),
+            "the credential fixture was rejected, so this test would prove nothing"
+        );
+        assert!(
+            !targets.is_empty(),
+            "the signed-in workspace must still produce a target"
+        );
+
+        assert!(
+            snapshot.plan_observations.is_empty(),
+            "platform organizations must not claim a subscription: {:?}",
+            snapshot.plan_observations
+        );
+        assert!(
+            !snapshot
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "codex_workspace_memberships_detected"),
+            "the membership diagnostic described observations that are no longer emitted"
+        );
+        // Target EVIDENCE still enumerates every organization the token names;
+        // `derive_codex_account_target_coverage` is what narrows it to the
+        // signed-in workspace, so exactly one default target is the shape the
+        // coverage step expects to receive.
+        assert_eq!(
+            targets.iter().filter(|target| target.is_default).count(),
+            1,
+            "the signed-in workspace must be the one default target"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

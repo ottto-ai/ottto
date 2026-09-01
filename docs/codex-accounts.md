@@ -12,7 +12,7 @@ subscriptions; two durable connections for the same exact composite are a
 duplicate. A default connection may temporarily shadow a matching durable
 connection without becoming a duplicate registration.
 
-Authenticated local-control protocol v21 exposes every workspace already
+Authenticated local-control protocol v23 exposes every workspace already
 observed in the Codex ID token as a typed `target_coverage.targets` row. Each
 row has a daemon-authored opaque target id, hashed account/workspace identity,
 the provider-supplied workspace title, durability and health, and explicit
@@ -29,6 +29,15 @@ The id spaces differ even where the names match: a target built from an
 `organizations[].id` is rejected with `identity_mismatch` when the same-named
 ChatGPT workspace is signed into, and a platform organization can be absent from
 the ChatGPT workspace picker entirely.
+
+Because of that split, a platform organization never witnesses a subscription.
+It contributes workspace-target evidence and nothing else: no plan observation,
+no plan name, no billing channel. One carrying a plan title used to be uploaded
+as a subscription-bearing observation with no account identifier attached, which
+materialized into a separate priced subscription row keyed on the account label
+- a plan the operator does not hold, added to their monthly total. The signed-in
+workspace's real plan still arrives through the app-server probe, which reads
+the subscription instead of inferring it from a title.
 
 Adding one of those unnameable workspaces is `codex_account_prepare_open`
 (protocol v23). It reserves a Codex home, the owner picks any workspace in the
