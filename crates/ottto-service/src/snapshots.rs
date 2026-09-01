@@ -1082,6 +1082,11 @@ pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 // fail closed when either bound is exceeded.
 const MAX_CODEX_PARENT_LEDGER_SIGNATURES: usize = 4_096;
 const MAX_CODEX_PARENT_LEDGER_REFS: usize = 256;
+// Terminal JSONL dispositions are durable, so they need the same kind of bound
+// the parent-ledger refs already carry. Orphan pruning is the primary control;
+// this cap is the backstop for a corpus that keeps more lossy transcripts live
+// than any index should retain.
+const MAX_TERMINAL_JSONL_DISPOSITIONS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1799,6 +1804,12 @@ pub struct ScanIndex {
     /// repeated work for an unchanged object.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     terminal_jsonl_dispositions: BTreeMap<String, TerminalJsonlDisposition>,
+    /// Cumulative number of terminal dispositions dropped by
+    /// `MAX_TERMINAL_JSONL_DISPOSITIONS`. Eviction is not silent: a non-zero
+    /// value is the durable disclosure that some still-present lossy file will
+    /// be reparsed once and re-record its disposition.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    terminal_jsonl_disposition_evictions: u64,
     /// Configured roots that have successfully resolved at least once for this
     /// destination/source index. A root that never existed is optional, but a
     /// root that disappears after contributing an authoritative census must
@@ -1969,6 +1980,7 @@ impl Default for ScanIndex {
             upload_context_fingerprint: None,
             files: BTreeMap::new(),
             terminal_jsonl_dispositions: BTreeMap::new(),
+            terminal_jsonl_disposition_evictions: 0,
             known_configured_scan_roots: BTreeSet::new(),
             legacy_unresolved_root_file_witnesses: BTreeSet::new(),
             codex_state_only_snapshot_fingerprints: BTreeMap::new(),
@@ -10247,6 +10259,12 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
     } else {
         false
     };
+    // Vanished paths are retired from `files` just above - by exact watcher
+    // remove/rename hints and by bounded census reconciliation. Terminal
+    // dispositions are keyed identically, so retire their orphans in the same
+    // place instead of carrying a renamed or deleted file's record forever, and
+    // bound whatever legitimately survives.
+    index.prune_terminal_jsonl_dispositions();
     if source == SnapshotSource::Codex
         && traversal_discovery_done
         && traversal_healthy
@@ -17498,6 +17516,9 @@ impl ScanIndex {
             upload_context_fingerprint: previous.upload_context_fingerprint.clone(),
             files,
             terminal_jsonl_dispositions: previous.terminal_jsonl_dispositions.clone(),
+            terminal_jsonl_disposition_evictions: self
+                .terminal_jsonl_disposition_evictions
+                .max(previous.terminal_jsonl_disposition_evictions),
             known_configured_scan_roots: self.known_configured_scan_roots.clone(),
             legacy_unresolved_root_file_witnesses: self
                 .legacy_unresolved_root_file_witnesses
@@ -17616,6 +17637,60 @@ impl ScanIndex {
         self.terminal_jsonl_dispositions.remove(key);
         self.confirmed_empty_files.remove(key);
         self.file_snapshot_fingerprints.remove(key);
+    }
+
+    /// Retire terminal JSONL dispositions whose file is no longer indexed, then
+    /// bound whatever survives.
+    ///
+    /// A disposition is only ever written together with the `files` entry for
+    /// the same key, so a key with no entry means the path was renamed, deleted
+    /// or reconciled away. Such a record can never be consulted again - a
+    /// candidate at that path already takes `CandidateDecision::Parse` through
+    /// the missing-entry arm - so dropping it is behaviour-neutral hygiene that
+    /// stops this durable map from growing monotonically with every lossy
+    /// transcript the user ever moves.
+    ///
+    /// The cap is the backstop. It evicts oldest-first by the indexed file's
+    /// modification time with the index key as tie-break, so the same index
+    /// evicts the same records on any machine, and it discloses how many
+    /// records it dropped. The only cost of an eviction is that a still-present
+    /// lossy file is reparsed once and re-records its disposition; disclosed
+    /// loss counters are recomputed from that reparse, never invented.
+    fn prune_terminal_jsonl_dispositions(&mut self) {
+        let files = &self.files;
+        self.terminal_jsonl_dispositions
+            .retain(|key, _| files.contains_key(key));
+        let overflow = self
+            .terminal_jsonl_dispositions
+            .len()
+            .saturating_sub(MAX_TERMINAL_JSONL_DISPOSITIONS);
+        if overflow == 0 {
+            return;
+        }
+        let mut ordered = self
+            .terminal_jsonl_dispositions
+            .keys()
+            .map(|key| {
+                (
+                    self.files
+                        .get(key)
+                        .map(|entry| entry.modified_unix_seconds)
+                        .unwrap_or_default(),
+                    key.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        ordered.sort();
+        for (_, key) in ordered.into_iter().take(overflow) {
+            self.terminal_jsonl_dispositions.remove(&key);
+        }
+        self.terminal_jsonl_disposition_evictions = self
+            .terminal_jsonl_disposition_evictions
+            .saturating_add(overflow as u64);
+        eprintln!(
+            "local snapshot scan evicted {overflow} terminal JSONL disposition(s) over the \
+             {MAX_TERMINAL_JSONL_DISPOSITIONS} cap; those files are reparsed once if still present"
+        );
     }
 
     fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
@@ -22675,6 +22750,159 @@ mod tests {
             assert!(second.snapshots.is_empty(), "{name}");
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    /// The disposition map is durable, so a record whose file was renamed or
+    /// deleted must not outlive the `files` entry it was written beside.
+    /// Without pruning the map grows monotonically for the life of the index,
+    /// one dead key per lossy transcript the user ever moves.
+    #[test]
+    fn terminal_dispositions_are_pruned_when_their_file_moves_or_disappears() {
+        let source = SnapshotSource::ClaudeCode;
+        let root = temp_dir("terminal-disposition-prune");
+        let original = root.join("session-a.jsonl");
+        let moved = root.join("session-b.jsonl");
+        let mut bytes = b"{\"type\":\"assistant\",\"sessionId\":\"019e2700-7777-7000-9000-777777777777\",\"uuid\":\"019e2700-7777-7000-9000-7777777777a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n".to_vec();
+        bytes.extend_from_slice(b"{\"type\":\"assistant\",\"ignored\":\"");
+        bytes.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
+        bytes.extend_from_slice(b"\"}\n");
+        fs::write(&original, &bytes).expect("write over-cap fixture");
+
+        let traverse = |index: &mut ScanIndex, at: &str| {
+            let mut result = scan_source_roots_with_limit(
+                source,
+                std::slice::from_ref(&root),
+                index,
+                at,
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("traversal completes");
+            assert!(result.census_complete);
+            finalize_scan_after_policy(source, &mut result, index);
+            result
+        };
+
+        let mut index = ScanIndex::default();
+        let first = traverse(&mut index, "2026-07-22T08:02:00Z");
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.over_line_cap_count, 1);
+        assert_eq!(index.terminal_jsonl_dispositions.len(), 1);
+        assert!(index
+            .terminal_jsonl_dispositions
+            .contains_key(&local_index_key(&original)));
+
+        // Moved path: the same bytes are a new object. The new key is recorded
+        // and the old key must NOT be carried forward beside it.
+        fs::rename(&original, &moved).expect("rename terminal fixture");
+        let after_move = traverse(&mut index, "2026-07-22T08:07:00Z");
+        assert_eq!(
+            after_move.scanned_file_count, 1,
+            "moved object is read once"
+        );
+        assert_eq!(
+            after_move.over_line_cap_count, 1,
+            "loss is not double-counted"
+        );
+        assert_eq!(
+            index.terminal_jsonl_dispositions.len(),
+            1,
+            "the renamed-away key is pruned, not accumulated"
+        );
+        assert!(index
+            .terminal_jsonl_dispositions
+            .contains_key(&local_index_key(&moved)));
+        assert_eq!(index.files.len(), 1);
+
+        // Deleted path: nothing indexed corresponds to the disposition at all.
+        fs::remove_file(&moved).expect("remove terminal fixture");
+        let after_delete = traverse(&mut index, "2026-07-22T08:12:00Z");
+        assert_eq!(after_delete.scanned_file_count, 0);
+        assert!(
+            index.terminal_jsonl_dispositions.is_empty(),
+            "a deleted file leaves no durable disposition behind"
+        );
+        assert!(index.files.is_empty());
+        assert_eq!(index.terminal_jsonl_disposition_evictions, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Pruning keeps the map proportional to the live corpus; the cap is the
+    /// backstop for a corpus legitimately larger than any index should retain.
+    /// Eviction must be deterministic - oldest indexed file first, so two
+    /// daemons over the same index drop the same records - and disclosed.
+    #[test]
+    fn terminal_disposition_cap_evicts_oldest_first_and_discloses_the_count() {
+        let disposition = |slot: usize| TerminalJsonlDisposition {
+            source_file_fingerprint: format!("fingerprint-{slot}"),
+            parser_generation: JSONL_TERMINAL_DISPOSITION_GENERATION.to_string(),
+            loss: TerminalJsonlLoss {
+                over_line_cap_count: 1,
+                recognized_usage_drop_count: 1,
+                dropped_usage_record_count: 1,
+            },
+        };
+        let key = |slot: usize| format!("/tmp/ottto/rollout-{slot:04}.jsonl");
+        let overflow = 3usize;
+        let total = MAX_TERMINAL_JSONL_DISPOSITIONS + overflow;
+
+        let mut index = ScanIndex::default();
+        for slot in 0..total {
+            index.files.insert(
+                key(slot),
+                ScanIndexEntry {
+                    size_bytes: 1,
+                    // Deliberately inverse to key order: the assertion below can
+                    // only pass on the modification-time rule, never on the
+                    // incidental `BTreeMap` key order.
+                    modified_unix_seconds: (total - slot) as u64,
+                    modified_unix_nanos: None,
+                    source_file_fingerprint: format!("fingerprint-{slot}"),
+                    last_snapshot_fingerprint: None,
+                    last_upload_body_witness: None,
+                    scan_identity_version: None,
+                },
+            );
+            index
+                .terminal_jsonl_dispositions
+                .insert(key(slot), disposition(slot));
+        }
+        index
+            .terminal_jsonl_dispositions
+            .insert("/tmp/ottto/vanished.jsonl".to_string(), disposition(total));
+
+        index.prune_terminal_jsonl_dispositions();
+
+        assert!(
+            !index
+                .terminal_jsonl_dispositions
+                .contains_key("/tmp/ottto/vanished.jsonl"),
+            "orphans are retired before the cap is consulted"
+        );
+        assert_eq!(
+            index.terminal_jsonl_dispositions.len(),
+            MAX_TERMINAL_JSONL_DISPOSITIONS
+        );
+        assert_eq!(index.terminal_jsonl_disposition_evictions, overflow as u64);
+        for slot in (total - overflow)..total {
+            assert!(
+                !index.terminal_jsonl_dispositions.contains_key(&key(slot)),
+                "slot {slot} carries the oldest indexed mtime and is evicted first"
+            );
+        }
+        assert!(index.terminal_jsonl_dispositions.contains_key(&key(0)));
+        assert!(index
+            .terminal_jsonl_dispositions
+            .contains_key(&key(total - overflow - 1)));
+
+        // At the cap the pass is a no-op: the disclosure counter cannot drift.
+        index.prune_terminal_jsonl_dispositions();
+        assert_eq!(
+            index.terminal_jsonl_dispositions.len(),
+            MAX_TERMINAL_JSONL_DISPOSITIONS
+        );
+        assert_eq!(index.terminal_jsonl_disposition_evictions, overflow as u64);
     }
 
     #[test]
