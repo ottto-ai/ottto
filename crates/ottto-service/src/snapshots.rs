@@ -309,6 +309,12 @@ pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v28";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
 const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v2";
+// A terminal oversized-line disposition is reusable only under the exact
+// bounded reader semantics that created it. Advancing the bound or teaching
+// the reader to salvage a new shape changes this witness, starts one fresh
+// traversal immediately, and re-opens each affected unchanged file once.
+const JSONL_TERMINAL_DISPOSITION_GENERATION: &str =
+    "bounded_jsonl_terminal:v1:max_line_bytes=16777216";
 const SCAN_INDEX_SCHEMA_VERSION: u16 = 2;
 const FILE_CONTENT_SAMPLE_BYTES: usize = 4 * 1024;
 pub(crate) const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v1";
@@ -1685,6 +1691,15 @@ struct ScanTraversalCounts {
     ownership_incomplete_file_count: usize,
     zero_snapshot_usage_evidence_count: usize,
     dropped_usage_record_count: u64,
+    /// Subset of the public loss counters above that has a durable terminal
+    /// disposition. These remain disclosed but do not make an exhausted
+    /// traversal retryable.
+    #[serde(default)]
+    terminal_over_line_cap_count: usize,
+    #[serde(default)]
+    terminal_recognized_usage_drop_count: usize,
+    #[serde(default)]
+    terminal_dropped_usage_record_count: u64,
 }
 
 impl ScanTraversalCounts {
@@ -1696,12 +1711,27 @@ impl ScanTraversalCounts {
             || self.disappeared_file_count > 0
             || self.malformed_json_line_count > 0
             || self.invalid_utf8_line_count > 0
-            || self.over_line_cap_count > 0
-            || self.recognized_usage_drop_count > 0
+            || self.over_line_cap_count > self.terminal_over_line_cap_count
+            || self.recognized_usage_drop_count > self.terminal_recognized_usage_drop_count
             || self.ownership_incomplete_file_count > 0
             || self.zero_snapshot_usage_evidence_count > 0
-            || self.dropped_usage_record_count > 0
+            || self.dropped_usage_record_count > self.terminal_dropped_usage_record_count
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+struct TerminalJsonlLoss {
+    over_line_cap_count: usize,
+    recognized_usage_drop_count: usize,
+    dropped_usage_record_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct TerminalJsonlDisposition {
+    source_file_fingerprint: String,
+    parser_generation: String,
+    loss: TerminalJsonlLoss,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1763,6 +1793,14 @@ pub struct ScanIndex {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     upload_context_fingerprint: Option<String>,
     pub files: BTreeMap<String, ScanIndexEntry>,
+    /// Files whose oversized physical lines were skipped once under a bounded
+    /// parser generation. The path key plus exact opened-object-derived source
+    /// fingerprint prevents both permanent condemnation after replacement and
+    /// repeated work for an unchanged object. Keyed identically to `files` and
+    /// retired with it, so this map is a subset of `files`, never its own
+    /// independently growing store - see `prune_terminal_jsonl_dispositions`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    terminal_jsonl_dispositions: BTreeMap<String, TerminalJsonlDisposition>,
     /// Configured roots that have successfully resolved at least once for this
     /// destination/source index. A root that never existed is optional, but a
     /// root that disappears after contributing an authoritative census must
@@ -1932,6 +1970,7 @@ impl Default for ScanIndex {
             generation: 0,
             upload_context_fingerprint: None,
             files: BTreeMap::new(),
+            terminal_jsonl_dispositions: BTreeMap::new(),
             known_configured_scan_roots: BTreeSet::new(),
             legacy_unresolved_root_file_witnesses: BTreeSet::new(),
             codex_state_only_snapshot_fingerprints: BTreeMap::new(),
@@ -2372,10 +2411,10 @@ pub enum ScanParseOutcome {
 /// Exact `snapshot_manifest:v2` wire contract carried on collector check-ins.
 /// Census diagnostics stay in the top-level status counters rather than
 /// masquerading as server proof inside this producer-side manifest.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotSourceManifest {
-    pub contract_version: &'static str,
-    pub scope: &'static str,
+    pub contract_version: String,
+    pub scope: String,
     pub source: String,
     pub window_start: String,
     pub window_end: String,
@@ -9917,6 +9956,16 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
             .unwrap_or_else(|| index.candidate_decision(&candidate));
         if source == SnapshotSource::Codex
             && decision == CandidateDecision::Skip
+            // A terminal disposition at this exact file fingerprint and parser
+            // generation means the previous traversal already parsed this
+            // object to completion and disclosed its loss. Parsing is
+            // deterministic over unchanged bytes, so a reparse would rebuild
+            // the same lossy ledger, be rejected again, and re-arm this
+            // override forever - an unbounded full reread of a multi-hundred-MB
+            // parent every cycle. The child stays fail-closed on the missing
+            // prefix evidence; only a new fingerprint or generation re-opens
+            // the file (`candidate_decision`, `terminal_jsonl_loss`).
+            && index.terminal_jsonl_loss(&candidate).is_none()
             && codex_session_id_candidates_from_path(&candidate.path)
                 .iter()
                 .any(|session_id| {
@@ -9933,7 +9982,12 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
             decision = CandidateDecision::Parse;
         }
         match decision {
-            CandidateDecision::Skip => continue,
+            CandidateDecision::Skip => {
+                if let Some(loss) = index.terminal_jsonl_loss(&candidate) {
+                    census.add_terminal_jsonl_loss(loss);
+                }
+                continue;
+            }
             CandidateDecision::Migrate => {
                 index.migrate(candidate);
                 continue;
@@ -10008,6 +10062,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         );
         codex_parent_resolution_retry_required |= parsed_file.codex_parent_resolution_pending;
         let parse_complete = parsed_file.complete();
+        let terminal_loss = parsed_file.terminal_loss();
         if let Some(parent_session_ref) = parsed_file.codex_parent_session_ref.as_ref() {
             let parent_session_ref = resolve_codex_identity(parent_session_ref.as_str());
             if index.codex_parent_ownership_refs.len() < MAX_CODEX_PARENT_LEDGER_REFS
@@ -10089,6 +10144,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
             parsed_snapshot_count,
         });
         if parse_complete {
+            index.record_terminal_jsonl_disposition(&candidate, terminal_loss.clone());
             let outcome = if last_snapshot_fingerprint.is_some() {
                 ScanParseOutcome::Snapshot
             } else {
@@ -10105,10 +10161,20 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         census.dropped_usage_record_count = census
             .dropped_usage_record_count
             .saturating_add(dropped_usage_record_count);
-        // A lossy file is one quarantined input, not a partially-authoritative
-        // entity. Healthy siblings continue, but none of this file's derived
-        // snapshots may reach upload/progress/manifest state until every line
-        // is readable and recognized.
+        if let Some(loss) = terminal_loss {
+            census.terminal_over_line_cap_count = census
+                .terminal_over_line_cap_count
+                .saturating_add(loss.over_line_cap_count);
+            census.terminal_recognized_usage_drop_count = census
+                .terminal_recognized_usage_drop_count
+                .saturating_add(loss.recognized_usage_drop_count);
+            census.terminal_dropped_usage_record_count = census
+                .terminal_dropped_usage_record_count
+                .saturating_add(loss.dropped_usage_record_count);
+        }
+        // Retryable parse loss still quarantines the whole derived entity.
+        // A bounded oversized line is different: its loss is terminal and
+        // disclosed, so independently parsed sibling records remain usable.
         if parse_complete {
             snapshots.extend(parsed);
         }
@@ -10141,6 +10207,18 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
             .counts
             .dropped_usage_record_count
             .saturating_add(census.dropped_usage_record_count);
+        traversal.counts.terminal_over_line_cap_count = traversal
+            .counts
+            .terminal_over_line_cap_count
+            .saturating_add(census.terminal_over_line_cap_count);
+        traversal.counts.terminal_recognized_usage_drop_count = traversal
+            .counts
+            .terminal_recognized_usage_drop_count
+            .saturating_add(census.terminal_recognized_usage_drop_count);
+        traversal.counts.terminal_dropped_usage_record_count = traversal
+            .counts
+            .terminal_dropped_usage_record_count
+            .saturating_add(census.terminal_dropped_usage_record_count);
     }
     // A remove/rename hint can arrive after bounded reconciliation has already
     // passed this key. Removing it only from `observed_index_keys` is then too
@@ -10171,6 +10249,13 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
     } else {
         false
     };
+    // Vanished paths are retired from `files` just above - by exact watcher
+    // remove/rename hints and by bounded census reconciliation. Terminal
+    // dispositions are keyed identically, so retire their orphans in the same
+    // place instead of carrying a renamed or deleted file's record forever.
+    // This keeps the map a subset of `files`, which is the whole bound it
+    // needs.
+    index.prune_terminal_jsonl_dispositions();
     if source == SnapshotSource::Codex
         && traversal_discovery_done
         && traversal_healthy
@@ -10758,6 +10843,7 @@ struct ParsedJsonlFile {
     ownership_incomplete_file_count: usize,
     zero_snapshot_usage_evidence: bool,
     dropped_usage_record_count: u64,
+    terminal_line_loss_count: usize,
     /// A rollout whose exclusive ownership could not be proven must not fall
     /// through to the inclusive state_5.sqlite tokens_used snapshot.
     state_only_blocked_session_ids: BTreeSet<String>,
@@ -10774,10 +10860,19 @@ struct ParsedJsonlFile {
 
 impl ParsedJsonlFile {
     fn complete(&self) -> bool {
-        self.report.complete()
-            && self.recognized_usage_drop_count == 0
+        self.report.complete_except_over_line_cap()
+            && self.report.over_line_cap_count == self.terminal_line_loss_count
+            && self.recognized_usage_drop_count == self.terminal_line_loss_count
             && self.ownership_incomplete_file_count == 0
             && !self.codex_parent_resolution_pending
+    }
+
+    fn terminal_loss(&self) -> Option<TerminalJsonlLoss> {
+        (self.terminal_line_loss_count > 0).then_some(TerminalJsonlLoss {
+            over_line_cap_count: self.terminal_line_loss_count,
+            recognized_usage_drop_count: self.terminal_line_loss_count,
+            dropped_usage_record_count: self.terminal_line_loss_count as u64,
+        })
     }
 }
 
@@ -10819,11 +10914,11 @@ fn parse_opened_jsonl_file(
             accumulator.seed_codex_sidecar_parent(path, &file_metadata, metadata);
         }
     }
-    let mut recognized_usage_drop_count = 0;
+    let mut recognized_usage_drop_count: usize = 0;
     let mut ownership_incomplete_file_count = 0;
     let mut positive_recognized_usage_count: usize = 0;
     let mut positive_usage_evidence = false;
-    let report = read_bounded_jsonl_lines(&mut reader, MAX_JSONL_LINE_BYTES, |value| {
+    let mut apply_value = |value: &Value| {
         let inherited_claude_line = source == SnapshotSource::ClaudeCode
             && claude_fork_line_provenance(value) == ClaudeForkLineProvenance::Inherited;
         if !inherited_claude_line && recognized_usage_shape_was_dropped(source, value) {
@@ -10836,8 +10931,19 @@ fn parse_opened_jsonl_file(
             positive_usage_evidence |= json_has_positive_usage_evidence(value);
         }
         apply_line(value, &mut accumulator);
-    })
+    };
+    let report = if source == SnapshotSource::Codex {
+        read_bounded_codex_jsonl_lines(&mut reader, MAX_JSONL_LINE_BYTES, &mut apply_value)
+    } else {
+        read_bounded_jsonl_lines(&mut reader, MAX_JSONL_LINE_BYTES, &mut apply_value)
+    }
     .with_context(|| format!("read JSONL {}", path.display()))?;
+    // The bounded reader cannot prove that a skipped physical line contained
+    // no usage. Account one potential recognized usage record per line while
+    // retaining every independently parseable sibling. This is a disclosed,
+    // terminal loss rather than a reason to discard the whole file forever.
+    recognized_usage_drop_count =
+        recognized_usage_drop_count.saturating_add(report.over_line_cap_count);
     let observed_after_read = opened_object_identity(source, reader.get_mut())
         .with_context(|| format!("revalidate opened JSONL {}", path.display()))?;
     if observed_after_read != expected_opened_object_identity {
@@ -10940,6 +11046,7 @@ fn parse_opened_jsonl_file(
         ownership_incomplete_file_count,
         zero_snapshot_usage_evidence,
         dropped_usage_record_count: recognized_usage_drop_count as u64,
+        terminal_line_loss_count: report.over_line_cap_count,
         state_only_blocked_session_ids,
         codex_parent_session_ref,
         codex_parent_ledger_identity_used,
@@ -11240,11 +11347,32 @@ impl JsonlReadReport {
             && self.invalid_utf8_line_count == 0
             && self.over_line_cap_count == 0
     }
+
+    fn complete_except_over_line_cap(self) -> bool {
+        self.malformed_json_line_count == 0 && self.invalid_utf8_line_count == 0
+    }
 }
 
 fn read_bounded_jsonl_lines(
+    reader: impl BufRead,
+    max_line_bytes: usize,
+    on_value: impl FnMut(&Value),
+) -> std::io::Result<JsonlReadReport> {
+    read_bounded_jsonl_lines_impl(reader, max_line_bytes, false, on_value)
+}
+
+fn read_bounded_codex_jsonl_lines(
+    reader: impl BufRead,
+    max_line_bytes: usize,
+    on_value: impl FnMut(&Value),
+) -> std::io::Result<JsonlReadReport> {
+    read_bounded_jsonl_lines_impl(reader, max_line_bytes, true, on_value)
+}
+
+fn read_bounded_jsonl_lines_impl(
     mut reader: impl BufRead,
     max_line_bytes: usize,
+    salvage_codex_envelope: bool,
     mut on_value: impl FnMut(&Value),
 ) -> std::io::Result<JsonlReadReport> {
     let mut buf = Vec::new();
@@ -11297,6 +11425,16 @@ fn read_bounded_jsonl_lines(
         report.physical_line_count += 1;
         if overflowed {
             report.over_line_cap_count += 1;
+            // Codex created-thread ownership requires a gap-free ordinal and
+            // timestamp stream. Image-bearing response/compaction rows carry
+            // that structural envelope before their huge payload. Preserve
+            // only those two content-free scalars; the payload stays skipped
+            // and is still disclosed as one dropped potential usage record.
+            if salvage_codex_envelope {
+                if let Some(value) = oversized_codex_envelope(&buf) {
+                    on_value(&value);
+                }
+            }
             // Drop the oversized line; its retained-capacity buffer is reset to
             // the cap so one huge line does not pin a large allocation.
             buf.clear();
@@ -11327,6 +11465,90 @@ fn read_bounded_jsonl_lines(
         }
     }
     Ok(report)
+}
+
+fn oversized_codex_envelope(prefix: &[u8]) -> Option<Value> {
+    let mut depth = 0_u32;
+    let mut index = 0_usize;
+    let mut ordinal = None;
+    let mut timestamp: Option<String> = None;
+    while index < prefix.len() {
+        match prefix[index] {
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                index += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b'"' => {
+                let end = json_string_token_end(prefix, index)?;
+                if depth != 1 {
+                    index = end;
+                    continue;
+                }
+                let key: String = serde_json::from_slice(&prefix[index..end]).ok()?;
+                let mut value_start = end;
+                while prefix.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+                    value_start += 1;
+                }
+                if prefix.get(value_start) != Some(&b':') {
+                    index = end;
+                    continue;
+                }
+                value_start += 1;
+                while prefix.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+                    value_start += 1;
+                }
+                match key.as_str() {
+                    "timestamp" => {
+                        let value_end = json_string_token_end(prefix, value_start)?;
+                        timestamp = serde_json::from_slice(&prefix[value_start..value_end]).ok();
+                        index = value_end;
+                    }
+                    "ordinal" => {
+                        let value_end = prefix[value_start..]
+                            .iter()
+                            .position(|byte| !byte.is_ascii_digit())
+                            .map(|offset| value_start + offset)
+                            .unwrap_or(prefix.len());
+                        ordinal = std::str::from_utf8(&prefix[value_start..value_end])
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok());
+                        index = value_end;
+                    }
+                    _ => index = end,
+                }
+                if ordinal.is_some() && timestamp.is_some() {
+                    break;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    Some(json!({
+        "timestamp": timestamp?,
+        "type": "oversized_payload_skipped",
+        "ordinal": ordinal?,
+    }))
+}
+
+fn json_string_token_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (offset, byte) in bytes[start + 1..].iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            return Some(start + offset + 2);
+        }
+    }
+    None
 }
 
 fn raw_value_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -14071,8 +14293,34 @@ struct ScanCensus {
     ownership_incomplete_file_count: usize,
     zero_snapshot_usage_evidence_count: usize,
     dropped_usage_record_count: u64,
+    terminal_over_line_cap_count: usize,
+    terminal_recognized_usage_drop_count: usize,
+    terminal_dropped_usage_record_count: u64,
     observed_index_keys: BTreeSet<String>,
     removed_index_keys: BTreeSet<String>,
+}
+
+impl ScanCensus {
+    fn add_terminal_jsonl_loss(&mut self, loss: &TerminalJsonlLoss) {
+        self.over_line_cap_count = self
+            .over_line_cap_count
+            .saturating_add(loss.over_line_cap_count);
+        self.recognized_usage_drop_count = self
+            .recognized_usage_drop_count
+            .saturating_add(loss.recognized_usage_drop_count);
+        self.dropped_usage_record_count = self
+            .dropped_usage_record_count
+            .saturating_add(loss.dropped_usage_record_count);
+        self.terminal_over_line_cap_count = self
+            .terminal_over_line_cap_count
+            .saturating_add(loss.over_line_cap_count);
+        self.terminal_recognized_usage_drop_count = self
+            .terminal_recognized_usage_drop_count
+            .saturating_add(loss.recognized_usage_drop_count);
+        self.terminal_dropped_usage_record_count = self
+            .terminal_dropped_usage_record_count
+            .saturating_add(loss.dropped_usage_record_count);
+    }
 }
 
 #[cfg(test)]
@@ -15466,6 +15714,10 @@ fn scan_traversal_context_fingerprint(
     update_length_prefixed(&mut digest, source.scan_identity_version().as_bytes());
     update_length_prefixed(&mut digest, LOCAL_SCAN_INDEX_IDENTITY_VERSION.as_bytes());
     update_length_prefixed(&mut digest, OPENED_OBJECT_IDENTITY_VERSION.as_bytes());
+    update_length_prefixed(
+        &mut digest,
+        JSONL_TERMINAL_DISPOSITION_GENERATION.as_bytes(),
+    );
     update_length_prefixed(&mut digest, &backfill_window_days.to_be_bytes());
     update_length_prefixed(
         &mut digest,
@@ -16591,6 +16843,7 @@ impl ScanIndex {
         self.historical_replay_generation = Some(generation);
         self.upload_context_fingerprint = None;
         self.files.clear();
+        self.terminal_jsonl_dispositions.clear();
         self.codex_state_only_snapshot_fingerprints.clear();
         self.codex_parent_ownership_refs.clear();
         self.codex_parent_ownership_ledgers.clear();
@@ -17069,8 +17322,8 @@ impl ScanIndex {
             ));
         }
         Ok(SnapshotSourceManifest {
-            contract_version: SNAPSHOT_MANIFEST_CONTRACT_VERSION,
-            scope: SNAPSHOT_MANIFEST_SCOPE,
+            contract_version: SNAPSHOT_MANIFEST_CONTRACT_VERSION.to_string(),
+            scope: SNAPSHOT_MANIFEST_SCOPE.to_string(),
             source: source.api_slug().to_string(),
             window_start: window_start.to_string(),
             window_end: window_end.to_string(),
@@ -17253,6 +17506,7 @@ impl ScanIndex {
             generation: previous.generation,
             upload_context_fingerprint: previous.upload_context_fingerprint.clone(),
             files,
+            terminal_jsonl_dispositions: previous.terminal_jsonl_dispositions.clone(),
             known_configured_scan_roots: self.known_configured_scan_roots.clone(),
             legacy_unresolved_root_file_witnesses: self
                 .legacy_unresolved_root_file_witnesses
@@ -17303,6 +17557,18 @@ impl ScanIndex {
             active_quarantine_witness: self.active_quarantine_witness.clone(),
             active_upload_context_fingerprint: self.active_upload_context_fingerprint.clone(),
         };
+        for key in &safe_keys {
+            match self.terminal_jsonl_dispositions.get(key) {
+                Some(disposition) => {
+                    result
+                        .terminal_jsonl_dispositions
+                        .insert(key.clone(), disposition.clone());
+                }
+                None => {
+                    result.terminal_jsonl_dispositions.remove(key);
+                }
+            }
+        }
         result.retain_quarantined_fingerprints(&retained_quarantine);
         result
     }
@@ -17356,12 +17622,57 @@ impl ScanIndex {
             self.codex_parent_ownership_ledgers.remove(&session_id);
         }
         self.files.remove(key);
+        self.terminal_jsonl_dispositions.remove(key);
         self.confirmed_empty_files.remove(key);
         self.file_snapshot_fingerprints.remove(key);
     }
 
+    /// Retire terminal JSONL dispositions whose file is no longer indexed.
+    ///
+    /// A disposition is only ever written together with the `files` entry for
+    /// the same key, so a key with no entry means the path was renamed, deleted
+    /// or reconciled away. Such a record can never be consulted again - a
+    /// candidate at that path already takes `CandidateDecision::Parse` through
+    /// the missing-entry arm - so dropping it is behaviour-neutral hygiene that
+    /// stops this durable map from growing monotonically with every lossy
+    /// transcript the user ever moves.
+    ///
+    /// This is also the whole bound, and it is structural rather than a cap.
+    /// `record_terminal_jsonl_disposition` is called from exactly one place,
+    /// inside the `parse_complete` block that inserts the `files` entry for the
+    /// same `local_index_key` six lines later, and `remove_file_entry` drops
+    /// both together; bounded census reconciliation removes from `files` alone,
+    /// which is precisely the orphan this retain sweeps. So
+    /// `terminal_jsonl_dispositions` is always a subset of `files` - at most
+    /// one small fixed-shape record per transcript the traversal currently
+    /// observes, alongside the strictly larger `ScanIndexEntry` the same key
+    /// already costs. `committable_subset` preserves that inductively: it
+    /// carries `previous.terminal_jsonl_dispositions` beside a `files` map that
+    /// unions in all of `previous.files`, so a subset stays a subset across a
+    /// partial commit. Whatever bounds `files` therefore bounds this map, and a
+    /// separate cap on a strict subset of `files` could not bound the index. It
+    /// could only evict a live record, which re-arms the child->parent reparse
+    /// override for Codex (re-reading an oversized rollout every cycle) or
+    /// silently drops that file's disclosed terminal loss for every source
+    /// without one.
+    fn prune_terminal_jsonl_dispositions(&mut self) {
+        let files = &self.files;
+        self.terminal_jsonl_dispositions
+            .retain(|key, _| files.contains_key(key));
+    }
+
     fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
         let key = local_index_key(&candidate.path);
+        if self
+            .terminal_jsonl_dispositions
+            .get(&key)
+            .is_some_and(|disposition| {
+                disposition.source_file_fingerprint != candidate.source_file_fingerprint
+                    || disposition.parser_generation != JSONL_TERMINAL_DISPOSITION_GENERATION
+            })
+        {
+            return CandidateDecision::Parse;
+        }
         let Some(entry) = self.files.get(&key) else {
             return CandidateDecision::Parse;
         };
@@ -17540,6 +17851,39 @@ impl ScanIndex {
                 self.confirmed_empty_files.remove(&key);
             }
         }
+    }
+
+    fn record_terminal_jsonl_disposition(
+        &mut self,
+        candidate: &CandidateFile,
+        loss: Option<TerminalJsonlLoss>,
+    ) {
+        let key = local_index_key(&candidate.path);
+        match loss {
+            Some(loss) => {
+                self.terminal_jsonl_dispositions.insert(
+                    key,
+                    TerminalJsonlDisposition {
+                        source_file_fingerprint: candidate.source_file_fingerprint.clone(),
+                        parser_generation: JSONL_TERMINAL_DISPOSITION_GENERATION.to_string(),
+                        loss,
+                    },
+                );
+            }
+            None => {
+                self.terminal_jsonl_dispositions.remove(&key);
+            }
+        }
+    }
+
+    fn terminal_jsonl_loss(&self, candidate: &CandidateFile) -> Option<&TerminalJsonlLoss> {
+        self.terminal_jsonl_dispositions
+            .get(&local_index_key(&candidate.path))
+            .filter(|disposition| {
+                disposition.source_file_fingerprint == candidate.source_file_fingerprint
+                    && disposition.parser_generation == JSONL_TERMINAL_DISPOSITION_GENERATION
+            })
+            .map(|disposition| &disposition.loss)
     }
 }
 
@@ -22242,9 +22586,12 @@ mod tests {
     }
 
     #[test]
-    fn every_lossy_line_class_quarantines_the_whole_file_entity() {
+    fn every_lossy_line_class_is_quarantined_or_terminally_disclosed() {
         let session = "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n";
         let usage = "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n";
+        // `over-line-cap` stays in this case list deliberately. It is no longer
+        // retryable-quarantined - it is terminal-with-disclosed-loss - so it is
+        // asserted here against its new contract instead of being deleted.
         let cases = ["invalid-utf8", "over-line-cap", "recognized-drop"];
         for case in cases {
             let root = temp_dir(case);
@@ -22254,7 +22601,7 @@ mod tests {
                 "invalid-utf8" => bytes.extend_from_slice(&[0xff, b'\n']),
                 "over-line-cap" => {
                     bytes.extend_from_slice(b"{\"ignored\":\"");
-                    bytes.extend(std::iter::repeat(b'x').take(MAX_JSONL_LINE_BYTES + 1));
+                    bytes.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
                     bytes.extend_from_slice(b"\"}\n");
                 }
                 "recognized-drop" => bytes.extend_from_slice(
@@ -22274,17 +22621,562 @@ mod tests {
                 true,
             )
             .expect("lossy file is isolated");
-            assert!(!scan.census_complete, "{case}");
-            assert!(scan.snapshots.is_empty(), "{case}");
-            assert!(index.files.is_empty(), "{case}");
             match case {
-                "invalid-utf8" => assert_eq!(scan.invalid_utf8_line_count, 1),
-                "over-line-cap" => assert_eq!(scan.over_line_cap_count, 1),
-                "recognized-drop" => assert_eq!(scan.recognized_usage_drop_count, 1),
+                "invalid-utf8" => {
+                    assert!(!scan.census_complete, "{case}");
+                    assert!(scan.snapshots.is_empty(), "{case}");
+                    assert!(index.files.is_empty(), "{case}");
+                    assert_eq!(scan.invalid_utf8_line_count, 1);
+                }
+                "over-line-cap" => {
+                    // Terminal, disclosed, and committed: the loss is not
+                    // recoverable by any later retry of the same bytes.
+                    assert!(scan.census_complete, "{case}");
+                    assert_eq!(scan.over_line_cap_count, 1);
+                    assert_eq!(scan.recognized_usage_drop_count, 1);
+                    assert_eq!(scan.dropped_usage_record_count, 1);
+                    assert_eq!(scan.snapshots.len(), 1, "healthy siblings still commit");
+                    assert_eq!(index.files.len(), 1, "{case}");
+                }
+                "recognized-drop" => {
+                    assert!(!scan.census_complete, "{case}");
+                    assert!(scan.snapshots.is_empty(), "{case}");
+                    assert!(index.files.is_empty(), "{case}");
+                    assert_eq!(scan.recognized_usage_drop_count, 1);
+                }
                 _ => unreachable!(),
             }
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    /// `terminal_line_loss_count` applies to every source, but the oversized
+    /// Codex envelope salvage does not: for Claude Code and Pi the whole
+    /// physical line - ordinal, timestamp and payload - is gone. Assert that
+    /// non-Codex shape directly instead of inferring it from the Codex case.
+    #[test]
+    fn over_line_cap_is_terminal_with_disclosed_loss_for_non_codex_sources() {
+        let claude = "{\"type\":\"assistant\",\"sessionId\":\"019e2700-5555-7000-9000-555555555555\",\"uuid\":\"019e2700-5555-7000-9000-5555555555a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n";
+        let pi = concat!(
+            "{\"type\":\"session\",\"session_id\":\"019e2700-6666-7000-9000-666666666666\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+            "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n",
+        );
+        for (source, name, healthy) in [
+            (SnapshotSource::ClaudeCode, "over-cap-claude", claude),
+            (SnapshotSource::Pi, "over-cap-pi", pi),
+        ] {
+            let root = temp_dir(name);
+            let path = root.join("session.jsonl");
+            let mut bytes = healthy.as_bytes().to_vec();
+            bytes.extend_from_slice(b"{\"type\":\"assistant\",\"ignored\":\"");
+            bytes.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
+            bytes.extend_from_slice(b"\"}\n");
+            fs::write(&path, bytes).expect("write over-cap fixture");
+
+            let mut index = ScanIndex::default();
+            let mut first = scan_source_roots_with_limit(
+                source,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T08:02:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("over-cap line reaches a terminal disclosed result");
+            assert!(first.census_complete, "{name}");
+            assert!(!first.scan_cap_hit, "{name}");
+            assert_eq!(first.scanned_file_count, 1, "{name}");
+            assert_eq!(first.over_line_cap_count, 1, "{name}");
+            assert_eq!(first.recognized_usage_drop_count, 1, "{name}");
+            assert_eq!(first.dropped_usage_record_count, 1, "{name}");
+            assert_eq!(
+                first.snapshots.len(),
+                1,
+                "{name}: healthy sibling lines still commit"
+            );
+            finalize_scan_after_policy(source, &mut first, &mut index);
+
+            let second = scan_source_roots_with_limit(
+                source,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T08:07:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("unchanged terminal file uses its disposition");
+            assert_eq!(
+                second.scanned_file_count, 0,
+                "{name}: unchanged terminal file is not reparsed"
+            );
+            assert!(second.census_complete, "{name}");
+            assert_eq!(second.over_line_cap_count, 1, "{name}");
+            assert_eq!(second.recognized_usage_drop_count, 1, "{name}");
+            assert_eq!(second.dropped_usage_record_count, 1, "{name}");
+            assert!(second.snapshots.is_empty(), "{name}");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    /// The disposition map is durable, so a record whose file was renamed or
+    /// deleted must not outlive the `files` entry it was written beside.
+    /// Without pruning the map grows monotonically for the life of the index,
+    /// one dead key per lossy transcript the user ever moves.
+    #[test]
+    fn terminal_dispositions_are_pruned_when_their_file_moves_or_disappears() {
+        let source = SnapshotSource::ClaudeCode;
+        let root = temp_dir("terminal-disposition-prune");
+        let original = root.join("session-a.jsonl");
+        let moved = root.join("session-b.jsonl");
+        let mut bytes = b"{\"type\":\"assistant\",\"sessionId\":\"019e2700-7777-7000-9000-777777777777\",\"uuid\":\"019e2700-7777-7000-9000-7777777777a1\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n".to_vec();
+        bytes.extend_from_slice(b"{\"type\":\"assistant\",\"ignored\":\"");
+        bytes.extend(std::iter::repeat_n(b'x', MAX_JSONL_LINE_BYTES + 1));
+        bytes.extend_from_slice(b"\"}\n");
+        fs::write(&original, &bytes).expect("write over-cap fixture");
+
+        let traverse = |index: &mut ScanIndex, at: &str| {
+            let mut result = scan_source_roots_with_limit(
+                source,
+                std::slice::from_ref(&root),
+                index,
+                at,
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("traversal completes");
+            assert!(result.census_complete);
+            finalize_scan_after_policy(source, &mut result, index);
+            result
+        };
+
+        let mut index = ScanIndex::default();
+        let first = traverse(&mut index, "2026-07-22T08:02:00Z");
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.over_line_cap_count, 1);
+        assert_eq!(index.terminal_jsonl_dispositions.len(), 1);
+        assert!(index
+            .terminal_jsonl_dispositions
+            .contains_key(&local_index_key(&original)));
+
+        // Moved path: the same bytes are a new object. The new key is recorded
+        // and the old key must NOT be carried forward beside it.
+        fs::rename(&original, &moved).expect("rename terminal fixture");
+        let after_move = traverse(&mut index, "2026-07-22T08:07:00Z");
+        assert_eq!(
+            after_move.scanned_file_count, 1,
+            "moved object is read once"
+        );
+        assert_eq!(
+            after_move.over_line_cap_count, 1,
+            "loss is not double-counted"
+        );
+        assert_eq!(
+            index.terminal_jsonl_dispositions.len(),
+            1,
+            "the renamed-away key is pruned, not accumulated"
+        );
+        assert!(index
+            .terminal_jsonl_dispositions
+            .contains_key(&local_index_key(&moved)));
+        assert_eq!(index.files.len(), 1);
+
+        // Deleted path: nothing indexed corresponds to the disposition at all.
+        fs::remove_file(&moved).expect("remove terminal fixture");
+        let after_delete = traverse(&mut index, "2026-07-22T08:12:00Z");
+        assert_eq!(after_delete.scanned_file_count, 0);
+        assert!(
+            index.terminal_jsonl_dispositions.is_empty(),
+            "a deleted file leaves no durable disposition behind"
+        );
+        assert!(index.files.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The disposition map is deliberately uncapped: pruning keeps it a subset
+    /// of `files`, and the live indexed-file population is the bound. A corpus
+    /// carrying more lossy transcripts than any fixed cap would allow must
+    /// still settle - every disposition recorded once on the first cycle, then
+    /// nothing re-read and no disclosed loss dropped on any later cycle.
+    ///
+    /// Traversing AFTER recording is the whole point of this test. A 256-record
+    /// cap satisfied a direct `prune_terminal_jsonl_dispositions` assertion and
+    /// still broke this: with that cap restored, both arms below record 300 on
+    /// cycle 0, keep only 256, and then disclose `over_line_cap_count` 256 - not
+    /// 300 - on every later cycle, because an evicted file's `files` entry,
+    /// fingerprint and snapshot fingerprints are all still valid so the
+    /// candidate falls to `Skip` and `terminal_jsonl_loss()` contributes
+    /// nothing. Any cap reintroduced here trips that assertion on cycle 1.
+    ///
+    /// The second, worse consequence of an eviction needs the parent/child
+    /// ordinal shape rather than this independent-session corpus: once
+    /// `terminal_jsonl_loss()` returns `None`, the child->parent reparse
+    /// override re-arms, the oversized rollout is fully re-read, re-records its
+    /// disposition, and the next prune evicts the same key again - forever.
+    /// `oversized_parent_of_ordinal_subagent_children_is_read_once` owns that
+    /// shape and asserts the file is read exactly once.
+    #[test]
+    fn terminal_dispositions_settle_for_a_corpus_larger_than_any_fixed_cap() {
+        use std::io::Write;
+
+        // Comfortably over the 256 records the removed cap allowed.
+        const FILES: usize = 300;
+
+        // The oversized payload is written as a file hole. `read_bounded_jsonl_
+        // lines_impl` copies at most `MAX_JSONL_LINE_BYTES` of the line, marks
+        // it over-cap and then clears the buffer without inspecting the skipped
+        // bytes, so a zero-filled hole is byte-equivalent input for this path
+        // and keeps a 300-file over-cap corpus off disk.
+        let write_over_cap_file = |path: &Path, head: &str, prefix: &str, suffix: &str| {
+            let mut file = File::create(path).expect("create over-cap fixture");
+            file.write_all(head.as_bytes()).expect("write healthy head");
+            file.write_all(prefix.as_bytes())
+                .expect("write oversized line prefix");
+            file.seek(SeekFrom::Current((MAX_JSONL_LINE_BYTES + 1) as i64))
+                .expect("skip the oversized payload hole");
+            file.write_all(suffix.as_bytes())
+                .expect("close the oversized line");
+        };
+
+        for (source, name) in [
+            (SnapshotSource::Codex, "terminal-disposition-scale-codex"),
+            (
+                SnapshotSource::ClaudeCode,
+                "terminal-disposition-scale-claude",
+            ),
+        ] {
+            let root = temp_dir(name);
+            for slot in 0..FILES {
+                let session_id = format!("019e2701-{slot:04x}-7000-9000-{slot:012x}");
+                match source {
+                    SnapshotSource::Codex => {
+                        let head = format!(
+                            "{{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{{\"id\":\"{session_id}\",\"session_id\":\"{session_id}\"}}}}\n"
+                        );
+                        // The Codex envelope salvage reads `ordinal` and
+                        // `timestamp` out of the prefix, so the ordinal chain
+                        // stays gap-free and the file parses complete.
+                        let prefix = "{\"timestamp\":\"2026-07-22T08:00:01Z\",\"type\":\"response_item\",\"ordinal\":1,\"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"";
+                        let suffix = format!(
+                            "\"}}]}}}}\n{}\n",
+                            codex_test_token_line(
+                                "2026-07-22T08:00:02Z",
+                                Some(2),
+                                (40, 0, 8, 0),
+                                Some((40, 0, 8, 0)),
+                            )
+                        );
+                        write_over_cap_file(
+                            &root.join(format!("rollout-2026-07-22T08-00-00-{session_id}.jsonl")),
+                            &head,
+                            prefix,
+                            &suffix,
+                        );
+                    }
+                    _ => {
+                        let head = format!(
+                            "{{\"type\":\"assistant\",\"sessionId\":\"{session_id}\",\"uuid\":\"019e2702-{slot:04x}-7000-9000-{slot:012x}\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{{\"id\":\"msg_{slot}\",\"model\":\"claude-sonnet-4-6\",\"usage\":{{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}}}\n"
+                        );
+                        write_over_cap_file(
+                            &root.join(format!("{session_id}.jsonl")),
+                            &head,
+                            "{\"type\":\"assistant\",\"ignored\":\"",
+                            "\"}\n",
+                        );
+                    }
+                }
+            }
+
+            let mut index = ScanIndex::default();
+            let mut observed = Vec::new();
+            for cycle in 0..4 {
+                let mut scan = scan_source_roots_with_limit(
+                    source,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    "2026-07-22T09:00:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                    MAX_BACKFILL_FILES_PER_SOURCE,
+                    true,
+                )
+                .unwrap_or_else(|error| panic!("{name} cycle {cycle} traversal: {error}"));
+                assert!(scan.census_complete, "{name} cycle {cycle} census");
+                assert!(!scan.scan_cap_hit, "{name} cycle {cycle} cap hit");
+                assert_eq!(
+                    scan.ownership_incomplete_file_count, 0,
+                    "{name} cycle {cycle} ownership"
+                );
+                // Disclosed loss is recomputed from the dispositions on the
+                // cycles that read nothing. One evicted record would show up
+                // here as a silently smaller number.
+                assert_eq!(
+                    scan.over_line_cap_count, FILES,
+                    "{name} cycle {cycle} over cap"
+                );
+                assert_eq!(
+                    scan.recognized_usage_drop_count, FILES,
+                    "{name} cycle {cycle} recognized drop"
+                );
+                assert_eq!(
+                    scan.dropped_usage_record_count, FILES as u64,
+                    "{name} cycle {cycle} dropped usage"
+                );
+                observed.push((scan.scanned_file_count, scan.snapshots.len()));
+                finalize_scan_after_policy(source, &mut scan, &mut index);
+                assert_eq!(
+                    index.terminal_jsonl_dispositions.len(),
+                    FILES,
+                    "{name} cycle {cycle} retains one disposition per live file"
+                );
+                assert_eq!(index.files.len(), FILES, "{name} cycle {cycle} files");
+            }
+            assert_eq!(
+                observed,
+                vec![(FILES, FILES), (0, 0), (0, 0), (0, 0)],
+                "{name}: an over-cap corpus is read once, not once per cycle"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn oversized_21mb_line_is_terminal_once_and_salvages_usage_siblings() {
+        let root = temp_dir("terminal-21mb-line");
+        let session_id = "019e2700-1111-7000-9000-111111111111";
+        let parent_id = "019e2700-2222-7000-9000-222222222222";
+        let path = root.join(format!("rollout-{session_id}.jsonl"));
+        let session = format!(
+            "{{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{{\"id\":\"{session_id}\",\"session_id\":\"{session_id}\",\"thread_source\":\"subagent\",\"forked_from_id\":\"{parent_id}\",\"subagent_history_start_ordinal\":1,\"source\":{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"{parent_id}\"}}}}}}}}}}\n"
+        );
+        let usage = codex_test_token_line(
+            "2026-07-22T08:00:02Z",
+            Some(2),
+            (12, 0, 4, 0),
+            Some((12, 0, 4, 0)),
+        )
+        .to_string()
+            + "\n";
+        let mut bytes = Vec::with_capacity(21 * 1024 * 1024 + session.len() + usage.len() + 32);
+        bytes.extend_from_slice(session.as_bytes());
+        bytes.extend_from_slice(b"{\"timestamp\":\"2026-07-22T08:00:01Z\",\"type\":\"response_item\",\"ordinal\":1,\"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"");
+        bytes.extend(std::iter::repeat_n(b'x', 21 * 1024 * 1024));
+        bytes.extend_from_slice(b"\"}]}}\n");
+        bytes.extend_from_slice(usage.as_bytes());
+        fs::write(&path, bytes).expect("write 21 MiB line fixture");
+
+        let mut index = ScanIndex::default();
+        let mut first = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("oversized line reaches a terminal disclosed result");
+        assert!(first.census_complete);
+        assert!(!first.scan_cap_hit);
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.snapshots.len(), 1, "valid usage sibling is salvaged");
+        assert_eq!(first.over_line_cap_count, 1);
+        assert_eq!(first.recognized_usage_drop_count, 1);
+        assert_eq!(first.dropped_usage_record_count, 1);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut index);
+
+        let second = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:07:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("unchanged terminal file uses its disposition");
+        assert!(second.census_complete);
+        assert!(!second.scan_cap_hit);
+        assert_eq!(
+            second.scanned_file_count, 0,
+            "unchanged file is not reparsed"
+        );
+        assert_eq!(second.over_line_cap_count, 1);
+        assert_eq!(second.recognized_usage_drop_count, 1);
+        assert_eq!(second.dropped_usage_record_count, 1);
+        assert!(second.snapshots.is_empty());
+
+        let key = local_index_key(&path);
+        index
+            .terminal_jsonl_dispositions
+            .get_mut(&key)
+            .expect("terminal disposition")
+            .parser_generation = "bounded_jsonl_terminal:future".to_string();
+        let mut upgraded = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:12:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("new parser generation gets one re-evaluation");
+        assert_eq!(upgraded.scanned_file_count, 1);
+        assert_eq!(upgraded.snapshots.len(), 1);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut upgraded, &mut index);
+
+        let settled = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:17:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("upgraded disposition settles");
+        assert_eq!(settled.scanned_file_count, 0);
+        assert_eq!(settled.dropped_usage_record_count, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Mirrors the exact live M4 shape that the single-file synthetic fixture
+    /// above cannot express: the oversized physical lines live in the PARENT
+    /// rollout, and its subagent children start at `subagent_history_start_ordinal`
+    /// 11 rather than 1. The parent is therefore a `codex_parent_ownership_refs`
+    /// member whose ledger can never be `scan_complete`, which is what used to
+    /// re-arm the child->parent reparse override on every traversal and re-read
+    /// a 127 MB rollout forever.
+    #[test]
+    fn oversized_parent_of_ordinal_subagent_children_is_read_once() {
+        let root = temp_dir("terminal-oversized-parent");
+        let parent_id = "019e2700-2222-7000-9000-222222222222";
+        let child_ids = [
+            "019e2700-3333-7000-9000-333333333333",
+            "019e2700-4444-7000-9000-444444444444",
+        ];
+
+        let oversized_line = |ordinal: u64, timestamp: &str, bytes: usize| {
+            let mut line = format!(
+                "{{\"timestamp\":\"{timestamp}\",\"type\":\"response_item\",\"ordinal\":{ordinal},\"payload\":{{\"type\":\"message\",\"content\":[{{\"type\":\"input_image\",\"image_url\":\""
+            )
+            .into_bytes();
+            line.extend(std::iter::repeat_n(b'x', bytes));
+            line.extend_from_slice(b"\"}]}}\n");
+            line
+        };
+
+        let parent_path = root.join(format!("rollout-2026-07-22T08-00-00-{parent_id}.jsonl"));
+        let mut parent_bytes = format!(
+            "{{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{{\"id\":\"{parent_id}\",\"session_id\":\"{parent_id}\"}}}}\n"
+        )
+        .into_bytes();
+        parent_bytes.extend_from_slice(&oversized_line(
+            1,
+            "2026-07-22T08:00:01Z",
+            21 * 1024 * 1024,
+        ));
+        parent_bytes.extend_from_slice(
+            (codex_test_token_line(
+                "2026-07-22T08:00:02Z",
+                Some(2),
+                (40, 0, 8, 0),
+                Some((40, 0, 8, 0)),
+            )
+            .to_string()
+                + "\n")
+                .as_bytes(),
+        );
+        fs::write(&parent_path, parent_bytes).expect("write oversized parent rollout");
+
+        for (offset, child_id) in child_ids.iter().enumerate() {
+            let path = root.join(format!(
+                "rollout-2026-07-22T08-1{offset}-00-{child_id}.jsonl"
+            ));
+            let mut bytes = format!(
+                "{{\"timestamp\":\"2026-07-22T08:10:00Z\",\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{{\"id\":\"{child_id}\",\"session_id\":\"{child_id}\",\"thread_source\":\"subagent\",\"forked_from_id\":\"{parent_id}\",\"subagent_history_start_ordinal\":11,\"source\":{{\"subagent\":{{\"thread_spawn\":{{\"parent_thread_id\":\"{parent_id}\"}}}}}}}}}}\n"
+            )
+            .into_bytes();
+            for ordinal in 1..=10_u64 {
+                bytes.extend_from_slice(
+                    format!(
+                        "{{\"timestamp\":\"2026-07-22T08:10:{ordinal:02}Z\",\"type\":\"response_item\",\"ordinal\":{ordinal},\"payload\":{{\"type\":\"message\",\"content\":[]}}}}\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            // Children carry oversized image rows too; the Codex envelope
+            // salvage keeps their ordinal chain gap-free.
+            bytes.extend_from_slice(&oversized_line(
+                11,
+                "2026-07-22T08:10:11Z",
+                MAX_JSONL_LINE_BYTES + 1,
+            ));
+            bytes.extend_from_slice(
+                (codex_test_token_line(
+                    "2026-07-22T08:10:12Z",
+                    Some(12),
+                    (12, 0, 4, 0),
+                    Some((12, 0, 4, 0)),
+                )
+                .to_string()
+                    + "\n")
+                    .as_bytes(),
+            );
+            fs::write(&path, bytes).expect("write ordinal subagent child rollout");
+        }
+
+        let mut index = ScanIndex::default();
+        let mut observed = Vec::new();
+        for cycle in 0..4 {
+            let mut scan = scan_source_roots_with_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T09:00:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap_or_else(|error| panic!("cycle {cycle} traversal: {error}"));
+            assert!(scan.census_complete, "cycle {cycle} census");
+            assert!(!scan.scan_cap_hit, "cycle {cycle} cap hit");
+            assert_eq!(
+                scan.ownership_incomplete_file_count, 0,
+                "cycle {cycle} ownership"
+            );
+            // Loss stays disclosed on every cycle, including the ones that
+            // read nothing: three oversized physical lines, one dropped
+            // potential usage record each.
+            assert_eq!(scan.over_line_cap_count, 3, "cycle {cycle} over cap");
+            assert_eq!(
+                scan.recognized_usage_drop_count, 3,
+                "cycle {cycle} recognized drop"
+            );
+            assert_eq!(
+                scan.dropped_usage_record_count, 3,
+                "cycle {cycle} dropped usage"
+            );
+            observed.push((scan.scanned_file_count, scan.snapshots.len()));
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+        }
+        assert_eq!(
+            observed,
+            vec![(3, 3), (0, 0), (0, 0), (0, 0)],
+            "the oversized parent must be read exactly once, not once per cycle"
+        );
+        assert!(
+            index.codex_parent_ownership_refs.contains(parent_id),
+            "children still resolve their parent reference"
+        );
+        assert!(
+            !index.codex_parent_ownership_ledgers.contains_key(parent_id),
+            "a lossy parent must not publish a scan-complete ownership ledger"
+        );
+        assert_eq!(index.terminal_jsonl_dispositions.len(), 3);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
