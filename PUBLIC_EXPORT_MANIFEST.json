@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 348,
-  "content_sha256": "80ebbeb0dac841adf488b5a9832b6e78519dbe6aaa875576a7d3648152dd2951",
+  "candidate_file_count": 350,
+  "content_sha256": "0d9ac07107fb1a2478f1c4d85df4587a948011fe99a4fe166965a0fea73f92af",
   "files": [
     {
       "executable": false,
@@ -440,8 +440,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "bb58d35f644fa9eecbff3d8c8b83f039bb7f5e751a7cd0afc758aa1dcf784dcd",
-      "size_bytes": 159124
+      "sha256": "525ea399a5cd9a1cc87811142f393818378ae9a4274210b70c8f83c19c69f6ae",
+      "size_bytes": 170500
     },
     {
       "executable": false,
@@ -489,8 +489,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/account_store.rs",
-      "sha256": "f21ff9b568a0b0c78ef2e87ada528841f964083d9b3833bf77ad9d3a53145607",
-      "size_bytes": 30732
+      "sha256": "2ab9eccf19fe851214984587c7499690ee2608fec7856368f0b6b34045ccec1c",
+      "size_bytes": 43412
     },
     {
       "executable": false,
@@ -524,8 +524,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/lib.rs",
-      "sha256": "d6c0afd8147d1d9927cbb4c83db2abe82fe9ceab65e3940dcc2e3ee011297638",
-      "size_bytes": 4588
+      "sha256": "472e5100b7dc92d920f5752847864012c1eec21a2b63b288b35912790696822c",
+      "size_bytes": 4852
     },
     {
       "executable": false,
@@ -804,8 +804,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/main.rs",
-      "sha256": "bf1328917eec7b55b40aa93046e5b423c767cd68769a7007e59ab3f759a60c78",
-      "size_bytes": 35737
+      "sha256": "7c3446dd8eb521de70b24317402dd90ada8e2e6242208f27d479b60e488e9dde",
+      "size_bytes": 36266
     },
     {
       "executable": false,
@@ -881,8 +881,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "5c342581309c98e0c99b38f646bab648130583d7e7152df9d134e2c1ddc74791",
-      "size_bytes": 1723083
+      "sha256": "4aaeb7a226ecc31c8ec93b329949c89a7867ea3c26848f222ca2e0b7c3cda716",
+      "size_bytes": 1728055
     },
     {
       "executable": false,
@@ -909,8 +909,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/README.md",
-      "sha256": "af882b14d02c0ed595f9138f5e8de827a27388e1dcdd0ce6fce30e5146acc3bb",
-      "size_bytes": 2625
+      "sha256": "72c82fb5743a012206a760c5eaaf2138d9befceb59d9d7fdb5832c404d56a36b",
+      "size_bytes": 2997
     },
     {
       "executable": false,
@@ -1524,6 +1524,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-09-02-persisted-attribution-capture.md",
+      "sha256": "33f0f06b2797303b3e0e63aa598d4ae22108f1ae39138340ace473606a77a8aa",
+      "size_bytes": 6951
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-surfaces.md",
       "sha256": "b49df98bbf9dbdcbcc4a904c35f084019541451e53f46c3134ea5c9ff31920b9",
       "size_bytes": 2026
@@ -1601,6 +1608,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/cli/config-show-output.json",
+      "sha256": "743a6aec46aff7ea3c3323a1cd35e06be433964461e98bc8c136ec38b7cfa12f",
+      "size_bytes": 367
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/cli/context-request.json",
       "sha256": "488498074080316954870328a966bf8f530a0dc9f3c079776a22b86f34414fff",
       "size_bytes": 475
@@ -1672,8 +1686,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/help-contract.txt",
-      "sha256": "c5fec08b0b2863f1bc6d5998b5a999e65c38af0de7d658791af69be58dfcad07",
-      "size_bytes": 25503
+      "sha256": "8196531802dd2c8280eca67b04668a3d4162636a2245a4a4bd72b17fc42aff37",
+      "size_bytes": 27654
     },
     {
       "executable": false,
@@ -2439,9 +2453,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-02T06:00:42+00:00",
+  "generated_at": "2026-09-02T06:59:59+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 349,
+  "output_file_count": 351,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2475,5 +2489,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "9fea4b96242dd3652c3a44dda1a62e358224cd2f"
+  "source_commit": "0b94ef84e9026a03f9b3fe4d6636dbac0827038e"
 }
