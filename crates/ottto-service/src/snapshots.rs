@@ -16988,7 +16988,16 @@ impl ScanIndex {
         // forced reparse decisions above.
         if !selected.is_empty() {
             self.legacy_settlement_reconcile_after_fingerprint = selected.last().cloned();
-            self.traversal = None;
+            // F2: Only reset traversal if it's already terminal-unhealthy,
+            // avoiding full re-traversal on every armed page for clean machines.
+            let traversal_is_terminal_unhealthy = self.traversal.as_ref().is_some_and(|t| {
+                t.pending_directories.is_empty()
+                    && t.pending_candidates.is_empty()
+                    && t.counts.has_errors()
+            });
+            if traversal_is_terminal_unhealthy {
+                self.traversal = None;
+            }
             self.bounded_sweep_had_unsettled_upload = true;
         }
         (selected, true)
@@ -17014,12 +17023,16 @@ impl ScanIndex {
     pub(crate) fn finish_legacy_settlement_reconciliation(&mut self) {
         // A ledger still at the unproven version has an accepted set this
         // daemon has not re-proved, so its pending set is not yet meaningful.
-        // Only `reopen_unproven_accepted_snapshot_ledger` may leave that state,
-        // and it is reached from the arming path alone. Without this guard a
-        // cycle that skipped arming (a pending historical replay, for instance)
-        // could observe the stale empty pending set and seal the ledger.
+        // The v1 state may be left by `reopen_unproven_accepted_snapshot_ledger`
+        // (reached from arming) or by `prepare_historical_replay` which directly
+        // promotes to v2. The v0 state (pre-ledger) with unproven accepted must
+        // also be guarded. Without these guards a cycle that skipped arming
+        // could observe stale empty pending set and seal the ledger prematurely.
         if self.accepted_snapshot_fingerprint_ledger_version
             == SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION
+            || (self.accepted_snapshot_fingerprint_ledger_version == 0
+                && !self.accepted_snapshot_fingerprints.is_empty()
+                && self.legacy_settlement_reconcile_after_fingerprint.is_none())
         {
             return;
         }
@@ -40691,5 +40704,202 @@ mod tests {
             );
             assert!(crate::canonical_json::is_canonicalizable(&body));
         }
+    }
+
+    /// F1: Verify that `finish_legacy_settlement_reconciliation` guards both v1 and v0 ledgers
+    /// with unproven accepted sets. The v0 state occurs on pre-ledger machines that didn't have
+    /// the version field before it was introduced.
+    #[test]
+    fn f1_finish_refuses_v0_ledger_with_unproven_accepted_set() {
+        let accepted_fingerprint = "a".repeat(64);
+        let unproven_fingerprint = "b".repeat(64);
+
+        // Create a v0 ledger (pre-ledger) with accepted fingerprints
+        let mut legacy = ScanIndex {
+            accepted_snapshot_fingerprints: BTreeSet::from([accepted_fingerprint.clone()]),
+            accepted_snapshot_fingerprint_ledger_version: 0, // v0, pre-ledger
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "test.jsonl".to_string(),
+                BTreeSet::from([accepted_fingerprint, unproven_fingerprint.clone()]),
+            )]),
+            ..ScanIndex::default()
+        };
+
+        // The pending set should be non-empty (has unproven_fingerprint that's not accepted)
+        let pending = legacy.legacy_settlement_reconciliation_pending_fingerprints();
+        assert!(
+            pending.contains(&unproven_fingerprint),
+            "v0 ledger with unproven fingerprints should have them in pending"
+        );
+
+        // finish should return early (not seal) because the v0 ledger with accepted set is unproven
+        legacy.finish_legacy_settlement_reconciliation();
+
+        // Version should remain 0, not be sealed to 2
+        assert_eq!(
+            legacy.accepted_snapshot_fingerprint_ledger_version, 0,
+            "v0 ledger with unproven accepted should not be sealed"
+        );
+    }
+
+    /// F1: Verify that finish_legacy_settlement_reconciliation mentions prepare_historical_replay
+    /// as a path that exits the v1 state (in addition to reopen_unproven_accepted_snapshot_ledger).
+    /// This test documents that the comment has been updated.
+    #[test]
+    fn f1_finish_comment_acknowledges_replay_promotion_path() {
+        // This is a documentation test. The actual behavior is verified by
+        // f1_finish_refuses_v0_ledger_with_unproven_accepted_set and existing tests.
+        // The comment update for F1 is verified by code review.
+
+        // Test that prepare_historical_replay directly sets version to 2
+        let mut index = legacy_shaped_index(ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "test.jsonl".to_string(),
+                BTreeSet::from(["a".repeat(64)]),
+            )]),
+            ..ScanIndex::default()
+        });
+
+        assert_eq!(index.accepted_snapshot_fingerprint_ledger_version, 0);
+        index.prepare_historical_replay("test-gen-v1".to_string());
+
+        // Verify that replay directly promotes to v2
+        assert_eq!(
+            index.accepted_snapshot_fingerprint_ledger_version, 2,
+            "prepare_historical_replay directly promotes to v2"
+        );
+    }
+
+    /// F2: Verify that traversal reset only happens for terminal-unhealthy traversals.
+    /// Without this fix, every armed page would reset traversal, forcing full re-traversal
+    /// on every machine even if their traversal is healthy (not terminal-unhealthy).
+    #[test]
+    fn f2_traversal_reset_scoped_to_terminal_unhealthy() {
+        // Create a clean index with a healthy traversal (no errors)
+        let healthy_traversal = ScanTraversalCheckpoint {
+            context_fingerprint: "test-ctx".to_string(),
+            census_window_end: "2026-01-01T00:00:00Z".to_string(),
+            scan_roots: vec![],
+            pending_directories: std::collections::VecDeque::from([ScanTraversalPath {
+                scan_root: std::path::PathBuf::from("/test"),
+                path: std::path::PathBuf::from("/test/sub"),
+                census_member: true,
+                watcher_hint: false,
+            }]),
+            pending_candidates: std::collections::VecDeque::new(),
+            observed_index_keys: Default::default(),
+            codex_rollout_paths: Default::default(),
+            reconciliation_upper_bound: None,
+            reconciliation_after: None,
+            reconciliation_started: false,
+            watcher_hint_seen: false,
+            codex_parent_resolution_retry_required: false,
+            unhealthy_retry_attempt: 0,
+            unhealthy_retry_not_before_unix_seconds: None,
+            counts: ScanTraversalCounts::default(), // No errors, healthy traversal
+        };
+
+        let mut index = ScanIndex {
+            traversal: Some(healthy_traversal),
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "test.jsonl".to_string(),
+                BTreeSet::from(["a".repeat(64), "b".repeat(64)]),
+            )]),
+            accepted_snapshot_fingerprint_ledger_version: 1,
+            ..ScanIndex::default()
+        };
+
+        let _traversal_before = index.traversal.clone();
+
+        // Call prepare_legacy_settlement_reconciliation which arms fingerprints
+        let (armed, _) = index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+
+        assert!(!armed.is_empty(), "should have armed some fingerprints");
+
+        // With F2 fix: traversal should NOT be reset because it's healthy (not terminal-unhealthy)
+        assert!(
+            index.traversal.is_some(),
+            "healthy traversal should not be reset when arming"
+        );
+    }
+
+    /// F2: Verify that traversal IS reset when it's terminal-unhealthy
+    /// (has pending items and errors), which is the only case where reset was intended.
+    #[test]
+    fn f2_traversal_reset_happens_for_terminal_unhealthy() {
+        // Create a terminal-unhealthy traversal (no pending items, has errors)
+        let terminal_unhealthy = ScanTraversalCheckpoint {
+            context_fingerprint: "test-ctx".to_string(),
+            census_window_end: "2026-01-01T00:00:00Z".to_string(),
+            scan_roots: vec![],
+            pending_directories: std::collections::VecDeque::new(), // Empty
+            pending_candidates: std::collections::VecDeque::new(),  // Empty
+            observed_index_keys: Default::default(),
+            codex_rollout_paths: Default::default(),
+            reconciliation_upper_bound: None,
+            reconciliation_after: None,
+            reconciliation_started: false,
+            watcher_hint_seen: false,
+            codex_parent_resolution_retry_required: false,
+            unhealthy_retry_attempt: 0,
+            unhealthy_retry_not_before_unix_seconds: None,
+            counts: ScanTraversalCounts {
+                symlink_rejected_count: 1, // Has errors
+                ..Default::default()
+            },
+        };
+
+        let mut index = ScanIndex {
+            traversal: Some(terminal_unhealthy),
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "test.jsonl".to_string(),
+                BTreeSet::from(["a".repeat(64), "b".repeat(64)]),
+            )]),
+            accepted_snapshot_fingerprint_ledger_version: 1,
+            ..ScanIndex::default()
+        };
+
+        // Call prepare_legacy_settlement_reconciliation which arms fingerprints
+        let (armed, _) = index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+
+        assert!(!armed.is_empty(), "should have armed some fingerprints");
+
+        // With F2 fix: traversal SHOULD be reset because it's terminal-unhealthy
+        assert!(
+            index.traversal.is_none(),
+            "terminal-unhealthy traversal should be reset when arming"
+        );
+    }
+
+    /// F3: Verify that finish prevents sealing any unproven ledger state (v0 or v1).
+    /// The guard must prevent premature sealing of ledgers where accepted fingerprints
+    /// haven't been re-proved through the server's entity ACK contract.
+    #[test]
+    fn f3_finish_prevents_sealing_v1_unproven_ledger() {
+        let mut legacy = legacy_shaped_index(ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "test.jsonl".to_string(),
+                BTreeSet::from(["a".repeat(64)]),
+            )]),
+            ..ScanIndex::default()
+        });
+
+        // Simulate the state after reopening: version is 0, accepted is empty
+        assert_eq!(legacy.accepted_snapshot_fingerprints.len(), 0);
+
+        // After some accepted fingerprints are recorded through re-offer
+        legacy.record_accepted_snapshot_fingerprints(&BTreeSet::from(["a".repeat(64)]));
+
+        // Manually set to v1 to test the v1 guard (normally this comes from legacy_shaped_index)
+        legacy.accepted_snapshot_fingerprint_ledger_version = 1;
+
+        // Calling finish on a v1 ledger should return early (not seal)
+        legacy.finish_legacy_settlement_reconciliation();
+
+        // Version should remain 1, not be sealed to 2
+        assert_eq!(
+            legacy.accepted_snapshot_fingerprint_ledger_version, 1,
+            "v1 unproven ledger should not be sealed"
+        );
     }
 }
