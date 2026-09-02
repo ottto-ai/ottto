@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ottto_core::ResolvedToggle;
 use rusqlite::{Connection, OpenFlags};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
@@ -15,7 +16,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
@@ -6925,32 +6926,75 @@ fn claude_workflow_detect_enabled_from(value: Option<&str>) -> bool {
     }
 }
 
+/// How long a resolved Claude-attribution-capture answer is reused before the
+/// persisted setting is read again.
+const CLAUDE_ATTRIBUTION_CAPTURE_TTL: Duration = Duration::from_secs(60);
+
 /// Local opt-IN for capturing Claude Code per-turn work-attribution
 /// (`attributionAgent`/`Skill`/`Plugin`/`McpServer`/`McpTool`) off each
 /// assistant+usage line into the per-turn `SelectorCapture`. Subagent
 /// attribution (`attributionAgent`) is the priority dimension.
 ///
-/// Defaults OFF: only `OTTTO_CLAUDE_ATTRIBUTION_CAPTURE` set to one of
-/// `on`/`1`/`true`/`yes`/`enabled` turns capture on. Approved attribution keys
-/// on `SELECTOR_CONTEXT_ALLOWED` reach `reduced_context`/`selector_hash` and
-/// cross the wire. MCP tool attribution is included whenever this capture is
-/// enabled; there is no second opt-in.
+/// Defaults OFF, and resolves in this order: an explicit
+/// `OTTTO_CLAUDE_ATTRIBUTION_CAPTURE` in this process's environment, then the
+/// persisted `settings.json` value, then off. Approved attribution keys on
+/// `SELECTOR_CONTEXT_ALLOWED` reach `reduced_context`/`selector_hash` and cross
+/// the wire. MCP tool attribution is included whenever this capture is enabled;
+/// there is no second opt-in.
+///
+/// The persisted step exists because the daemon's environment is not the
+/// operator's to keep: `brew upgrade ottto` regenerates
+/// `net.ottto.service.plist` from the formula's `service` block, which emits
+/// only `PATH`, so an operator-set environment override silently disappears on
+/// every upgrade and capture reverts to off with no signal. `settings.json`
+/// lives in the per-user support directory the formula never rewrites.
 fn claude_attribution_capture_enabled() -> bool {
-    claude_attribution_capture_enabled_from(
-        std::env::var("OTTTO_CLAUDE_ATTRIBUTION_CAPTURE")
+    claude_attribution_capture_status().enabled
+}
+
+/// TTL-cached so a per-LINE caller never touches the filesystem, and so an
+/// `ottto config set` is picked up by a running daemon within
+/// [`CLAUDE_ATTRIBUTION_CAPTURE_TTL`] rather than at the next restart. Mirrors
+/// the refresh idiom in `launch_events.rs`.
+pub fn claude_attribution_capture_status() -> ResolvedToggle {
+    static CACHE: OnceLock<Mutex<Option<(Instant, ResolvedToggle)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((loaded_at, resolved)) = guard.as_ref() {
+            if loaded_at.elapsed() < CLAUDE_ATTRIBUTION_CAPTURE_TTL {
+                return *resolved;
+            }
+        }
+    }
+    let resolved = resolve_claude_attribution_capture_now();
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), resolved));
+    }
+    resolved
+}
+
+fn resolve_claude_attribution_capture_now() -> ResolvedToggle {
+    resolve_claude_attribution_capture_from(
+        &ottto_core::FileSettingsStore::default(),
+        std::env::var(ottto_core::CLAUDE_ATTRIBUTION_CAPTURE_ENV)
             .ok()
             .as_deref(),
     )
 }
 
+/// The daemon-side read, with both inputs supplied. Split out so a test can
+/// point it at a real settings file instead of mutating the process
+/// environment or the real support directory.
+fn resolve_claude_attribution_capture_from(
+    store: &ottto_core::FileSettingsStore,
+    env_value: Option<&str>,
+) -> ResolvedToggle {
+    store.load_lenient().claude_attribution_capture(env_value)
+}
+
+#[cfg(test)]
 fn claude_attribution_capture_enabled_from(value: Option<&str>) -> bool {
-    match value {
-        Some(raw) => matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "on" | "1" | "true" | "yes" | "enabled"
-        ),
-        None => false,
-    }
+    ottto_core::resolve_claude_attribution_capture(value, None).enabled
 }
 
 /// True when `dir` (a Claude Code session's `workflows/` sibling directory)
@@ -26412,6 +26456,83 @@ mod tests {
                 "expected {on:?} to enable attribution capture"
             );
         }
+    }
+
+    fn attribution_settings_store(label: &str) -> ottto_core::FileSettingsStore {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-attribution-capture-{}-{}",
+            std::process::id(),
+            label
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        ottto_core::FileSettingsStore::new(dir.join(ottto_core::SETTINGS_FILE_NAME))
+    }
+
+    #[test]
+    fn claude_attribution_capture_reads_the_persisted_setting_when_the_environment_is_silent() {
+        let store = attribution_settings_store("persisted");
+        // No settings file at all is the shipped default.
+        assert_eq!(
+            resolve_claude_attribution_capture_from(&store, None),
+            ottto_core::ResolvedToggle {
+                enabled: false,
+                source: ottto_core::SettingSource::Default,
+            }
+        );
+
+        store
+            .save(&ottto_core::LocalSettings {
+                claude_attribution_capture: Some("on".to_string()),
+            })
+            .expect("save settings");
+
+        // This is the regenerated-LaunchAgent case: the plist emits only PATH,
+        // so the daemon sees no override, and capture must still be on.
+        assert_eq!(
+            resolve_claude_attribution_capture_from(&store, None),
+            ottto_core::ResolvedToggle {
+                enabled: true,
+                source: ottto_core::SettingSource::Persisted,
+            }
+        );
+
+        // An explicit environment override still wins, in both directions.
+        assert_eq!(
+            resolve_claude_attribution_capture_from(&store, Some("off")),
+            ottto_core::ResolvedToggle {
+                enabled: false,
+                source: ottto_core::SettingSource::Environment,
+            }
+        );
+        assert_eq!(
+            resolve_claude_attribution_capture_from(&store, Some("on")),
+            ottto_core::ResolvedToggle {
+                enabled: true,
+                source: ottto_core::SettingSource::Environment,
+            }
+        );
+
+        let _ = fs::remove_dir_all(store.path().parent().expect("settings parent"));
+    }
+
+    #[test]
+    fn claude_attribution_capture_falls_back_to_off_on_an_unusable_settings_file() {
+        let store = attribution_settings_store("unusable");
+        fs::create_dir_all(store.path().parent().expect("settings parent"))
+            .expect("create settings dir");
+
+        for body in [
+            &b"{ not json at all"[..],
+            &br#"{"claude_attribution_capture": "maybe"}"#[..],
+        ] {
+            fs::write(store.path(), body).expect("write settings");
+            assert!(
+                !resolve_claude_attribution_capture_from(&store, None).enabled,
+                "an unusable settings file must never turn capture on"
+            );
+        }
+
+        let _ = fs::remove_dir_all(store.path().parent().expect("settings parent"));
     }
 
     #[test]

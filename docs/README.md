@@ -55,8 +55,15 @@ ottto setup --json
 ottto verify --app claude-code --json
 ottto verify --repair --app claude-code --json
 ottto fix --app claude-code --json
+ottto config show --json
 ottto diagnostics collect --json
 ```
+
+`ottto config` reads and writes `settings.json` in the per-user support
+directory. Settings persisted there survive `brew upgrade` and
+`brew services restart`, which regenerate the LaunchAgent plist and drop any
+environment variables set on it. A matching environment variable still
+overrides the persisted value for the process that carries it.
 
 Lower-level source nouns can still appear in protocol payloads and compatibility
 options, but public docs should prefer `apps` and `--app`.

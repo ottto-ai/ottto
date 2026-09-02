@@ -3,8 +3,9 @@ use ottto_core::{
     client_control_token, default_socket_path, execute_local_uninstall,
     ingest_claude_statusline_payload, install_owner_for_path, kickstart_macos_launch_agent,
     load_or_create_control_token, local_lifecycle_home_dir, request_unix_socket_with_timeout,
-    UninstallExecutionOptions, LOCAL_CONTROL_REFRESH_TIMEOUT, LOCAL_CONTROL_SOCKET_TIMEOUT,
-    OTTTO_SERVICE_BINARY_NAME, OTTTO_SOCKET_ENV,
+    FileSettingsStore, LocalSettings, UninstallExecutionOptions, CLAUDE_ATTRIBUTION_CAPTURE_ENV,
+    LOCAL_CONTROL_REFRESH_TIMEOUT, LOCAL_CONTROL_SOCKET_TIMEOUT, OTTTO_SERVICE_BINARY_NAME,
+    OTTTO_SOCKET_ENV,
 };
 use ottto_protocol::{
     AgentContextQuery, AgentCostsQuery, AgentProviderImpactQuery, AgentRecommendationsQuery,
@@ -89,6 +90,8 @@ enum Command {
     Verify(VerifyArgs),
     #[command(hide = true)]
     ClaudeCodeStatusline(JsonArgs),
+    #[command(about = "Show or persist local settings that survive upgrades")]
+    Config(ConfigArgs),
     #[command(about = "Collect local-only or approved support diagnostics")]
     Diagnostics {
         #[command(subcommand)]
@@ -713,6 +716,62 @@ impl SourceArg {
     }
 }
 
+#[derive(Debug, Args)]
+struct ConfigArgs {
+    #[arg(
+        long,
+        global = true,
+        help = "Print one final JSON object and no human summary text"
+    )]
+    json: bool,
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    #[command(about = "Show local settings and how each one resolves here")]
+    Show,
+    #[command(about = "Persist one local setting so upgrades keep it")]
+    Set(ConfigSetArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConfigSetArgs {
+    #[arg(long, help = "Setting to persist")]
+    setting: ConfigSettingArg,
+    #[arg(long, help = "Value to persist")]
+    value: ConfigToggleArg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ConfigSettingArg {
+    ClaudeAttributionCapture,
+}
+
+impl ConfigSettingArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            ConfigSettingArg::ClaudeAttributionCapture => "claude-attribution-capture",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ConfigToggleArg {
+    On,
+    Off,
+}
+
+impl ConfigToggleArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            ConfigToggleArg::On => "on",
+            ConfigToggleArg::Off => "off",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum DiagnosticsCommand {
     #[command(about = "Collect a redacted diagnostics bundle")]
@@ -786,6 +845,10 @@ fn main() {
         let code = run_claude_code_statusline(args.json);
         std::process::exit(code);
     }
+    if let Command::Config(args) = &cli.command {
+        let code = run_config(args, output_mode);
+        std::process::exit(code);
+    }
     if matches!(cli.command, Command::Uninstall(_)) {
         let code = run_uninstall(output_mode);
         std::process::exit(code);
@@ -800,6 +863,16 @@ fn main() {
 }
 
 fn validate_cli(cli: &Cli) -> Result<(), CliError> {
+    // `config` reads and writes one local file; there is no daemon round trip
+    // to stream progress events for.
+    if matches!(&cli.command, Command::Config(_)) && cli.watch {
+        return Err(CliError {
+            code: CliErrorCode::InvalidRequest,
+            message: "ottto config does not support --watch".to_string(),
+            retryable: false,
+            details: BTreeMap::new(),
+        });
+    }
     if let Command::Cloud(args) = &cli.command {
         let approved = match &args.command {
             CloudCommand::Register(args) => args.approve,
@@ -1717,6 +1790,117 @@ fn open_browser(url: &str) -> Result<(), String> {
     }
 }
 
+/// One setting as `ottto config` reports it.
+///
+/// `resolved_in_this_process` is deliberately named: this CLI resolves the
+/// order against ITS OWN environment, which is the operator's shell, not the
+/// daemon's. The daemon reads the same persisted file but its own environment,
+/// and states its answer in one startup log line. Only `persisted_value` is
+/// shared ground between the two.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ConfigSettingEntry {
+    setting: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persisted_value: Option<String>,
+    default_enabled: bool,
+    env_var: &'static str,
+    env_value_present: bool,
+    resolved_in_this_process: ottto_core::ResolvedToggle,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ConfigPayload {
+    settings_path: String,
+    settings: Vec<ConfigSettingEntry>,
+}
+
+fn claude_attribution_capture_entry(
+    settings: &LocalSettings,
+    env_value: Option<&str>,
+) -> ConfigSettingEntry {
+    ConfigSettingEntry {
+        setting: ConfigSettingArg::ClaudeAttributionCapture.as_str(),
+        persisted_value: settings.claude_attribution_capture.clone(),
+        default_enabled: ottto_core::CLAUDE_ATTRIBUTION_CAPTURE_DEFAULT,
+        env_var: CLAUDE_ATTRIBUTION_CAPTURE_ENV,
+        env_value_present: env_value.is_some(),
+        resolved_in_this_process: settings.claude_attribution_capture(env_value),
+    }
+}
+
+/// Read, optionally write, then report. Split from `run_config` so the JSON
+/// contract is testable against an explicit store and an explicit environment
+/// value instead of the process's own.
+fn apply_config(
+    store: &FileSettingsStore,
+    env_value: Option<&str>,
+    command: &ConfigCommand,
+) -> Result<ConfigPayload, CliError> {
+    let mut settings = store
+        .load()
+        .map_err(|error| internal_error(&format!("{error:#}")))?
+        .unwrap_or_default();
+
+    if let ConfigCommand::Set(set) = command {
+        match set.setting {
+            ConfigSettingArg::ClaudeAttributionCapture => {
+                settings.claude_attribution_capture = Some(set.value.as_str().to_string());
+            }
+        }
+        store
+            .save(&settings)
+            .map_err(|error| internal_error(&format!("{error:#}")))?;
+    }
+
+    Ok(ConfigPayload {
+        settings_path: store.path().display().to_string(),
+        settings: vec![claude_attribution_capture_entry(&settings, env_value)],
+    })
+}
+
+fn print_config_human(payload: &ConfigPayload) {
+    println!("settings file: {}", payload.settings_path);
+    for entry in &payload.settings {
+        println!(
+            "{}: {} (source: {})",
+            entry.setting,
+            if entry.resolved_in_this_process.enabled {
+                "on"
+            } else {
+                "off"
+            },
+            entry.resolved_in_this_process.source.as_str()
+        );
+        if entry.env_value_present {
+            println!(
+                "  note: {} is set in this shell and overrides the persisted value here; the daemon reads its own environment",
+                entry.env_var
+            );
+        }
+    }
+}
+
+fn run_config(args: &ConfigArgs, output_mode: OutputMode) -> i32 {
+    let env_value = std::env::var(CLAUDE_ATTRIBUTION_CAPTURE_ENV).ok();
+    match apply_config(
+        &FileSettingsStore::default(),
+        env_value.as_deref(),
+        &args.command,
+    ) {
+        Ok(payload) => {
+            match output_mode {
+                // `--watch` is refused for this command, so Ndjson is
+                // unreachable; treat it as the human view rather than
+                // inventing a second event shape for a local file read.
+                OutputMode::Human | OutputMode::Ndjson => print_config_human(&payload),
+                OutputMode::Json => println!("{}", pretty_json(&payload)),
+            }
+            0
+        }
+        Err(error) => print_error(error, output_mode, None),
+    }
+}
+
 fn run_uninstall(output_mode: OutputMode) -> i32 {
     let request_id = request_id();
     if output_mode == OutputMode::Ndjson {
@@ -1955,6 +2139,7 @@ fn local_command(command: Command) -> LocalControlCommand {
             query: args.query(),
         },
         Command::ClaudeCodeStatusline(_) => unreachable!("statusLine helper is handled directly"),
+        Command::Config(_) => unreachable!("config is handled directly"),
         Command::Setup(args) | Command::Login(args) => LocalControlCommand::Setup {
             sources: Vec::new(),
             claim_code: args.claim_code,
@@ -2017,6 +2202,7 @@ fn command_json(command: &Command) -> bool {
         Command::Context(args) => args.json,
         Command::Costs(args) => args.json,
         Command::Cloud(args) => args.json,
+        Command::Config(args) => args.json,
         Command::Sessions(args) => args.json,
         Command::Recommendations(args) => args.json,
         Command::ProviderImpact(args) => args.json,
@@ -2478,7 +2664,7 @@ mod tests {
     }
 
     fn cli_help_snapshot() -> String {
-        let commands: [(&str, &[&str]); 30] = [
+        let commands: [(&str, &[&str]); 33] = [
             ("ottto --help", &["ottto", "--help"]),
             ("ottto status --help", &["ottto", "status", "--help"]),
             ("ottto apps --help", &["ottto", "apps", "--help"]),
@@ -2537,6 +2723,15 @@ mod tests {
             ("ottto doctor --help", &["ottto", "doctor", "--help"]),
             ("ottto fix --help", &["ottto", "fix", "--help"]),
             ("ottto verify --help", &["ottto", "verify", "--help"]),
+            ("ottto config --help", &["ottto", "config", "--help"]),
+            (
+                "ottto config show --help",
+                &["ottto", "config", "show", "--help"],
+            ),
+            (
+                "ottto config set --help",
+                &["ottto", "config", "set", "--help"],
+            ),
             (
                 "ottto diagnostics --help",
                 &["ottto", "diagnostics", "--help"],
@@ -2559,6 +2754,129 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
             + "\n"
+    }
+
+    /// A store at a fixed, never-written path so the frozen `config show`
+    /// contract does not carry a machine-specific `settings_path`.
+    fn config_contract_store() -> FileSettingsStore {
+        FileSettingsStore::new("/tmp/ottto-cli-config-contract/settings.json")
+    }
+
+    fn config_scratch_store(label: &str) -> FileSettingsStore {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-cli-config-test-{}-{}",
+            std::process::id(),
+            label
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        FileSettingsStore::new(dir.join("settings.json"))
+    }
+
+    #[test]
+    fn config_show_json_matches_frozen_contract() {
+        let payload = apply_config(&config_contract_store(), None, &ConfigCommand::Show)
+            .expect("config show succeeds with no settings file");
+        let actual = serde_json::to_value(&payload).expect("payload serializes");
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/cli/config-show-output.json"
+        ))
+        .expect("fixture parses");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn config_set_persists_the_value_and_reports_it() {
+        let store = config_scratch_store("set");
+        let payload = apply_config(
+            &store,
+            None,
+            &ConfigCommand::Set(ConfigSetArgs {
+                setting: ConfigSettingArg::ClaudeAttributionCapture,
+                value: ConfigToggleArg::On,
+            }),
+        )
+        .expect("config set succeeds");
+        let actual = serde_json::to_value(&payload).expect("payload serializes");
+
+        assert_eq!(
+            actual["settings"][0],
+            serde_json::json!({
+                "setting": "claude-attribution-capture",
+                "persisted_value": "on",
+                "default_enabled": false,
+                "env_var": "OTTTO_CLAUDE_ATTRIBUTION_CAPTURE",
+                "env_value_present": false,
+                "resolved_in_this_process": { "enabled": true, "source": "persisted" },
+            })
+        );
+        assert_eq!(actual["settings_path"], store.path().display().to_string());
+
+        // The next read is a fresh process's read: it must see the same thing
+        // with no environment help at all.
+        let reread =
+            apply_config(&store, None, &ConfigCommand::Show).expect("config show succeeds");
+        assert_eq!(
+            serde_json::to_value(&reread).expect("payload serializes"),
+            actual
+        );
+
+        let _ = std::fs::remove_dir_all(store.path().parent().expect("scratch parent"));
+    }
+
+    #[test]
+    fn config_json_shows_an_environment_override_without_losing_the_persisted_value() {
+        let store = config_scratch_store("env-override");
+        apply_config(
+            &store,
+            None,
+            &ConfigCommand::Set(ConfigSetArgs {
+                setting: ConfigSettingArg::ClaudeAttributionCapture,
+                value: ConfigToggleArg::On,
+            }),
+        )
+        .expect("config set succeeds");
+
+        let payload = apply_config(&store, Some("off"), &ConfigCommand::Show)
+            .expect("config show succeeds under an override");
+        let actual = serde_json::to_value(&payload).expect("payload serializes");
+
+        assert_eq!(actual["settings"][0]["persisted_value"], "on");
+        assert_eq!(actual["settings"][0]["env_value_present"], true);
+        assert_eq!(
+            actual["settings"][0]["resolved_in_this_process"],
+            serde_json::json!({ "enabled": false, "source": "environment" })
+        );
+
+        let _ = std::fs::remove_dir_all(store.path().parent().expect("scratch parent"));
+    }
+
+    #[test]
+    fn config_json_reports_a_malformed_persisted_value_as_invalid_and_off() {
+        let store = config_scratch_store("malformed");
+        let path = store.path().to_path_buf();
+        std::fs::create_dir_all(path.parent().expect("scratch parent")).expect("create scratch");
+        std::fs::write(&path, br#"{"claude_attribution_capture": "maybe"}"#)
+            .expect("write malformed settings");
+
+        let payload =
+            apply_config(&store, None, &ConfigCommand::Show).expect("config show succeeds");
+        let actual = serde_json::to_value(&payload).expect("payload serializes");
+
+        assert_eq!(actual["settings"][0]["persisted_value"], "maybe");
+        assert_eq!(
+            actual["settings"][0]["resolved_in_this_process"],
+            serde_json::json!({ "enabled": false, "source": "persisted_invalid" })
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("scratch parent"));
+    }
+
+    #[test]
+    fn config_refuses_watch() {
+        let cli = Cli::parse_from(["ottto", "config", "show", "--json", "--watch"]);
+        let error = validate_cli(&cli).expect_err("watch invalid for config");
+        assert_eq!(error.code, CliErrorCode::InvalidRequest);
+        assert_eq!(error.message, "ottto config does not support --watch");
     }
 
     #[test]
