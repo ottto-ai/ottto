@@ -982,7 +982,20 @@ pub struct SnapshotStatusRequest {
     /// not upload. Without it, "the collector suppressed 718 unchanged
     /// sessions" and "the collector did nothing" are the same receipt.
     pub last_semantic_noop_count: u64,
-    pub last_census_complete: bool,
+    /// Whether the last traversal saw the whole corpus. Present only on a scan
+    /// result; ABSENT on a liveness beat.
+    ///
+    /// The distinction is load-bearing on the wire, not a style choice. The
+    /// backend merges a check-in's census into what it already retained, and
+    /// completeness has no arithmetic identity the way a counter's zero does:
+    /// it resolves an omitted value by RETAINING the accepted one and an
+    /// explicitly declared `false` by LOWERING it, because only a real census
+    /// can assert incompleteness. A beat has run no census, so a hardcoded
+    /// `false` here would be a measurement it never took — and would retract a
+    /// complete census on every heartbeat. Omission is the honest wire shape,
+    /// so this is an `Option` that a beat leaves `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_census_complete: Option<bool>,
     pub last_symlink_rejected_count: u64,
     pub last_unreadable_path_count: u64,
     pub last_oversized_file_count: u64,
@@ -1095,8 +1108,13 @@ impl SnapshotStatusRequest {
         if *last_scan_cap_hit {
             return Some("last_scan_cap_hit");
         }
-        // Completeness is a claim only a real census can make.
-        if *last_census_complete {
+        // Completeness is a claim only a real census can make — in EITHER
+        // direction. `true` asserts a complete census; an explicit `false`
+        // asserts an incomplete one, which the backend reads as a fresh
+        // disclosure and uses to lower a retained `true`. A beat has taken no
+        // census, so the only honest wire shape is absence. This mirrors the
+        // backend's own `model_fields_set` rule: present means declared.
+        if last_census_complete.is_some() {
             return Some("last_census_complete");
         }
         for (name, value) in [
@@ -2626,7 +2644,7 @@ mod tests {
             last_skipped_file_count_due_to_limit: 0,
             last_scan_cap_hit: false,
             last_semantic_noop_count: 0,
-            last_census_complete: false,
+            last_census_complete: None,
             last_symlink_rejected_count: 0,
             last_unreadable_path_count: 0,
             last_oversized_file_count: 0,
@@ -2696,9 +2714,17 @@ mod tests {
                 "last_scan_cap_hit",
                 Box::new(|r| r.last_scan_cap_hit = true),
             ),
+            // Both directions, because the backend reads PRESENCE, not truth:
+            // an explicit `true` re-asserts a complete census, and an explicit
+            // `false` lowers a completeness it had already accepted. A beat has
+            // measured neither, so either one is a false declaration.
             (
                 "last_census_complete",
-                Box::new(|r| r.last_census_complete = true),
+                Box::new(|r| r.last_census_complete = Some(true)),
+            ),
+            (
+                "last_census_complete",
+                Box::new(|r| r.last_census_complete = Some(false)),
             ),
             (
                 "last_uploaded_count",
@@ -2793,9 +2819,10 @@ mod tests {
         for (field, mutate) in mutations {
             let mut beat = clean_checkin_request();
             mutate(&mut beat);
-            let refused = beat
-                .validate_declared_report_kind()
-                .expect_err("a beat carrying {field} is a false declaration");
+            let refused = match beat.validate_declared_report_kind() {
+                Ok(()) => panic!("a beat carrying {field} is a false declaration"),
+                Err(error) => error,
+            };
             assert!(
                 refused.to_string().contains(field),
                 "{field} was not named: {refused}"
@@ -2862,7 +2889,7 @@ mod tests {
             last_snapshot_unproven_terminal_count: 0,
             last_snapshot_superseded_terminal_count: 0,
             last_semantic_noop_count: 7,
-            last_census_complete: false,
+            last_census_complete: Some(false),
             last_symlink_rejected_count: 1,
             last_unreadable_path_count: 2,
             last_oversized_file_count: 3,
@@ -2924,7 +2951,7 @@ mod tests {
             last_skipped_file_count_due_to_limit: 0,
             last_scan_cap_hit: false,
             last_semantic_noop_count: 0,
-            last_census_complete: true,
+            last_census_complete: Some(true),
             last_symlink_rejected_count: 0,
             last_unreadable_path_count: 0,
             last_oversized_file_count: 0,

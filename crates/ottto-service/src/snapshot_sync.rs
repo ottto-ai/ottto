@@ -3774,7 +3774,7 @@ fn collector_status_request(
         last_skipped_file_count_due_to_limit: status.counts.skipped_file_count_due_to_limit,
         last_scan_cap_hit: status.counts.scan_cap_hit,
         last_semantic_noop_count: status.counts.semantic_noop_count,
-        last_census_complete: status.counts.census_complete,
+        last_census_complete: Some(status.counts.census_complete),
         last_symlink_rejected_count: status.counts.symlink_rejected_count,
         last_unreadable_path_count: status.counts.unreadable_path_count,
         last_oversized_file_count: status.counts.oversized_file_count,
@@ -3948,7 +3948,9 @@ fn report_status_with_fresh_relay_token(
 /// The declaration is honest by construction, not by convention: this function
 /// has no access to any scan outcome. It takes a source, a machine id, an
 /// optional cycle-start clock, and the server's own width hint; every
-/// scan-result field below is a literal absence or zero, and the only evidence
+/// scan-result field below is a literal absence or zero — census completeness
+/// included, which is `None` here so it never reaches the wire at all — and the
+/// only evidence
 /// it forwards is the manifest witness the backend already accepted from the
 /// last completed terminal report. `last_scan_finished_at` stays deliberately
 /// absent so a backend that predates `report_kind` still infers the same
@@ -4018,7 +4020,12 @@ fn report_checkin_status(
         last_skipped_file_count_due_to_limit: 0,
         last_scan_cap_hit: false,
         last_semantic_noop_count: 0,
-        last_census_complete: false,
+        // ABSENT, not `false`. A beat has run no census, and the backend
+        // resolves an explicitly declared `false` by lowering the completeness
+        // it already accepted while resolving an omitted one by retaining it.
+        // Sending `false` here would retract a complete census on every
+        // heartbeat; sending `true` would assert one it never measured.
+        last_census_complete: None,
         last_symlink_rejected_count: 0,
         last_unreadable_path_count: 0,
         last_oversized_file_count: 0,
@@ -8455,7 +8462,18 @@ mod tests {
             assert!(beat[absent].is_null(), "{absent} must be absent on a beat");
         }
         assert_eq!(beat["last_scan_cap_hit"], false);
-        assert_eq!(beat["last_census_complete"], false);
+        // The KEY must be missing, not present-and-false. The backend resolves
+        // census completeness by whether the field was declared at all: an
+        // omitted one retains what it already accepted, an explicit `false`
+        // lowers it. `is_null()` would pass for a serialized `null` too, so
+        // assert on the object's keys.
+        assert!(
+            !beat
+                .as_object()
+                .expect("beat is a JSON object")
+                .contains_key("last_census_complete"),
+            "a beat must not put last_census_complete on the wire at all: {beat}"
+        );
         for counter in [
             "last_uploaded_count",
             "last_scanned_session_count",
@@ -8482,6 +8500,63 @@ mod tests {
         ] {
             assert_eq!(beat[counter], 0, "{counter} must be zero on a beat");
         }
+    }
+
+    /// Census completeness is the one census field with no arithmetic identity,
+    /// so its wire treatment differs from every counter above and is asserted
+    /// on its own.
+    ///
+    /// The backend merges a check-in's census into what it already accepted.
+    /// Counters take a `max`, for which a beat's honest `0` is the identity and
+    /// therefore harmless. Completeness takes a conjunction resolved through
+    /// `model_fields_set`: an OMITTED value retains the accepted one, an
+    /// explicitly declared `false` asserts incompleteness and lowers it. A beat
+    /// has run no census, so it must send neither `false` (which would retract
+    /// a complete census on every heartbeat) nor `true` (which would assert one
+    /// it never measured) — it must send nothing. The terminal path, which did
+    /// run the census, still states the measured value in both directions.
+    #[test]
+    #[serial(source_manifests)]
+    fn only_a_scan_result_puts_census_completeness_on_the_wire() {
+        let _source_manifests = SourceManifestTestGuard::new();
+
+        for scan_started_at in [None, Some("2026-06-01T10:00:00Z")] {
+            let beat = captured_checkin_receipt(scan_started_at);
+            assert_eq!(beat["report_kind"], "checkin");
+            assert!(
+                !beat
+                    .as_object()
+                    .expect("beat is a JSON object")
+                    .contains_key("last_census_complete"),
+                "the key must be absent, not null and not false: {beat}"
+            );
+        }
+
+        // Both terminal outcomes still declare what the census actually found.
+        let mut complete = SyncCounts::for_policy(30);
+        complete.census_complete = true;
+        let terminal_complete = captured_terminal_receipt(
+            complete,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            30,
+        );
+        assert_eq!(terminal_complete["report_kind"], "scan_status");
+        assert_eq!(terminal_complete["last_census_complete"], true);
+
+        let mut incomplete = SyncCounts::for_policy(30);
+        incomplete.census_complete = false;
+        let terminal_incomplete = captured_terminal_receipt(
+            incomplete,
+            CollectorState::Error {
+                code: "scan_error",
+                message: "local snapshot scan failed",
+            },
+            TerminalManifestSource::Withdraw,
+            30,
+        );
+        assert_eq!(terminal_incomplete["report_kind"], "scan_status");
+        assert_eq!(terminal_incomplete["last_census_complete"], false);
     }
 
     #[test]

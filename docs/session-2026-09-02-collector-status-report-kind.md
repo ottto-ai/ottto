@@ -39,8 +39,11 @@ That is closed by construction rather than by convention:
 
 - `report_checkin_status` has no access to any scan outcome. It receives a
   source, a machine id, an optional cycle-start clock, and the server's own
-  width hint; every scan-result field it writes is a literal absence, zero, or
-  `false`. A durable terminal status journal does exist (ottto#393 writes the
+  width hint; every scan-result field it writes is a literal absence or zero.
+  `last_census_complete` is the one field where zero-shaped honesty is not
+  enough — see "Census completeness is absence, not `false`" below — so it is
+  an `Option<bool>` the beat leaves `None`. A durable terminal status journal
+  does exist (ottto#393 writes the
   exact typed receipt to disk before the POST), but no beat can reach it:
   `report_checkin_status` takes no support directory and has no reader for it,
   and its doc comment records why replaying one there would be wrong. So a beat
@@ -57,6 +60,44 @@ That is closed by construction rather than by convention:
 `checkin` plus a disabled collector is unreachable here for the same reason: a
 disabled state report is durable state, and only the terminal path can express
 it. (The backend rejects that combination with a 400.)
+
+## Census completeness is absence, not `false`
+
+Declaring the kind exposed a bug that the shape inference had been hiding, and
+this change fixes it rather than shipping on top of it.
+
+The backend merges a check-in's census into what it has already accepted
+(`_merge_retained_checkin_census`). For the counters that merge is a `max`, and
+a beat's honest `0` is the identity, so an unmeasured zero is harmless.
+`last_census_complete` has no such identity. It merges as a conjunction resolved
+through pydantic's `model_fields_set`: an OMITTED value retains the accepted
+one, and an explicitly declared `false` asserts incompleteness and LOWERS it,
+because only a real census can claim a corpus was not fully seen.
+
+`report_checkin_status` hardcoded `last_census_complete: false`, and the field
+was a plain `bool` that always serialized. So every heartbeat declared an
+incomplete census it had never measured, and — against a backend that reads the
+declaration — would retract a complete census on every beat.
+
+The fix is on the daemon, where the honesty belongs: a beat has run no census,
+so it must state nothing.
+
+- `SnapshotStatusRequest.last_census_complete` is now
+  `Option<bool>` with `#[serde(skip_serializing_if = "Option::is_none")]`, so
+  `None` means the key is ABSENT on the wire — not `null`, not `false`.
+- `report_checkin_status` sends `None`. `collector_status_request` still sends
+  the measured `Some(bool)` in both directions.
+- `checkin_contradicting_evidence` refuses ANY present value on a declared
+  `checkin`, `true` and `false` alike. That is parity with the backend's rule:
+  it reads presence, not truth.
+
+Verified against the deployed backend model (private `origin/master`, which
+carries #5225): the real emitted beat bodies validate with
+`last_census_complete` outside `model_fields_set` and merge to
+`census_complete=True` against a retained-`True` head, while the same body with
+an explicit `false` merges to `False`. The legacy shape inference
+(`_inferred_checkin_receipt`) does not read the field, so a backend predating
+`report_kind` classifies the beat exactly as before.
 
 Building the receipt is already split from sending it: `collector_status_request`
 is pure, and `report_status_with_fresh_relay_token` journals and posts what it
@@ -86,7 +127,11 @@ handling paths behave identically against old and new backends.
 - `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked
   -- -D warnings` on both 1.88.0 and 1.97.0
 - New coverage: heartbeat and cycle-start marker both declare `checkin`; a beat
-  discloses nothing (every scan-result field absent, zero, or false); fresh
+  discloses nothing (every scan-result field absent or zero, and
+  `last_census_complete` absent from the serialized body entirely, asserted on
+  the JSON keys rather than the struct); the guard refuses a declared `checkin`
+  carrying `last_census_complete` in either direction; the terminal path still
+  emits the measured bool for both a complete and an incomplete census; fresh
   terminal report, new or changed error, derived `parse_error` with a changed
   loss census, cap-hit change, disabled transition, zero-width tombstone, and
   the first report after a reinstall all declare `scan_status`; the guard names
