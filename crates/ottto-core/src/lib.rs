@@ -11,14 +11,17 @@ pub mod status;
 pub mod token_store;
 
 pub use account_store::{
-    default_account_path, default_connection_api_base_url, default_connection_path,
-    default_device_path, default_machine_path, default_pending_device_credential_path,
-    default_sources_dir, default_support_dir, is_persistent_installation_id,
-    is_persistent_machine_id, source_state_file_name, FileAccountStore, FileConnectionStore,
-    FileDeviceStore, FileMachineStore, FilePendingDeviceCredentialStore, FileSourceStateStore,
-    LocalConnectionBinding, LocalDeviceBinding, LocalDeviceCredentialBinding, LocalMachineBinding,
-    LocalSourceState, PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
-    PendingDeviceCredentialRequestAuthority,
+    claude_attribution_capture_env_enabled, default_account_path, default_connection_api_base_url,
+    default_connection_path, default_device_path, default_machine_path,
+    default_pending_device_credential_path, default_settings_path, default_sources_dir,
+    default_support_dir, is_persistent_installation_id, is_persistent_machine_id,
+    resolve_claude_attribution_capture, source_state_file_name, FileAccountStore,
+    FileConnectionStore, FileDeviceStore, FileMachineStore, FilePendingDeviceCredentialStore,
+    FileSettingsStore, FileSourceStateStore, LocalConnectionBinding, LocalDeviceBinding,
+    LocalDeviceCredentialBinding, LocalMachineBinding, LocalSettings, LocalSourceState,
+    PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
+    PendingDeviceCredentialRequestAuthority, ResolvedToggle, SettingSource,
+    CLAUDE_ATTRIBUTION_CAPTURE_DEFAULT, CLAUDE_ATTRIBUTION_CAPTURE_ENV, SETTINGS_FILE_NAME,
 };
 pub use claude_account::{
     billing_identity_hash, claude_account_identifier_hash, claude_cli_account_identifier_hash,

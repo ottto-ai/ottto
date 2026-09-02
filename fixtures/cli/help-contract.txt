@@ -20,6 +20,7 @@ Commands:
   doctor           Run daemon health checks and print current status
   fix              Apply daemon-approved repair for one app
   verify           Verify one app and publish safe setup status
+  config           Show or persist local settings that survive upgrades
   diagnostics      Collect local-only or approved support diagnostics
   update           Check owner-aware update state and instructions
   uninstall        Remove Ottto local runtime state for this user
@@ -475,6 +476,49 @@ Options:
       --json             Print one final JSON object and no human summary text
       --watch            Emit NDJSON progress events and a final event; requires --json
   -h, --help             Print help
+### ottto config --help
+Show or persist local settings that survive upgrades
+
+Usage: ottto config [OPTIONS] <COMMAND>
+
+Commands:
+  show  Show local settings and how each one resolves here
+  set   Persist one local setting so upgrades keep it
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto config show --help
+Show local settings and how each one resolves here
+
+Usage: ottto config show [OPTIONS]
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto config set --help
+Persist one local setting so upgrades keep it
+
+Usage: ottto config set [OPTIONS] --setting <SETTING> --value <VALUE>
+
+Options:
+      --json               Print one final JSON object and no human summary text
+      --setting <SETTING>  Setting to persist [possible values: claude-attribution-capture]
+      --socket <SOCKET>    Override the ottto-service Unix socket path
+      --token <TOKEN>      Override the local-control token for CLI and agent requests
+      --value <VALUE>      Value to persist [possible values: on, off]
+      --no-autostart       Do not kickstart the standard per-user ottto-service
+      --watch              Emit NDJSON progress events and a final event; requires --json
+  -h, --help               Print help
 ### ottto diagnostics --help
 Collect local-only or approved support diagnostics
 

@@ -1,0 +1,15 @@
+{
+  "settings_path": "/tmp/ottto-cli-config-contract/settings.json",
+  "settings": [
+    {
+      "setting": "claude-attribution-capture",
+      "default_enabled": false,
+      "env_var": "OTTTO_CLAUDE_ATTRIBUTION_CAPTURE",
+      "env_value_present": false,
+      "resolved_in_this_process": {
+        "enabled": false,
+        "source": "default"
+      }
+    }
+  ]
+}
