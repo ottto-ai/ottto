@@ -420,6 +420,13 @@ pub const MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK: usize = 10_000;
 pub const MAX_WATCHER_HINTED_FILES_PER_TICK: usize = 256;
 const UNHEALTHY_SCAN_RETRY_BASE_SECONDS: u64 = 60;
 const UNHEALTHY_SCAN_RETRY_MAX_SECONDS: u64 = 60 * 60;
+/// The retry attempt at which the exponential delay reaches its ceiling
+/// (`60 * 2^6` seconds is clamped to one hour). The attempt counter saturates
+/// here: a traversal that stays terminal-unhealthy is re-walked at most hourly
+/// and its persisted witness never grows past this value. The counter clears
+/// only when a generation completes (the traversal is dropped) or the scan
+/// context changes (a fresh traversal starts at zero).
+const UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS: u8 = 7;
 pub(crate) const MAX_COMPACTION_TIMESTAMPS: usize = 64;
 pub(crate) const MAX_CONTEXT_CURVE_POINTS: usize = 256;
 pub(crate) const MAX_CONTEXT_CURVE_BOUNDARIES: usize = 64;
@@ -1717,10 +1724,38 @@ struct ScanTraversalCounts {
     terminal_recognized_usage_drop_count: usize,
     #[serde(default)]
     terminal_dropped_usage_record_count: u64,
+    /// Non-progressing residue promoted to terminal by the generation that
+    /// re-derived it. Ownership-incomplete Codex rollouts whose parent
+    /// resolution is not pending, files with usage evidence but no entity, and
+    /// the usage records those files drop are deterministic functions of their
+    /// unchanged bytes, sidecar and parent evidence. Their files are never
+    /// checkpointed, so every generation parses them again and reaches the
+    /// same counts; retrying the traversal cannot change them. Once discovery
+    /// finishes without any retryable problem they are settled here so the
+    /// census can complete with the loss named, instead of holding every
+    /// downstream completeness gate red for as long as those files exist.
+    /// See `settle_non_progressing_residue`.
+    #[serde(default)]
+    terminal_ownership_incomplete_file_count: usize,
+    #[serde(default)]
+    terminal_zero_snapshot_usage_evidence_count: usize,
+}
+
+/// Residue a generation disclosed as terminal after settling. Counts exclude
+/// the over-line-cap loss that already carried its own terminal disposition.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SettledScanResidue {
+    ownership_incomplete_file_count: usize,
+    zero_snapshot_usage_evidence_count: usize,
+    dropped_usage_record_count: u64,
 }
 
 impl ScanTraversalCounts {
-    fn has_errors(&self) -> bool {
+    /// Loss that a later traversal can still change: a directory the walk
+    /// could not enter or finish, an object it could not open or read, a root
+    /// that vanished, or a line the parser rejected. These keep their retry
+    /// semantics: the census stays red and the bounded retry latch re-walks.
+    fn has_retryable_problems(&self) -> bool {
         self.symlink_rejected_count > 0
             || self.directory_entry_cap_exceeded_count > 0
             || self.unreadable_path_count > 0
@@ -1729,10 +1764,59 @@ impl ScanTraversalCounts {
             || self.malformed_json_line_count > 0
             || self.invalid_utf8_line_count > 0
             || self.over_line_cap_count > self.terminal_over_line_cap_count
+    }
+
+    /// Non-progressing residue this generation has not yet disclosed as
+    /// terminal.
+    fn has_unsettled_residue(&self) -> bool {
+        self.ownership_incomplete_file_count > self.terminal_ownership_incomplete_file_count
+            || self.zero_snapshot_usage_evidence_count
+                > self.terminal_zero_snapshot_usage_evidence_count
             || self.recognized_usage_drop_count > self.terminal_recognized_usage_drop_count
-            || self.ownership_incomplete_file_count > 0
-            || self.zero_snapshot_usage_evidence_count > 0
             || self.dropped_usage_record_count > self.terminal_dropped_usage_record_count
+    }
+
+    fn has_errors(&self) -> bool {
+        self.has_retryable_problems() || self.has_unsettled_residue()
+    }
+
+    /// Promote the non-progressing residue to terminal for this generation.
+    ///
+    /// Only a generation that has finished discovery and carries no retryable
+    /// problem may settle: a walk that could not enter a directory or read an
+    /// object may simply not have seen the file that would resolve a fork, so
+    /// its residue is not yet known to be non-progressing. The promotion is an
+    /// assignment, not an accumulation, so a retained traversal that parses
+    /// further pages settles again from the counts it actually re-derived.
+    /// Returns true when something was newly settled.
+    fn settle_non_progressing_residue(&mut self) -> bool {
+        if self.has_retryable_problems() || !self.has_unsettled_residue() {
+            return false;
+        }
+        self.terminal_ownership_incomplete_file_count = self.ownership_incomplete_file_count;
+        self.terminal_zero_snapshot_usage_evidence_count = self.zero_snapshot_usage_evidence_count;
+        self.terminal_recognized_usage_drop_count = self.recognized_usage_drop_count;
+        self.terminal_dropped_usage_record_count = self.dropped_usage_record_count;
+        true
+    }
+
+    /// The residue this generation settled, if any. Over-line-cap loss carries
+    /// its own per-file terminal disposition and is excluded here; its dropped
+    /// record share equals `terminal_over_line_cap_count` by construction
+    /// (`ParsedJsonlFile::terminal_loss`, `ScanCensus::add_terminal_jsonl_loss`).
+    fn settled_residue(&self) -> Option<SettledScanResidue> {
+        let dropped_usage_record_count = self
+            .terminal_dropped_usage_record_count
+            .saturating_sub(self.terminal_over_line_cap_count as u64);
+        (self.terminal_ownership_incomplete_file_count > 0
+            || self.terminal_zero_snapshot_usage_evidence_count > 0
+            || dropped_usage_record_count > 0)
+            .then_some(SettledScanResidue {
+                ownership_incomplete_file_count: self.terminal_ownership_incomplete_file_count,
+                zero_snapshot_usage_evidence_count: self
+                    .terminal_zero_snapshot_usage_evidence_count,
+                dropped_usage_record_count,
+            })
     }
 }
 
@@ -1778,6 +1862,80 @@ struct ScanTraversalCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unhealthy_retry_not_before_unix_seconds: Option<u64>,
     counts: ScanTraversalCounts,
+    /// Files this generation parsed cleanly but could not checkpoint because
+    /// their content yields non-progressing residue. Recorded so the settled
+    /// counts name their files instead of silently folding them into totals.
+    #[serde(default, skip_serializing_if = "ScanTraversalResidue::is_empty")]
+    residue: ScanTraversalResidue,
+}
+
+/// Per-generation bookkeeping behind `ScanTraversalCounts::settle_non_progressing_residue`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct ScanTraversalResidue {
+    /// Local index keys of the residue files (the same key space as `files`).
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    index_keys: BTreeSet<String>,
+    /// Codex session ids those files hold out of the inclusive state-only
+    /// fallback. They are never pruned from
+    /// `ScanIndex::codex_state_only_blocked_session_ids` by settling: the block
+    /// records what the rollout's content proved about its ownership, and
+    /// releasing it would publish inclusive `tokens_used` for a thread whose
+    /// exclusive usage is exactly what could not be determined.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    blocked_session_ids: BTreeSet<String>,
+}
+
+impl ScanTraversalResidue {
+    fn is_empty(&self) -> bool {
+        self.index_keys.is_empty() && self.blocked_session_ids.is_empty()
+    }
+}
+
+/// Durable record of the residue disclosed by the last census that completed
+/// with named, non-progressing loss. Written when a generation completes and
+/// cleared when a generation completes clean, so an operator reading the index
+/// can see which files the machine cannot checkpoint and which Codex sessions
+/// are held out of the state-only fallback, rather than inferring it from
+/// per-cycle log lines.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct ScanResidueWitness {
+    census_window_end: String,
+    ownership_incomplete_file_count: usize,
+    zero_snapshot_usage_evidence_count: usize,
+    dropped_usage_record_count: u64,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    index_keys: BTreeSet<String>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    codex_state_only_blocked_session_ids: BTreeSet<String>,
+}
+
+impl ScanResidueWitness {
+    /// Same residue, ignoring the census clock that advances every cycle.
+    fn same_residue(&self, other: &Self) -> bool {
+        self.ownership_incomplete_file_count == other.ownership_incomplete_file_count
+            && self.zero_snapshot_usage_evidence_count == other.zero_snapshot_usage_evidence_count
+            && self.dropped_usage_record_count == other.dropped_usage_record_count
+            && self.index_keys == other.index_keys
+            && self.codex_state_only_blocked_session_ids
+                == other.codex_state_only_blocked_session_ids
+    }
+
+    /// Residue files that live under an archived Codex sessions root. An
+    /// archived rollout is still inside the configured scan roots, so it is
+    /// parsed like any other; the distinction only names where the residue
+    /// sits so a report can say so without printing a local path.
+    fn archived_residue_file_count(&self) -> usize {
+        self.index_keys
+            .iter()
+            .filter(|key| {
+                Path::new(key)
+                    .components()
+                    .any(|component| component.as_os_str() == "archived_sessions")
+            })
+            .count()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1922,6 +2080,10 @@ pub struct ScanIndex {
     /// this finite queue without an O(all paths) tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     traversal: Option<ScanTraversalCheckpoint>,
+    /// Residue named by the last completed census, see `ScanResidueWitness`.
+    /// Absent while the last completed census was clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scan_residue_witness: Option<ScanResidueWitness>,
     /// Destination-scoped historical bootstrap/replay generation currently
     /// being paged. Matching generations resume; a new reviewed revision
     /// clears only derived transcript settlement state once.
@@ -2010,6 +2172,7 @@ impl Default for ScanIndex {
             resume_census_window_end: None,
             bounded_sweep_had_unsettled_upload: false,
             traversal: None,
+            scan_residue_witness: None,
             historical_replay_generation: None,
             context_curve_capability_enabled: false,
             context_curve_replay_epoch: 0,
@@ -9803,6 +9966,9 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
     let mut semantic_noop_count = 0;
     let mut codex_state_only_blocked_session_ids = BTreeSet::new();
     let mut codex_parent_resolution_retry_required = false;
+    let mut residue_index_keys = BTreeSet::new();
+    let mut settled_residue_index_keys = BTreeSet::new();
+    let mut residue_blocked_session_ids = BTreeSet::new();
     let mut pending_finalization = Vec::new();
     let claude_authority_preflight =
         source == SnapshotSource::ClaudeCode && !index.claude_usage_authority_quarantine.is_empty();
@@ -10115,8 +10281,18 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
                 }
             }
         }
+        let index_key = local_index_key(&candidate.path);
+        let non_progressing_residue = parsed_file.non_progressing_residue();
+        if non_progressing_residue {
+            residue_index_keys.insert(index_key.clone());
+        } else {
+            settled_residue_index_keys.insert(index_key.clone());
+        }
         for session_id in &parsed_file.state_only_blocked_session_ids {
             let session_id = resolve_codex_identity(session_id.as_str());
+            if non_progressing_residue {
+                residue_blocked_session_ids.insert(session_id.clone());
+            }
             codex_state_only_blocked_session_ids.insert(session_id.clone());
             index
                 .codex_state_only_blocked_session_ids
@@ -10147,7 +10323,6 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
             .last()
             .map(|snapshot| snapshot.snapshot_fingerprint.clone());
         let parsed_snapshot_count = parsed.len();
-        let index_key = local_index_key(&candidate.path);
         pending_finalization.push(PendingIndexFinalization {
             index_key,
             source_file_fingerprint: source_file_fingerprint.clone(),
@@ -10198,6 +10373,20 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
     }
     if let Some(traversal) = index.traversal.as_mut() {
         traversal.codex_parent_resolution_retry_required |= codex_parent_resolution_retry_required;
+        // A residue file that this page parsed to completion, or that a
+        // watcher hint proved absent, leaves the generation's residue set; a
+        // file that reproduced its residue (re)enters it.
+        for index_key in settled_residue_index_keys
+            .iter()
+            .chain(census.removed_index_keys.iter())
+        {
+            traversal.residue.index_keys.remove(index_key);
+        }
+        traversal.residue.index_keys.extend(residue_index_keys);
+        traversal
+            .residue
+            .blocked_session_ids
+            .extend(residue_blocked_session_ids);
         // Exact watcher remove/rename hints must amend the same durable
         // observation set used by directory census reconciliation. Apply
         // removals first so a valid observation later in this page wins.
@@ -10247,13 +10436,27 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
     for index_key in &census.removed_index_keys {
         index.remove_file_entry(index_key);
     }
+    let traversal_discovery_done = index.traversal.as_ref().is_some_and(|traversal| {
+        traversal.pending_directories.is_empty() && traversal.pending_candidates.is_empty()
+    });
+    if traversal_discovery_done {
+        // Discovery has visited every directory and parsed every candidate,
+        // so the counts are the complete re-derivation for this generation.
+        // Loss that only a change to the corpus can move is settled now, so a
+        // machine whose only problem is an unresolvable rollout still reaches
+        // a terminal census instead of retrying the same bytes forever with
+        // every downstream gate (historical backfill, the legacy settlement
+        // sweep, the terminal manifest) held behind it. Retryable problems
+        // veto the settlement inside the helper.
+        if let Some(traversal) = index.traversal.as_mut() {
+            traversal.counts.settle_non_progressing_residue();
+        }
+    }
     let traversal_snapshot = index
         .traversal
         .as_ref()
         .cloned()
         .expect("traversal remains active");
-    let traversal_discovery_done = traversal_snapshot.pending_directories.is_empty()
-        && traversal_snapshot.pending_candidates.is_empty();
     let traversal_healthy = !traversal_snapshot.counts.has_errors();
     let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
     let reconciliation_complete = if traversal_discovery_done
@@ -10337,10 +10540,27 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
         let traversal = index.traversal.as_mut().expect("traversal remains active");
         if traversal.unhealthy_retry_not_before_unix_seconds.is_none() {
-            traversal.unhealthy_retry_attempt = traversal.unhealthy_retry_attempt.saturating_add(1);
+            let previous_attempt = traversal.unhealthy_retry_attempt;
+            // The counter saturates at the attempt whose delay is already the
+            // hourly ceiling. A persistent problem therefore costs at most one
+            // bounded re-walk per hour and the persisted witness stays small.
+            traversal.unhealthy_retry_attempt = previous_attempt
+                .saturating_add(1)
+                .min(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS);
             traversal.unhealthy_retry_not_before_unix_seconds = Some(now.saturating_add(
                 unhealthy_scan_retry_delay_seconds(traversal.unhealthy_retry_attempt),
             ));
+            if previous_attempt < UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS
+                && traversal.unhealthy_retry_attempt == UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS
+            {
+                eprintln!(
+                    "ottto-service: bounded scan retry for {} reached attempt {}; the traversal \
+                     stays a durable red witness and is re-walked at most hourly until the \
+                     problem clears or the scan context changes",
+                    source.api_slug(),
+                    UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS
+                );
+            }
         }
     }
     let pending_work_count = pending_work_count
@@ -10348,6 +10568,9 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         .saturating_add(usize::from(terminal_unhealthy))
         .saturating_add(usize::from(needs_clean_followup))
         .saturating_add(usize::from(parent_resolution_restart));
+    if raw_census_complete {
+        index.record_scan_residue_witness(source, &traversal_snapshot);
+    }
     if raw_census_complete || restart_after_hints || parent_resolution_restart {
         index.traversal = None;
         index.resume_after_path = None;
@@ -10881,6 +11104,21 @@ impl ParsedJsonlFile {
             && self.report.over_line_cap_count == self.terminal_line_loss_count
             && self.recognized_usage_drop_count == self.terminal_line_loss_count
             && self.ownership_incomplete_file_count == 0
+            && !self.codex_parent_resolution_pending
+    }
+
+    /// Every line parsed and no parent evidence is outstanding, yet the file
+    /// cannot be checkpointed: its ownership boundary is unresolved with
+    /// nothing left to wait for, or it carries usage the parser could not turn
+    /// into an entity. Re-reading the same bytes under the same sidecar and
+    /// parent evidence reproduces this outcome exactly, so the loss is
+    /// disclosed by the census as terminal residue rather than retried. The
+    /// file itself stays retryable in the ordinary sense: it is never recorded
+    /// in the index, so the next generation parses it again and any change to
+    /// its bytes, sidecar or parent evidence is picked up.
+    fn non_progressing_residue(&self) -> bool {
+        !self.complete()
+            && self.report.complete_except_over_line_cap()
             && !self.codex_parent_resolution_pending
     }
 
@@ -15802,13 +16040,23 @@ fn ensure_bounded_traversal(
         let terminal_unhealthy = traversal.pending_directories.is_empty()
             && traversal.pending_candidates.is_empty()
             && traversal.counts.has_errors();
+        // What clears the latch: a generation that completes drops the
+        // traversal, and a changed scan context takes the `else` branch below;
+        // both start the next traversal at attempt zero. What bounds it: the
+        // attempt saturates at `UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS`, the delay
+        // at `UNHEALTHY_SCAN_RETRY_MAX_SECONDS`, and a deadline that is past,
+        // absurdly far ahead, or missing altogether (an index persisted before
+        // the deadline existed) is due now. The retry depends on the clock
+        // alone, never on new input arriving.
         let retry_due = match rfc3339_unix_seconds(collected_at) {
-            Some(now) => traversal
-                .unhealthy_retry_not_before_unix_seconds
-                .is_some_and(|deadline| {
-                    now >= deadline
-                        || deadline > now.saturating_add(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
-                }),
+            Some(now) => {
+                traversal
+                    .unhealthy_retry_not_before_unix_seconds
+                    .map_or(true, |deadline| {
+                        now >= deadline
+                            || deadline > now.saturating_add(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
+                    })
+            }
             // A malformed or backwards observation clock must not turn the
             // durable red witness into a permanent fence. Retrying remains
             // bounded by the per-tick traversal limits.
@@ -15817,7 +16065,9 @@ fn ensure_bounded_traversal(
         if !terminal_unhealthy || !retry_due {
             return;
         }
-        traversal.unhealthy_retry_attempt
+        traversal
+            .unhealthy_retry_attempt
+            .min(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS)
     } else {
         0
     };
@@ -15948,6 +16198,7 @@ fn ensure_bounded_traversal(
         unhealthy_retry_attempt: retry_attempt,
         unhealthy_retry_not_before_unix_seconds: None,
         counts,
+        residue: ScanTraversalResidue::default(),
     });
 }
 
@@ -16820,6 +17071,60 @@ impl ScanIndex {
         self.bounded_sweep_had_unsettled_upload = true;
     }
 
+    /// Record (or clear) the residue the completing generation disclosed, and
+    /// say so once per change rather than once per cycle. The log names counts
+    /// only; the index keys stay in the local index.
+    fn record_scan_residue_witness(
+        &mut self,
+        source: SnapshotSource,
+        traversal: &ScanTraversalCheckpoint,
+    ) {
+        let next = traversal
+            .counts
+            .settled_residue()
+            .map(|residue| ScanResidueWitness {
+                census_window_end: traversal.census_window_end.clone(),
+                ownership_incomplete_file_count: residue.ownership_incomplete_file_count,
+                zero_snapshot_usage_evidence_count: residue.zero_snapshot_usage_evidence_count,
+                dropped_usage_record_count: residue.dropped_usage_record_count,
+                index_keys: traversal.residue.index_keys.clone(),
+                codex_state_only_blocked_session_ids: traversal
+                    .residue
+                    .blocked_session_ids
+                    .iter()
+                    .filter(|session_id| {
+                        self.codex_state_only_blocked_session_ids
+                            .contains(session_id.as_str())
+                    })
+                    .cloned()
+                    .collect(),
+            });
+        match (self.scan_residue_witness.as_ref(), next.as_ref()) {
+            (Some(previous), Some(next)) if previous.same_residue(next) => {}
+            (None, None) => {}
+            (_, Some(next)) => eprintln!(
+                "ottto-service: {} census completed with non-progressing residue: {} \
+                 ownership-incomplete Codex rollout(s) ({} under an archived root), {} file(s) \
+                 with usage evidence but no entity, {} dropped usage record(s); {} Codex \
+                 session(s) stay held out of the state-only fallback; the residue is re-derived \
+                 every generation and clears only when its files, their sidecar, or the parser \
+                 change",
+                source.api_slug(),
+                next.ownership_incomplete_file_count,
+                next.archived_residue_file_count(),
+                next.zero_snapshot_usage_evidence_count,
+                next.dropped_usage_record_count,
+                next.codex_state_only_blocked_session_ids.len(),
+            ),
+            (Some(_), None) => eprintln!(
+                "ottto-service: {} census residue cleared; every previously non-progressing \
+                 file now checkpoints",
+                source.api_slug()
+            ),
+        }
+        self.scan_residue_witness = next;
+    }
+
     pub(crate) fn claude_usage_authority_pending_count(&self) -> usize {
         self.claude_usage_authority_quarantine
             .values()
@@ -16946,6 +17251,7 @@ impl ScanIndex {
         self.resume_census_window_end = None;
         self.bounded_sweep_had_unsettled_upload = false;
         self.traversal = None;
+        self.scan_residue_witness = None;
         self.confirmed_empty_files.clear();
         self.file_snapshot_fingerprints.clear();
         self.snapshot_activity_at.clear();
@@ -17172,6 +17478,7 @@ impl ScanIndex {
                 disappeared_file_count: 1,
                 ..ScanTraversalCounts::default()
             },
+            residue: ScanTraversalResidue::default(),
         });
     }
 
@@ -17665,6 +17972,7 @@ impl ScanIndex {
             resume_census_window_end: self.resume_census_window_end.clone(),
             bounded_sweep_had_unsettled_upload: self.bounded_sweep_had_unsettled_upload,
             traversal: self.traversal.clone(),
+            scan_residue_witness: self.scan_residue_witness.clone(),
             historical_replay_generation: self.historical_replay_generation.clone(),
             context_curve_capability_enabled: previous.context_curve_capability_enabled,
             context_curve_replay_epoch: previous.context_curve_replay_epoch,
@@ -19062,6 +19370,7 @@ mod tests {
                 disappeared_file_count: 1,
                 ..ScanTraversalCounts::default()
             },
+            residue: ScanTraversalResidue::default(),
         }
     }
 
@@ -21788,6 +22097,7 @@ mod tests {
             unhealthy_retry_attempt: 0,
             unhealthy_retry_not_before_unix_seconds: None,
             counts: ScanTraversalCounts::default(),
+            residue: ScanTraversalResidue::default(),
         });
 
         let scan = scan_source_roots(
@@ -22062,6 +22372,7 @@ mod tests {
                 unhealthy_retry_attempt: 0,
                 unhealthy_retry_not_before_unix_seconds: None,
                 counts: ScanTraversalCounts::default(),
+                residue: ScanTraversalResidue::default(),
             }),
             ..ScanIndex::default()
         };
@@ -22437,6 +22748,958 @@ mod tests {
         assert_eq!(retried.scanned_file_count, 2);
         assert!(!retried.census_complete);
         let _ = fs::remove_dir_all(root);
+    }
+
+    // ---------------------------------------------------------------------
+    // Non-progressing census residue and the bounded unhealthy-retry latch.
+    // ---------------------------------------------------------------------
+
+    /// A Codex home with both configured roots and a state database. A thread
+    /// whose state row declares a provider-created thread while its rollout
+    /// carries only a file-controlled pagination marker is ownership-incomplete
+    /// with no parent evidence outstanding: the exact shape that re-derives
+    /// the same residue on every generation.
+    struct CodexResidueFixture {
+        home: PathBuf,
+        sessions: PathBuf,
+        archived: PathBuf,
+    }
+
+    impl CodexResidueFixture {
+        fn create(name: &str) -> Self {
+            let home = temp_dir(name);
+            let codex_dir = home.join(".codex");
+            let sessions = codex_dir.join("sessions");
+            let archived = codex_dir.join("archived_sessions");
+            fs::create_dir_all(&sessions).expect("create sessions root");
+            fs::create_dir_all(&archived).expect("create archived root");
+            Connection::open(codex_dir.join("state_5.sqlite"))
+                .expect("open state database")
+                .execute_batch(
+                    "CREATE TABLE threads (\
+                        id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                        thread_source TEXT, first_user_message TEXT\
+                    );",
+                )
+                .expect("create threads table");
+            Self {
+                home,
+                sessions,
+                archived,
+            }
+        }
+
+        fn roots(&self) -> Vec<PathBuf> {
+            vec![self.sessions.clone(), self.archived.clone()]
+        }
+
+        fn insert_thread(&self, session_id: &str, tokens_used: i64, thread_source: &str) {
+            Connection::open(self.home.join(".codex").join("state_5.sqlite"))
+                .expect("open state database")
+                .execute(
+                    "INSERT INTO threads VALUES (?1, 'Thread', ?2, ?3, NULL)",
+                    rusqlite::params![session_id, tokens_used, thread_source],
+                )
+                .expect("insert thread row");
+        }
+
+        fn set_thread_source(&self, session_id: &str, thread_source: &str) {
+            Connection::open(self.home.join(".codex").join("state_5.sqlite"))
+                .expect("open state database")
+                .execute(
+                    "UPDATE threads SET thread_source = ?2 WHERE id = ?1",
+                    rusqlite::params![session_id, thread_source],
+                )
+                .expect("update thread row");
+        }
+
+        /// A file-controlled paginated rollout with one usage record. With a
+        /// `user` state row it is all-local and yields one entity; with an
+        /// `agent_created_thread` state row the two declarations disagree and
+        /// the rollout is ownership-incomplete with nothing left to wait for.
+        fn write_rollout(&self, root: &Path, session_id: &str, stamp: &str) -> PathBuf {
+            let path = root.join(format!("rollout-{stamp}-{session_id}.jsonl"));
+            let values = [
+                json!({"timestamp":"2026-07-30T11:35:45Z","type":"session_meta","payload":{"id":session_id,"session_id":session_id,"history_mode":"paginated","history_base":{"cursor":"file-controlled"},"source":"cli"}}),
+                json!({"timestamp":"2026-07-30T11:35:46Z","type":"turn_context","payload":{"turn_id":"residue-turn","model":"gpt-5.6-sol"}}),
+                codex_test_token_line(
+                    "2026-07-30T11:35:47Z",
+                    None,
+                    (30, 8, 12, 1),
+                    Some((30, 8, 12, 1)),
+                ),
+            ];
+            fs::write(
+                &path,
+                values
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n",
+            )
+            .expect("write rollout");
+            path
+        }
+    }
+
+    const RESIDUE_SESSION: &str = "019fb22a-0000-7000-8000-000000000001";
+    const ACTIVE_RESIDUE_SESSION: &str = "019fb22a-0000-7000-8000-000000000002";
+    const HEALTHY_SESSIONS: [&str; 3] = [
+        "019fb22b-0000-7000-8000-000000000011",
+        "019fb22b-0000-7000-8000-000000000012",
+        "019fb22b-0000-7000-8000-000000000013",
+    ];
+
+    /// One cycle of the source loop in the order `sync_source_snapshots`
+    /// evaluates it: the historical-backfill gate is read from durable
+    /// backfill state before the scan, the legacy settlement sweep is armed
+    /// only while no replay is pending, the scan runs, a complete census marks
+    /// the backfill done for this destination, and the sweep is finished after
+    /// settlement. The server leg is deliberately absent - nothing is ACKed -
+    /// so an armed page stays armed and the accepted set never grows here.
+    fn gated_codex_cycle(
+        index: &mut ScanIndex,
+        roots: &[PathBuf],
+        backfill: &mut crate::backfill::BackfillState,
+        destination: &str,
+        collected_at: &str,
+    ) -> (SourceScanResult, Option<BTreeSet<String>>) {
+        let backfill_pending =
+            crate::backfill::pending_backfill_sources_for_destination(backfill, destination)
+                .contains(&SnapshotSource::Codex);
+        let armed =
+            (!backfill_pending && index.legacy_settlement_ledger_needs_migration()).then(|| {
+                index
+                    .prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50)
+                    .0
+            });
+        let scan = scan_source_roots(
+            SnapshotSource::Codex,
+            roots,
+            index,
+            collected_at,
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan the residue fixture");
+        if backfill_pending && scan.census_complete {
+            crate::backfill::mark_backfill_complete_for_destination(
+                backfill,
+                SnapshotSource::Codex,
+                destination,
+            );
+        }
+        index.finish_legacy_settlement_reconciliation();
+        (scan, armed)
+    }
+
+    fn cycle_clock(cycle: u64) -> String {
+        format!("2026-09-03T00:{:02}:00Z", 5 * cycle)
+    }
+
+    #[test]
+    fn non_progressing_residue_settles_only_without_retryable_problems() {
+        let residue = ScanTraversalCounts {
+            ownership_incomplete_file_count: 1,
+            zero_snapshot_usage_evidence_count: 1,
+            recognized_usage_drop_count: 1_105,
+            dropped_usage_record_count: 1_105,
+            ..ScanTraversalCounts::default()
+        };
+        assert!(residue.has_errors());
+        assert!(!residue.has_retryable_problems());
+        assert!(residue.has_unsettled_residue());
+
+        // Every retryable class vetoes settlement: a walk that could not
+        // enter, open, read or parse something has not proved the residue
+        // non-progressing.
+        let vetoes: [fn(&mut ScanTraversalCounts); 8] = [
+            |counts| counts.symlink_rejected_count = 1,
+            |counts| counts.directory_entry_cap_exceeded_count = 1,
+            |counts| counts.unreadable_path_count = 1,
+            |counts| counts.oversized_file_count = 1,
+            |counts| counts.disappeared_file_count = 1,
+            |counts| counts.malformed_json_line_count = 1,
+            |counts| counts.invalid_utf8_line_count = 1,
+            |counts| counts.over_line_cap_count = 1,
+        ];
+        for veto in vetoes {
+            let mut red = residue.clone();
+            veto(&mut red);
+            assert!(!red.settle_non_progressing_residue());
+            assert!(red.has_errors());
+            assert!(red.has_unsettled_residue());
+            assert_eq!(red.terminal_ownership_incomplete_file_count, 0);
+            assert!(red.settled_residue().is_none());
+        }
+
+        let mut settled = residue.clone();
+        assert!(settled.settle_non_progressing_residue());
+        assert!(!settled.has_errors());
+        assert_eq!(
+            settled.settled_residue(),
+            Some(SettledScanResidue {
+                ownership_incomplete_file_count: 1,
+                zero_snapshot_usage_evidence_count: 1,
+                dropped_usage_record_count: 1_105,
+            })
+        );
+        assert!(
+            !settled.settle_non_progressing_residue(),
+            "settling is idempotent within a generation"
+        );
+
+        // Over-line-cap loss keeps its own per-file terminal disposition and
+        // is not re-counted as residue.
+        let mut with_cap_loss = ScanTraversalCounts {
+            over_line_cap_count: 11,
+            terminal_over_line_cap_count: 11,
+            recognized_usage_drop_count: 11 + 577,
+            terminal_recognized_usage_drop_count: 11,
+            dropped_usage_record_count: 11 + 577,
+            terminal_dropped_usage_record_count: 11,
+            ownership_incomplete_file_count: 2,
+            zero_snapshot_usage_evidence_count: 1,
+            ..ScanTraversalCounts::default()
+        };
+        assert!(with_cap_loss.settle_non_progressing_residue());
+        assert!(!with_cap_loss.has_errors());
+        assert_eq!(
+            with_cap_loss.settled_residue(),
+            Some(SettledScanResidue {
+                ownership_incomplete_file_count: 2,
+                zero_snapshot_usage_evidence_count: 1,
+                dropped_usage_record_count: 577,
+            })
+        );
+
+        let clean = ScanTraversalCounts::default();
+        assert!(!clean.has_errors());
+        assert!(clean.settled_residue().is_none());
+    }
+
+    /// The shape found on an upgraded machine: a ledger sealed at the unproven
+    /// version with every current revision recorded as accepted and no cursor,
+    /// behind a Codex census that a single unresolvable archived rollout keeps
+    /// incomplete with nothing pending. The census must complete with the
+    /// residue named, the destination backfill must clear on that census, and
+    /// the next cycle must re-open the ledger exactly once.
+    #[test]
+    fn unproven_ledger_behind_non_progressing_codex_residue_completes_and_reopens_once() {
+        let fixture = CodexResidueFixture::create("codex-residue-unproven-ledger");
+        fixture.insert_thread(RESIDUE_SESSION, 1_105, "agent_created_thread");
+        let residue_path =
+            fixture.write_rollout(&fixture.archived, RESIDUE_SESSION, "2026-07-30T11-35-45");
+        for (position, session_id) in HEALTHY_SESSIONS.iter().take(2).enumerate() {
+            fixture.insert_thread(session_id, 40, "user");
+            fixture.write_rollout(
+                &fixture.sessions,
+                session_id,
+                &format!("2026-08-2{position}T09-00-00"),
+            );
+        }
+        let roots = fixture.roots();
+        let destination = "destination-namespace-under-test";
+        let mut index = ScanIndex::default();
+        let mut backfill = crate::backfill::BackfillState::default();
+
+        // Cycle 0 establishes the checkpointed history. Then model the
+        // upgrade: the previous daemon sealed every current revision into a
+        // v1 ledger, and this destination's backfill is pending again.
+        let (seed, _) = gated_codex_cycle(
+            &mut index,
+            &roots,
+            &mut backfill,
+            destination,
+            &cycle_clock(0),
+        );
+        assert_eq!(seed.snapshots.len(), 2, "{seed:#?}");
+        assert_eq!(seed.ownership_incomplete_file_count, 1);
+        assert_eq!(seed.zero_snapshot_usage_evidence_count, 1);
+        assert_eq!(seed.dropped_usage_record_count, 1);
+        assert!(index
+            .codex_state_only_blocked_session_ids
+            .contains(RESIDUE_SESSION));
+        let current = index.current_snapshot_fingerprints();
+        assert_eq!(current.len(), 2);
+        index.accepted_snapshot_fingerprints = current.clone();
+        index.accepted_snapshot_fingerprint_ledger_version =
+            SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION;
+        index.legacy_settlement_reconcile_after_fingerprint = None;
+        let mut backfill = crate::backfill::BackfillState::default();
+        assert!(
+            crate::backfill::pending_backfill_sources_for_destination(&backfill, destination)
+                .contains(&SnapshotSource::Codex)
+        );
+
+        // Cycle 1: the gate is still closed when it is read, but the census
+        // completes with the residue named, which clears the backfill.
+        let (first, armed) = gated_codex_cycle(
+            &mut index,
+            &roots,
+            &mut backfill,
+            destination,
+            &cycle_clock(1),
+        );
+        assert!(
+            armed.is_none(),
+            "the gate was closed when this cycle read it"
+        );
+        assert!(first.census_complete, "{first:#?}");
+        assert!(!first.scan_cap_hit);
+        assert_eq!(first.ownership_incomplete_file_count, 1);
+        assert_eq!(first.dropped_usage_record_count, 1);
+        assert!(
+            index.traversal.is_none(),
+            "a complete census drops the traversal"
+        );
+        let witness = index
+            .scan_residue_witness
+            .clone()
+            .expect("a census that completed with residue records it");
+        assert_eq!(witness.ownership_incomplete_file_count, 1);
+        assert_eq!(witness.zero_snapshot_usage_evidence_count, 1);
+        assert_eq!(witness.dropped_usage_record_count, 1);
+        assert_eq!(
+            witness.index_keys,
+            BTreeSet::from([local_index_key(&residue_path)])
+        );
+        assert_eq!(witness.archived_residue_file_count(), 1);
+        assert_eq!(
+            witness.codex_state_only_blocked_session_ids,
+            BTreeSet::from([RESIDUE_SESSION.to_string()])
+        );
+        assert!(
+            !crate::backfill::pending_backfill_sources_for_destination(&backfill, destination)
+                .contains(&SnapshotSource::Codex),
+            "a complete census marks the destination backfill done"
+        );
+        assert_eq!(
+            index.accepted_snapshot_fingerprint_ledger_version,
+            SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION,
+            "the ledger is untouched until the gate opens"
+        );
+
+        // Cycle 2: the gate is open and the unproven ledger re-opens.
+        let (second, armed) = gated_codex_cycle(
+            &mut index,
+            &roots,
+            &mut backfill,
+            destination,
+            &cycle_clock(2),
+        );
+        assert!(second.census_complete);
+        assert_eq!(
+            armed.as_ref(),
+            Some(&current),
+            "every previously sealed revision is re-offered"
+        );
+        assert!(index.accepted_snapshot_fingerprints.is_empty());
+        assert_eq!(index.accepted_snapshot_fingerprint_ledger_version, 0);
+        assert_eq!(
+            index.legacy_settlement_reconcile_after_fingerprint.as_ref(),
+            current.iter().next_back()
+        );
+        let persisted = serde_json::to_value(&index).expect("serialize index");
+        assert!(
+            persisted
+                .get("accepted_snapshot_fingerprint_ledger_version")
+                .is_none(),
+            "the re-opened ledger drops its version key"
+        );
+        assert!(persisted
+            .get("legacy_settlement_reconcile_after_fingerprint")
+            .is_some());
+
+        // Cycle 3: nothing is re-opened again; the armed page waits for the
+        // server, which this model never provides.
+        let (third, armed) = gated_codex_cycle(
+            &mut index,
+            &roots,
+            &mut backfill,
+            destination,
+            &cycle_clock(3),
+        );
+        assert!(third.census_complete);
+        assert_eq!(armed, Some(BTreeSet::new()));
+        assert_eq!(index.accepted_snapshot_fingerprint_ledger_version, 0);
+        assert_eq!(index.quarantined_snapshot_fingerprints.len(), 2);
+        assert_eq!(
+            index.legacy_settlement_reconciliation_pending_fingerprints(),
+            current
+        );
+        assert!(index
+            .codex_state_only_blocked_session_ids
+            .contains(RESIDUE_SESSION));
+        let _ = fs::remove_dir_all(fixture.home);
+    }
+
+    /// The other shape: a pre-ledger index mid-sweep with a persisted cursor,
+    /// frozen behind the same residue. Once the census completes the sweep
+    /// arms its next page; nothing is re-opened and the re-earned acceptances
+    /// are kept.
+    #[test]
+    fn pre_ledger_sweep_behind_non_progressing_codex_residue_resumes() {
+        let fixture = CodexResidueFixture::create("codex-residue-pre-ledger-sweep");
+        fixture.insert_thread(ACTIVE_RESIDUE_SESSION, 577, "agent_created_thread");
+        fixture.write_rollout(
+            &fixture.sessions,
+            ACTIVE_RESIDUE_SESSION,
+            "2026-07-30T11-35-45",
+        );
+        for (position, session_id) in HEALTHY_SESSIONS.iter().enumerate() {
+            fixture.insert_thread(session_id, 40, "user");
+            fixture.write_rollout(
+                &fixture.sessions,
+                session_id,
+                &format!("2026-08-2{position}T09-00-00"),
+            );
+        }
+        let roots = fixture.roots();
+        let destination = "destination-namespace-under-test";
+        let mut index = ScanIndex::default();
+        let mut backfill = crate::backfill::BackfillState::default();
+        let (seed, _) = gated_codex_cycle(
+            &mut index,
+            &roots,
+            &mut backfill,
+            destination,
+            &cycle_clock(0),
+        );
+        assert_eq!(seed.snapshots.len(), 3, "{seed:#?}");
+        let current = index
+            .current_snapshot_fingerprints()
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(current.len(), 3);
+        let settled = current.iter().take(2).cloned().collect::<BTreeSet<_>>();
+        index.accepted_snapshot_fingerprints = settled.clone();
+        index.accepted_snapshot_fingerprint_ledger_version = 0;
+        index.legacy_settlement_reconcile_after_fingerprint = Some(current[1].clone());
+        let mut backfill = crate::backfill::BackfillState::default();
+
+        let (first, armed) = gated_codex_cycle(
+            &mut index,
+            &roots,
+            &mut backfill,
+            destination,
+            &cycle_clock(1),
+        );
+        assert!(armed.is_none());
+        assert!(first.census_complete, "{first:#?}");
+        assert_eq!(first.ownership_incomplete_file_count, 1);
+        let witness = index.scan_residue_witness.clone().expect("residue witness");
+        assert_eq!(witness.archived_residue_file_count(), 0);
+        assert_eq!(
+            witness.codex_state_only_blocked_session_ids,
+            BTreeSet::from([ACTIVE_RESIDUE_SESSION.to_string()])
+        );
+
+        let (second, armed) = gated_codex_cycle(
+            &mut index,
+            &roots,
+            &mut backfill,
+            destination,
+            &cycle_clock(2),
+        );
+        assert!(second.census_complete);
+        assert_eq!(
+            armed,
+            Some(BTreeSet::from([current[2].clone()])),
+            "the sweep resumes from its cursor with the one unsettled revision"
+        );
+        assert_eq!(
+            index.accepted_snapshot_fingerprints, settled,
+            "a pre-ledger sweep keeps what the server already acknowledged"
+        );
+        assert_eq!(index.accepted_snapshot_fingerprint_ledger_version, 0);
+        assert_eq!(
+            index.legacy_settlement_reconcile_after_fingerprint.as_ref(),
+            Some(&current[2])
+        );
+        let _ = fs::remove_dir_all(fixture.home);
+    }
+
+    /// Residue is settled only once discovery has finished: a page that still
+    /// has candidates queued keeps the census red and the counts unsettled.
+    #[test]
+    fn residue_is_not_settled_while_candidates_are_still_pending() {
+        let fixture = CodexResidueFixture::create("codex-residue-pending-candidates");
+        fixture.insert_thread(ACTIVE_RESIDUE_SESSION, 577, "agent_created_thread");
+        // Sorts before the healthy rollouts so the first bounded page parses it.
+        fixture.write_rollout(
+            &fixture.sessions,
+            ACTIVE_RESIDUE_SESSION,
+            "2026-07-30T11-35-45",
+        );
+        for (position, session_id) in HEALTHY_SESSIONS.iter().take(2).enumerate() {
+            fixture.insert_thread(session_id, 40, "user");
+            fixture.write_rollout(
+                &fixture.sessions,
+                session_id,
+                &format!("2026-08-2{position}T09-00-00"),
+            );
+        }
+        let roots = fixture.roots();
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            &cycle_clock(0),
+            BACKFILL_WINDOW_DAYS,
+            1,
+            true,
+        )
+        .expect("first bounded page");
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.ownership_incomplete_file_count, 1);
+        assert!(!first.census_complete);
+        assert!(first.scan_cap_hit);
+        let traversal = index
+            .traversal
+            .as_ref()
+            .expect("bounded traversal continues");
+        assert!(!traversal.pending_candidates.is_empty());
+        assert_eq!(traversal.counts.terminal_ownership_incomplete_file_count, 0);
+        assert!(traversal.counts.has_unsettled_residue());
+        assert_eq!(
+            traversal.unhealthy_retry_attempt, 0,
+            "not a retry, just paging"
+        );
+        assert!(index.scan_residue_witness.is_none());
+
+        let mut last = first;
+        for cycle in 1..4 {
+            last = scan_source_roots_with_limit(
+                SnapshotSource::Codex,
+                &roots,
+                &mut index,
+                &cycle_clock(cycle),
+                BACKFILL_WINDOW_DAYS,
+                1,
+                true,
+            )
+            .expect("later bounded page");
+            if last.census_complete {
+                break;
+            }
+        }
+        assert!(last.census_complete, "{last:#?}");
+        assert!(index.traversal.is_none());
+        assert_eq!(
+            index
+                .scan_residue_witness
+                .as_ref()
+                .map(|witness| witness.ownership_incomplete_file_count),
+            Some(1)
+        );
+        let _ = fs::remove_dir_all(fixture.home);
+    }
+
+    /// A genuine retryable problem beside the residue keeps the census red,
+    /// leaves the residue unsettled, and re-arms the bounded latch on the
+    /// usual backoff - up to the cap, never past it.
+    #[cfg(unix)]
+    #[test]
+    fn retryable_problem_keeps_the_census_red_and_the_latch_bounded() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = CodexResidueFixture::create("codex-residue-with-retryable-problem");
+        fixture.insert_thread(RESIDUE_SESSION, 1_105, "agent_created_thread");
+        fixture.write_rollout(&fixture.archived, RESIDUE_SESSION, "2026-07-30T11-35-45");
+        fixture.insert_thread(HEALTHY_SESSIONS[0], 40, "user");
+        fixture.write_rollout(
+            &fixture.sessions,
+            HEALTHY_SESSIONS[0],
+            "2026-08-20T09-00-00",
+        );
+        let outside = temp_dir("codex-residue-symlink-target");
+        symlink(&outside, fixture.sessions.join("escape")).expect("create directory symlink");
+        let roots = fixture.roots();
+        let mut index = ScanIndex::default();
+
+        let started = "2026-09-03T00:00:00Z";
+        let first = scan_source_roots(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            started,
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first unhealthy generation");
+        assert_eq!(first.symlink_rejected_count, 1);
+        assert_eq!(first.ownership_incomplete_file_count, 1);
+        assert!(!first.census_complete);
+        assert!(first.scan_cap_hit);
+        assert!(index.scan_residue_witness.is_none());
+        let now = rfc3339_unix_seconds(started).expect("fixture clock");
+        {
+            let traversal = index.traversal.as_ref().expect("red witness stays durable");
+            assert_eq!(traversal.counts.terminal_ownership_incomplete_file_count, 0);
+            assert!(traversal.counts.has_retryable_problems());
+            assert_eq!(traversal.unhealthy_retry_attempt, 1);
+            assert_eq!(
+                traversal.unhealthy_retry_not_before_unix_seconds,
+                Some(now + 60)
+            );
+        }
+
+        let quiet = scan_source_roots(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            "2026-09-03T00:00:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("retry not yet due");
+        assert_eq!(quiet.scanned_file_count, 0);
+        assert!(!quiet.census_complete);
+        assert_eq!(
+            index
+                .traversal
+                .as_ref()
+                .map(|traversal| traversal.unhealthy_retry_attempt),
+            Some(1)
+        );
+
+        // Each due retry re-walks, stays red, and re-arms on the next delay;
+        // the attempt saturates at the cap and the delay at one hour.
+        let expected_attempts = [2_u8, 3, 4, 5, 6, 7, 7, 7, 7];
+        for expected in expected_attempts {
+            let deadline = index
+                .traversal
+                .as_ref()
+                .and_then(|traversal| traversal.unhealthy_retry_not_before_unix_seconds)
+                .expect("an unhealthy traversal always carries a deadline");
+            let collected_at = OffsetDateTime::from_unix_timestamp(deadline as i64)
+                .expect("deadline")
+                .format(&Rfc3339)
+                .expect("format");
+            let retried = scan_source_roots(
+                SnapshotSource::Codex,
+                &roots,
+                &mut index,
+                &collected_at,
+                BACKFILL_WINDOW_DAYS,
+            )
+            .expect("due retry");
+            assert!(!retried.census_complete);
+            assert_eq!(retried.symlink_rejected_count, 1);
+            let traversal = index.traversal.as_ref().expect("still red");
+            assert_eq!(
+                traversal.census_window_end, collected_at,
+                "the retry re-walked"
+            );
+            assert_eq!(traversal.unhealthy_retry_attempt, expected);
+            assert!(traversal.unhealthy_retry_attempt <= UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS);
+            let next = traversal
+                .unhealthy_retry_not_before_unix_seconds
+                .expect("re-armed");
+            assert_eq!(
+                next,
+                deadline + unhealthy_scan_retry_delay_seconds(expected)
+            );
+            assert!(next <= deadline + UNHEALTHY_SCAN_RETRY_MAX_SECONDS);
+        }
+        assert_eq!(
+            unhealthy_scan_retry_delay_seconds(7),
+            UNHEALTHY_SCAN_RETRY_MAX_SECONDS
+        );
+
+        // Removing the retryable problem lets the next due retry settle the
+        // residue and complete.
+        fs::remove_file(fixture.sessions.join("escape")).expect("remove symlink");
+        let deadline = index
+            .traversal
+            .as_ref()
+            .and_then(|traversal| traversal.unhealthy_retry_not_before_unix_seconds)
+            .expect("deadline");
+        let collected_at = OffsetDateTime::from_unix_timestamp(deadline as i64)
+            .expect("deadline")
+            .format(&Rfc3339)
+            .expect("format");
+        let repaired = scan_source_roots(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            &collected_at,
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("repaired generation");
+        assert!(repaired.census_complete, "{repaired:#?}");
+        assert_eq!(repaired.ownership_incomplete_file_count, 1);
+        assert!(index.traversal.is_none());
+        assert_eq!(
+            index
+                .scan_residue_witness
+                .as_ref()
+                .map(|witness| witness.archived_residue_file_count()),
+            Some(1)
+        );
+        let _ = fs::remove_dir_all(fixture.home);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    /// The dormant-slot shape - attempt 46 with a deadline fifteen hours stale -
+    /// is retried immediately and clamped to the cap, and a persisted witness
+    /// with no deadline at all (written before the deadline existed) is due
+    /// now rather than fenced forever.
+    #[cfg(unix)]
+    #[test]
+    fn unhealthy_retry_latch_saturates_at_its_cap_and_a_missing_deadline_is_due_now() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("latch-cap-root");
+        let outside = temp_dir("latch-cap-outside");
+        symlink(&outside, root.join("escape")).expect("create directory symlink");
+        fs::write(
+            root.join("session.jsonl"),
+            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":3,\"output\":1}}}\n",
+        )
+        .expect("write healthy transcript");
+        let roots = vec![root.clone()];
+        let mut index = ScanIndex::default();
+        let started = "2026-09-03T00:00:00Z";
+        let now = rfc3339_unix_seconds(started).expect("fixture clock");
+        let stale_witness =
+            |index: &ScanIndex, attempt: u8, deadline: Option<u64>| ScanTraversalCheckpoint {
+                context_fingerprint: scan_traversal_context_fingerprint(
+                    SnapshotSource::Pi,
+                    &roots,
+                    index,
+                    BACKFILL_WINDOW_DAYS,
+                ),
+                census_window_end: "2026-09-02T09:00:00Z".to_string(),
+                scan_roots: Vec::new(),
+                pending_directories: VecDeque::new(),
+                pending_candidates: VecDeque::new(),
+                observed_index_keys: BTreeSet::new(),
+                codex_rollout_paths: BTreeSet::new(),
+                reconciliation_upper_bound: None,
+                reconciliation_after: None,
+                reconciliation_started: false,
+                watcher_hint_seen: false,
+                codex_parent_resolution_retry_required: false,
+                unhealthy_retry_attempt: attempt,
+                unhealthy_retry_not_before_unix_seconds: deadline,
+                counts: ScanTraversalCounts {
+                    symlink_rejected_count: 1,
+                    ..ScanTraversalCounts::default()
+                },
+                residue: ScanTraversalResidue::default(),
+            };
+
+        index.traversal = Some(stale_witness(&index, 46, Some(now - 15 * 60 * 60)));
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            &roots,
+            &mut index,
+            started,
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("stale deadline is due now");
+        assert!(!scan.census_complete);
+        assert_eq!(scan.scanned_file_count, 1, "the retry re-walked the root");
+        let traversal = index.traversal.as_ref().expect("still red");
+        assert_eq!(traversal.census_window_end, started);
+        assert_eq!(
+            traversal.unhealthy_retry_attempt,
+            UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS
+        );
+        assert_eq!(
+            traversal.unhealthy_retry_not_before_unix_seconds,
+            Some(now + UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
+        );
+
+        for hour in 1..4_u64 {
+            let collected_at = OffsetDateTime::from_unix_timestamp(
+                (now + hour * UNHEALTHY_SCAN_RETRY_MAX_SECONDS) as i64,
+            )
+            .expect("clock")
+            .format(&Rfc3339)
+            .expect("format");
+            let scan = scan_source_roots(
+                SnapshotSource::Pi,
+                &roots,
+                &mut index,
+                &collected_at,
+                BACKFILL_WINDOW_DAYS,
+            )
+            .expect("hourly retry");
+            assert!(!scan.census_complete);
+            let traversal = index.traversal.as_ref().expect("still red");
+            assert_eq!(traversal.census_window_end, collected_at);
+            assert_eq!(
+                traversal.unhealthy_retry_attempt,
+                UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS
+            );
+            assert_eq!(
+                traversal.unhealthy_retry_not_before_unix_seconds,
+                Some(now + (hour + 1) * UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
+            );
+        }
+
+        // No deadline at all: due now, and the counter resumes from where the
+        // persisted witness left it.
+        index.traversal = Some(stale_witness(&index, 3, None));
+        let later = "2026-09-03T06:00:00Z";
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            &roots,
+            &mut index,
+            later,
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("missing deadline is due now");
+        assert!(!scan.census_complete);
+        let traversal = index.traversal.as_ref().expect("still red");
+        assert_eq!(traversal.census_window_end, later, "the retry re-walked");
+        assert_eq!(traversal.unhealthy_retry_attempt, 4);
+        assert_eq!(
+            traversal.unhealthy_retry_not_before_unix_seconds,
+            Some(rfc3339_unix_seconds(later).expect("clock") + 480)
+        );
+
+        // The latch clears with the problem: the next due retry completes and
+        // drops the traversal, so a fresh generation starts at zero.
+        fs::remove_file(root.join("escape")).expect("remove symlink");
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            &roots,
+            &mut index,
+            "2026-09-03T06:08:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("repaired generation");
+        assert!(scan.census_complete);
+        assert!(index.traversal.is_none());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    /// Residue rollouts under the archived root and under the active root are
+    /// handled alike: both sessions stay held out of the inclusive state-only
+    /// fallback (the block is never pruned by settling), the witness names
+    /// which of them sits under an archived root, and - because the census
+    /// now completes - the fallback resumes for the threads it may publish.
+    #[test]
+    fn residue_rollouts_under_archived_and_active_roots_stay_blocked_while_the_fallback_resumes() {
+        let fixture = CodexResidueFixture::create("codex-residue-archived-and-active");
+        fixture.insert_thread(RESIDUE_SESSION, 1_105, "agent_created_thread");
+        let archived_path =
+            fixture.write_rollout(&fixture.archived, RESIDUE_SESSION, "2026-07-30T11-35-45");
+        fixture.insert_thread(ACTIVE_RESIDUE_SESSION, 900, "agent_created_thread");
+        let active_path = fixture.write_rollout(
+            &fixture.sessions,
+            ACTIVE_RESIDUE_SESSION,
+            "2026-08-01T08-00-00",
+        );
+        let state_only = "019fb22c-0000-7000-8000-000000000077";
+        fixture.insert_thread(state_only, 77, "user");
+        fixture.insert_thread(HEALTHY_SESSIONS[0], 40, "user");
+        fixture.write_rollout(
+            &fixture.sessions,
+            HEALTHY_SESSIONS[0],
+            "2026-08-20T09-00-00",
+        );
+        let roots = fixture.roots();
+        let mut index = ScanIndex::default();
+
+        let scan = scan_source_roots(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            &cycle_clock(0),
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan archived and active residue");
+        assert!(scan.census_complete, "{scan:#?}");
+        assert_eq!(scan.ownership_incomplete_file_count, 2);
+        let emitted = scan
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.source_session_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            emitted,
+            BTreeSet::from([HEALTHY_SESSIONS[0], state_only]),
+            "the file-backed entity and the unblocked state-only thread, nothing else"
+        );
+        let fallback = scan
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.source_session_id == state_only)
+            .expect("state-only fallback resumed");
+        assert_eq!(fallback.unattributed_total_tokens, 77);
+        for blocked in [RESIDUE_SESSION, ACTIVE_RESIDUE_SESSION] {
+            assert!(
+                index.codex_state_only_blocked_session_ids.contains(blocked),
+                "{blocked} stays blocked"
+            );
+        }
+        let witness = index.scan_residue_witness.clone().expect("residue witness");
+        assert_eq!(witness.ownership_incomplete_file_count, 2);
+        assert_eq!(
+            witness.index_keys,
+            BTreeSet::from([
+                local_index_key(&archived_path),
+                local_index_key(&active_path)
+            ])
+        );
+        assert_eq!(witness.archived_residue_file_count(), 1);
+        assert_eq!(
+            witness.codex_state_only_blocked_session_ids,
+            BTreeSet::from([
+                RESIDUE_SESSION.to_string(),
+                ACTIVE_RESIDUE_SESSION.to_string()
+            ])
+        );
+
+        // The witness survives a round trip and an unchanged generation.
+        let persisted = serde_json::to_vec(&index).expect("serialize index");
+        let mut index: ScanIndex = serde_json::from_slice(&persisted).expect("restore index");
+        assert_eq!(index.scan_residue_witness.as_ref(), Some(&witness));
+        let again = scan_source_roots(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            &cycle_clock(1),
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("unchanged generation");
+        assert!(again.census_complete);
+        assert_eq!(again.ownership_incomplete_file_count, 2);
+        assert!(index
+            .scan_residue_witness
+            .as_ref()
+            .is_some_and(|next| next.same_residue(&witness)));
+
+        // New input - the state rows stop declaring provider-created threads -
+        // re-derives both files as ordinary all-local rollouts and clears the
+        // witness. Nothing about the earlier settlement had to be undone.
+        fixture.set_thread_source(RESIDUE_SESSION, "user");
+        fixture.set_thread_source(ACTIVE_RESIDUE_SESSION, "user");
+        let resolved = scan_source_roots(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            &cycle_clock(2),
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("resolved generation");
+        assert!(resolved.census_complete, "{resolved:#?}");
+        assert_eq!(resolved.ownership_incomplete_file_count, 0);
+        assert_eq!(resolved.dropped_usage_record_count, 0);
+        let emitted = resolved
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.source_session_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(emitted.contains(RESIDUE_SESSION));
+        assert!(emitted.contains(ACTIVE_RESIDUE_SESSION));
+        assert!(index.scan_residue_witness.is_none());
+        let _ = fs::remove_dir_all(fixture.home);
     }
 
     #[test]
@@ -22953,7 +24216,10 @@ mod tests {
                     assert_eq!(index.files.len(), 1, "{case}");
                 }
                 "recognized-drop" => {
-                    assert!(!scan.census_complete, "{case}");
+                    // Non-progressing residue: the census completes with the
+                    // loss named while the file itself stays un-indexed and
+                    // retryable (`settle_non_progressing_residue`).
+                    assert!(scan.census_complete, "{case}");
                     assert!(scan.snapshots.is_empty(), "{case}");
                     assert!(index.files.is_empty(), "{case}");
                     assert_eq!(scan.recognized_usage_drop_count, 1);
@@ -23517,7 +24783,9 @@ mod tests {
         .expect("lossy positive usage remains retryable");
 
         assert_eq!(scan.recognized_usage_drop_count, 1);
-        assert!(!scan.census_complete);
+        // Non-progressing residue: the census completes with the loss named
+        // while the file itself stays un-indexed and retryable.
+        assert!(scan.census_complete);
         assert!(scan.snapshots.is_empty());
         assert!(index.files.is_empty());
         assert!(index.confirmed_empty_files.is_empty());
@@ -25419,7 +26687,9 @@ mod tests {
         )
         .expect("scan");
         assert!(scan.snapshots.is_empty());
-        assert!(!scan.census_complete);
+        // Non-progressing residue: the census completes with the loss named
+        // while the file itself stays un-indexed and retryable.
+        assert!(scan.census_complete);
         assert_eq!(scan.dropped_usage_record_count, 3);
         assert_eq!(bounded_rfc3339_millis(i64::MIN), None);
         assert_eq!(bounded_rfc3339_millis(i64::MAX), None);
@@ -25432,7 +26702,9 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
         )
         .expect("settled mixed scan");
-        assert_eq!(mixed_settled.scanned_file_count, 0);
+        // The lossy file is never checkpointed, so a completed generation
+        // re-reads it and re-derives the same disclosed loss.
+        assert_eq!(mixed_settled.scanned_file_count, 1);
         assert_eq!(mixed_settled.dropped_usage_record_count, 3);
 
         fs::write(
@@ -25470,7 +26742,8 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
         )
         .expect("settled malformed-usage checkpoint");
-        assert_eq!(settled.scanned_file_count, 0);
+        // Re-read, not checkpointed: the residue is re-derived, not remembered.
+        assert_eq!(settled.scanned_file_count, 1);
         assert_eq!(settled.zero_snapshot_usage_evidence_count, 1);
         assert_eq!(settled.dropped_usage_record_count, 1);
 
@@ -25521,7 +26794,9 @@ mod tests {
         .expect("scan invalid provider timestamp fixture");
 
         assert!(scan.snapshots.is_empty());
-        assert!(!scan.census_complete);
+        // Non-progressing residue: the census completes with the loss named
+        // while the file itself stays un-indexed and retryable.
+        assert!(scan.census_complete);
         assert_eq!(scan.dropped_usage_record_count, 1);
         assert!(index.files.is_empty());
         let _ = fs::remove_dir_all(root);
@@ -25550,7 +26825,9 @@ mod tests {
         )
         .expect("scan Codex partial-loss fixture");
         assert!(codex.snapshots.is_empty());
-        assert!(!codex.census_complete);
+        // Non-progressing residue: the census completes with the loss named
+        // while the file itself stays un-indexed and retryable.
+        assert!(codex.census_complete);
         assert_eq!(codex.dropped_usage_record_count, 1);
 
         let claude_root = temp_dir("claude-partial-timestamp-loss");
@@ -25574,7 +26851,9 @@ mod tests {
         )
         .expect("scan Claude partial-loss fixture");
         assert!(claude.snapshots.is_empty());
-        assert!(!claude.census_complete);
+        // Non-progressing residue: the census completes with the loss named
+        // while the file itself stays un-indexed and retryable.
+        assert!(claude.census_complete);
         assert_eq!(claude.dropped_usage_record_count, 1);
 
         let _ = fs::remove_dir_all(codex_root);
@@ -35028,7 +36307,9 @@ mod tests {
             "an exact prefix from a lossy file cannot reach upload"
         );
         assert_eq!(scan.dropped_usage_record_count, 1);
-        assert!(!scan.census_complete);
+        // Non-progressing residue: the census completes with the loss named
+        // while the file itself stays un-indexed and retryable.
+        assert!(scan.census_complete);
         assert!(!index.files.contains_key(&local_index_key(&path)));
         let _ = fs::remove_dir_all(root);
     }
@@ -35220,7 +36501,9 @@ mod tests {
 
         assert!(scan.snapshots.is_empty());
         assert_eq!(scan.dropped_usage_record_count, 1);
-        assert!(!scan.census_complete);
+        // Non-progressing residue: the census completes with the loss named
+        // while the file itself stays un-indexed and retryable.
+        assert!(scan.census_complete);
         assert!(index.files.is_empty());
 
         let _ = fs::remove_dir_all(root);
@@ -35253,7 +36536,9 @@ mod tests {
 
         assert!(scan.snapshots.is_empty());
         assert_eq!(scan.dropped_usage_record_count, 1);
-        assert!(!scan.census_complete);
+        // Non-progressing residue: the census completes with the loss named
+        // while the file itself stays un-indexed and retryable.
+        assert!(scan.census_complete);
         assert!(index.files.is_empty());
 
         let _ = fs::remove_dir_all(root);
