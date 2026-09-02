@@ -642,6 +642,14 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   workspace labels before upload when the effective backend org/user activity
   hint disables them, uploads changed snapshots in schema-v5 batches, and
   reports collector status and cap-hit metadata without exposing local paths.
+  Every collector-status receipt declares its own kind — `checkin` for a
+  liveness beat (the independent heartbeat and the cycle-start in-progress
+  marker) or `scan_status` for a scan result (completed traversal, error,
+  changed loss census, cap-hit change, enabled/disabled transition) — so the
+  meaning of a receipt is stated rather than inferred from its shape. A
+  liveness beat never discloses scan evidence: it is built without access to
+  any scan outcome, and a receipt whose declared kind its own payload
+  contradicts is refused before it reaches the network.
   Schema-v5 activity buckets are generated from timestamped local usage events:
   Codex cumulative usage rows without explicit request totals count as one
   observed activity event, and top-level snapshot `request_count` matches the

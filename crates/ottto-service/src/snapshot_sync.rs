@@ -13,8 +13,8 @@ use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
     LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
-    RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusRequest,
-    UploadFailureDiagnostics, UploadShed,
+    RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusReportKind,
+    SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
 };
 use crate::snapshots::{
     apply_upload_policy, collector_version, context_curve_derivation_revision,
@@ -3684,6 +3684,11 @@ fn source_kind(source: SnapshotSource) -> SourceKind {
     }
 }
 
+/// Build the terminal collector receipt for a completed cycle.
+///
+/// Split from the send so the live path can journal the exact typed receipt it
+/// is about to POST, and so tests can assert against that same payload —
+/// including its declared `report_kind` — rather than a hand-rolled lookalike.
 fn collector_status_request(
     destination_namespace: &str,
     status: CollectorStatus<'_>,
@@ -3741,6 +3746,12 @@ fn collector_status_request(
         schema_version: SNAPSHOT_STATUS_SCHEMA_VERSION,
         source: status.source.api_slug().to_string(),
         machine_id: status.machine_id.to_string(),
+        // This function has exactly one caller shape: a completed collector
+        // cycle reporting its outcome. Success, parse failure, scan/upload
+        // error, policy tombstone, and the disabled transition are all NEW
+        // scan results, so the kind is a constant here rather than anything
+        // derived from the fields below.
+        report_kind: SnapshotStatusReportKind::ScanStatus,
         enabled,
         disabled_reason,
         last_scan_started_at: Some(status.scan_started_at.to_string()),
@@ -3763,7 +3774,7 @@ fn collector_status_request(
         last_skipped_file_count_due_to_limit: status.counts.skipped_file_count_due_to_limit,
         last_scan_cap_hit: status.counts.scan_cap_hit,
         last_semantic_noop_count: status.counts.semantic_noop_count,
-        last_census_complete: status.counts.census_complete,
+        last_census_complete: Some(status.counts.census_complete),
         last_symlink_rejected_count: status.counts.symlink_rejected_count,
         last_unreadable_path_count: status.counts.unreadable_path_count,
         last_oversized_file_count: status.counts.oversized_file_count,
@@ -3926,19 +3937,33 @@ fn report_status_with_fresh_relay_token(
     Ok(())
 }
 
-/// Post a non-terminal collector check-in receipt. `last_scan_finished_at` is
-/// deliberately absent: the backend treats that shape as liveness-only — it
-/// bumps the server-received freshness marker (and the scan-start marker when
-/// one is carried) while preserving the previous terminal report's success
-/// evidence, error state, and counters. Terminal reports stay the source of
-/// truth for scan outcomes; this only says "the collector is alive".
+/// Post a non-terminal collector check-in receipt.
 ///
-/// This body must stay byte-identical to the shape the backend classifies as a
-/// check-in (`last_scan_finished_at is None && enabled && last_error_code is
-/// None && next_retry_at is None && consecutive_failures == 0`). Replaying a
-/// journaled terminal receipt here would silently retire check-in receipts,
-/// make the cycle-start in-progress marker dead code, and flip manifest
-/// preservation to invalidation on every heartbeat while an error is retained.
+/// The receipt declares `report_kind: checkin`: it says "the collector is
+/// alive" and nothing else. The backend bumps the server-received freshness
+/// marker (and the scan-start marker when a cycle-start one is carried) while
+/// preserving the previous terminal report's success evidence, error state, and
+/// counters. Terminal reports stay the source of truth for scan outcomes.
+///
+/// The declaration is honest by construction, not by convention: this function
+/// has no access to any scan outcome. It takes a source, a machine id, an
+/// optional cycle-start clock, and the server's own width hint; every
+/// scan-result field below is a literal absence or zero — census completeness
+/// included, which is `None` here so it never reaches the wire at all — and the
+/// only evidence
+/// it forwards is the manifest witness the backend already accepted from the
+/// last completed terminal report. `last_scan_finished_at` stays deliberately
+/// absent so a backend that predates `report_kind` still infers the same
+/// liveness classification from the shape.
+///
+/// That absence is also why this body must stay byte-identical to the shape the
+/// backend classifies as a check-in (`last_scan_finished_at is None && enabled
+/// && last_error_code is None && next_retry_at is None && consecutive_failures
+/// == 0`). Replaying the journaled terminal receipt here — the local journal
+/// `report_status_with_fresh_relay_token` writes — would silently retire
+/// check-in receipts, make the cycle-start in-progress marker dead code, flip
+/// manifest preservation to invalidation on every heartbeat while an error is
+/// retained, and put a `scan_status` payload behind a `checkin` declaration.
 fn report_checkin_status(
     client: &SnapshotApiClient,
     relay_token: &str,
@@ -3969,6 +3994,10 @@ fn report_checkin_status(
         schema_version: SNAPSHOT_STATUS_SCHEMA_VERSION,
         source: source.api_slug().to_string(),
         machine_id: machine_id.to_string(),
+        // Liveness only. Both callers — the independent heartbeat and the
+        // cycle-start in-progress marker — reach this one construction site,
+        // and neither can supply a scan outcome to contradict the claim.
+        report_kind: SnapshotStatusReportKind::Checkin,
         enabled: true,
         disabled_reason: None,
         last_scan_started_at: scan_started_at.map(str::to_string),
@@ -3991,7 +4020,12 @@ fn report_checkin_status(
         last_skipped_file_count_due_to_limit: 0,
         last_scan_cap_hit: false,
         last_semantic_noop_count: 0,
-        last_census_complete: false,
+        // ABSENT, not `false`. A beat has run no census, and the backend
+        // resolves an explicitly declared `false` by lowering the completeness
+        // it already accepted while resolving an omitted one by retaining it.
+        // Sending `false` here would retract a complete census on every
+        // heartbeat; sending `true` would assert one it never measured.
+        last_census_complete: None,
         last_symlink_rejected_count: 0,
         last_unreadable_path_count: 0,
         last_oversized_file_count: 0,
@@ -8322,6 +8356,390 @@ mod tests {
         assert!(requests[1].contains("\"machine_id\":\"otm_test\""));
     }
 
+    fn report_kind_test_device() -> LocalDeviceBinding {
+        LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        }
+    }
+
+    /// Capture the wire body of one liveness beat, with or without a
+    /// cycle-start clock.
+    fn captured_checkin_receipt(scan_started_at: Option<&str>) -> serde_json::Value {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        report_checkin_status_with_fresh_relay_token(
+            &client,
+            &report_kind_test_device(),
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            scan_started_at,
+        )
+        .expect("liveness beat");
+        let requests = captured.lock().expect("captured requests").clone();
+        http_request_json(&requests[1])
+    }
+
+    /// Capture the wire body of one terminal receipt for a given outcome.
+    fn captured_terminal_receipt(
+        counts: SyncCounts,
+        state: CollectorState<'_>,
+        manifest_source: TerminalManifestSource<'_>,
+        hint_days: u64,
+    ) -> serde_json::Value {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server_with_hints(
+            captured.clone(),
+            vec![hint_days],
+        ));
+        report_status_with_fresh_relay_token(
+            &client,
+            &report_kind_test_device(),
+            "device-secret",
+            test_terminal_status_support_dir(),
+            SnapshotSource::Codex,
+            manifest_source,
+            CollectorStatus {
+                source: SnapshotSource::Codex,
+                machine_id: "otm_test",
+                scan_started_at: "2026-06-01T10:00:00Z",
+                counts,
+                state,
+            },
+        )
+        .expect("terminal receipt");
+        let requests = captured.lock().expect("captured requests").clone();
+        http_request_json(&requests[1])
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn the_independent_heartbeat_declares_a_checkin() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let beat = captured_checkin_receipt(None);
+        assert_eq!(beat["report_kind"], "checkin");
+        // The pre-`report_kind` shape is unchanged, so a backend that predates
+        // the field still infers exactly the same classification from it.
+        assert!(beat["last_scan_started_at"].is_null());
+        assert!(beat["last_scan_finished_at"].is_null());
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn the_cycle_start_marker_declares_a_checkin() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        // `sync_once` posts this before any scanning: an in-progress marker,
+        // not a result.
+        let marker = captured_checkin_receipt(Some("2026-06-01T10:00:00Z"));
+        assert_eq!(marker["report_kind"], "checkin");
+        assert_eq!(marker["last_scan_started_at"], "2026-06-01T10:00:00Z");
+        assert!(marker["last_scan_finished_at"].is_null());
+    }
+
+    /// A liveness beat may only repeat evidence the backend has already
+    /// accepted. A durable terminal journal now exists (ottto#393), but no
+    /// beat reads it — `report_checkin_status` has no path to it — so a beat
+    /// replays nothing at all: every scan-result field is literally absent,
+    /// zero, or false, and the only carried witness is the cached manifest
+    /// from the last completed terminal report.
+    #[test]
+    #[serial(source_manifests)]
+    fn a_liveness_beat_discloses_nothing_the_backend_has_not_accepted() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let beat = captured_checkin_receipt(Some("2026-06-01T10:00:00Z"));
+        assert_eq!(beat["report_kind"], "checkin");
+        assert_eq!(beat["enabled"], true);
+        for absent in [
+            "disabled_reason",
+            "last_scan_finished_at",
+            "last_success_at",
+            "last_error_code",
+            "last_error_message",
+            "next_retry_at",
+        ] {
+            assert!(beat[absent].is_null(), "{absent} must be absent on a beat");
+        }
+        assert_eq!(beat["last_scan_cap_hit"], false);
+        // The KEY must be missing, not present-and-false. The backend resolves
+        // census completeness by whether the field was declared at all: an
+        // omitted one retains what it already accepted, an explicit `false`
+        // lowers it. `is_null()` would pass for a serialized `null` too, so
+        // assert on the object's keys.
+        assert!(
+            !beat
+                .as_object()
+                .expect("beat is a JSON object")
+                .contains_key("last_census_complete"),
+            "a beat must not put last_census_complete on the wire at all: {beat}"
+        );
+        for counter in [
+            "last_uploaded_count",
+            "last_scanned_session_count",
+            "last_scanned_file_count",
+            "last_zero_snapshot_confirmed_count",
+            "last_zero_snapshot_usage_evidence_count",
+            "last_dropped_usage_record_count",
+            "last_ownership_incomplete_file_count",
+            "last_snapshot_unproven_terminal_count",
+            "last_snapshot_superseded_terminal_count",
+            "last_backfill_file_limit",
+            "last_discovered_file_count",
+            "last_skipped_file_count_due_to_limit",
+            "last_semantic_noop_count",
+            "last_symlink_rejected_count",
+            "last_unreadable_path_count",
+            "last_oversized_file_count",
+            "last_disappeared_file_count",
+            "last_malformed_json_line_count",
+            "last_invalid_utf8_line_count",
+            "last_over_line_cap_count",
+            "last_recognized_usage_drop_count",
+            "consecutive_failures",
+        ] {
+            assert_eq!(beat[counter], 0, "{counter} must be zero on a beat");
+        }
+    }
+
+    /// Census completeness is the one census field with no arithmetic identity,
+    /// so its wire treatment differs from every counter above and is asserted
+    /// on its own.
+    ///
+    /// The backend merges a check-in's census into what it already accepted.
+    /// Counters take a `max`, for which a beat's honest `0` is the identity and
+    /// therefore harmless. Completeness takes a conjunction resolved through
+    /// `model_fields_set`: an OMITTED value retains the accepted one, an
+    /// explicitly declared `false` asserts incompleteness and lowers it. A beat
+    /// has run no census, so it must send neither `false` (which would retract
+    /// a complete census on every heartbeat) nor `true` (which would assert one
+    /// it never measured) — it must send nothing. The terminal path, which did
+    /// run the census, still states the measured value in both directions.
+    #[test]
+    #[serial(source_manifests)]
+    fn only_a_scan_result_puts_census_completeness_on_the_wire() {
+        let _source_manifests = SourceManifestTestGuard::new();
+
+        for scan_started_at in [None, Some("2026-06-01T10:00:00Z")] {
+            let beat = captured_checkin_receipt(scan_started_at);
+            assert_eq!(beat["report_kind"], "checkin");
+            assert!(
+                !beat
+                    .as_object()
+                    .expect("beat is a JSON object")
+                    .contains_key("last_census_complete"),
+                "the key must be absent, not null and not false: {beat}"
+            );
+        }
+
+        // Both terminal outcomes still declare what the census actually found.
+        let mut complete = SyncCounts::for_policy(30);
+        complete.census_complete = true;
+        let terminal_complete = captured_terminal_receipt(
+            complete,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            30,
+        );
+        assert_eq!(terminal_complete["report_kind"], "scan_status");
+        assert_eq!(terminal_complete["last_census_complete"], true);
+
+        let mut incomplete = SyncCounts::for_policy(30);
+        incomplete.census_complete = false;
+        let terminal_incomplete = captured_terminal_receipt(
+            incomplete,
+            CollectorState::Error {
+                code: "scan_error",
+                message: "local snapshot scan failed",
+            },
+            TerminalManifestSource::Withdraw,
+            30,
+        );
+        assert_eq!(terminal_incomplete["report_kind"], "scan_status");
+        assert_eq!(terminal_incomplete["last_census_complete"], false);
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn a_fresh_terminal_report_declares_a_scan_status() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let mut counts = SyncCounts::for_policy(30);
+        counts.census_complete = true;
+        counts.uploaded_count = 3;
+        counts.scanned_session_count = 3;
+        let terminal = captured_terminal_receipt(
+            counts,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            30,
+        );
+        assert_eq!(terminal["report_kind"], "scan_status");
+        assert!(terminal["last_scan_finished_at"].is_string());
+        assert_eq!(terminal["last_census_complete"], true);
+        assert_eq!(terminal["last_uploaded_count"], 3);
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn a_new_or_changed_error_declares_a_scan_status() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        for (code, message) in [
+            ("scan_error", "local snapshot scan failed"),
+            ("upload_error", "local snapshot upload failed"),
+        ] {
+            let terminal = captured_terminal_receipt(
+                SyncCounts::for_policy(30),
+                CollectorState::Error { code, message },
+                TerminalManifestSource::Withdraw,
+                30,
+            );
+            assert_eq!(terminal["report_kind"], "scan_status");
+            assert_eq!(terminal["last_error_code"], code);
+            assert_eq!(terminal["consecutive_failures"], 1);
+        }
+
+        // The derived parse_error: a scan that "succeeded" while losing
+        // recognized usage is a changed loss census, never a liveness beat.
+        let mut counts = SyncCounts::for_policy(30);
+        counts.discovered_file_count = 1;
+        counts.dropped_usage_record_count = 1_105;
+        counts.recognized_usage_drop_count = 1_105;
+        counts.ownership_incomplete_file_count = 1;
+        let lossy = captured_terminal_receipt(
+            counts,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            30,
+        );
+        assert_eq!(lossy["report_kind"], "scan_status");
+        assert_eq!(lossy["last_error_code"], "parse_error");
+        assert_eq!(lossy["last_dropped_usage_record_count"], 1_105);
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn a_cap_hit_change_declares_a_scan_status() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let mut counts = SyncCounts::for_policy(30);
+        counts.scan_cap_hit = true;
+        counts.discovered_file_count = 1_100;
+        counts.skipped_file_count_due_to_limit = 100;
+        let terminal = captured_terminal_receipt(
+            counts,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            30,
+        );
+        assert_eq!(terminal["report_kind"], "scan_status");
+        assert_eq!(terminal["last_scan_cap_hit"], true);
+        assert_eq!(terminal["last_skipped_file_count_due_to_limit"], 100);
+    }
+
+    /// `checkin` + disabled is a backend 400 by contract. It is also
+    /// unreachable here: the disabled transition is a durable state report and
+    /// only the terminal path can express it.
+    #[test]
+    #[serial(source_manifests)]
+    fn a_disabled_state_report_declares_a_scan_status_and_never_a_checkin() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let disabled = captured_terminal_receipt(
+            SyncCounts::for_policy(30),
+            CollectorState::Disabled(Some("disabled_by_admin".to_string())),
+            TerminalManifestSource::Withdraw,
+            30,
+        );
+        assert_eq!(disabled["report_kind"], "scan_status");
+        assert_eq!(disabled["enabled"], false);
+        assert_eq!(disabled["disabled_reason"], "disabled_by_admin");
+
+        // The server-authoritative zero-width tombstone withdraws the census
+        // without claiming a scan; it is still a state report, not liveness.
+        let tombstone = captured_terminal_receipt(
+            SyncCounts::for_policy(0),
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            0,
+        );
+        assert_eq!(tombstone["report_kind"], "scan_status");
+        assert_eq!(tombstone["last_backfill_window_days"], 0);
+        assert_eq!(tombstone["last_census_complete"], false);
+    }
+
+    /// After a reinstall the scan index is empty, so the first cycle is a full
+    /// traversal that re-asserts census completeness and resets every loss
+    /// counter to zero. Only a scan status may lower counters or re-assert
+    /// completeness, so this receipt must never claim to be a beat.
+    #[test]
+    #[serial(source_manifests)]
+    fn the_first_report_after_a_reinstall_declares_a_scan_status() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let index = ScanIndex::default();
+        let mut counts = SyncCounts::for_policy(183);
+        counts.census_complete = true;
+        let first = captured_terminal_receipt(
+            counts,
+            CollectorState::Success,
+            TerminalManifestSource::CompleteCensus(&index),
+            183,
+        );
+        assert_eq!(first["report_kind"], "scan_status");
+        assert_eq!(first["last_census_complete"], true);
+        assert_eq!(first["last_recognized_usage_drop_count"], 0);
+        assert_eq!(first["last_dropped_usage_record_count"], 0);
+        assert_eq!(first["consecutive_failures"], 0);
+    }
+
+    /// Mutation proof for Attack 2: take the REAL receipt the collector builds
+    /// for a fresh error and force its declared kind to `checkin`. The egress
+    /// guard refuses it, so no code path — present or future — can beat while
+    /// disclosing scan evidence the backend has not accepted.
+    #[test]
+    #[serial(source_manifests)]
+    fn forcing_a_checkin_onto_a_receipt_carrying_a_new_error_never_reaches_the_wire() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+
+        let mut request = collector_status_request(
+            "destination",
+            CollectorStatus {
+                source: SnapshotSource::Codex,
+                machine_id: "otm_test",
+                scan_started_at: "2026-06-01T10:00:00Z",
+                counts: SyncCounts::for_policy(30),
+                state: CollectorState::Error {
+                    code: "scan_error",
+                    message: "local snapshot scan failed",
+                },
+            },
+        )
+        .expect("terminal error receipt");
+        assert_eq!(request.report_kind, SnapshotStatusReportKind::ScanStatus);
+        assert_eq!(request.last_error_code.as_deref(), Some("scan_error"));
+        // Truthfully declared, it travels.
+        client
+            .report_status("relay-token-codex", &request)
+            .expect("a scan status carrying an error is accepted");
+
+        // The mutation: only the declaration changes.
+        request.report_kind = SnapshotStatusReportKind::Checkin;
+        let refused = client
+            .report_status("relay-token-codex", &request)
+            .expect_err("a beat may not disclose a new error");
+        assert!(
+            refused.to_string().contains("report_kind=checkin"),
+            "unexpected refusal: {refused}"
+        );
+
+        // Exactly one receipt reached the server: the truthful one.
+        let requests = captured.lock().expect("captured requests").clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            http_request_json(&requests[0])["report_kind"],
+            "scan_status"
+        );
+    }
+
     #[test]
     #[serial(source_manifests)]
     fn settled_zero_snapshot_usage_evidence_reports_persistent_parse_error() {
@@ -8557,6 +8975,65 @@ mod tests {
                 .exists(),
             "the journal genuinely failed to write; the POST proceeded anyway"
         );
+    }
+
+    /// The journal persists the exact typed `SnapshotStatusRequest` that is
+    /// about to go on the wire, so the declared `report_kind` has to survive
+    /// the disk round trip like every other field. Without `Deserialize` on
+    /// `SnapshotStatusReportKind` the journal would not compile at all; with a
+    /// `skip`/`default` escape hatch it would silently reload as some other
+    /// kind and a replayed receipt would lie about what it is. This asserts the
+    /// reloaded receipt is byte-for-byte the one that was committed.
+    #[test]
+    #[serial(source_manifests)]
+    fn the_journaled_receipt_reloads_with_its_declared_report_kind() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let mut counts = SyncCounts::for_policy(30);
+        counts.census_complete = true;
+        counts.recognized_usage_drop_count = 7;
+        counts.dropped_usage_record_count = 7;
+        let request = collector_status_request(
+            "destination",
+            CollectorStatus {
+                source: SnapshotSource::Codex,
+                machine_id: "otm_test",
+                scan_started_at: "2026-09-01T07:44:00Z",
+                counts,
+                state: CollectorState::Error {
+                    code: "scan_error",
+                    message: "local snapshot scan failed",
+                },
+            },
+        )
+        .expect("terminal receipt");
+        assert_eq!(request.report_kind, SnapshotStatusReportKind::ScanStatus);
+
+        let path = terminal_status_journal_path(
+            test_terminal_status_support_dir(),
+            "destination",
+            SnapshotSource::Codex,
+        );
+        save_terminal_status_journal(&path, &request).expect("journal the terminal receipt");
+        let reloaded = load_terminal_status_journal(&path)
+            .expect("read journal")
+            .expect("journal exists");
+
+        // The declaration itself survives...
+        assert_eq!(reloaded.report_kind, SnapshotStatusReportKind::ScanStatus);
+        // ...as the snake_case wire token, not a re-derived guess...
+        let reloaded_json = serde_json::to_value(&reloaded).expect("reloaded JSON");
+        assert_eq!(reloaded_json["report_kind"], "scan_status");
+        // ...and the whole receipt is unchanged by the round trip, so a replay
+        // could never post a body that differs from the one committed.
+        assert_eq!(
+            reloaded_json,
+            serde_json::to_value(&request).expect("committed JSON")
+        );
+        // A journaled scan result stays a scan result on the egress guard: it
+        // can never re-enter the wire wearing a check-in declaration.
+        reloaded
+            .validate_declared_report_kind()
+            .expect("a journaled scan status is truthfully declared");
     }
 
     #[test]
