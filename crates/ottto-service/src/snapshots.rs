@@ -363,7 +363,15 @@ const CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS: u64 = 6 * 60 * 60;
 /// bounding an unchanged family's non-terminal lifetime to 18-36 hours.
 const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES: u8 = 4;
 const SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION: &str = "snapshot_unproven_retry:v1";
-const SNAPSHOT_ACCEPTED_LEDGER_VERSION: u8 = 1;
+const SNAPSHOT_ACCEPTED_LEDGER_VERSION: u8 = 2;
+/// Ledger version 1 was written by the first legacy-settlement migration, which
+/// had a fast path that declared every currently indexed revision accepted
+/// whenever the local index merely looked clean. That inference is unsound: the
+/// silent retry-loss path this migration exists to repair ends in a clean index.
+/// The ledger records no witness distinguishing a v1 ledger sealed by that fast
+/// path from one drained by the bounded sweep, so every v1 ledger is re-opened
+/// once and re-proved through the server, which is the authority on acceptance.
+const SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION: u8 = 1;
 pub(crate) const MAX_SNAPSHOT_RECONSTRUCTION_FAILURES: u8 = 4;
 
 /// What the manifest counts, declared on the wire rather than assumed.
@@ -16836,6 +16844,41 @@ impl ScanIndex {
         self.accepted_snapshot_fingerprint_ledger_version != SNAPSHOT_ACCEPTED_LEDGER_VERSION
     }
 
+    /// Discard an accepted-revision ledger that a previous version marked
+    /// migrated without per-revision settlement evidence, so the bounded sweep
+    /// re-offers every currently indexed revision exactly once.
+    ///
+    /// Clearing the whole v1 set is the conservative reading, and it is forced:
+    /// the on-disk ledger carries no per-revision provenance and no witness of
+    /// which migration path wrote it, so a v1 entry proved by a real entity ACK
+    /// is byte-identical to one sealed by the unsound fast path. The re-offer
+    /// costs one bounded pass — the server answers each revision it already
+    /// holds as an unchanged no-op and re-records it as accepted — while a
+    /// wrongly retained entry would suppress the lost revision forever.
+    ///
+    /// Dropping the version back to the pre-ledger value, rather than holding a
+    /// separate "re-opened" bit, is what makes this idempotent: the next call
+    /// sees a plain unmigrated ledger and resumes the sweep instead of clearing
+    /// the acceptances the sweep has since re-earned.
+    fn reopen_unproven_accepted_snapshot_ledger(&mut self, source: SnapshotSource) {
+        if self.accepted_snapshot_fingerprint_ledger_version
+            != SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION
+        {
+            return;
+        }
+        let reopened = self.accepted_snapshot_fingerprints.len();
+        self.accepted_snapshot_fingerprints.clear();
+        self.legacy_settlement_reconcile_after_fingerprint = None;
+        self.accepted_snapshot_fingerprint_ledger_version = 0;
+        eprintln!(
+            "ottto-service: re-opened the legacy snapshot settlement ledger for {}; {} revision(s) \
+             were previously recorded as accepted without per-revision settlement proof and are \
+             re-offered through the existing entity-ACK contract in bounded pages",
+            source.api_slug(),
+            reopened
+        );
+    }
+
     pub fn prepare_historical_replay(&mut self, generation: String) {
         if self.historical_replay_generation.as_ref() == Some(&generation) {
             return;
@@ -16876,6 +16919,14 @@ impl ScanIndex {
     /// the already-deployed snapshot entity-ACK upload contract. The cursor and
     /// each armed quarantine record are persisted before scanning, so a restart
     /// resumes instead of rebuilding one unbounded request.
+    ///
+    /// A revision leaves this migration only through positive settlement
+    /// evidence: an exact entity ACK recorded in `accepted_snapshot_fingerprints`,
+    /// or an explicit terminal quarantine disposition that discloses it. There
+    /// is deliberately no shortcut that infers acceptance from the shape of the
+    /// local index, because a clean index is exactly what the silent
+    /// retry-loss path leaves behind, and inferring from it seals the lost
+    /// revision as accepted with no re-offer and no disclosure.
     pub(crate) fn prepare_legacy_settlement_reconciliation(
         &mut self,
         source: SnapshotSource,
@@ -16884,16 +16935,7 @@ impl ScanIndex {
         if self.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {
             return (BTreeSet::new(), false);
         }
-        let current = self.current_snapshot_fingerprints();
-        if self.legacy_settlement_reconcile_after_fingerprint.is_none()
-            && self.traversal.is_none()
-            && !self.bounded_sweep_had_unsettled_upload
-            && self.quarantined_snapshot_fingerprints.is_empty()
-        {
-            self.accepted_snapshot_fingerprints = current;
-            self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
-            return (BTreeSet::new(), true);
-        }
+        self.reopen_unproven_accepted_snapshot_ledger(source);
 
         let pending = self.legacy_settlement_reconciliation_pending_fingerprints();
         if pending.is_empty() {
@@ -16970,6 +17012,17 @@ impl ScanIndex {
     }
 
     pub(crate) fn finish_legacy_settlement_reconciliation(&mut self) {
+        // A ledger still at the unproven version has an accepted set this
+        // daemon has not re-proved, so its pending set is not yet meaningful.
+        // Only `reopen_unproven_accepted_snapshot_ledger` may leave that state,
+        // and it is reached from the arming path alone. Without this guard a
+        // cycle that skipped arming (a pending historical replay, for instance)
+        // could observe the stale empty pending set and seal the ledger.
+        if self.accepted_snapshot_fingerprint_ledger_version
+            == SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION
+        {
+            return;
+        }
         if self
             .legacy_settlement_reconciliation_pending_fingerprints()
             .is_empty()
@@ -19973,28 +20026,209 @@ mod tests {
         index
     }
 
+    /// A clean index is not settlement evidence. This is the exact state the
+    /// silent retry-loss path leaves behind — no cursor, no traversal, no
+    /// unsettled-sweep flag, an empty quarantine — while one indexed revision
+    /// was never offered to the server at all. Sealing here would write that
+    /// lost revision into the accepted ledger and remove it from the pending
+    /// set permanently.
     #[test]
-    fn legacy_0_1_121_fully_settled_history_is_not_rearmed() {
+    fn legacy_0_1_121_clean_index_is_rearmed_rather_than_sealed_as_accepted() {
         let accepted = "a".repeat(64);
-        let settled_sibling = "b".repeat(64);
+        let stranded = "b".repeat(64);
         let mut legacy = legacy_shaped_index(ScanIndex {
             file_snapshot_fingerprints: BTreeMap::from([(
                 "same-session-siblings.jsonl".to_string(),
-                BTreeSet::from([accepted.clone(), settled_sibling.clone()]),
+                BTreeSet::from([accepted.clone(), stranded.clone()]),
+            )]),
+            ..ScanIndex::default()
+        });
+        assert!(legacy
+            .legacy_settlement_reconcile_after_fingerprint
+            .is_none());
+        assert!(legacy.traversal.is_none());
+        assert!(!legacy.bounded_sweep_had_unsettled_upload);
+        assert!(legacy.quarantined_snapshot_fingerprints.is_empty());
+
+        let (armed, changed) =
+            legacy.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+        assert!(changed);
+        assert_eq!(
+            armed,
+            BTreeSet::from([accepted.clone(), stranded.clone()]),
+            "a clean index proves nothing about server acceptance, so both revisions are re-offered"
+        );
+        assert!(
+            legacy.accepted_snapshot_fingerprints.is_empty(),
+            "nothing may enter the accepted ledger without an exact entity ACK"
+        );
+        assert!(
+            legacy.legacy_settlement_ledger_needs_migration(),
+            "the ledger stays open until the server settles every revision"
+        );
+        for fingerprint in [&accepted, &stranded] {
+            let record = legacy
+                .quarantined_snapshot_fingerprints
+                .get(fingerprint)
+                .expect("every current revision is re-armed for the bounded sweep");
+            assert_eq!(
+                record.disposition,
+                SnapshotQuarantineDisposition::RetryPending
+            );
+            assert_eq!(record.retry_after_unix_seconds, 0);
+        }
+        assert_eq!(
+            legacy.legacy_settlement_reconciliation_pending_fingerprints(),
+            BTreeSet::from([accepted, stranded])
+        );
+    }
+
+    /// The 0.1.122 ledger records no witness of which migration path wrote it,
+    /// so a machine that sealed its revisions without proof and one that swept
+    /// them are indistinguishable on disk. Every ledger left at the unproven
+    /// version is therefore re-opened exactly once and re-proved.
+    #[test]
+    fn ledger_migrated_without_settlement_proof_reopens_once_then_stays_terminal() {
+        let root = temp_dir("scan-index-unproven-ledger-reopen");
+        let path = root.join("codex-scan-index-v3.json");
+        let sealed = "a".repeat(64);
+        let stranded = "b".repeat(64);
+        let mut index = ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "same-session-siblings.jsonl".to_string(),
+                BTreeSet::from([sealed.clone(), stranded.clone()]),
+            )]),
+            accepted_snapshot_fingerprints: BTreeSet::from([sealed.clone(), stranded.clone()]),
+            accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION,
+            ..ScanIndex::default()
+        };
+        index
+            .save(&path)
+            .expect("persist the unproven 0.1.122 ledger");
+
+        let mut reopened = ScanIndex::load(&path).expect("the unproven ledger shape still loads");
+        assert!(
+            reopened.legacy_settlement_ledger_needs_migration(),
+            "an unproven ledger is not treated as migrated"
+        );
+        let (armed, changed) =
+            reopened.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+        assert!(changed);
+        assert_eq!(
+            armed,
+            BTreeSet::from([sealed.clone(), stranded.clone()]),
+            "the whole unproven accepted set is re-offered, not trusted"
+        );
+        assert!(reopened.accepted_snapshot_fingerprints.is_empty());
+
+        // The re-open is idempotent: a second cycle resumes the sweep from the
+        // persisted cursor instead of discarding what the server has since
+        // acknowledged.
+        reopened.save(&path).expect("persist the re-opened ledger");
+        let mut resumed = ScanIndex::load(&path).expect("reload the re-opened ledger");
+        let (again, _) =
+            resumed.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+        assert!(
+            again.is_empty(),
+            "both revisions are already armed, so no page is re-armed"
+        );
+        assert_eq!(
+            resumed.legacy_settlement_reconciliation_pending_fingerprints(),
+            BTreeSet::from([sealed.clone(), stranded.clone()])
+        );
+
+        // The server settles both, which is the only evidence that closes the
+        // migration.
+        resumed.retain_quarantined_fingerprints(&BTreeMap::new());
+        resumed.record_accepted_snapshot_fingerprints(&BTreeSet::from([sealed, stranded]));
+        resumed.finish_legacy_settlement_reconciliation();
+        assert!(!resumed.legacy_settlement_ledger_needs_migration());
+        assert!(resumed
+            .legacy_settlement_reconcile_after_fingerprint
+            .is_none());
+        let (terminal, changed) =
+            resumed.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+        assert!(terminal.is_empty());
+        assert!(!changed, "a settled ledger never re-opens again");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A ledger left at the unproven version must not be sealed by a cycle that
+    /// never armed anything — its pending set is computed from an accepted set
+    /// this daemon has not re-proved.
+    #[test]
+    fn unproven_ledger_is_not_finished_without_the_bounded_reopen() {
+        let sealed = "a".repeat(64);
+        let mut index = ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "same-session-siblings.jsonl".to_string(),
+                BTreeSet::from([sealed.clone()]),
+            )]),
+            accepted_snapshot_fingerprints: BTreeSet::from([sealed]),
+            accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION,
+            ..ScanIndex::default()
+        };
+        assert!(index
+            .legacy_settlement_reconciliation_pending_fingerprints()
+            .is_empty());
+
+        index.finish_legacy_settlement_reconciliation();
+
+        assert!(
+            index.legacy_settlement_ledger_needs_migration(),
+            "the stale pending set may not close the migration"
+        );
+    }
+
+    /// The sweep is self-terminating: each cycle advances the cursor by exactly
+    /// one page, and the migration closes once the server has settled every
+    /// revision. This is what makes removing the fast path affordable.
+    #[test]
+    fn legacy_reconciliation_advances_one_page_per_cycle_and_terminates() {
+        let fingerprints = (0..120)
+            .map(|value| format!("{value:064x}"))
+            .collect::<BTreeSet<_>>();
+        let mut index = legacy_shaped_index(ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "bounded-sweep-session-set.jsonl".to_string(),
+                fingerprints.clone(),
             )]),
             ..ScanIndex::default()
         });
 
-        let (armed, changed) =
-            legacy.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-        assert!(armed.is_empty());
-        assert!(changed);
-        assert!(!legacy.legacy_settlement_ledger_needs_migration());
-        assert_eq!(
-            legacy.accepted_snapshot_fingerprints,
-            BTreeSet::from([accepted, settled_sibling])
+        let mut pages = Vec::new();
+        let mut cursors = Vec::new();
+        while index.legacy_settlement_ledger_needs_migration() {
+            let (armed, _) =
+                index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+            if armed.is_empty() {
+                break;
+            }
+            assert!(armed.len() <= 50, "a cycle never arms more than one page");
+            pages.push(armed.len());
+            cursors.push(
+                index
+                    .legacy_settlement_reconcile_after_fingerprint
+                    .clone()
+                    .expect("an armed page always advances the cursor"),
+            );
+            // The server settles the armed page.
+            index.retain_quarantined_fingerprints(&BTreeMap::new());
+            index.record_accepted_snapshot_fingerprints(&armed);
+            index.finish_legacy_settlement_reconciliation();
+        }
+
+        assert_eq!(pages, vec![50, 50, 20]);
+        assert!(
+            cursors.windows(2).all(|pair| pair[0] < pair[1]),
+            "the lexicographic cursor advances monotonically"
         );
-        assert!(legacy.quarantined_snapshot_fingerprints.is_empty());
+        assert!(!index.legacy_settlement_ledger_needs_migration());
+        assert_eq!(index.accepted_snapshot_fingerprints, fingerprints);
+        let (terminal, changed) =
+            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+        assert!(terminal.is_empty());
+        assert!(!changed);
     }
 
     #[test]
