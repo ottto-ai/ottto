@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 348,
-  "content_sha256": "80ebbeb0dac841adf488b5a9832b6e78519dbe6aaa875576a7d3648152dd2951",
+  "candidate_file_count": 349,
+  "content_sha256": "79bf91bbf46aec4a35787b1cdbc402a6d32772390fa12085efd22a40313f47e4",
   "files": [
     {
       "executable": false,
@@ -881,8 +881,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "5c342581309c98e0c99b38f646bab648130583d7e7152df9d134e2c1ddc74791",
-      "size_bytes": 1723083
+      "sha256": "99ad361ca700b8b1527346a848b6f1acda8e9165f2dcd1d549bfccfa201f0849",
+      "size_bytes": 1734573
     },
     {
       "executable": false,
@@ -1520,6 +1520,13 @@
       "path": "docs/session-2026-09-02-collector-status-report-kind.md",
       "sha256": "a3192794826debab803ed309f1af9eef255d48e835889f662f31eacfcd7b807f",
       "size_bytes": 8041
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-09-02-legacy-settlement-seal.md",
+      "sha256": "e9084530ce6699dd42f4fe1214a821e6265e5d162d47056d8fac98ce347f34a7",
+      "size_bytes": 9077
     },
     {
       "executable": false,
@@ -2439,9 +2446,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-02T06:00:42+00:00",
+  "generated_at": "2026-09-02T08:01:19+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 349,
+  "output_file_count": 350,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2475,5 +2482,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "9fea4b96242dd3652c3a44dda1a62e358224cd2f"
+  "source_commit": "3c40572ed618e8384848ce4cad4b6bac25882ed4"
 }
