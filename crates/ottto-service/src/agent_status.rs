@@ -884,11 +884,18 @@ fn codex_source_health_snapshot(
         }
     }
     if custom_needs_attention {
-        source_health_snapshot.status = AgentStatusState::Degraded;
+        let current_login_available = source_health_snapshot.status == AgentStatusState::Available;
+        if current_login_available {
+            source_health_snapshot.status = AgentStatusState::Degraded;
+        }
         source_health_snapshot
             .diagnostics
             .push(AgentStatusDiagnostic::source(
-                "codex_registered_slot_needs_attention",
+                if current_login_available {
+                    "codex_registered_slot_needs_attention_current_available"
+                } else {
+                    "codex_registered_slot_needs_attention"
+                },
                 AgentDiagnosticSeverity::Warning,
                 "One or more durable Codex account connections need local attention; healthy accounts continue collecting independently.",
             ));
@@ -909,13 +916,30 @@ pub(crate) fn annotate_codex_accounts_status(
     status
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CodexSlotSetupCollectionError {
+    ProviderLoginPending(String),
+    DurableStateUnavailable(String),
+}
+
+impl CodexSlotSetupCollectionError {
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::ProviderLoginPending(message) | Self::DurableStateUnavailable(message) => message,
+        }
+    }
+}
+
 pub(crate) fn collect_registered_codex_slot_for_setup(
     slot_id: &str,
-) -> Result<(CodexStrongIdentity, CodexAccountSlotCollectionStatusV1), String> {
+) -> Result<(CodexStrongIdentity, CodexAccountSlotCollectionStatusV1), CodexSlotSetupCollectionError>
+{
     let store = FileCodexAccountSlotSettingsStore::default();
-    let home = store
-        .slot_home(slot_id)
-        .map_err(|_| "Codex durable connection state is unavailable.".to_string())?;
+    let home = store.slot_home(slot_id).map_err(|_| {
+        CodexSlotSetupCollectionError::DurableStateUnavailable(
+            "Codex durable connection state is unavailable.".to_string(),
+        )
+    })?;
     let captured_at = crate::current_rfc3339_timestamp();
     let (snapshot, identity, _) = collect_codex_status_for_home(
         captured_at.clone(),
@@ -924,7 +948,9 @@ pub(crate) fn collect_registered_codex_slot_for_setup(
         CodexHomeTrust::Managed,
     );
     let identity = identity.ok_or_else(|| {
-        "Codex sign-in has not produced a complete account and workspace identity.".to_string()
+        CodexSlotSetupCollectionError::ProviderLoginPending(
+            "Codex sign-in has not produced a complete account and workspace identity.".to_string(),
+        )
     })?;
     let status = codex_collection_status_from_snapshot(&snapshot);
     if status.state != CodexAccountSlotCollectionStateV1::Fresh
@@ -933,10 +959,10 @@ pub(crate) fn collect_registered_codex_slot_for_setup(
         || status.workspace_identifier_hash.as_deref()
             != Some(identity.workspace_identifier_hash.as_str())
     {
-        return Err(
+        return Err(CodexSlotSetupCollectionError::ProviderLoginPending(
             "Codex sign-in is present, but fresh quota for its exact account and workspace is not yet available."
                 .to_string(),
-        );
+        ));
     }
     Ok((identity, status))
 }
@@ -2554,11 +2580,12 @@ fn collect_claude_status_snapshots(
         let mut resolved = match resolve_registered_claude_slot(descriptor.clone()) {
             Ok(resolved) => resolved,
             Err(failure) => {
-                let mut status = failure.status(&captured_at);
-                if let Some(slot) = claude_config_slot_for_descriptor(&descriptor) {
-                    retain_verified_claude_slot_binding(&descriptor.slot_id, &slot, &mut status);
-                }
-                apply_claude_upkeep_observation(&mut status, upkeep.status);
+                let status = registered_claude_failure_status(
+                    &descriptor,
+                    failure,
+                    &captured_at,
+                    upkeep.status,
+                );
                 slot_states.insert(descriptor.slot_id, status);
                 continue;
             }
@@ -2744,11 +2771,18 @@ fn collect_claude_status_snapshots(
     let default_full_meter_needs_attention = default_has_full_meter_evidence
         && default_state.state != ClaudeConfigSlotCollectionStateV1::Fresh;
     if has_actionable_custom_slot || default_full_meter_needs_attention {
-        source_health_snapshot.status = AgentStatusState::Degraded;
+        let current_login_available = source_health_snapshot.status == AgentStatusState::Available;
+        if current_login_available {
+            source_health_snapshot.status = AgentStatusState::Degraded;
+        }
         source_health_snapshot
             .diagnostics
             .push(AgentStatusDiagnostic::source(
-                "claude_registered_slot_needs_attention",
+                if current_login_available {
+                    "claude_registered_slot_needs_attention_current_available"
+                } else {
+                    "claude_registered_slot_needs_attention"
+                },
                 AgentDiagnosticSeverity::Warning,
                 "One or more registered Claude account slots need local attention; healthy accounts continue collecting independently.",
             ));
@@ -2962,15 +2996,20 @@ pub(crate) fn collect_registered_claude_slot_status(
         !claude_oauth_usage_network_disabled(),
     );
     if !upkeep.proceed_with_collection {
-        let status = blocked_claude_upkeep_status(slot_id, &captured_at, upkeep.status);
+        let mut status = blocked_claude_upkeep_status(slot_id, &captured_at, upkeep.status);
+        if let Some(slot) = claude_config_slot_for_descriptor(&descriptor) {
+            retain_verified_claude_slot_binding(slot_id, &slot, &mut status);
+        } else {
+            clear_claude_slot_binding(&mut status);
+        }
         let _ = persist_one_claude_slot_collection_state(slot_id, &status);
         return status;
     }
-    let mut resolved = match resolve_registered_claude_slot(descriptor) {
+    let mut resolved = match resolve_registered_claude_slot(descriptor.clone()) {
         Ok(resolved) => resolved,
         Err(failure) => {
-            let mut status = failure.status(&captured_at);
-            apply_claude_upkeep_observation(&mut status, upkeep.status);
+            let status =
+                registered_claude_failure_status(&descriptor, failure, &captured_at, upkeep.status);
             let _ = persist_one_claude_slot_collection_state(slot_id, &status);
             return status;
         }
@@ -2992,7 +3031,11 @@ pub(crate) fn collect_registered_claude_slot_status(
         captured_at,
         expires_at,
     ) {
-        Ok((_, status)) | Err(status) => status,
+        Ok((_, status)) => status,
+        Err(mut status) => {
+            retain_exact_claude_slot_binding(&mut status, &account_hash, &organization_hash);
+            status
+        }
     };
     apply_claude_upkeep_observation(&mut status, upkeep.status);
     let _ = persist_one_claude_slot_collection_state(slot_id, &status);
@@ -4000,6 +4043,22 @@ fn apply_claude_upkeep_observation(
         });
     }
     status.upkeep = Some(upkeep);
+}
+
+fn registered_claude_failure_status(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    failure: ClaudeSlotProbeFailure,
+    observed_at: &str,
+    upkeep: ottto_protocol::ClaudeConfigSlotUpkeepStatusV1,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    let mut status = failure.status(observed_at);
+    if let Some(slot) = claude_config_slot_for_descriptor(descriptor) {
+        retain_verified_claude_slot_binding(&descriptor.slot_id, &slot, &mut status);
+    } else {
+        clear_claude_slot_binding(&mut status);
+    }
+    apply_claude_upkeep_observation(&mut status, upkeep);
+    status
 }
 
 fn upkeep_state_diagnostic(
@@ -19626,6 +19685,29 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         assert_eq!(
             projected_claude_quota_access_state(&failed),
             Some(ClaudeQuotaAccessState::AttentionRequired)
+        );
+
+        let direct_failure = registered_claude_failure_status(
+            &slot.descriptor(slot_id, ClaudeConfigSlotOwnership::Managed),
+            ClaudeSlotProbeFailure::CredentialUnavailable,
+            "2026-08-12T10:00:30Z",
+            ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                result: ClaudeConfigSlotUpkeepResultV1::NotRequired,
+                due_access_expires_at: None,
+                refresh_token_expires_at: None,
+                attempted_at: None,
+                next_allowed_attempt_at: None,
+                consecutive_failures: 0,
+            },
+        );
+        assert_eq!(
+            direct_failure.account_identifier_hash.as_deref(),
+            Some(account_hash.as_str()),
+            "a transient direct workflow probe must not erase the saved anchor"
+        );
+        assert_eq!(
+            direct_failure.organization_identifier_hash.as_deref(),
+            Some(organization_hash.as_str())
         );
 
         let mut current_full = fresh_slot_status(
