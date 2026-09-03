@@ -884,11 +884,18 @@ fn codex_source_health_snapshot(
         }
     }
     if custom_needs_attention {
-        source_health_snapshot.status = AgentStatusState::Degraded;
+        let current_login_available = source_health_snapshot.status == AgentStatusState::Available;
+        if current_login_available {
+            source_health_snapshot.status = AgentStatusState::Degraded;
+        }
         source_health_snapshot
             .diagnostics
             .push(AgentStatusDiagnostic::source(
-                "codex_registered_slot_needs_attention",
+                if current_login_available {
+                    "codex_registered_slot_needs_attention_current_available"
+                } else {
+                    "codex_registered_slot_needs_attention"
+                },
                 AgentDiagnosticSeverity::Warning,
                 "One or more durable Codex account connections need local attention; healthy accounts continue collecting independently.",
             ));
@@ -909,13 +916,30 @@ pub(crate) fn annotate_codex_accounts_status(
     status
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CodexSlotSetupCollectionError {
+    ProviderLoginPending(String),
+    DurableStateUnavailable(String),
+}
+
+impl CodexSlotSetupCollectionError {
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::ProviderLoginPending(message) | Self::DurableStateUnavailable(message) => message,
+        }
+    }
+}
+
 pub(crate) fn collect_registered_codex_slot_for_setup(
     slot_id: &str,
-) -> Result<(CodexStrongIdentity, CodexAccountSlotCollectionStatusV1), String> {
+) -> Result<(CodexStrongIdentity, CodexAccountSlotCollectionStatusV1), CodexSlotSetupCollectionError>
+{
     let store = FileCodexAccountSlotSettingsStore::default();
-    let home = store
-        .slot_home(slot_id)
-        .map_err(|_| "Codex durable connection state is unavailable.".to_string())?;
+    let home = store.slot_home(slot_id).map_err(|_| {
+        CodexSlotSetupCollectionError::DurableStateUnavailable(
+            "Codex durable connection state is unavailable.".to_string(),
+        )
+    })?;
     let captured_at = crate::current_rfc3339_timestamp();
     let (snapshot, identity, _) = collect_codex_status_for_home(
         captured_at.clone(),
@@ -924,7 +948,9 @@ pub(crate) fn collect_registered_codex_slot_for_setup(
         CodexHomeTrust::Managed,
     );
     let identity = identity.ok_or_else(|| {
-        "Codex sign-in has not produced a complete account and workspace identity.".to_string()
+        CodexSlotSetupCollectionError::ProviderLoginPending(
+            "Codex sign-in has not produced a complete account and workspace identity.".to_string(),
+        )
     })?;
     let status = codex_collection_status_from_snapshot(&snapshot);
     if status.state != CodexAccountSlotCollectionStateV1::Fresh
@@ -933,10 +959,10 @@ pub(crate) fn collect_registered_codex_slot_for_setup(
         || status.workspace_identifier_hash.as_deref()
             != Some(identity.workspace_identifier_hash.as_str())
     {
-        return Err(
+        return Err(CodexSlotSetupCollectionError::ProviderLoginPending(
             "Codex sign-in is present, but fresh quota for its exact account and workspace is not yet available."
                 .to_string(),
-        );
+        ));
     }
     Ok((identity, status))
 }
@@ -2745,11 +2771,18 @@ fn collect_claude_status_snapshots(
     let default_full_meter_needs_attention = default_has_full_meter_evidence
         && default_state.state != ClaudeConfigSlotCollectionStateV1::Fresh;
     if has_actionable_custom_slot || default_full_meter_needs_attention {
-        source_health_snapshot.status = AgentStatusState::Degraded;
+        let current_login_available = source_health_snapshot.status == AgentStatusState::Available;
+        if current_login_available {
+            source_health_snapshot.status = AgentStatusState::Degraded;
+        }
         source_health_snapshot
             .diagnostics
             .push(AgentStatusDiagnostic::source(
-                "claude_registered_slot_needs_attention",
+                if current_login_available {
+                    "claude_registered_slot_needs_attention_current_available"
+                } else {
+                    "claude_registered_slot_needs_attention"
+                },
                 AgentDiagnosticSeverity::Warning,
                 "One or more registered Claude account slots need local attention; healthy accounts continue collecting independently.",
             ));

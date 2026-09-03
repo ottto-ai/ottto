@@ -2117,25 +2117,27 @@ fn check_codex_account(
     // login is progress, not a failed durable connection. Probe before moving
     // the persisted operation to `validating`; only a complete exact identity
     // and fresh quota snapshot crosses that state boundary.
-    let pending_collection =
-        if current_operation.state == CodexAccountSetupOperationStateV1::WaitingForUserLogin {
-            let slot_id = current_operation.slot_id.as_deref().ok_or_else(|| {
-                LocalApiError::InvalidRequest(
-                    "Codex setup operation has no durable connection slot".to_string(),
-                )
-            })?;
-            match crate::agent_status::collect_registered_codex_slot_for_setup(slot_id) {
-                Ok(result) => Some(result),
-                Err(_) => {
-                    return store
-                        .load()
-                        .map_err(codex_account_slot_settings_error)
-                        .map(crate::agent_status::annotate_codex_accounts_status);
-                }
+    let pending_collection = if current_operation.state
+        == CodexAccountSetupOperationStateV1::WaitingForUserLogin
+    {
+        let slot_id = current_operation.slot_id.as_deref().ok_or_else(|| {
+            LocalApiError::InvalidRequest(
+                "Codex setup operation has no durable connection slot".to_string(),
+            )
+        })?;
+        match crate::agent_status::collect_registered_codex_slot_for_setup(slot_id) {
+            Ok(result) => Some(Ok(result)),
+            Err(crate::agent_status::CodexSlotSetupCollectionError::ProviderLoginPending(_)) => {
+                return store
+                    .load()
+                    .map_err(codex_account_slot_settings_error)
+                    .map(crate::agent_status::annotate_codex_accounts_status);
             }
-        } else {
-            None
-        };
+            Err(error) => Some(Err(error)),
+        }
+    } else {
+        None
+    };
     store
         .begin_validation(schema_version, operation_id)
         .map_err(codex_account_slot_settings_error)?;
@@ -2193,14 +2195,14 @@ fn check_codex_account(
         };
     }
     let collection = match pending_collection {
-        Some(result) => Ok(result),
+        Some(result) => result,
         None => crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id),
     };
     let (identity, _) = match collection {
         Ok(result) => result,
-        Err(message) => {
+        Err(error) => {
             return store
-                .fail_validation(schema_version, operation_id, &message)
+                .fail_validation(schema_version, operation_id, error.message())
                 .map_err(codex_account_slot_settings_error)
                 .map(crate::agent_status::annotate_codex_accounts_status);
         }

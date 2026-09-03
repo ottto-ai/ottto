@@ -2014,7 +2014,6 @@ pub enum StableProblemCode {
     ConfigDrift,
     SecretMissing,
     SecretExpired,
-    AccountConnectionNeedsAttention,
     RelayUnavailable,
     TelemetryNotVerified,
     SourceNotInstalled,
