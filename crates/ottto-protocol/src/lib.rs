@@ -22,10 +22,12 @@ pub const CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION: u16 = 19;
 /// effects; only explicit v23 commands may start `claude auth login`.
 pub const CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION: u16 = 23;
 /// Command-scoped version for the machine-local Codex durable-account registry.
-/// v21 adds daemon-authored workspace targets and target-bound setup. The base
-/// protocol remains unchanged so older clients continue to use every unrelated
-/// command during a rolling local-runtime upgrade.
-pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 23;
+/// v21 adds daemon-authored workspace targets and target-bound setup. v24 makes
+/// a setup check nonterminal while provider sign-in is still pending, allowing
+/// clients to poll safely until the exact account/workspace proof is ready.
+/// The base protocol remains unchanged so older clients continue to use every
+/// unrelated command during a rolling local-runtime upgrade.
+pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 24;
 pub const CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
 pub const CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
@@ -2012,6 +2014,7 @@ pub enum StableProblemCode {
     ConfigDrift,
     SecretMissing,
     SecretExpired,
+    AccountConnectionNeedsAttention,
     RelayUnavailable,
     TelemetryNotVerified,
     SourceNotInstalled,
@@ -4228,7 +4231,7 @@ mod tests {
     fn codex_account_commands_fail_closed_on_every_older_protocol_version() {
         // Each superseded version is rejected by name, so a stale companion says
         // "update Ottto" instead of quietly rendering a payload it cannot read.
-        for stale in [20, 21, 22] {
+        for stale in [20, 21, 22, 23] {
             let request = serde_json::json!({
                 "request_id": "req_codex_account",
                 "protocol_version": stale,
@@ -4238,10 +4241,10 @@ mod tests {
             let error = serde_json::from_value::<LocalControlRequest>(request)
                 .expect_err("a superseded client must get an explicit incompatibility signal");
             assert!(error.to_string().contains(&format!(
-                "unsupported local control protocol_version {stale}; expected 23"
+                "unsupported local control protocol_version {stale}; expected 24"
             )));
         }
-        assert_eq!(CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION, 23);
+        assert_eq!(CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION, 24);
     }
 
     #[test]

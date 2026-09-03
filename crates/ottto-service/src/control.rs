@@ -2112,6 +2112,30 @@ fn check_codex_account(
             .map_err(codex_account_slot_settings_error)
             .map(crate::agent_status::annotate_codex_accounts_status);
     }
+    // `codex login` completes outside this request. A visible client is allowed
+    // to poll while the provider-owned browser flow is open, but an incomplete
+    // login is progress, not a failed durable connection. Probe before moving
+    // the persisted operation to `validating`; only a complete exact identity
+    // and fresh quota snapshot crosses that state boundary.
+    let pending_collection =
+        if current_operation.state == CodexAccountSetupOperationStateV1::WaitingForUserLogin {
+            let slot_id = current_operation.slot_id.as_deref().ok_or_else(|| {
+                LocalApiError::InvalidRequest(
+                    "Codex setup operation has no durable connection slot".to_string(),
+                )
+            })?;
+            match crate::agent_status::collect_registered_codex_slot_for_setup(slot_id) {
+                Ok(result) => Some(result),
+                Err(_) => {
+                    return store
+                        .load()
+                        .map_err(codex_account_slot_settings_error)
+                        .map(crate::agent_status::annotate_codex_accounts_status);
+                }
+            }
+        } else {
+            None
+        };
     store
         .begin_validation(schema_version, operation_id)
         .map_err(codex_account_slot_settings_error)?;
@@ -2168,8 +2192,11 @@ fn check_codex_account(
                 .map(crate::agent_status::annotate_codex_accounts_status),
         };
     }
-    let (identity, _) = match crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id)
-    {
+    let collection = match pending_collection {
+        Some(result) => Ok(result),
+        None => crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id),
+    };
+    let (identity, _) = match collection {
         Ok(result) => result,
         Err(message) => {
             return store
@@ -14697,6 +14724,31 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    #[serial]
+    fn codex_check_keeps_provider_login_pending_nonterminal() {
+        let root = control_test_root("codex-check-pending");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let operation_id = "codex_setup_0123456789abcdef0123456789abcdef";
+
+        let prepared = prepare_open_codex_account(1, operation_id.to_string())
+            .expect("prepare open Codex connection");
+        assert_eq!(
+            prepared.setup_operation.state,
+            CodexAccountSetupOperationStateV1::WaitingForUserLogin
+        );
+
+        let checked = check_codex_account(1, operation_id)
+            .expect("pending provider login remains a successful status read");
+        assert_eq!(
+            checked.setup_operation.state,
+            CodexAccountSetupOperationStateV1::WaitingForUserLogin
+        );
+        assert!(checked.setup_operation.launch_command.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn cloud_operation_rejects_secrets_and_unapproved_mutations() {

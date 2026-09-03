@@ -2554,11 +2554,12 @@ fn collect_claude_status_snapshots(
         let mut resolved = match resolve_registered_claude_slot(descriptor.clone()) {
             Ok(resolved) => resolved,
             Err(failure) => {
-                let mut status = failure.status(&captured_at);
-                if let Some(slot) = claude_config_slot_for_descriptor(&descriptor) {
-                    retain_verified_claude_slot_binding(&descriptor.slot_id, &slot, &mut status);
-                }
-                apply_claude_upkeep_observation(&mut status, upkeep.status);
+                let status = registered_claude_failure_status(
+                    &descriptor,
+                    failure,
+                    &captured_at,
+                    upkeep.status,
+                );
                 slot_states.insert(descriptor.slot_id, status);
                 continue;
             }
@@ -2962,15 +2963,20 @@ pub(crate) fn collect_registered_claude_slot_status(
         !claude_oauth_usage_network_disabled(),
     );
     if !upkeep.proceed_with_collection {
-        let status = blocked_claude_upkeep_status(slot_id, &captured_at, upkeep.status);
+        let mut status = blocked_claude_upkeep_status(slot_id, &captured_at, upkeep.status);
+        if let Some(slot) = claude_config_slot_for_descriptor(&descriptor) {
+            retain_verified_claude_slot_binding(slot_id, &slot, &mut status);
+        } else {
+            clear_claude_slot_binding(&mut status);
+        }
         let _ = persist_one_claude_slot_collection_state(slot_id, &status);
         return status;
     }
-    let mut resolved = match resolve_registered_claude_slot(descriptor) {
+    let mut resolved = match resolve_registered_claude_slot(descriptor.clone()) {
         Ok(resolved) => resolved,
         Err(failure) => {
-            let mut status = failure.status(&captured_at);
-            apply_claude_upkeep_observation(&mut status, upkeep.status);
+            let status =
+                registered_claude_failure_status(&descriptor, failure, &captured_at, upkeep.status);
             let _ = persist_one_claude_slot_collection_state(slot_id, &status);
             return status;
         }
@@ -2992,7 +2998,11 @@ pub(crate) fn collect_registered_claude_slot_status(
         captured_at,
         expires_at,
     ) {
-        Ok((_, status)) | Err(status) => status,
+        Ok((_, status)) => status,
+        Err(mut status) => {
+            retain_exact_claude_slot_binding(&mut status, &account_hash, &organization_hash);
+            status
+        }
     };
     apply_claude_upkeep_observation(&mut status, upkeep.status);
     let _ = persist_one_claude_slot_collection_state(slot_id, &status);
@@ -4000,6 +4010,22 @@ fn apply_claude_upkeep_observation(
         });
     }
     status.upkeep = Some(upkeep);
+}
+
+fn registered_claude_failure_status(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    failure: ClaudeSlotProbeFailure,
+    observed_at: &str,
+    upkeep: ottto_protocol::ClaudeConfigSlotUpkeepStatusV1,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    let mut status = failure.status(observed_at);
+    if let Some(slot) = claude_config_slot_for_descriptor(descriptor) {
+        retain_verified_claude_slot_binding(&descriptor.slot_id, &slot, &mut status);
+    } else {
+        clear_claude_slot_binding(&mut status);
+    }
+    apply_claude_upkeep_observation(&mut status, upkeep);
+    status
 }
 
 fn upkeep_state_diagnostic(
@@ -19626,6 +19652,29 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         assert_eq!(
             projected_claude_quota_access_state(&failed),
             Some(ClaudeQuotaAccessState::AttentionRequired)
+        );
+
+        let direct_failure = registered_claude_failure_status(
+            &slot.descriptor(slot_id, ClaudeConfigSlotOwnership::Managed),
+            ClaudeSlotProbeFailure::CredentialUnavailable,
+            "2026-08-12T10:00:30Z",
+            ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                result: ClaudeConfigSlotUpkeepResultV1::NotRequired,
+                due_access_expires_at: None,
+                refresh_token_expires_at: None,
+                attempted_at: None,
+                next_allowed_attempt_at: None,
+                consecutive_failures: 0,
+            },
+        );
+        assert_eq!(
+            direct_failure.account_identifier_hash.as_deref(),
+            Some(account_hash.as_str()),
+            "a transient direct workflow probe must not erase the saved anchor"
+        );
+        assert_eq!(
+            direct_failure.organization_identifier_hash.as_deref(),
+            Some(organization_hash.as_str())
         );
 
         let mut current_full = fresh_slot_status(

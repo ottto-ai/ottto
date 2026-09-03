@@ -12,7 +12,7 @@ subscriptions; two durable connections for the same exact composite are a
 duplicate. A default connection may temporarily shadow a matching durable
 connection without becoming a duplicate registration.
 
-Authenticated local-control protocol v23 exposes every workspace already
+Authenticated local-control protocol v24 exposes every workspace already
 observed in the Codex ID token as a typed `target_coverage.targets` row. Each
 row has a daemon-authored opaque target id, hashed account/workspace identity,
 the provider-supplied workspace title, durability and health, and explicit
@@ -107,7 +107,11 @@ returns an exact launch command for the official `codex login` flow. The user
 completes OpenAI's browser login and workspace selection; Ottto never receives
 or types an email, password, MFA code, cookie, access token, or refresh token.
 
-The setup check accepts the connection only when all of these are true:
+While the provider-owned browser flow is open, Companion polls a nonterminal
+setup check. An incomplete sign-in stays `waiting_for_user_login`; it is not
+converted into a failed connection. As soon as the provider exposes complete
+identity and fresh quota, the same check advances automatically and accepts the
+connection only when all of these are true:
 
 - the signed-in ChatGPT user hash matches the selected target;
 - the active ChatGPT workspace hash matches the selected target;

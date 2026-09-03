@@ -2315,6 +2315,7 @@ fn stable_problem_code_slug(code: &StableProblemCode) -> &'static str {
         StableProblemCode::ConfigDrift => "config_drift",
         StableProblemCode::SecretMissing => "secret_missing",
         StableProblemCode::SecretExpired => "secret_expired",
+        StableProblemCode::AccountConnectionNeedsAttention => "account_connection_needs_attention",
         StableProblemCode::RelayUnavailable => "relay_unavailable",
         StableProblemCode::TelemetryNotVerified => "telemetry_not_verified",
         StableProblemCode::SourceNotInstalled => "source_not_installed",
@@ -3724,6 +3725,27 @@ fn source_health_from_agent_status(
                 retryable: false,
             }],
         ),
+        AgentStatusState::Degraded if snapshot.diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic.code.as_str(),
+                    "claude_registered_slot_needs_attention"
+                        | "codex_registered_slot_needs_attention"
+                )
+            }) => {
+            (
+                SourceState::NeedsConfirmation,
+                HealthGrade::Warning,
+                vec![HealthProblem {
+                    code: StableProblemCode::AccountConnectionNeedsAttention,
+                    title: format!(
+                        "{} durable connections need attention",
+                        source_display_name(&snapshot.source)
+                    ),
+                    detail: "The current login remains available. One or more saved account connections need provider sign-in again.".to_string(),
+                    retryable: true,
+                }],
+            )
+        }
         AgentStatusState::AuthRequired | AgentStatusState::Degraded | AgentStatusState::Unknown => {
             (
                 SourceState::NeedsConfirmation,
@@ -4168,9 +4190,10 @@ fn source_display_name(source: &SourceKind) -> String {
 mod tests {
     use super::*;
     use ottto_protocol::{
-        AccountBindingState, DetectedUseTokenSample, HealthGrade, LocalAccountOrganization,
-        LocalHealthContractFixture, LocalHealthOverallState, LocalHealthSourceState,
-        OperatingSystem, SourceConfigState, SourceState,
+        AccountBindingState, AgentDiagnosticSeverity, AgentStatusDiagnostic,
+        DetectedUseTokenSample, HealthGrade, LocalAccountOrganization, LocalHealthContractFixture,
+        LocalHealthOverallState, LocalHealthSourceState, OperatingSystem, SourceConfigState,
+        SourceState,
     };
     use serial_test::serial;
 
@@ -7340,6 +7363,32 @@ mod tests {
             Some("~/.claude/settings.json")
         );
         assert!(status.sources[0].agent_status.is_some());
+    }
+
+    #[test]
+    fn registered_account_slot_warning_does_not_claim_current_login_is_missing() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut snapshot = available_agent_status(SourceKind::ClaudeCode, "2026-09-03T10:20:00Z");
+        snapshot.status = AgentStatusState::Degraded;
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            "claude_registered_slot_needs_attention",
+            AgentDiagnosticSeverity::Warning,
+            "One saved connection needs attention.",
+        ));
+
+        let state = daemon.inner.lock().expect("state");
+        let health = source_health_from_agent_status(&state, snapshot);
+
+        assert_eq!(health.state, SourceState::NeedsConfirmation);
+        assert_eq!(health.grade, HealthGrade::Warning);
+        assert_eq!(
+            health.problems[0].code,
+            StableProblemCode::AccountConnectionNeedsAttention
+        );
+        assert!(health.problems[0].title.contains("durable connections"));
+        assert!(health.problems[0]
+            .detail
+            .contains("current login remains available"));
     }
 
     #[test]
