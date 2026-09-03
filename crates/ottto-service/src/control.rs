@@ -14730,6 +14730,7 @@ mod tests {
     #[test]
     #[serial]
     fn codex_check_keeps_provider_login_pending_nonterminal() {
+        let _guard = lock_backend_test_env();
         let root = control_test_root("codex-check-pending");
         let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
         let operation_id = "codex_setup_0123456789abcdef0123456789abcdef";
