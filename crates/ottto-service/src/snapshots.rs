@@ -42290,6 +42290,7 @@ mod tests {
             unhealthy_retry_attempt: 0,
             unhealthy_retry_not_before_unix_seconds: None,
             counts,
+            residue: ScanTraversalResidue::default(),
         }
     }
 
