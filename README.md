@@ -650,6 +650,16 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   liveness beat never discloses scan evidence: it is built without access to
   any scan outcome, and a receipt whose declared kind its own payload
   contradicts is refused before it reaches the network.
+  Every scan result also discloses, beside each public loss counter, the share
+  the daemon settled as non-progressing (`last_terminal_*`) and the residue
+  witness as counts only, so a backend can prove class by class that the loss
+  a census discloses is loss no retry can change. A census that completed with
+  only such settled residue is reported as a success — `last_success_at` set,
+  zero consecutive failures — under the named code `census_residue`, but only
+  once the backend's activity hint advertises
+  `census_residue_status_contract: census_residue_status:v1`; until then the
+  receipt keeps the legacy `parse_error` shape and still carries the additive
+  counters.
   Schema-v5 activity buckets are generated from timestamped local usage events:
   Codex cumulative usage rows without explicit request totals count as one
   observed activity event, and top-level snapshot `request_count` matches the

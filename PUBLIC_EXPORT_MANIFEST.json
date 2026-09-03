@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 350,
-  "content_sha256": "9ea037fddc7a63511f02e6aaee3ad3b4d5dfee8d325ecba9d7930077d4691329",
+  "candidate_file_count": 352,
+  "content_sha256": "f5a835f134681c671e30582bdc751cacf4ecb8da20602323b33d15e09f34af19",
   "files": [
     {
       "executable": false,
@@ -76,8 +76,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "4aa30755e02e6744fc428e452028f72c69b4ae75d1fe4a77ad1184b2545bd8f3",
-      "size_bytes": 50875
+      "sha256": "153728654a128e1ba3380e85700aa77f62ee49775a84ef5defeccaf37849cff3",
+      "size_bytes": 51560
     },
     {
       "executable": false,
@@ -860,15 +860,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "0507ed7bdb57379d82b5bf06e1c8e93578d66622a3ce6c5f93468965940e7d36",
-      "size_bytes": 133615
+      "sha256": "7f349c280ecad67809db29ef5cdb9c571f241be1baf717460620fda9f33fed98",
+      "size_bytes": 145184
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "80c10207c7f2f87373316d5b74bccdc255fb2694d8926c3689c074911d3c6cae",
-      "size_bytes": 426460
+      "sha256": "5c0da8f994549a26a4f1d868cda3c09c786e3a43042985f7bc8c499fafc97939",
+      "size_bytes": 454433
     },
     {
       "executable": false,
@@ -881,8 +881,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "c97135a3bf674eb68baccf907c110282bbb30544adc6d692a7f2d085489f7ec7",
-      "size_bytes": 1811831
+      "sha256": "5359aa07e08f785890a27172d4b2f141ef245e8b97624db93218bba0235ad0a3",
+      "size_bytes": 1816490
     },
     {
       "executable": false,
@@ -1531,6 +1531,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-09-03-census-residue-wire.md",
+      "sha256": "cbc41a889d39d7ef137c54237e137bf3ce55560bc07e42cc7dd29dd9431c56fd",
+      "size_bytes": 8296
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-09-03-non-progressing-census-residue.md",
       "sha256": "45a73c7bacce490e028dbda70da8e11d847682d5283add85fd9db65cb3d28af0",
       "size_bytes": 9201
@@ -1842,6 +1849,13 @@
       "path": "fixtures/cli/watch-without-json-error.json",
       "sha256": "187f995fedaa87fbb1073758de3690b9b29fc6479fca114d17abf756cc72ffcd",
       "size_bytes": 136
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/collector-status/census-residue-scan-status-v1.json",
+      "sha256": "5b572f8cc854aa5adc52508b0bf237b143eec223b2f3e62f8973bbae223d2118",
+      "size_bytes": 2381
     },
     {
       "executable": false,
@@ -2453,9 +2467,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-03T05:01:36+00:00",
+  "generated_at": "2026-09-03T05:22:46+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 351,
+  "output_file_count": 353,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2489,5 +2503,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "978e280c2c3da270cb40e8e39413baa4e641c173"
+  "source_commit": "3bac92f9a904bb9e5b0584230e0312e9f703fa8a"
 }

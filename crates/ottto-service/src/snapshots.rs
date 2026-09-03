@@ -2635,6 +2635,25 @@ pub struct SourceScanResult {
     pub zero_snapshot_confirmed_count: usize,
     pub zero_snapshot_usage_evidence_count: usize,
     pub dropped_usage_record_count: u64,
+    /// The generation's SETTLED share of each public loss counter above
+    /// (`ScanTraversalCounts::terminal_*`): loss that carries a durable
+    /// terminal disposition or was settled as non-progressing once discovery
+    /// finished without a retryable problem. Each is a decomposition of the
+    /// public counter it is named after, never an addend, so `terminal <=
+    /// public` always holds; equality in every class is what lets a receipt
+    /// prove that all the loss it discloses is loss no retry can change.
+    pub terminal_ownership_incomplete_file_count: usize,
+    pub terminal_zero_snapshot_usage_evidence_count: usize,
+    pub terminal_recognized_usage_drop_count: usize,
+    pub terminal_dropped_usage_record_count: u64,
+    pub terminal_over_line_cap_count: usize,
+    /// Cardinalities of the residue witness this generation recorded
+    /// (`ScanIndex::scan_residue_witness`), counts only. All zero when the
+    /// generation did not complete (the durable witness then describes an
+    /// earlier census, not this scan) and when it completed clean.
+    pub census_residue_index_key_count: usize,
+    pub census_residue_archived_rollout_count: usize,
+    pub census_residue_blocked_session_count: usize,
     pub snapshots: Vec<SnapshotItem>,
     pending_finalization: Vec<PendingIndexFinalization>,
 }
@@ -10581,6 +10600,29 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
     let zero_snapshot_confirmed_count = index.confirmed_empty_files.len();
     let zero_snapshot_usage_evidence_count = counts.zero_snapshot_usage_evidence_count;
     let dropped_usage_record_count = counts.dropped_usage_record_count;
+    // The witness just recorded above describes THIS generation only when the
+    // generation completed; otherwise the durable one is an earlier census's
+    // and must not be reported as this scan's evidence. Counts only: the
+    // witness's index keys and session ids never leave the local index.
+    let (
+        census_residue_index_key_count,
+        census_residue_archived_rollout_count,
+        census_residue_blocked_session_count,
+    ) = if raw_census_complete {
+        index
+            .scan_residue_witness
+            .as_ref()
+            .map(|witness| {
+                (
+                    witness.index_keys.len(),
+                    witness.archived_residue_file_count(),
+                    witness.codex_state_only_blocked_session_ids.len(),
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        (0, 0, 0)
+    };
     if !context_curve_enabled {
         for snapshot in &mut snapshots {
             snapshot.context_curve = None;
@@ -10613,6 +10655,15 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         zero_snapshot_confirmed_count,
         zero_snapshot_usage_evidence_count,
         dropped_usage_record_count,
+        terminal_ownership_incomplete_file_count: counts.terminal_ownership_incomplete_file_count,
+        terminal_zero_snapshot_usage_evidence_count: counts
+            .terminal_zero_snapshot_usage_evidence_count,
+        terminal_recognized_usage_drop_count: counts.terminal_recognized_usage_drop_count,
+        terminal_dropped_usage_record_count: counts.terminal_dropped_usage_record_count,
+        terminal_over_line_cap_count: counts.terminal_over_line_cap_count,
+        census_residue_index_key_count,
+        census_residue_archived_rollout_count,
+        census_residue_blocked_session_count,
         snapshots,
         pending_finalization,
     })
@@ -23333,6 +23384,13 @@ mod tests {
         assert!(!first.census_complete);
         assert!(first.scan_cap_hit);
         assert!(index.scan_residue_witness.is_none());
+        // The receipt-facing view of the same veto: the loss is disclosed,
+        // none of it is terminal, and no witness counts describe this scan.
+        assert_eq!(first.terminal_ownership_incomplete_file_count, 0);
+        assert_eq!(first.terminal_dropped_usage_record_count, 0);
+        assert_eq!(first.census_residue_index_key_count, 0);
+        assert_eq!(first.census_residue_archived_rollout_count, 0);
+        assert_eq!(first.census_residue_blocked_session_count, 0);
         let now = rfc3339_unix_seconds(started).expect("fixture clock");
         {
             let traversal = index.traversal.as_ref().expect("red witness stays durable");
@@ -23616,6 +23674,27 @@ mod tests {
         .expect("scan archived and active residue");
         assert!(scan.census_complete, "{scan:#?}");
         assert_eq!(scan.ownership_incomplete_file_count, 2);
+        // What the terminal receipt will read off this scan: every disclosed
+        // loss class equals its settled counterpart, and the witness is
+        // reported as counts only (two residue keys, one under an archived
+        // root, two sessions held out of the fallback).
+        assert_eq!(scan.terminal_ownership_incomplete_file_count, 2);
+        assert_eq!(
+            scan.terminal_zero_snapshot_usage_evidence_count,
+            scan.zero_snapshot_usage_evidence_count
+        );
+        assert_eq!(
+            scan.terminal_recognized_usage_drop_count,
+            scan.recognized_usage_drop_count
+        );
+        assert_eq!(
+            scan.terminal_dropped_usage_record_count,
+            scan.dropped_usage_record_count
+        );
+        assert_eq!(scan.terminal_over_line_cap_count, scan.over_line_cap_count);
+        assert_eq!(scan.census_residue_index_key_count, 2);
+        assert_eq!(scan.census_residue_archived_rollout_count, 1);
+        assert_eq!(scan.census_residue_blocked_session_count, 2);
         let emitted = scan
             .snapshots
             .iter()
@@ -23691,6 +23770,12 @@ mod tests {
         assert!(resolved.census_complete, "{resolved:#?}");
         assert_eq!(resolved.ownership_incomplete_file_count, 0);
         assert_eq!(resolved.dropped_usage_record_count, 0);
+        // A clean census reports no settled share and no witness counts.
+        assert_eq!(resolved.terminal_ownership_incomplete_file_count, 0);
+        assert_eq!(resolved.terminal_dropped_usage_record_count, 0);
+        assert_eq!(resolved.census_residue_index_key_count, 0);
+        assert_eq!(resolved.census_residue_archived_rollout_count, 0);
+        assert_eq!(resolved.census_residue_blocked_session_count, 0);
         let emitted = resolved
             .snapshots
             .iter()

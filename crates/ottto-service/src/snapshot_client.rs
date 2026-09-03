@@ -545,6 +545,17 @@ pub struct ActivityHintResponse {
     /// emits curves that the server cannot durably acknowledge.
     #[serde(default)]
     pub session_context_curve_contract: Option<String>,
+    /// Backend admission of the `census_residue` collector error code
+    /// (`CENSUS_RESIDUE_STATUS_CONTRACT`). The backend's error-code set is a
+    /// closed list and its forward tolerance covers unknown FIELDS, never
+    /// unknown VALUES, so a daemon that emitted the code against a backend
+    /// which does not admit it would have its ENTIRE terminal receipt rejected
+    /// — no journal append, no census counters, no manifest. Missing / null /
+    /// any other token is fail-closed: the receipt keeps the legacy
+    /// `parse_error` shape and still carries the additive residue counters,
+    /// which every backend accepts.
+    #[serde(default)]
+    pub census_residue_status_contract: Option<String>,
     pub recommended_scan_after: String,
 }
 
@@ -947,6 +958,18 @@ pub enum SnapshotStatusReportKind {
     ScanStatus,
 }
 
+/// Activity-hint token under which the backend admits `census_residue` as a
+/// collector error code and declares the residue counters beside it. Compared
+/// exactly; a different version, `null`, or an absent field keeps the legacy
+/// receipt shape.
+pub const CENSUS_RESIDUE_STATUS_CONTRACT: &str = "census_residue_status:v1";
+
+/// Collector error code for a census that COMPLETED and whose every disclosed
+/// loss class is exactly the loss the daemon settled as non-progressing. Not a
+/// failure: the receipt carrying it also carries `last_success_at` and zero
+/// consecutive failures. Emitted only under `CENSUS_RESIDUE_STATUS_CONTRACT`.
+pub const CENSUS_RESIDUE_ERROR_CODE: &str = "census_residue";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotStatusRequest {
     pub schema_version: u16,
@@ -1004,6 +1027,45 @@ pub struct SnapshotStatusRequest {
     pub last_invalid_utf8_line_count: u64,
     pub last_over_line_cap_count: u64,
     pub last_recognized_usage_drop_count: u64,
+    /// The daemon's own SETTLED, non-progressing share of each public loss
+    /// counter above (`ScanTraversalCounts::terminal_*`): the part of the loss
+    /// it proved a later traversal of the same bytes cannot change. Each is a
+    /// DECOMPOSITION of the public counter it is named after, never an addend
+    /// beside it, so `terminal <= public` always holds and a completed census
+    /// may legitimately carry a nonzero value. A backend can therefore prove
+    /// class by class, by equality, that every loss a receipt discloses is
+    /// exactly the loss the daemon settled — instead of taking an opaque error
+    /// code on faith. Additive: a backend that predates them ignores them.
+    /// `#[serde(default)]` so a terminal-status journal written by an older
+    /// daemon still reloads.
+    #[serde(default)]
+    pub last_terminal_ownership_incomplete_file_count: u64,
+    #[serde(default)]
+    pub last_terminal_zero_snapshot_usage_evidence_count: u64,
+    #[serde(default)]
+    pub last_terminal_recognized_usage_drop_count: u64,
+    #[serde(default)]
+    pub last_terminal_dropped_usage_record_count: u64,
+    #[serde(default)]
+    pub last_terminal_over_line_cap_count: u64,
+    /// True when this receipt's census completed with disclosed loss and every
+    /// nonzero loss class equals its terminal counterpart above: the residue
+    /// was settled as non-progressing this generation. False on a clean census
+    /// (nothing to settle), on an incomplete one, and whenever a retryable
+    /// problem or an unsettled class remains. Sent regardless of whether the
+    /// backend admits `census_residue`, so the disclosure is journaled even
+    /// while the error code still reads `parse_error`.
+    #[serde(default)]
+    pub last_census_residue_settled: bool,
+    /// Cardinalities of the local residue witness, COUNTS ONLY. The witness
+    /// itself holds local filesystem index keys and Codex session ids; neither
+    /// ever reaches the wire.
+    #[serde(default)]
+    pub last_census_residue_index_key_count: u64,
+    #[serde(default)]
+    pub last_census_residue_archived_rollout_count: u64,
+    #[serde(default)]
+    pub last_census_residue_blocked_session_count: u64,
     pub consecutive_failures: u64,
     pub next_retry_at: Option<String>,
     pub collector_version: Option<String>,
@@ -1070,6 +1132,15 @@ impl SnapshotStatusRequest {
             last_invalid_utf8_line_count,
             last_over_line_cap_count,
             last_recognized_usage_drop_count,
+            last_terminal_ownership_incomplete_file_count,
+            last_terminal_zero_snapshot_usage_evidence_count,
+            last_terminal_recognized_usage_drop_count,
+            last_terminal_dropped_usage_record_count,
+            last_terminal_over_line_cap_count,
+            last_census_residue_settled,
+            last_census_residue_index_key_count,
+            last_census_residue_archived_rollout_count,
+            last_census_residue_blocked_session_count,
             consecutive_failures,
             next_retry_at,
             // Build identity, unrelated to any scan.
@@ -1116,6 +1187,10 @@ impl SnapshotStatusRequest {
         // backend's own `model_fields_set` rule: present means declared.
         if last_census_complete.is_some() {
             return Some("last_census_complete");
+        }
+        // Settled residue is a census verdict; only a scan result can claim it.
+        if *last_census_residue_settled {
+            return Some("last_census_residue_settled");
         }
         for (name, value) in [
             ("last_uploaded_count", *last_uploaded_count),
@@ -1168,6 +1243,38 @@ impl SnapshotStatusRequest {
             (
                 "last_recognized_usage_drop_count",
                 *last_recognized_usage_drop_count,
+            ),
+            (
+                "last_terminal_ownership_incomplete_file_count",
+                *last_terminal_ownership_incomplete_file_count,
+            ),
+            (
+                "last_terminal_zero_snapshot_usage_evidence_count",
+                *last_terminal_zero_snapshot_usage_evidence_count,
+            ),
+            (
+                "last_terminal_recognized_usage_drop_count",
+                *last_terminal_recognized_usage_drop_count,
+            ),
+            (
+                "last_terminal_dropped_usage_record_count",
+                *last_terminal_dropped_usage_record_count,
+            ),
+            (
+                "last_terminal_over_line_cap_count",
+                *last_terminal_over_line_cap_count,
+            ),
+            (
+                "last_census_residue_index_key_count",
+                *last_census_residue_index_key_count,
+            ),
+            (
+                "last_census_residue_archived_rollout_count",
+                *last_census_residue_archived_rollout_count,
+            ),
+            (
+                "last_census_residue_blocked_session_count",
+                *last_census_residue_blocked_session_count,
             ),
             ("consecutive_failures", *consecutive_failures),
         ] {
@@ -2349,6 +2456,63 @@ mod tests {
         );
     }
 
+    /// The `census_residue` admission follows the same fail-closed contract
+    /// shape as the curve capability: absent, null, and any other token all
+    /// read as "not admitted", and only the exact token admits.
+    #[test]
+    fn census_residue_status_admission_defaults_off_and_requires_exact_contract() {
+        let old_backend: ActivityHintResponse =
+            serde_json::from_str(&activity_hint_json("")).expect("old activity hint");
+        assert_eq!(old_backend.census_residue_status_contract, None);
+
+        let explicit_null: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+            r#", "census_residue_status_contract":null"#,
+        ))
+        .expect("null admission");
+        assert_eq!(explicit_null.census_residue_status_contract, None);
+
+        let admitted: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+            r#", "census_residue_status_contract":"census_residue_status:v1""#,
+        ))
+        .expect("residue-admitting activity hint");
+        assert_eq!(
+            admitted.census_residue_status_contract.as_deref(),
+            Some(CENSUS_RESIDUE_STATUS_CONTRACT)
+        );
+        assert_eq!(CENSUS_RESIDUE_STATUS_CONTRACT, "census_residue_status:v1");
+        assert_eq!(CENSUS_RESIDUE_ERROR_CODE, "census_residue");
+    }
+
+    /// An older daemon's terminal-status journal predates the residue fields.
+    /// It must still reload — with the residue absent, not as a parse error —
+    /// so a daemon upgrade never strands the last committed receipt.
+    #[test]
+    fn a_journaled_receipt_without_residue_fields_reloads_with_them_absent() {
+        let mut committed = serde_json::to_value(clean_checkin_request()).expect("receipt JSON");
+        let body = committed.as_object_mut().expect("object");
+        for name in [
+            "last_terminal_ownership_incomplete_file_count",
+            "last_terminal_zero_snapshot_usage_evidence_count",
+            "last_terminal_recognized_usage_drop_count",
+            "last_terminal_dropped_usage_record_count",
+            "last_terminal_over_line_cap_count",
+            "last_census_residue_settled",
+            "last_census_residue_index_key_count",
+            "last_census_residue_archived_rollout_count",
+            "last_census_residue_blocked_session_count",
+        ] {
+            assert!(body.remove(name).is_some(), "{name} is on the wire");
+        }
+        let reloaded: SnapshotStatusRequest =
+            serde_json::from_value(committed).expect("a pre-residue journal reloads");
+        assert!(!reloaded.last_census_residue_settled);
+        assert_eq!(reloaded.last_terminal_dropped_usage_record_count, 0);
+        assert_eq!(reloaded.last_census_residue_index_key_count, 0);
+        reloaded
+            .validate_declared_report_kind()
+            .expect("the reloaded beat is still truthful");
+    }
+
     #[test]
     fn activity_hint_requires_a_unsigned_backfill_window() {
         let missing = activity_hint_json("").replace("\"backfill_window_days\":183,", "");
@@ -2653,6 +2817,15 @@ mod tests {
             last_invalid_utf8_line_count: 0,
             last_over_line_cap_count: 0,
             last_recognized_usage_drop_count: 0,
+            last_terminal_ownership_incomplete_file_count: 0,
+            last_terminal_zero_snapshot_usage_evidence_count: 0,
+            last_terminal_recognized_usage_drop_count: 0,
+            last_terminal_dropped_usage_record_count: 0,
+            last_terminal_over_line_cap_count: 0,
+            last_census_residue_settled: false,
+            last_census_residue_index_key_count: 0,
+            last_census_residue_archived_rollout_count: 0,
+            last_census_residue_blocked_session_count: 0,
             consecutive_failures: 0,
             next_retry_at: None,
             collector_version: Some("0.1.123".to_string()),
@@ -2810,6 +2983,45 @@ mod tests {
                 "last_recognized_usage_drop_count",
                 Box::new(|r| r.last_recognized_usage_drop_count = 1),
             ),
+            // The settled-residue counters and verdict are census evidence
+            // like the loss counters they decompose; a beat measured none of
+            // it.
+            (
+                "last_terminal_ownership_incomplete_file_count",
+                Box::new(|r| r.last_terminal_ownership_incomplete_file_count = 1),
+            ),
+            (
+                "last_terminal_zero_snapshot_usage_evidence_count",
+                Box::new(|r| r.last_terminal_zero_snapshot_usage_evidence_count = 1),
+            ),
+            (
+                "last_terminal_recognized_usage_drop_count",
+                Box::new(|r| r.last_terminal_recognized_usage_drop_count = 1),
+            ),
+            (
+                "last_terminal_dropped_usage_record_count",
+                Box::new(|r| r.last_terminal_dropped_usage_record_count = 1),
+            ),
+            (
+                "last_terminal_over_line_cap_count",
+                Box::new(|r| r.last_terminal_over_line_cap_count = 1),
+            ),
+            (
+                "last_census_residue_settled",
+                Box::new(|r| r.last_census_residue_settled = true),
+            ),
+            (
+                "last_census_residue_index_key_count",
+                Box::new(|r| r.last_census_residue_index_key_count = 1),
+            ),
+            (
+                "last_census_residue_archived_rollout_count",
+                Box::new(|r| r.last_census_residue_archived_rollout_count = 1),
+            ),
+            (
+                "last_census_residue_blocked_session_count",
+                Box::new(|r| r.last_census_residue_blocked_session_count = 1),
+            ),
             (
                 "consecutive_failures",
                 Box::new(|r| r.consecutive_failures = 1),
@@ -2898,6 +3110,15 @@ mod tests {
             last_invalid_utf8_line_count: 6,
             last_over_line_cap_count: 7,
             last_recognized_usage_drop_count: 8,
+            last_terminal_ownership_incomplete_file_count: 0,
+            last_terminal_zero_snapshot_usage_evidence_count: 0,
+            last_terminal_recognized_usage_drop_count: 0,
+            last_terminal_dropped_usage_record_count: 0,
+            last_terminal_over_line_cap_count: 7,
+            last_census_residue_settled: false,
+            last_census_residue_index_key_count: 0,
+            last_census_residue_archived_rollout_count: 0,
+            last_census_residue_blocked_session_count: 0,
             consecutive_failures: 1,
             next_retry_at: None,
             collector_version: Some("0.1.0".to_string()),
@@ -2960,6 +3181,15 @@ mod tests {
             last_invalid_utf8_line_count: 0,
             last_over_line_cap_count: 0,
             last_recognized_usage_drop_count: 0,
+            last_terminal_ownership_incomplete_file_count: 0,
+            last_terminal_zero_snapshot_usage_evidence_count: 0,
+            last_terminal_recognized_usage_drop_count: 0,
+            last_terminal_dropped_usage_record_count: 0,
+            last_terminal_over_line_cap_count: 0,
+            last_census_residue_settled: false,
+            last_census_residue_index_key_count: 0,
+            last_census_residue_archived_rollout_count: 0,
+            last_census_residue_blocked_session_count: 0,
             consecutive_failures: 0,
             next_retry_at: None,
             collector_version: Some("0.1.120".to_string()),

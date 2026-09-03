@@ -14,7 +14,8 @@ use crate::snapshot_client::{
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
     LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
     RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusReportKind,
-    SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
+    SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed, CENSUS_RESIDUE_ERROR_CODE,
+    CENSUS_RESIDUE_STATUS_CONTRACT,
 };
 use crate::snapshots::{
     apply_upload_policy, collector_version, context_curve_derivation_revision,
@@ -962,10 +963,77 @@ struct SyncCounts {
     zero_snapshot_confirmed_count: u64,
     zero_snapshot_usage_evidence_count: u64,
     dropped_usage_record_count: u64,
+    /// The scan's settled share of each public loss counter above; see
+    /// `SourceScanResult`. `terminal <= public` in every class.
+    terminal_ownership_incomplete_file_count: u64,
+    terminal_zero_snapshot_usage_evidence_count: u64,
+    terminal_recognized_usage_drop_count: u64,
+    terminal_dropped_usage_record_count: u64,
+    terminal_over_line_cap_count: u64,
+    /// Residue witness cardinalities, counts only.
+    census_residue_index_key_count: u64,
+    census_residue_archived_rollout_count: u64,
+    census_residue_blocked_session_count: u64,
     uploaded_count: u64,
 }
 
+/// How the loss a completed cycle discloses reads on its terminal receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisclosedLoss {
+    /// No ownership-incomplete file, no usage evidence without an entity, no
+    /// dropped usage record.
+    None,
+    /// The census completed, no retryable problem remains, and every loss
+    /// class equals its terminal counterpart: the receipt can prove, class by
+    /// class, that all the loss it discloses is loss no retry can change.
+    Terminal,
+    /// Loss the daemon has not proved non-progressing: an incomplete census,
+    /// a retryable problem beside the residue, or a class it has not settled.
+    Unsettled,
+}
+
 impl SyncCounts {
+    /// Loss a later traversal can still change. Mirrors
+    /// `ScanTraversalCounts::has_retryable_problems` on the receipt's own
+    /// counters so the receipt can never claim a settled residue the scan did
+    /// not: a walk that could not enter, open, read, or parse something may
+    /// simply not have seen the file that would resolve a fork.
+    fn has_retryable_problems(&self) -> bool {
+        self.symlink_rejected_count > 0
+            || self.unreadable_path_count > 0
+            || self.oversized_file_count > 0
+            || self.disappeared_file_count > 0
+            || self.malformed_json_line_count > 0
+            || self.invalid_utf8_line_count > 0
+            || self.over_line_cap_count > self.terminal_over_line_cap_count
+    }
+
+    /// The loss classes that have always turned a successful cycle's receipt
+    /// into a `parse_error`. Unchanged, so the legacy shape is byte-identical.
+    fn has_disclosed_loss(&self) -> bool {
+        self.ownership_incomplete_file_count > 0
+            || self.zero_snapshot_usage_evidence_count > 0
+            || self.dropped_usage_record_count > 0
+    }
+
+    fn disclosed_loss(&self) -> DisclosedLoss {
+        if !self.has_disclosed_loss() {
+            return DisclosedLoss::None;
+        }
+        let every_class_terminal = self.ownership_incomplete_file_count
+            == self.terminal_ownership_incomplete_file_count
+            && self.zero_snapshot_usage_evidence_count
+                == self.terminal_zero_snapshot_usage_evidence_count
+            && self.recognized_usage_drop_count == self.terminal_recognized_usage_drop_count
+            && self.dropped_usage_record_count == self.terminal_dropped_usage_record_count
+            && self.over_line_cap_count == self.terminal_over_line_cap_count;
+        if self.census_complete && !self.has_retryable_problems() && every_class_terminal {
+            DisclosedLoss::Terminal
+        } else {
+            DisclosedLoss::Unsettled
+        }
+    }
+
     fn for_policy(backfill_window_days: u64) -> Self {
         Self {
             backfill_window_days,
@@ -1008,6 +1076,21 @@ impl SyncCounts {
             zero_snapshot_usage_evidence_count: scan_result.zero_snapshot_usage_evidence_count
                 as u64,
             dropped_usage_record_count: scan_result.dropped_usage_record_count,
+            terminal_ownership_incomplete_file_count: scan_result
+                .terminal_ownership_incomplete_file_count
+                as u64,
+            terminal_zero_snapshot_usage_evidence_count: scan_result
+                .terminal_zero_snapshot_usage_evidence_count
+                as u64,
+            terminal_recognized_usage_drop_count: scan_result.terminal_recognized_usage_drop_count
+                as u64,
+            terminal_dropped_usage_record_count: scan_result.terminal_dropped_usage_record_count,
+            terminal_over_line_cap_count: scan_result.terminal_over_line_cap_count as u64,
+            census_residue_index_key_count: scan_result.census_residue_index_key_count as u64,
+            census_residue_archived_rollout_count: scan_result.census_residue_archived_rollout_count
+                as u64,
+            census_residue_blocked_session_count: scan_result.census_residue_blocked_session_count
+                as u64,
             uploaded_count,
         }
     }
@@ -1019,6 +1102,13 @@ impl SyncCounts {
         // also contribute to the established incomplete-evidence health scalar.
         self.ownership_incomplete_file_count = self
             .ownership_incomplete_file_count
+            .saturating_add(self.snapshot_unproven_terminal_count);
+        // They are terminal by disposition (the bounded reconstruction ladder
+        // is exhausted), so the settled share grows by exactly the same
+        // number: the ownership-incomplete class stays matched, and the
+        // receipt keeps `terminal <= public`.
+        self.terminal_ownership_incomplete_file_count = self
+            .terminal_ownership_incomplete_file_count
             .saturating_add(self.snapshot_unproven_terminal_count);
         self
     }
@@ -3692,8 +3782,10 @@ fn source_kind(source: SnapshotSource) -> SourceKind {
 fn collector_status_request(
     destination_namespace: &str,
     status: CollectorStatus<'_>,
+    census_residue_status_admitted: bool,
 ) -> Result<SnapshotStatusRequest> {
     let finished_at = current_rfc3339();
+    let disclosed_loss = status.counts.disclosed_loss();
     let (
         enabled,
         disabled_reason,
@@ -3702,20 +3794,37 @@ fn collector_status_request(
         consecutive_failures,
         terminal_succeeded,
     ) = match status.state {
+        // A census that completed and whose every disclosed loss class is
+        // exactly the loss the daemon settled as non-progressing. The scan
+        // succeeded: the clock binds (`last_success_at`), nothing is retried,
+        // and the code still names the residue so a consumer that needs a
+        // fully clean receipt sees that loss was disclosed. Only under the
+        // backend's explicit admission — its error-code set is closed, and an
+        // unadmitted code would have the whole receipt rejected.
         CollectorState::Success
-            if status.counts.ownership_incomplete_file_count > 0
-                || status.counts.zero_snapshot_usage_evidence_count > 0
-                || status.counts.dropped_usage_record_count > 0 =>
+            if disclosed_loss == DisclosedLoss::Terminal && census_residue_status_admitted =>
         {
             (
                 true,
                 None,
-                Some("parse_error".to_string()),
-                Some("local usage evidence produced no session snapshot".to_string()),
-                1,
-                false,
+                Some(CENSUS_RESIDUE_ERROR_CODE.to_string()),
+                Some(census_residue_message(&status.counts)),
+                0,
+                true,
             )
         }
+        // Loss the daemon has not proved non-progressing — or settled residue
+        // that a backend predating the admission can only read in this legacy
+        // shape. Byte-identical to every released daemon apart from the
+        // additive residue counters, which such a backend ignores.
+        CollectorState::Success if disclosed_loss != DisclosedLoss::None => (
+            true,
+            None,
+            Some("parse_error".to_string()),
+            Some("local usage evidence produced no session snapshot".to_string()),
+            1,
+            false,
+        ),
         CollectorState::Success => (true, None, None, None, 0, true),
         CollectorState::PolicyTombstone => (true, None, None, None, 0, false),
         CollectorState::Disabled(disabled_reason) => (false, disabled_reason, None, None, 0, false),
@@ -3783,6 +3892,33 @@ fn collector_status_request(
         last_invalid_utf8_line_count: status.counts.invalid_utf8_line_count,
         last_over_line_cap_count: status.counts.over_line_cap_count,
         last_recognized_usage_drop_count: status.counts.recognized_usage_drop_count,
+        // Always sent, whichever error code the receipt carries: the settled
+        // shares are scan evidence like the counters they decompose, and a
+        // backend that declares them journals the disclosure even while the
+        // code still reads `parse_error`. A backend that predates them ignores
+        // them.
+        last_terminal_ownership_incomplete_file_count: status
+            .counts
+            .terminal_ownership_incomplete_file_count,
+        last_terminal_zero_snapshot_usage_evidence_count: status
+            .counts
+            .terminal_zero_snapshot_usage_evidence_count,
+        last_terminal_recognized_usage_drop_count: status
+            .counts
+            .terminal_recognized_usage_drop_count,
+        last_terminal_dropped_usage_record_count: status.counts.terminal_dropped_usage_record_count,
+        last_terminal_over_line_cap_count: status.counts.terminal_over_line_cap_count,
+        // A census verdict, so it is a function of the counts alone and not of
+        // the admission: true exactly when every disclosed loss class was
+        // settled this generation.
+        last_census_residue_settled: disclosed_loss == DisclosedLoss::Terminal,
+        last_census_residue_index_key_count: status.counts.census_residue_index_key_count,
+        last_census_residue_archived_rollout_count: status
+            .counts
+            .census_residue_archived_rollout_count,
+        last_census_residue_blocked_session_count: status
+            .counts
+            .census_residue_blocked_session_count,
         consecutive_failures,
         next_retry_at: None,
         collector_version: Some(collector_version()),
@@ -3792,6 +3928,23 @@ fn collector_status_request(
     Ok(request)
 }
 
+/// The residue a `census_residue` receipt names: classes and settled counts
+/// only. Never a path, an index key, or a session id — the backend rejects a
+/// path-shaped message outright, and the witness identifiers stay in the local
+/// index.
+fn census_residue_message(counts: &SyncCounts) -> String {
+    format!(
+        "census completed with settled non-progressing residue: \
+         ownership_incomplete_files={}, zero_snapshot_usage_evidence_files={}, \
+         recognized_usage_drops={}, dropped_usage_records={}, over_line_cap_lines={}",
+        counts.terminal_ownership_incomplete_file_count,
+        counts.terminal_zero_snapshot_usage_evidence_count,
+        counts.terminal_recognized_usage_drop_count,
+        counts.terminal_dropped_usage_record_count,
+        counts.terminal_over_line_cap_count,
+    )
+}
+
 #[cfg(test)]
 fn report_status(
     client: &SnapshotApiClient,
@@ -3799,14 +3952,38 @@ fn report_status(
     destination_namespace: &str,
     status: CollectorStatus<'_>,
 ) -> Result<()> {
-    let request = collector_status_request(destination_namespace, status)?;
+    let request = collector_status_request(destination_namespace, status, false)?;
     client.report_status(relay_token, &request)?;
     Ok(())
 }
 
-fn current_receipt_window_days(client: &SnapshotApiClient, relay_token: &str) -> Result<u64> {
+/// What the server's activity hint decides for a terminal receipt: the
+/// evidence width, and whether the backend admits the `census_residue` code.
+#[derive(Debug, Clone, Copy)]
+struct TerminalReceiptPolicy {
+    receipt_window_days: u64,
+    /// Exact match on `CENSUS_RESIDUE_STATUS_CONTRACT`, fail-closed: absent,
+    /// null, and any other token keep the legacy receipt shape. The backend's
+    /// error-code set is closed, so this is what keeps a daemon from having
+    /// its entire terminal receipt rejected by a backend that predates the
+    /// admission — whatever order the two are deployed in.
+    census_residue_status_admitted: bool,
+}
+
+fn current_terminal_receipt_policy(
+    client: &SnapshotApiClient,
+    relay_token: &str,
+) -> Result<TerminalReceiptPolicy> {
     let activity_hint = client.get_activity_hint(relay_token)?;
-    validated_receipt_window_days(activity_hint.backfill_window_days)
+    Ok(TerminalReceiptPolicy {
+        receipt_window_days: validated_receipt_window_days(activity_hint.backfill_window_days)?,
+        census_residue_status_admitted: activity_hint.census_residue_status_contract.as_deref()
+            == Some(CENSUS_RESIDUE_STATUS_CONTRACT),
+    })
+}
+
+fn current_receipt_window_days(client: &SnapshotApiClient, relay_token: &str) -> Result<u64> {
+    Ok(current_terminal_receipt_policy(client, relay_token)?.receipt_window_days)
 }
 
 fn refresh_terminal_manifest(
@@ -3900,8 +4077,13 @@ fn report_status_with_fresh_relay_token(
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     // This is the single terminal report boundary. Every terminal outcome
     // reacquires its width here, after scanning/uploading and immediately
-    // before deriving both the manifest and status scalar from that same hint.
-    let receipt_window_days = current_receipt_window_days(client, &relay_token)?;
+    // before deriving both the manifest and status scalar from that same hint
+    // — and reads the residue admission off the same hint, so the receipt
+    // shape and the width are decided by one server answer.
+    let TerminalReceiptPolicy {
+        receipt_window_days,
+        census_residue_status_admitted,
+    } = current_terminal_receipt_policy(client, &relay_token)?;
     let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
     status.counts.backfill_window_days = receipt_window_days;
     if receipt_window_days == 0 {
@@ -3915,7 +4097,11 @@ fn report_status_with_fresh_relay_token(
         receipt_window_days,
         manifest_source,
     )?;
-    let request = collector_status_request(&destination_namespace, status)?;
+    let request = collector_status_request(
+        &destination_namespace,
+        status,
+        census_residue_status_admitted,
+    )?;
     let journal_path = terminal_status_journal_path(support_dir, &destination_namespace, source);
     // Commit the exact typed receipt before it can reach the backend. A later
     // cycle-start or heartbeat therefore repeats one coherent scan result
@@ -4034,6 +4220,16 @@ fn report_checkin_status(
         last_invalid_utf8_line_count: 0,
         last_over_line_cap_count: 0,
         last_recognized_usage_drop_count: 0,
+        // Census evidence like the loss counters above; a beat measured none.
+        last_terminal_ownership_incomplete_file_count: 0,
+        last_terminal_zero_snapshot_usage_evidence_count: 0,
+        last_terminal_recognized_usage_drop_count: 0,
+        last_terminal_dropped_usage_record_count: 0,
+        last_terminal_over_line_cap_count: 0,
+        last_census_residue_settled: false,
+        last_census_residue_index_key_count: 0,
+        last_census_residue_archived_rollout_count: 0,
+        last_census_residue_blocked_session_count: 0,
         consecutive_failures: 0,
         next_retry_at: None,
         collector_version: Some(collector_version()),
@@ -5519,6 +5715,9 @@ mod tests {
         let disclosed = SyncCounts::default().with_snapshot_terminal_counts(&terminal_index);
         assert_eq!(disclosed.snapshot_unproven_terminal_count, 1);
         assert_eq!(disclosed.ownership_incomplete_file_count, 1);
+        // Terminal by disposition, so the settled share grows by the same
+        // number and the ownership-incomplete class stays matched.
+        assert_eq!(disclosed.terminal_ownership_incomplete_file_count, 1);
 
         let fifth = upload_resumable_batches_with_body_witness(
             std::slice::from_ref(&item),
@@ -8389,10 +8588,22 @@ mod tests {
         manifest_source: TerminalManifestSource<'_>,
         hint_days: u64,
     ) -> serde_json::Value {
+        captured_terminal_receipt_under_hint(counts, state, manifest_source, hint_days, "")
+    }
+
+    /// Same, with extra JSON members appended to the activity hint the server
+    /// answers — the backend's additive capability advertisements.
+    fn captured_terminal_receipt_under_hint(
+        counts: SyncCounts,
+        state: CollectorState<'_>,
+        manifest_source: TerminalManifestSource<'_>,
+        hint_days: u64,
+        hint_extra: &'static str,
+    ) -> serde_json::Value {
         let captured = Arc::new(Mutex::new(Vec::new()));
-        let client = SnapshotApiClient::new(snapshot_status_server_with_hints(
+        let client = SnapshotApiClient::new(snapshot_status_server_with_hint_extras(
             captured.clone(),
-            vec![hint_days],
+            vec![(hint_days, hint_extra)],
         ));
         report_status_with_fresh_relay_token(
             &client,
@@ -8712,6 +8923,7 @@ mod tests {
                     message: "local snapshot scan failed",
                 },
             },
+            false,
         )
         .expect("terminal error receipt");
         assert_eq!(request.report_kind, SnapshotStatusReportKind::ScanStatus);
@@ -8777,6 +8989,362 @@ mod tests {
         assert!(requests[1].contains("\"last_zero_snapshot_usage_evidence_count\":1"));
         assert!(requests[1].contains("\"last_success_at\":null"));
         assert!(requests[1].contains("\"consecutive_failures\":1"));
+    }
+
+    /// The M1 codex witness once its residue settles (ottto#399): a COMPLETED
+    /// census whose every nonzero loss class equals its terminal counterpart,
+    /// with the witness reported as counts only.
+    fn m1_named_residue_counts() -> SyncCounts {
+        let mut counts = SyncCounts::for_policy(183);
+        counts.census_complete = true;
+        counts.discovered_file_count = 448;
+        counts.scanned_file_count = 448;
+        counts.scanned_session_count = 442;
+        counts.ownership_incomplete_file_count = 1;
+        counts.zero_snapshot_usage_evidence_count = 1;
+        counts.recognized_usage_drop_count = 1_105;
+        counts.dropped_usage_record_count = 1_105;
+        counts.terminal_ownership_incomplete_file_count = 1;
+        counts.terminal_zero_snapshot_usage_evidence_count = 1;
+        counts.terminal_recognized_usage_drop_count = 1_105;
+        counts.terminal_dropped_usage_record_count = 1_105;
+        counts.census_residue_index_key_count = 1;
+        counts.census_residue_archived_rollout_count = 1;
+        counts.census_residue_blocked_session_count = 1;
+        counts
+    }
+
+    /// The activity-hint member a backend that admits the code advertises.
+    const RESIDUE_ADMITTING_HINT: &str =
+        r#","census_residue_status_contract":"census_residue_status:v1""#;
+
+    /// A named mutation of the receipt counts, for table-driven vetoes.
+    type CountsMutation = (&'static str, fn(&mut SyncCounts));
+
+    const RESIDUE_TERMINAL_PAIRS: [(&str, &str); 5] = [
+        (
+            "last_terminal_ownership_incomplete_file_count",
+            "last_ownership_incomplete_file_count",
+        ),
+        (
+            "last_terminal_zero_snapshot_usage_evidence_count",
+            "last_zero_snapshot_usage_evidence_count",
+        ),
+        (
+            "last_terminal_recognized_usage_drop_count",
+            "last_recognized_usage_drop_count",
+        ),
+        (
+            "last_terminal_dropped_usage_record_count",
+            "last_dropped_usage_record_count",
+        ),
+        (
+            "last_terminal_over_line_cap_count",
+            "last_over_line_cap_count",
+        ),
+    ];
+
+    /// A census that completed with only settled, non-progressing residue is
+    /// a successful scan. Once the backend admits the code the receipt says
+    /// so: `census_residue`, zero failures, and the success clock bound to
+    /// the finish clock — with each settled share equal to the public loss it
+    /// settles, so a consumer can prove the residue class by class instead of
+    /// trusting the code.
+    #[test]
+    #[serial(source_manifests)]
+    fn a_settled_residue_census_reports_census_residue_once_the_backend_admits_it() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let receipt = captured_terminal_receipt_under_hint(
+            m1_named_residue_counts(),
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            183,
+            RESIDUE_ADMITTING_HINT,
+        );
+        assert_eq!(receipt["report_kind"], "scan_status");
+        assert_eq!(receipt["enabled"], true);
+        assert_eq!(receipt["last_error_code"], "census_residue");
+        assert_eq!(
+            receipt["last_error_message"],
+            "census completed with settled non-progressing residue: \
+             ownership_incomplete_files=1, zero_snapshot_usage_evidence_files=1, \
+             recognized_usage_drops=1105, dropped_usage_records=1105, over_line_cap_lines=0"
+        );
+        assert_eq!(receipt["consecutive_failures"], 0);
+        assert!(receipt["next_retry_at"].is_null());
+        assert_eq!(receipt["last_census_complete"], true);
+        assert_eq!(receipt["last_scan_cap_hit"], false);
+        assert_eq!(receipt["last_skipped_file_count_due_to_limit"], 0);
+        // The scan succeeded, so the clock binds. This is the identity every
+        // backend terminal predicate reads.
+        assert!(receipt["last_success_at"].is_string());
+        assert_eq!(receipt["last_success_at"], receipt["last_scan_finished_at"]);
+        for (terminal, public) in RESIDUE_TERMINAL_PAIRS {
+            assert_eq!(receipt[terminal], receipt[public], "{terminal}");
+        }
+        assert_eq!(receipt["last_terminal_ownership_incomplete_file_count"], 1);
+        assert_eq!(
+            receipt["last_terminal_zero_snapshot_usage_evidence_count"],
+            1
+        );
+        assert_eq!(receipt["last_terminal_recognized_usage_drop_count"], 1_105);
+        assert_eq!(receipt["last_terminal_dropped_usage_record_count"], 1_105);
+        assert_eq!(receipt["last_terminal_over_line_cap_count"], 0);
+        assert_eq!(receipt["last_census_residue_settled"], true);
+        assert_eq!(receipt["last_census_residue_index_key_count"], 1);
+        assert_eq!(receipt["last_census_residue_archived_rollout_count"], 1);
+        assert_eq!(receipt["last_census_residue_blocked_session_count"], 1);
+        // Counts only. The backend refuses a path-shaped message outright,
+        // and the witness's index keys and session ids never leave the index.
+        let message = receipt["last_error_message"].as_str().expect("message");
+        for fragment in [
+            "/",
+            "\\",
+            ".jsonl",
+            ".codex",
+            ".claude",
+            "transcript_path",
+            "workspace_path",
+        ] {
+            assert!(!message.contains(fragment), "{fragment:?} in {message:?}");
+        }
+    }
+
+    /// The backend's error-code set is closed and its forward tolerance covers
+    /// unknown fields, never unknown values: `census_residue` against a backend
+    /// that does not admit it would reject the ENTIRE receipt. So until the
+    /// exact contract is advertised the receipt keeps today's shape —
+    /// `parse_error`, one failure, no success clock — while the additive
+    /// counters still travel for a backend that declares them.
+    #[test]
+    #[serial(source_manifests)]
+    fn a_settled_residue_census_keeps_the_legacy_shape_until_the_backend_admits_the_code() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        for hint_extra in [
+            "",
+            r#","census_residue_status_contract":null"#,
+            r#","census_residue_status_contract":"census_residue_status:v2""#,
+            r#","census_residue_status_contract":"census_residue""#,
+        ] {
+            let receipt = captured_terminal_receipt_under_hint(
+                m1_named_residue_counts(),
+                CollectorState::Success,
+                TerminalManifestSource::Withdraw,
+                183,
+                hint_extra,
+            );
+            assert_eq!(receipt["report_kind"], "scan_status", "{hint_extra:?}");
+            assert_eq!(receipt["last_error_code"], "parse_error", "{hint_extra:?}");
+            assert_eq!(
+                receipt["last_error_message"], "local usage evidence produced no session snapshot",
+                "{hint_extra:?}"
+            );
+            assert_eq!(receipt["consecutive_failures"], 1, "{hint_extra:?}");
+            assert!(receipt["last_success_at"].is_null(), "{hint_extra:?}");
+            assert_eq!(receipt["last_census_complete"], true, "{hint_extra:?}");
+            // The disclosure is the same either way; only the code differs.
+            assert_eq!(
+                receipt["last_census_residue_settled"], true,
+                "{hint_extra:?}"
+            );
+            for (terminal, public) in RESIDUE_TERMINAL_PAIRS {
+                assert_eq!(receipt[terminal], receipt[public], "{terminal}");
+            }
+            assert_eq!(receipt["last_terminal_dropped_usage_record_count"], 1_105);
+            assert_eq!(receipt["last_census_residue_index_key_count"], 1);
+            assert_eq!(receipt["last_census_residue_archived_rollout_count"], 1);
+            assert_eq!(receipt["last_census_residue_blocked_session_count"], 1);
+        }
+    }
+
+    /// A retryable problem beside the residue vetoes the settled verdict even
+    /// when the backend admits the code: a walk that could not enter, open,
+    /// read, or parse something has not proved the residue non-progressing.
+    /// The receipt keeps the retryable shape.
+    #[test]
+    #[serial(source_manifests)]
+    fn a_retryable_problem_beside_settled_residue_still_reports_parse_error() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let vetoes: [CountsMutation; 7] = [
+            ("symlink_rejected", |counts| {
+                counts.symlink_rejected_count = 1
+            }),
+            ("unreadable_path", |counts| counts.unreadable_path_count = 1),
+            ("oversized_file", |counts| counts.oversized_file_count = 1),
+            ("disappeared_file", |counts| {
+                counts.disappeared_file_count = 1
+            }),
+            ("malformed_json_line", |counts| {
+                counts.malformed_json_line_count = 1
+            }),
+            ("invalid_utf8_line", |counts| {
+                counts.invalid_utf8_line_count = 1
+            }),
+            // Over-line-cap loss beyond its terminal share is bounded line
+            // loss not yet given its per-file terminal disposition.
+            ("unterminal_over_line_cap", |counts| {
+                counts.over_line_cap_count = 1
+            }),
+        ];
+        for (veto_name, veto) in vetoes {
+            let mut counts = m1_named_residue_counts();
+            veto(&mut counts);
+            let receipt = captured_terminal_receipt_under_hint(
+                counts,
+                CollectorState::Success,
+                TerminalManifestSource::Withdraw,
+                183,
+                RESIDUE_ADMITTING_HINT,
+            );
+            assert_eq!(receipt["last_error_code"], "parse_error", "{veto_name}");
+            assert_eq!(receipt["consecutive_failures"], 1, "{veto_name}");
+            assert!(receipt["last_success_at"].is_null(), "{veto_name}");
+            assert_eq!(receipt["last_census_residue_settled"], false, "{veto_name}");
+            // The settled shares are still disclosed as measured.
+            assert_eq!(
+                receipt["last_terminal_dropped_usage_record_count"], 1_105,
+                "{veto_name}"
+            );
+        }
+    }
+
+    /// Residue the generation has not settled — one class above its terminal
+    /// counterpart — and residue on a census that did not complete both keep
+    /// the retryable shape, admission or not. Only the exact per-class
+    /// equality on a completed census earns the settled verdict.
+    #[test]
+    #[serial(source_manifests)]
+    fn unsettled_residue_and_an_incomplete_census_still_report_parse_error() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let unsettled: [CountsMutation; 6] = [
+            ("ownership_incomplete unsettled", |counts| {
+                counts.terminal_ownership_incomplete_file_count = 0
+            }),
+            ("zero_snapshot_usage_evidence unsettled", |counts| {
+                counts.terminal_zero_snapshot_usage_evidence_count = 0
+            }),
+            ("recognized_usage_drop unsettled", |counts| {
+                counts.terminal_recognized_usage_drop_count = 1_104
+            }),
+            ("dropped_usage_record unsettled", |counts| {
+                counts.terminal_dropped_usage_record_count = 1_104
+            }),
+            // A settled share above its public counter is not a shape the
+            // scan can produce; it must never read as settled either.
+            ("terminal above public", |counts| {
+                counts.terminal_ownership_incomplete_file_count = 2
+            }),
+            ("census incomplete", |counts| counts.census_complete = false),
+        ];
+        for (case, mutate) in unsettled {
+            let mut counts = m1_named_residue_counts();
+            mutate(&mut counts);
+            let receipt = captured_terminal_receipt_under_hint(
+                counts,
+                CollectorState::Success,
+                TerminalManifestSource::Withdraw,
+                183,
+                RESIDUE_ADMITTING_HINT,
+            );
+            assert_eq!(receipt["last_error_code"], "parse_error", "{case}");
+            assert_eq!(receipt["consecutive_failures"], 1, "{case}");
+            assert!(receipt["last_success_at"].is_null(), "{case}");
+            assert_eq!(receipt["last_census_residue_settled"], false, "{case}");
+        }
+
+        // And a clean census is untouched by the admission: no code, no
+        // message, no settled verdict.
+        let mut clean = SyncCounts::for_policy(183);
+        clean.census_complete = true;
+        let receipt = captured_terminal_receipt_under_hint(
+            clean,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            183,
+            RESIDUE_ADMITTING_HINT,
+        );
+        assert!(receipt["last_error_code"].is_null());
+        assert!(receipt["last_error_message"].is_null());
+        assert_eq!(receipt["consecutive_failures"], 0);
+        assert_eq!(receipt["last_success_at"], receipt["last_scan_finished_at"]);
+        assert_eq!(receipt["last_census_residue_settled"], false);
+    }
+
+    /// The exact body the backend admits for a named-residue census — its
+    /// status model's residue admission — pinned as a fixture. Exact equality
+    /// is also the privacy fence: any member added to the wire, an index key
+    /// or a session id included, fails here. Only the finish/success clock and
+    /// the build identity are live.
+    #[test]
+    #[serial(source_manifests)]
+    fn the_census_residue_receipt_matches_the_backend_admitted_wire_fixture() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let index = ScanIndex::default();
+        let mut receipt = captured_terminal_receipt_under_hint(
+            m1_named_residue_counts(),
+            CollectorState::Success,
+            TerminalManifestSource::CompleteCensus(&index),
+            183,
+            RESIDUE_ADMITTING_HINT,
+        );
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/collector-status/census-residue-scan-status-v1.json"
+        ))
+        .expect("census residue wire fixture");
+
+        let finished_at = receipt["last_scan_finished_at"].clone();
+        assert!(finished_at.is_string());
+        assert_eq!(receipt["last_success_at"], finished_at);
+        for clock in ["last_scan_finished_at", "last_success_at"] {
+            receipt[clock] = expected[clock].clone();
+        }
+        assert_eq!(receipt["collector_version"], collector_version());
+        receipt["collector_version"] = expected["collector_version"].clone();
+
+        assert_eq!(receipt, expected);
+        // The fixture itself carries no identifier-shaped member and no path.
+        let serialized = serde_json::to_string(&expected).expect("fixture text");
+        for forbidden in ["index_keys", "session_ids", "/Users/", ".codex", ".claude"] {
+            assert!(!serialized.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    /// The journal commits the exact receipt about to go on the wire, residue
+    /// fields included, and reloads it byte-for-byte.
+    #[test]
+    #[serial(source_manifests)]
+    fn the_journaled_census_residue_receipt_reloads_byte_for_byte() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let request = collector_status_request(
+            "destination",
+            CollectorStatus {
+                source: SnapshotSource::Codex,
+                machine_id: "otm_test",
+                scan_started_at: "2026-09-03T04:00:00Z",
+                counts: m1_named_residue_counts(),
+                state: CollectorState::Success,
+            },
+            true,
+        )
+        .expect("census residue receipt");
+        assert_eq!(request.last_error_code.as_deref(), Some("census_residue"));
+        assert!(request.last_census_residue_settled);
+
+        let path = terminal_status_journal_path(
+            test_terminal_status_support_dir(),
+            "destination",
+            SnapshotSource::Codex,
+        );
+        save_terminal_status_journal(&path, &request).expect("journal the receipt");
+        let reloaded = load_terminal_status_journal(&path)
+            .expect("read journal")
+            .expect("journal exists");
+        assert_eq!(
+            serde_json::to_value(&reloaded).expect("reloaded JSON"),
+            serde_json::to_value(&request).expect("committed JSON")
+        );
+        assert_eq!(reloaded.last_terminal_dropped_usage_record_count, 1_105);
+        assert_eq!(reloaded.last_census_residue_blocked_session_count, 1);
     }
 
     #[test]
@@ -9004,6 +9572,7 @@ mod tests {
                     message: "local snapshot scan failed",
                 },
             },
+            false,
         )
         .expect("terminal receipt");
         assert_eq!(request.report_kind, SnapshotStatusReportKind::ScanStatus);
@@ -10096,6 +10665,18 @@ mod tests {
         captured: Arc<Mutex<Vec<String>>>,
         hints: Vec<u64>,
     ) -> String {
+        snapshot_status_server_with_hint_extras(
+            captured,
+            hints.into_iter().map(|days| (days, "")).collect(),
+        )
+    }
+
+    /// One `(backfill_window_days, extra JSON members)` pair per receipt; the
+    /// extra members are appended verbatim to the activity hint body.
+    fn snapshot_status_server_with_hint_extras(
+        captured: Arc<Mutex<Vec<String>>>,
+        hints: Vec<(u64, &'static str)>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind snapshot status backend");
         let address = listener.local_addr().expect("local address");
         std::thread::spawn(move || {
@@ -10112,9 +10693,9 @@ mod tests {
                     r#"{"token":"relay-token-codex","expires_at":"2026-06-01T10:15:00Z"}"#
                         .to_string()
                 } else if request.contains("/activity-hints") {
-                    let hint = hints.next().expect("one hint per receipt");
+                    let (hint, extra) = hints.next().expect("one hint per receipt");
                     format!(
-                        r#"{{"source":"codex","server_time":"2026-06-01T10:00:00Z","last_data_at":null,"record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":{hint},"recommended_scan_after":"2026-06-01T10:05:00Z"}}"#
+                        r#"{{"source":"codex","server_time":"2026-06-01T10:00:00Z","last_data_at":null,"record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":{hint}{extra},"recommended_scan_after":"2026-06-01T10:05:00Z"}}"#
                     )
                 } else {
                     captured
