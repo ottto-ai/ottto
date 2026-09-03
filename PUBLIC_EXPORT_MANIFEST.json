@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 349,
-  "content_sha256": "1fd64e5f018abad2e6ba9ac468bb2636a9178fae2cc563ed6afe1ca63496ba98",
+  "candidate_file_count": 350,
+  "content_sha256": "9ea037fddc7a63511f02e6aaee3ad3b4d5dfee8d325ecba9d7930077d4691329",
   "files": [
     {
       "executable": false,
@@ -790,8 +790,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "d5673a794ea8afe15488e3b1e8ea910ea859f9011b9cacde5c7a3f91909dc611",
-      "size_bytes": 307976
+      "sha256": "44e16a358951a73e215d31ff4fcb44476719a7605f125f57f99d66f2d4670269",
+      "size_bytes": 310547
     },
     {
       "executable": false,
@@ -881,8 +881,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "c7cf36c6ea2c5760b3d3ea803501d30537acc1c4ab20f526662e5663b4fcf6f1",
-      "size_bytes": 1754684
+      "sha256": "c97135a3bf674eb68baccf907c110282bbb30544adc6d692a7f2d085489f7ec7",
+      "size_bytes": 1811831
     },
     {
       "executable": false,
@@ -1527,6 +1527,13 @@
       "path": "docs/session-2026-09-02-legacy-settlement-seal.md",
       "sha256": "e9084530ce6699dd42f4fe1214a821e6265e5d162d47056d8fac98ce347f34a7",
       "size_bytes": 9077
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-09-03-non-progressing-census-residue.md",
+      "sha256": "45a73c7bacce490e028dbda70da8e11d847682d5283add85fd9db65cb3d28af0",
+      "size_bytes": 9201
     },
     {
       "executable": false,
@@ -2446,9 +2453,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-02T16:39:44+00:00",
+  "generated_at": "2026-09-03T05:01:36+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 350,
+  "output_file_count": 351,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2482,5 +2489,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "465747428cbd5e54d1d19f9ab5971ef2b0283ccb"
+  "source_commit": "978e280c2c3da270cb40e8e39413baa4e641c173"
 }

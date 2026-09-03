@@ -237,6 +237,11 @@ struct DaemonState {
     repair_locked: bool,
     running: bool,
     now: String,
+    /// Wall-clock instant this daemon process started, stamped once at
+    /// construction. `RuntimeIdentityV1.started_at` and the runtime heartbeat
+    /// report it; every status query reports the query time only as
+    /// `last_seen_at`.
+    started_at: String,
 }
 
 impl DaemonState {
@@ -393,6 +398,7 @@ impl LocalDaemon {
         control_token: ControlToken,
         now: impl Into<String>,
     ) -> Self {
+        let now = now.into();
         Self {
             inner: Arc::new(Mutex::new(DaemonState {
                 machine,
@@ -414,7 +420,8 @@ impl LocalDaemon {
                 pending_switch: None,
                 repair_locked: false,
                 running: true,
-                now: now.into(),
+                started_at: now.clone(),
+                now,
             })),
             control_token,
         }
@@ -1819,7 +1826,7 @@ fn status_from_state(state: &DaemonState) -> DaemonStatus {
     }
     status.local_health_events = state.local_health_events.clone();
     status.command_ledger = state.command_ledger.clone();
-    refresh_canonical_local_health(&mut status);
+    refresh_canonical_local_health_with_started_at(&mut status, &state.started_at);
     status
 }
 
@@ -1865,7 +1872,23 @@ fn push_local_health_event(
     });
 }
 
+/// Re-project canonical health over a status that already carries a runtime
+/// projection. The start instant is taken from that projection: a
+/// re-projection observes the daemon again, it does not restart it. A status
+/// that was never projected from daemon state has no start instant to carry,
+/// so it falls back to the observation time.
 pub fn refresh_canonical_local_health(status: &mut DaemonStatus) {
+    let started_at = status
+        .runtime_heartbeat
+        .as_ref()
+        .map(|heartbeat| heartbeat.started_at.clone())
+        .unwrap_or_else(|| status.generated_at.clone());
+    refresh_canonical_local_health_with_started_at(status, &started_at);
+}
+
+/// Project canonical health from daemon state, where `started_at` is the
+/// process start instant recorded once at construction.
+pub fn refresh_canonical_local_health_with_started_at(status: &mut DaemonStatus, started_at: &str) {
     let observed_at = status.generated_at.clone();
     let projection_revision = next_status_projection_revision(status);
     let runtime_event = LocalHealthEventV1 {
@@ -1885,7 +1908,7 @@ pub fn refresh_canonical_local_health(status: &mut DaemonStatus) {
     };
     let mut events = status.local_health_events.clone();
     events.push(runtime_event.clone());
-    let runtime = runtime_identity_for_status(status, &observed_at);
+    let runtime = runtime_identity_for_status(status, started_at, &observed_at);
     let heartbeat = runtime_heartbeat_for_status(status, &runtime, projection_revision);
     let account = local_health_account_for_status(status);
     let mut sources = status
@@ -1970,9 +1993,14 @@ fn next_status_projection_revision(status: &DaemonStatus) -> u64 {
         + 1
 }
 
-fn runtime_identity_for_status(status: &DaemonStatus, observed_at: &str) -> RuntimeIdentityV1 {
+fn runtime_identity_for_status(
+    status: &DaemonStatus,
+    started_at: &str,
+    observed_at: &str,
+) -> RuntimeIdentityV1 {
     runtime_identity_for_status_with_installed_app_version(
         status,
+        started_at,
         observed_at,
         &ottto_core::compiled_release_version(),
     )
@@ -1980,6 +2008,7 @@ fn runtime_identity_for_status(status: &DaemonStatus, observed_at: &str) -> Runt
 
 fn runtime_identity_for_status_with_installed_app_version(
     status: &DaemonStatus,
+    started_at: &str,
     observed_at: &str,
     installed_app_version: &str,
 ) -> RuntimeIdentityV1 {
@@ -2014,7 +2043,7 @@ fn runtime_identity_for_status_with_installed_app_version(
         service_executable_hash: None,
         launchd_label: Some(ottto_core::MACOS_LAUNCH_AGENT_LABEL.to_string()),
         launchd_loaded_program_hash: None,
-        started_at: observed_at.to_string(),
+        started_at: started_at.to_string(),
         last_seen_at: observed_at.to_string(),
         boot_id: std::env::var("OTTTO_BOOT_ID").ok(),
         session_id: std::env::var("OTTTO_SESSION_ID").ok(),
@@ -5157,6 +5186,7 @@ mod tests {
 
         let runtime = runtime_identity_for_status_with_installed_app_version(
             &status,
+            "2026-06-15T07:00:00Z",
             "2026-06-15T08:00:00Z",
             "0.1.30-rc1",
         );
@@ -5177,6 +5207,7 @@ mod tests {
 
         let runtime = runtime_identity_for_status_with_installed_app_version(
             &status,
+            "2026-06-15T07:00:00Z",
             "2026-06-15T08:00:00Z",
             "0.1.30-rc1",
         );
@@ -6564,6 +6595,29 @@ mod tests {
             .expect("claim in flight");
         assert_eq!(claim.claim_code, "claim_one");
         assert_eq!(account.state, LocalAccountState::ClaimPending);
+    }
+
+    #[test]
+    fn runtime_started_at_is_the_process_start_instant_not_the_status_query_time() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let status = daemon.status(TOKEN).expect("status");
+        let health = status.canonical_health.as_ref().expect("canonical health");
+        assert_eq!(health.runtime.started_at, "2026-05-05T09:10:00Z");
+        assert_eq!(health.runtime.last_seen_at, status.generated_at);
+        assert_ne!(health.runtime.started_at, health.runtime.last_seen_at);
+        let heartbeat = status
+            .runtime_heartbeat
+            .as_ref()
+            .expect("runtime heartbeat");
+        assert_eq!(heartbeat.started_at, "2026-05-05T09:10:00Z");
+        assert_eq!(heartbeat.last_seen_at, status.generated_at);
+
+        // A re-projection observes the daemon again; it does not restart it.
+        let mut reprojected = status.clone();
+        refresh_canonical_local_health(&mut reprojected);
+        let health = reprojected.canonical_health.expect("re-projected health");
+        assert_eq!(health.runtime.started_at, "2026-05-05T09:10:00Z");
+        assert_eq!(health.runtime.last_seen_at, reprojected.generated_at);
     }
 
     fn daemon() -> LocalDaemon {
