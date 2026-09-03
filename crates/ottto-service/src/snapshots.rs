@@ -372,6 +372,15 @@ const SNAPSHOT_ACCEPTED_LEDGER_VERSION: u8 = 2;
 /// path from one drained by the bounded sweep, so every v1 ledger is re-opened
 /// once and re-proved through the server, which is the authority on acceptance.
 const SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION: u8 = 1;
+/// Ledger version 0 is the pre-ledger shape: an index written before the
+/// version field existed, so serde defaults it to 0 on load. Its accepted
+/// entries are real entity ACKs - `record_accepted_snapshot_fingerprints` is
+/// their only writer - but the revisions the silent retry-loss dropped are
+/// absent from the index entirely, so `current - accepted` cannot see them and
+/// only the bounded sweep's forced re-parse of their owning files recovers
+/// them. A pre-ledger ledger that has never armed a page therefore carries no
+/// settlement proof either, exactly like the v1 ledger above.
+const SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION: u8 = 0;
 pub(crate) const MAX_SNAPSHOT_RECONSTRUCTION_FAILURES: u8 = 4;
 
 /// What the manifest counts, declared on the wire rather than assumed.
@@ -16844,9 +16853,53 @@ impl ScanIndex {
         self.accepted_snapshot_fingerprint_ledger_version != SNAPSHOT_ACCEPTED_LEDGER_VERSION
     }
 
-    /// Discard an accepted-revision ledger that a previous version marked
-    /// migrated without per-revision settlement evidence, so the bounded sweep
-    /// re-offers every currently indexed revision exactly once.
+    /// True while the accepted ledger carries no settlement proof this daemon
+    /// has observed, so `current - accepted` is not evidence and no seal may be
+    /// taken from it. This is the single predicate both seal sites share:
+    /// `prepare_legacy_settlement_reconciliation` (through the re-open) at the
+    /// top of a cycle, and `finish_legacy_settlement_reconciliation` at its end.
+    /// Guarding only the second one delays an unproven seal by one cycle rather
+    /// than preventing it, because `prepare_*` seals the identical shape first.
+    ///
+    /// Two shapes qualify:
+    ///
+    /// - `SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION`: written by the first
+    ///   legacy-settlement migration, whose fast path inferred acceptance from
+    ///   index cleanliness.
+    /// - `SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION` with a non-empty accepted
+    ///   set and no sweep cursor: a pre-ledger index that has never armed a
+    ///   page. Its pending set can already be empty, and sealing on that
+    ///   observation retires the migration without the forced re-parse that is
+    ///   the only thing that recovers a revision the retry-loss dropped from the
+    ///   index. The cursor is what scopes this to never-armed ledgers: any
+    ///   `legacy_settlement_reconcile_after_fingerprint` means the bounded sweep
+    ///   is already proving this set, so it is neither unproven nor re-openable.
+    ///   An empty accepted set is likewise not unproven - there is nothing to
+    ///   re-open, and the ordinary sweep already re-offers every current
+    ///   revision.
+    ///
+    /// The unproven state is left by `reopen_unproven_accepted_snapshot_ledger`,
+    /// which clears the accepted set, and by `prepare_historical_replay`, which
+    /// promotes straight to `SNAPSHOT_ACCEPTED_LEDGER_VERSION` after clearing
+    /// the whole index and re-offering everything it re-parses.
+    pub(crate) fn legacy_settlement_ledger_is_unproven(&self) -> bool {
+        self.accepted_snapshot_fingerprint_ledger_version
+            == SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION
+            || (self.accepted_snapshot_fingerprint_ledger_version
+                == SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION
+                && !self.accepted_snapshot_fingerprints.is_empty()
+                && self.legacy_settlement_reconcile_after_fingerprint.is_none())
+    }
+
+    /// Discard an accepted-revision ledger this daemon cannot re-prove, so the
+    /// bounded sweep re-offers every currently indexed revision exactly once.
+    ///
+    /// `legacy_settlement_ledger_is_unproven` selects the shapes: the ledger the
+    /// first migration marked migrated without per-revision settlement evidence,
+    /// and a pre-ledger ledger that has never armed a page. The second one
+    /// matters because its pending set can already be empty, in which case no
+    /// page is ever armed and the forced re-parse that recovers a dropped
+    /// revision never runs.
     ///
     /// Clearing the whole v1 set is the conservative reading, and it is forced:
     /// the on-disk ledger carries no per-revision provenance and no witness of
@@ -16861,9 +16914,7 @@ impl ScanIndex {
     /// sees a plain unmigrated ledger and resumes the sweep instead of clearing
     /// the acceptances the sweep has since re-earned.
     fn reopen_unproven_accepted_snapshot_ledger(&mut self, source: SnapshotSource) {
-        if self.accepted_snapshot_fingerprint_ledger_version
-            != SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION
-        {
+        if !self.legacy_settlement_ledger_is_unproven() {
             return;
         }
         let reopened = self.accepted_snapshot_fingerprints.len();
@@ -16872,7 +16923,7 @@ impl ScanIndex {
         self.accepted_snapshot_fingerprint_ledger_version = 0;
         eprintln!(
             "ottto-service: re-opened the legacy snapshot settlement ledger for {}; {} revision(s) \
-             were previously recorded as accepted without per-revision settlement proof and are \
+             were recorded as accepted by a ledger this daemon cannot re-prove and are \
              re-offered through the existing entity-ACK contract in bounded pages",
             source.api_slug(),
             reopened
@@ -16938,7 +16989,14 @@ impl ScanIndex {
         self.reopen_unproven_accepted_snapshot_ledger(source);
 
         let pending = self.legacy_settlement_reconciliation_pending_fingerprints();
-        if pending.is_empty() {
+        // This is the seal that actually runs first: `prepare_*` is called at the
+        // top of every ordinary cycle and `finish_*` only at its end, so the same
+        // guard has to hold here or a guard in `finish_*` alone merely delays an
+        // unproven seal by one cycle. The re-open above has already cleared every
+        // unproven accepted set, so the predicate is false by construction here;
+        // it is repeated as a fail-safe, and it fails toward leaving the ledger
+        // open rather than sealing it without proof.
+        if pending.is_empty() && !self.legacy_settlement_ledger_is_unproven() {
             self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
             self.legacy_settlement_reconcile_after_fingerprint = None;
             return (BTreeSet::new(), true);
@@ -16988,7 +17046,31 @@ impl ScanIndex {
         // forced reparse decisions above.
         if !selected.is_empty() {
             self.legacy_settlement_reconcile_after_fingerprint = selected.last().cloned();
-            self.traversal = None;
+            // Reset only a traversal that is already terminal-unhealthy. The
+            // predicate is the production `terminal_unhealthy` definition:
+            // discovery done (both pending queues empty) and errors recorded.
+            // That is the one persisted shape `ensure_bounded_traversal` refuses
+            // to rebuild while its independent retry is not due, which is why the
+            // reset existed; every other shape it either rebuilds or advances on
+            // its own. Scoping it here is what stops a machine from paying a full
+            // re-discovery for each armed page of the sweep.
+            //
+            // Accepted delta: a traversal that is mid-walk with errors already
+            // recorded, or discovery-complete and healthy but held open by an
+            // unfinished state/sidecar census or reconciliation, is no longer
+            // reset. The armed page then waits for the current traversal
+            // generation to finish before it is re-parsed and re-offered. That is
+            // bounded added latency, not a stall - the traversal is still advanced
+            // by `ensure_bounded_traversal` - and the ledger stays open meanwhile,
+            // which is the safe state.
+            let traversal_is_terminal_unhealthy = self.traversal.as_ref().is_some_and(|t| {
+                t.pending_directories.is_empty()
+                    && t.pending_candidates.is_empty()
+                    && t.counts.has_errors()
+            });
+            if traversal_is_terminal_unhealthy {
+                self.traversal = None;
+            }
             self.bounded_sweep_had_unsettled_upload = true;
         }
         (selected, true)
@@ -17012,15 +17094,13 @@ impl ScanIndex {
     }
 
     pub(crate) fn finish_legacy_settlement_reconciliation(&mut self) {
-        // A ledger still at the unproven version has an accepted set this
-        // daemon has not re-proved, so its pending set is not yet meaningful.
-        // Only `reopen_unproven_accepted_snapshot_ledger` may leave that state,
-        // and it is reached from the arming path alone. Without this guard a
-        // cycle that skipped arming (a pending historical replay, for instance)
-        // could observe the stale empty pending set and seal the ledger.
-        if self.accepted_snapshot_fingerprint_ledger_version
-            == SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION
-        {
+        // An unproven ledger's accepted set has not been re-proved by this
+        // daemon, so its pending set is not yet meaningful and a cycle that
+        // skipped arming could observe a stale empty pending set and seal it.
+        // `legacy_settlement_ledger_is_unproven` carries the exact scope,
+        // including the cursor condition that limits the pre-ledger leg to
+        // never-armed ledgers, and the two ways the state is left.
+        if self.legacy_settlement_ledger_is_unproven() {
             return;
         }
         if self
@@ -40691,5 +40771,343 @@ mod tests {
             );
             assert!(crate::canonical_json::is_canonicalizable(&body));
         }
+    }
+
+    /// The exact on-disk shape of an index written before the accepted-ledger
+    /// version field existed: the accepted set is present, because
+    /// `record_accepted_snapshot_fingerprints` recorded real entity ACKs, and
+    /// the version field is absent, so serde defaults it to the pre-ledger
+    /// value. Building it through serde rather than by assigning `0` is what
+    /// makes it the shape a real upgrade deserializes.
+    fn pre_ledger_index_with_accepted(mut index: ScanIndex) -> ScanIndex {
+        let mut value = serde_json::to_value(&index).expect("serialize current index");
+        let object = value.as_object_mut().expect("scan index object");
+        object.remove("accepted_snapshot_fingerprint_ledger_version");
+        index = serde_json::from_value(value).expect("deserialize exact pre-ledger index shape");
+        assert_eq!(
+            index.accepted_snapshot_fingerprint_ledger_version,
+            SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION
+        );
+        assert!(!index.accepted_snapshot_fingerprints.is_empty());
+        assert!(index.legacy_settlement_ledger_needs_migration());
+        index
+    }
+
+    /// A pre-ledger accepted set holds real entity ACKs, but the revisions the
+    /// silent retry-loss dropped are gone from the index entirely, so
+    /// `current - accepted` is already empty and the seal branch is reachable
+    /// on the first cycle. Sealing there retires the migration without ever
+    /// arming a page, and arming is the forced re-parse of the owning files
+    /// that recovers those revisions.
+    ///
+    /// This is the exact pre-fix state: version field absent on disk, accepted
+    /// covering every current revision, no sweep cursor, empty pending set.
+    #[test]
+    fn pre_ledger_accepted_set_is_not_sealed_by_finish_without_the_bounded_sweep() {
+        let accepted = "a".repeat(64);
+        let sibling = "b".repeat(64);
+        let mut index = pre_ledger_index_with_accepted(ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "same-session-siblings.jsonl".to_string(),
+                BTreeSet::from([accepted.clone(), sibling.clone()]),
+            )]),
+            accepted_snapshot_fingerprints: BTreeSet::from([accepted, sibling]),
+            ..ScanIndex::default()
+        });
+        assert!(
+            index
+                .legacy_settlement_reconcile_after_fingerprint
+                .is_none(),
+            "the shape under test has never armed a page"
+        );
+        assert!(
+            index
+                .legacy_settlement_reconciliation_pending_fingerprints()
+                .is_empty(),
+            "the seal branch is reachable only because nothing is pending"
+        );
+
+        index.finish_legacy_settlement_reconciliation();
+
+        assert_eq!(
+            index.accepted_snapshot_fingerprint_ledger_version,
+            SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION,
+            "an empty pending set over a never-swept pre-ledger accepted set is not settlement \
+             evidence and may not close the migration"
+        );
+        assert!(index.legacy_settlement_ledger_needs_migration());
+    }
+
+    /// The same guard has to hold at the earlier site.
+    /// `prepare_legacy_settlement_reconciliation` runs at the top of every
+    /// ordinary cycle and `finish_legacy_settlement_reconciliation` only at its
+    /// end, so a guard that lives only in `finish_*` delays the unproven seal
+    /// by one cycle instead of preventing it. On the same never-armed
+    /// pre-ledger shape the sweep re-opens the ledger and arms every current
+    /// revision rather than sealing it.
+    #[test]
+    fn pre_ledger_accepted_set_is_reopened_by_prepare_instead_of_sealed() {
+        let accepted = "a".repeat(64);
+        let sibling = "b".repeat(64);
+        let mut index = pre_ledger_index_with_accepted(ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "same-session-siblings.jsonl".to_string(),
+                BTreeSet::from([accepted.clone(), sibling.clone()]),
+            )]),
+            accepted_snapshot_fingerprints: BTreeSet::from([accepted.clone(), sibling.clone()]),
+            ..ScanIndex::default()
+        });
+        assert!(
+            index
+                .legacy_settlement_reconciliation_pending_fingerprints()
+                .is_empty(),
+            "the seal branch is reachable only because nothing is pending"
+        );
+
+        let (armed, changed) =
+            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+
+        assert!(changed);
+        assert_eq!(
+            armed,
+            BTreeSet::from([accepted.clone(), sibling.clone()]),
+            "the never-swept pre-ledger set is re-offered, not sealed"
+        );
+        assert!(
+            index.accepted_snapshot_fingerprints.is_empty(),
+            "the re-open clears the set so the sweep has something to arm"
+        );
+        assert!(
+            index.legacy_settlement_ledger_needs_migration(),
+            "the ledger stays open until the server settles every revision"
+        );
+        for fingerprint in [&accepted, &sibling] {
+            let record = index
+                .quarantined_snapshot_fingerprints
+                .get(fingerprint)
+                .expect("every current revision is re-armed for the bounded sweep");
+            assert_eq!(
+                record.disposition,
+                SnapshotQuarantineDisposition::RetryPending
+            );
+            assert_eq!(record.retry_after_unix_seconds, 0);
+        }
+        assert!(
+            index.bounded_sweep_had_unsettled_upload,
+            "arming is what forces the re-parse that recovers a dropped revision"
+        );
+    }
+
+    /// The re-open is bounded, not a wedge: refusing the unproven seal starts
+    /// the ordinary sweep, and the sweep closes the migration once the server
+    /// has settled every page.
+    #[test]
+    fn reopened_pre_ledger_sweep_terminates_and_seals_after_the_server_settles() {
+        let fingerprints = (0..120)
+            .map(|value| format!("{value:064x}"))
+            .collect::<BTreeSet<_>>();
+        let mut index = pre_ledger_index_with_accepted(ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "bounded-sweep-session-set.jsonl".to_string(),
+                fingerprints.clone(),
+            )]),
+            accepted_snapshot_fingerprints: fingerprints.clone(),
+            ..ScanIndex::default()
+        });
+        assert!(index
+            .legacy_settlement_reconciliation_pending_fingerprints()
+            .is_empty());
+
+        let mut pages = Vec::new();
+        while index.legacy_settlement_ledger_needs_migration() {
+            let (armed, _) =
+                index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+            if armed.is_empty() {
+                break;
+            }
+            assert!(armed.len() <= 50, "a cycle never arms more than one page");
+            pages.push(armed.len());
+            // The server settles the armed page.
+            index.retain_quarantined_fingerprints(&BTreeMap::new());
+            index.record_accepted_snapshot_fingerprints(&armed);
+            index.finish_legacy_settlement_reconciliation();
+        }
+
+        assert_eq!(pages, vec![50, 50, 20]);
+        assert!(
+            !index.legacy_settlement_ledger_needs_migration(),
+            "the guard refuses one unproven seal; it does not hold the ledger open forever"
+        );
+        assert_eq!(index.accepted_snapshot_fingerprints, fingerprints);
+        let (terminal, changed) =
+            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+        assert!(terminal.is_empty());
+        assert!(!changed, "a settled ledger never re-opens again");
+    }
+
+    /// The sweep cursor is what scopes the pre-ledger leg to never-armed
+    /// ledgers. A ledger already being swept has re-earned acceptances through
+    /// the server, and a second re-open would discard them and restart the
+    /// pass, so the guard must not fire once the cursor is set.
+    #[test]
+    fn pre_ledger_ledger_already_being_swept_is_not_reopened_again() {
+        let proved = "a".repeat(64);
+        let first_pending = "b".repeat(64);
+        let second_pending = "c".repeat(64);
+        let mut index = pre_ledger_index_with_accepted(ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "same-session-siblings.jsonl".to_string(),
+                BTreeSet::from([
+                    proved.clone(),
+                    first_pending.clone(),
+                    second_pending.clone(),
+                ]),
+            )]),
+            accepted_snapshot_fingerprints: BTreeSet::from([proved.clone()]),
+            legacy_settlement_reconcile_after_fingerprint: Some(proved.clone()),
+            ..ScanIndex::default()
+        });
+        assert!(!index.legacy_settlement_ledger_is_unproven());
+
+        let (armed, changed) =
+            index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+
+        assert!(changed);
+        assert_eq!(
+            armed,
+            BTreeSet::from([first_pending, second_pending]),
+            "the sweep resumes over the remaining revisions"
+        );
+        assert_eq!(
+            index.accepted_snapshot_fingerprints,
+            BTreeSet::from([proved]),
+            "an acceptance the sweep already proved is never discarded"
+        );
+    }
+
+    fn traversal_reset_scope_checkpoint(
+        pending_directories: VecDeque<ScanTraversalPath>,
+        counts: ScanTraversalCounts,
+    ) -> ScanTraversalCheckpoint {
+        ScanTraversalCheckpoint {
+            context_fingerprint: "traversal-reset-scope".to_string(),
+            census_window_end: "2026-01-01T00:00:00Z".to_string(),
+            scan_roots: Vec::new(),
+            pending_directories,
+            pending_candidates: VecDeque::new(),
+            observed_index_keys: BTreeSet::new(),
+            codex_rollout_paths: BTreeSet::new(),
+            reconciliation_upper_bound: None,
+            reconciliation_after: None,
+            reconciliation_started: false,
+            watcher_hint_seen: false,
+            codex_parent_resolution_retry_required: false,
+            unhealthy_retry_attempt: 0,
+            unhealthy_retry_not_before_unix_seconds: None,
+            counts,
+        }
+    }
+
+    fn one_pending_directory() -> VecDeque<ScanTraversalPath> {
+        VecDeque::from([ScanTraversalPath {
+            scan_root: std::path::PathBuf::from("/test"),
+            path: std::path::PathBuf::from("/test/sub"),
+            census_member: true,
+            watcher_hint: false,
+        }])
+    }
+
+    fn traversal_reset_scope_index(traversal: ScanTraversalCheckpoint) -> ScanIndex {
+        ScanIndex {
+            traversal: Some(traversal),
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "test.jsonl".to_string(),
+                BTreeSet::from(["a".repeat(64), "b".repeat(64)]),
+            )]),
+            accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION,
+            ..ScanIndex::default()
+        }
+    }
+
+    /// Arming resets traversal discovery only for the terminal-unhealthy shape.
+    /// Every other persisted traversal is either rebuilt or advanced by
+    /// `ensure_bounded_traversal` on its own, so resetting it made each armed
+    /// page pay a full re-discovery. The retained shapes below are the whole
+    /// behavioural delta of that scoping, including the two the shipped
+    /// unconditional reset used to clear: a mid-walk traversal that already
+    /// recorded errors, and one whose discovery finished cleanly while a census
+    /// or reconciliation still holds it open.
+    #[test]
+    fn f2_traversal_reset_is_scoped_to_the_terminal_unhealthy_shape() {
+        let retained: [(&str, ScanTraversalCheckpoint); 3] = [
+            (
+                "mid-walk and healthy",
+                traversal_reset_scope_checkpoint(
+                    one_pending_directory(),
+                    ScanTraversalCounts::default(),
+                ),
+            ),
+            (
+                "mid-walk with errors already recorded",
+                traversal_reset_scope_checkpoint(
+                    one_pending_directory(),
+                    ScanTraversalCounts {
+                        symlink_rejected_count: 1,
+                        ..ScanTraversalCounts::default()
+                    },
+                ),
+            ),
+            (
+                "discovery complete and healthy",
+                traversal_reset_scope_checkpoint(VecDeque::new(), ScanTraversalCounts::default()),
+            ),
+        ];
+
+        // Every case is measured before asserting, so a regression names all of
+        // the shapes it re-broke instead of only the first one.
+        let mut kept = Vec::new();
+        for (label, traversal) in retained {
+            let mut index = traversal_reset_scope_index(traversal);
+            let (armed, _) =
+                index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+            assert!(!armed.is_empty(), "{label}: the page must arm");
+            assert!(
+                index.bounded_sweep_had_unsettled_upload,
+                "{label}: the unsettled-sweep marker is still set unconditionally"
+            );
+            kept.push((label, index.traversal.is_some()));
+        }
+
+        assert_eq!(
+            kept,
+            vec![
+                ("mid-walk and healthy", true),
+                ("mid-walk with errors already recorded", true),
+                ("discovery complete and healthy", true),
+            ],
+            "only a terminal-unhealthy traversal is reset by arming"
+        );
+    }
+
+    /// The complement: the shape the reset exists for is still reset. This is
+    /// the persisted traversal `ensure_bounded_traversal` refuses to rebuild
+    /// while its independent retry is not due, so nothing else would clear it.
+    #[test]
+    fn f2_traversal_reset_still_happens_for_the_terminal_unhealthy_shape() {
+        let mut index = traversal_reset_scope_index(traversal_reset_scope_checkpoint(
+            VecDeque::new(),
+            ScanTraversalCounts {
+                symlink_rejected_count: 1,
+                ..ScanTraversalCounts::default()
+            },
+        ));
+
+        let (armed, _) = index.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+
+        assert!(!armed.is_empty(), "the page must arm");
+        assert!(
+            index.traversal.is_none(),
+            "a terminal-unhealthy traversal is still dropped so discovery restarts"
+        );
     }
 }
