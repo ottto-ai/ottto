@@ -3740,7 +3740,7 @@ fn source_health_from_agent_status(
                         "{} durable connections need attention",
                         source_display_name(&snapshot.source)
                     ),
-                    detail: "The current login remains available. One or more saved account connections need provider sign-in again.".to_string(),
+                    detail: "The current login remains available. One or more saved account connections need attention; their last verified identities remain separate.".to_string(),
                     retryable: true,
                 }],
             )
