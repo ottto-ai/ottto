@@ -97,4 +97,7 @@ census is ignored by duplicate validation only while its quarantine is bounded
 and bound to the exact retained witness. Current-window invalid evidence,
 unbound stale state, and witness-cap overflow still fence all Claude posture.
 This prevents a valid retrying family from globally suppressing unrelated
-sessions without weakening the fail-closed boundary.
+sessions without weakening the fail-closed boundary. Duplicate reconciliation
+also re-arms every current member containing a changed request hash, including
+a new singleton owner after both previously recorded owners disappear, so a
+conservative tombstone cannot become permanent when ownership moves.

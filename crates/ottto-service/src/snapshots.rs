@@ -3896,6 +3896,15 @@ fn apply_claude_reported_usage_with_index_and_limits(
         }
         duplicate_witnesses_after.retain(|_, owners| owners.len() > 1);
         let overflowed_before = index.claude_duplicate_request_witness_overflowed;
+        let changed_duplicate_request_hashes = duplicate_witnesses_before
+            .keys()
+            .chain(duplicate_witnesses_after.keys())
+            .filter(|request_hash| {
+                duplicate_witnesses_before.get(*request_hash)
+                    != duplicate_witnesses_after.get(*request_hash)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let changed_duplicate_owners = duplicate_witnesses_before
             .iter()
             .chain(duplicate_witnesses_after.iter())
@@ -3939,12 +3948,20 @@ fn apply_claude_reported_usage_with_index_and_limits(
             };
             let duplicate_owner =
                 claude_duplicate_request_owner(&root_session_id, &source_session_id);
+            let current_member_owns_changed_request = index
+                .claude_usage_family_pending
+                .get(&root_session_id)
+                .and_then(|pending| pending.member_request_id_hashes.get(&source_session_id))
+                .is_some_and(|request_hashes| {
+                    !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
+                });
             if overflowed_before
                 || index.claude_duplicate_request_witness_overflowed
                 || (proven.contains_key(&root_session_id)
                     && !current_ids.contains(source_session_id.as_str()))
                 || invalidated_witness_roots.contains(&root_session_id)
                 || changed_duplicate_owners.contains(&duplicate_owner)
+                || current_member_owns_changed_request
             {
                 // Reparse earlier-page members when terminal family proof
                 // changes or when a later page reveals a cross-family request
@@ -34427,6 +34444,86 @@ mod tests {
                 .expect("deletion child index entry")
                 .source_file_fingerprint,
             "deletion-corrected"
+        );
+
+        // If every recorded owner disappears and a different session becomes
+        // the sole current owner, changing the request-hash witness must re-arm
+        // that replacement too. It was conservatively cleared against the old
+        // durable duplicate on this pass and needs one correction pass after
+        // the witness is removed.
+        let replacement_id = "cccccccc-dddd-eeee-ffff-000000000000";
+        let replacement_path = root.join(format!("{replacement_id}.jsonl"));
+        fs::write(
+            &replacement_path,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-08-20T11:05:00Z\",\"sessionId\":\"{replacement_id}\",\"type\":\"assistant\",\"forkedFrom\":{{\"sessionId\":\"explicit-parent\",\"messageUuid\":\"parent-message\"}},\"requestId\":\"req_parent\",\"message\":{{\"id\":\"msg_parent\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":900000,\"output_tokens\":2}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:05:59Z\",\"sessionId\":\"{replacement_id}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"owned prompt\"}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:06:00Z\",\"sessionId\":\"{replacement_id}\",\"type\":\"assistant\",\"requestId\":\"req_ambiguous\",\"message\":{{\"id\":\"msg_replacement\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":30,\"cache_read_input_tokens\":300,\"output_tokens\":4}}}}}}\n"
+                ),
+                replacement_id = replacement_id,
+            ),
+        )
+        .expect("write replacement owner fixture");
+        let replacement = parse_claude_code_jsonl_file(
+            &replacement_path,
+            "2026-08-20T11:07:00Z",
+            "replacement-fingerprint".to_string(),
+        )
+        .expect("parse replacement owner")
+        .remove(0);
+        assert_eq!(replacement.peak_context_fill_tokens, Some(330));
+        let mut replacement_index = paged_index.clone();
+        replacement_index.files.clear();
+        replacement_index.files.insert(
+            local_index_key(&replacement_path),
+            manifest_index_entry(Some("replacement-settled")),
+        );
+        let mut replacement_pass = vec![replacement.clone()];
+        apply_claude_reported_usage_with_index(
+            &mut replacement_pass,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut replacement_index,
+            true,
+            "2026-08-20T11:07:00Z",
+        );
+        assert_eq!(replacement_pass[0].peak_context_fill_tokens, None);
+        assert!(replacement_index.claude_duplicate_request_owners.is_empty());
+        assert!(replacement_index
+            .files
+            .get(&local_index_key(&replacement_path))
+            .expect("replacement index entry")
+            .source_file_fingerprint
+            .is_empty());
+        replacement_index
+            .files
+            .get_mut(&local_index_key(&replacement_path))
+            .expect("replacement index entry")
+            .source_file_fingerprint = "replacement-corrected".to_string();
+        let mut replacement_recovery = vec![replacement];
+        apply_claude_reported_usage_with_index(
+            &mut replacement_recovery,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut replacement_index,
+            true,
+            "2026-08-20T11:07:00Z",
+        );
+        assert_eq!(replacement_recovery[0].peak_context_fill_tokens, Some(330));
+        assert_eq!(
+            replacement_index
+                .files
+                .get(&local_index_key(&replacement_path))
+                .expect("replacement index entry")
+                .source_file_fingerprint,
+            "replacement-corrected"
         );
 
         // Overflow never stores a partial owner map. A complete corrective
