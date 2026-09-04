@@ -227,7 +227,10 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // It also binds the first record to the sidecar creation time within five
 // seconds and, when Codex exposes them, corroborates the opened file against
 // its state-row rollout path/times and thread-history byte/ordinal extent.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v36";
+// codex v37 promotes allowlisted SKILL.md reads from the existing activity
+// summary into canonical opaque skill attribution facts. This makes the
+// Sessions skill facet work for Codex without uploading paths or prompt text.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v37";
 const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // claude_code v30: retain the exact response ids for counted transcript usage
 // in local memory. Account attribution can then prove that every billed request
@@ -293,7 +296,9 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // codex v31 also moves scan identity: historical rollout headers already carry
 // `agent_path`, but those immutable files would otherwise stay indexed under
 // the version that emitted no label.
-pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v31";
+// codex v32 revisits existing rollouts once so activity-derived skill facts
+// backfill naturally instead of appearing only on sessions touched later.
+pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v32";
 // v28 revisits Claude history once because the v34 MCP-tool selector changes
 // transcript-derived session semantics for operators who enabled attribution
 // capture. Sessions parsed with capture off remain semantic no-ops.
@@ -9251,6 +9256,7 @@ impl SnapshotAccumulator {
                         source_version: self.source.parser_version(),
                         first_prompt: self.first_prompt_material.as_deref(),
                         provider_skills: &self.provider_skills,
+                        activity_skills: &self.activity_skills,
                         repository_hash: repository_identity
                             .as_ref()
                             .and_then(|identity| identity.repository_hash.as_deref()),
