@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 352,
-  "content_sha256": "cab64925f1d2f9bdce8ae7cdb1a5385ee9e4a85affc486d0a89cbdf42843f0aa",
+  "candidate_file_count": 354,
+  "content_sha256": "a07626c6451fcdd305c1c285152913cb05a8267b60c0d445bd29bf96cccfc33d",
   "files": [
     {
       "executable": false,
@@ -734,8 +734,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_posture.rs",
-      "sha256": "99c1ca721d9f6dfe059baf65264814f764b4494ef2208af8852714ed0a34fa88",
-      "size_bytes": 30007
+      "sha256": "43443f89a34e927a60d03375031a05151394f105b002f5369cadb35b02d6f997",
+      "size_bytes": 31736
     },
     {
       "executable": false,
@@ -867,8 +867,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "5c0da8f994549a26a4f1d868cda3c09c786e3a43042985f7bc8c499fafc97939",
-      "size_bytes": 454433
+      "sha256": "29b25dc264a24c1c0045a04fd919d1d0350989c21be5683cd535914796725325",
+      "size_bytes": 460644
     },
     {
       "executable": false,
@@ -881,8 +881,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "5359aa07e08f785890a27172d4b2f141ef245e8b97624db93218bba0235ad0a3",
-      "size_bytes": 1816490
+      "sha256": "29818674c02278379ab83031aded23903964a8480108581eab86dc011fed2148",
+      "size_bytes": 1863866
     },
     {
       "executable": false,
@@ -1496,6 +1496,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-08-30-claude-owned-context-posture.md",
+      "sha256": "92f7501364f3fcbb077c1c5d7ef6bbe26c931c952b5695bdb9b57814f0c1aaf4",
+      "size_bytes": 5764
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-08-30-envelope-ack-witness.md",
       "sha256": "cba649de560bfc571d91d48c1cddc8a2d2db4f145a0dc8411f5f4dcd872a37ae",
       "size_bytes": 1862
@@ -1912,6 +1919,13 @@
       "path": "fixtures/snapshot-audit/attribution-budget-golden.json",
       "sha256": "7213186384c98efd1a1b9691f1b58351e65ca224c01fab8b2de26f2ad673847d",
       "size_bytes": 31896
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/snapshot-audit/body-witness-ack-normalization-v1.json",
+      "sha256": "fb59e7e2ed286f18f2f2b2af622680fd9f1c15f097924ab39bb3de9ae3fdcc9d",
+      "size_bytes": 663
     },
     {
       "executable": false,
@@ -2467,9 +2481,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-03T18:46:50+00:00",
+  "generated_at": "2026-09-04T19:31:41+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 353,
+  "output_file_count": 355,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2503,5 +2517,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "19349354b8cebea5de8c288eaf8c266890cdae43"
+  "source_commit": "92b55d2c15f6b460d5fffb9654746e083abfb99b"
 }
