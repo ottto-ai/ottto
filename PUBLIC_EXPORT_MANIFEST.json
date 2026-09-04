@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 354,
-  "content_sha256": "a07626c6451fcdd305c1c285152913cb05a8267b60c0d445bd29bf96cccfc33d",
+  "content_sha256": "1ee694543d089923aff5dc4be4835e57026bbd105b2fd12c49f5a076ed560074",
   "files": [
     {
       "executable": false,
@@ -881,8 +881,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "29818674c02278379ab83031aded23903964a8480108581eab86dc011fed2148",
-      "size_bytes": 1863866
+      "sha256": "780a605cb66348699de9fb74a21d2cc0cf6138cfd00e9f002cc3c1c1b31526b0",
+      "size_bytes": 1868824
     },
     {
       "executable": false,
@@ -1497,8 +1497,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-08-30-claude-owned-context-posture.md",
-      "sha256": "92f7501364f3fcbb077c1c5d7ef6bbe26c931c952b5695bdb9b57814f0c1aaf4",
-      "size_bytes": 5764
+      "sha256": "b249d24e317f7ec59a56b4ced6d7c8ca115f35816af7ef2b6648b0e31a0dbc38",
+      "size_bytes": 6013
     },
     {
       "executable": false,
@@ -2481,7 +2481,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-04T19:31:41+00:00",
+  "generated_at": "2026-09-04T20:01:21+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 355,
   "public_roots": [
@@ -2517,5 +2517,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "92b55d2c15f6b460d5fffb9654746e083abfb99b"
+  "source_commit": "53ffdedd4d2b6aeb7dae921e76df22115c250b00"
 }
