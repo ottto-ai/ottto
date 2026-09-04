@@ -305,6 +305,12 @@ pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v31";
 // v26 deliberately revisits Claude history so every snapshot clears the old
 // safety state and future-captured, trace-owned occurrence unions can mint the
 // reported-usage contract. Historical v31 sidecars remain unproven.
+// v28 binds context-posture scalars to that same owned-occurrence proof. Legacy
+// Fable/takeover transcripts can copy an unmarked predecessor prefix; v32 usage
+// reconciliation and v33 curves excluded it, but first/peak/last context and
+// compactions still came from the raw transcript. Revisit Claude history once
+// so proven successors replace those scalars and unresolved predecessors omit
+// them instead of publishing inherited context as child-owned.
 pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v28";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
@@ -710,6 +716,60 @@ fn canonical_claude_curve_boundaries(
             .then_with(|| left.timestamp.cmp(&right.timestamp))
     });
     boundaries
+}
+
+fn clear_claude_context_posture(item: &mut SnapshotItem) {
+    item.peak_context_fill_tokens = None;
+    item.first_turn_context_tokens = None;
+    item.last_turn_context_tokens = None;
+    item.compaction_count = None;
+    item.compaction_timestamps.clear();
+    item.compaction_total_pre_tokens = None;
+    item.compaction_total_post_tokens = None;
+    item.compaction_total_cumulative_dropped_tokens = None;
+    item.compaction_total_duration_ms = None;
+}
+
+/// Replace Claude posture scalars from the same owned response suffix used by
+/// reported usage and the request curve. `copied_prefix_end` is present only
+/// for a legacy unmarked fork whose exact leading request prefix was assigned
+/// to another root; explicit `forkedFrom` records were already suppressed by
+/// the line parser, while an exclusive root owns every observed boundary.
+fn rebuild_claude_context_posture(
+    item: &mut SnapshotItem,
+    owned_occurrences: &[ClaudeTranscriptUsageOccurrence],
+    copied_prefix_end: Option<u64>,
+) {
+    let contexts = owned_occurrences
+        .iter()
+        .map(|occurrence| occurrence.effective_input_context)
+        .filter(|context| *context > 0)
+        .collect::<Vec<_>>();
+    item.first_turn_context_tokens = contexts.first().copied();
+    item.peak_context_fill_tokens = contexts.iter().copied().max();
+    item.last_turn_context_tokens = contexts.last().copied();
+
+    let owned_observations = item
+        .claude_context_curve_boundaries
+        .iter()
+        .filter(|observation| {
+            copied_prefix_end
+                .map(|sequence| observation.response_count_before > sequence)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let (count, timestamps, metrics) = claude_compaction_summary(&owned_observations);
+    item.compaction_count = Some(count);
+    item.compaction_timestamps = timestamps;
+    item.compaction_total_pre_tokens =
+        (metrics.metrics_count > 0).then_some(metrics.total_pre_tokens);
+    item.compaction_total_post_tokens =
+        (metrics.metrics_count > 0).then_some(metrics.total_post_tokens);
+    item.compaction_total_cumulative_dropped_tokens =
+        (metrics.metrics_count > 0).then_some(metrics.total_cumulative_dropped_tokens);
+    item.compaction_total_duration_ms =
+        (metrics.metrics_count > 0).then_some(metrics.total_duration_ms);
 }
 
 fn unavailable_context_curve(
@@ -2043,6 +2103,16 @@ pub struct ScanIndex {
     /// re-prove authority without trusting the older body itself.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     claude_usage_authority_quarantine: BTreeMap<String, ClaudeUsageAuthorityQuarantineRecord>,
+    /// Hash-only duplicate request ownership discovered by a complete Claude
+    /// census. This keeps later incremental reparses fail-closed even after
+    /// the terminal pending census is released.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    claude_duplicate_request_owners: BTreeMap<String, BTreeSet<ClaudeDuplicateRequestOwner>>,
+    /// A duplicate witness that exceeds the local bound cannot be represented
+    /// partially. Fail all Claude posture closed and force a full corrective
+    /// census instead.
+    #[serde(default)]
+    claude_duplicate_request_witness_overflowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_desktop_store_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2162,6 +2232,8 @@ impl Default for ScanIndex {
             claude_usage_family_witnesses: BTreeMap::new(),
             claude_usage_family_pending: BTreeMap::new(),
             claude_usage_authority_quarantine: BTreeMap::new(),
+            claude_duplicate_request_owners: BTreeMap::new(),
+            claude_duplicate_request_witness_overflowed: false,
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
@@ -2520,10 +2592,45 @@ fn sha256_hex_is_well_formed(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct ClaudeDuplicateRequestOwner {
+    root_session_id_hash: String,
+    source_session_id_hash: String,
+}
+
 // Historical paging may retain occurrence witnesses until a complete family
 // census closes. Keep that retry state finite; crossing the bound makes only
 // the affected pending proof fail closed and never authorizes partial usage.
 const MAX_CLAUDE_PENDING_USAGE_OCCURRENCES: usize = 250_000;
+const MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS: usize = 250_000;
+
+fn claude_duplicate_request_owner(
+    root_session_id: &str,
+    source_session_id: &str,
+) -> ClaudeDuplicateRequestOwner {
+    let hash = |domain: &[u8], value: &str| {
+        let mut digest = Sha256::new();
+        digest.update(domain);
+        digest.update(b"\0");
+        digest.update(value.as_bytes());
+        format!("{:x}", digest.finalize())
+    };
+    ClaudeDuplicateRequestOwner {
+        root_session_id_hash: hash(b"claude_duplicate_root:v1", root_session_id),
+        source_session_id_hash: hash(b"claude_duplicate_source:v1", source_session_id),
+    }
+}
+
+fn claude_duplicate_request_witness_within_bound(
+    witnesses: &BTreeMap<String, BTreeSet<ClaudeDuplicateRequestOwner>>,
+    max_owners: usize,
+) -> bool {
+    witnesses
+        .values()
+        .map(BTreeSet::len)
+        .try_fold(0_usize, |total, count| total.checked_add(count))
+        .is_some_and(|total| total <= max_owners)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ClaudeTranscriptUsageOccurrenceWitness {
@@ -3214,8 +3321,9 @@ pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
 /// responses and locally reported API-request occurrences, but only after a
 /// complete filesystem census and an exact enhanced-trace ownership join.
 ///
-/// This mutates usage and cost fields only. Provider graph facts remain the
-/// transcript/filesystem truth and are never inferred from telemetry spans.
+/// This mutates usage, cost, and context-posture fields only. Provider graph
+/// facts remain the transcript/filesystem truth and are never inferred from
+/// telemetry spans.
 pub fn apply_claude_reported_usage_with_index(
     snapshots: &mut [SnapshotItem],
     api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
@@ -3224,10 +3332,34 @@ pub fn apply_claude_reported_usage_with_index(
     census_complete: bool,
     census_window_end: &str,
 ) -> ClaudeUsageAuthorityDisposition {
-    accumulate_claude_usage_family_pending(
+    apply_claude_reported_usage_with_index_and_limits(
+        snapshots,
+        api_report,
+        trace_report,
+        index,
+        census_complete,
+        census_window_end,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_claude_reported_usage_with_index_and_limits(
+    snapshots: &mut [SnapshotItem],
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    index: &mut ScanIndex,
+    census_complete: bool,
+    census_window_end: &str,
+    max_pending_occurrences: usize,
+    max_duplicate_owners: usize,
+) -> ClaudeUsageAuthorityDisposition {
+    accumulate_claude_usage_family_pending_with_limit(
         snapshots,
         &mut index.claude_usage_family_pending,
         census_window_end,
+        max_pending_occurrences,
     );
 
     let complete_families = if census_complete {
@@ -3418,7 +3550,31 @@ pub fn apply_claude_reported_usage_with_index(
     // predecessor may be missing or deleted. Exact inherited-prefix or
     // session-exclusive provider/local proof below must establish the start;
     // all duplicate, missing-id, or unproven-start shapes fail closed.
-    let duplicated_request_hashes = if census_complete {
+    let duplicate_census_invalid =
+        index
+            .claude_usage_family_pending
+            .iter()
+            .any(|(root_session_id, pending)| {
+                if pending.census_window_end == census_window_end {
+                    return pending.invalid;
+                }
+                // A demoted family retains its prior pending proof while bounded
+                // quarantine retries reconstruct the durable witness. That old
+                // window is not part of this census and must not globally poison
+                // unrelated Claude posture. Ignore it only while the quarantine
+                // is well formed and bound to the exact retained witness; every
+                // other stale or invalid pending shape remains fail closed.
+                !index
+                    .claude_usage_authority_quarantine
+                    .get(root_session_id)
+                    .zip(index.claude_usage_family_witnesses.get(root_session_id))
+                    .is_some_and(|(quarantine, witness)| {
+                        claude_usage_authority_deadline_is_bounded(quarantine)
+                            && quarantine.proven_witness_fingerprint
+                                == claude_usage_family_witness_fingerprint(witness)
+                    })
+            });
+    let detected_duplicate_request_owners = if census_complete && !duplicate_census_invalid {
         let mut owners = BTreeMap::<String, BTreeSet<(String, String)>>::new();
         for (root_session_id, pending) in &index.claude_usage_family_pending {
             if pending.invalid || pending.census_window_end != census_window_end {
@@ -3435,12 +3591,88 @@ pub fn apply_claude_reported_usage_with_index(
         }
         owners
             .into_iter()
-            .filter_map(|(request_hash, owners)| (owners.len() > 1).then_some(request_hash))
-            .collect::<BTreeSet<_>>()
+            .filter(|(_, owners)| owners.len() > 1)
+            .map(|(request_hash, owners)| {
+                (
+                    request_hash,
+                    owners
+                        .into_iter()
+                        .map(|(root_session_id, source_session_id)| {
+                            claude_duplicate_request_owner(&root_session_id, &source_session_id)
+                        })
+                        .collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
     } else {
-        BTreeSet::new()
+        BTreeMap::new()
     };
+    let duplicated_request_hashes = index
+        .claude_duplicate_request_owners
+        .keys()
+        .chain(detected_duplicate_request_owners.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
     for item in snapshots.iter_mut() {
+        let root_session_id = claude_snapshot_family_root(item);
+        let family = proven
+            .get(&root_session_id)
+            .or_else(|| reconstructed.get(&root_session_id));
+        let excluded_request_hashes = family
+            .and_then(|family| {
+                family
+                    .witness
+                    .legacy_excluded_request_id_hashes
+                    .get(&item.source_session_id)
+            })
+            .cloned()
+            .unwrap_or_default();
+        let unresolved_duplicate = duplicate_census_invalid
+            || index.claude_duplicate_request_witness_overflowed
+            || item.claude_usage_request_ids.iter().any(|request_id| {
+                let request_hash = format!("{:x}", Sha256::digest(request_id.as_bytes()));
+                duplicated_request_hashes.contains(&request_hash)
+                    && !excluded_request_hashes.contains(&request_hash)
+            });
+        let provider_owned_start = !excluded_request_hashes.is_empty()
+            || item.usage_accounting_contract.as_deref()
+                == Some("session_exclusive_reported_usage:v1");
+        let explicit_owned_start = item.claude_context_curve_owned_start_proven;
+        let posture_owned = (explicit_owned_start || provider_owned_start) && !unresolved_duplicate;
+
+        if !posture_owned {
+            // A raw top-level transcript can be a Fable/takeover successor
+            // with a copied, unmarked prefix. Until the predecessor or an
+            // exclusive provider ledger proves where ownership starts, no
+            // first/peak/last context or compaction scalar is truthful.
+            clear_claude_context_posture(item);
+        } else if item.claude_context_curve_identity_complete {
+            let mut owned_occurrences = item
+                .claude_usage_occurrences
+                .iter()
+                .filter_map(|(request_id, occurrence)| {
+                    let request_hash = format!("{:x}", Sha256::digest(request_id.as_bytes()));
+                    (!excluded_request_hashes.contains(&request_hash)).then_some(occurrence.clone())
+                })
+                .collect::<Vec<_>>();
+            owned_occurrences.sort_by_key(|occurrence| occurrence.sequence);
+            let copied_prefix_end = if excluded_request_hashes.is_empty() {
+                None
+            } else {
+                owned_occurrences
+                    .first()
+                    .map(|occurrence| occurrence.sequence)
+            };
+            if excluded_request_hashes.is_empty() || copied_prefix_end.is_some() {
+                rebuild_claude_context_posture(item, &owned_occurrences, copied_prefix_end);
+            } else {
+                clear_claude_context_posture(item);
+            }
+        }
+        // Context posture participates in semantic identity. Recompute after
+        // the ownership fold even when curve admission is disabled.
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+
         if item.context_curve.is_none() {
             // Activity hint did not advertise durable curve admission for this
             // cycle. Do not mint additive evidence that cannot be settled.
@@ -3464,7 +3696,6 @@ pub fn apply_claude_reported_usage_with_index(
         {
             continue;
         }
-        let root_session_id = claude_snapshot_family_root(item);
         if index
             .claude_usage_family_pending
             .get(&root_session_id)
@@ -3474,18 +3705,6 @@ pub fn apply_claude_reported_usage_with_index(
         {
             continue;
         }
-        let family = proven
-            .get(&root_session_id)
-            .or_else(|| reconstructed.get(&root_session_id));
-        let excluded_request_hashes = family
-            .and_then(|family| {
-                family
-                    .witness
-                    .legacy_excluded_request_id_hashes
-                    .get(&item.source_session_id)
-            })
-            .cloned()
-            .unwrap_or_default();
         let owned_start_proven = item.claude_context_curve_owned_start_proven
             || !excluded_request_hashes.is_empty()
             || item.usage_accounting_contract.as_deref()
@@ -3498,11 +3717,6 @@ pub fn apply_claude_reported_usage_with_index(
             // prefix, or complete provider-reported ownership evidence.
             continue;
         }
-        let unresolved_duplicate = item.claude_usage_request_ids.iter().any(|request_id| {
-            let request_hash = format!("{:x}", Sha256::digest(request_id.as_bytes()));
-            duplicated_request_hashes.contains(&request_hash)
-                && !excluded_request_hashes.contains(&request_hash)
-        });
         if unresolved_duplicate {
             continue;
         }
@@ -3646,6 +3860,72 @@ pub fn apply_claude_reported_usage_with_index(
     }
 
     if census_complete {
+        let duplicate_witnesses_before = index.claude_duplicate_request_owners.clone();
+        let mut duplicate_witnesses_after = duplicate_witnesses_before.clone();
+        if !duplicate_census_invalid {
+            let current_owner_universe = complete_families
+                .iter()
+                .flat_map(|(root_session_id, source_session_ids)| {
+                    source_session_ids.iter().map(|source_session_id| {
+                        claude_duplicate_request_owner(root_session_id, source_session_id)
+                    })
+                })
+                .collect::<BTreeSet<_>>();
+            for owners in duplicate_witnesses_after.values_mut() {
+                owners.retain(|owner| current_owner_universe.contains(owner));
+            }
+        }
+        for (root_session_id, pending) in &index.claude_usage_family_pending {
+            if pending.invalid || pending.census_window_end != census_window_end {
+                continue;
+            }
+            for (source_session_id, current_request_hashes) in &pending.member_request_id_hashes {
+                let owner = claude_duplicate_request_owner(root_session_id, source_session_id);
+                for (request_hash, owners) in &mut duplicate_witnesses_after {
+                    if owners.contains(&owner) && !current_request_hashes.contains(request_hash) {
+                        owners.remove(&owner);
+                    }
+                }
+            }
+        }
+        for (request_hash, owners) in &detected_duplicate_request_owners {
+            duplicate_witnesses_after
+                .entry(request_hash.clone())
+                .or_default()
+                .extend(owners.iter().cloned());
+        }
+        duplicate_witnesses_after.retain(|_, owners| owners.len() > 1);
+        let overflowed_before = index.claude_duplicate_request_witness_overflowed;
+        let changed_duplicate_request_hashes = duplicate_witnesses_before
+            .keys()
+            .chain(duplicate_witnesses_after.keys())
+            .filter(|request_hash| {
+                duplicate_witnesses_before.get(*request_hash)
+                    != duplicate_witnesses_after.get(*request_hash)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let changed_duplicate_owners = duplicate_witnesses_before
+            .iter()
+            .chain(duplicate_witnesses_after.iter())
+            .filter(|(request_hash, _)| {
+                duplicate_witnesses_before.get(*request_hash)
+                    != duplicate_witnesses_after.get(*request_hash)
+            })
+            .flat_map(|(_, owners)| owners.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        if duplicate_census_invalid
+            || !claude_duplicate_request_witness_within_bound(
+                &duplicate_witnesses_after,
+                max_duplicate_owners,
+            )
+        {
+            index.claude_duplicate_request_owners.clear();
+            index.claude_duplicate_request_witness_overflowed = true;
+        } else {
+            index.claude_duplicate_request_owners = duplicate_witnesses_after;
+            index.claude_duplicate_request_witness_overflowed = false;
+        }
         let invalidated_witness_roots = witness_roots_before
             .difference(
                 &index
@@ -3666,10 +3946,28 @@ pub fn apply_claude_reported_usage_with_index(
             else {
                 continue;
             };
-            if (proven.contains_key(&root_session_id)
-                && !current_ids.contains(source_session_id.as_str()))
+            let duplicate_owner =
+                claude_duplicate_request_owner(&root_session_id, &source_session_id);
+            let current_member_owns_changed_request = index
+                .claude_usage_family_pending
+                .get(&root_session_id)
+                .and_then(|pending| pending.member_request_id_hashes.get(&source_session_id))
+                .is_some_and(|request_hashes| {
+                    !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
+                });
+            if overflowed_before
+                || index.claude_duplicate_request_witness_overflowed
+                || (proven.contains_key(&root_session_id)
+                    && !current_ids.contains(source_session_id.as_str()))
                 || invalidated_witness_roots.contains(&root_session_id)
+                || changed_duplicate_owners.contains(&duplicate_owner)
+                || current_member_owns_changed_request
             {
+                // Reparse earlier-page members when terminal family proof
+                // changes or when a later page reveals a cross-family request
+                // duplicate. Changed hash-only witnesses re-arm every affected
+                // owner once; stable duplicates remain fail-closed without an
+                // unbounded corrective replay loop.
                 entry.source_file_fingerprint.clear();
             }
         }
@@ -3741,10 +4039,11 @@ pub fn apply_claude_reported_usage_with_index(
     disposition
 }
 
-fn accumulate_claude_usage_family_pending(
+fn accumulate_claude_usage_family_pending_with_limit(
     snapshots: &[SnapshotItem],
     pending_by_root: &mut BTreeMap<String, ClaudeUsageFamilyPending>,
     census_window_end: &str,
+    max_occurrences: usize,
 ) {
     let mut retained_occurrence_count = pending_by_root
         .values()
@@ -3814,6 +4113,7 @@ fn accumulate_claude_usage_family_pending(
             retained_occurrence_count,
             replaced_occurrence_count,
             occurrences.len(),
+            max_occurrences,
         ) else {
             invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
@@ -3858,9 +4158,10 @@ fn claude_pending_occurrence_count_after_replace(
     retained: usize,
     replaced: usize,
     incoming: usize,
+    max_occurrences: usize,
 ) -> Option<usize> {
     let next = retained.saturating_sub(replaced).saturating_add(incoming);
-    (next <= MAX_CLAUDE_PENDING_USAGE_OCCURRENCES).then_some(next)
+    (next <= max_occurrences).then_some(next)
 }
 
 fn complete_claude_usage_family_members(index: &ScanIndex) -> BTreeMap<String, BTreeSet<String>> {
@@ -18012,6 +18313,9 @@ impl ScanIndex {
             claude_usage_family_witnesses: self.claude_usage_family_witnesses.clone(),
             claude_usage_family_pending: self.claude_usage_family_pending.clone(),
             claude_usage_authority_quarantine: self.claude_usage_authority_quarantine.clone(),
+            claude_duplicate_request_owners: self.claude_duplicate_request_owners.clone(),
+            claude_duplicate_request_witness_overflowed: self
+                .claude_duplicate_request_witness_overflowed,
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
             claude_desktop_store_sweep_had_errors: self.claude_desktop_store_sweep_had_errors,
@@ -30216,6 +30520,7 @@ mod tests {
                 MAX_CLAUDE_PENDING_USAGE_OCCURRENCES - 10,
                 0,
                 10,
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
             ),
             Some(MAX_CLAUDE_PENDING_USAGE_OCCURRENCES)
         );
@@ -30224,6 +30529,7 @@ mod tests {
                 MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
                 10,
                 10,
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
             ),
             Some(MAX_CLAUDE_PENDING_USAGE_OCCURRENCES)
         );
@@ -30232,6 +30538,7 @@ mod tests {
                 MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
                 0,
                 1,
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
             ),
             None
         );
@@ -30596,7 +30903,19 @@ mod tests {
                     .expect("fixture rejected fingerprint")
             })
             .collect::<BTreeSet<_>>();
-        assert_eq!(rejected_hashes, fixture_hashes);
+        assert_ne!(
+            rejected_hashes, fixture_hashes,
+            "v28 recomputes semantic identity after clearing unowned posture"
+        );
+        assert!(rejected_hashes
+            .iter()
+            .all(|fingerprint| sha256_hex_is_well_formed(fingerprint)));
+        assert!(weaker_revision.iter().all(|item| {
+            item.first_turn_context_tokens.is_none()
+                && item.peak_context_fill_tokens.is_none()
+                && item.last_turn_context_tokens.is_none()
+                && item.compaction_count.is_none()
+        }));
         let mut uploadable = weaker_revision.clone();
         disposition.retain_uploadable(&mut uploadable);
         assert!(uploadable.is_empty(), "all seven demoting bodies are held");
@@ -30621,7 +30940,7 @@ mod tests {
                 .values()
                 .cloned()
                 .collect::<BTreeSet<_>>(),
-            fixture_hashes.into_iter().map(str::to_string).collect()
+            fixture_hashes.iter().copied().map(str::to_string).collect()
         );
 
         let mut exhausted_index = index.clone();
@@ -30831,7 +31150,7 @@ mod tests {
             &parent_path,
             format!(
                 concat!(
-                    "{{\"uuid\":\"shared-assistant\",\"timestamp\":\"2026-08-02T07:00:01Z\",\"type\":\"assistant\",\"sessionId\":\"{parent}\",\"requestId\":\"req_shared\",\"message\":{{\"id\":\"msg_shared\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n",
+                    "{{\"uuid\":\"shared-assistant\",\"timestamp\":\"2026-08-02T07:00:01Z\",\"type\":\"assistant\",\"sessionId\":\"{parent}\",\"requestId\":\"req_shared\",\"message\":{{\"id\":\"msg_shared\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_input_tokens\":895000}}}}}}\n",
                     "{{\"uuid\":\"parent-assistant\",\"timestamp\":\"2026-08-02T07:00:02Z\",\"type\":\"assistant\",\"sessionId\":\"{parent}\",\"requestId\":\"req_parent\",\"message\":{{\"id\":\"msg_parent\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":11,\"output_tokens\":3}}}}}}\n"
                 ),
                 parent = parent,
@@ -30842,8 +31161,11 @@ mod tests {
             &child_path,
             format!(
                 concat!(
-                    "{{\"uuid\":\"shared-assistant\",\"timestamp\":\"2026-08-02T07:00:01Z\",\"type\":\"assistant\",\"sessionId\":\"{child}\",\"requestId\":\"req_shared\",\"message\":{{\"id\":\"msg_shared\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n",
-                    "{{\"uuid\":\"child-assistant\",\"timestamp\":\"2026-08-02T07:00:03Z\",\"type\":\"assistant\",\"sessionId\":\"{child}\",\"requestId\":\"req_child\",\"message\":{{\"id\":\"msg_child\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":12,\"output_tokens\":4}}}}}}\n"
+                    "{{\"uuid\":\"shared-assistant\",\"timestamp\":\"2026-08-02T07:00:01Z\",\"type\":\"assistant\",\"sessionId\":\"{child}\",\"requestId\":\"req_shared\",\"message\":{{\"id\":\"msg_shared\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_input_tokens\":895000}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-02T07:00:01.500Z\",\"sessionId\":\"{child}\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"preTokens\":895010,\"postTokens\":100000,\"durationMs\":20}}}}\n",
+                    "{{\"uuid\":\"child-assistant\",\"timestamp\":\"2026-08-02T07:00:03Z\",\"type\":\"assistant\",\"sessionId\":\"{child}\",\"requestId\":\"req_child\",\"message\":{{\"id\":\"msg_child\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":100}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-02T07:00:03.500Z\",\"sessionId\":\"{child}\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"preTokens\":112,\"postTokens\":50,\"durationMs\":10}}}}\n",
+                    "{{\"uuid\":\"child-assistant-2\",\"timestamp\":\"2026-08-02T07:00:04Z\",\"type\":\"assistant\",\"sessionId\":\"{child}\",\"requestId\":\"req_child_2\",\"message\":{{\"id\":\"msg_child_2\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":14,\"output_tokens\":5,\"cache_read_input_tokens\":200}}}}}}\n"
                 ),
                 child = child,
             ),
@@ -30863,24 +31185,33 @@ mod tests {
             )
             .expect("parse child"),
         );
-        assert_eq!(
-            items[1].request_count, 2,
-            "raw legacy child double-counts prefix"
-        );
+        assert_eq!(items[1].request_count, 3, "raw child double-counts prefix");
+        assert_eq!(items[1].first_turn_context_tokens, Some(895_010));
+        assert_eq!(items[1].peak_context_fill_tokens, Some(895_010));
+        assert_eq!(items[1].compaction_count, Some(2));
 
+        let with_cache_read = |mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence,
+                               tokens| {
+            row.cache_read_tokens = tokens;
+            row.fingerprint.clear();
+            let bytes = serde_json::to_vec(&row).expect("serialize API evidence");
+            row.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
+            row
+        };
+        let shared_api =
+            with_cache_read(complete_api_row(parent, "req_shared", 1, 10, 2, 0), 895_000);
+        let child_api = with_cache_read(complete_api_row(child, "req_child", 3, 12, 4, 0), 100);
+        let child_api_2 = with_cache_read(complete_api_row(child, "req_child_2", 4, 14, 5, 0), 200);
         let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
             evidence: BTreeMap::from([
                 (
                     parent.to_string(),
                     vec![
-                        complete_api_row(parent, "req_shared", 1, 10, 2, 0),
+                        shared_api,
                         complete_api_row(parent, "req_parent", 2, 11, 3, 0),
                     ],
                 ),
-                (
-                    child.to_string(),
-                    vec![complete_api_row(child, "req_child", 3, 12, 4, 0)],
-                ),
+                (child.to_string(), vec![child_api, child_api_2]),
             ]),
             health: Default::default(),
         };
@@ -30895,7 +31226,10 @@ mod tests {
                 ),
                 (
                     child.to_string(),
-                    vec![complete_trace_row(child, "req_child", "")],
+                    vec![
+                        complete_trace_row(child, "req_child", ""),
+                        complete_trace_row(child, "req_child_2", ""),
+                    ],
                 ),
             ]),
             ..Default::default()
@@ -30916,9 +31250,20 @@ mod tests {
             "2026-08-02T07:10:00Z",
         );
         assert_eq!(items[0].request_count, 2);
-        assert_eq!(items[1].request_count, 1);
-        assert_eq!(items[1].input_tokens, 12);
-        assert_eq!(items[1].output_tokens, 4);
+        assert_eq!(items[1].request_count, 2);
+        assert_eq!(items[1].input_tokens, 26);
+        assert_eq!(items[1].output_tokens, 9);
+        assert_eq!(items[1].first_turn_context_tokens, Some(112));
+        assert_eq!(items[1].peak_context_fill_tokens, Some(214));
+        assert_eq!(items[1].last_turn_context_tokens, Some(214));
+        assert_eq!(items[1].compaction_count, Some(1));
+        assert_eq!(
+            items[1].compaction_timestamps,
+            vec!["2026-08-02T07:00:03.500Z".to_string()]
+        );
+        assert_eq!(items[1].compaction_total_pre_tokens, Some(112));
+        assert_eq!(items[1].compaction_total_post_tokens, Some(50));
+        assert_eq!(items[1].compaction_total_duration_ms, Some(10));
         assert!(items.iter().all(|item| {
             item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
         }));
@@ -30927,8 +31272,9 @@ mod tests {
             .as_ref()
             .expect("legacy child owned curve");
         assert_eq!(child_curve.coverage, "complete");
-        assert_eq!(child_curve.total_owned_request_count, 1);
-        assert_eq!(child_curve.points[0].effective_input_tokens, 12);
+        assert_eq!(child_curve.total_owned_request_count, 2);
+        assert_eq!(child_curve.points[0].effective_input_tokens, 112);
+        assert_eq!(child_curve.total_compaction_boundary_count, 1);
         let child_witness = index
             .claude_usage_family_witnesses
             .get(child)
@@ -30956,31 +31302,35 @@ mod tests {
             false,
             "2026-08-02T07:11:00Z",
         );
-        assert_eq!(child_only[0].request_count, 1);
+        assert_eq!(child_only[0].request_count, 2);
+        assert_eq!(child_only[0].first_turn_context_tokens, Some(112));
+        assert_eq!(child_only[0].peak_context_fill_tokens, Some(214));
+        assert_eq!(child_only[0].compaction_count, Some(1));
         assert_eq!(
             child_only[0].usage_accounting_contract.as_deref(),
             Some("session_exclusive_reported_usage:v1")
         );
+        let child_only_api =
+            with_cache_read(complete_api_row(child, "req_child", 3, 12, 4, 0), 100);
+        let child_only_api_2 =
+            with_cache_read(complete_api_row(child, "req_child_2", 4, 14, 5, 0), 200);
         let child_only_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
-            evidence: BTreeMap::from([(
-                child.to_string(),
-                vec![complete_api_row(child, "req_child", 3, 12, 4, 0)],
-            )]),
+            evidence: BTreeMap::from([(child.to_string(), vec![child_only_api, child_only_api_2])]),
             health: Default::default(),
         };
         let child_only_trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
             evidence: BTreeMap::from([(
                 child.to_string(),
-                vec![complete_trace_row(child, "req_child", "")],
+                vec![
+                    complete_trace_row(child, "req_child", ""),
+                    complete_trace_row(child, "req_child_2", ""),
+                ],
             )]),
             ..Default::default()
         };
-        let mut unproven = parse_claude_code_jsonl_file(
-            &child_path,
-            "2026-08-02T07:12:00Z",
-            "child-fp-3".to_string(),
-        )
-        .expect("reparse unproven child");
+        let mut unproven =
+            parse_claude_code_jsonl_file(&child_path, "2026-08-02T07:12:00Z", "3".repeat(64))
+                .expect("reparse unproven child");
         let unproven_disposition = apply_claude_reported_usage_with_index(
             &mut unproven,
             &child_only_report,
@@ -30989,9 +31339,17 @@ mod tests {
             false,
             "2026-08-02T07:12:00Z",
         );
-        assert_eq!(unproven[0].request_count, 2);
+        assert_eq!(unproven[0].request_count, 3);
         assert_eq!(unproven[0].usage_accounting_contract, None);
         assert_eq!(unproven_disposition.quarantined_entity_count(), 1);
+        assert_eq!(unproven[0].first_turn_context_tokens, None);
+        assert_eq!(unproven[0].peak_context_fill_tokens, None);
+        assert_eq!(unproven[0].last_turn_context_tokens, None);
+        assert_eq!(unproven[0].compaction_count, None);
+        assert!(unproven[0].compaction_timestamps.is_empty());
+        assert_eq!(unproven[0].compaction_total_pre_tokens, None);
+        assert_eq!(unproven[0].compaction_total_post_tokens, None);
+        assert_eq!(unproven[0].compaction_total_duration_ms, None);
         assert_eq!(
             unproven[0]
                 .context_curve
@@ -31010,10 +31368,36 @@ mod tests {
         );
         assert!(index.claude_usage_family_witnesses.contains_key(child));
         assert!(index.claude_usage_authority_quarantine.contains_key(child));
-        assert!(index
-            .files
-            .get(&local_index_key(&child_path))
-            .is_some_and(|entry| !entry.source_file_fingerprint.is_empty()));
+        assert!(
+            !index.claude_duplicate_request_witness_overflowed,
+            "a bounded stale quarantine is outside the new census and cannot poison all posture"
+        );
+        assert!(
+            index
+                .files
+                .get(&local_index_key(&child_path))
+                .is_some_and(|entry| entry.source_file_fingerprint.is_empty()),
+            "the durable duplicate-owner correction keeps the quarantined revision re-armed"
+        );
+
+        let retained_pending = index
+            .claude_usage_family_pending
+            .get_mut(child)
+            .expect("quarantined family retains pending proof");
+        retained_pending.census_window_end = "2026-08-02T07:13:00Z".to_string();
+        retained_pending.invalid = true;
+        apply_claude_reported_usage_with_index(
+            &mut [],
+            &child_only_report,
+            &child_only_trace,
+            &mut index,
+            true,
+            "2026-08-02T07:13:00Z",
+        );
+        assert!(
+            index.claude_duplicate_request_witness_overflowed,
+            "a current-window invalid quarantine must remain globally fail closed"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -33752,6 +34136,14 @@ mod tests {
             "provider_reported_model"
         );
         assert_eq!(items[0].usage_accounting_contract, None);
+        assert_eq!(items[0].first_turn_context_tokens, Some(115));
+        assert_eq!(items[0].peak_context_fill_tokens, Some(337));
+        assert_eq!(items[0].last_turn_context_tokens, Some(337));
+        assert_eq!(items[0].compaction_count, Some(1));
+        assert_eq!(
+            items[0].compaction_timestamps,
+            vec!["2026-08-20T10:02:30Z".to_string()]
+        );
         validate_context_curve(0, curve).expect("Claude curve validates");
         let _ = fs::remove_file(path);
     }
@@ -33827,6 +34219,589 @@ mod tests {
     }
 
     #[test]
+    fn claude_explicit_fork_duplicate_owned_request_fails_posture_closed() {
+        let root = temp_dir("claude-explicit-fork-duplicate");
+        let child_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let sibling_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+        let child_path = root.join(format!("{child_id}.jsonl"));
+        let sibling_path = root.join(format!("{sibling_id}.jsonl"));
+        fs::write(
+            &child_path,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-08-20T11:00:00Z\",\"sessionId\":\"{child_id}\",\"type\":\"assistant\",\"forkedFrom\":{{\"sessionId\":\"explicit-parent\",\"messageUuid\":\"parent-message\"}},\"requestId\":\"req_parent\",\"message\":{{\"id\":\"msg_parent\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":900000,\"output_tokens\":2}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"{child_id}\",\"type\":\"assistant\",\"requestId\":\"req_ambiguous\",\"message\":{{\"id\":\"msg_child\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":10,\"cache_read_input_tokens\":895000,\"output_tokens\":2}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:01:30Z\",\"sessionId\":\"{child_id}\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"trigger\":\"auto\",\"preTokens\":895010,\"postTokens\":100000}}}}\n"
+                ),
+                child_id = child_id,
+            ),
+        )
+        .expect("write explicit child fixture");
+        fs::write(
+            &sibling_path,
+            format!(
+                "{{\"timestamp\":\"2026-08-20T11:02:00Z\",\"sessionId\":\"{sibling_id}\",\"type\":\"assistant\",\"requestId\":\"req_ambiguous\",\"message\":{{\"id\":\"msg_sibling\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":20,\"cache_read_input_tokens\":100,\"output_tokens\":3}}}}}}\n"
+            ),
+        )
+        .expect("write duplicate sibling fixture");
+        let child = parse_claude_code_jsonl_file(
+            &child_path,
+            "2026-08-20T11:04:00Z",
+            "child-fingerprint".to_string(),
+        )
+        .expect("parse child")
+        .remove(0);
+        let sibling = parse_claude_code_jsonl_file(
+            &sibling_path,
+            "2026-08-20T11:04:00Z",
+            "sibling-fingerprint".to_string(),
+        )
+        .expect("parse sibling")
+        .remove(0);
+        let mut items = vec![child.clone(), sibling.clone()];
+        assert!(items[0].claude_context_curve_owned_start_proven);
+        assert_eq!(items[0].peak_context_fill_tokens, Some(895_010));
+        assert_eq!(items[0].compaction_count, Some(1));
+
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut ScanIndex::default(),
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+
+        assert_eq!(items[0].first_turn_context_tokens, None);
+        assert_eq!(items[0].peak_context_fill_tokens, None);
+        assert_eq!(items[0].last_turn_context_tokens, None);
+        assert_eq!(items[0].compaction_count, None);
+        assert!(items[0].compaction_timestamps.is_empty());
+        assert_eq!(
+            items[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("ownership_unresolved")
+        );
+
+        let mut paged_index = ScanIndex::default();
+        paged_index.files.insert(
+            local_index_key(&child_path),
+            manifest_index_entry(Some("child-settled")),
+        );
+        paged_index.files.insert(
+            local_index_key(&sibling_path),
+            manifest_index_entry(Some("sibling-settled")),
+        );
+        let mut child_page = vec![child];
+        apply_claude_reported_usage_with_index(
+            &mut child_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            false,
+            "2026-08-20T11:04:00Z",
+        );
+        assert_eq!(child_page[0].peak_context_fill_tokens, Some(895_010));
+
+        let mut sibling_page = vec![sibling];
+        apply_claude_reported_usage_with_index(
+            &mut sibling_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+        assert!(paged_index
+            .files
+            .get(&local_index_key(&child_path))
+            .expect("child index entry")
+            .source_file_fingerprint
+            .is_empty());
+        assert!(paged_index
+            .files
+            .get(&local_index_key(&sibling_path))
+            .expect("sibling index entry")
+            .source_file_fingerprint
+            .is_empty());
+        assert_eq!(paged_index.claude_duplicate_request_owners.len(), 1);
+
+        paged_index
+            .files
+            .get_mut(&local_index_key(&child_path))
+            .expect("child index entry")
+            .source_file_fingerprint = "child-corrective".to_string();
+        paged_index
+            .files
+            .get_mut(&local_index_key(&sibling_path))
+            .expect("sibling index entry")
+            .source_file_fingerprint = "sibling-corrective".to_string();
+
+        // The corrective traversal reparses every duplicate owner. Its
+        // complete census must keep the inherited 895K context and compaction
+        // tombstoned instead of treating the lone re-armed child as unique.
+        let mut corrective_page = vec![child_page.remove(0), sibling_page.remove(0)];
+        apply_claude_reported_usage_with_index(
+            &mut corrective_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+        assert_eq!(corrective_page[0].first_turn_context_tokens, None);
+        assert_eq!(corrective_page[0].peak_context_fill_tokens, None);
+        assert_eq!(corrective_page[0].last_turn_context_tokens, None);
+        assert_eq!(corrective_page[0].compaction_count, None);
+        assert!(corrective_page[0].compaction_timestamps.is_empty());
+        assert_eq!(
+            corrective_page[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("ownership_unresolved")
+        );
+        assert_eq!(
+            paged_index
+                .files
+                .get(&local_index_key(&child_path))
+                .expect("child index entry")
+                .source_file_fingerprint,
+            "child-corrective"
+        );
+        assert_eq!(
+            paged_index
+                .files
+                .get(&local_index_key(&sibling_path))
+                .expect("sibling index entry")
+                .source_file_fingerprint,
+            "sibling-corrective"
+        );
+
+        // A deleted or aged-out duplicate owner is absent from both pending
+        // evidence and the complete current file universe. Intersecting the
+        // durable witness with that universe removes the stale owner, re-arms
+        // the survivor once, and then permits owned posture without looping.
+        let mut deletion_index = paged_index.clone();
+        deletion_index.files.remove(&local_index_key(&sibling_path));
+        let mut deletion_pass = vec![corrective_page[0].clone()];
+        apply_claude_reported_usage_with_index(
+            &mut deletion_pass,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut deletion_index,
+            true,
+            "2026-08-20T11:05:00Z",
+        );
+        assert!(deletion_index.claude_duplicate_request_owners.is_empty());
+        assert_eq!(deletion_pass[0].peak_context_fill_tokens, None);
+        assert!(deletion_index
+            .files
+            .get(&local_index_key(&child_path))
+            .expect("deletion child index entry")
+            .source_file_fingerprint
+            .is_empty());
+        deletion_index
+            .files
+            .get_mut(&local_index_key(&child_path))
+            .expect("deletion child index entry")
+            .source_file_fingerprint = "deletion-corrected".to_string();
+        let mut deletion_recovery = vec![corrective_page[0].clone()];
+        apply_claude_reported_usage_with_index(
+            &mut deletion_recovery,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut deletion_index,
+            true,
+            "2026-08-20T11:05:00Z",
+        );
+        assert_eq!(deletion_recovery[0].peak_context_fill_tokens, Some(895_010));
+        assert_eq!(deletion_recovery[0].compaction_count, Some(1));
+        assert_eq!(
+            deletion_index
+                .files
+                .get(&local_index_key(&child_path))
+                .expect("deletion child index entry")
+                .source_file_fingerprint,
+            "deletion-corrected"
+        );
+
+        // If every recorded owner disappears and a different session becomes
+        // the sole current owner, changing the request-hash witness must re-arm
+        // that replacement too. It was conservatively cleared against the old
+        // durable duplicate on this pass and needs one correction pass after
+        // the witness is removed.
+        let replacement_id = "cccccccc-dddd-eeee-ffff-000000000000";
+        let replacement_path = root.join(format!("{replacement_id}.jsonl"));
+        fs::write(
+            &replacement_path,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-08-20T11:05:00Z\",\"sessionId\":\"{replacement_id}\",\"type\":\"assistant\",\"forkedFrom\":{{\"sessionId\":\"explicit-parent\",\"messageUuid\":\"parent-message\"}},\"requestId\":\"req_parent\",\"message\":{{\"id\":\"msg_parent\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":900000,\"output_tokens\":2}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:05:59Z\",\"sessionId\":\"{replacement_id}\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"owned prompt\"}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:06:00Z\",\"sessionId\":\"{replacement_id}\",\"type\":\"assistant\",\"requestId\":\"req_ambiguous\",\"message\":{{\"id\":\"msg_replacement\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":30,\"cache_read_input_tokens\":300,\"output_tokens\":4}}}}}}\n"
+                ),
+                replacement_id = replacement_id,
+            ),
+        )
+        .expect("write replacement owner fixture");
+        let replacement = parse_claude_code_jsonl_file(
+            &replacement_path,
+            "2026-08-20T11:07:00Z",
+            "replacement-fingerprint".to_string(),
+        )
+        .expect("parse replacement owner")
+        .remove(0);
+        assert_eq!(replacement.peak_context_fill_tokens, Some(330));
+        let mut replacement_index = paged_index.clone();
+        replacement_index.files.clear();
+        replacement_index.files.insert(
+            local_index_key(&replacement_path),
+            manifest_index_entry(Some("replacement-settled")),
+        );
+        let mut replacement_pass = vec![replacement.clone()];
+        apply_claude_reported_usage_with_index(
+            &mut replacement_pass,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut replacement_index,
+            true,
+            "2026-08-20T11:07:00Z",
+        );
+        assert_eq!(replacement_pass[0].peak_context_fill_tokens, None);
+        assert!(replacement_index.claude_duplicate_request_owners.is_empty());
+        assert!(replacement_index
+            .files
+            .get(&local_index_key(&replacement_path))
+            .expect("replacement index entry")
+            .source_file_fingerprint
+            .is_empty());
+        replacement_index
+            .files
+            .get_mut(&local_index_key(&replacement_path))
+            .expect("replacement index entry")
+            .source_file_fingerprint = "replacement-corrected".to_string();
+        let mut replacement_recovery = vec![replacement];
+        apply_claude_reported_usage_with_index(
+            &mut replacement_recovery,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut replacement_index,
+            true,
+            "2026-08-20T11:07:00Z",
+        );
+        assert_eq!(replacement_recovery[0].peak_context_fill_tokens, Some(330));
+        assert_eq!(
+            replacement_index
+                .files
+                .get(&local_index_key(&replacement_path))
+                .expect("replacement index entry")
+                .source_file_fingerprint,
+            "replacement-corrected"
+        );
+
+        // Overflow never stores a partial owner map. A complete corrective
+        // census rebuilds the bounded witness, re-arms once, and the following
+        // stable pass does not create a hot replay loop.
+        paged_index.claude_duplicate_request_owners.clear();
+        paged_index.claude_duplicate_request_witness_overflowed = true;
+        let mut overflow_recovery = corrective_page.clone();
+        apply_claude_reported_usage_with_index(
+            &mut overflow_recovery,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+        assert!(!paged_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(paged_index.claude_duplicate_request_owners.len(), 1);
+        assert!(paged_index
+            .files
+            .get(&local_index_key(&child_path))
+            .expect("child index entry")
+            .source_file_fingerprint
+            .is_empty());
+        paged_index
+            .files
+            .get_mut(&local_index_key(&child_path))
+            .expect("child index entry")
+            .source_file_fingerprint = "child-after-overflow".to_string();
+        paged_index
+            .files
+            .get_mut(&local_index_key(&sibling_path))
+            .expect("sibling index entry")
+            .source_file_fingerprint = "sibling-after-overflow".to_string();
+        let mut stable_after_overflow = corrective_page.clone();
+        apply_claude_reported_usage_with_index(
+            &mut stable_after_overflow,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+        assert_eq!(
+            paged_index
+                .files
+                .get(&local_index_key(&child_path))
+                .expect("child index entry")
+                .source_file_fingerprint,
+            "child-after-overflow"
+        );
+
+        // Exercise the real pending-occurrence cap with a tiny injected limit:
+        // page one fits exactly, page two crosses in another family and is
+        // discarded, yet the terminal pass still installs the durable global
+        // fail-closed fence. A later complete below-cap census clears the fence
+        // but re-arms once before owned posture may return.
+        let mut cap_index = ScanIndex::default();
+        cap_index.files.insert(
+            local_index_key(&child_path),
+            manifest_index_entry(Some("cap-child-settled")),
+        );
+        cap_index.files.insert(
+            local_index_key(&sibling_path),
+            manifest_index_entry(Some("cap-sibling-settled")),
+        );
+        let mut cap_child_page = vec![corrective_page[0].clone()];
+        apply_claude_reported_usage_with_index_and_limits(
+            &mut cap_child_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut cap_index,
+            false,
+            "2026-08-20T11:04:00Z",
+            1,
+            10,
+        );
+        assert_eq!(cap_child_page[0].peak_context_fill_tokens, Some(895_010));
+        let mut cap_sibling_page = vec![corrective_page[1].clone()];
+        apply_claude_reported_usage_with_index_and_limits(
+            &mut cap_sibling_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut cap_index,
+            true,
+            "2026-08-20T11:04:00Z",
+            1,
+            10,
+        );
+        assert!(cap_index.claude_duplicate_request_witness_overflowed);
+        assert!(cap_index.claude_duplicate_request_owners.is_empty());
+        assert_eq!(cap_sibling_page[0].peak_context_fill_tokens, None);
+        assert!(cap_index
+            .files
+            .values()
+            .all(|entry| entry.source_file_fingerprint.is_empty()));
+
+        cap_index.files.remove(&local_index_key(&sibling_path));
+        let mut cap_recovery = vec![corrective_page[0].clone()];
+        apply_claude_reported_usage_with_index_and_limits(
+            &mut cap_recovery,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut cap_index,
+            true,
+            "2026-08-20T11:06:00Z",
+            1,
+            10,
+        );
+        assert!(!cap_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(cap_recovery[0].peak_context_fill_tokens, None);
+        cap_index
+            .files
+            .get_mut(&local_index_key(&child_path))
+            .expect("cap child index entry")
+            .source_file_fingerprint = "cap-recovered".to_string();
+        let mut cap_restored = vec![corrective_page[0].clone()];
+        apply_claude_reported_usage_with_index_and_limits(
+            &mut cap_restored,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut cap_index,
+            true,
+            "2026-08-20T11:06:00Z",
+            1,
+            10,
+        );
+        assert_eq!(cap_restored[0].peak_context_fill_tokens, Some(895_010));
+        assert_eq!(
+            cap_index
+                .files
+                .get(&local_index_key(&child_path))
+                .expect("cap child index entry")
+                .source_file_fingerprint,
+            "cap-recovered"
+        );
+
+        // When one owner removes the duplicated request, the durable witness
+        // is reconciled away and both former owners re-arm. The next complete
+        // census may then restore only actually owned posture.
+        fs::write(
+            &child_path,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-08-20T11:00:00Z\",\"sessionId\":\"{child_id}\",\"type\":\"assistant\",\"forkedFrom\":{{\"sessionId\":\"explicit-parent\",\"messageUuid\":\"parent-message\"}},\"requestId\":\"req_parent\",\"message\":{{\"id\":\"msg_parent\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":900000,\"output_tokens\":2}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"{child_id}\",\"type\":\"assistant\",\"requestId\":\"req_child_unique\",\"message\":{{\"id\":\"msg_child\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":10,\"cache_read_input_tokens\":895000,\"output_tokens\":2}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T11:01:30Z\",\"sessionId\":\"{child_id}\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"trigger\":\"auto\",\"preTokens\":895010,\"postTokens\":100000}}}}\n"
+                ),
+                child_id = child_id,
+            ),
+        )
+        .expect("rewrite child fixture");
+        let changed_child = parse_claude_code_jsonl_file(
+            &child_path,
+            "2026-08-20T11:05:00Z",
+            "child-changed".to_string(),
+        )
+        .expect("parse changed child")
+        .remove(0);
+        let unchanged_sibling = parse_claude_code_jsonl_file(
+            &sibling_path,
+            "2026-08-20T11:05:00Z",
+            "sibling-unchanged".to_string(),
+        )
+        .expect("parse unchanged sibling")
+        .remove(0);
+        let mut resolved_child_page = vec![changed_child];
+        apply_claude_reported_usage_with_index(
+            &mut resolved_child_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            false,
+            "2026-08-20T11:05:00Z",
+        );
+        assert_eq!(paged_index.claude_duplicate_request_owners.len(), 1);
+        let mut resolved_sibling_page = vec![unchanged_sibling];
+        apply_claude_reported_usage_with_index(
+            &mut resolved_sibling_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            true,
+            "2026-08-20T11:05:00Z",
+        );
+        assert!(paged_index.claude_duplicate_request_owners.is_empty());
+        assert!(paged_index
+            .files
+            .get(&local_index_key(&child_path))
+            .expect("child index entry")
+            .source_file_fingerprint
+            .is_empty());
+        let mut resolved_correction = vec![
+            resolved_child_page.remove(0),
+            resolved_sibling_page.remove(0),
+        ];
+        apply_claude_reported_usage_with_index(
+            &mut resolved_correction,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut paged_index,
+            true,
+            "2026-08-20T11:05:00Z",
+        );
+        assert!(resolved_correction[0].peak_context_fill_tokens.is_some());
+        assert_eq!(resolved_correction[0].compaction_count, Some(1));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_duplicate_request_witness_is_bounded_hashed_and_backward_compatible() {
+        let first = claude_duplicate_request_owner("raw-root", "raw-source-a");
+        let second = claude_duplicate_request_owner("raw-root", "raw-source-b");
+        assert_eq!(first.root_session_id_hash.len(), 64);
+        assert_eq!(first.source_session_id_hash.len(), 64);
+        assert!(!serde_json::to_string(&first)
+            .expect("serialize owner")
+            .contains("raw-"));
+
+        let mut witnesses = BTreeMap::new();
+        witnesses.insert(
+            "request-hash".to_string(),
+            BTreeSet::from([second.clone(), first.clone()]),
+        );
+        assert!(claude_duplicate_request_witness_within_bound(&witnesses, 2));
+        assert!(!claude_duplicate_request_witness_within_bound(
+            &witnesses, 1
+        ));
+        let serialized = serde_json::to_string(&witnesses).expect("serialize witnesses");
+        let reverse =
+            BTreeMap::from([("request-hash".to_string(), BTreeSet::from([first, second]))]);
+        assert_eq!(
+            serialized,
+            serde_json::to_string(&reverse).expect("serialize reverse witnesses")
+        );
+
+        let mut old_index = serde_json::to_value(ScanIndex::default()).expect("serialize index");
+        old_index
+            .as_object_mut()
+            .expect("index object")
+            .remove("claude_duplicate_request_owners");
+        old_index
+            .as_object_mut()
+            .expect("index object")
+            .remove("claude_duplicate_request_witness_overflowed");
+        let restored: ScanIndex = serde_json::from_value(old_index).expect("load old index");
+        assert!(restored.claude_duplicate_request_owners.is_empty());
+        assert!(!restored.claude_duplicate_request_witness_overflowed);
+    }
+
+    #[test]
     fn claude_context_curve_multi_iteration_response_is_not_request_indexed() {
         let path = temp_file("claude-context-curve-multi-iteration");
         fs::write(
@@ -33866,7 +34841,10 @@ mod tests {
         fs::write(
             &path,
             concat!(
+                "{\"timestamp\":\"2026-08-20T11:00:59Z\",\"sessionId\":\"fable-takeover\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"copied prompt\"}}\n",
                 "{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"fable-takeover\",\"type\":\"assistant\",\"requestId\":\"req_copied_unique\",\"message\":{\"id\":\"msg_copied_unique\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":895000,\"output_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-08-20T11:01:30Z\",\"sessionId\":\"fable-takeover\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":895010,\"postTokens\":100000,\"durationMs\":20}}\n",
+                "{\"timestamp\":\"2026-08-20T11:01:59Z\",\"sessionId\":\"fable-takeover\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"owned prompt\"}}\n",
                 "{\"timestamp\":\"2026-08-20T11:02:00Z\",\"sessionId\":\"fable-takeover\",\"type\":\"assistant\",\"requestId\":\"req_owned_unique\",\"message\":{\"id\":\"msg_owned_unique\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":20,\"cache_read_input_tokens\":100,\"output_tokens\":3}}}\n"
             ),
         )
@@ -33877,6 +34855,11 @@ mod tests {
             "curve-fingerprint".to_string(),
         )
         .expect("parse");
+        assert_eq!(items[0].first_turn_context_tokens, Some(895_010));
+        assert_eq!(items[0].peak_context_fill_tokens, Some(895_010));
+        assert_eq!(items[0].compaction_count, Some(1));
+        assert_eq!(items[0].avg_duration_ms, Some(1_000));
+        assert_eq!(items[0].max_duration_ms, Some(1_000));
         let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
             evidence: BTreeMap::new(),
             health: Default::default(),
@@ -33893,6 +34876,16 @@ mod tests {
         assert_eq!(curve.coverage, "ownership_unresolved");
         assert_eq!(curve.total_owned_request_count, 0);
         assert!(curve.points.is_empty());
+        assert_eq!(items[0].first_turn_context_tokens, None);
+        assert_eq!(items[0].peak_context_fill_tokens, None);
+        assert_eq!(items[0].last_turn_context_tokens, None);
+        assert_eq!(items[0].compaction_count, None);
+        assert!(items[0].compaction_timestamps.is_empty());
+        assert_eq!(items[0].compaction_total_pre_tokens, None);
+        assert_eq!(items[0].compaction_total_post_tokens, None);
+        assert_eq!(items[0].compaction_total_duration_ms, None);
+        assert_eq!(items[0].avg_duration_ms, Some(1_000));
+        assert_eq!(items[0].max_duration_ms, Some(1_000));
         let _ = fs::remove_file(path);
     }
 
@@ -34912,6 +35905,9 @@ mod tests {
         response(None, None)
             .validate_entity_ack(&request)
             .expect_err("generic entity ACK cannot settle curve evidence");
+        response(Some(5), Some("0".repeat(64)))
+            .validate_entity_ack(&request)
+            .expect_err("mismatched durable proof cannot settle curve evidence");
         response(
             Some(SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION),
             Some(snapshot_upload_body_witness(&item)),
@@ -34929,7 +35925,102 @@ mod tests {
             Some(snapshot_upload_body_witness(&item)),
         )
         .validate_entity_ack(&request)
-        .expect("exact accepted-log proof settles curve evidence");
+        .expect("exact released accepted-log proof settles curve evidence");
+
+        let mut exclusive_item = item.clone();
+        exclusive_item.usage_accounting_contract =
+            Some("session_exclusive_reported_usage:v1".to_string());
+        exclusive_item.snapshot_fingerprint =
+            snapshot_fingerprint(SnapshotSource::ClaudeCode, &exclusive_item);
+        let exclusive_request = SnapshotBatchRequest {
+            snapshots: vec![exclusive_item.clone()],
+            ..request
+        };
+        let exclusive_response = |version| crate::snapshot_client::SnapshotBatchResponse {
+            accepted: 1,
+            sessions_reconciled: 0,
+            session_ids: Vec::new(),
+            disabled: false,
+            disabled_reason: None,
+            entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.to_string()),
+            accepted_entities: vec![crate::snapshot_client::SnapshotEntityRef {
+                source_session_id: exclusive_item.source_session_id.clone(),
+                snapshot_fingerprint: exclusive_item.snapshot_fingerprint.clone(),
+                occurrence_count: 1,
+                body_witness_version: Some(version),
+                body_witness_digest: Some(snapshot_upload_body_witness(&exclusive_item)),
+                head_etag: None,
+                head_challenge: None,
+            }],
+            unchanged_entities: Vec::new(),
+            rejected_entities: Vec::new(),
+            conflict_entities: Vec::new(),
+        };
+        exclusive_response(SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION)
+            .validate_entity_ack(&exclusive_request)
+            .expect_err("internal v12 alias cannot replace released v6 ACK proof");
+        exclusive_response(6)
+            .validate_entity_ack(&exclusive_request)
+            .expect("released v6 accepted-log proof settles internal v12 curve evidence");
+    }
+
+    #[test]
+    fn body_witness_ack_normalization_fixture_is_canonical_and_current() {
+        let curve = build_context_curve(
+            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+            "claude_owned_request_start_proof:v1",
+            "claude_transcript_model:v1",
+            &[ContextCurveCandidatePoint {
+                observed_at: Some("2026-08-30T12:00:00Z".to_string()),
+                effective_input_tokens: 42,
+                model: Some("claude-opus-4-8".to_string()),
+                context_window_tokens: None,
+            }],
+            &[],
+            "ownership_unresolved",
+        );
+        let mut nonexclusive = sample_session_artifact_item();
+        nonexclusive.context_curve = Some(curve.clone());
+        let mut exclusive = nonexclusive.clone();
+        exclusive.usage_accounting_contract =
+            Some("session_exclusive_reported_usage:v1".to_string());
+        let mappings = (7_u64..=12)
+            .map(|internal_version| {
+                json!({
+                    "internal_version": internal_version,
+                    "released_ack_version": internal_version - 6,
+                })
+            })
+            .collect::<Vec<_>>();
+        let fixture = json!({
+            "contract_version": "snapshot_body_witness_ack_normalization:v1",
+            "mappings": mappings,
+            "curve_cases": {
+                "nonexclusive": {
+                    "internal_version": snapshot_upload_body_witness_version(&nonexclusive),
+                    "released_ack_version": 5,
+                    "digest": snapshot_upload_body_witness(&nonexclusive),
+                },
+                "exclusive": {
+                    "internal_version": snapshot_upload_body_witness_version(&exclusive),
+                    "released_ack_version": 6,
+                    "digest": snapshot_upload_body_witness(&exclusive),
+                },
+            },
+        });
+        let mut canonical = crate::canonical_json::canonicalize(&fixture)
+            .expect("ACK normalization fixture canonicalizes");
+        canonical.push(b'\n');
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/snapshot-audit/body-witness-ack-normalization-v1.json");
+        if std::env::var_os("UPDATE_BODY_WITNESS_ACK_GOLDEN").is_some() {
+            fs::write(&fixture_path, &canonical).expect("write ACK normalization fixture");
+        }
+        assert_eq!(
+            fs::read(&fixture_path).expect("read ACK normalization fixture"),
+            canonical,
+            "run UPDATE_BODY_WITNESS_ACK_GOLDEN=1 cargo test -p ottto-service --lib body_witness_ack_normalization_fixture_is_canonical_and_current"
+        );
     }
 
     #[test]
