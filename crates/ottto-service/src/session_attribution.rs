@@ -122,6 +122,7 @@ pub struct SessionAttributionGroupingInput<'a> {
     pub source_version: &'a str,
     pub first_prompt: Option<&'a str>,
     pub provider_skills: &'a BTreeSet<String>,
+    pub activity_skills: &'a BTreeSet<String>,
     pub repository_hash: Option<&'a str>,
     pub source_started_at: Option<&'a str>,
     pub transcript_path: &'a Path,
@@ -302,6 +303,7 @@ impl SessionAttributionContext {
             }
         }
 
+        let mut emitted_skills = BTreeSet::new();
         for skill in input.provider_skills.iter().take(8) {
             if let Some(value) = opaque_hmac_id(&self.key, "skill", skill) {
                 let display_label = skill_name_display_label(skill);
@@ -315,10 +317,30 @@ impl SessionAttributionContext {
                     "direct",
                     &evidence_context,
                 );
+                emitted_skills.insert(skill.clone());
+            }
+        }
+        for skill in input.activity_skills {
+            if emitted_skills.len() >= 8 || emitted_skills.contains(skill) {
+                continue;
+            }
+            if let Some(value) = opaque_hmac_id(&self.key, "skill", skill) {
+                let display_label = skill_name_display_label(skill);
+                push_labeled_fact(
+                    &mut facts,
+                    "skill_id",
+                    &value,
+                    display_label.as_deref(),
+                    Some("skill_name"),
+                    "provider_artifact",
+                    "direct",
+                    &evidence_context,
+                );
+                emitted_skills.insert(skill.clone());
             }
         }
         if let Some(skill) = input.first_prompt.and_then(slash_skill_name) {
-            if !input.provider_skills.contains(&skill) {
+            if emitted_skills.len() < 8 && !emitted_skills.contains(&skill) {
                 if let Some(value) = opaque_hmac_id(&self.key, "skill", &skill) {
                     let display_label = skill_name_display_label(&skill);
                     push_labeled_fact(
@@ -1919,6 +1941,7 @@ mod tests {
             source_version: "codex_jsonl:v21",
             first_prompt: Some(&first_prompt),
             provider_skills: &skills,
+            activity_skills: &BTreeSet::new(),
             repository_hash: None,
             source_started_at: None,
             transcript_path: Path::new("/missing"),
@@ -1951,6 +1974,57 @@ mod tests {
         assert!(wire.contains("landing-lander"));
         assert!(wire.contains("Inspect the landing queue"));
         assert!(wire.len() <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn grouping_facts_promote_activity_skills_without_duplicates() {
+        let context = SessionAttributionContext {
+            key: Zeroizing::new(vec![7_u8; 32]),
+            provider_schedules: ProviderScheduleInventory::default(),
+            external_schedulers:
+                crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
+            launch_events: crate::launch_events::LaunchEventInventory::default(),
+        };
+        let provider_skills = BTreeSet::from(["shared-skill".to_string()]);
+        let activity_skills = BTreeSet::from([
+            "repo-task-lifecycle".to_string(),
+            "shared-skill".to_string(),
+        ]);
+
+        let facts = context.grouping_facts(SessionAttributionGroupingInput {
+            source: SnapshotSource::Codex,
+            origin: None,
+            source_session_id: "activity-skill-session",
+            observed_at: "2026-09-04T00:00:00Z",
+            source_version: "codex_jsonl:v37",
+            first_prompt: Some("/repo-task-lifecycle continue"),
+            provider_skills: &provider_skills,
+            activity_skills: &activity_skills,
+            repository_hash: None,
+            source_started_at: None,
+            transcript_path: Path::new("/missing"),
+        });
+
+        let skill_facts = facts
+            .iter()
+            .filter(|fact| fact.field == "skill_id")
+            .collect::<Vec<_>>();
+        assert_eq!(skill_facts.len(), 2);
+        assert!(skill_facts.iter().any(|fact| {
+            fact.display_label.as_deref() == Some("repo-task-lifecycle")
+                && fact.evidence.kind == "provider_artifact"
+        }));
+        assert_eq!(
+            skill_facts
+                .iter()
+                .filter(|fact| fact.display_label.as_deref() == Some("shared-skill"))
+                .count(),
+            1
+        );
+        assert!(skill_facts.iter().any(|fact| {
+            fact.display_label.as_deref() == Some("shared-skill")
+                && fact.evidence.kind == "provider_native"
+        }));
     }
 
     #[test]

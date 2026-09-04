@@ -46,7 +46,7 @@
   "consecutive_failures": 0,
   "next_retry_at": null,
   "collector_version": "0.1.124",
-  "parser_version": "codex_jsonl:v36",
+  "parser_version": "codex_jsonl:v37",
   "manifest": {
     "contract_version": "snapshot_manifest:v2",
     "scope": "semantic_activity_window",
