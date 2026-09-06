@@ -1017,6 +1017,15 @@ impl SyncCounts {
     }
 
     fn disclosed_loss(&self) -> DisclosedLoss {
+        // A partial census is itself unsettled evidence even when it has not
+        // yet populated one of the public loss counters. In particular,
+        // RetryPending Claude authority families deliberately lower
+        // `census_complete` and raise the scan-cap latch without inventing a
+        // per-file loss. Letting the zero-loss fast path win here would emit a
+        // clean success that the backend classifies as terminal.
+        if !self.census_complete {
+            return DisclosedLoss::Unsettled;
+        }
         if !self.has_disclosed_loss() {
             return DisclosedLoss::None;
         }
@@ -1027,7 +1036,7 @@ impl SyncCounts {
             && self.recognized_usage_drop_count == self.terminal_recognized_usage_drop_count
             && self.dropped_usage_record_count == self.terminal_dropped_usage_record_count
             && self.over_line_cap_count == self.terminal_over_line_cap_count;
-        if self.census_complete && !self.has_retryable_problems() && every_class_terminal {
+        if !self.has_retryable_problems() && every_class_terminal {
             DisclosedLoss::Terminal
         } else {
             DisclosedLoss::Unsettled
@@ -8742,6 +8751,24 @@ mod tests {
         hint_days: u64,
         hint_extra: &'static str,
     ) -> serde_json::Value {
+        captured_terminal_receipt_for_source_under_hint(
+            SnapshotSource::Codex,
+            counts,
+            state,
+            manifest_source,
+            hint_days,
+            hint_extra,
+        )
+    }
+
+    fn captured_terminal_receipt_for_source_under_hint(
+        source: SnapshotSource,
+        counts: SyncCounts,
+        state: CollectorState<'_>,
+        manifest_source: TerminalManifestSource<'_>,
+        hint_days: u64,
+        hint_extra: &'static str,
+    ) -> serde_json::Value {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let client = SnapshotApiClient::new(snapshot_status_server_with_hint_extras(
             captured.clone(),
@@ -8752,10 +8779,10 @@ mod tests {
             &report_kind_test_device(),
             "device-secret",
             test_terminal_status_support_dir(),
-            SnapshotSource::Codex,
+            source,
             manifest_source,
             CollectorStatus {
-                source: SnapshotSource::Codex,
+                source,
                 machine_id: "otm_test",
                 scan_started_at: "2026-06-01T10:00:00Z",
                 counts,
@@ -9160,6 +9187,70 @@ mod tests {
     const RESIDUE_ADMITTING_HINT: &str =
         r#","census_residue_status_contract":"census_residue_status:v1""#;
 
+    fn claude_usage_authority_index(dispositions: &[(&str, usize)]) -> ScanIndex {
+        let quarantine = dispositions
+            .iter()
+            .enumerate()
+            .map(|(family_index, (disposition, member_count))| {
+                let members = (0..*member_count)
+                    .map(|member_index| {
+                        (
+                            format!("session-{family_index}-{member_index}"),
+                            serde_json::Value::String(format!(
+                                "{:064x}",
+                                family_index * 100 + member_index + 1
+                            )),
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                (
+                    format!("root-{family_index}"),
+                    serde_json::json!({
+                        "contract": "claude_usage_authority_quarantine:v1",
+                        "proven_witness_fingerprint": format!("{:064x}", family_index + 1_000),
+                        "member_source_file_fingerprints": members,
+                        "failed_reconstruction_count": if *disposition == "unproven_terminal" { 4 } else { 1 },
+                        "disposition": disposition,
+                        "retry_after_unix_seconds": 0,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let mut serialized = serde_json::to_value(ScanIndex::default()).expect("serialize index");
+        serialized
+            .as_object_mut()
+            .expect("index is an object")
+            .insert(
+                "claude_usage_authority_quarantine".to_string(),
+                serde_json::Value::Object(quarantine),
+            );
+        serde_json::from_value(serialized).expect("deserialize authority quarantine fixture")
+    }
+
+    fn claude_usage_authority_census_counts(
+        fixture_name: &str,
+        dispositions: &[(&str, usize)],
+    ) -> SyncCounts {
+        let root = test_dir(fixture_name);
+        std::fs::create_dir_all(&root).expect("create empty Claude scan root");
+        let mut index = claude_usage_authority_index(dispositions);
+        let mut scan = crate::snapshots::scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-06-01T10:00:00Z",
+            183,
+        )
+        .expect("scan empty Claude root");
+        if index.account_claude_usage_authority_census_health(&mut scan) {
+            scan.census_complete = false;
+            scan.scan_cap_hit = true;
+        }
+        let counts = SyncCounts::from_scan_result(&scan, 0, 183);
+        let _ = std::fs::remove_dir_all(root);
+        counts
+    }
+
     /// A named mutation of the receipt counts, for table-driven vetoes.
     type CountsMutation = (&'static str, fn(&mut SyncCounts));
 
@@ -9250,6 +9341,76 @@ mod tests {
         ] {
             assert!(!message.contains(fragment), "{fragment:?} in {message:?}");
         }
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn exhausted_claude_authority_is_terminal_residue() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let exhausted = claude_usage_authority_census_counts(
+            "exhausted-claude-authority-receipt",
+            &[("unproven_terminal", 3)],
+        );
+        assert!(exhausted.census_complete);
+        assert!(!exhausted.scan_cap_hit);
+        assert_eq!(exhausted.ownership_incomplete_file_count, 3);
+        assert_eq!(exhausted.terminal_ownership_incomplete_file_count, 3);
+        assert_eq!(exhausted.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(exhausted.dropped_usage_record_count, 0);
+
+        let receipt = captured_terminal_receipt_for_source_under_hint(
+            SnapshotSource::ClaudeCode,
+            exhausted,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            183,
+            RESIDUE_ADMITTING_HINT,
+        );
+        assert_eq!(receipt["source"], "claude_code");
+        assert_eq!(receipt["last_error_code"], "census_residue");
+        assert_eq!(receipt["consecutive_failures"], 0);
+        assert!(receipt["last_success_at"].is_string());
+        assert_eq!(receipt["last_success_at"], receipt["last_scan_finished_at"]);
+        assert_eq!(
+            receipt["last_terminal_ownership_incomplete_file_count"],
+            receipt["last_ownership_incomplete_file_count"]
+        );
+        assert_eq!(receipt["last_terminal_ownership_incomplete_file_count"], 3);
+    }
+
+    /// A RetryPending-only authority family has no per-file residue to count,
+    /// but it still vetoes census completion. Exercise the complete production
+    /// derivation path so that zero disclosed-loss counters can never turn the
+    /// pending family into a clean terminal receipt.
+    #[test]
+    #[serial(source_manifests)]
+    fn retry_pending_only_claude_authority_reports_parse_error() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let retry_pending = claude_usage_authority_census_counts(
+            "retry-pending-only-claude-authority-receipt",
+            &[("retry_pending", 1)],
+        );
+        assert!(!retry_pending.census_complete);
+        assert!(retry_pending.scan_cap_hit);
+        assert_eq!(retry_pending.ownership_incomplete_file_count, 0);
+        assert_eq!(retry_pending.terminal_ownership_incomplete_file_count, 0);
+        assert_eq!(retry_pending.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(retry_pending.dropped_usage_record_count, 0);
+
+        let receipt = captured_terminal_receipt_for_source_under_hint(
+            SnapshotSource::ClaudeCode,
+            retry_pending,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            183,
+            RESIDUE_ADMITTING_HINT,
+        );
+        assert_eq!(receipt["source"], "claude_code");
+        assert_eq!(receipt["last_census_complete"], false);
+        assert_eq!(receipt["last_scan_cap_hit"], true);
+        assert_eq!(receipt["last_error_code"], "parse_error");
+        assert_eq!(receipt["consecutive_failures"], 1);
+        assert!(receipt["last_success_at"].is_null());
     }
 
     /// The backend's error-code set is closed and its forward tolerance covers
