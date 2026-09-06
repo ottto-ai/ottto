@@ -17506,9 +17506,13 @@ impl ScanIndex {
         &self,
         scan_result: &mut SourceScanResult,
     ) -> bool {
+        let terminal_entity_count = self.claude_usage_authority_terminal_entity_count();
         scan_result.ownership_incomplete_file_count = scan_result
             .ownership_incomplete_file_count
-            .saturating_add(self.claude_usage_authority_terminal_entity_count());
+            .saturating_add(terminal_entity_count);
+        scan_result.terminal_ownership_incomplete_file_count = scan_result
+            .terminal_ownership_incomplete_file_count
+            .saturating_add(terminal_entity_count);
         self.claude_usage_authority_pending_count() > 0
     }
 
@@ -31002,6 +31006,12 @@ mod tests {
             "named terminal loss completes the census instead of deadlocking it"
         );
         assert_eq!(terminal_health.ownership_incomplete_file_count, 7);
+        assert_eq!(terminal_health.terminal_ownership_incomplete_file_count, 7);
+        assert_eq!(
+            terminal_health.terminal_ownership_incomplete_file_count,
+            terminal_health.ownership_incomplete_file_count,
+            "every exhausted authority entity is disclosed as terminal residue"
+        );
         let _ = fs::remove_dir_all(health_root);
 
         index
