@@ -8510,6 +8510,23 @@ fn codex_app_server_quota_windows(value: &Value) -> Vec<AgentQuotaWindow> {
 }
 
 fn codex_app_server_rate_limit_snapshots(value: &Value) -> Vec<(String, &Value)> {
+    // `rateLimits` is the app server's effective subscription snapshot.  The
+    // sibling `rateLimitsByLimitId` map may also contain inactive/model-specific
+    // pools whose reset boundaries advance on every read.  Treating that map as
+    // the primary source fabricated extra customer quotas and, because the
+    // effective snapshot was then skipped, could also hide its credit balance.
+    // Keep the map only as a compatibility fallback for app-server versions
+    // that do not provide a usable effective snapshot.
+    if let Some(snapshot) = value
+        .get("rateLimits")
+        .filter(|snapshot| codex_rate_limit_snapshot_has_usage(snapshot))
+    {
+        return vec![(
+            first_json_string(snapshot, &["limitId", "limit_id"])
+                .unwrap_or_else(|| "codex".to_string()),
+            snapshot,
+        )];
+    }
     if let Some(by_limit_id) = value.get("rateLimitsByLimitId").and_then(Value::as_object) {
         let mut snapshots = by_limit_id
             .iter()
@@ -8521,23 +8538,17 @@ fn codex_app_server_rate_limit_snapshots(value: &Value) -> Vec<(String, &Value)>
             return snapshots;
         }
     }
-    value
-        .get("rateLimits")
-        .filter(|snapshot| codex_rate_limit_snapshot_has_usage(snapshot))
-        .map(|snapshot| {
-            vec![(
-                first_json_string(snapshot, &["limitId", "limit_id"])
-                    .unwrap_or_else(|| "codex".to_string()),
-                snapshot,
-            )]
-        })
-        .unwrap_or_default()
+    Vec::new()
 }
 
 fn codex_rate_limit_snapshot_has_usage(value: &Value) -> bool {
-    value.get("primary").is_some()
-        || value.get("secondary").is_some()
-        || value.get("credits").is_some()
+    ["primary", "secondary"].iter().any(|field| {
+        value.get(field).is_some_and(|window| {
+            codex_app_server_quota_window(field, "codex", window, value).is_some()
+        })
+    }) || value
+        .get("credits")
+        .is_some_and(|credits| codex_credit_balance_from_credits_snapshot(credits, value).is_some())
         || codex_monthly_credit_limit_from_snapshot(value).is_some()
 }
 
@@ -14837,16 +14848,11 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_app_server_parser_extracts_windows_and_reset_bank() {
+    fn codex_app_server_prefers_effective_snapshot_over_internal_limit_map() {
         let json = serde_json::json!({
             "rateLimits": {
-                "limitId": "codex_bengalfox",
+                "limitId": "codex",
                 "primary": {
-                    "usedPercent": 9,
-                    "windowDurationMins": 300,
-                    "resetsAt": 1779049800
-                },
-                "secondary": {
                     "usedPercent": 37,
                     "windowDurationMins": 10080,
                     "resetsAt": 1779613200
@@ -14859,26 +14865,21 @@ for line in sys.stdin:
                 "planType": "pro"
             },
             "rateLimitsByLimitId": {
+                "base_model_inference": {
+                    "limitId": "base_model_inference",
+                    "primary": {"usedPercent": 0, "windowDurationMins": 10080, "resetsAt": 1779613200}
+                },
                 "codex_bengalfox": {
                     "limitId": "codex_bengalfox",
-                    "primary": {"usedPercent": 9, "windowDurationMins": 300, "resetsAt": 1779049800}
+                    "primary": {"usedPercent": 0, "windowDurationMins": 300, "resetsAt": 1779049800},
+                    "secondary": {"usedPercent": 0, "windowDurationMins": 10080, "resetsAt": 1779613200}
                 },
                 "codex": {
                     "limitId": "codex",
                     "primary": {
-                        "usedPercent": 3,
-                        "windowDurationMins": 300,
-                        "resetsAt": 1779049800
-                    },
-                    "secondary": {
-                        "usedPercent": 5,
+                        "usedPercent": 37,
                         "windowDurationMins": 10080,
                         "resetsAt": 1779613200
-                    },
-                    "credits": {
-                        "hasCredits": true,
-                        "unlimited": false,
-                        "balance": "12.4"
                     },
                     "planType": "pro"
                 }
@@ -14891,23 +14892,16 @@ for line in sys.stdin:
         let windows = codex_app_server_quota_windows(&json);
         let credits = codex_app_server_credit_balances(&json);
 
-        assert_eq!(windows.len(), 3);
-        assert_eq!(windows[0].name, "codex_primary_five_hour_reset_known");
-        assert_eq!(windows[0].left_percent, Some(97));
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].name, "codex_primary_weekly_reset_known");
+        assert_eq!(windows[0].left_percent, Some(63));
         assert_eq!(
             windows[0].started_at.as_deref(),
-            Some("2026-05-17T15:30:00Z")
+            Some("2026-05-17T09:00:00Z")
         );
-        assert_eq!(windows[1].name, "codex_secondary_weekly_reset_known");
-        assert_eq!(windows[1].left_percent, Some(95));
-        assert_eq!(
-            windows[2].name,
-            "codex_5fbengalfox_primary_five_hour_reset_known"
-        );
-        assert_eq!(windows[2].left_percent, Some(91));
         assert_eq!(credits.len(), 2);
         assert_eq!(credits[0].name, "credits");
-        assert_eq!(credits[0].remaining, Some(12));
+        assert_eq!(credits[0].remaining, Some(4));
         // A payload without the spend-cap fields leaves them unset.
         assert_eq!(credits[0].spend_control_reached, None);
         assert_eq!(credits[0].rate_limit_reached_type, None);
@@ -15148,6 +15142,42 @@ for line in sys.stdin:
         assert_eq!(credits.len(), 1);
         assert_eq!(credits[0].name, "workspace_monthly_credits");
         assert_eq!(credits[0].remaining, Some(3475));
+    }
+
+    #[test]
+    fn codex_app_server_falls_back_from_null_effective_snapshot_to_limit_map() {
+        let json = serde_json::json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": null,
+                "secondary": null,
+                "credits": null,
+                "individualLimit": null
+            },
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": 21,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1779613200
+                    },
+                    "credits": {
+                        "hasCredits": true,
+                        "unlimited": false,
+                        "balance": "3"
+                    }
+                }
+            }
+        });
+
+        let windows = codex_app_server_quota_windows(&json);
+        let credits = codex_app_server_credit_balances(&json);
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].left_percent, Some(79));
+        assert_eq!(credits.len(), 1);
+        assert_eq!(credits[0].remaining, Some(3));
     }
 
     #[test]

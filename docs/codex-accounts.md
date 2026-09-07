@@ -139,10 +139,13 @@ the installed Codex binary with exact per-slot `CODEX_HOME` and
 `CODEX_SQLITE_HOME` values, a cleared environment, and no ambient provider API
 keys. Durable homes never use Ottto's legacy OAuth
 HTTP fallback. Collection uses the documented local Codex App Server
-`account/rateLimits/read` method and preserves every reported
-`rateLimitsByLimitId` bucket. Every window key combines its limit id, field,
-reported duration, and reset availability; unknown durations remain unique and
-no bucket meaning is inferred from position.
+`account/rateLimits/read` method and treats its `rateLimits` field as the
+effective subscription snapshot. `rateLimitsByLimitId` is retained only as a
+compatibility fallback when no usable effective snapshot is present, because
+current app-server versions may include inactive model/internal pools in that
+map. Every emitted window key combines its limit id, field, reported duration,
+and reset availability; unknown durations remain unique and no bucket meaning
+is inferred from position.
 
 Homes are probed concurrently under the ten-slot cap, so one provider timeout
 does not serialize or suppress healthy siblings. One backend-safe snapshot is
