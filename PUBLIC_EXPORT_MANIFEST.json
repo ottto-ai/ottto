@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 354,
-  "content_sha256": "651e1e57ea81a0c4864b22a1097427823bf51f0e4e29ef8c067446b3b1cd3a46",
+  "candidate_file_count": 355,
+  "content_sha256": "7f8c1370f144b09512e1356cba083974ec835f10e66a5caff997c89c1c8de5aa",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "56d5904e4e8f8c0cc3990e6bdfaa2889187e157c284007202d5d82814d66daac",
-      "size_bytes": 806602
+      "sha256": "fbe2869baeb08062080e04325fa57d19656df9491bb120a56894116ad5eaad82",
+      "size_bytes": 807968
     },
     {
       "executable": false,
@@ -937,8 +937,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/codex-accounts.md",
-      "sha256": "a83f242fbc37947c864a30aa09430d3b986b6d4d77fc80f6732c919ea2f5e5b3",
-      "size_bytes": 11108
+      "sha256": "39c478813dec1d19e3353cbf8641b018d1f8002edc28dd4f1adeb45ba6f6d733",
+      "size_bytes": 11335
     },
     {
       "executable": false,
@@ -1548,6 +1548,13 @@
       "path": "docs/session-2026-09-03-non-progressing-census-residue.md",
       "sha256": "45a73c7bacce490e028dbda70da8e11d847682d5283add85fd9db65cb3d28af0",
       "size_bytes": 9201
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-09-08-codex-effective-rate-limit-snapshot.md",
+      "sha256": "ce7c9526f7daa11a48da4b103c615ca2a767b99f751d59c380ae2cb39e608318",
+      "size_bytes": 1010
     },
     {
       "executable": false,
@@ -2481,9 +2488,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-06T20:59:54+00:00",
+  "generated_at": "2026-09-07T23:37:04+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 355,
+  "output_file_count": 356,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2517,5 +2524,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "53ffdedd4d2b6aeb7dae921e76df22115c250b00"
+  "source_commit": "5fd850f5f810d04552882979b8aa7489b688db5e"
 }
