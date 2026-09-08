@@ -139,6 +139,7 @@ pub enum LocalApiError {
     AccountSwitchCandidate {
         current_user_email: String,
         new_user_email: String,
+        new_organization_name: String,
         claim_code: String,
     },
     #[error("no pending Ottto sign-in claim")]
@@ -381,6 +382,7 @@ impl std::fmt::Debug for StagedAccountSwitch {
 pub struct AccountSwitchCandidateInfo {
     pub current_user_email: String,
     pub new_user_email: String,
+    pub new_organization_name: String,
     pub claim_code: String,
 }
 
@@ -512,8 +514,7 @@ impl LocalDaemon {
     }
 
     pub fn account_for_trusted_client(&self) -> Result<LocalAccountBinding, LocalApiError> {
-        let state = self.state()?;
-        Ok(state.account.clone())
+        Ok(self.status_for_authorized_client()?.account)
     }
 
     /// This machine's identity, for the local loopback `/whoami` probe. Exposes
@@ -567,6 +568,7 @@ impl LocalDaemon {
                 code: "claim_pending".to_string(),
                 text: "Waiting for browser sign-in to finish.".to_string(),
             }),
+            can_reconnect: None,
         };
         Ok(AuthStartResponse {
             account: state.account.clone(),
@@ -687,6 +689,12 @@ impl LocalDaemon {
         let info = AccountSwitchCandidateInfo {
             current_user_email: existing_user.email.clone(),
             new_user_email: new_user.email.clone(),
+            new_organization_name: staged
+                .new_account
+                .organization
+                .as_ref()
+                .map(|organization| organization.name.clone())
+                .unwrap_or_else(|| "Unknown workspace".to_string()),
             claim_code: staged.claim_code.clone(),
         };
         state.pending_auth = None;
@@ -812,6 +820,27 @@ impl LocalDaemon {
             code: ACCOUNT_NOT_FOUND_MESSAGE_CODE.to_string(),
             text: "The Ottto account this Mac was connected to no longer exists. Sign in to connect it to an account.".to_string(),
         });
+        Ok(())
+    }
+
+    /// Keep the pending browser claim resumable while exposing an actionable,
+    /// typed device-authority conflict instead of an endless claim-pending loop.
+    pub fn mark_reattach_required(
+        &self,
+        message: StableMessage,
+        can_reconnect: bool,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        if state.pending_auth.is_none() {
+            return Err(LocalApiError::NoPendingAuthClaim);
+        }
+        state.account.state = LocalAccountState::ReattachRequired;
+        state.account.user = None;
+        state.account.organization = None;
+        state.account.connected_at = None;
+        state.account.last_refreshed_at = Some(state.now.clone());
+        state.account.message = Some(message);
+        state.account.can_reconnect = Some(can_reconnect);
         Ok(())
     }
 
@@ -1806,6 +1835,21 @@ impl Drop for RepairLease {
 fn status_from_state(state: &DaemonState) -> DaemonStatus {
     let mut status = empty_status(state.machine.clone(), current_rfc3339_timestamp());
     status.account = state.account.clone();
+    // Legacy builds could start a second browser claim over a fully bound
+    // account. Keep that internal claim available for recovery, but never let
+    // its overlay hide the locally completed identity from `account --json` or
+    // Companion status. A genuine first claim has no bound user/connection and
+    // remains `claim_pending`.
+    if status.account.state == LocalAccountState::ClaimPending
+        && status.account.user.is_some()
+        && state.connection.is_some()
+    {
+        status.account.state = LocalAccountState::Connected;
+        status.account.message = Some(StableMessage {
+            code: "connected".to_string(),
+            text: "This Mac is connected to Ottto.".to_string(),
+        });
+    }
     status.daemon = if !state.running {
         DaemonRuntimeState::Unavailable
     } else if state.repair_locked {
@@ -2180,7 +2224,9 @@ fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV
             LocalSetupRunState::Pending,
             LocalSetupTokenState::Unknown,
         ),
-        LocalAccountState::ResetRequired | LocalAccountState::Error => (
+        LocalAccountState::ReattachRequired
+        | LocalAccountState::ResetRequired
+        | LocalAccountState::Error => (
             LocalHealthAccountState::ReconnectRequired,
             LocalSetupRunState::RebindRequired,
             LocalSetupTokenState::RefreshRequired,
@@ -6620,6 +6666,47 @@ mod tests {
     }
 
     #[test]
+    fn pending_claim_overlay_never_hides_a_completed_local_binding() {
+        let daemon = daemon();
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_one", "nonce_one"))
+            .expect("start auth");
+        daemon
+            .complete_auth_with_account(
+                "claim_one",
+                "nonce_one",
+                account("user_1", "ron@example.com"),
+                "setup_1".to_string(),
+                "2026-05-05T10:10:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("complete auth");
+        {
+            let mut state = daemon.state().expect("state");
+            state.account.state = LocalAccountState::ClaimPending;
+            state.account.message = Some(StableMessage {
+                code: "claim_pending".to_string(),
+                text: "Waiting for browser sign-in to finish.".to_string(),
+            });
+            state.pending_auth = Some(pending_claim("claim_stale", "nonce_stale"));
+        }
+
+        let visible = daemon.status(TOKEN).expect("status").account;
+        assert_eq!(visible.state, LocalAccountState::Connected);
+        assert_eq!(
+            visible.user.as_ref().map(|user| user.id.as_str()),
+            Some("user_1")
+        );
+        assert_eq!(
+            visible
+                .message
+                .as_ref()
+                .map(|message| message.code.as_str()),
+            Some("connected")
+        );
+    }
+
+    #[test]
     fn runtime_started_at_is_the_process_start_instant_not_the_status_query_time() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let status = daemon.status(TOKEN).expect("status");
@@ -8005,6 +8092,7 @@ mod tests {
                 code: "connected".to_string(),
                 text: "This Mac is connected to Ottto.".to_string(),
             }),
+            can_reconnect: None,
         }
     }
 

@@ -14,18 +14,19 @@ use crate::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ottto_core::{
-    compiled_build_id, compiled_release_channel, compiled_release_version, default_support_dir,
-    execute_local_uninstall, generate_control_token, install_owner_for_path,
-    local_lifecycle_home_dir, plan_local_uninstall, redact_inline, release_channel_from_str,
-    ClaudeConfigSlotSettingsError, CodexAccountSlotSettingsError, ControlTokenStore,
-    FileAccountStore, FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore,
-    FileConnectionStore, FileDeviceStore, FilePendingDeviceCredentialStore, KeychainSecretStore,
+    compiled_build_id, compiled_release_channel, compiled_release_version,
+    default_prior_device_path, default_support_dir, execute_local_uninstall,
+    generate_control_token, install_owner_for_path, local_lifecycle_home_dir, plan_local_uninstall,
+    redact_inline, release_channel_from_str, ClaudeConfigSlotSettingsError,
+    CodexAccountSlotSettingsError, ControlTokenStore, FileAccountStore,
+    FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore, FileConnectionStore,
+    FileDeviceStore, FileMachineStore, FilePendingDeviceCredentialStore, KeychainSecretStore,
     LocalConnectionBinding, LocalDeviceBinding, LocalDeviceCredentialBinding,
     PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
     PendingDeviceCredentialRequestAuthority, TokenStoreError, UninstallExecutionOptions,
     OTTTO_CLIENT_NAME, OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
-    OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
-    OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+    OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT, OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 use ottto_protocol::{
     validate_local_control_protocol_version, AgentContextQuery, AgentCostsQuery,
@@ -72,6 +73,9 @@ use std::sync::{mpsc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table};
+
+#[cfg(test)]
+use ottto_core::LocalMachineBinding;
 
 // Direct API host (was the apex `ottto.net/backend` proxy, retired in the
 // marketing-site cutover). Matches DIRECT_API_BASE_URL below.
@@ -640,9 +644,15 @@ fn handle_command(
         LocalControlCommand::AuthSwitchAccount { claim_code } => {
             to_value(auth_switch_account(daemon, &authorization, &claim_code)?)
         }
-        LocalControlCommand::AuthReset { local_only } => {
-            to_value(auth_reset(daemon, &authorization, local_only)?)
-        }
+        LocalControlCommand::AuthReset {
+            local_only,
+            forget_installation,
+        } => to_value(auth_reset(
+            daemon,
+            &authorization,
+            local_only,
+            forget_installation,
+        )?),
         LocalControlCommand::Account => to_value(account_for(daemon, &authorization)?),
         LocalControlCommand::ClaudeAccountsStatus => {
             require_authorized_local_client(daemon, &authorization)?;
@@ -4162,14 +4172,22 @@ fn auth_start(
     authorization: &RequestAuthorization,
 ) -> Result<AuthStartResponse, LocalApiError> {
     let status = status_for(daemon, authorization)?;
+    if status.account.state == LocalAccountState::Connected && status.account.user.is_some() {
+        return Err(LocalApiError::InvalidRequest(
+            "This Mac is already connected. Run `ottto account` to view it, or `ottto logout` before pairing a different account."
+                .to_string(),
+        ));
+    }
     // Idempotent re-trigger: while a claim is in flight and unexpired,
     // repeated Sign-in presses return the SAME claim instead of minting a
     // parallel one. Racing claims were one writer behind the observed
     // ClaimPending/ResetRequired status flip-flop (a completion for claim A
     // landing while claim B had already replaced the pending state).
     if let Some((pending, account)) = daemon.pending_auth_claim_snapshot()? {
-        if account.state == LocalAccountState::ClaimPending
-            && !auth_claim_is_expired(&pending.expires_at)
+        if matches!(
+            account.state,
+            LocalAccountState::ClaimPending | LocalAccountState::ReattachRequired
+        ) && !auth_claim_is_expired(&pending.expires_at)
         {
             return Ok(AuthStartResponse {
                 account,
@@ -4274,6 +4292,13 @@ fn complete_pending_auth_claim(
         Ok(completed) => completed,
         Err(error) => {
             log_auth_complete_backend_failure(&error);
+            if let Some(reattach) = reattach_required_state(&error) {
+                daemon.mark_reattach_required(reattach.message.clone(), reattach.can_reconnect)?;
+                let account = daemon.account_for_trusted_client()?;
+                FileAccountStore::default()
+                    .save(&account)
+                    .map_err(|_| LocalApiError::StatePoisoned)?;
+            }
             return Err(error);
         }
     };
@@ -4301,6 +4326,7 @@ fn complete_pending_auth_claim(
             code: "connected".to_string(),
             text: "This Mac is connected to Ottto.".to_string(),
         }),
+        can_reconnect: None,
     };
     let prepared_pending = match &relay_credentials {
         ClaimRelayDeviceCredential::Prepared(prepared) => {
@@ -4370,6 +4396,7 @@ fn complete_pending_auth_claim(
         return Err(LocalApiError::AccountSwitchCandidate {
             current_user_email: candidate.current_user_email,
             new_user_email: candidate.new_user_email,
+            new_organization_name: candidate.new_organization_name,
             claim_code: candidate.claim_code,
         });
     }
@@ -4433,6 +4460,7 @@ fn complete_pending_auth_claim(
             &FilePendingDeviceCredentialStore::default(),
             &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
         )?;
+        let _ = clear_prior_device_credential();
         request_snapshot_sync_after_device_registration(daemon);
         return Ok(response);
     }
@@ -4482,6 +4510,7 @@ fn complete_pending_auth_claim(
         })
         .map_err(|_| LocalApiError::StatePoisoned)?;
     if relay_credentials_persisted {
+        let _ = clear_prior_device_credential();
         request_snapshot_sync_after_device_registration(daemon);
     }
     Ok(response)
@@ -5646,7 +5675,14 @@ fn auth_reset(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     local_only: bool,
+    forget_installation: bool,
 ) -> Result<AuthResetResponse, LocalApiError> {
+    if forget_installation && !local_only {
+        return Err(LocalApiError::InvalidRequest(
+            "--forget-installation requires --local-only; this reset does not mutate cloud state"
+                .to_string(),
+        ));
+    }
     require_authorized_local_client(daemon, authorization)?;
     // Both ordinary and explicit local-only logout clear the account/device
     // authority needed for exact backend cleanup, so neither may strand an
@@ -5675,14 +5711,30 @@ fn auth_reset(
         require_cloud_session_cleanup_before_identity_change_without_pause(
             &crate::cloud_sessions::CloudSessionGrantStore::default(),
         )?;
+        if local_only {
+            retain_prior_device_credential_for_logout()?;
+        }
         clear_pending_device_credential(
             &FilePendingDeviceCredentialStore::default(),
             &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
         )?;
+        if !local_only || forget_installation {
+            // The public selector is the usable half of a retained predecessor
+            // credential. A destructive reset must durably remove it before
+            // reporting success. The now-unusable Keychain half is deleted
+            // best-effort below so a locked Keychain cannot strand the reset.
+            clear_prior_device_selector()?;
+        }
         reset_local_account_files_locked(Some(&identity_reservation))?;
+        if forget_installation {
+            forget_installation_state_locked()?;
+        }
     }
     let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
     let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
+    if !local_only || forget_installation {
+        let _ = KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT).delete();
+    }
     let mut reset = daemon.reset_account_for_authorized_client()?;
     reset.local_only = local_only;
     reset.cloud_disconnected = cloud_disconnect.is_some();
@@ -5693,18 +5745,42 @@ fn auth_reset(
         .as_ref()
         .map(|disconnect| disconnect.disconnected_at.clone());
     reset.message = StableMessage {
-        code: if local_only {
+        code: if forget_installation {
+            "installation_forgotten".to_string()
+        } else if local_only {
             "local_disconnect_complete".to_string()
         } else {
             "cloud_disconnect_complete".to_string()
         },
-        text: if local_only {
-            "Local Ottto credentials were cleared without changing cloud state.".to_string()
+        text: if forget_installation {
+            "Installation identity, account scope, credentials, and local sync receipts were cleared. Agent source data was not changed. Restart ottto-service before pairing."
+                .to_string()
+        } else if local_only {
+            "Active local credentials were cleared without changing cloud state; prior device proof was retained securely for reconnection."
+                .to_string()
         } else {
             "This Mac was disconnected from Ottto.".to_string()
         },
     };
     Ok(reset)
+}
+
+fn forget_installation_state_locked() -> Result<(), LocalApiError> {
+    FileMachineStore::default()
+        .reset()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let support_dir = default_support_dir();
+    for path in [
+        support_dir.join("snapshots"),
+        support_dir.join("snapshot_backfill_state.json"),
+    ] {
+        if path.is_dir() {
+            fs::remove_dir_all(&path).map_err(|_| LocalApiError::StatePoisoned)?;
+        } else if path.exists() {
+            fs::remove_file(&path).map_err(|_| LocalApiError::StatePoisoned)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -6608,6 +6684,7 @@ fn cli_error(error: LocalApiError) -> CliError {
         LocalApiError::AccountSwitchCandidate {
             current_user_email,
             new_user_email,
+            new_organization_name,
             claim_code,
         } => {
             // Same wire code as AccountResetRequired so pre-switch clients keep
@@ -6622,6 +6699,10 @@ fn cli_error(error: LocalApiError) -> CliError {
             details.insert(
                 "new_user_email".to_string(),
                 RedactedValue::String(new_user_email.clone()),
+            );
+            details.insert(
+                "new_organization_name".to_string(),
+                RedactedValue::String(new_organization_name.clone()),
             );
             details.insert(
                 "claim_code".to_string(),
@@ -6717,6 +6798,23 @@ fn cli_error_message(error: &LocalApiError) -> String {
                 .as_deref()
                 .unwrap_or_default()
                 .to_ascii_lowercase();
+            if body.contains("revoked_cross_account_predecessor") {
+                return "This Mac belonged to another Ottto account whose device is revoked. The new signed-in owner must choose Replace it on the browser claim page; Ottto will start local history at the prior revocation cutoff."
+                    .to_string();
+            }
+            if body.contains("cross-account takeover requires the exact active predecessor") {
+                return "This Mac still has a live registration for another Ottto account. Complete the takeover from that live installation with its exact saved device credential, or have the prior owner revoke it before the new owner approves Replace it."
+                    .to_string();
+            }
+            if body.contains("requires an explicit relay device") {
+                return "This Mac is already registered. Choose Reconnect it in the Ottto app to use the saved device credential, or choose Replace it on the browser claim page.".to_string();
+            }
+            if body.contains("requires an explicit prior credential") {
+                return "This Mac is already registered but its prior device credential is unavailable. Choose Replace it on the browser claim page, then retry `ottto login` or `ottto setup`.".to_string();
+            }
+            if body.contains("more than one active authority") {
+                return "This Mac has multiple active registrations. Choose Replace it on the browser claim page to revoke them and create one fresh device, then retry `ottto login` or `ottto setup`.".to_string();
+            }
             if body.contains("expired") {
                 return "Setup run expired. Open the Ottto app from Ottto to attach an active setup run.".to_string();
             }
@@ -6758,6 +6856,95 @@ fn cli_error_message(error: &LocalApiError) -> String {
         }
         _ => error.to_string(),
     }
+}
+
+fn bounded_display_text(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+struct ReattachRequiredState {
+    message: StableMessage,
+    can_reconnect: bool,
+}
+
+fn reattach_required_state(error: &LocalApiError) -> Option<ReattachRequiredState> {
+    let LocalApiError::Backend(backend) = error else {
+        return None;
+    };
+    let raw = backend.body_excerpt.as_deref().unwrap_or_default();
+    let parsed = serde_json::from_str::<serde_json::Value>(raw).ok();
+    let detail = parsed.as_ref().and_then(|value| value.get("detail"));
+    let detail_object = detail.and_then(serde_json::Value::as_object);
+    let backend_message = detail_object
+        .and_then(|object| object.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| detail.and_then(serde_json::Value::as_str))
+        .unwrap_or(raw);
+    let lower = backend_message.to_ascii_lowercase();
+    let reason = detail_object
+        .and_then(|object| object.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| {
+            matches!(
+                *value,
+                "existing_authority"
+                    | "multiple_active_authorities"
+                    | "revoked_cross_account_predecessor"
+            )
+        })
+        .or_else(|| {
+            lower
+                .contains("more than one active authority")
+                .then_some("multiple_active_authorities")
+        })
+        .or_else(|| {
+            (lower.contains("requires an explicit relay device")
+                || lower.contains("requires an explicit prior credential"))
+            .then_some("existing_authority")
+        })?;
+    let device_name = detail_object
+        .and_then(|object| object.get("device_name"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| bounded_display_text(value, 80))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "this Mac".to_string());
+    let last_seen = detail_object
+        .and_then(|object| object.get("last_seen_at"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| bounded_display_text(value, 40))
+        .filter(|value| !value.is_empty());
+    let last_seen_text = last_seen
+        .map(|value| format!(" (last seen {value})"))
+        .unwrap_or_default();
+    let can_reconnect = detail_object
+        .and_then(|object| object.get("can_reconnect"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let action = if can_reconnect {
+        "Reconnect it with the saved credential, or approve Replace it in the browser."
+    } else {
+        "The predecessor was revoked. Approve Replace it in the browser to bind the new owner without importing pre-revocation history."
+    };
+    Some(ReattachRequiredState {
+        message: StableMessage {
+            code: format!("reattach_required:{reason}"),
+            text: format!(
+                "This Mac is already registered as {device_name}{last_seen_text}. {action}"
+            ),
+        },
+        can_reconnect,
+    })
+}
+
+#[cfg(test)]
+fn reattach_required_message(error: &LocalApiError) -> Option<StableMessage> {
+    reattach_required_state(error).map(|state| state.message)
 }
 
 fn agent_read_timeout_message(error: &LocalApiError) -> Option<String> {
@@ -6817,6 +7004,26 @@ fn setup_run(
             Some(trimmed)
         }
     });
+
+    if status.account.state == LocalAccountState::Connected
+        && status.account.user.is_some()
+        && !claim_code_provided
+        && requested_setup_run_id.is_none()
+    {
+        return Ok(json!({
+            "status": "completed",
+            "already_connected": true,
+            "setup_run_id": connection.as_ref().map(|binding| binding.setup_run_id.clone()),
+            "claim_code_provided": false,
+            "source_count": 0,
+            "detected_sources": [],
+            "next_question": null,
+            "next_action": null,
+            "setup_claim_url": null,
+            "actions": [],
+            "message": "This Mac is already connected. No new setup claim was created.",
+        }));
+    }
 
     if let Some(code) = claim_code
         .as_ref()
@@ -6937,22 +7144,10 @@ fn is_terminal_setup_run_scan_error(error: &LocalApiError) -> bool {
     if matches!(details.status, Some(404) | Some(410)) {
         return true;
     }
-    if !matches!(details.status, Some(401) | Some(403)) {
-        return false;
-    }
-    let body = details
-        .body_excerpt
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    body.contains("setup run cancelled")
-        || body.contains("setup_run_cancelled")
-        || body.contains("setup run expired")
-        || body.contains("setup_run_expired")
-        || body.contains("setup run companion token expired")
-        || body.contains("setup_run_companion_token_expired")
-        || body.contains("setup run missing")
-        || body.contains("setup run not found")
+    // A setup-run token that the backend rejects cannot become valid by
+    // polling harder. Clear the stale binding after the first authoritative
+    // 401/403 so an unattended CLI cannot hammer an old run forever.
+    matches!(details.status, Some(401) | Some(403))
 }
 
 fn setup_answer(
@@ -9305,10 +9500,84 @@ struct PriorDeviceCredential {
 
 fn prior_device_credential_for_registration() -> Result<Option<PriorDeviceCredential>, LocalApiError>
 {
+    let active_store = FileDeviceStore::default();
+    if active_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .is_some()
+    {
+        return prior_device_credential_with_stores(
+            &active_store,
+            &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        );
+    }
     prior_device_credential_with_stores(
+        &FileDeviceStore::new(default_prior_device_path()),
+        &KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT),
+    )
+}
+
+fn retain_prior_device_credential_for_logout() -> Result<(), LocalApiError> {
+    retain_prior_device_credential_with_stores(
         &FileDeviceStore::default(),
         &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        &FileDeviceStore::new(default_prior_device_path()),
+        &KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT),
     )
+}
+
+fn retain_prior_device_credential_with_stores(
+    active_device_store: &FileDeviceStore,
+    active_secret_store: &impl ControlTokenStore,
+    prior_device_store: &FileDeviceStore,
+    prior_secret_store: &impl ControlTokenStore,
+) -> Result<(), LocalApiError> {
+    let Some(device) = active_device_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+    else {
+        return Ok(());
+    };
+    let secret = match active_secret_store.load() {
+        Ok(secret) => secret,
+        Err(TokenStoreError::Missing) => {
+            // The active binding was already incomplete before logout. Do not
+            // fail logout or reuse an unrelated older proof; the next claim
+            // will surface the typed replacement path.
+            prior_device_store
+                .reset()
+                .map_err(|_| LocalApiError::StatePoisoned)?;
+            // The public device-id half is the authority selector. Removing it
+            // makes any orphaned secret unusable; secret deletion is best
+            // effort because a locked Keychain must not block local logout.
+            let _ = prior_secret_store.delete();
+            return Ok(());
+        }
+        Err(_) => return Err(LocalApiError::StatePoisoned),
+    };
+    if device.device_id.trim().is_empty() || secret.trim().is_empty() {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    prior_secret_store
+        .save(&secret)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    prior_device_store
+        .save(&device)
+        .map_err(|_| LocalApiError::StatePoisoned)
+}
+
+fn clear_prior_device_credential() -> Result<(), LocalApiError> {
+    clear_prior_device_selector()?;
+    KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT)
+        .delete()
+        .map_err(|_| LocalApiError::StatePoisoned)
+}
+
+fn clear_prior_device_selector() -> Result<(), LocalApiError> {
+    FileDeviceStore::new(default_prior_device_path())
+        .reset()
+        .map(|_| ())
+        .map_err(|_| LocalApiError::StatePoisoned)
 }
 
 fn prior_device_credential_with_stores(
@@ -9324,10 +9593,7 @@ fn prior_device_credential_with_stores(
     let device_secret = secret_store
         .load()
         .map_err(|_| LocalApiError::StatePoisoned)?;
-    if device.device_id.trim().is_empty()
-        || device.sources.is_empty()
-        || device_secret.trim().is_empty()
-    {
+    if device.device_id.trim().is_empty() || device_secret.trim().is_empty() {
         return Err(LocalApiError::StatePoisoned);
     }
     Ok(Some(PriorDeviceCredential {
@@ -14341,6 +14607,23 @@ fn safe_backend_endpoint(url: &str) -> String {
 }
 
 fn safe_backend_body_excerpt(body: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(detail) = value.get("detail").and_then(serde_json::Value::as_object) {
+            if detail.get("code").and_then(serde_json::Value::as_str) == Some("reattach_required") {
+                let safe = json!({
+                    "detail": {
+                        "code": "reattach_required",
+                        "message": detail.get("message").and_then(serde_json::Value::as_str).map(|value| bounded_display_text(value, 120)),
+                        "reason": detail.get("reason").and_then(serde_json::Value::as_str).map(|value| bounded_display_text(value, 40)),
+                        "device_name": detail.get("device_name").and_then(serde_json::Value::as_str).map(|value| bounded_display_text(value, 80)),
+                        "last_seen_at": detail.get("last_seen_at").and_then(serde_json::Value::as_str).map(|value| bounded_display_text(value, 40)),
+                        "can_reconnect": detail.get("can_reconnect").and_then(serde_json::Value::as_bool),
+                    }
+                });
+                return serde_json::to_string(&safe).ok();
+            }
+        }
+    }
     let compact = body
         .split_whitespace()
         .take(40)
@@ -14538,6 +14821,39 @@ mod tests {
         assert!(!excerpt.contains(&prior));
         assert!(!excerpt.contains(&install));
         assert!(!excerpt.contains(&candidate));
+    }
+
+    #[test]
+    fn reattach_excerpt_preserves_false_reconnect_capability() {
+        let body = serde_json::json!({
+            "detail": {
+                "code": "reattach_required",
+                "message": "Cross-account replacement requires browser approval",
+                "reason": "revoked_cross_account_predecessor",
+                "device_name": "Previous Mac",
+                "can_reconnect": false,
+            }
+        })
+        .to_string();
+        let excerpt = super::safe_backend_body_excerpt(&body).expect("reattach excerpt");
+        let error = LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: "https://api.ottto.net/api/v1/setup-claims/[claim]/local-client/complete"
+                .to_string(),
+            status: Some(401),
+            body_excerpt: Some(excerpt),
+        });
+
+        let message = reattach_required_message(&error).expect("typed reattach message");
+        assert!(
+            !reattach_required_state(&error)
+                .expect("typed reattach state")
+                .can_reconnect
+        );
+        assert!(message.text.contains("predecessor was revoked"));
+        assert!(!message
+            .text
+            .contains("Reconnect it with the saved credential"));
     }
 
     #[test]
@@ -16422,6 +16738,7 @@ mod tests {
             connected_at: Some("2026-07-31T20:00:00Z".to_string()),
             last_refreshed_at: Some("2026-07-31T20:00:00Z".to_string()),
             message: None,
+            can_reconnect: None,
         };
         let connection = LocalConnectionBinding {
             setup_run_id: "setup-switch-new".to_string(),
@@ -16848,6 +17165,46 @@ mod tests {
             "waiting_for_user_login"
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn forget_installation_fails_closed_when_prior_selector_cannot_be_removed() {
+        let root = telemetry_key_store_root("forget-installation-prior-selector-failure");
+        let support_root = root.join("support");
+        let secret_root = root.join("secrets");
+        fs::create_dir_all(&support_root).unwrap();
+        fs::create_dir_all(&secret_root).unwrap();
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileMachineStore::default()
+            .save(&LocalMachineBinding {
+                machine_id: "otm_must_survive".to_string(),
+                installation_id: "oti_must_survive".to_string(),
+                hardware_uuid: None,
+            })
+            .unwrap();
+        fs::create_dir_all(default_prior_device_path()).unwrap();
+
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_forget_prior_failure".to_string(),
+                protocol_version: ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::AuthReset {
+                    local_only: true,
+                    forget_installation: true,
+                },
+            },
+        );
+
+        assert!(!response.ok, "selector removal failure must abort reset");
+        assert!(FileMachineStore::default().load().unwrap().is_some());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -18059,6 +18416,7 @@ mod tests {
         let error = cli_error(LocalApiError::AccountSwitchCandidate {
             current_user_email: "old@example.com".to_string(),
             new_user_email: "new@example.com".to_string(),
+            new_organization_name: "New Workspace".to_string(),
             claim_code: "claim_123".to_string(),
         });
 
@@ -18077,6 +18435,10 @@ mod tests {
         assert_eq!(
             error.details.get("new_user_email"),
             Some(&RedactedValue::String("new@example.com".to_string()))
+        );
+        assert_eq!(
+            error.details.get("new_organization_name"),
+            Some(&RedactedValue::String("New Workspace".to_string()))
         );
         assert_eq!(
             error.details.get("claim_code"),
@@ -18116,6 +18478,77 @@ mod tests {
             response.account.state,
             ottto_protocol::LocalAccountState::ClaimPending
         );
+    }
+
+    #[test]
+    fn auth_start_on_connected_daemon_does_not_create_competing_claim() {
+        let daemon = daemon();
+        daemon
+            .begin_auth_with_claim(crate::PendingAuthClaim {
+                claim_code: "claim_connected".to_string(),
+                claim_token: "token_connected".to_string(),
+                nonce: "nonce_connected".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_connected".to_string(),
+                expires_at: "2100-01-01T00:00:00Z".to_string(),
+            })
+            .expect("begin claim");
+        daemon
+            .complete_auth_with_account(
+                "claim_connected",
+                "nonce_connected",
+                connected_account(),
+                "run_connected".to_string(),
+                "2100-01-01T00:00:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("connect account");
+
+        let error = auth_start(&daemon, &RequestAuthorization::Token("token".to_string()))
+            .expect_err("connected auth start must be explicit");
+        assert!(matches!(
+            error,
+            LocalApiError::InvalidRequest(message)
+                if message.contains("already connected") && message.contains("ottto logout")
+        ));
+        assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
+    }
+
+    #[test]
+    fn setup_on_connected_daemon_is_truthful_noop() {
+        let daemon = daemon();
+        daemon
+            .begin_auth_with_claim(crate::PendingAuthClaim {
+                claim_code: "claim_connected_setup".to_string(),
+                claim_token: "token_connected_setup".to_string(),
+                nonce: "nonce_connected_setup".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_connected_setup".to_string(),
+                expires_at: "2100-01-01T00:00:00Z".to_string(),
+            })
+            .expect("begin claim");
+        daemon
+            .complete_auth_with_account(
+                "claim_connected_setup",
+                "nonce_connected_setup",
+                connected_account(),
+                "run_connected_setup".to_string(),
+                "2100-01-01T00:00:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("connect account");
+
+        let payload = setup_run(
+            &daemon,
+            &RequestAuthorization::Token("token".to_string()),
+            Vec::new(),
+            None,
+            None,
+            None,
+        )
+        .expect("connected setup no-op");
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["already_connected"], true);
+        assert_eq!(payload["setup_run_id"], "run_connected_setup");
+        assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
     }
 
     #[test]
@@ -18173,7 +18606,10 @@ mod tests {
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
                 client_install_owner: None,
-                command: LocalControlCommand::AuthReset { local_only: false },
+                command: LocalControlCommand::AuthReset {
+                    local_only: false,
+                    forget_installation: false,
+                },
             },
         );
 
@@ -18216,7 +18652,10 @@ mod tests {
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
                 client_install_owner: None,
-                command: LocalControlCommand::AuthReset { local_only: true },
+                command: LocalControlCommand::AuthReset {
+                    local_only: true,
+                    forget_installation: false,
+                },
             },
         );
 
@@ -18235,6 +18674,211 @@ mod tests {
         );
         let _ = fs::remove_dir_all(support_root);
         let _ = fs::remove_dir_all(secret_root);
+    }
+
+    #[test]
+    #[serial]
+    fn local_only_logout_retains_prior_proof_and_rejection_becomes_reattach_required() {
+        let _lock = lock_backend_test_env();
+        let root = telemetry_key_store_root("logout-prior-credential");
+        let support_root = root.join("support");
+        let secret_root = root.join("secrets");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let account = connected_account();
+        let device = LocalDeviceBinding {
+            device_id: "device-prior-proof".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        FileAccountStore::default().save(&account).unwrap();
+        FileDeviceStore::default().save(&device).unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("prior-secret-test")
+            .unwrap();
+        let daemon = daemon().with_account(account);
+
+        let reset = handle_request(
+            &daemon,
+            LocalControlRequest {
+                request_id: "req_local_only_prior".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::AuthReset {
+                    local_only: true,
+                    forget_installation: false,
+                },
+            },
+        );
+        assert!(reset.ok, "{reset:?}");
+        assert!(FileDeviceStore::default().load().unwrap().is_none());
+        assert!(KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .is_err());
+        assert_eq!(
+            FileDeviceStore::new(default_prior_device_path())
+                .load()
+                .unwrap(),
+            Some(device)
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .unwrap(),
+            "prior-secret-test"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind reattach backend");
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept reattach request");
+            let request = read_complete_http_request(&mut stream);
+            let body: serde_json::Value =
+                serde_json::from_str(http_request_body(&request)).expect("completion body");
+            assert_eq!(body["relay_device_id"], "device-prior-proof");
+            assert_eq!(body["prior_device_secret"], "prior-secret-test");
+            write_json_response(
+                &mut stream,
+                409,
+                "Conflict",
+                r#"{"detail":{"code":"reattach_required","message":"Existing installation authority requires an explicit relay device","reason":"existing_authority","device_name":"Founder M4","last_seen_at":"2026-09-07T12:30:00Z","can_reconnect":true,"can_replace":true,"replacement_approved":false}}"#,
+            );
+        });
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
+        let pending = PendingAuthClaim {
+            claim_code: "claim_reattach".to_string(),
+            claim_token: "claim_token_reattach".to_string(),
+            nonce: "nonce_reattach_1234567890".to_string(),
+            claim_url: "https://ottto.net/setup/claim?code=claim_reattach".to_string(),
+            expires_at: "2026-09-08T12:30:00Z".to_string(),
+        };
+        daemon.begin_auth_with_claim(pending.clone()).unwrap();
+        let result = complete_pending_auth_claim(&daemon, &test_machine(), pending);
+        server.join().unwrap();
+
+        assert!(matches!(result, Err(LocalApiError::Backend(_))));
+        let status = daemon.status("token").unwrap();
+        assert_eq!(status.account.state, LocalAccountState::ReattachRequired);
+        assert!(status.account.user.is_none());
+        assert_eq!(status.account.can_reconnect, Some(true));
+        let message = status.account.message.unwrap();
+        assert_eq!(message.code, "reattach_required:existing_authority");
+        assert!(message.text.contains("Founder M4"));
+        assert!(message.text.contains("2026-09-07T12:30:00Z"));
+        assert!(message.text.contains("Reconnect it"));
+    }
+
+    #[test]
+    #[serial]
+    fn forget_installation_clears_identity_scope_credentials_and_receipts_only() {
+        let root = telemetry_key_store_root("forget-installation");
+        let support_root = root.join("support");
+        let secret_root = root.join("secrets");
+        fs::create_dir_all(support_root.join("snapshots/destinations/old")).unwrap();
+        fs::create_dir_all(&secret_root).unwrap();
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileMachineStore::default()
+            .save(&LocalMachineBinding {
+                machine_id: "otm_original".to_string(),
+                installation_id: "oti_original".to_string(),
+                hardware_uuid: None,
+            })
+            .unwrap();
+        FileAccountStore::default()
+            .save(&connected_account())
+            .unwrap();
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_forget".to_string(),
+                machine_id: Some("otm_original".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+        FileDeviceStore::new(default_prior_device_path())
+            .save(&LocalDeviceBinding {
+                device_id: "device_prior_forget".to_string(),
+                machine_id: Some("otm_original".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+        FileConnectionStore::default()
+            .save(&LocalConnectionBinding {
+                setup_run_id: "run_forget".to_string(),
+                setup_run_token_expires_at: "2026-09-08T12:00:00Z".to_string(),
+                machine_id: Some("otm_original".to_string()),
+                claim_code: None,
+                api_base_url: "https://api.ottto.net".to_string(),
+            })
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device-secret-forget")
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("setup-token-forget")
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("prior-device-secret-forget")
+            .unwrap();
+        fs::write(
+            support_root.join("snapshots/destinations/old/codex-scan-index.json"),
+            b"receipt",
+        )
+        .unwrap();
+        fs::write(
+            support_root.join("snapshot_backfill_state.json"),
+            b"backfill",
+        )
+        .unwrap();
+        let source_data = root.join("codex-source.jsonl");
+        fs::write(&source_data, b"source data").unwrap();
+
+        let response = handle_request(
+            &daemon().with_account(connected_account()),
+            LocalControlRequest {
+                request_id: "req_forget_installation".to_string(),
+                protocol_version: ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::AuthReset {
+                    local_only: true,
+                    forget_installation: true,
+                },
+            },
+        );
+        assert!(response.ok, "{response:?}");
+        assert!(FileMachineStore::default().load().unwrap().is_none());
+        assert!(FileDeviceStore::default().load().unwrap().is_none());
+        assert!(FileConnectionStore::default().load().unwrap().is_none());
+        assert!(FileDeviceStore::new(default_prior_device_path())
+            .load()
+            .unwrap()
+            .is_none());
+        assert!(KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .is_err());
+        assert!(
+            KeychainSecretStore::new(OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .is_err()
+        );
+        assert!(KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .load()
+            .is_err());
+        assert!(!support_root.join("snapshots").exists());
+        assert!(!support_root.join("snapshot_backfill_state.json").exists());
+        assert_eq!(fs::read(source_data).unwrap(), b"source data");
+        assert_eq!(
+            response.payload.unwrap()["message"]["code"],
+            "installation_forgotten"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -19126,7 +19770,10 @@ mod tests {
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
                 client_install_owner: None,
-                command: LocalControlCommand::AuthReset { local_only: false },
+                command: LocalControlCommand::AuthReset {
+                    local_only: false,
+                    forget_installation: false,
+                },
             },
         );
 
@@ -20421,8 +21068,11 @@ mod tests {
     #[serial]
     fn auth_reset_preserves_identity_until_cloud_session_cleanup_is_confirmed() {
         let support_root = telemetry_key_store_root("auth-reset-cloud-session-cleanup");
+        let secret_root = telemetry_key_store_root("auth-reset-cloud-session-cleanup-secrets");
+        fs::create_dir_all(&secret_root).unwrap();
         let _support_guard =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
         let account = connected_account();
         let device_id = "00000000-0000-4000-8000-000000000001";
         FileAccountStore::default().save(&account).unwrap();
@@ -20432,6 +21082,9 @@ mod tests {
                 machine_id: Some("machine_test".to_string()),
                 sources: vec!["codex".to_string()],
             })
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("otdev_cloud_cleanup")
             .unwrap();
         let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
         grants
@@ -20456,7 +21109,10 @@ mod tests {
             token: Some("token".to_string()),
             client_kind: Some(LocalClientKind::Cli),
             client_install_owner: None,
-            command: LocalControlCommand::AuthReset { local_only },
+            command: LocalControlCommand::AuthReset {
+                local_only,
+                forget_installation: false,
+            },
         };
         for local_only in [false, true] {
             let blocked = handle_request(&daemon, request(local_only));
@@ -20549,6 +21205,7 @@ mod tests {
             connected_at: Some("2026-05-05T10:00:00Z".to_string()),
             last_refreshed_at: Some("2026-05-05T10:00:00Z".to_string()),
             message: None,
+            can_reconnect: None,
         };
         daemon
             .stage_account_switch_if_user_mismatch(StagedAccountSwitch {
@@ -25627,8 +26284,10 @@ log_user_prompt = true
             claim_code: Some("claim_existing".to_string()),
             api_base_url: api_base_url.clone(),
         };
+        let mut stale_overlay = connected_account();
+        stale_overlay.state = LocalAccountState::ClaimPending;
         let daemon = daemon()
-            .with_account(connected_account())
+            .with_account(stale_overlay)
             .with_connection(Some(connection));
         daemon
             .begin_auth_with_claim(PendingAuthClaim {
@@ -25721,8 +26380,10 @@ log_user_prompt = true
             claim_code: None,
             api_base_url: api_base_url.clone(),
         };
+        let mut stale_overlay = connected_account();
+        stale_overlay.state = LocalAccountState::ClaimPending;
         let daemon = daemon()
-            .with_account(connected_account())
+            .with_account(stale_overlay)
             .with_connection(Some(connection));
 
         let result = verify_source(
@@ -25842,6 +26503,36 @@ log_user_prompt = true
     }
 
     #[test]
+    fn cli_error_messages_name_each_pairing_recovery_action() {
+        let error = |body: &str| {
+            cli_error_message(&LocalApiError::Backend(BackendErrorDetails {
+                kind: BackendErrorKind::Rejected,
+                endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
+                status: Some(409),
+                body_excerpt: Some(body.to_string()),
+            }))
+        };
+
+        let relay = error("Existing installation authority requires an explicit relay device");
+        assert!(relay.contains("Reconnect it"));
+        assert!(relay.contains("Replace it"));
+        let prior = error("Existing installation authority requires an explicit prior credential");
+        assert!(prior.contains("Replace it"));
+        assert!(prior.contains("ottto login"));
+        let multiple = error("The setup-claim installation has more than one active authority");
+        assert!(multiple.contains("multiple active registrations"));
+        assert!(multiple.contains("Replace it"));
+        let revoked = error(
+            r#"{"detail":{"reason":"revoked_cross_account_predecessor","message":"Cross-account takeover requires the exact active predecessor credential"}}"#,
+        );
+        assert!(revoked.contains("new signed-in owner"));
+        assert!(revoked.contains("revocation cutoff"));
+        let live = error("Cross-account takeover requires the exact active predecessor credential");
+        assert!(live.contains("live registration"));
+        assert!(live.contains("exact saved device credential"));
+    }
+
+    #[test]
     fn auth_complete_log_endpoint_redacts_claim_code() {
         assert_eq!(
             auth_complete_log_endpoint(
@@ -25894,8 +26585,12 @@ log_user_prompt = true
         FileConnectionStore::default()
             .save(&connection)
             .expect("persist connection binding");
+        let mut stale_overlay = connected_account();
+        stale_overlay.state = LocalAccountState::ClaimPending;
+        stale_overlay.user = None;
+        stale_overlay.organization = None;
         let daemon = daemon()
-            .with_account(connected_account())
+            .with_account(stale_overlay)
             .with_connection(Some(connection));
 
         let response = handle_request(
@@ -25965,8 +26660,12 @@ log_user_prompt = true
         FileConnectionStore::default()
             .save(&connection)
             .expect("persist connection binding");
+        let mut stale_overlay = connected_account();
+        stale_overlay.state = LocalAccountState::ClaimPending;
+        stale_overlay.user = None;
+        stale_overlay.organization = None;
         let daemon = daemon()
-            .with_account(connected_account())
+            .with_account(stale_overlay)
             .with_connection(Some(connection));
 
         let response = handle_request(
@@ -27650,6 +28349,7 @@ log_user_prompt = true
             connected_at: Some("2026-05-05T09:00:00Z".to_string()),
             last_refreshed_at: Some("2026-05-05T09:20:00Z".to_string()),
             message: None,
+            can_reconnect: None,
         }
     }
 

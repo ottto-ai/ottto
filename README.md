@@ -269,6 +269,7 @@ ottto login --json --no-browser --no-wait
 ottto account --json
 ottto logout --json
 ottto logout --local-only --json
+ottto logout --local-only --forget-installation --confirm --json
 ottto doctor --json
 ottto fix --app codex --json
 ottto verify --app codex --json
@@ -277,7 +278,7 @@ ottto diagnostics collect --json
 ottto diagnostics collect --upload --approve-upload --accept-retention-disclosure --support-claim <claim> --json
 ottto update --json
 ottto update check --json
-ottto uninstall --json
+ottto uninstall --backup-state ./ottto-state-backup --confirm --json
 ```
 
 Automation should pass `--json`; JSON mode prints one final JSON object and no
@@ -397,6 +398,11 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   owner-only files under the Ottto support directory so dev/preview signature
   churn, unavailable Keychain access, or blocking Keychain calls do not strand
   verification after restart.
+- local-only logout moves the relay-device id and secret into a dormant,
+  owner-only prior-credential slot. A later browser claim presents that exact
+  predecessor proof, so emergency local cleanup does not strand an otherwise
+  valid installation. The slot is never printed or logged and is deleted after
+  a successful reattach, cloud logout, installation reset, or uninstall.
 - native app auth commands: `auth_status`, `auth_start`, `auth_complete`, and
   `auth_reset`. Reset/logout is cloud-first by default: the daemon records a
   `local-client/disconnect` in Ottto before clearing local account, connection,
@@ -408,7 +414,26 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   relay-device registration use the same guard before any backend identity
   rotation. While one accepted identity update is in flight, competing setup,
   logout, device writes, and Cloud-session mutations fail with
-  `identity_mutation_in_progress` and are safe to retry.
+  `identity_mutation_in_progress` and are safe to retry. Setup and login are
+  idempotent no-ops while a bound user is already connected; they cannot create
+  a pending-claim overlay over a healthy binding. Rejected or unauthorized
+  setup-run polling is terminal locally instead of retrying a stale run.
+- `ottto logout --local-only --forget-installation --confirm` is the explicit
+  destructive reset path. It clears installation id, account scope, active and
+  prior credentials, setup bindings, destination receipt namespaces, and
+  first-sweep progress together, while leaving Codex, Claude Code, and Pi source
+  data untouched. Restart the daemon before pairing so it creates a fresh
+  installation identity. Because replacement credentials use a new destination
+  namespace, ordinary replacement never reuses the old destination's receipts;
+  it creates clean receipt and first-sweep state for the new destination while
+  preserving the stable `otm_…` machine identity.
+- `ottto uninstall` requires `--confirm`, warns about receipt and first-sweep
+  loss, and accepts `--backup-state <directory>` to export only those receipts
+  and first-sweep state first (never relay credentials or account secrets).
+  Uninstall also unregisters the installed production app bundle from Launch
+  Services before removal. Development and QA app launch scripts omit the
+  production `ottto://` URL scheme, preventing stale runner bundles from taking
+  ownership of setup links.
 - native app account-state UX now treats browser login and local app binding as
   separate states: Verify returns a sign-in-specific message when no local
   account is bound, and the SwiftUI app keeps polling a pending browser claim so

@@ -4,6 +4,10 @@ use std::fmt;
 
 pub const PROTOCOL_VERSION: u16 = 15;
 pub const LOCAL_CONTROL_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 pub const CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION: u16 = 16;
 /// Command-scoped version for `provider_daily_reference_control`. Older daemons
 /// reject it outright, so a UI that can drive this consent is told to update
@@ -28,6 +32,9 @@ pub const CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION: u16 = 23;
 /// The base protocol remains unchanged so older clients continue to use every
 /// unrelated command during a rolling local-runtime upgrade.
 pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 24;
+/// Destructive installation reset is command-scoped so an older daemon cannot
+/// accept the request while silently ignoring `forget_installation`.
+pub const INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION: u16 = 25;
 pub const CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
 pub const CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
@@ -567,6 +574,8 @@ pub struct LocalAccountBinding {
     pub connected_at: Option<Rfc3339Timestamp>,
     pub last_refreshed_at: Option<Rfc3339Timestamp>,
     pub message: Option<StableMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_reconnect: Option<bool>,
 }
 
 impl LocalAccountBinding {
@@ -578,6 +587,7 @@ impl LocalAccountBinding {
             connected_at: None,
             last_refreshed_at: None,
             message: None,
+            can_reconnect: None,
         }
     }
 }
@@ -587,6 +597,7 @@ impl LocalAccountBinding {
 pub enum LocalAccountState {
     NotConnected,
     ClaimPending,
+    ReattachRequired,
     Connected,
     ResetRequired,
     Error,
@@ -2532,6 +2543,10 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         | LocalControlCommand::CodexAccountCheck { .. }
         | LocalControlCommand::CodexAccountStopWaiting { .. }
         | LocalControlCommand::CodexAccountRemove { .. } => CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+        LocalControlCommand::AuthReset {
+            forget_installation: true,
+            ..
+        } => INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION,
         _ => LOCAL_CONTROL_PROTOCOL_VERSION,
     }
 }
@@ -3448,6 +3463,8 @@ pub enum LocalControlCommand {
     AuthReset {
         #[serde(default)]
         local_only: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        forget_installation: bool,
     },
     Account,
     /// Read machine-local Claude account registration state.
@@ -5124,7 +5141,10 @@ mod tests {
 
         assert_eq!(
             request.command,
-            LocalControlCommand::AuthReset { local_only: false }
+            LocalControlCommand::AuthReset {
+                local_only: false,
+                forget_installation: false,
+            }
         );
 
         let local_only: LocalControlRequest = serde_json::from_value(serde_json::json!({
@@ -5138,7 +5158,42 @@ mod tests {
 
         assert_eq!(
             local_only.command,
-            LocalControlCommand::AuthReset { local_only: true }
+            LocalControlCommand::AuthReset {
+                local_only: true,
+                forget_installation: false,
+            }
+        );
+
+        let legacy_forget = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_auth_reset_forget_legacy",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "auth_reset",
+            "local_only": true,
+            "forget_installation": true
+        }));
+        assert!(legacy_forget
+            .expect_err("destructive reset must reject the legacy protocol")
+            .to_string()
+            .contains(&format!(
+                "expected {INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION}"
+            )));
+
+        let forget: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_auth_reset_forget",
+            "protocol_version": INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "auth_reset",
+            "local_only": true,
+            "forget_installation": true
+        }))
+        .expect("command-scoped installation reset");
+        assert_eq!(
+            forget.command,
+            LocalControlCommand::AuthReset {
+                local_only: true,
+                forget_installation: true,
+            }
         );
     }
 
