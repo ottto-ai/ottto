@@ -4430,6 +4430,7 @@ mod tests {
                 connected_at: None,
                 last_refreshed_at: None,
                 message: None,
+                can_reconnect: None,
             })
             .unwrap();
         let devices = FileDeviceStore::new(root.join("device.json"));
@@ -7786,6 +7787,7 @@ mod tests {
                 connected_at: None,
                 last_refreshed_at: None,
                 message: None,
+                can_reconnect: None,
             })
             .unwrap();
         let before_grant = fs::read(grants.path()).unwrap();

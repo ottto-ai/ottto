@@ -7,9 +7,10 @@ use ottto_core::{
     OTTTO_SERVICE_BINARY_NAME, OTTTO_SOCKET_ENV,
 };
 use ottto_protocol::{
-    AgentContextQuery, AgentCostsQuery, AgentProviderImpactQuery, AgentRecommendationsQuery,
-    AgentSessionsQuery, CliError, CliErrorCode, CliErrorResponse, DiagnosticsUploadApproval,
-    LocalControlCommand, LocalControlRequest, LocalControlResponse, RedactedValue, SourceKind,
+    expected_local_control_protocol_version, AgentContextQuery, AgentCostsQuery,
+    AgentProviderImpactQuery, AgentRecommendationsQuery, AgentSessionsQuery, CliError,
+    CliErrorCode, CliErrorResponse, DiagnosticsUploadApproval, LocalControlCommand,
+    LocalControlRequest, LocalControlResponse, RedactedValue, SourceKind,
     LOCAL_CONTROL_PROTOCOL_VERSION,
 };
 use std::collections::BTreeMap;
@@ -97,13 +98,30 @@ enum Command {
     #[command(about = "Check owner-aware update state and instructions")]
     Update(UpdateArgs),
     #[command(about = "Remove Ottto local runtime state for this user")]
-    Uninstall(JsonArgs),
+    Uninstall(UninstallArgs),
 }
 
 #[derive(Debug, Args)]
 struct JsonArgs {
     #[arg(long, help = "Print one final JSON object and no human summary text")]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct UninstallArgs {
+    #[arg(long, help = "Print one final JSON object and no human summary text")]
+    json: bool,
+    #[arg(
+        long,
+        value_name = "DIRECTORY",
+        help = "Copy local sync receipts and first-sweep progress here before uninstalling"
+    )]
+    backup_state: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Confirm removal of local credentials, receipts, and first-sweep progress"
+    )]
+    confirm: bool,
 }
 
 #[derive(Debug, Args)]
@@ -634,6 +652,16 @@ struct LogoutArgs {
         help = "Clear local credentials without first disconnecting this Mac in Ottto"
     )]
     local_only: bool,
+    #[arg(
+        long,
+        help = "Forget installation identity, account scope, credentials, and local sync receipts"
+    )]
+    forget_installation: bool,
+    #[arg(
+        long,
+        help = "Confirm destructive installation reset and local receipt removal"
+    )]
+    confirm: bool,
 }
 
 #[derive(Debug, Args)]
@@ -786,8 +814,8 @@ fn main() {
         let code = run_claude_code_statusline(args.json);
         std::process::exit(code);
     }
-    if matches!(cli.command, Command::Uninstall(_)) {
-        let code = run_uninstall(output_mode);
+    if let Command::Uninstall(args) = &cli.command {
+        let code = run_uninstall(output_mode, args);
         std::process::exit(code);
     }
     let invocation = build_invocation(cli, output_mode);
@@ -800,6 +828,30 @@ fn main() {
 }
 
 fn validate_cli(cli: &Cli) -> Result<(), CliError> {
+    if matches!(&cli.command, Command::Uninstall(args) if !args.confirm) {
+        return Err(CliError {
+            code: CliErrorCode::InvalidRequest,
+            message: "uninstall removes local receipts and first-sweep progress; rerun with --confirm, optionally adding --backup-state <directory>"
+                .to_string(),
+            retryable: false,
+            details: BTreeMap::new(),
+        });
+    }
+    if matches!(
+        &cli.command,
+        Command::Logout(LogoutArgs {
+            forget_installation: true,
+            confirm: false,
+            ..
+        })
+    ) {
+        return Err(CliError {
+            code: CliErrorCode::InvalidRequest,
+            message: "--forget-installation clears local receipts and first-sweep progress; rerun with --confirm after backing up the Ottto support directory if needed".to_string(),
+            retryable: false,
+            details: BTreeMap::new(),
+        });
+    }
     if let Command::Cloud(args) = &cli.command {
         let approved = match &args.command {
             CloudCommand::Register(args) => args.approve,
@@ -1717,7 +1769,7 @@ fn open_browser(url: &str) -> Result<(), String> {
     }
 }
 
-fn run_uninstall(output_mode: OutputMode) -> i32 {
+fn run_uninstall(output_mode: OutputMode, args: &UninstallArgs) -> i32 {
     let request_id = request_id();
     if output_mode == OutputMode::Ndjson {
         println!(
@@ -1727,6 +1779,15 @@ fn run_uninstall(output_mode: OutputMode) -> i32 {
     }
     match local_lifecycle_home_dir() {
         Ok(home) => {
+            if let Some(destination) = args.backup_state.as_ref() {
+                if let Err(error) = backup_uninstall_state(&home, destination) {
+                    return print_error(
+                        internal_error(&format!("failed to back up Ottto state: {error}")),
+                        output_mode,
+                        Some(request_id.as_str()),
+                    );
+                }
+            }
             let report = execute_local_uninstall(&home, UninstallExecutionOptions::CLI);
             let payload = serde_json::to_value(&report).expect("payload should serialize");
 
@@ -1767,6 +1828,83 @@ fn run_uninstall(output_mode: OutputMode) -> i32 {
             Some(request_id.as_str()),
         ),
     }
+}
+
+fn backup_uninstall_state(home: &Path, destination: &Path) -> std::io::Result<()> {
+    if destination.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "backup destination already exists",
+        ));
+    }
+    let destination = canonical_new_directory_path(destination)?;
+    let home = std::fs::canonicalize(home)?;
+    let cleanup_roots = [
+        home.join("Library/Application Support/Ottto"),
+        home.join("Library/Logs/Ottto"),
+        home.join(".ottto"),
+        home.join("Applications/Ottto.app"),
+        home.join("Applications/Ottto Companion.app"),
+        PathBuf::from("/Applications/Ottto.app"),
+        PathBuf::from("/Applications/Ottto Companion.app"),
+    ];
+    if cleanup_roots
+        .iter()
+        .any(|root| destination.starts_with(root))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "backup destination must be outside every Ottto uninstall cleanup path",
+        ));
+    }
+    let support = home.join("Library/Application Support/Ottto/support");
+    let snapshots = support.join("snapshots");
+    if snapshots.is_dir() {
+        let snapshots = std::fs::canonicalize(&snapshots)?;
+        if destination.starts_with(&snapshots) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "backup destination must be outside the snapshot source",
+            ));
+        }
+    }
+    std::fs::create_dir_all(&destination)?;
+    if snapshots.is_dir() {
+        copy_directory(&snapshots, &destination.join("snapshots"))?;
+    }
+    let backfill = support.join("snapshot_backfill_state.json");
+    if backfill.is_file() {
+        std::fs::copy(backfill, destination.join("snapshot_backfill_state.json"))?;
+    }
+    Ok(())
+}
+
+fn canonical_new_directory_path(destination: &Path) -> std::io::Result<PathBuf> {
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = destination.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "backup destination must name a new directory",
+        )
+    })?;
+    Ok(std::fs::canonicalize(parent)?.join(name))
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_directory(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1858,11 +1996,13 @@ fn build_invocation(cli: Cli, output_mode: OutputMode) -> Invocation {
     let env_socket_present = std::env::var_os(OTTTO_SOCKET_ENV).is_some();
     let token = cli.token.unwrap_or_else(default_cli_control_token);
     let socket = cli.socket.unwrap_or_else(default_socket_path);
+    let command = local_command(cli.command);
+    let protocol_version = expected_local_control_protocol_version(&command);
     Invocation {
         socket,
         request: LocalControlRequest {
             request_id: request_id(),
-            protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
+            protocol_version,
             token: Some(token),
             client_kind: Some(ottto_protocol::LocalClientKind::Cli),
             client_install_owner: std::env::current_exe()
@@ -1870,7 +2010,7 @@ fn build_invocation(cli: Cli, output_mode: OutputMode) -> Invocation {
                 .as_deref()
                 .map(install_owner_for_path)
                 .filter(|owner| *owner != ottto_protocol::InstallOwner::Unknown),
-            command: local_command(cli.command),
+            command,
         },
         output_mode,
         auto_start: should_auto_start(socket_overridden, cli.no_autostart, env_socket_present),
@@ -1964,6 +2104,7 @@ fn local_command(command: Command) -> LocalControlCommand {
         Command::Account(_) => LocalControlCommand::Account,
         Command::Logout(args) => LocalControlCommand::AuthReset {
             local_only: args.local_only,
+            forget_installation: args.forget_installation,
         },
         Command::Doctor(_) => LocalControlCommand::Status {
             refresh_agent_status: false,
@@ -2011,7 +2152,8 @@ fn command_json(command: &Command) -> bool {
             Some(AppsCommand::Detect(args)) => args.json,
             Some(AppsCommand::Status(args)) => args.json,
         },
-        Command::Doctor(args) | Command::Uninstall(args) | Command::Account(args) => args.json,
+        Command::Doctor(args) | Command::Account(args) => args.json,
+        Command::Uninstall(args) => args.json,
         Command::Setup(args) | Command::Login(args) => args.json,
         Command::Logout(args) => args.json,
         Command::Context(args) => args.json,
@@ -2967,6 +3109,31 @@ mod tests {
     }
 
     #[test]
+    fn pairing_reattach_error_preserves_exact_next_step_and_is_not_pending() {
+        let error = CliError {
+            code: CliErrorCode::BackendRejected,
+            message: "This Mac is already registered. Choose Reconnect it in the Ottto app to use the saved device credential, or choose Replace it on the browser claim page.".to_string(),
+            retryable: false,
+            details: BTreeMap::from([(
+                "body_excerpt".to_string(),
+                RedactedValue::String(
+                    r#"{"detail":{"code":"reattach_required","reason":"existing_authority"}}"#
+                        .to_string(),
+                ),
+            )]),
+        };
+
+        assert!(!pending_browser_claim_error(&error));
+        assert!(!setup_error_should_start_browser_claim(&error));
+        assert_eq!(sanitize_for_terminal(&error.message), error.message);
+        let json = serde_json::to_value(&CliErrorResponse { error }).unwrap();
+        assert!(json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Replace it on the browser claim page"));
+    }
+
+    #[test]
     fn setup_rejected_stale_run_starts_fresh_browser_claim() {
         let rejected = CliError {
             code: CliErrorCode::BackendRejected,
@@ -3305,7 +3472,10 @@ mod tests {
         assert_eq!(invocation.output_mode, OutputMode::Json);
         assert_eq!(
             invocation.request.command,
-            LocalControlCommand::AuthReset { local_only: false }
+            LocalControlCommand::AuthReset {
+                local_only: false,
+                forget_installation: false,
+            }
         );
     }
 
@@ -3320,6 +3490,8 @@ mod tests {
                 command: Command::Logout(LogoutArgs {
                     json: true,
                     local_only: false,
+                    forget_installation: false,
+                    confirm: false,
                 }),
             },
             OutputMode::Json,
@@ -3341,7 +3513,41 @@ mod tests {
         assert_eq!(invocation.output_mode, OutputMode::Json);
         assert_eq!(
             invocation.request.command,
-            LocalControlCommand::AuthReset { local_only: true }
+            LocalControlCommand::AuthReset {
+                local_only: true,
+                forget_installation: false,
+            }
+        );
+    }
+
+    #[test]
+    fn forget_installation_requires_confirmation_and_sets_typed_request() {
+        let unconfirmed =
+            Cli::parse_from(["ottto", "logout", "--local-only", "--forget-installation"]);
+        let error = validate_cli(&unconfirmed).expect_err("confirmation required");
+        assert!(error.message.contains("local receipts"));
+        assert!(error.message.contains("--confirm"));
+
+        let confirmed = Cli::parse_from([
+            "ottto",
+            "logout",
+            "--local-only",
+            "--forget-installation",
+            "--confirm",
+            "--json",
+        ]);
+        assert!(validate_cli(&confirmed).is_ok());
+        let invocation = invocation_from_cli(confirmed);
+        assert_eq!(
+            invocation.request.protocol_version,
+            ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::AuthReset {
+                local_only: true,
+                forget_installation: true,
+            }
         );
     }
 
@@ -3356,6 +3562,8 @@ mod tests {
                 command: Command::Logout(LogoutArgs {
                     json: true,
                     local_only: true,
+                    forget_installation: false,
+                    confirm: false,
                 }),
             },
             OutputMode::Json,
@@ -4219,7 +4427,11 @@ mod tests {
                 token: Some("test-token".to_string()),
                 no_autostart: false,
                 watch: false,
-                command: Command::Uninstall(JsonArgs { json: true }),
+                command: Command::Uninstall(UninstallArgs {
+                    json: true,
+                    backup_state: None,
+                    confirm: true,
+                }),
             },
             OutputMode::Json,
         );
@@ -4232,6 +4444,84 @@ mod tests {
         assert_request_matches_fixture(
             &invocation,
             include_str!("../../../fixtures/cli/uninstall-request.json"),
+        );
+    }
+
+    #[test]
+    fn uninstall_backup_exports_receipts_but_never_credentials() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ottto-uninstall-backup-{suffix}"));
+        let home = root.join("home");
+        let support = home.join("Library/Application Support/Ottto/support");
+        let destination = root.join("backup");
+        std::fs::create_dir_all(support.join("snapshots/destinations/current"))
+            .expect("snapshot directory");
+        std::fs::write(
+            support.join("snapshots/destinations/current/receipt.json"),
+            b"receipt",
+        )
+        .expect("receipt");
+        std::fs::write(support.join("snapshot_backfill_state.json"), b"progress")
+            .expect("backfill progress");
+        std::fs::write(support.join("account.json"), b"must-not-export")
+            .expect("sensitive state sentinel");
+        std::fs::write(support.join("relay-device.json"), b"must-not-export")
+            .expect("credential sentinel");
+
+        backup_uninstall_state(&home, &destination).expect("backup");
+
+        assert_eq!(
+            std::fs::read(destination.join("snapshots/destinations/current/receipt.json"))
+                .expect("backed-up receipt"),
+            b"receipt"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("snapshot_backfill_state.json"))
+                .expect("backed-up progress"),
+            b"progress"
+        );
+        assert!(!destination.join("account.json").exists());
+        assert!(!destination.join("relay-device.json").exists());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn uninstall_backup_rejects_cleanup_and_snapshot_descendants() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ottto-uninstall-backup-path-{suffix}"));
+        let home = root.join("home");
+        let snapshots = home.join("Library/Application Support/Ottto/support/snapshots");
+        std::fs::create_dir_all(&snapshots).expect("snapshot directory");
+
+        let cleanup_destination = home.join("Library/Application Support/Ottto/backup");
+        let cleanup_error = backup_uninstall_state(&home, &cleanup_destination)
+            .expect_err("cleanup descendant must be rejected");
+        assert_eq!(cleanup_error.kind(), std::io::ErrorKind::InvalidInput);
+
+        let recursive_destination = snapshots.join("backup");
+        let recursive_error = backup_uninstall_state(&home, &recursive_destination)
+            .expect_err("snapshot descendant must be rejected");
+        assert_eq!(recursive_error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!recursive_destination.exists());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn uninstall_backup_accepts_single_component_relative_destination() {
+        let expected = std::env::current_dir()
+            .expect("current directory")
+            .join("ottto-backup");
+
+        assert_eq!(
+            canonical_new_directory_path(Path::new("ottto-backup"))
+                .expect("single-component backup path"),
+            expected
         );
     }
 

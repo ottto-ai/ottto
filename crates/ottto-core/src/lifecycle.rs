@@ -7,7 +7,8 @@ use crate::token_store::{ControlTokenStore, KeychainSecretStore};
 use crate::{
     OTTTO_KEYCHAIN_ACCOUNT, OTTTO_KEYCHAIN_SERVICE, OTTTO_LEGACY_KEYCHAIN_SERVICE,
     OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
-    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+    OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 use ottto_protocol::{UninstallAction, UninstallExecutionResult, UninstallPlan};
 use std::fs;
@@ -20,6 +21,7 @@ use thiserror::Error;
 
 const LAUNCHCTL: &str = "/bin/launchctl";
 const PKILL: &str = "/usr/bin/pkill";
+const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
 
 /// macOS Keychain generic-password *services* that hold per-source telemetry
 /// exporter keys. These are keyed by the backend-issued `key_id` (the item
@@ -168,6 +170,13 @@ pub fn plan_local_uninstall(home: &Path) -> UninstallPlan {
             destructive: true,
         },
         UninstallAction {
+            action: "remove_prior_relay_device_credential".to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        },
+        UninstallAction {
             action: "remove_pending_relay_device_credential".to_string(),
             target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT}"),
             kind: "local_keychain_item".to_string(),
@@ -200,6 +209,7 @@ pub fn plan_local_uninstall(home: &Path) -> UninstallPlan {
             OTTTO_KEYCHAIN_ACCOUNT,
             OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
             OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+            OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT,
             OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
             OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
         ]
@@ -234,6 +244,7 @@ pub fn plan_local_uninstall(home: &Path) -> UninstallPlan {
         actions,
         warnings: vec![
             "Cloud provider credentials, provider CLI logins, and remote Ottto data are not revoked or removed by this local uninstall.".to_string(),
+            "Uninstall removes local sync receipts and first-sweep progress. Use `ottto uninstall --backup-state <directory> --confirm` to export those receipts first.".to_string(),
         ],
         requires_confirmation: true,
         cloud_credentials_untouched: true,
@@ -270,11 +281,39 @@ pub fn execute_local_uninstall(
 
     remove_keychain_tokens(&mut report);
 
+    unregister_companion_apps(home, &mut report);
+
     for target in uninstall_cleanup_targets(home) {
         remove_cleanup_target(target, &mut report);
     }
 
     execution_result(plan, report)
+}
+
+fn unregister_companion_apps(home: &Path, report: &mut CleanupReport) {
+    if !Path::new(LSREGISTER).is_file() {
+        report.warn("LaunchServices helper was unavailable; ottto:// may remain registered until macOS refreshes its app database");
+        return;
+    }
+    for app in [
+        home.join("Applications/Ottto.app"),
+        PathBuf::from("/Applications/Ottto.app"),
+    ] {
+        if !app.exists() {
+            continue;
+        }
+        match Command::new(LSREGISTER).arg("-u").arg(&app).status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => report.warn(format!(
+                "LaunchServices unregister returned {status} for {}",
+                app.display()
+            )),
+            Err(error) => report.warn(format!(
+                "Could not unregister {} from LaunchServices: {error}",
+                app.display()
+            )),
+        }
+    }
 }
 
 pub fn launch_agent_path(home: &Path) -> PathBuf {
@@ -646,6 +685,10 @@ mod tests {
                     "net.ottto.service/relay-device-secret"
                 ),
                 (
+                    "remove_prior_relay_device_credential",
+                    "net.ottto.service/prior-relay-device-secret"
+                ),
+                (
                     "remove_pending_relay_device_credential",
                     "net.ottto.service/pending-relay-device-secret"
                 ),
@@ -667,6 +710,7 @@ mod tests {
                 "net.ottto.locald/control-token",
                 "net.ottto.locald/setup-run-token",
                 "net.ottto.locald/relay-device-secret",
+                "net.ottto.locald/prior-relay-device-secret",
                 "net.ottto.locald/pending-relay-device-secret",
                 "net.ottto.locald/pending-setup-run-token",
             ]

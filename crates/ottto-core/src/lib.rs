@@ -13,11 +13,12 @@ pub mod token_store;
 pub use account_store::{
     default_account_path, default_connection_api_base_url, default_connection_path,
     default_device_path, default_machine_path, default_pending_device_credential_path,
-    default_sources_dir, default_support_dir, is_persistent_installation_id,
-    is_persistent_machine_id, source_state_file_name, FileAccountStore, FileConnectionStore,
-    FileDeviceStore, FileMachineStore, FilePendingDeviceCredentialStore, FileSourceStateStore,
-    LocalConnectionBinding, LocalDeviceBinding, LocalDeviceCredentialBinding, LocalMachineBinding,
-    LocalSourceState, PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
+    default_prior_device_path, default_sources_dir, default_support_dir,
+    is_persistent_installation_id, is_persistent_machine_id, source_state_file_name,
+    FileAccountStore, FileConnectionStore, FileDeviceStore, FileMachineStore,
+    FilePendingDeviceCredentialStore, FileSourceStateStore, LocalConnectionBinding,
+    LocalDeviceBinding, LocalDeviceCredentialBinding, LocalMachineBinding, LocalSourceState,
+    PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
     PendingDeviceCredentialRequestAuthority,
 };
 pub use claude_account::{
@@ -79,6 +80,6 @@ pub use token_store::{
     load_or_create_control_token, write_owner_only_file_atomic, ControlTokenStore,
     KeychainSecretStore, TokenStoreError, OTTTO_KEYCHAIN_ACCOUNT, OTTTO_KEYCHAIN_SERVICE,
     OTTTO_LEGACY_KEYCHAIN_SERVICE, OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
-    OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
-    OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+    OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT, OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };

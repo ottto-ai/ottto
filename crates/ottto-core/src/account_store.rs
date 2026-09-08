@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 pub const ACCOUNT_FILE_NAME: &str = "account.json";
 pub const CONNECTION_FILE_NAME: &str = "connection.json";
 pub const DEVICE_FILE_NAME: &str = "device.json";
+pub const PRIOR_DEVICE_FILE_NAME: &str = "prior-device.json";
 pub const PENDING_DEVICE_CREDENTIAL_FILE_NAME: &str = "pending-device-credential.json";
 pub const MACHINE_FILE_NAME: &str = "machine.json";
 pub const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
@@ -36,6 +37,10 @@ pub fn default_connection_path() -> PathBuf {
 
 pub fn default_device_path() -> PathBuf {
     default_support_dir().join(DEVICE_FILE_NAME)
+}
+
+pub fn default_prior_device_path() -> PathBuf {
+    default_support_dir().join(PRIOR_DEVICE_FILE_NAME)
 }
 
 pub fn default_pending_device_credential_path() -> PathBuf {
@@ -850,6 +855,7 @@ mod tests {
                 code: "connected".to_string(),
                 text: "Connected".to_string(),
             }),
+            can_reconnect: None,
         }
     }
 

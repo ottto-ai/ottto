@@ -1446,6 +1446,7 @@ mod tests {
             connected_at: Some("2026-06-15T19:00:00Z".to_string()),
             last_refreshed_at: Some("2026-06-15T19:10:00Z".to_string()),
             message: None,
+            can_reconnect: None,
         });
 
         let payload = local_health_response_payload(&daemon, None).expect("payload");

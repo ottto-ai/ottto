@@ -427,13 +427,15 @@ Disconnect this Mac from Ottto
 Usage: ottto logout [OPTIONS]
 
 Options:
-      --json             Print one final JSON object and no human summary text
-      --socket <SOCKET>  Override the ottto-service Unix socket path
-      --local-only       Clear local credentials without first disconnecting this Mac in Ottto
-      --token <TOKEN>    Override the local-control token for CLI and agent requests
-      --no-autostart     Do not kickstart the standard per-user ottto-service
-      --watch            Emit NDJSON progress events and a final event; requires --json
-  -h, --help             Print help
+      --json                 Print one final JSON object and no human summary text
+      --socket <SOCKET>      Override the ottto-service Unix socket path
+      --local-only           Clear local credentials without first disconnecting this Mac in Ottto
+      --token <TOKEN>        Override the local-control token for CLI and agent requests
+      --forget-installation  Forget installation identity, account scope, credentials, and local sync receipts
+      --no-autostart         Do not kickstart the standard per-user ottto-service
+      --confirm              Confirm destructive installation reset and local receipt removal
+      --watch                Emit NDJSON progress events and a final event; requires --json
+  -h, --help                 Print help
 ### ottto doctor --help
 Run daemon health checks and print current status
 
@@ -540,9 +542,11 @@ Remove Ottto local runtime state for this user
 Usage: ottto uninstall [OPTIONS]
 
 Options:
-      --json             Print one final JSON object and no human summary text
-      --socket <SOCKET>  Override the ottto-service Unix socket path
-      --token <TOKEN>    Override the local-control token for CLI and agent requests
-      --no-autostart     Do not kickstart the standard per-user ottto-service
-      --watch            Emit NDJSON progress events and a final event; requires --json
-  -h, --help             Print help
+      --json                      Print one final JSON object and no human summary text
+      --socket <SOCKET>           Override the ottto-service Unix socket path
+      --backup-state <DIRECTORY>  Copy local sync receipts and first-sweep progress here before uninstalling
+      --token <TOKEN>             Override the local-control token for CLI and agent requests
+      --confirm                   Confirm removal of local credentials, receipts, and first-sweep progress
+      --no-autostart              Do not kickstart the standard per-user ottto-service
+      --watch                     Emit NDJSON progress events and a final event; requires --json
+  -h, --help                      Print help
