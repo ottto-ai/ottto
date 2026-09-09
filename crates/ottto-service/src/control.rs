@@ -781,6 +781,18 @@ fn handle_command(
                 target_id,
             )?)
         }
+        LocalControlCommand::ClaudeAccountSubmitAuthCode {
+            schema_version,
+            operation_id,
+            code,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(submit_claude_authorization_code(
+                schema_version,
+                &operation_id,
+                code,
+            )?)
+        }
         LocalControlCommand::CodexAccountsStatus => {
             require_authorized_local_client(daemon, &authorization)?;
             to_value(load_codex_account_settings()?)
@@ -1219,6 +1231,22 @@ fn start_claude_browser_reconnect(
         crate::claude_browser_auth::BrowserLoginMode::Reconnect,
     )
     .map_err(LocalApiError::LocalOperationFailed)
+}
+
+fn submit_claude_authorization_code(
+    schema_version: u16,
+    operation_id: &str,
+    code: ottto_protocol::SecretString,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    if schema_version != ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION {
+        return Err(LocalApiError::InvalidRequest(format!(
+            "unsupported Claude account schema_version {schema_version}; expected {}",
+            ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION
+        )));
+    }
+    crate::claude_browser_auth::submit_authorization_code(operation_id, code)
+        .map_err(LocalApiError::LocalOperationFailed)?;
+    load_claude_config_slot_settings()
 }
 
 fn set_claude_account_upkeep_consent(
@@ -18321,6 +18349,34 @@ mod tests {
                 CliErrorCode::LocalAuthFailed
             );
         }
+    }
+
+    #[test]
+    fn claude_auth_code_command_rejects_bad_control_token_without_echoing_code() {
+        let submitted = "fixture-code-must-not-echo";
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_claude_code_bad_token".to_string(),
+                protocol_version: ottto_protocol::CLAUDE_AUTH_CODE_CONTROL_PROTOCOL_VERSION,
+                token: Some("bad-token".to_string()),
+                client_kind: Some(LocalClientKind::CompanionApp),
+                client_install_owner: None,
+                command: LocalControlCommand::ClaudeAccountSubmitAuthCode {
+                    schema_version: ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                    operation_id: "claude_setup_c0dec0dec0dec0dec0dec0dec0dec0de".to_string(),
+                    code: ottto_protocol::SecretString::new(submitted),
+                },
+            },
+        );
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().expect("error").code,
+            CliErrorCode::LocalAuthFailed
+        );
+        assert!(!serde_json::to_string(&response)
+            .expect("response")
+            .contains(submitted));
     }
 
     #[test]

@@ -9,6 +9,7 @@ authors.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

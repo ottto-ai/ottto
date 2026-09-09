@@ -2127,6 +2127,7 @@ fn status_contract_with_selected_operation(
             remaining_slots: (MAX_CLAUDE_ACCOUNT_SLOTS - used_slots) as u8,
         },
         browser_auth_supported: None,
+        auth_code_entry_supported: None,
         retained_provisional_login_count: None,
     }
 }
