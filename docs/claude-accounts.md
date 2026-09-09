@@ -144,14 +144,35 @@ usage rows. Authenticated v23 local status exposes only an identifier-free
 count for the app's Advanced section; it exposes no root id, path, service
 alias, account hash, organization hash, logout, or delete action.
 
-Older local-service versions retain the legacy path: authenticated local
-control prepares a private managed directory and returns one exact command of
-the form `CLAUDE_CONFIG_DIR='<path>' claude`. The app offers **Finish in
-Terminal** only for that compatibility path or the browser flow's exact
-`browser_fallback_required` outcome, and only when the daemon resolves an
-installed official Claude executable. Login failure, timeout, identity mismatch,
-or a missing executable use a fresh browser operation instead. The customer
-completes the official provider sign-in there.
+Current local-service versions do not return a Terminal fallback. The daemon
+privately drains the official CLI's output and recognizes only its explicit
+authorization-code prompt. Authenticated local status then reports
+`waiting_for_code`; after a v25 in-app submission it reports `submitting_code`.
+If the provider emits its exact rejection sentence after submission, status
+returns to `waiting_for_code` with `code_error: invalid_code`. A terminal
+`timed_out` outcome tells the app that the ceremony expired. Browser completion
+remains automatic when the provider finishes without asking for a code.
+
+The v25 request is exact-operation-bound:
+
+```json
+{
+  "request_id": "req_opaque",
+  "protocol_version": 25,
+  "command": "claude_account_submit_auth_code",
+  "schema_version": 1,
+  "operation_id": "claude_setup_<opaque>",
+  "code": "<one-time code>"
+}
+```
+
+`auth_code_entry_supported: true` is the additive status capability. The code
+must be one non-empty printable line of at most 2,048 bytes and is accepted only
+while that exact active operation is `waiting_for_code`. It is carried as a
+redacted, zeroizing secret, forwarded through anonymous pipes, and never written
+to state, logs, diagnostics, backend payloads, provider-output fields, or the
+local-control response. Raw provider output is likewise discarded after a
+bounded private prompt scan.
 
 Browser setup is idempotent by opaque operation id, including across daemon
 restarts. The daemon persists lifecycle and exact-root identity, never adopts a
@@ -168,11 +189,9 @@ directory; customers remain in control of credential deletion.
 
 When an already registered custom slot reaches `needs_login`, **Sign in again**
 starts browser authentication for that exact opaque slot on a v23 daemon. It
-does not create another config directory or registration. An old daemon or the
-exact `browser_fallback_required` outcome may return the same carefully quoted
-`CLAUDE_CONFIG_DIR='<exact path>' claude` Terminal fallback. Spaces, quotes,
-shell metacharacters, Unicode spelling, and a trailing slash remain data in the
-exact stored string; reconnect never normalizes or substitutes a sibling slot.
+does not create another config directory or registration. A v25-capable app
+submits an explicitly requested authorization code to that exact operation;
+current daemons never substitute a Terminal ceremony or sibling slot.
 Reconnect refuses
 the default slot, an unknown or removed registration, a weak/missing account
 binding, and a login that resolves to a different strong account. Stop Waiting

@@ -2293,6 +2293,9 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::ClaudeAccountStartBrowserReconnect { .. } => {
             "claude_account_start_browser_reconnect"
         }
+        LocalControlCommand::ClaudeAccountSubmitAuthCode { .. } => {
+            "claude_account_submit_auth_code"
+        }
         LocalControlCommand::CodexAccountsStatus => "codex_accounts_status",
         LocalControlCommand::CodexAccountPrepare { .. } => "codex_account_prepare",
         LocalControlCommand::CodexAccountPrepareOpen { .. } => "codex_account_prepare_open",

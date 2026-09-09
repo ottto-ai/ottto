@@ -1,8 +1,10 @@
 //! Explicit provider-owned Claude browser authentication.
 //!
-//! This module never constructs an OAuth URL, reads browser state, or captures
-//! provider output. It supervises the official CLI with one exact managed
-//! root, then hands identity/quota verification back to the existing collector.
+//! This module never constructs an OAuth URL or reads browser state. It
+//! privately drains provider output only to detect the explicit authorization
+//! code prompt, discards it immediately, and supervises the official CLI with
+//! one exact managed root before handing identity/quota verification back to
+//! the existing collector.
 
 use ottto_core::{
     default_support_dir, prepare_managed_claude_provisional_root, write_owner_only_file_atomic,
@@ -10,16 +12,16 @@ use ottto_core::{
 };
 use ottto_protocol::{
     ClaudeAccountSetupOperationKind, ClaudeAccountSetupOperationState,
-    ClaudeAccountSetupOperationV1, ClaudeAccountsStatusV1, ClaudeBrowserAuthIdentityMismatchV1,
-    ClaudeBrowserAuthOperationV1, ClaudeBrowserAuthOutcomeV1, ClaudeBrowserAuthPhaseV1,
-    CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+    ClaudeAccountSetupOperationV1, ClaudeAccountsStatusV1, ClaudeBrowserAuthCodeErrorV1,
+    ClaudeBrowserAuthIdentityMismatchV1, ClaudeBrowserAuthOperationV1, ClaudeBrowserAuthOutcomeV1,
+    ClaudeBrowserAuthPhaseV1, SecretString, CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,9 +39,16 @@ const RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TERMINAL_STATUS_RETENTION: u64 = 5 * 60;
 const TERM_GRACE: Duration = Duration::from_millis(500);
 const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_AUTH_CODE_BYTES: usize = 2_048;
+const PROVIDER_EVENT_READY: u8 = 1;
+const PROVIDER_EVENT_CODE_PROMPT: u8 = 2;
+const PROVIDER_EVENT_CODE_INVALID: u8 = 3;
 
 static STATE_TRANSACTION: OnceLock<Mutex<()>> = OnceLock::new();
 static ADMISSION_TRANSACTION: OnceLock<Mutex<()>> = OnceLock::new();
+static CODE_SUBMISSIONS: OnceLock<
+    Mutex<std::collections::BTreeMap<String, mpsc::SyncSender<SecretString>>>,
+> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,6 +110,8 @@ struct PersistedState {
     schema_version: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invalid_code_operation_id: Option<String>,
     #[serde(default)]
     operations: Vec<PersistedOperation>,
     #[serde(default)]
@@ -112,6 +123,7 @@ impl Default for PersistedState {
         Self {
             schema_version: STATE_SCHEMA_VERSION,
             active_operation_id: None,
+            invalid_code_operation_id: None,
             operations: Vec::new(),
             quarantined_roots: Vec::new(),
         }
@@ -220,8 +232,41 @@ impl Drop for ProviderProcessGuard {
 struct SupervisedChild {
     child: Child,
     control: Option<File>,
+    code: Option<File>,
+    events: Option<File>,
     #[cfg(unix)]
     process_group_id: libc::pid_t,
+}
+
+impl SupervisedChild {
+    fn submit_code(&mut self, code: &SecretString) -> std::io::Result<()> {
+        let writer = self.code.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "Claude auth code pipe is unavailable",
+            )
+        })?;
+        writer.write_all(code.expose_secret().as_bytes())?;
+        writer.write_all(b"\n")?;
+        writer.flush()
+    }
+
+    fn provider_events(&mut self) -> std::io::Result<Vec<u8>> {
+        let Some(events) = self.events.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let mut observed = Vec::new();
+        let mut buffer = [0_u8; 16];
+        loop {
+            match events.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => observed.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(observed)
+    }
 }
 
 impl SupervisedChild {
@@ -299,6 +344,7 @@ impl Drop for AdmissionGuard {
 
 pub(crate) fn annotate_status(mut status: ClaudeAccountsStatusV1) -> ClaudeAccountsStatusV1 {
     status.browser_auth_supported = Some(true);
+    status.auth_code_entry_supported = Some(cfg!(unix));
     let state = read_state();
     let retained = state
         .quarantined_roots
@@ -342,9 +388,9 @@ pub(crate) fn annotate_status(mut status: ClaudeAccountsStatusV1) -> ClaudeAccou
         .or_else(|| state.operations.iter().rev().find(visible));
     if let Some(operation) = selected {
         if status.setup_operation.operation_id.as_deref() != Some(&operation.operation_id) {
-            status.setup_operation = synthetic_operation(operation);
+            status.setup_operation = synthetic_operation_with_state(operation, &state);
         }
-        status.setup_operation.browser_auth = Some(public_operation(operation));
+        status.setup_operation.browser_auth = Some(public_operation_with_state(operation, &state));
     }
     status
 }
@@ -529,7 +575,16 @@ pub(crate) fn terminal_replay(
     Some(status)
 }
 
+#[cfg(test)]
 fn public_operation(operation: &PersistedOperation) -> ClaudeBrowserAuthOperationV1 {
+    let state = read_state();
+    public_operation_with_state(operation, &state)
+}
+
+fn public_operation_with_state(
+    operation: &PersistedOperation,
+    state: &PersistedState,
+) -> ClaudeBrowserAuthOperationV1 {
     let effective_outcome = if operation.fallback_completed {
         Some(ClaudeBrowserAuthOutcomeV1::Complete)
     } else {
@@ -558,15 +613,24 @@ fn public_operation(operation: &PersistedOperation) -> ClaudeBrowserAuthOperatio
                     | ClaudeBrowserAuthOutcomeV1::IdentityMismatch
             )
         ),
-        terminal_fallback_available: effective_outcome
-            == Some(ClaudeBrowserAuthOutcomeV1::BrowserFallbackRequired)
-            && resolved_legacy_fallback_command(operation).is_some(),
+        terminal_fallback_available: false,
+        code_error: (state.invalid_code_operation_id.as_deref()
+            == Some(operation.operation_id.as_str()))
+        .then_some(ClaudeBrowserAuthCodeErrorV1::InvalidCode),
         identity_mismatch: operation.identity_mismatch,
         canonical_slot_id: operation.canonical_slot_id.clone(),
     }
 }
 
 fn synthetic_operation(operation: &PersistedOperation) -> ClaudeAccountSetupOperationV1 {
+    let state = read_state();
+    synthetic_operation_with_state(operation, &state)
+}
+
+fn synthetic_operation_with_state(
+    operation: &PersistedOperation,
+    persisted_state: &PersistedState,
+) -> ClaudeAccountSetupOperationV1 {
     let effective_outcome = if operation.fallback_completed {
         Some(ClaudeBrowserAuthOutcomeV1::Complete)
     } else {
@@ -586,7 +650,9 @@ fn synthetic_operation(operation: &PersistedOperation) -> ClaudeAccountSetupOper
         None => match operation.phase {
             ClaudeBrowserAuthPhaseV1::Prepared
             | ClaudeBrowserAuthPhaseV1::Launching
-            | ClaudeBrowserAuthPhaseV1::WaitingForProvider => {
+            | ClaudeBrowserAuthPhaseV1::WaitingForProvider
+            | ClaudeBrowserAuthPhaseV1::WaitingForCode
+            | ClaudeBrowserAuthPhaseV1::SubmittingCode => {
                 ClaudeAccountSetupOperationState::WaitingForUserLogin
             }
             ClaudeBrowserAuthPhaseV1::Validating => ClaudeAccountSetupOperationState::Validating,
@@ -613,13 +679,8 @@ fn synthetic_operation(operation: &PersistedOperation) -> ClaudeAccountSetupOper
             .clone(),
         account_identifier_hash: None,
         organization_identifier_hash: None,
-        launch_command: matches!(
-            operation.outcome,
-            Some(ClaudeBrowserAuthOutcomeV1::BrowserFallbackRequired)
-        )
-        .then(|| resolved_legacy_fallback_command(operation))
-        .flatten(),
-        browser_auth: Some(public_operation(operation)),
+        launch_command: None,
+        browser_auth: Some(public_operation_with_state(operation, persisted_state)),
         message: operation.cancel_requested.then(|| {
             "Stopping Claude authentication; ordered local cleanup is still in progress."
                 .to_string()
@@ -1127,6 +1188,136 @@ pub(crate) enum BrowserLoginMode {
     Reconnect,
 }
 
+struct CodeSubmissionRegistration {
+    operation_id: String,
+}
+
+impl Drop for CodeSubmissionRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut submissions) = CODE_SUBMISSIONS
+            .get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+            .lock()
+        {
+            submissions.remove(&self.operation_id);
+        }
+    }
+}
+
+fn register_code_submissions(
+    operation_id: &str,
+) -> Result<(CodeSubmissionRegistration, mpsc::Receiver<SecretString>), String> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let mut submissions = CODE_SUBMISSIONS
+        .get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .map_err(|_| "Claude auth code channel is unavailable".to_string())?;
+    if submissions.contains_key(operation_id) {
+        return Err("Claude auth code channel is already registered".to_string());
+    }
+    submissions.insert(operation_id.to_string(), sender);
+    Ok((
+        CodeSubmissionRegistration {
+            operation_id: operation_id.to_string(),
+        },
+        receiver,
+    ))
+}
+
+pub(crate) fn submit_authorization_code(
+    operation_id: &str,
+    code: SecretString,
+) -> Result<(), String> {
+    validate_authorization_code(&code)?;
+    let sender = CODE_SUBMISSIONS
+        .get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .map_err(|_| "Claude auth code channel is unavailable".to_string())?
+        .get(operation_id)
+        .cloned()
+        .ok_or_else(|| "Claude authorization code is not currently requested".to_string())?;
+    transact(|state| {
+        if state.active_operation_id.as_deref() != Some(operation_id) {
+            return Err(
+                "Claude authorization code does not match the active operation".to_string(),
+            );
+        }
+        let operation = state
+            .operations
+            .iter_mut()
+            .find(|candidate| candidate.operation_id == operation_id)
+            .ok_or_else(|| "Claude authorization operation is unknown".to_string())?;
+        if operation.outcome.is_some()
+            || operation.cancel_requested
+            || operation.phase != ClaudeBrowserAuthPhaseV1::WaitingForCode
+        {
+            return Err("Claude authorization code is not currently requested".to_string());
+        }
+        operation.phase = ClaudeBrowserAuthPhaseV1::SubmittingCode;
+        if state.invalid_code_operation_id.as_deref() == Some(operation_id) {
+            state.invalid_code_operation_id = None;
+        }
+        Ok::<(), String>(())
+    })
+    .map_err(|error| error.to_string())??;
+    if sender.try_send(code).is_err() {
+        let _ = transact(|state| {
+            if let Some(operation) = state.operations.iter_mut().find(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.phase == ClaudeBrowserAuthPhaseV1::SubmittingCode
+                    && candidate.outcome.is_none()
+            }) {
+                operation.phase = ClaudeBrowserAuthPhaseV1::WaitingForCode;
+            }
+        });
+        return Err("Claude auth code channel closed before submission".to_string());
+    }
+    Ok(())
+}
+
+fn validate_authorization_code(code: &SecretString) -> Result<(), String> {
+    let value = code.expose_secret();
+    if value.is_empty() || value.len() > MAX_AUTH_CODE_BYTES {
+        return Err("Claude authorization code must be 1-2048 bytes".to_string());
+    }
+    if value
+        .chars()
+        .any(|character| character == '\r' || character == '\n' || character.is_control())
+    {
+        return Err("Claude authorization code must be a single printable line".to_string());
+    }
+    if value.trim() != value {
+        return Err("Claude authorization code must not have surrounding whitespace".to_string());
+    }
+    Ok(())
+}
+
+fn apply_provider_event(operation_id: &str, event: u8) {
+    let _ = transact(|state| {
+        let Some(operation) = state
+            .operations
+            .iter_mut()
+            .find(|candidate| candidate.operation_id == operation_id)
+        else {
+            return;
+        };
+        if operation.outcome.is_some() || operation.cancel_requested {
+            return;
+        }
+        match (event, operation.phase) {
+            (PROVIDER_EVENT_CODE_PROMPT, ClaudeBrowserAuthPhaseV1::WaitingForProvider) => {
+                operation.phase = ClaudeBrowserAuthPhaseV1::WaitingForCode;
+                state.invalid_code_operation_id = None;
+            }
+            (PROVIDER_EVENT_CODE_PROMPT, ClaudeBrowserAuthPhaseV1::SubmittingCode)
+            | (PROVIDER_EVENT_CODE_INVALID, ClaudeBrowserAuthPhaseV1::SubmittingCode) => {
+                operation.phase = ClaudeBrowserAuthPhaseV1::WaitingForCode;
+                state.invalid_code_operation_id = Some(operation_id.to_string());
+            }
+            _ => {}
+        }
+    });
+}
+
 impl BrowserLoginMode {
     fn persisted(self) -> PersistedMode {
         match self {
@@ -1158,7 +1349,13 @@ fn run_worker(operation_id: &str) {
         return;
     }
     let Ok(mut child) = spawn_supervised_login(operation_id, &config_dir) else {
-        fail_operation(operation_id, fallback_outcome(&operation));
+        fail_operation(operation_id, ClaudeBrowserAuthOutcomeV1::LoginFailed);
+        return;
+    };
+    let Ok((_submission_registration, submissions)) = register_code_submissions(operation_id)
+    else {
+        cancel_provider_before_terminal(&mut child, operation_id);
+        fail_operation(operation_id, ClaudeBrowserAuthOutcomeV1::LoginFailed);
         return;
     };
     if !pinned_root.path_matches(&config_dir) {
@@ -1168,7 +1365,32 @@ fn run_worker(operation_id: &str) {
     }
     set_phase(operation_id, ClaudeBrowserAuthPhaseV1::WaitingForProvider);
     let start = Instant::now();
-    let process_success = loop {
+    let _process_success = loop {
+        match child.provider_events() {
+            Ok(events) => {
+                for event in events {
+                    apply_provider_event(operation_id, event);
+                }
+            }
+            Err(_) => {
+                cancel_provider_before_terminal(&mut child, operation_id);
+                fail_operation(operation_id, ClaudeBrowserAuthOutcomeV1::LoginFailed);
+                return;
+            }
+        }
+        loop {
+            match submissions.try_recv() {
+                Ok(code) => {
+                    if child.submit_code(&code).is_err() {
+                        cancel_provider_before_terminal(&mut child, operation_id);
+                        fail_operation(operation_id, ClaudeBrowserAuthOutcomeV1::LoginFailed);
+                        return;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
         if !pinned_root.path_matches(&config_dir) {
             cancel_provider_before_terminal(&mut child, operation_id);
             fail_operation(operation_id, ClaudeBrowserAuthOutcomeV1::LoginFailed);
@@ -1205,7 +1427,7 @@ fn run_worker(operation_id: &str) {
     }
     if !pinned_root.path_matches(&config_dir) || !ceremony_witness_changed(&operation, &config_dir)
     {
-        fail_operation(operation_id, fallback_outcome(&operation));
+        fail_operation(operation_id, ClaudeBrowserAuthOutcomeV1::LoginFailed);
         return;
     }
     set_phase(operation_id, ClaudeBrowserAuthPhaseV1::Validating);
@@ -1215,14 +1437,7 @@ fn run_worker(operation_id: &str) {
         &observed_at(),
     );
     let Ok(proof) = proof else {
-        fail_operation(
-            operation_id,
-            if process_success {
-                ClaudeBrowserAuthOutcomeV1::LoginFailed
-            } else {
-                fallback_outcome(&operation)
-            },
-        );
+        fail_operation(operation_id, ClaudeBrowserAuthOutcomeV1::LoginFailed);
         return;
     };
     if cancel_requested(operation_id) {
@@ -1784,20 +1999,6 @@ fn login_command(config_dir: &str) -> Option<std::process::Command> {
     Some(command)
 }
 
-fn resolved_legacy_fallback_command(operation: &PersistedOperation) -> Option<String> {
-    let config_dir = operation_config_dir(operation);
-    login_command(&config_dir)?;
-    ottto_core::claude_legacy_launch_command(&config_dir).ok()
-}
-
-fn fallback_outcome(operation: &PersistedOperation) -> ClaudeBrowserAuthOutcomeV1 {
-    if resolved_legacy_fallback_command(operation).is_some() {
-        ClaudeBrowserAuthOutcomeV1::BrowserFallbackRequired
-    } else {
-        ClaudeBrowserAuthOutcomeV1::LoginFailed
-    }
-}
-
 #[cfg(unix)]
 fn spawn_supervised_login(
     operation_id: &str,
@@ -1832,11 +2033,14 @@ fn spawn_supervised_login(
     }
 
     let (control_read, control_write) = pipe_pair()?;
-    let (mut ready_read, ready_write) = pipe_pair()?;
+    let (code_read, code_write) = pipe_pair()?;
+    let (mut event_read, event_write) = pipe_pair()?;
     set_cloexec(control_read.as_raw_fd(), false)?;
-    set_cloexec(ready_write.as_raw_fd(), false)?;
+    set_cloexec(code_read.as_raw_fd(), false)?;
+    set_cloexec(event_write.as_raw_fd(), false)?;
     set_cloexec(control_write.as_raw_fd(), true)?;
-    set_cloexec(ready_read.as_raw_fd(), true)?;
+    set_cloexec(code_write.as_raw_fd(), true)?;
+    set_cloexec(event_read.as_raw_fd(), true)?;
 
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
@@ -1847,8 +2051,10 @@ fn spawn_supervised_login(
         .arg(config_dir)
         .arg("--control-fd")
         .arg(control_read.as_raw_fd().to_string())
+        .arg("--code-fd")
+        .arg(code_read.as_raw_fd().to_string())
         .arg("--ready-fd")
-        .arg(ready_write.as_raw_fd().to_string())
+        .arg(event_write.as_raw_fd().to_string())
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1868,12 +2074,13 @@ fn spawn_supervised_login(
     }
     let mut child = command.spawn()?;
     drop(control_read);
-    drop(ready_write);
+    drop(code_read);
+    drop(event_write);
 
     let deadline = Instant::now() + SUPERVISOR_READY_TIMEOUT;
     loop {
         let mut poll = libc::pollfd {
-            fd: ready_read.as_raw_fd(),
+            fd: event_read.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
@@ -1895,7 +2102,7 @@ fn spawn_supervised_login(
             ));
         }
         let mut byte = [0_u8; 1];
-        if ready_read.read_exact(&mut byte).is_ok() && byte == [1] {
+        if event_read.read_exact(&mut byte).is_ok() && byte == [PROVIDER_EVENT_READY] {
             break;
         }
         kill_owned_process(&mut child);
@@ -1904,10 +2111,25 @@ fn spawn_supervised_login(
             "Claude auth supervisor exited before readiness",
         ));
     }
+    let flags = unsafe { libc::fcntl(event_read.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe {
+            libc::fcntl(
+                event_read.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            )
+        } != 0
+    {
+        kill_owned_process(&mut child);
+        return Err(std::io::Error::last_os_error());
+    }
     let process_group_id = child.id() as libc::pid_t;
     Ok(SupervisedChild {
         child,
         control: Some(control_write),
+        code: Some(code_write),
+        events: Some(event_read),
         process_group_id,
     })
 }
@@ -1923,6 +2145,8 @@ fn spawn_supervised_login(
     Ok(SupervisedChild {
         child,
         control: None,
+        code: None,
+        events: None,
     })
 }
 
@@ -1934,6 +2158,7 @@ pub fn run_auth_supervisor(
     operation_id: &str,
     config_dir: &str,
     control_fd: i32,
+    code_fd: i32,
     ready_fd: i32,
 ) -> Result<i32, String> {
     #[cfg(unix)]
@@ -1941,25 +2166,31 @@ pub fn run_auth_supervisor(
         use std::os::fd::FromRawFd;
         validate_supervisor_binding(operation_id, config_dir)?;
         let pinned_root = pin_managed_root(config_dir).map_err(|error| error.to_string())?;
-        validate_supervisor_pipe_fds(control_fd, ready_fd)?;
+        validate_supervisor_pipe_fds(control_fd, code_fd, ready_fd)?;
         let mut provider = provider_process_guard(operation_id, false)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "Claude provider process is already supervised".to_string())?;
         validate_supervisor_binding(operation_id, config_dir)?;
         // SAFETY: these descriptors are passed exclusively by the parent.
         let mut control = unsafe { File::from_raw_fd(control_fd) };
+        let code_input = unsafe { File::from_raw_fd(code_fd) };
         let mut ready = unsafe { File::from_raw_fd(ready_fd) };
-        let control_flags = unsafe { libc::fcntl(control_fd, libc::F_GETFD) };
-        if control_flags < 0
-            || unsafe { libc::fcntl(control_fd, libc::F_SETFD, control_flags | libc::FD_CLOEXEC) }
-                != 0
-        {
-            return Err(std::io::Error::last_os_error().to_string());
+        for fd in [control_fd, code_fd, ready_fd] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } != 0
+            {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
         }
-        ready.write_all(&[1]).map_err(|error| error.to_string())?;
-        drop(ready);
+        ready
+            .write_all(&[PROVIDER_EVENT_READY])
+            .map_err(|error| error.to_string())?;
         let mut command = login_command(config_dir)
             .ok_or_else(|| "official Claude Code executable is unavailable".to_string())?;
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         // The provider inherits both the supervisor's owned process group and
         // the provider-lifetime lock. If the supervisor itself crashes, the
         // surviving provider therefore keeps the exact root non-reusable and
@@ -1974,6 +2205,24 @@ pub fn run_auth_supervisor(
         // credentials but the supervisor explicitly unlocked its evidence.
         let mut child = command.spawn().map_err(|error| error.to_string())?;
         let child_pid = child.id() as libc::pid_t;
+        let child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Claude provider stdin was not piped".to_string())?;
+        let child_stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Claude provider stdout was not piped".to_string())?;
+        let child_stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "Claude provider stderr was not piped".to_string())?;
+        let event_writer = Arc::new(Mutex::new(ready));
+        let stdout_events = Arc::clone(&event_writer);
+        thread::spawn(move || scan_provider_output(child_stdout, stdout_events));
+        let stderr_events = Arc::clone(&event_writer);
+        thread::spawn(move || scan_provider_output(child_stderr, stderr_events));
+        thread::spawn(move || forward_authorization_codes(code_input, child_stdin));
         thread::spawn(move || {
             let mut byte = [0_u8; 1];
             while control.read(&mut byte).is_ok_and(|count| count > 0) {}
@@ -2011,17 +2260,31 @@ pub fn run_auth_supervisor(
     }
     #[cfg(not(unix))]
     {
-        let _ = (operation_id, config_dir, control_fd, ready_fd);
+        let _ = (operation_id, config_dir, control_fd, code_fd, ready_fd);
         Err("Claude auth supervision is unsupported on this platform".to_string())
     }
 }
 
 #[cfg(unix)]
-fn validate_supervisor_pipe_fds(control_fd: i32, ready_fd: i32) -> Result<(), String> {
-    if control_fd < 0 || ready_fd < 0 || control_fd == ready_fd {
+fn validate_supervisor_pipe_fds(
+    control_fd: i32,
+    code_fd: i32,
+    ready_fd: i32,
+) -> Result<(), String> {
+    if control_fd < 0
+        || code_fd < 0
+        || ready_fd < 0
+        || control_fd == code_fd
+        || control_fd == ready_fd
+        || code_fd == ready_fd
+    {
         return Err("Claude auth supervisor requires distinct live pipe descriptors".to_string());
     }
-    for (fd, expected_access) in [(control_fd, libc::O_RDONLY), (ready_fd, libc::O_WRONLY)] {
+    for (fd, expected_access) in [
+        (control_fd, libc::O_RDONLY),
+        (code_fd, libc::O_RDONLY),
+        (ready_fd, libc::O_WRONLY),
+    ] {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 || flags & libc::O_ACCMODE != expected_access {
             return Err("Claude auth supervisor pipe direction is invalid".to_string());
@@ -2036,6 +2299,86 @@ fn validate_supervisor_pipe_fds(control_fd: i32, ready_fd: i32) -> Result<(), St
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn scan_provider_output<R: Read>(mut stream: R, events: Arc<Mutex<File>>) {
+    use zeroize::Zeroize;
+    // Claude Code 2.1.263 uses these exact strings. Including the prompt's
+    // trailing delimiter and the rejection's complete sentence prevents
+    // nearby prose from opening or resetting the secret-input path.
+    const PROMPT: &[u8] = b"paste code here if prompted >";
+    const INVALID: &[u8] = b"invalid code. please make sure the full code was copied.";
+    const MAX_SENTINEL_LEN: usize = INVALID.len();
+    let mut tail = Vec::with_capacity(MAX_SENTINEL_LEN);
+    let mut buffer = [0_u8; 512];
+    loop {
+        let count = match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        for byte in &buffer[..count] {
+            tail.push(byte.to_ascii_lowercase());
+            if tail.len() > MAX_SENTINEL_LEN {
+                tail.remove(0);
+            }
+            let event = if tail.ends_with(PROMPT) {
+                Some(PROVIDER_EVENT_CODE_PROMPT)
+            } else if tail.ends_with(INVALID) {
+                Some(PROVIDER_EVENT_CODE_INVALID)
+            } else {
+                None
+            };
+            if let Some(event) = event {
+                if let Ok(mut writer) = events.lock() {
+                    let _ = writer.write_all(&[event]);
+                    let _ = writer.flush();
+                }
+                tail.clear();
+            }
+        }
+        buffer[..count].zeroize();
+    }
+    tail.zeroize();
+    buffer.zeroize();
+}
+
+#[cfg(unix)]
+fn forward_authorization_codes<R: Read, W: Write>(mut source: R, mut provider: W) {
+    use zeroize::Zeroize;
+    let mut code = Vec::with_capacity(MAX_AUTH_CODE_BYTES);
+    let mut buffer = [0_u8; 256];
+    let mut overflow = false;
+    loop {
+        let count = match source.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        for byte in &buffer[..count] {
+            if *byte == b'\n' {
+                if !overflow
+                    && !code.is_empty()
+                    && (provider.write_all(&code).is_err()
+                        || provider.write_all(b"\n").is_err()
+                        || provider.flush().is_err())
+                {
+                    code.zeroize();
+                    buffer[..count].zeroize();
+                    return;
+                }
+                code.zeroize();
+                code.clear();
+                overflow = false;
+            } else if code.len() < MAX_AUTH_CODE_BYTES {
+                code.push(*byte);
+            } else {
+                overflow = true;
+            }
+        }
+        buffer[..count].zeroize();
+    }
+    code.zeroize();
+    buffer.zeroize();
 }
 
 fn validate_supervisor_binding(operation_id: &str, config_dir: &str) -> Result<(), String> {
@@ -2807,6 +3150,9 @@ fn finish(
         {
             state.active_operation_id = None;
         }
+        if terminalized && state.invalid_code_operation_id.as_deref() == Some(operation_id) {
+            state.invalid_code_operation_id = None;
+        }
         terminalized
     });
     if terminalized.ok() == Some(true)
@@ -2911,6 +3257,7 @@ fn consume_reusable_root_claim(operation_id: &str) -> Result<(), String> {
 
 fn set_phase(operation_id: &str, phase: ClaudeBrowserAuthPhaseV1) {
     let _ = transact(|state| {
+        let mut changed = false;
         if let Some(operation) = state
             .operations
             .iter_mut()
@@ -2918,7 +3265,14 @@ fn set_phase(operation_id: &str, phase: ClaudeBrowserAuthPhaseV1) {
         {
             if operation.outcome.is_none() {
                 operation.phase = phase;
+                changed = true;
             }
+        }
+        if changed
+            && phase != ClaudeBrowserAuthPhaseV1::WaitingForCode
+            && state.invalid_code_operation_id.as_deref() == Some(operation_id)
+        {
+            state.invalid_code_operation_id = None;
         }
     });
 }
@@ -2976,6 +3330,8 @@ pub(crate) fn active_replay_is_sealed(
             operation.phase,
             ClaudeBrowserAuthPhaseV1::Launching
                 | ClaudeBrowserAuthPhaseV1::WaitingForProvider
+                | ClaudeBrowserAuthPhaseV1::WaitingForCode
+                | ClaudeBrowserAuthPhaseV1::SubmittingCode
                 | ClaudeBrowserAuthPhaseV1::Validating
                 | ClaudeBrowserAuthPhaseV1::Reading
         )
@@ -3347,6 +3703,204 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn authorization_code_state_is_typed_ephemeral_and_single_submission() {
+        let root = temp_dir("auth-code-state");
+        let support = root.join("support");
+        fs::create_dir_all(&support).expect("support");
+        #[cfg(unix)]
+        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
+        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let operation_id = "claude_setup_c0dec0dec0dec0dec0dec0dec0dec0de";
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let status = prepare_generic(store.load().expect("registry"), operation_id)
+            .expect("prepare generic");
+        set_phase(operation_id, ClaudeBrowserAuthPhaseV1::WaitingForProvider);
+        let (_registration, submissions) =
+            register_code_submissions(operation_id).expect("submission channel");
+
+        apply_provider_event(operation_id, PROVIDER_EVENT_CODE_PROMPT);
+        let waiting = annotate_status(status.clone());
+        let waiting_auth = waiting
+            .setup_operation
+            .browser_auth
+            .as_ref()
+            .expect("browser auth");
+        assert_eq!(waiting_auth.phase, ClaudeBrowserAuthPhaseV1::WaitingForCode);
+        assert_eq!(waiting.auth_code_entry_supported, Some(cfg!(unix)));
+
+        let fixture_code = "fixture-ephemeral-code";
+        submit_authorization_code(operation_id, SecretString::new(fixture_code))
+            .expect("first submission");
+        let submitting = annotate_status(status.clone());
+        assert_eq!(
+            submitting
+                .setup_operation
+                .browser_auth
+                .as_ref()
+                .expect("browser auth")
+                .phase,
+            ClaudeBrowserAuthPhaseV1::SubmittingCode
+        );
+        assert!(submit_authorization_code(operation_id, SecretString::new("duplicate")).is_err());
+
+        let persisted = serde_json::to_string(&read_state()).expect("persisted state");
+        let public = serde_json::to_string(&submitting).expect("public status");
+        assert!(!persisted.contains(fixture_code));
+        assert!(!public.contains(fixture_code));
+        assert!(!public.contains("provider_output"));
+        let submitted = submissions.recv().expect("ephemeral submission");
+        assert_eq!(submitted.expose_secret(), fixture_code);
+        drop(submitted);
+
+        apply_provider_event(operation_id, PROVIDER_EVENT_CODE_INVALID);
+        let invalid = annotate_status(status);
+        let invalid_auth = invalid.setup_operation.browser_auth.expect("browser auth");
+        assert_eq!(invalid_auth.phase, ClaudeBrowserAuthPhaseV1::WaitingForCode);
+        assert_eq!(
+            invalid_auth.code_error,
+            Some(ClaudeBrowserAuthCodeErrorV1::InvalidCode)
+        );
+        finish(operation_id, ClaudeBrowserAuthOutcomeV1::Cancelled, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn authorization_code_projection_uses_one_state_snapshot() {
+        let root = temp_dir("auth-code-status-snapshot");
+        let support = root.join("support");
+        fs::create_dir_all(&support).expect("support");
+        #[cfg(unix)]
+        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
+        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let operation_id = "claude_setup_c3dec3dec3dec3dec3dec3dec3dec3de";
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let status = prepare_generic(store.load().expect("registry"), operation_id)
+            .expect("prepare generic");
+        set_phase(operation_id, ClaudeBrowserAuthPhaseV1::SubmittingCode);
+
+        let snapshot = read_state();
+        let snapshot_operation = snapshot
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .expect("snapshot operation");
+        apply_provider_event(operation_id, PROVIDER_EVENT_CODE_INVALID);
+
+        let snapshot_projection = synthetic_operation_with_state(snapshot_operation, &snapshot);
+        let snapshot_auth = snapshot_projection
+            .browser_auth
+            .expect("snapshot browser auth");
+        assert_eq!(
+            snapshot_auth.phase,
+            ClaudeBrowserAuthPhaseV1::SubmittingCode
+        );
+        assert_eq!(snapshot_auth.code_error, None);
+
+        let current = annotate_status(status);
+        let current_auth = current
+            .setup_operation
+            .browser_auth
+            .expect("current browser auth");
+        assert_eq!(current_auth.phase, ClaudeBrowserAuthPhaseV1::WaitingForCode);
+        assert_eq!(
+            current_auth.code_error,
+            Some(ClaudeBrowserAuthCodeErrorV1::InvalidCode)
+        );
+
+        finish(operation_id, ClaudeBrowserAuthOutcomeV1::Cancelled, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn authorization_code_rejects_wrong_operation_and_unbounded_or_multiline_input() {
+        let root = temp_dir("auth-code-validation");
+        let support = root.join("support");
+        fs::create_dir_all(&support).expect("support");
+        #[cfg(unix)]
+        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
+        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let operation_id = "claude_setup_c1dec1dec1dec1dec1dec1dec1dec1de";
+        let wrong_id = "claude_setup_c2dec2dec2dec2dec2dec2dec2dec2de";
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        prepare_generic(store.load().expect("registry"), operation_id).expect("prepare generic");
+        set_phase(operation_id, ClaudeBrowserAuthPhaseV1::WaitingForCode);
+        let (_wrong_registration, _wrong_rx) =
+            register_code_submissions(wrong_id).expect("wrong operation channel");
+        assert!(
+            submit_authorization_code(wrong_id, SecretString::new("bounded-code"))
+                .expect_err("wrong operation")
+                .contains("active operation")
+        );
+        let (_registration, _rx) =
+            register_code_submissions(operation_id).expect("submission channel");
+
+        for invalid in [
+            "",
+            "two\nlines",
+            "carriage\rreturn",
+            "control\u{7}character",
+            " surrounding-space",
+        ] {
+            assert!(submit_authorization_code(operation_id, SecretString::new(invalid)).is_err());
+            assert_eq!(
+                read_operation(operation_id).expect("operation").phase,
+                ClaudeBrowserAuthPhaseV1::WaitingForCode
+            );
+        }
+        assert!(submit_authorization_code(
+            operation_id,
+            SecretString::new("x".repeat(MAX_AUTH_CODE_BYTES + 1))
+        )
+        .is_err());
+        assert_eq!(
+            read_operation(operation_id).expect("operation").phase,
+            ClaudeBrowserAuthPhaseV1::WaitingForCode
+        );
+        finish(operation_id, ClaudeBrowserAuthOutcomeV1::Cancelled, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn provider_scanner_emits_only_exact_generic_auth_events() {
+        use std::io::{Cursor, Seek, SeekFrom};
+
+        let path = temp_dir("provider-events").with_extension("bin");
+        let mut event_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("event file");
+        let writer = event_file.try_clone().expect("event writer");
+        scan_provider_output(
+            Cursor::new(
+                b"private-provider-output\npaste code here if prompted but this is prose\nInvalid code. Please make certain the full code was copied.\nPaste code here if prompted >\nInvalid code. Please make sure the full code was copied\nInvalid code. Please make sure the full code was copied.\nprivate-tail\nPaste code here if prompted >",
+            ),
+            Arc::new(Mutex::new(writer)),
+        );
+        event_file.seek(SeekFrom::Start(0)).expect("seek events");
+        let mut events = Vec::new();
+        event_file.read_to_end(&mut events).expect("read events");
+        assert_eq!(
+            events,
+            vec![
+                PROVIDER_EVENT_CODE_PROMPT,
+                PROVIDER_EVENT_CODE_INVALID,
+                PROVIDER_EVENT_CODE_PROMPT
+            ]
+        );
+        assert!(!events
+            .windows(b"private-provider-output".len())
+            .any(|window| window == b"private-provider-output"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn public_metadata_contains_no_path_or_identity() {
         let operation = PersistedOperation {
             operation_id: "claude_setup_0123456789abcdef0123456789abcdef".to_string(),
@@ -3442,6 +3996,29 @@ mod tests {
             operation_id,
             BrowserLoginMode::Target
         ));
+        for phase in [
+            ClaudeBrowserAuthPhaseV1::WaitingForCode,
+            ClaudeBrowserAuthPhaseV1::SubmittingCode,
+        ] {
+            let mut target = base.clone();
+            target.phase = phase;
+            install(vec![target.clone()], Some(operation_id));
+            assert!(
+                active_replay_is_sealed(&core, operation_id, BrowserLoginMode::Target),
+                "targeted {phase:?} replay must remain sealed"
+            );
+
+            target.mode = PersistedMode::Reconnect;
+            let mut reconnect_core = core.clone();
+            reconnect_core.setup_operation.kind =
+                ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot;
+            install(vec![target], Some(operation_id));
+            assert!(
+                active_replay_is_sealed(&reconnect_core, operation_id, BrowserLoginMode::Reconnect),
+                "reconnect {phase:?} replay must remain sealed"
+            );
+        }
+        install(vec![base.clone()], Some(operation_id));
 
         let mut cases = Vec::new();
         let mut changed = base.clone();
@@ -4202,6 +4779,7 @@ mod tests {
                 remaining_slots: 9,
             },
             browser_auth_supported: Some(true),
+            auth_code_entry_supported: Some(true),
             retained_provisional_login_count: None,
         };
         let mut existing = ClaudeConfigDirSlot::registered("/tmp/existing".to_string())
@@ -4719,6 +5297,8 @@ mod tests {
         let mut supervised = SupervisedChild {
             child,
             control: None,
+            code: None,
+            events: None,
             process_group_id,
         };
 
@@ -4744,10 +5324,11 @@ mod tests {
         let support = root.join("support");
         fs::create_dir_all(&support).expect("support");
         let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-        assert!(run_auth_supervisor("../escape", "/tmp/arbitrary", -1, -1).is_err());
+        assert!(run_auth_supervisor("../escape", "/tmp/arbitrary", -1, -1, -1).is_err());
         assert!(run_auth_supervisor(
             "claude_setup_a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6",
             "/tmp/arbitrary",
+            -1,
             -1,
             -1,
         )
@@ -4760,8 +5341,8 @@ mod tests {
         prepare_generic(status, operation_id).expect("prepare");
         set_phase(operation_id, ClaudeBrowserAuthPhaseV1::Launching);
         let exact = read_operation(operation_id).expect("operation").config_dir;
-        assert!(run_auth_supervisor(operation_id, "/tmp/wrong", -1, -1).is_err());
-        assert!(run_auth_supervisor(operation_id, &exact, -1, -1).is_err());
+        assert!(run_auth_supervisor(operation_id, "/tmp/wrong", -1, -1, -1).is_err());
+        assert!(run_auth_supervisor(operation_id, &exact, -1, -1, -1).is_err());
         let mut pipe_fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
         // SAFETY: successful pipe returned newly-owned descriptors.
@@ -4772,6 +5353,7 @@ mod tests {
             &exact,
             pipe_read.as_raw_fd(),
             pipe_read.as_raw_fd(),
+            pipe_read.as_raw_fd(),
         )
         .is_err());
         let unrelated = File::open(&exact).expect("unrelated directory descriptor");
@@ -4779,11 +5361,12 @@ mod tests {
             operation_id,
             &exact,
             unrelated.as_raw_fd(),
+            pipe_read.as_raw_fd(),
             pipe_write.as_raw_fd(),
         )
         .is_err());
         finish(operation_id, ClaudeBrowserAuthOutcomeV1::LoginFailed, None);
-        assert!(run_auth_supervisor(operation_id, &exact, -1, -1).is_err());
+        assert!(run_auth_supervisor(operation_id, &exact, -1, -1, -1).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4802,7 +5385,11 @@ mod tests {
         fs::create_dir_all(&home).expect("home");
         fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
         let executable = bin.join("claude");
-        fs::write(&executable, "#!/bin/sh\nexec sleep 30\n").expect("fake claude");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf 'Paste code here if prompted >' >&2\nIFS= read -r code\nunset code\nexec sleep 30\n",
+        )
+        .expect("fake claude");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
             .expect("fake executable mode");
         let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
@@ -4817,12 +5404,16 @@ mod tests {
         let config_dir = read_operation(operation_id).expect("operation").config_dir;
 
         let mut control_fds = [-1; 2];
+        let mut code_fds = [-1; 2];
         let mut ready_fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(control_fds.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(code_fds.as_mut_ptr()) }, 0);
         assert_eq!(unsafe { libc::pipe(ready_fds.as_mut_ptr()) }, 0);
         // SAFETY: successful pipe calls returned newly-owned descriptors.
         let control_read = unsafe { File::from_raw_fd(control_fds[0]) };
         let control_write = unsafe { File::from_raw_fd(control_fds[1]) };
+        let code_read = unsafe { File::from_raw_fd(code_fds[0]) };
+        let code_write = unsafe { File::from_raw_fd(code_fds[1]) };
         let mut ready_read = unsafe { File::from_raw_fd(ready_fds[0]) };
         let ready_write = unsafe { File::from_raw_fd(ready_fds[1]) };
         let operation = operation_id.to_string();
@@ -4832,14 +5423,22 @@ mod tests {
                 &operation,
                 &supervisor_root,
                 control_read.into_raw_fd(),
+                code_read.into_raw_fd(),
                 ready_write.into_raw_fd(),
             )
         });
         let mut ready = [0_u8; 1];
         ready_read.read_exact(&mut ready).expect("ready");
-        assert_eq!(ready, [1]);
+        assert_eq!(ready, [PROVIDER_EVENT_READY]);
+        let mut prompt = [0_u8; 1];
+        ready_read.read_exact(&mut prompt).expect("prompt event");
+        assert_eq!(prompt, [PROVIDER_EVENT_CODE_PROMPT]);
+        (&code_write)
+            .write_all(b"fixture-forwarded-code\n")
+            .expect("forward code");
         assert!(provider_process_active(operation_id).expect("lock state"));
         drop(control_write);
+        drop(code_write);
         let result = supervisor.join().expect("supervisor thread");
         assert!(result.is_ok(), "supervisor result: {result:?}");
         assert!(!provider_process_active(operation_id).expect("released lock"));
@@ -6433,7 +7032,7 @@ exit 1
     #[test]
     #[serial]
     #[cfg(unix)]
-    fn fallback_terminal_replay_restores_observer_and_releases_at_deadline() {
+    fn legacy_fallback_replay_is_not_advertised_and_releases_at_deadline() {
         let root = temp_dir("fallback-replay-deadline");
         let support = root.join("support");
         let bin = root.join("bin");
@@ -6468,7 +7067,7 @@ exit 1
         })
         .expect("fallback transition fixture");
         let replay = terminal_replay(prepared, operation_id).expect("terminal replay");
-        assert!(replay
+        assert!(!replay
             .setup_operation
             .browser_auth
             .as_ref()

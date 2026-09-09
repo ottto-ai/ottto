@@ -18617,6 +18617,7 @@ exit 1
                 remaining_slots: 4,
             },
             browser_auth_supported: None,
+            auth_code_entry_supported: None,
             retained_provisional_login_count: None,
         };
 
