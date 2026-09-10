@@ -2054,24 +2054,13 @@ fn spawn_supervised_login(
         .arg("--code-fd")
         .arg(code_read.as_raw_fd().to_string())
         .arg("--ready-fd")
-        .arg(event_write.as_raw_fd().to_string())
-        .env_clear()
+        .arg(event_write.as_raw_fd().to_string());
+    configure_auth_supervisor_environment(&mut command);
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
-    for key in [
-        "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-        "OTTTO_COMMAND_SEARCH_PATH",
-        "OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-    ] {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
     let mut child = command.spawn()?;
     drop(control_read);
     drop(code_read);
@@ -2132,6 +2121,30 @@ fn spawn_supervised_login(
         events: Some(event_read),
         process_group_id,
     })
+}
+
+#[cfg(unix)]
+fn configure_auth_supervisor_environment(command: &mut std::process::Command) {
+    let support_dir = default_support_dir();
+    command
+        .env_clear()
+        // `default_support_dir` normally derives from HOME, but the hardened
+        // supervisor deliberately starts from an empty environment. Pass the
+        // already-resolved directory explicitly so a production launch (where
+        // no test override exists) validates the same operation journal that
+        // the parent daemon just wrote instead of falling back to /tmp/Ottto.
+        .env("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", support_dir);
+    for key in [
+        "OTTTO_COMMAND_SEARCH_PATH",
+        "OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -3730,6 +3743,12 @@ mod tests {
             unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
     }
 
     impl Drop for EnvGuard {
@@ -3906,6 +3925,34 @@ mod tests {
             ClaudeBrowserAuthPhaseV1::WaitingForCode
         );
         finish(operation_id, ClaudeBrowserAuthOutcomeV1::Cancelled, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn production_supervisor_environment_keeps_the_resolved_operation_journal() {
+        let root = temp_dir("production-supervisor-environment");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("home");
+        let _support = EnvGuard::remove("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
+        let _home = EnvGuard::set("HOME", &home);
+        let mut command = std::process::Command::new("/usr/bin/true");
+
+        configure_auth_supervisor_environment(&mut command);
+
+        let support_dir = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR"))
+            .and_then(|(_, value)| value)
+            .map(PathBuf::from)
+            .expect("explicit supervisor support directory");
+        assert_eq!(
+            support_dir,
+            home.join("Library")
+                .join("Application Support")
+                .join("Ottto")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
