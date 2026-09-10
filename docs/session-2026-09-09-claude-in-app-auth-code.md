@@ -34,11 +34,13 @@ wrong, cancelled, completed, or timed-out operation fail closed.
 
 The protocol models the value as `SecretString`: debug output is redacted and
 the allocation is zeroized on drop. The daemon passes it once through an
-in-memory bounded channel and anonymous pipe. The provider supervisor pipes and
-drains stdout/stderr, retains only bounded rolling matchers for the exact prompt
-and rejection sentence, emits only typed single-byte events, and never logs,
-persists, uploads, echoes, or returns raw output. Provider stdin accepts only
-the bounded line frame from the daemon.
+in-memory bounded channel and anonymous pipe. The provider supervisor gives the
+official CLI a private no-echo pseudo-terminal so Claude retains its supported
+interactive browser launch, then drains that terminal locally. It retains only
+bounded rolling matchers for the exact prompt and rejection sentence, emits
+only typed single-byte events, and never logs, persists, uploads, echoes, or
+returns raw output. Provider input accepts only the bounded line frame from the
+daemon.
 
 The sentinels were verified against installed Claude Code 2.1.263. The scanner
 ASCII-case-folds the full prompt literal, including its trailing ` >` delimiter,

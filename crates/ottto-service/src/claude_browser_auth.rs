@@ -2187,10 +2187,28 @@ pub fn run_auth_supervisor(
             .map_err(|error| error.to_string())?;
         let mut command = login_command(config_dir)
             .ok_or_else(|| "official Claude Code executable is unavailable".to_string())?;
+        // Claude Code deliberately suppresses browser launch when its standard
+        // streams are ordinary pipes. Give the official CLI a private PTY so
+        // it keeps its supported interactive/browser behavior while Ottto
+        // still drains all provider bytes locally and exposes only typed
+        // prompt events. Echo is disabled before launch so a submitted
+        // authorization code is never reflected into the scanner.
+        let (provider_io, provider_tty) = private_provider_pty()?;
         command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .env("TERM", "dumb")
+            .env("NO_COLOR", "1")
+            .env("FORCE_COLOR", "0")
+            .stdin(Stdio::from(
+                provider_tty
+                    .try_clone()
+                    .map_err(|error| error.to_string())?,
+            ))
+            .stdout(Stdio::from(
+                provider_tty
+                    .try_clone()
+                    .map_err(|error| error.to_string())?,
+            ))
+            .stderr(Stdio::from(provider_tty));
         // The provider inherits both the supervisor's owned process group and
         // the provider-lifetime lock. If the supervisor itself crashes, the
         // surviving provider therefore keeps the exact root non-reusable and
@@ -2205,24 +2223,10 @@ pub fn run_auth_supervisor(
         // credentials but the supervisor explicitly unlocked its evidence.
         let mut child = command.spawn().map_err(|error| error.to_string())?;
         let child_pid = child.id() as libc::pid_t;
-        let child_stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Claude provider stdin was not piped".to_string())?;
-        let child_stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "Claude provider stdout was not piped".to_string())?;
-        let child_stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "Claude provider stderr was not piped".to_string())?;
         let event_writer = Arc::new(Mutex::new(ready));
-        let stdout_events = Arc::clone(&event_writer);
-        thread::spawn(move || scan_provider_output(child_stdout, stdout_events));
-        let stderr_events = Arc::clone(&event_writer);
-        thread::spawn(move || scan_provider_output(child_stderr, stderr_events));
-        thread::spawn(move || forward_authorization_codes(code_input, child_stdin));
+        let provider_output = provider_io.try_clone().map_err(|error| error.to_string())?;
+        thread::spawn(move || scan_provider_output(provider_output, event_writer));
+        thread::spawn(move || forward_authorization_codes(code_input, provider_io));
         thread::spawn(move || {
             let mut byte = [0_u8; 1];
             while control.read(&mut byte).is_ok_and(|count| count > 0) {}
@@ -2263,6 +2267,48 @@ pub fn run_auth_supervisor(
         let _ = (operation_id, config_dir, control_fd, code_fd, ready_fd);
         Err("Claude auth supervision is unsupported on this platform".to_string())
     }
+}
+
+#[cfg(unix)]
+fn private_provider_pty() -> Result<(File, File), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    if unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: successful openpty returns two newly-owned descriptors.
+    let master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+
+    for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+
+    let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(slave.as_raw_fd(), attributes.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: tcgetattr initialized the structure on success.
+    let mut attributes = unsafe { attributes.assume_init() };
+    attributes.c_lflag &= !(libc::ECHO | libc::ECHONL);
+    if unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &attributes) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok((master, slave))
 }
 
 #[cfg(unix)]
@@ -3865,6 +3911,28 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn private_provider_pty_is_interactive_and_does_not_echo_secrets() {
+        use std::os::fd::AsRawFd;
+
+        let (provider_io, provider_tty) = private_provider_pty().expect("private provider PTY");
+        assert_eq!(unsafe { libc::isatty(provider_tty.as_raw_fd()) }, 1);
+        for fd in [provider_io.as_raw_fd(), provider_tty.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+        let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(provider_tty.as_raw_fd(), attributes.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: tcgetattr initialized the structure on success.
+        let attributes = unsafe { attributes.assume_init() };
+        assert_eq!(attributes.c_lflag & (libc::ECHO | libc::ECHONL), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn provider_scanner_emits_only_exact_generic_auth_events() {
         use std::io::{Cursor, Seek, SeekFrom};
 
@@ -5387,7 +5455,7 @@ mod tests {
         let executable = bin.join("claude");
         fs::write(
             &executable,
-            "#!/bin/sh\nprintf 'Paste code here if prompted >' >&2\nIFS= read -r code\nunset code\nexec sleep 30\n",
+            "#!/bin/sh\nfor fd in 0 1 2; do test -t \"$fd\" || exit 42; done\nprintf 'Paste code here if prompted >' >&2\nIFS= read -r code\nunset code\nexec sleep 30\n",
         )
         .expect("fake claude");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))

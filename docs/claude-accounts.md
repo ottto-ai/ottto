@@ -281,9 +281,9 @@ recover. Background upkeep cannot promise an indefinitely fresh login.
 - Remember `/login` replaces the terminal account rather than adding one.
   After switching, the previous account's terminal readings stop refreshing
   and will show their age honestly.
-- For another account, use **Keep limits available** in the Ottto app. Use the
-  exact managed-slot Terminal command only when Ottto explicitly presents it as
-  fallback; do not run `/login` in the default terminal slot unless replacing
-  it is your intent.
+- For another account, use **Keep limits available** in the Ottto app. Current
+  versions keep supported Claude sign-in completion in the browser and Ottto
+  app; update Ottto if an older local service cannot do so. Do not run `/login`
+  in the default terminal slot unless replacing it is your intent.
 - The badge and the "not verified" label are not errors. They are Ottto
   telling you exactly how much it can prove.
