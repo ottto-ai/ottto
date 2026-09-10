@@ -11,6 +11,7 @@ use crate::{
     OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 use ottto_protocol::{UninstallAction, UninstallExecutionResult, UninstallPlan};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -295,13 +296,30 @@ fn unregister_companion_apps(home: &Path, report: &mut CleanupReport) {
         report.warn("LaunchServices helper was unavailable; ottto:// may remain registered until macOS refreshes its app database");
         return;
     }
-    for app in [
+    let mut apps = [
         home.join("Applications/Ottto.app"),
+        home.join("Applications/Ottto Companion.app"),
         PathBuf::from("/Applications/Ottto.app"),
-    ] {
-        if !app.exists() {
-            continue;
+        PathBuf::from("/Applications/Ottto Companion.app"),
+    ]
+    .into_iter()
+    .filter(|app| app.exists())
+    .collect::<BTreeSet<_>>();
+    match Command::new(LSREGISTER).arg("-dump").output() {
+        Ok(output) if output.status.success() => {
+            apps.extend(companion_app_paths_from_launchservices_dump(
+                &String::from_utf8_lossy(&output.stdout),
+            ));
         }
+        Ok(output) => report.warn(format!(
+            "LaunchServices inventory returned {}; known Ottto app locations will still be unregistered",
+            output.status
+        )),
+        Err(error) => report.warn(format!(
+            "Could not inventory LaunchServices registrations: {error}; known Ottto app locations will still be unregistered"
+        )),
+    }
+    for app in apps {
         match Command::new(LSREGISTER).arg("-u").arg(&app).status() {
             Ok(status) if status.success() => {}
             Ok(status) => report.warn(format!(
@@ -314,6 +332,32 @@ fn unregister_companion_apps(home: &Path, report: &mut CleanupReport) {
             )),
         }
     }
+}
+
+fn companion_app_paths_from_launchservices_dump(dump: &str) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    let mut current_path = None;
+    for line in dump.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("path:") {
+            let value = value.trim();
+            let value = value
+                .rsplit_once(" (0x")
+                .map_or(value, |(path, _)| path)
+                .trim();
+            current_path = value.ends_with(".app").then(|| PathBuf::from(value));
+            continue;
+        }
+        if trimmed
+            .strip_prefix("identifier:")
+            .is_some_and(|identifier| identifier.trim() == "net.ottto.Companion")
+        {
+            if let Some(path) = current_path.take() {
+                paths.insert(path);
+            }
+        }
+    }
+    paths
 }
 
 pub fn launch_agent_path(home: &Path) -> PathBuf {
@@ -629,6 +673,31 @@ fn remove_cleanup_target(target: CleanupTarget, report: &mut CleanupReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launchservices_inventory_finds_all_companion_registrations() {
+        let paths = companion_app_paths_from_launchservices_dump(
+            r#"
+path:                       /Applications/Ottto.app (0x123)
+name:                       Ottto
+identifier:                 net.ottto.Companion
+path:                       /Users/Shared/ottto-qa/Ottto.app (0x456)
+identifier:                 net.ottto.Companion
+path:                       /tmp/Other.app (0x789)
+identifier:                 example.other
+path:                       /tmp/not-an-app
+identifier:                 net.ottto.Companion
+"#,
+        );
+
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                PathBuf::from("/Applications/Ottto.app"),
+                PathBuf::from("/Users/Shared/ottto-qa/Ottto.app"),
+            ])
+        );
+    }
 
     #[test]
     fn uninstall_plan_is_user_scoped_and_cloud_safe() {

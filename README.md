@@ -430,10 +430,11 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
 - `ottto uninstall` requires `--confirm`, warns about receipt and first-sweep
   loss, and accepts `--backup-state <directory>` to export only those receipts
   and first-sweep state first (never relay credentials or account secrets).
-  Uninstall also unregisters the installed production app bundle from Launch
-  Services before removal. Development and QA app launch scripts omit the
-  production `ottto://` URL scheme, preventing stale runner bundles from taking
-  ownership of setup links.
+  Uninstall also inventories and unregisters every Launch Services record for
+  the production Companion bundle identifier before removal. Only stable
+  packages declare the production `ottto://` URL scheme; development, preview,
+  stable-candidate, QA, and runner bundles cannot become stale setup-link
+  handlers.
 - native app account-state UX now treats browser login and local app binding as
   separate states: Verify returns a sign-in-specific message when no local
   account is bound, and the SwiftUI app keeps polling a pending browser claim so

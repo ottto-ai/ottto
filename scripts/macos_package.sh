@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/macos_sparkle_bundle_version.sh
 source "$SCRIPT_DIR/macos_sparkle_bundle_version.sh"
+# shellcheck source=scripts/macos_bundle_url_scheme.sh
+source "$SCRIPT_DIR/macos_bundle_url_scheme.sh"
 ROOT="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "$ROOT" ]]; then
   ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -316,6 +318,12 @@ SPARKLEKEYS
 )
 fi
 
+# Only the stable app may own the production deep-link scheme. Candidate,
+# preview, and developer bundles remain launchable directly and complete
+# browser claims through daemon polling or the CLI fallback without leaving a
+# stale ottto:// handler behind on QA and release-runner machines.
+OTTTO_URL_TYPES_PLIST="$(ottto_macos_url_types_plist "$CHANNEL")"
+
 cat > "$APP_CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -341,17 +349,7 @@ cat > "$APP_CONTENTS/Info.plist" <<PLIST
   <string>${VERSION}</string>
   <key>CFBundleVersion</key>
   <string>${BUNDLE_VERSION}</string>
-  <key>CFBundleURLTypes</key>
-  <array>
-    <dict>
-      <key>CFBundleURLName</key>
-      <string>Ottto Local Platform</string>
-      <key>CFBundleURLSchemes</key>
-      <array>
-        <string>ottto</string>
-      </array>
-    </dict>
-  </array>
+${OTTTO_URL_TYPES_PLIST}
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
   <key>LSMultipleInstancesProhibited</key>
