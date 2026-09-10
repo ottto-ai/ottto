@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 357,
-  "content_sha256": "a8bb19474fffab6b9e72edd85ada74a73b223a53390e8a06f65f04ec355caa92",
+  "candidate_file_count": 358,
+  "content_sha256": "2914e360b9ce2f2b80649cc8c8f2b8b5058776de900f9631c607cf1f9b8abbb5",
   "files": [
     {
       "executable": false,
@@ -671,8 +671,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_browser_auth.rs",
-      "sha256": "de51aaef11b6d095b8f8eceedf322e7878c6562eb6d58a99bb0577217ec6304e",
-      "size_bytes": 300940
+      "sha256": "748817e2b23aa9633fc6f2ccae40ad9f3c46d8a1723cb3907541e8bd3f6cf461",
+      "size_bytes": 303849
     },
     {
       "executable": false,
@@ -923,8 +923,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/claude-accounts.md",
-      "sha256": "f46d39c44376d97e82a972f13d9991a2108fb3cedc283ce54169083dedfc408e",
-      "size_bytes": 17286
+      "sha256": "762cd2f2e3b296986c37172caab17162d4a9081cdea261b7dca344553a51bcde",
+      "size_bytes": 17331
     },
     {
       "executable": false,
@@ -1560,8 +1560,15 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-09-09-claude-in-app-auth-code.md",
-      "sha256": "3e94282a737fd42c612de07ebe527326af6d73fa47f9c44982a12b571def87ff",
-      "size_bytes": 2799
+      "sha256": "375129eb775acfc02b931553a393f31b5de3306ef8efb821fca5fb577ff196d9",
+      "size_bytes": 2922
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-09-10-claude-browser-pty.md",
+      "sha256": "9c4b97ef6ad0359c1c95fe140e1c49ceaae2a16144b31e0aae266e8f38398a89",
+      "size_bytes": 1393
     },
     {
       "executable": false,
@@ -2502,9 +2509,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-09T13:01:16+00:00",
+  "generated_at": "2026-09-10T02:46:06+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 358,
+  "output_file_count": 359,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2538,5 +2545,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "89d6e94c839bb089d34aae688d573c23068c8441"
+  "source_commit": "957fd7d5dc30b9599d57a029e89d55b5fa659585"
 }
