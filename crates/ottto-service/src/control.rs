@@ -570,6 +570,42 @@ fn handle_command(
             inject_machine_icon(&mut value);
             Ok(value)
         }
+        LocalControlCommand::Receipts {
+            limit,
+            since,
+            source,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            if limit == 0
+                || usize::from(limit) > crate::upload_receipts::UPLOAD_RECEIPT_RING_CAPACITY
+            {
+                return Err(LocalApiError::InvalidRequest(format!(
+                    "receipts limit must be between 1 and {}",
+                    crate::upload_receipts::UPLOAD_RECEIPT_RING_CAPACITY
+                )));
+            }
+            if let Some(value) = since.as_deref() {
+                time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                    .map_err(|_| {
+                        LocalApiError::InvalidRequest(
+                            "receipts since must be an RFC3339 timestamp".to_string(),
+                        )
+                    })?;
+            }
+            to_value(
+                crate::upload_receipts::read(
+                    &default_support_dir(),
+                    limit,
+                    since.as_deref(),
+                    source,
+                )
+                .map_err(|_| {
+                    LocalApiError::LocalOperationFailed(
+                        "could not read snapshot upload receipts".to_string(),
+                    )
+                })?,
+            )
+        }
         LocalControlCommand::AuthStatus => to_value(status_for(daemon, &authorization)?),
         LocalControlCommand::AgentStatusRefresh { source } => {
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
@@ -5817,6 +5853,7 @@ fn forget_installation_state_locked() -> Result<(), LocalApiError> {
         .reset()
         .map_err(|_| LocalApiError::StatePoisoned)?;
     let support_dir = default_support_dir();
+    crate::upload_receipts::clear(&support_dir).map_err(|_| LocalApiError::StatePoisoned)?;
     for path in [
         support_dir.join("snapshots"),
         support_dir.join("snapshot_backfill_state.json"),
@@ -16952,6 +16989,37 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn handles_authenticated_receipts_request_from_private_ring() {
+        let support_root = telemetry_key_store_root("receipts-control");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        crate::upload_receipts::append_transport_error(&support_root, SourceKind::Codex, 3)
+            .unwrap();
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_receipts".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Receipts {
+                    limit: 10,
+                    since: None,
+                    source: Some(SourceKind::Codex),
+                },
+            },
+        );
+        assert!(response.ok, "{response:?}");
+        let payload = response.payload.unwrap();
+        assert_eq!(payload["schema"], "ottto.upload_receipts.v1");
+        assert_eq!(payload["receipts"][0]["outcome"], "transport_error");
+        assert_eq!(payload["receipts"][0]["batch_item_count"], 3);
+        let _ = fs::remove_dir_all(support_root);
+    }
+
+    #[test]
     fn maps_bad_token_to_local_auth_error() {
         let response = handle_request(
             &daemon(),
@@ -18910,6 +18978,11 @@ mod tests {
             b"backfill",
         )
         .unwrap();
+        fs::write(
+            support_root.join("snapshot_upload_receipts.json"),
+            b"upload receipt",
+        )
+        .unwrap();
         let source_data = root.join("codex-source.jsonl");
         fs::write(&source_data, b"source data").unwrap();
 
@@ -18948,6 +19021,7 @@ mod tests {
             .is_err());
         assert!(!support_root.join("snapshots").exists());
         assert!(!support_root.join("snapshot_backfill_state.json").exists());
+        assert!(!support_root.join("snapshot_upload_receipts.json").exists());
         assert_eq!(fs::read(source_data).unwrap(), b"source data");
         assert_eq!(
             response.payload.unwrap()["message"]["code"],

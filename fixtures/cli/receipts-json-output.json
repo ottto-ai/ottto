@@ -1,0 +1,33 @@
+{
+  "schema": "ottto.upload_receipts.v1",
+  "receipts": [
+    {
+      "uploaded_at": "2026-09-10T02:54:21Z",
+      "outcome": "partial",
+      "http_status": 200,
+      "server_request_id": "req-server-01HX",
+      "retry_after_seconds": null,
+      "source": "codex",
+      "batch_item_count": 2,
+      "accepted_count": 1,
+      "accepted_entities": [
+        {
+          "source_session_id_hash": "7d96706e12ab",
+          "snapshot_fingerprint_prefix": "abcdef012345",
+          "occurrence_count": 1
+        }
+      ],
+      "unchanged_entities": [],
+      "conflict_entities": [
+        {
+          "source_session_id_hash": "1ba9866825df",
+          "snapshot_fingerprint_prefix": "9876543210ab",
+          "occurrence_count": 1
+        }
+      ],
+      "rejected_entities": []
+    }
+  ],
+  "ring_capacity": 500,
+  "state_path_present": true
+}

@@ -1639,7 +1639,7 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
         return Err(anyhow!("machine identity is missing"));
     };
     let api_base_url = snapshot_api_base_url();
-    let client = SnapshotApiClient::new(api_base_url);
+    let client = SnapshotApiClient::new(api_base_url).with_receipt_state_dir(support_dir);
     let enabled_sources = enabled_snapshot_sources(&device);
 
     if let Some(source) = enabled_sources.first().copied() {

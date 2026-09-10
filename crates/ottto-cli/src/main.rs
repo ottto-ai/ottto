@@ -58,6 +58,8 @@ struct Cli {
 enum Command {
     #[command(about = "Show daemon, account, relay, update, and app health")]
     Status(StatusArgs),
+    #[command(about = "Show recent snapshot upload acknowledgements")]
+    Receipts(ReceiptsArgs),
     #[command(about = "List apps or refresh app setup status")]
     Apps(AppsArgs),
     #[command(about = "Refresh one source status using the lower-level source noun")]
@@ -284,6 +286,28 @@ struct StatusArgs {
         help = "Refresh Codex, Claude Code, and Pi status before returning"
     )]
     refresh_agent_status: bool,
+}
+
+#[derive(Debug, Args)]
+struct ReceiptsArgs {
+    #[arg(long, help = "Print one final JSON object and no human summary text")]
+    json: bool,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 50,
+        value_parser = clap::value_parser!(u16).range(1..=500),
+        help = "Maximum number of recent receipts to return"
+    )]
+    limit: u16,
+    #[arg(
+        long,
+        value_name = "RFC3339",
+        help = "Return receipts uploaded at or after this timestamp"
+    )]
+    since: Option<String>,
+    #[arg(long, value_enum, help = "Filter receipts to one source")]
+    source: Option<SourceArg>,
 }
 
 #[derive(Debug, Args)]
@@ -2039,6 +2063,11 @@ fn local_command(command: Command) -> LocalControlCommand {
         Command::Status(args) => LocalControlCommand::Status {
             refresh_agent_status: args.refresh_agent_status,
         },
+        Command::Receipts(args) => LocalControlCommand::Receipts {
+            limit: args.limit,
+            since: non_empty_option(args.since.as_deref()),
+            source: args.source.map(Into::into),
+        },
         Command::Apps(args) => match args.command {
             None => LocalControlCommand::Status {
                 refresh_agent_status: false,
@@ -2147,6 +2176,7 @@ fn diagnostics_upload_approval(args: &DiagnosticsCollectArgs) -> Option<Diagnost
 fn command_json(command: &Command) -> bool {
     match command {
         Command::Status(args) => args.json,
+        Command::Receipts(args) => args.json,
         Command::Apps(args) => match &args.command {
             None => args.json,
             Some(AppsCommand::Detect(args)) => args.json,
@@ -2253,6 +2283,7 @@ fn final_error_event(request_id: &str, exit_code: i32, error: CliError) -> serde
 fn local_command_name(command: &LocalControlCommand) -> &'static str {
     match command {
         LocalControlCommand::Status { .. } => "status",
+        LocalControlCommand::Receipts { .. } => "receipts",
         LocalControlCommand::AuthStatus => "auth_status",
         LocalControlCommand::AgentStatusRefresh { .. } => "agent_status_refresh",
         LocalControlCommand::PersonalMeterLocalSnapshot { .. } => "personal_meter_local_snapshot",
@@ -2372,6 +2403,9 @@ fn setup_payload_exit_code(payload: &serde_json::Value) -> i32 {
 /// through `sanitize_for_terminal` so a malicious backend cannot inject
 /// terminal escape sequences into the TTY.
 fn human_summary(payload: &serde_json::Value) -> String {
+    if payload.get("schema").and_then(|value| value.as_str()) == Some("ottto.upload_receipts.v1") {
+        return human_receipts(payload);
+    }
     if let Some(message) = payload
         .get("message")
         .and_then(|value| value.get("text"))
@@ -2403,6 +2437,54 @@ fn human_summary(payload: &serde_json::Value) -> String {
         }
     }
     payload_summary(payload)
+}
+
+fn human_receipts(payload: &serde_json::Value) -> String {
+    let Some(receipts) = payload.get("receipts").and_then(|value| value.as_array()) else {
+        return "No upload receipts.".to_string();
+    };
+    if receipts.is_empty() {
+        return "No upload receipts.".to_string();
+    }
+    let mut lines = vec![
+        "TIME                     OUTCOME          STATUS  ACCEPTED/TOTAL  REQUEST ID".to_string(),
+    ];
+    for receipt in receipts {
+        let time = receipt
+            .get("uploaded_at")
+            .and_then(|value| value.as_str())
+            .unwrap_or("-");
+        let outcome = receipt
+            .get("outcome")
+            .and_then(|value| value.as_str())
+            .unwrap_or("-");
+        let status = receipt
+            .get("http_status")
+            .and_then(|value| value.as_u64())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let accepted = receipt
+            .get("accepted_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let total = receipt
+            .get("batch_item_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let request_id = receipt
+            .get("server_request_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("-");
+        lines.push(format!(
+            "{:<24} {:<16} {:<7} {:<15} {}",
+            sanitize_for_terminal(time),
+            sanitize_for_terminal(outcome),
+            status,
+            format!("{accepted}/{total}"),
+            sanitize_for_terminal(request_id),
+        ));
+    }
+    lines.join("\n")
 }
 
 fn payload_summary(payload: &serde_json::Value) -> String {
@@ -2623,9 +2705,10 @@ mod tests {
     }
 
     fn cli_help_snapshot() -> String {
-        let commands: [(&str, &[&str]); 30] = [
+        let commands: [(&str, &[&str]); 31] = [
             ("ottto --help", &["ottto", "--help"]),
             ("ottto status --help", &["ottto", "status", "--help"]),
+            ("ottto receipts --help", &["ottto", "receipts", "--help"]),
             ("ottto apps --help", &["ottto", "apps", "--help"]),
             (
                 "ottto apps detect --help",
@@ -2807,6 +2890,78 @@ mod tests {
         .expect("fixture parses");
         assert_eq!(actual, expected);
         assert!(!output.contains("Ottto local daemon"));
+    }
+
+    #[test]
+    fn receipts_request_matches_contract_fixture() {
+        let cli = Cli::parse_from([
+            "ottto",
+            "receipts",
+            "--json",
+            "--limit",
+            "25",
+            "--since",
+            "2026-09-10T00:00:00Z",
+            "--source",
+            "codex",
+        ]);
+        let mut invocation = invocation_from_cli(cli);
+        invocation.request.request_id = "req_cli_receipts_fixture".to_string();
+        invocation.request.token = Some("test-token".to_string());
+        assert_request_matches_fixture(
+            &invocation,
+            include_str!("../../../fixtures/cli/receipts-request.json"),
+        );
+    }
+
+    #[test]
+    fn receipts_json_and_human_output_match_contract_fixtures() {
+        let payload: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/cli/receipts-json-output.json"
+        ))
+        .expect("receipts JSON fixture");
+        let rendered_json = pretty_json(&payload);
+        assert_eq!(parse_json_output(&rendered_json), payload);
+        assert_eq!(
+            human_summary(&payload) + "\n",
+            include_str!("../../../fixtures/cli/receipts-human-output.txt")
+        );
+    }
+
+    #[test]
+    fn receipts_daemon_unavailable_uses_stable_status_error_contract() {
+        let cli = Cli::parse_from([
+            "ottto",
+            "--socket",
+            "/tmp/ottto.sock",
+            "--no-autostart",
+            "receipts",
+            "--json",
+        ]);
+        let invocation = invocation_from_cli(cli);
+        assert_eq!(invocation.output_mode, OutputMode::Json);
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::Receipts {
+                limit: 50,
+                since: None,
+                source: None,
+            }
+        );
+        let error = daemon_unavailable_error(
+            "connection refused".to_string(),
+            &PathBuf::from("/tmp/ottto.sock"),
+            false,
+            None,
+        );
+        assert_eq!(error.code.exit_code(), 10);
+        assert!(error.retryable);
+        let actual = serde_json::to_value(&CliErrorResponse { error }).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/cli/daemon-unavailable-error.json"
+        ))
+        .unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]

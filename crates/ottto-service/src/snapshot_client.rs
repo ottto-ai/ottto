@@ -15,6 +15,7 @@ use ottto_protocol::{AgentStatusSnapshot, LocalMachineHealthV1, MachineRuntimeHe
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -1370,6 +1371,7 @@ pub struct SnapshotApiClient {
     api_base_url: String,
     agent: ureq::Agent,
     batch_agent: ureq::Agent,
+    receipt_state_dir: Option<PathBuf>,
 }
 
 impl SnapshotApiClient {
@@ -1391,7 +1393,14 @@ impl SnapshotApiClient {
             api_base_url: api_base_url.into(),
             agent,
             batch_agent,
+            receipt_state_dir: None,
         }
+    }
+
+    /// Enable privacy-safe local receipts for snapshot batch attempts.
+    pub fn with_receipt_state_dir(mut self, state_dir: impl Into<PathBuf>) -> Self {
+        self.receipt_state_dir = Some(state_dir.into());
+        self
     }
 
     pub fn issue_relay_token(
@@ -1530,19 +1539,56 @@ impl SnapshotApiClient {
             outcome = request_builder().send_bytes(&body);
         }
         match outcome {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse snapshot batch response failed: {error}")),
+            Ok(response) => {
+                let status = response.status();
+                let server_request_id = response.header("X-Request-ID").map(str::to_string);
+                match response.into_json::<SnapshotBatchResponse>() {
+                    Ok(response) => {
+                        self.record_batch_success(
+                            request,
+                            status,
+                            server_request_id.as_deref(),
+                            &response,
+                        );
+                        Ok(response)
+                    }
+                    Err(error) => {
+                        self.record_batch_http_failure(
+                            request,
+                            ottto_protocol::UploadReceiptOutcomeV1::Rejected,
+                            status,
+                            server_request_id.as_deref(),
+                            None,
+                        );
+                        Err(anyhow!("parse snapshot batch response failed: {error}"))
+                    }
+                }
+            }
             // A shed request is not a failed request. Keep it typed and carry the
             // server's own backoff so the caller can honour it instead of
             // re-uploading identical bytes on the next tick.
             Err(ureq::Error::Status(code @ (429 | 503), response)) => {
-                Err(anyhow::Error::new(shed_from_response(code, &response)))
+                let shed = shed_from_response(code, &response);
+                self.record_batch_http_failure(
+                    request,
+                    ottto_protocol::UploadReceiptOutcomeV1::Shed,
+                    code,
+                    response.header("X-Request-ID"),
+                    shed.retry_after.map(|retry_after| retry_after.as_secs()),
+                );
+                Err(anyhow::Error::new(shed))
             }
             // 401/403 means relay authorization failed, not schema drift.
             // Keep it typed and body-free so the caller can surface an auth
             // diagnostic without leaking backend details or token-adjacent text.
-            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+            Err(ureq::Error::Status(code @ (401 | 403), response)) => {
+                self.record_batch_http_failure(
+                    request,
+                    ottto_protocol::UploadReceiptOutcomeV1::AuthRejected,
+                    code,
+                    response.header("X-Request-ID"),
+                    None,
+                );
                 Err(anyhow::Error::new(BatchAuthorizationRejected {
                     status: code,
                 }))
@@ -1552,12 +1598,26 @@ impl SnapshotApiClient {
             // the exact validator failure (for example, missing usage_buckets)
             // without leaking tokens, paths, account IDs, or machine IDs.
             Err(ureq::Error::Status(code @ (400 | 422), response)) => {
+                self.record_batch_http_failure(
+                    request,
+                    ottto_protocol::UploadReceiptOutcomeV1::Rejected,
+                    code,
+                    response.header("X-Request-ID"),
+                    None,
+                );
                 Err(anyhow::Error::new(BatchRejected {
                     status: code,
                     body_excerpt: response_body_excerpt(response),
                 }))
             }
             Err(ureq::Error::Status(code, response)) => {
+                self.record_batch_http_failure(
+                    request,
+                    ottto_protocol::UploadReceiptOutcomeV1::Rejected,
+                    code,
+                    response.header("X-Request-ID"),
+                    None,
+                );
                 Err(anyhow::Error::new(UploadFailureDiagnostics::http(
                     "local snapshot upload",
                     "snapshot_batch",
@@ -1565,11 +1625,79 @@ impl SnapshotApiClient {
                     &response,
                 )))
             }
-            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
-                "local snapshot upload",
-                "snapshot_batch",
-                &error,
-            ))),
+            Err(error) => {
+                self.record_batch_transport_error(request);
+                Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+                    "local snapshot upload",
+                    "snapshot_batch",
+                    &error,
+                )))
+            }
+        }
+    }
+
+    fn record_batch_success(
+        &self,
+        request: &SnapshotBatchRequest,
+        status: u16,
+        server_request_id: Option<&str>,
+        response: &SnapshotBatchResponse,
+    ) {
+        let Some(state_dir) = self.receipt_state_dir.as_deref() else {
+            return;
+        };
+        if crate::upload_receipts::append_success(
+            state_dir,
+            receipt_source(&request.source),
+            request.snapshots.len(),
+            status,
+            server_request_id,
+            response,
+        )
+        .is_err()
+        {
+            eprintln!("ottto-service: snapshot upload receipt persistence failed");
+        }
+    }
+
+    fn record_batch_http_failure(
+        &self,
+        request: &SnapshotBatchRequest,
+        outcome: ottto_protocol::UploadReceiptOutcomeV1,
+        status: u16,
+        server_request_id: Option<&str>,
+        retry_after_seconds: Option<u64>,
+    ) {
+        let Some(state_dir) = self.receipt_state_dir.as_deref() else {
+            return;
+        };
+        if crate::upload_receipts::append_http_failure(
+            state_dir,
+            receipt_source(&request.source),
+            request.snapshots.len(),
+            outcome,
+            status,
+            server_request_id,
+            retry_after_seconds,
+        )
+        .is_err()
+        {
+            eprintln!("ottto-service: snapshot upload receipt persistence failed");
+        }
+    }
+
+    fn record_batch_transport_error(&self, request: &SnapshotBatchRequest) {
+        let Some(state_dir) = self.receipt_state_dir.as_deref() else {
+            return;
+        };
+        if crate::upload_receipts::append_transport_error(
+            state_dir,
+            receipt_source(&request.source),
+            request.snapshots.len(),
+        )
+        .is_err()
+        {
+            eprintln!("ottto-service: snapshot upload receipt persistence failed");
         }
     }
 
@@ -2097,6 +2225,14 @@ impl SnapshotApiClient {
 
     fn api_url(&self, path: &str) -> String {
         format!("{}{}", self.api_base_url.trim_end_matches('/'), path)
+    }
+}
+
+fn receipt_source(source: &str) -> ottto_protocol::SourceKind {
+    match source {
+        "claude_code" => ottto_protocol::SourceKind::ClaudeCode,
+        "pi" => ottto_protocol::SourceKind::Pi,
+        _ => ottto_protocol::SourceKind::Codex,
     }
 }
 
@@ -3309,6 +3445,127 @@ mod tests {
             rejected_entities: Vec::new(),
             conflict_entities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn snapshot_batch_transport_records_each_typed_receipt_outcome() {
+        use ottto_protocol::UploadReceiptOutcomeV1;
+        use std::net::TcpListener;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "ottto-snapshot-client-receipts-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind receipt fixture");
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let responses = [
+                (
+                    "200 OK",
+                    Some("request-accepted"),
+                    None,
+                    r#"{"accepted":0,"sessions_reconciled":0,"session_ids":[],"disabled":false,"disabled_reason":null,"entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":[],"unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]}"#,
+                ),
+                (
+                    "200 OK",
+                    Some("request-partial"),
+                    None,
+                    r#"{"accepted":1,"sessions_reconciled":0,"session_ids":[],"disabled":false,"disabled_reason":null,"entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":[],"unchanged_entities":[],"rejected_entities":[{"source_session_id":"raw-partial-session","snapshot_fingerprint":"abcdef0123456789","reason":"contract","detail":"fixture","permanent":true,"occurrence_count":1}],"conflict_entities":[]}"#,
+                ),
+                (
+                    "429 Too Many Requests",
+                    Some("request-shed"),
+                    Some("30"),
+                    "{}",
+                ),
+                (
+                    "422 Unprocessable Entity",
+                    Some("request-rejected"),
+                    None,
+                    "{}",
+                ),
+                ("401 Unauthorized", Some("request-auth"), None, "{}"),
+            ];
+            for (status, request_id, retry_after, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept batch request");
+                let _ = read_complete_http_request(&mut stream);
+                let request_id = request_id
+                    .map(|value| format!("X-Request-ID: {value}\r\n"))
+                    .unwrap_or_default();
+                let retry_after = retry_after
+                    .map(|value| format!("Retry-After: {value}\r\n"))
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{request_id}{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                use std::io::Write;
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".to_string(),
+            machine_id: "machine".to_string(),
+            collector_version: None,
+            snapshots: Vec::new(),
+            upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let client =
+            SnapshotApiClient::new(format!("http://{address}")).with_receipt_state_dir(&state_dir);
+        client.upload_batch("relay", &request, false).unwrap();
+        client.upload_batch("relay", &request, false).unwrap();
+        assert!(client
+            .upload_batch("relay", &request, false)
+            .unwrap_err()
+            .downcast_ref::<UploadShed>()
+            .is_some());
+        assert!(client
+            .upload_batch("relay", &request, false)
+            .unwrap_err()
+            .downcast_ref::<BatchRejected>()
+            .is_some());
+        assert!(client
+            .upload_batch("relay", &request, false)
+            .unwrap_err()
+            .downcast_ref::<BatchAuthorizationRejected>()
+            .is_some());
+
+        let transport =
+            SnapshotApiClient::new("http://127.0.0.1:1").with_receipt_state_dir(&state_dir);
+        assert!(transport.upload_batch("relay", &request, false).is_err());
+
+        let receipt_response = crate::upload_receipts::read(&state_dir, 10, None, None).unwrap();
+        let outcomes = receipt_response
+            .receipts
+            .iter()
+            .map(|receipt| receipt.outcome)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            vec![
+                UploadReceiptOutcomeV1::TransportError,
+                UploadReceiptOutcomeV1::AuthRejected,
+                UploadReceiptOutcomeV1::Rejected,
+                UploadReceiptOutcomeV1::Shed,
+                UploadReceiptOutcomeV1::Partial,
+                UploadReceiptOutcomeV1::Accepted,
+            ]
+        );
+        assert_eq!(
+            receipt_response.receipts[5].server_request_id.as_deref(),
+            Some("request-accepted")
+        );
+        assert_eq!(
+            receipt_response.receipts[4].server_request_id.as_deref(),
+            Some("request-partial")
+        );
+        assert_eq!(receipt_response.receipts[3].retry_after_seconds, Some(30));
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[test]
