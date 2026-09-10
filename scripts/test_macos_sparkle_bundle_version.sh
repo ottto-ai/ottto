@@ -45,6 +45,7 @@ mkdir -p \
   "$mock_bin"
 
 cp "$ROOT/scripts/macos_package.sh" "$repo/scripts/macos_package.sh"
+cp "$ROOT/scripts/macos_bundle_url_scheme.sh" "$repo/scripts/macos_bundle_url_scheme.sh"
 cp "$ROOT/scripts/macos_sparkle_bundle_version.sh" "$repo/scripts/macos_sparkle_bundle_version.sh"
 cat > "$repo/crates/ottto-protocol/src/lib.rs" <<'RS'
 pub const PROTOCOL_VERSION: u16 = 15;

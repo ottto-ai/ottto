@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 358,
-  "content_sha256": "2914e360b9ce2f2b80649cc8c8f2b8b5058776de900f9631c607cf1f9b8abbb5",
+  "candidate_file_count": 360,
+  "content_sha256": "02c76a92c2e64c288f58c422cfd097ccab17159e10e6eb30939ef54f55916e12",
   "files": [
     {
       "executable": false,
@@ -76,8 +76,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "64920b2bc93d3bcfd6a7e970a50723251f2e57153c335c6c26c3ba3b2e55a2c5",
-      "size_bytes": 53465
+      "sha256": "a3b4c8f10e5bc514f4e2e5453ef412abb9c2efb1b9acdaac6220eddca80093c6",
+      "size_bytes": 53522
     },
     {
       "executable": false,
@@ -531,8 +531,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/lifecycle.rs",
-      "sha256": "58292af0e86716c2a09eb992014ad9f02c4f8d2984a26ab10fd3343e8b71206c",
-      "size_bytes": 26986
+      "sha256": "b683e0f08e94a6e5ba054f5b782799223307de6830eca35f18300c9006827696",
+      "size_bytes": 29524
     },
     {
       "executable": false,
@@ -741,8 +741,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "00f8a2ca71fc437e5ea4542a1f3d9f4de943217367fc8b53dc9b2716aae74ef2",
-      "size_bytes": 1130144
+      "sha256": "5fc93f076c3521bb59b3e97f703a0736d0dec973a25ce521e05b7c9aa8ff299e",
+      "size_bytes": 1131750
     },
     {
       "executable": false,
@@ -2166,6 +2166,13 @@
       "size_bytes": 10252
     },
     {
+      "executable": false,
+      "mode": "0644",
+      "path": "scripts/macos_bundle_url_scheme.sh",
+      "sha256": "0266a5ad5d6fba201b62d3e9ac4304e8b10dfe6a01fbdcbd36914e908c3712be",
+      "size_bytes": 545
+    },
+    {
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_dev_install.sh",
@@ -2204,8 +2211,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_package.sh",
-      "sha256": "be7232c5fe112c33f7f0da573153ac0c6270748b426d400f4a69519baf196c3b",
-      "size_bytes": 37427
+      "sha256": "7401441c984b928f4d05886a1c74bf5f458e72dce144413c7f534d3cc390f2fe",
+      "size_bytes": 37667
     },
     {
       "executable": true,
@@ -2323,8 +2330,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_surface_ci.sh",
-      "sha256": "110c6d0c8174769cfbc9e692701c7031ad459882fc62f5c1f165efc88335d73d",
-      "size_bytes": 7294
+      "sha256": "aec0b8944c527c186a09ea9c2b3fca6f933c2081b421cfe2814e908a0e162660",
+      "size_bytes": 7395
     },
     {
       "executable": true,
@@ -2379,8 +2386,15 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_package_root_resolution.sh",
-      "sha256": "d1add0cbe64d4e5479c7a44541fbff77e78f658cc96f1591227f6010dacbc111",
-      "size_bytes": 2553
+      "sha256": "ee674885d4197f38f1263a73fadad8a8fe5f556a1286effdd39ff79edc921a8d",
+      "size_bytes": 2642
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_macos_package_url_scheme_policy.sh",
+      "sha256": "c6bf2d2acb0387ef78d61de51ebda02797f166e202c162e356e4f23f6c62a4bc",
+      "size_bytes": 1332
     },
     {
       "executable": true,
@@ -2414,8 +2428,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_sparkle_bundle_version.sh",
-      "sha256": "96b1bdf72ae56e3e1b4232f067489ce70ae74a7edb1ab664650afbcff28bc398",
-      "size_bytes": 8245
+      "sha256": "a7ab86f3a8f1218b598ff771cfd981fa3f65b1c1633c2f92f45c317f32f33281",
+      "size_bytes": 8334
     },
     {
       "executable": true,
@@ -2509,9 +2523,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-10T02:46:06+00:00",
+  "generated_at": "2026-09-10T03:06:48+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 359,
+  "output_file_count": 361,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

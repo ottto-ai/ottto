@@ -4808,6 +4808,9 @@ pub(crate) fn backend_error_indicates_account_gone(error: &LocalApiError) -> boo
 }
 
 fn log_auth_complete_backend_failure(error: &LocalApiError) {
+    if auth_complete_error_is_pending(error) {
+        return;
+    }
     match error {
         LocalApiError::Backend(details) => {
             let status = details
@@ -4834,6 +4837,22 @@ fn log_auth_complete_backend_failure(error: &LocalApiError) {
         }
         _ => {}
     }
+}
+
+/// Browser approval and local claim completion are separate steps. The backend
+/// returns this bounded 400 while the owner is still looking at the claim page;
+/// it is an expected polling result, not a rejected pairing attempt.
+fn auth_complete_error_is_pending(error: &LocalApiError) -> bool {
+    let LocalApiError::Backend(details) = error else {
+        return false;
+    };
+    if details.status != Some(400) {
+        return false;
+    }
+    details.body_excerpt.as_deref().is_some_and(|body| {
+        body.to_ascii_lowercase()
+            .contains("setup claim session is pending")
+    })
 }
 
 fn auth_complete_log_endpoint(endpoint: &str) -> String {
@@ -26604,6 +26623,27 @@ log_user_prompt = true
             auth_complete_log_endpoint("/api/v1/setup-claims/claim_private/status"),
             "/api/v1/setup-claims/claim_private/status"
         );
+    }
+
+    #[test]
+    fn pending_browser_claim_is_not_logged_as_backend_failure() {
+        let pending = LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
+            status: Some(400),
+            body_excerpt: Some(r#"{"detail":"Setup claim session is pending"}"#.to_string()),
+        });
+        assert!(auth_complete_error_is_pending(&pending));
+
+        let terminal = LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
+            status: Some(401),
+            body_excerpt: Some(
+                "Existing installation authority requires an explicit relay device".to_string(),
+            ),
+        });
+        assert!(!auth_complete_error_is_pending(&terminal));
     }
 
     #[test]
