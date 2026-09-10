@@ -67,10 +67,12 @@ ottto receipts --json --since 2026-09-10T00:00:00Z --source codex
 The daemon keeps at most 500 receipts. Source session ids are never stored:
 each is replaced with a 12-hex SHA-256 prefix, and snapshot fingerprints are
 limited to 12 hex characters. Request bodies, authorization headers, tokens,
-and raw backend rejection details are not included. If `server_request_id` is
-present, provide it to support so the local attempt can be correlated with the
-server request. Older backends may omit the optional `X-Request-ID` header, in
-which case the field is `null`.
+and raw backend rejection details are not included. `device_label` and
+`account_binding` use only the user-facing label and binding state already
+shown by `ottto status`; raw device, account, user, and organization ids are
+never stored. If `server_request_id` is present, provide it to support so the
+local attempt can be correlated with the server request. Older backends may
+omit the optional `X-Request-ID` header, in which case the field is `null`.
 
 ```json
 {
@@ -83,6 +85,8 @@ which case the field is `null`.
       "server_request_id": "req-server-01HX",
       "retry_after_seconds": null,
       "source": "codex",
+      "device_label": "Test Mac",
+      "account_binding": "connected",
       "batch_item_count": 1,
       "accepted_count": 1,
       "accepted_entities": [

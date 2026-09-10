@@ -1372,6 +1372,7 @@ pub struct SnapshotApiClient {
     agent: ureq::Agent,
     batch_agent: ureq::Agent,
     receipt_state_dir: Option<PathBuf>,
+    receipt_context: crate::upload_receipts::UploadReceiptContext,
 }
 
 impl SnapshotApiClient {
@@ -1394,12 +1395,27 @@ impl SnapshotApiClient {
             agent,
             batch_agent,
             receipt_state_dir: None,
+            receipt_context: crate::upload_receipts::UploadReceiptContext::default(),
         }
     }
 
     /// Enable privacy-safe local receipts for snapshot batch attempts.
     pub fn with_receipt_state_dir(mut self, state_dir: impl Into<PathBuf>) -> Self {
         self.receipt_state_dir = Some(state_dir.into());
+        self
+    }
+
+    /// Attach only the user-facing device label and account state already
+    /// exposed by local status. Raw account or device ids are never accepted.
+    pub fn with_receipt_context(
+        mut self,
+        device_label: Option<String>,
+        account_binding: Option<ottto_protocol::LocalAccountState>,
+    ) -> Self {
+        self.receipt_context = crate::upload_receipts::UploadReceiptContext {
+            device_label,
+            account_binding,
+        };
         self
     }
 
@@ -1646,13 +1662,14 @@ impl SnapshotApiClient {
         let Some(state_dir) = self.receipt_state_dir.as_deref() else {
             return;
         };
-        if crate::upload_receipts::append_success(
+        if crate::upload_receipts::append_success_with_context(
             state_dir,
             receipt_source(&request.source),
             request.snapshots.len(),
             status,
             server_request_id,
             response,
+            &self.receipt_context,
         )
         .is_err()
         {
@@ -1671,7 +1688,7 @@ impl SnapshotApiClient {
         let Some(state_dir) = self.receipt_state_dir.as_deref() else {
             return;
         };
-        if crate::upload_receipts::append_http_failure(
+        if crate::upload_receipts::append_http_failure_with_context(
             state_dir,
             receipt_source(&request.source),
             request.snapshots.len(),
@@ -1679,6 +1696,7 @@ impl SnapshotApiClient {
             status,
             server_request_id,
             retry_after_seconds,
+            &self.receipt_context,
         )
         .is_err()
         {
@@ -1690,10 +1708,11 @@ impl SnapshotApiClient {
         let Some(state_dir) = self.receipt_state_dir.as_deref() else {
             return;
         };
-        if crate::upload_receipts::append_transport_error(
+        if crate::upload_receipts::append_transport_error_with_context(
             state_dir,
             receipt_source(&request.source),
             request.snapshots.len(),
+            &self.receipt_context,
         )
         .is_err()
         {
@@ -3449,7 +3468,7 @@ mod tests {
 
     #[test]
     fn snapshot_batch_transport_records_each_typed_receipt_outcome() {
-        use ottto_protocol::UploadReceiptOutcomeV1;
+        use ottto_protocol::{LocalAccountState, UploadReceiptOutcomeV1};
         use std::net::TcpListener;
 
         let state_dir = std::env::temp_dir().join(format!(
@@ -3515,8 +3534,12 @@ mod tests {
             upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
             client_report: crate::client_report::ClientReport::empty(),
         };
-        let client =
-            SnapshotApiClient::new(format!("http://{address}")).with_receipt_state_dir(&state_dir);
+        let client = SnapshotApiClient::new(format!("http://{address}"))
+            .with_receipt_state_dir(&state_dir)
+            .with_receipt_context(
+                Some("Test Mac".to_string()),
+                Some(LocalAccountState::Connected),
+            );
         client.upload_batch("relay", &request, false).unwrap();
         client.upload_batch("relay", &request, false).unwrap();
         assert!(client
@@ -3559,6 +3582,14 @@ mod tests {
         assert_eq!(
             receipt_response.receipts[5].server_request_id.as_deref(),
             Some("request-accepted")
+        );
+        assert_eq!(
+            receipt_response.receipts[5].device_label.as_deref(),
+            Some("Test Mac")
+        );
+        assert_eq!(
+            receipt_response.receipts[5].account_binding,
+            Some(LocalAccountState::Connected)
         );
         assert_eq!(
             receipt_response.receipts[4].server_request_id.as_deref(),

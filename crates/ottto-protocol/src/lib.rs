@@ -3753,6 +3753,12 @@ pub struct UploadReceiptV1 {
     pub server_request_id: Option<String>,
     pub retry_after_seconds: Option<u64>,
     pub source: SourceKind,
+    /// User-facing device label already exposed by local `status`; never an id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_label: Option<String>,
+    /// Current local account binding state already exposed by local `status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_binding: Option<LocalAccountState>,
     pub batch_item_count: u64,
     pub accepted_count: u64,
     pub accepted_entities: Vec<UploadReceiptEntityV1>,

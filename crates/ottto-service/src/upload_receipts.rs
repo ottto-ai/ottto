@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use ottto_core::write_owner_only_file_atomic;
 use ottto_protocol::{
-    SourceKind, UploadReceiptEntityV1, UploadReceiptOutcomeV1, UploadReceiptV1,
+    LocalAccountState, SourceKind, UploadReceiptEntityV1, UploadReceiptOutcomeV1, UploadReceiptV1,
     UploadReceiptsResponseV1,
 };
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,14 @@ static CORRUPTION_LOGGED: AtomicBool = AtomicBool::new(false);
 struct PersistedReceiptRing {
     schema_version: u16,
     receipts: Vec<UploadReceiptV1>,
+}
+
+/// Status-safe labels captured with a receipt. Neither value contains a raw
+/// device, user, account, or organization identifier.
+#[derive(Debug, Clone, Default)]
+pub struct UploadReceiptContext {
+    pub device_label: Option<String>,
+    pub account_binding: Option<LocalAccountState>,
 }
 
 pub fn upload_receipts_path(state_dir: &Path) -> PathBuf {
@@ -64,6 +72,26 @@ pub fn append_success(
     http_status: u16,
     server_request_id: Option<&str>,
     response: &SnapshotBatchResponse,
+) -> Result<()> {
+    append_success_with_context(
+        state_dir,
+        source,
+        batch_item_count,
+        http_status,
+        server_request_id,
+        response,
+        &UploadReceiptContext::default(),
+    )
+}
+
+pub fn append_success_with_context(
+    state_dir: &Path,
+    source: SourceKind,
+    batch_item_count: usize,
+    http_status: u16,
+    server_request_id: Option<&str>,
+    response: &SnapshotBatchResponse,
+    context: &UploadReceiptContext,
 ) -> Result<()> {
     let outcome = if response.disabled {
         UploadReceiptOutcomeV1::Rejected
@@ -114,6 +142,8 @@ pub fn append_success(
             server_request_id: sanitize_server_request_id(server_request_id),
             retry_after_seconds: None,
             source,
+            device_label: sanitize_device_label(context.device_label.as_deref()),
+            account_binding: context.account_binding.clone(),
             batch_item_count: batch_item_count as u64,
             accepted_count: response.accepted,
             accepted_entities,
@@ -133,6 +163,29 @@ pub fn append_http_failure(
     server_request_id: Option<&str>,
     retry_after_seconds: Option<u64>,
 ) -> Result<()> {
+    append_http_failure_with_context(
+        state_dir,
+        source,
+        batch_item_count,
+        outcome,
+        http_status,
+        server_request_id,
+        retry_after_seconds,
+        &UploadReceiptContext::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn append_http_failure_with_context(
+    state_dir: &Path,
+    source: SourceKind,
+    batch_item_count: usize,
+    outcome: UploadReceiptOutcomeV1,
+    http_status: u16,
+    server_request_id: Option<&str>,
+    retry_after_seconds: Option<u64>,
+    context: &UploadReceiptContext,
+) -> Result<()> {
     append(
         state_dir,
         empty_receipt(
@@ -142,6 +195,7 @@ pub fn append_http_failure(
             Some(http_status),
             sanitize_server_request_id(server_request_id),
             retry_after_seconds,
+            context,
         ),
     )
 }
@@ -150,6 +204,20 @@ pub fn append_transport_error(
     state_dir: &Path,
     source: SourceKind,
     batch_item_count: usize,
+) -> Result<()> {
+    append_transport_error_with_context(
+        state_dir,
+        source,
+        batch_item_count,
+        &UploadReceiptContext::default(),
+    )
+}
+
+pub fn append_transport_error_with_context(
+    state_dir: &Path,
+    source: SourceKind,
+    batch_item_count: usize,
+    context: &UploadReceiptContext,
 ) -> Result<()> {
     append(
         state_dir,
@@ -160,6 +228,7 @@ pub fn append_transport_error(
             None,
             None,
             None,
+            context,
         ),
     )
 }
@@ -214,6 +283,7 @@ fn empty_receipt(
     http_status: Option<u16>,
     server_request_id: Option<String>,
     retry_after_seconds: Option<u64>,
+    context: &UploadReceiptContext,
 ) -> UploadReceiptV1 {
     UploadReceiptV1 {
         uploaded_at: now_rfc3339(),
@@ -222,6 +292,8 @@ fn empty_receipt(
         server_request_id,
         retry_after_seconds,
         source,
+        device_label: sanitize_device_label(context.device_label.as_deref()),
+        account_binding: context.account_binding.clone(),
         batch_item_count: batch_item_count as u64,
         accepted_count: 0,
         accepted_entities: Vec::new(),
@@ -361,6 +433,20 @@ fn sanitize_server_request_id(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+fn sanitize_device_label(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(80)
+                .collect::<String>()
+        })
+        .filter(|value| !value.is_empty())
+}
+
 fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
@@ -414,14 +500,19 @@ mod tests {
     fn append_is_private_atomic_bounded_and_sanitized() {
         let dir = temp_dir();
         let raw_id = "raw-session-id-must-never-be-stored";
+        let context = UploadReceiptContext {
+            device_label: Some("  Test\nMac  ".to_string()),
+            account_binding: Some(LocalAccountState::Connected),
+        };
         for _ in 0..=UPLOAD_RECEIPT_RING_CAPACITY {
-            append_success(
+            append_success_with_context(
                 &dir,
                 SourceKind::Codex,
                 1,
                 200,
                 Some("request-safe-123"),
                 &response(raw_id),
+                &context,
             )
             .unwrap();
         }
@@ -436,6 +527,11 @@ mod tests {
         assert_eq!(
             result.receipts[0].accepted_entities[0].snapshot_fingerprint_prefix,
             "abcdef012345"
+        );
+        assert_eq!(result.receipts[0].device_label.as_deref(), Some("TestMac"));
+        assert_eq!(
+            result.receipts[0].account_binding,
+            Some(LocalAccountState::Connected)
         );
         let bytes = std::fs::read(upload_receipts_path(&dir)).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains(raw_id));

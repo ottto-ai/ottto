@@ -8,6 +8,8 @@
       "server_request_id": "req-server-01HX",
       "retry_after_seconds": null,
       "source": "codex",
+      "device_label": "Test Mac",
+      "account_binding": "connected",
       "batch_item_count": 2,
       "accepted_count": 1,
       "accepted_entities": [
