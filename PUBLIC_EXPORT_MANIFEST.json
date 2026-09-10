@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 366,
-  "content_sha256": "76125a34ee57973a9177edaa7089dfcb199133de67b0e4f95a90d1538a587fde",
+  "candidate_file_count": 367,
+  "content_sha256": "e6a218bab7a6d4b1e23093234397d91015bc1cb87cfc6bbf5a197142d1d3c269",
   "files": [
     {
       "executable": false,
@@ -671,8 +671,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_browser_auth.rs",
-      "sha256": "748817e2b23aa9633fc6f2ccae40ad9f3c46d8a1723cb3907541e8bd3f6cf461",
-      "size_bytes": 303849
+      "sha256": "beda3c83a382b6b1f01918d3a4630622b43939a463a13aca426d742573c8bd9c",
+      "size_bytes": 305709
     },
     {
       "executable": false,
@@ -1576,6 +1576,13 @@
       "path": "docs/session-2026-09-10-claude-browser-pty.md",
       "sha256": "9c4b97ef6ad0359c1c95fe140e1c49ceaae2a16144b31e0aae266e8f38398a89",
       "size_bytes": 1393
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-09-10-claude-supervisor-support-dir.md",
+      "sha256": "3c987a09ba399c22d3475692948dcbaa75058cca5af03a74b6db553cda3317bb",
+      "size_bytes": 1362
     },
     {
       "executable": false,
@@ -2565,9 +2572,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-10T14:39:10+00:00",
+  "generated_at": "2026-09-10T16:02:21+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 367,
+  "output_file_count": 368,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2601,5 +2608,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "056f48118fc98f9965ec210328c66776e98eb6f6"
+  "source_commit": "921afff187ac403f4053cadfb333078c891d2196"
 }
