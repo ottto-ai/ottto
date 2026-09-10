@@ -33,6 +33,7 @@ pub mod snapshot_watcher;
 pub mod snapshots;
 #[cfg(unix)]
 pub mod unix_socket;
+pub mod upload_receipts;
 pub mod xpc_mach;
 
 use crate::detected_uses::{prune_stale_detected_uses, DETECTED_USE_RETENTION_DAYS};

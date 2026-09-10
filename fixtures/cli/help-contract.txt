@@ -5,6 +5,7 @@ Usage: ottto [OPTIONS] <COMMAND>
 
 Commands:
   status           Show daemon, account, relay, update, and app health
+  receipts         Show recent snapshot upload acknowledgements
   apps             List apps or refresh app setup status
   agent-status     Refresh one source status using the lower-level source noun
   context          Print cloud context for AI agents
@@ -44,6 +45,21 @@ Options:
       --no-autostart          Do not kickstart the standard per-user ottto-service
       --watch                 Emit NDJSON progress events and a final event; requires --json
   -h, --help                  Print help
+### ottto receipts --help
+Show recent snapshot upload acknowledgements
+
+Usage: ottto receipts [OPTIONS]
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --limit <N>        Maximum number of recent receipts to return [default: 50]
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --since <RFC3339>  Return receipts uploaded at or after this timestamp
+      --source <SOURCE>  Filter receipts to one source [possible values: codex, claude-code, pi]
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
 ### ottto apps --help
 List apps or refresh app setup status
 

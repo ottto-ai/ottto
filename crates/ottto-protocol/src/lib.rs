@@ -3418,6 +3418,14 @@ pub enum LocalControlCommand {
         #[serde(default)]
         refresh_agent_status: bool,
     },
+    /// Read the daemon's bounded, privacy-safe snapshot upload receipt ring.
+    Receipts {
+        limit: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<SourceKind>,
+    },
     AuthStatus,
     AgentStatusRefresh {
         source: Option<SourceKind>,
@@ -3714,6 +3722,58 @@ pub enum LocalControlCommand {
         confirm: bool,
     },
     Uninstall,
+}
+
+/// One privacy-safe entity acknowledgement in a local upload receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadReceiptEntityV1 {
+    pub source_session_id_hash: String,
+    pub snapshot_fingerprint_prefix: String,
+    pub occurrence_count: u64,
+}
+
+/// Result of one snapshot batch upload attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadReceiptOutcomeV1 {
+    Accepted,
+    Partial,
+    Shed,
+    Rejected,
+    AuthRejected,
+    TransportError,
+}
+
+/// Persisted, privacy-safe summary of one snapshot batch upload attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadReceiptV1 {
+    pub uploaded_at: String,
+    pub outcome: UploadReceiptOutcomeV1,
+    pub http_status: Option<u16>,
+    pub server_request_id: Option<String>,
+    pub retry_after_seconds: Option<u64>,
+    pub source: SourceKind,
+    /// User-facing device label already exposed by local `status`; never an id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_label: Option<String>,
+    /// Current local account binding state already exposed by local `status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_binding: Option<LocalAccountState>,
+    pub batch_item_count: u64,
+    pub accepted_count: u64,
+    pub accepted_entities: Vec<UploadReceiptEntityV1>,
+    pub unchanged_entities: Vec<UploadReceiptEntityV1>,
+    pub conflict_entities: Vec<UploadReceiptEntityV1>,
+    pub rejected_entities: Vec<UploadReceiptEntityV1>,
+}
+
+/// Stable JSON payload returned by `ottto receipts --json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadReceiptsResponseV1 {
+    pub schema: String,
+    pub receipts: Vec<UploadReceiptV1>,
+    pub ring_capacity: u16,
+    pub state_path_present: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5851,6 +5911,19 @@ mod tests {
         ))
         .expect("control request fixture should deserialize");
 
+        let receipts_request = serde_json::from_str::<LocalControlRequest>(include_str!(
+            "../../../fixtures/control/receipts-request.json"
+        ))
+        .expect("receipts control request fixture should deserialize");
+        assert_eq!(
+            receipts_request.command,
+            LocalControlCommand::Receipts {
+                limit: 25,
+                since: Some("2026-09-10T00:00:00Z".to_string()),
+                source: Some(SourceKind::Codex),
+            }
+        );
+
         let response = serde_json::from_str::<LocalControlResponse>(include_str!(
             "../../../fixtures/control/status-response.json"
         ))
@@ -5863,6 +5936,19 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(PROTOCOL_VERSION as u64)
         );
+
+        let receipts_response = serde_json::from_str::<LocalControlResponse>(include_str!(
+            "../../../fixtures/control/receipts-response.json"
+        ))
+        .expect("receipts control response fixture should deserialize");
+        let payload: UploadReceiptsResponseV1 = serde_json::from_value(
+            receipts_response
+                .payload
+                .expect("receipts response payload"),
+        )
+        .expect("typed receipts payload");
+        assert_eq!(payload.schema, "ottto.upload_receipts.v1");
+        assert_eq!(payload.receipts.len(), 1);
     }
 
     #[test]

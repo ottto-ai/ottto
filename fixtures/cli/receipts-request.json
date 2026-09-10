@@ -1,0 +1,10 @@
+{
+  "request_id": "req_cli_receipts_fixture",
+  "protocol_version": 15,
+  "token": "test-token",
+  "client_kind": "cli",
+  "command": "receipts",
+  "limit": 25,
+  "since": "2026-09-10T00:00:00Z",
+  "source": "codex"
+}

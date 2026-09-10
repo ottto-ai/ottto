@@ -80,6 +80,7 @@ The first public smoke commands are:
 
 ```bash
 ottto status --json
+ottto receipts --json --limit 20
 ottto context --json
 ottto setup --json
 ottto apps detect --json
@@ -122,6 +123,7 @@ private operations, and planning docs remain private.
 Every customer-facing local action should cross the typed protocol boundary:
 
 - status
+- receipts
 - setup
 - doctor
 - fix
@@ -238,6 +240,8 @@ Current locked commands:
 ```bash
 ottto status --json
 ottto status --json --watch
+ottto receipts --json
+ottto receipts --json --limit 20 --since 2026-09-10T00:00:00Z --source codex
 ottto status --refresh-agent-status --json
 ottto context --json
 ottto context --json --range today --source codex
