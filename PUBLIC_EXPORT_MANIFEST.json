@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 367,
-  "content_sha256": "e6a218bab7a6d4b1e23093234397d91015bc1cb87cfc6bbf5a197142d1d3c269",
+  "candidate_file_count": 368,
+  "content_sha256": "b13cb72e856ecf32a3fe357efcffa36fb5fdc00de5fbf6313e9c9cf036ccba1e",
   "files": [
     {
       "executable": false,
@@ -678,8 +678,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_local_otel.rs",
-      "sha256": "c2101a86dd614b8fde7f850dd9aa7ff77d0c7758a40fe753675d31bfb316c4e9",
-      "size_bytes": 52077
+      "sha256": "bcbdd5d36c43380abbe9ed58b42f5ec4a4fdebdc2f5120c64406fb7822384f1c",
+      "size_bytes": 57523
     },
     {
       "executable": false,
@@ -881,8 +881,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "76692381bb413c5dd2409da1e56ee312cc75ffd1b943efa93f9963f6b1d8c6e8",
-      "size_bytes": 1869831
+      "sha256": "358f0b75a83058b5a5fe3bb152dee4d3a7ca64f588e30ec21c07a1df7107410c",
+      "size_bytes": 1887539
     },
     {
       "executable": false,
@@ -1587,6 +1587,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-09-11-claude-owned-start-emission.md",
+      "sha256": "4c086b91cb10defe8bb3155498a0fe4f4bde64d40306271932210e23afae7a23",
+      "size_bytes": 2803
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-surfaces.md",
       "sha256": "b49df98bbf9dbdcbcc4a904c35f084019541451e53f46c3134ea5c9ff31920b9",
       "size_bytes": 2026
@@ -2022,7 +2029,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-manifest.json",
-      "sha256": "2a9b61029b54fbc133fff0bf8f64567a60fa9694713af9d63ed4191b6970ad9f",
+      "sha256": "5d0a3ea669d3472b8ef60ca846fc9ca52286dab099970a4ff3cf66a9096b8f83",
       "size_bytes": 1777
     },
     {
@@ -2572,9 +2579,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-10T16:02:21+00:00",
+  "generated_at": "2026-09-10T23:45:25+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 368,
+  "output_file_count": 369,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2608,5 +2615,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "921afff187ac403f4053cadfb333078c891d2196"
+  "source_commit": "887392e0c8050bed2cd6c6f6de88479fca7a3b0b"
 }

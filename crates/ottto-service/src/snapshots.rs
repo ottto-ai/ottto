@@ -448,7 +448,11 @@ const CONTEXT_CURVE_SAMPLING_REVISION: &str = "deterministic_even_gap:v1";
 const CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION: &str = "codex_owned_rollout_occurrences:v1";
 const CODEX_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION: &str =
     "codex_token_count_model_context_window:v1";
-const CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION: &str = "claude_owned_request_start_proof:v1";
+// v2 persists provider-owned-start census proof across bounded pages and
+// accepts the documented minimal API-log/trace request join. Advancing the
+// derivation revision rearms one bounded historical replay so already-indexed
+// transcripts receive the correction instead of limiting it to new sessions.
+const CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION: &str = "claude_owned_request_start_proof:v2";
 const CLAUDE_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION: &str = "claude_transcript_model:v1";
 const CONTEXT_CURVE_RETENTION_ANCHOR: u16 = 0x01;
 const CONTEXT_CURVE_RETENTION_COMPACTION_BEFORE: u16 = 0x02;
@@ -2118,6 +2122,14 @@ pub struct ScanIndex {
     /// census instead.
     #[serde(default)]
     claude_duplicate_request_witness_overflowed: bool,
+    /// Provider-authored `forkedFrom` proves where this file's owned suffix
+    /// starts, but duplicate-request safety is known only after the bounded
+    /// filesystem census completes. Persist that census result so a marker
+    /// parsed on an earlier page can be reselected once and emitted on the
+    /// following pass instead of leaving its first `ownership_unresolved` body
+    /// permanent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    claude_owned_start_census: BTreeMap<String, ClaudeOwnedStartCensusWitness>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_desktop_store_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2239,6 +2251,7 @@ impl Default for ScanIndex {
             claude_usage_authority_quarantine: BTreeMap::new(),
             claude_duplicate_request_owners: BTreeMap::new(),
             claude_duplicate_request_witness_overflowed: false,
+            claude_owned_start_census: BTreeMap::new(),
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
@@ -2434,6 +2447,19 @@ struct ClaudeUsageFamilyPending {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     member_occurrences: BTreeMap<String, BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>>,
     invalid: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClaudeOwnedStartCensusWitness {
+    /// Exact scan fingerprint of the transcript that carried `forkedFrom`.
+    marker_source_file_fingerprint: String,
+    /// The marker fingerprint after a complete duplicate-request census.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified_source_file_fingerprint: Option<String>,
+    /// The same fingerprint after a curve body carrying the proven owned start
+    /// has been synthesized. Inequality rearms exactly one corrective parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    emitted_source_file_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3618,6 +3644,50 @@ fn apply_claude_reported_usage_with_index_and_limits(
         .chain(detected_duplicate_request_owners.keys())
         .cloned()
         .collect::<BTreeSet<_>>();
+    if census_complete {
+        let current_members = complete_families
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        index
+            .claude_owned_start_census
+            .retain(|source_session_id, _| current_members.contains(source_session_id));
+    }
+    if census_complete
+        && !duplicate_census_invalid
+        && !index.claude_duplicate_request_witness_overflowed
+    {
+        let verified = index
+            .claude_owned_start_census
+            .iter()
+            .filter_map(|(source_session_id, witness)| {
+                let (root_session_id, _) = complete_families
+                    .iter()
+                    .find(|(_, members)| members.contains(source_session_id))?;
+                let pending = index.claude_usage_family_pending.get(root_session_id)?;
+                if pending.invalid || pending.census_window_end != census_window_end {
+                    return None;
+                }
+                let request_hashes = pending.member_request_id_hashes.get(source_session_id)?;
+                if !request_hashes.is_disjoint(&duplicated_request_hashes) {
+                    return None;
+                }
+                let indexed_fingerprint = index.files.iter().find_map(|(index_key, entry)| {
+                    claude_index_path_family_member(Path::new(index_key))
+                        .filter(|(_, member)| member == source_session_id)
+                        .map(|_| entry.source_file_fingerprint.clone())
+                })?;
+                (indexed_fingerprint == witness.marker_source_file_fingerprint)
+                    .then_some((source_session_id.clone(), indexed_fingerprint))
+            })
+            .collect::<Vec<_>>();
+        for (source_session_id, fingerprint) in verified {
+            if let Some(witness) = index.claude_owned_start_census.get_mut(&source_session_id) {
+                witness.verified_source_file_fingerprint = Some(fingerprint);
+            }
+        }
+    }
     for item in snapshots.iter_mut() {
         let root_session_id = claude_snapshot_family_root(item);
         let family = proven
@@ -3695,7 +3765,8 @@ fn apply_claude_reported_usage_with_index_and_limits(
             0,
             0,
         ));
-        if !census_complete
+        let owned_start_census_verified = claude_owned_start_was_census_verified(item, index);
+        if !(census_complete || owned_start_census_verified)
             || !item.claude_context_curve_identity_complete
             || !item.claude_context_curve_request_index_complete
         {
@@ -3769,6 +3840,46 @@ fn apply_claude_reported_usage_with_index_and_limits(
             &boundaries,
             "parser_unsupported",
         ));
+        if item
+            .context_curve
+            .as_ref()
+            .is_some_and(|curve| matches!(curve.coverage.as_str(), "complete" | "sampled"))
+        {
+            if let Some(fingerprint) = item.source_file_fingerprint.as_ref() {
+                if let Some(witness) = index
+                    .claude_owned_start_census
+                    .get_mut(&item.source_session_id)
+                    .filter(|witness| {
+                        witness.verified_source_file_fingerprint.as_ref() == Some(fingerprint)
+                    })
+                {
+                    witness.emitted_source_file_fingerprint = Some(fingerprint.clone());
+                }
+            }
+        }
+    }
+
+    let owned_start_reparse_ids = index
+        .claude_owned_start_census
+        .iter()
+        .filter_map(|(source_session_id, witness)| {
+            witness
+                .verified_source_file_fingerprint
+                .as_ref()
+                .filter(|verified| {
+                    witness.emitted_source_file_fingerprint.as_ref() != Some(*verified)
+                })
+                .map(|_| source_session_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    if !owned_start_reparse_ids.is_empty() {
+        for (index_key, entry) in &mut index.files {
+            if claude_index_path_family_member(Path::new(index_key)).is_some_and(
+                |(_, source_session_id)| owned_start_reparse_ids.contains(&source_session_id),
+            ) {
+                entry.source_file_fingerprint.clear();
+            }
+        }
     }
 
     let mut disposition = ClaudeUsageAuthorityDisposition::default();
@@ -4219,6 +4330,20 @@ fn claude_snapshot_family_root(item: &SnapshotItem) -> String {
         .unwrap_or_else(|| item.source_session_id.clone())
 }
 
+fn claude_owned_start_was_census_verified(item: &SnapshotItem, index: &ScanIndex) -> bool {
+    item.source_file_fingerprint
+        .as_deref()
+        .is_some_and(|fingerprint| {
+            index
+                .claude_owned_start_census
+                .get(&item.source_session_id)
+                .is_some_and(|witness| {
+                    witness.marker_source_file_fingerprint == fingerprint
+                        && witness.verified_source_file_fingerprint.as_deref() == Some(fingerprint)
+                })
+        })
+}
+
 #[derive(Debug, Clone)]
 struct ClaudeLegacyRequestOwner {
     root_session_id: String,
@@ -4589,12 +4714,8 @@ fn reduce_claude_usage_ledger(
         if row.capture_revision != "claude_api_request:v2"
             || row.session_id != root_session_id
             || row.request_id.is_empty()
-            || row.client_request_id.is_empty()
             || row.model.is_empty()
             || row.request_count != 1
-            || row.event_sequence.is_none()
-            || row.app_version.is_empty()
-            || row.cost_usd_micros.is_none()
             || !claude_api_evidence_fingerprint_is_valid(row)
             || OffsetDateTime::parse(&row.observed_at, &Rfc3339).is_err()
             || api_by_request.insert(row.request_id.clone(), row).is_some()
@@ -4607,7 +4728,6 @@ fn reduce_claude_usage_ledger(
         if row.capture_revision != "claude_llm_request_ownership:v1"
             || row.session_id != root_session_id
             || row.request_id.is_empty()
-            || row.client_request_id.is_empty()
             || !claude_trace_evidence_fingerprint_is_valid(row)
             || OffsetDateTime::parse(&row.observed_at, &Rfc3339).is_err()
             || trace_by_request
@@ -4633,7 +4753,10 @@ fn reduce_claude_usage_ledger(
     digest.update(b"claude_reported_usage_ledger:v1\0");
     for (request_id, api_row) in api_by_request {
         let trace_row = trace_by_request.get(&request_id)?;
-        if api_row.client_request_id != trace_row.client_request_id {
+        if !api_row.client_request_id.is_empty()
+            && !trace_row.client_request_id.is_empty()
+            && api_row.client_request_id != trace_row.client_request_id
+        {
             return None;
         }
         let owner = claude_trace_owner_session_id(root_session_id, &trace_row.agent_id);
@@ -5289,20 +5412,21 @@ fn rebuild_claude_reported_usage(
     let mut totals = UsageTotals::default();
     let mut buckets: BTreeMap<String, UsageBucketState> = BTreeMap::new();
     let mut total_cost_picos = 0_u128;
+    let mut cost_complete = true;
 
     for row in rows {
-        let cost_picos = match row
+        let cost_picos = row
             .cost_usd_micros
             .map(u128::from)
-            .and_then(|value| value.checked_mul(1_000_000))
-        {
-            Some(value) => value,
-            None => return false,
-        };
-        total_cost_picos = match total_cost_picos.checked_add(cost_picos) {
-            Some(value) => value,
-            None => return false,
-        };
+            .and_then(|value| value.checked_mul(1_000_000));
+        if let Some(cost_picos) = cost_picos {
+            total_cost_picos = match total_cost_picos.checked_add(cost_picos) {
+                Some(value) => value,
+                None => return false,
+            };
+        } else {
+            cost_complete = false;
+        }
         let occurrence = item.claude_usage_occurrences.get(&row.request_id);
         let mut selector = occurrence
             .map(|occurrence| occurrence.selector.clone())
@@ -5391,7 +5515,7 @@ fn rebuild_claude_reported_usage(
             )
         };
         usage.request_count = 1;
-        usage.costs = UsageCosts {
+        usage.costs = cost_picos.map_or_else(UsageCosts::default, |cost_picos| UsageCosts {
             observed: true,
             reported: true,
             total: Some(cost_picos),
@@ -5399,7 +5523,7 @@ fn rebuild_claude_reported_usage(
             output: None,
             cache_read: None,
             cache_creation: None,
-        };
+        });
         if !totals.add(&usage) {
             return false;
         }
@@ -5505,7 +5629,7 @@ fn rebuild_claude_reported_usage(
             item.source_ended_at = Some(last_activity_at);
         }
     }
-    item.cost = Some(SnapshotCost {
+    item.cost = cost_complete.then(|| SnapshotCost {
         total_cost_usd: Some(usd_picos_string(total_cost_picos)),
         input_cost_usd: None,
         output_cost_usd: None,
@@ -10630,6 +10754,33 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         let zero_snapshot_usage_evidence = parsed_file.zero_snapshot_usage_evidence;
         let dropped_usage_record_count = parsed_file.dropped_usage_record_count;
         let mut parsed = parsed_file.snapshots;
+        if source == SnapshotSource::ClaudeCode && parse_complete {
+            if let Some((_, source_session_id)) = claude_index_path_family_member(&candidate.path) {
+                let marker_present = parsed.iter().any(|snapshot| {
+                    snapshot.source_session_id == source_session_id
+                        && snapshot.claude_context_curve_owned_start_proven
+                });
+                if !marker_present {
+                    index.claude_owned_start_census.remove(&source_session_id);
+                } else {
+                    let witness = index
+                        .claude_owned_start_census
+                        .entry(source_session_id)
+                        .or_insert_with(|| ClaudeOwnedStartCensusWitness {
+                            marker_source_file_fingerprint: source_file_fingerprint.clone(),
+                            verified_source_file_fingerprint: None,
+                            emitted_source_file_fingerprint: None,
+                        });
+                    if witness.marker_source_file_fingerprint != source_file_fingerprint {
+                        *witness = ClaudeOwnedStartCensusWitness {
+                            marker_source_file_fingerprint: source_file_fingerprint.clone(),
+                            verified_source_file_fingerprint: None,
+                            emitted_source_file_fingerprint: None,
+                        };
+                    }
+                }
+            }
+        }
         if source == SnapshotSource::Codex {
             for snapshot in parsed.iter_mut() {
                 apply_codex_state_evidence(snapshot, &codex_title_metadata);
@@ -17608,6 +17759,7 @@ impl ScanIndex {
         self.codex_state_only_snapshot_fingerprints.clear();
         self.codex_parent_ownership_refs.clear();
         self.codex_parent_ownership_ledgers.clear();
+        self.claude_owned_start_census.clear();
         self.resume_after_path = None;
         self.resume_upper_bound_path = None;
         self.resume_census_window_end = None;
@@ -18303,6 +18455,17 @@ impl ScanIndex {
                 snapshot_activity_at.insert(fingerprint.clone(), activity_at.clone());
             }
         }
+        let mut claude_owned_start_census = previous.claude_owned_start_census.clone();
+        for (source_session_id, witness) in &self.claude_owned_start_census {
+            let source_file_settled = self.files.keys().any(|key| {
+                safe_keys.contains(key)
+                    && claude_index_path_family_member(Path::new(key))
+                        .is_some_and(|(_, member)| member == *source_session_id)
+            });
+            if source_file_settled {
+                claude_owned_start_census.insert(source_session_id.clone(), witness.clone());
+            }
+        }
         let mut result = ScanIndex {
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: previous.generation,
@@ -18326,6 +18489,10 @@ impl ScanIndex {
             claude_duplicate_request_owners: self.claude_duplicate_request_owners.clone(),
             claude_duplicate_request_witness_overflowed: self
                 .claude_duplicate_request_witness_overflowed,
+            // In particular, do not commit `emitted_source_file_fingerprint`
+            // until the curve-bearing entity itself is accepted. Otherwise a
+            // shed upload could make the corrective reparse disappear.
+            claude_owned_start_census,
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
             claude_desktop_store_sweep_had_errors: self.claude_desktop_store_sweep_had_errors,
@@ -34161,6 +34328,236 @@ mod tests {
             vec!["2026-08-20T10:02:30Z".to_string()]
         );
         validate_context_curve(0, curve).expect("Claude curve validates");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_forked_owned_start_rearms_an_earlier_bounded_page() {
+        let path = temp_file("claude-forked-owned-start-page");
+        let source_session_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .expect("fixture stem")
+            .to_string();
+        fs::write(
+            &path,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-08-20T10:00:00Z\",\"sessionId\":\"{source_session_id}\",\"type\":\"assistant\",\"forkedFrom\":{{\"sessionId\":\"parent\",\"messageUuid\":\"parent-message\"}},\"requestId\":\"req_parent\",\"message\":{{\"id\":\"msg_parent\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":900000,\"output_tokens\":2}}}}}}\n",
+                    "{{\"timestamp\":\"2026-08-20T10:01:00Z\",\"sessionId\":\"{source_session_id}\",\"type\":\"assistant\",\"requestId\":\"req_owned\",\"message\":{{\"id\":\"msg_owned\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n"
+                ),
+                source_session_id = source_session_id,
+            ),
+        )
+        .expect("write fixture");
+        let parse = || {
+            parse_claude_code_jsonl_file(&path, "2026-08-20T10:02:00Z", "source".to_string())
+                .expect("parse")
+        };
+        let mut first_page = parse();
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&path),
+            manifest_index_entry(Some("unresolved")),
+        );
+        index.claude_owned_start_census.insert(
+            source_session_id.clone(),
+            ClaudeOwnedStartCensusWitness {
+                marker_source_file_fingerprint: "source".to_string(),
+                verified_source_file_fingerprint: None,
+                emitted_source_file_fingerprint: None,
+            },
+        );
+        apply_claude_reported_usage_with_index(
+            &mut first_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            false,
+            "2026-08-20T10:02:00Z",
+        );
+        assert_eq!(
+            first_page[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("ownership_unresolved")
+        );
+
+        apply_claude_reported_usage_with_index(
+            &mut [],
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            true,
+            "2026-08-20T10:02:00Z",
+        );
+        assert!(index.files[&local_index_key(&path)]
+            .source_file_fingerprint
+            .is_empty());
+        let durable_before_corrective_upload = index.clone();
+
+        let corrective_entry = index.files.get_mut(&local_index_key(&path)).unwrap();
+        corrective_entry.source_file_fingerprint = "source".to_string();
+        corrective_entry.last_snapshot_fingerprint = Some("complete".to_string());
+        let mut corrective_page = parse();
+        apply_claude_reported_usage_with_index(
+            &mut corrective_page,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            false,
+            "2026-08-20T10:03:00Z",
+        );
+        assert_eq!(
+            corrective_page[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("complete")
+        );
+        assert_eq!(
+            index.claude_owned_start_census[&source_session_id]
+                .emitted_source_file_fingerprint
+                .as_deref(),
+            Some("source")
+        );
+        let shed = index.committable_subset(
+            &durable_before_corrective_upload,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            shed.claude_owned_start_census[&source_session_id].emitted_source_file_fingerprint,
+            None,
+            "a shed corrective upload must remain re-armed"
+        );
+        let accepted = index.committable_subset(
+            &durable_before_corrective_upload,
+            &BTreeSet::from(["complete".to_string()]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            accepted.claude_owned_start_census[&source_session_id]
+                .emitted_source_file_fingerprint
+                .as_deref(),
+            Some("source")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_nonforked_owned_start_accepts_minimal_paired_request_evidence() {
+        let path = temp_file("claude-nonforked-paired-owned-start");
+        let source_session_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .expect("fixture stem")
+            .to_string();
+        fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"{source_session_id}\",\"type\":\"assistant\",\"requestId\":\"req_owned\",\"message\":{{\"id\":\"msg_owned\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut items =
+            parse_claude_code_jsonl_file(&path, "2026-08-20T11:02:00Z", "source".to_string())
+                .expect("parse");
+        let mut api = complete_api_row(&source_session_id, "req_owned", 1, 10, 2, 0);
+        api.client_request_id.clear();
+        api.cost_usd_micros = None;
+        api.event_sequence = None;
+        api.app_version.clear();
+        api.fingerprint.clear();
+        api.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&api).expect("serialize API evidence"))
+        );
+        let mut trace = complete_trace_row(&source_session_id, "req_owned", "");
+        trace.client_request_id.clear();
+        trace.fingerprint.clear();
+        trace.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&trace).expect("serialize trace evidence"))
+        );
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&path),
+            manifest_index_entry(Some("unresolved")),
+        );
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::from([(source_session_id.clone(), vec![api])]),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+                evidence: BTreeMap::from([(source_session_id, vec![trace])]),
+                ..Default::default()
+            },
+            &mut index,
+            true,
+            "2026-08-20T11:02:00Z",
+        );
+        assert_eq!(
+            items[0].usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        assert_eq!(items[0].cost, None);
+        assert_eq!(
+            items[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("complete")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_missing_request_pair_remains_truthfully_unresolved() {
+        let path = temp_file("claude-missing-pair-owned-start");
+        let source_session_id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .expect("fixture stem")
+            .to_string();
+        fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-08-20T12:01:00Z\",\"sessionId\":\"{source_session_id}\",\"type\":\"assistant\",\"requestId\":\"req_unpaired\",\"message\":{{\"id\":\"msg_unpaired\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut items =
+            parse_claude_code_jsonl_file(&path, "2026-08-20T12:02:00Z", "source".to_string())
+                .expect("parse");
+        let api = complete_api_row(&source_session_id, "req_unpaired", 1, 10, 2, 0);
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&path),
+            manifest_index_entry(Some("unresolved")),
+        );
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::from([(source_session_id, vec![api])]),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            true,
+            "2026-08-20T12:02:00Z",
+        );
+        assert_eq!(items[0].usage_accounting_contract, None);
+        assert_eq!(
+            items[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("ownership_unresolved")
+        );
         let _ = fs::remove_file(path);
     }
 

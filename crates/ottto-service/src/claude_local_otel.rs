@@ -167,9 +167,18 @@ pub fn capture_claude_api_request_logs(
     body: &[u8],
     content_type: &str,
 ) -> Result<usize> {
-    if !content_type.to_ascii_lowercase().contains("json") {
+    let content_type = content_type.to_ascii_lowercase();
+    let evidence = if content_type.contains("json") {
+        api_evidence_from_json(body)?
+    } else if content_type.contains("protobuf") || content_type.contains("octet-stream") {
+        api_evidence_from_protobuf(body)?
+    } else {
         return Ok(0);
-    }
+    };
+    persist_api_evidence(support_dir, evidence)
+}
+
+fn api_evidence_from_json(body: &[u8]) -> Result<Vec<ClaudeLocalOtelEvidence>> {
     let payload: Value = serde_json::from_slice(body).context("parse Claude OTLP JSON logs")?;
     let mut evidence = Vec::new();
     for resource_logs in payload
@@ -196,12 +205,54 @@ pub fn capture_claude_api_request_logs(
                 }
                 let mut attrs = resource_attrs.clone();
                 attrs.extend(attributes_at(record.get("attributes")));
-                if let Some(item) = evidence_from_record(record, &attrs) {
+                if let Some(item) = api_evidence_from_attrs(&attrs, timestamp_at(record)) {
                     evidence.push(item);
                 }
             }
         }
     }
+    Ok(evidence)
+}
+
+fn api_evidence_from_protobuf(body: &[u8]) -> Result<Vec<ClaudeLocalOtelEvidence>> {
+    let payload = otlp_proto::ExportLogsServiceRequest::decode(body)
+        .context("parse Claude OTLP protobuf logs")?;
+    let mut evidence = Vec::new();
+    for resource_logs in payload.resource_logs {
+        let resource_attrs = proto_attributes(
+            resource_logs
+                .resource
+                .as_ref()
+                .map(|resource| resource.attributes.as_slice())
+                .unwrap_or_default(),
+        );
+        for scope_logs in resource_logs.scope_logs {
+            for record in scope_logs.log_records {
+                if record.body.as_ref().and_then(proto_any_value).as_deref()
+                    != Some("claude_code.api_request")
+                {
+                    continue;
+                }
+                let mut attrs = resource_attrs.clone();
+                attrs.extend(proto_attributes(&record.attributes));
+                let observed_at = format_nanos(i128::from(if record.time_unix_nano > 0 {
+                    record.time_unix_nano
+                } else {
+                    record.observed_time_unix_nano
+                }));
+                if let Some(item) = api_evidence_from_attrs(&attrs, observed_at) {
+                    evidence.push(item);
+                }
+            }
+        }
+    }
+    Ok(evidence)
+}
+
+fn persist_api_evidence(
+    support_dir: &Path,
+    evidence: Vec<ClaudeLocalOtelEvidence>,
+) -> Result<usize> {
     if evidence.is_empty() {
         return Ok(0);
     }
@@ -624,9 +675,9 @@ fn sidecar_fingerprint(path: PathBuf, namespace: &str) -> String {
     )
 }
 
-fn evidence_from_record(
-    record: &Value,
+fn api_evidence_from_attrs(
     attrs: &BTreeMap<String, String>,
+    observed_at: Option<String>,
 ) -> Option<ClaudeLocalOtelEvidence> {
     let session_id = first_attr(attrs, &["session.id", "session_id"])?;
     let model = first_attr(attrs, &["model", "gen_ai.request.model"])?;
@@ -635,7 +686,7 @@ fn evidence_from_record(
         .map(str::to_ascii_lowercase)
         .filter(|value| VALID_EFFORTS.contains(&value.as_str()))
         .unwrap_or_default();
-    let observed_at = timestamp_at(record)?;
+    let observed_at = observed_at?;
     // Anthropic's own request id, not the client-generated one: the transcript
     // records `requestId` from the response, so only this value joins.
     let request_id = first_attr(attrs, &["request_id", "gen_ai.response.id"])
@@ -947,10 +998,42 @@ fn append_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Minimal OTLP trace wire surface. Keeping these definitions local avoids
-/// retaining span events, links, status, trace ids, or any non-allowlisted
-/// content after decoding.
+/// Minimal OTLP log/trace wire surface. Keeping these definitions local avoids
+/// retaining log bodies, span events, links, status, trace ids, or any
+/// non-allowlisted content after decoding.
 mod otlp_proto {
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct ExportLogsServiceRequest {
+        #[prost(message, repeated, tag = "1")]
+        pub resource_logs: Vec<ResourceLogs>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct ResourceLogs {
+        #[prost(message, optional, tag = "1")]
+        pub resource: Option<Resource>,
+        #[prost(message, repeated, tag = "2")]
+        pub scope_logs: Vec<ScopeLogs>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct ScopeLogs {
+        #[prost(message, repeated, tag = "2")]
+        pub log_records: Vec<LogRecord>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct LogRecord {
+        #[prost(fixed64, tag = "1")]
+        pub time_unix_nano: u64,
+        #[prost(message, optional, tag = "5")]
+        pub body: Option<AnyValue>,
+        #[prost(message, repeated, tag = "6")]
+        pub attributes: Vec<KeyValue>,
+        #[prost(fixed64, tag = "11")]
+        pub observed_time_unix_nano: u64,
+    }
+
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct ExportTraceServiceRequest {
         #[prost(message, repeated, tag = "1")]
@@ -1089,6 +1172,38 @@ mod tests {
         .encode_to_vec()
     }
 
+    fn api_log_body() -> Vec<u8> {
+        otlp_proto::ExportLogsServiceRequest {
+            resource_logs: vec![otlp_proto::ResourceLogs {
+                resource: Some(otlp_proto::Resource {
+                    attributes: vec![
+                        proto_string("session.id", "sess-protobuf"),
+                        proto_string("service.version", "2.1.226"),
+                    ],
+                }),
+                scope_logs: vec![otlp_proto::ScopeLogs {
+                    log_records: vec![otlp_proto::LogRecord {
+                        time_unix_nano: 1_785_708_000_000_000_000,
+                        body: Some(otlp_proto::AnyValue {
+                            value: Some(otlp_proto::any_value::Value::StringValue(
+                                "claude_code.api_request".to_string(),
+                            )),
+                        }),
+                        attributes: vec![
+                            proto_string("request_id", "req-protobuf"),
+                            proto_string("model", "claude-opus-5"),
+                            proto_string("input_tokens", "12"),
+                            proto_string("output_tokens", "3"),
+                            proto_string("prompt", "must-not-persist"),
+                        ],
+                        observed_time_unix_nano: 0,
+                    }],
+                }],
+            }],
+        }
+        .encode_to_vec()
+    }
+
     #[test]
     fn indexes_effort_by_request_id_across_parent_and_subagent_turns() {
         let dir = std::env::temp_dir().join(format!("ottto-effort-req-{}", std::process::id()));
@@ -1177,6 +1292,29 @@ mod tests {
         let persisted = fs::read_to_string(evidence_path(&dir, "sess-1")).unwrap();
         assert!(!persisted.contains("must-not-persist"));
         assert!(!persisted.contains("123e4567-e89b-12d3-a456-426614174000"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn captures_protobuf_api_request_for_trace_pairing() {
+        let dir = std::env::temp_dir().join(format!("ottto-api-protobuf-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            capture_claude_api_request_logs(&dir, &api_log_body(), "application/x-protobuf")
+                .unwrap(),
+            1
+        );
+
+        let report = load_claude_api_request_evidence_report(&dir, ["sess-protobuf".to_string()]);
+        assert!(report.health.is_complete(), "{:?}", report.health);
+        let row = &report.evidence["sess-protobuf"][0];
+        assert_eq!(row.request_id, "req-protobuf");
+        assert_eq!(row.model, "claude-opus-5");
+        assert_eq!((row.input_tokens, row.output_tokens), (12, 3));
+        assert!(row.client_request_id.is_empty());
+        assert!(row.cost_usd_micros.is_none());
+        let persisted = fs::read_to_string(evidence_path(&dir, "sess-protobuf")).unwrap();
+        assert!(!persisted.contains("must-not-persist"));
         let _ = fs::remove_dir_all(dir);
     }
 
