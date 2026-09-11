@@ -2364,6 +2364,7 @@ fn stable_problem_code_slug(code: &StableProblemCode) -> &'static str {
         StableProblemCode::SecretExpired => "secret_expired",
         StableProblemCode::RelayUnavailable => "relay_unavailable",
         StableProblemCode::TelemetryNotVerified => "telemetry_not_verified",
+        StableProblemCode::TelemetryDisabledByAdmin => "telemetry_disabled_by_admin",
         StableProblemCode::SourceNotInstalled => "source_not_installed",
         StableProblemCode::AgentCliUnavailable => "agent_cli_unavailable",
         StableProblemCode::UnsupportedPlatform => "unsupported_platform",
@@ -3264,6 +3265,7 @@ fn source_health_from_verification(
             .iter()
             .any(|drift| drift.key.ends_with("config_file"));
     let patch_disabled = result.message.code == "patch_disabled";
+    let telemetry_disabled_by_admin = result.message.code == "telemetry_disabled_by_admin";
     let usage_limited = verification_result_is_usage_limited(result);
     let pi_local_only = result.source == SourceKind::Pi && result.message.code == "pi_local_only";
     let source_not_installed = result.message.code == SOURCE_NOT_INSTALLED_VERIFICATION_CODE;
@@ -3325,6 +3327,20 @@ fn source_health_from_verification(
                 },
                 detail: result.message.text.clone(),
                 retryable: true,
+            }],
+        )
+    } else if telemetry_disabled_by_admin {
+        (
+            SourceState::NeedsConfirmation,
+            HealthGrade::Warning,
+            vec![HealthProblem {
+                code: StableProblemCode::TelemetryDisabledByAdmin,
+                title: format!(
+                    "{} telemetry is turned off",
+                    source_display_name(&result.source)
+                ),
+                detail: result.message.text.clone(),
+                retryable: false,
             }],
         )
     } else if patch_disabled || usage_limited || pi_local_only {
@@ -3399,7 +3415,7 @@ fn source_health_from_verification(
                 result.config.fingerprint.clone(),
             )),
         }]
-    } else if result.verified || patch_disabled || usage_limited {
+    } else if result.verified || patch_disabled || usage_limited || telemetry_disabled_by_admin {
         Vec::new()
     } else {
         vec![RepairAction {
@@ -3643,6 +3659,13 @@ fn has_pi_oauth_reauth_problem(health: &SourceHealth) -> bool {
         })
 }
 
+fn has_telemetry_disabled_by_admin_problem(health: &SourceHealth) -> bool {
+    health
+        .problems
+        .iter()
+        .any(|problem| problem.code == StableProblemCode::TelemetryDisabledByAdmin)
+}
+
 fn refreshed_pi_status_has_available_routes(refreshed: &SourceHealth) -> bool {
     if refreshed.source != SourceKind::Pi || refreshed.state != SourceState::Healthy {
         return false;
@@ -3726,7 +3749,11 @@ fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: 
     let preserve_failed_verification = existing.last_verified_at.is_some()
         && has_verification_failure_problem(existing)
         && !clear_failed_verification;
-    if (preserve_config_drift && has_config_drift_problem(existing)) || preserve_failed_verification
+    let preserve_telemetry_disabled_by_admin =
+        existing.last_verified_at.is_some() && has_telemetry_disabled_by_admin_problem(existing);
+    if (preserve_config_drift && has_config_drift_problem(existing))
+        || preserve_failed_verification
+        || preserve_telemetry_disabled_by_admin
     {
         refreshed.state = existing.state.clone();
         refreshed.grade = existing.grade.clone();
@@ -5722,6 +5749,63 @@ mod tests {
                 .iter()
                 .any(|entry| entry.observed_at == attempt_at),
             "the soft verify attempt remains in the ledger for support triage"
+        );
+    }
+
+    #[test]
+    fn available_agent_status_preserves_admin_disabled_verification_policy() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let result = SourceVerificationResult {
+            source: SourceKind::Pi,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.pi/agent/settings.json".to_string()),
+                fingerprint: Some("sha256:test".to_string()),
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::NoFreshTelemetry,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-09-11T06:55:00Z".to_string()),
+            message: StableMessage {
+                code: "telemetry_disabled_by_admin".to_string(),
+                text: "Pi telemetry is turned off in this workspace. Turn telemetry on in Ottto, then retry Verify.".to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record admin-disabled policy");
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::Pi, "2026-09-11T07:05:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after refresh");
+        let source = status.sources.first().expect("Pi source");
+        assert_eq!(source.state, SourceState::NeedsConfirmation);
+        assert_eq!(source.grade, HealthGrade::Warning);
+        assert_eq!(
+            source.problems.first().map(|problem| &problem.code),
+            Some(&StableProblemCode::TelemetryDisabledByAdmin)
+        );
+        assert!(source.recommended_actions.is_empty());
+        let canonical = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Pi)
+            .expect("canonical Pi source");
+        assert_eq!(
+            canonical.blocking_reason.as_deref(),
+            Some("telemetry_disabled_by_admin")
         );
     }
 

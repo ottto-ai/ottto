@@ -2038,6 +2038,7 @@ pub enum StableProblemCode {
     SecretExpired,
     RelayUnavailable,
     TelemetryNotVerified,
+    TelemetryDisabledByAdmin,
     SourceNotInstalled,
     /// Data/config for the source is present on this machine but its CLI
     /// binary cannot be found or executed (for example a desktop-app-only
