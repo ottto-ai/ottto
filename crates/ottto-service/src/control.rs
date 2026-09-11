@@ -1112,7 +1112,8 @@ fn status_for(
 }
 
 fn verification_result_should_refresh_agent_status(result: &SourceVerificationResult) -> bool {
-    matches!(result.status, SourceVerificationStatus::NoFreshTelemetry)
+    (matches!(result.status, SourceVerificationStatus::NoFreshTelemetry)
+        && result.message.code != "telemetry_disabled_by_admin")
         || (matches!(result.status, SourceVerificationStatus::Failed)
             && matches!(
                 result.message.code.as_str(),
@@ -11982,10 +11983,7 @@ fn verification_failure_message(
     clear_condition: Option<&str>,
 ) -> String {
     if code == "telemetry_disabled_by_admin" {
-        return format!(
-            "{} telemetry is turned off in this workspace. Turn telemetry on in Ottto, then retry Verify.",
-            source_display_name(source)
-        );
+        return telemetry_disabled_by_admin_message(source);
     }
     if code == no_fresh_telemetry_code(source, smoke) {
         return no_fresh_telemetry_message(source, smoke);
@@ -12001,6 +11999,13 @@ fn verification_failure_message(
         );
     }
     no_fresh_telemetry_message(source, smoke)
+}
+
+fn telemetry_disabled_by_admin_message(source: &SourceKind) -> String {
+    format!(
+        "{} telemetry is turned off in this workspace. Turn telemetry on in Ottto, then retry Verify.",
+        source_display_name(source)
+    )
 }
 
 fn read_command_diagnostic_with_flags(
@@ -13992,6 +13997,15 @@ fn pi_route_aggregate_result(
         && route_results
             .iter()
             .all(|route| route.error_code.as_deref() == Some(PI_SESSION_CENSUS_FAILED_CODE));
+    let all_telemetry_disabled = total > 0
+        && route_results
+            .iter()
+            .all(|route| route.error_code.as_deref() == Some("telemetry_disabled_by_admin"));
+    let status = if all_telemetry_disabled {
+        SourceVerificationStatus::NoFreshTelemetry
+    } else {
+        status
+    };
     let (code, text): (&str, String) = match status {
         SourceVerificationStatus::Verified => {
             ("verified", format!("Verified {total} Pi model routes."))
@@ -14023,6 +14037,10 @@ fn pi_route_aggregate_result(
             PI_SESSION_CENSUS_FAILED_CODE,
             "Pi verification could not safely establish complete local session evidence before or after smoke. No local session evidence was accepted; check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify."
                 .to_string(),
+        ),
+        SourceVerificationStatus::NoFreshTelemetry if all_telemetry_disabled => (
+            "telemetry_disabled_by_admin",
+            telemetry_disabled_by_admin_message(&SourceKind::Pi),
         ),
         _ => (
             "pi_route_smoke_failed",
@@ -14130,6 +14148,22 @@ fn verification_result_for_backend_error_with_config(
         );
     }
     if let LocalApiError::Backend(details) = error {
+        if details.status == Some(403)
+            && backend_error_has_detail_code(details, "telemetry_disabled_by_admin")
+        {
+            return verification_result_with_config(
+                source.clone(),
+                config,
+                SourceVerificationStatus::NoFreshTelemetry,
+                false,
+                0,
+                None,
+                None,
+                smoke_after,
+                "telemetry_disabled_by_admin",
+                &telemetry_disabled_by_admin_message(&source),
+            );
+        }
         if details.status == Some(401) {
             let expired = details
                 .body_excerpt
@@ -14193,6 +14227,20 @@ fn verification_result_for_backend_error_with_config(
         "verification_service_unavailable",
         "Could not reach Ottto verification. Check your network and retry.",
     )
+}
+
+fn backend_error_has_detail_code(details: &BackendErrorDetails, code: &str) -> bool {
+    let Some(body) = details.body_excerpt.as_deref() else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(detail) = value.get("detail") else {
+        return false;
+    };
+    detail.as_str() == Some(code)
+        || detail.get("code").and_then(serde_json::Value::as_str) == Some(code)
 }
 
 fn no_fresh_telemetry_message(source: &SourceKind, smoke: &SmokeResult) -> String {
@@ -15369,6 +15417,76 @@ mod tests {
 
         assert_eq!(aggregate.status, SourceVerificationStatus::Verified);
         assert!(aggregate.verified);
+    }
+
+    #[test]
+    fn pi_admin_disabled_import_rejection_stays_typed_and_non_blocking() {
+        let error = LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: "/api/v1/pi/sessions/import".to_string(),
+            status: Some(403),
+            body_excerpt: Some(r#"{"detail":"telemetry_disabled_by_admin"}"#.to_string()),
+        });
+        let smoke = SmokeResult {
+            command_found: true,
+            succeeded: true,
+            exit_status: Some(0),
+            duration_ms: 12_000,
+            message: "Pi smoke session completed.".to_string(),
+            diagnostic: None,
+            error_code: None,
+            local_session_observed: Some(true),
+        };
+
+        let route = pi_route_result_from_backend_error(
+            &live_pi_route(),
+            &smoke,
+            Some("2026-09-11T06:55:00Z".to_string()),
+            &error,
+        );
+        assert_eq!(route.status, SourceVerificationStatus::NoFreshTelemetry);
+        assert_eq!(
+            route.error_code.as_deref(),
+            Some("telemetry_disabled_by_admin")
+        );
+        assert!(!route.message.text.contains("Sign in"));
+
+        let aggregate = pi_route_aggregate_result(vec![route]);
+        assert_eq!(aggregate.status, SourceVerificationStatus::NoFreshTelemetry);
+        assert_eq!(aggregate.message.code, "telemetry_disabled_by_admin");
+        assert!(aggregate
+            .message
+            .text
+            .contains("turned off in this workspace"));
+        assert!(!verification_result_should_refresh_agent_status(&aggregate));
+
+        let daemon = daemon().with_account(connected_account());
+        daemon
+            .record_verification_result(&aggregate)
+            .expect("record typed admin-disabled result");
+        assert!(daemon
+            .sources_with_blocking_verification_failure()
+            .expect("list blocking verification failures")
+            .is_empty());
+        let status = daemon.status("token").expect("read projected health");
+        let source = status.sources.first().expect("Pi source health");
+        assert_eq!(source.grade, ottto_protocol::HealthGrade::Warning);
+        assert_eq!(
+            source.problems.first().map(|problem| &problem.code),
+            Some(&ottto_protocol::StableProblemCode::TelemetryDisabledByAdmin)
+        );
+        assert!(source.recommended_actions.is_empty());
+        let canonical_source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Pi)
+            .expect("canonical Pi source");
+        assert_eq!(
+            canonical_source.blocking_reason.as_deref(),
+            Some("telemetry_disabled_by_admin")
+        );
     }
 
     #[test]
