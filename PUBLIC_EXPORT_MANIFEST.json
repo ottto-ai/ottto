@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 369,
-  "content_sha256": "26df816817c4be4d9ff8e667f0ad076b61c60bc777fc7d809f3b955034661b66",
+  "candidate_file_count": 370,
+  "content_sha256": "234c9d9b744919bd925eabe7f6d412bf5a97297bfc827fb71d4a8af63eae520f",
   "files": [
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_upkeep.rs",
-      "sha256": "b0e6e05030457f458e2cc8ee62b5bc887dfb64cd8c5d48b9cbcd5bb0a089930e",
-      "size_bytes": 67012
+      "sha256": "2a3747f937acb9fb3ce6afc70a9fd645380e1f3d8443c627088442a15ed78cf0",
+      "size_bytes": 79224
     },
     {
       "executable": false,
@@ -1590,6 +1590,13 @@
       "path": "docs/session-2026-09-11-claude-owned-start-emission.md",
       "sha256": "4c086b91cb10defe8bb3155498a0fe4f4bde64d40306271932210e23afae7a23",
       "size_bytes": 2803
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-09-11-claude-upkeep-completion-status.md",
+      "sha256": "4de672b874bc32de60b2563ed65b93ada49c0505bf98c8b61d2d5fe309b7417e",
+      "size_bytes": 2295
     },
     {
       "executable": false,
@@ -2586,9 +2593,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-11T07:33:23+00:00",
+  "generated_at": "2026-09-11T20:09:58+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 370,
+  "output_file_count": 371,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2622,5 +2629,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "07a670f9e5ef4d0c81e46f6f4f979cd2eb3f08a9"
+  "source_commit": "b5504989a2a654a1825cbe0160d3401a00abecdf"
 }
