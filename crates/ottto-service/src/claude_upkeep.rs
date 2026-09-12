@@ -240,7 +240,7 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
                 if status.consent != ClaudeAccountUpkeepConsentState::Granted {
                     return Err(ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented);
                 }
-                if !slot_is_still_registered(&status, descriptor) {
+                if !slot_is_still_registered(status, descriptor) {
                     return Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin);
                 }
                 if crate::claude_browser_auth::collection_suppression(&descriptor.slot_id).is_some()
@@ -271,7 +271,7 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
         FileClaudeConfigSlotSettingsStore::default()
             .with_locked_status(|registry| {
                 if registry.consent != ClaudeAccountUpkeepConsentState::Granted
-                    || !slot_is_still_registered(&registry, descriptor)
+                    || !slot_is_still_registered(registry, descriptor)
                     || crate::claude_browser_auth::collection_suppression(&descriptor.slot_id)
                         .is_some()
                     || crate::agent_status::claude_oauth_usage_network_disabled()
@@ -1254,14 +1254,12 @@ mod tests {
 
         let gate = ProductionFinalSpawnGate;
         assert!(
-            matches!(
-                gate.start_if_allowed(
-                    &annotated,
-                    &FixedProcess(DoctorProcessResult::ExitZero),
-                    &config_dir,
-                ),
-                Ok(_)
-            ),
+            gate.start_if_allowed(
+                &annotated,
+                &FixedProcess(DoctorProcessResult::ExitZero),
+                &config_dir,
+            )
+            .is_ok(),
             "a registered slot carrying collector annotations must reach the doctor spawn"
         );
 
