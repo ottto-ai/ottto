@@ -1171,10 +1171,11 @@ fn start_inner(
     }
 
     let operation_for_thread = operation_id.clone();
-    if thread::Builder::new()
-        .name("ottto-claude-browser-auth".to_string())
-        .spawn(move || run_worker(&operation_for_thread))
-        .is_err()
+    if crate::support_dir_scope::spawn_pinned(
+        thread::Builder::new().name("ottto-claude-browser-auth".to_string()),
+        move || run_worker(&operation_for_thread),
+    )
+    .is_err()
     {
         fail_operation(&operation_id, ClaudeBrowserAuthOutcomeV1::LoginFailed);
     }
@@ -1481,9 +1482,10 @@ impl Drop for WorkerCeremonyGuard<'_> {
             release_ceremony(self.operation_id);
         } else if !releasable_terminal && !hold_for_provider {
             let operation_id = self.operation_id.to_string();
-            let _ = thread::Builder::new()
-                .name("ottto-claude-browser-auth-recovery".to_string())
-                .spawn(move || recover_operation(&operation_id));
+            let _ = crate::support_dir_scope::spawn_pinned(
+                thread::Builder::new().name("ottto-claude-browser-auth-recovery".to_string()),
+                move || recover_operation(&operation_id),
+            );
         }
     }
 }
@@ -2662,25 +2664,28 @@ pub fn recover_at_startup() {
         if fallback {
             spawn_fallback_observer(&operation_id);
         } else {
-            let _ = thread::Builder::new()
-                .name("ottto-claude-browser-auth-recovery".to_string())
-                .spawn(move || recover_operation(&operation_id));
+            let _ = crate::support_dir_scope::spawn_pinned(
+                thread::Builder::new().name("ottto-claude-browser-auth-recovery".to_string()),
+                move || recover_operation(&operation_id),
+            );
         }
     }
 }
 
 pub(crate) fn resume_operation_recovery(operation_id: &str) {
     let operation_id = operation_id.to_string();
-    let _ = thread::Builder::new()
-        .name("ottto-claude-browser-auth-recovery".to_string())
-        .spawn(move || recover_operation(&operation_id));
+    let _ = crate::support_dir_scope::spawn_pinned(
+        thread::Builder::new().name("ottto-claude-browser-auth-recovery".to_string()),
+        move || recover_operation(&operation_id),
+    );
 }
 
 fn spawn_fallback_observer(operation_id: &str) {
     let operation_id = operation_id.to_string();
-    let _ = thread::Builder::new()
-        .name("ottto-claude-browser-auth-fallback-observer".to_string())
-        .spawn(move || observe_fallback(&operation_id));
+    let _ = crate::support_dir_scope::spawn_pinned(
+        thread::Builder::new().name("ottto-claude-browser-auth-fallback-observer".to_string()),
+        move || observe_fallback(&operation_id),
+    );
 }
 
 fn observe_fallback(operation_id: &str) {

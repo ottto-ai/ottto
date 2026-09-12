@@ -14,12 +14,12 @@ pub use account_store::{
     default_account_path, default_connection_api_base_url, default_connection_path,
     default_device_path, default_machine_path, default_pending_device_credential_path,
     default_prior_device_path, default_sources_dir, default_support_dir,
-    is_persistent_installation_id, is_persistent_machine_id, source_state_file_name,
-    FileAccountStore, FileConnectionStore, FileDeviceStore, FileMachineStore,
-    FilePendingDeviceCredentialStore, FileSourceStateStore, LocalConnectionBinding,
-    LocalDeviceBinding, LocalDeviceCredentialBinding, LocalMachineBinding, LocalSourceState,
-    PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
-    PendingDeviceCredentialRequestAuthority,
+    is_persistent_installation_id, is_persistent_machine_id, pin_support_dir,
+    source_state_file_name, FileAccountStore, FileConnectionStore, FileDeviceStore,
+    FileMachineStore, FilePendingDeviceCredentialStore, FileSourceStateStore,
+    LocalConnectionBinding, LocalDeviceBinding, LocalDeviceCredentialBinding, LocalMachineBinding,
+    LocalSourceState, PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
+    PendingDeviceCredentialRequestAuthority, SupportDirPin,
 };
 pub use claude_account::{
     billing_identity_hash, claude_account_identifier_hash, claude_cli_account_identifier_hash,

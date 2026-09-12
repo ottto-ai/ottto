@@ -31,6 +31,7 @@ pub mod snapshot_client;
 pub mod snapshot_sync;
 pub mod snapshot_watcher;
 pub mod snapshots;
+mod support_dir_scope;
 #[cfg(unix)]
 pub mod unix_socket;
 pub mod upload_receipts;

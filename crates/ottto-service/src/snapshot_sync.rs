@@ -88,9 +88,21 @@ static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
 static CLAUDE_REFRESH_ACTIVITY: OnceLock<Mutex<ClaudeRefreshActivity>> = OnceLock::new();
 
 #[derive(Default)]
+/// Which installations have a Claude refresh worker running, and whether each
+/// has a trailing run queued behind it.
+///
+/// Keyed by support directory because a worker is pinned to one installation
+/// for its whole life. A single global flag would let a trigger for one
+/// installation be absorbed by a worker serving another, so that installation
+/// would never be refreshed while the other was refreshed twice. A daemon has
+/// exactly one installation, so in production this holds at most one entry.
 struct ClaudeRefreshActivity {
-    running: bool,
-    pending: bool,
+    workers: BTreeMap<PathBuf, ClaudeRefreshWorkerState>,
+}
+
+#[derive(Default)]
+struct ClaudeRefreshWorkerState {
+    trailing_run_queued: bool,
 }
 static SNAPSHOT_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -1220,9 +1232,9 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
     let home = home_dir()?;
     let support_dir = default_support_dir();
     let phase_offset = local_cadence_phase_offset(SNAPSHOT_SYNC_INTERVAL);
-    std::thread::Builder::new()
-        .name("ottto-snapshot-sync".to_string())
-        .spawn(move || {
+    crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name("ottto-snapshot-sync".to_string()),
+        move || {
             // Spread the fleet's cycle phase deterministically before the first
             // cycle. Otherwise phase is set by install or restart time, and every
             // fleet-wide event re-aligns every machine onto the same tick.
@@ -1328,9 +1340,9 @@ fn local_cadence_phase_offset(interval: Duration) -> Duration {
 }
 
 pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
-    std::thread::Builder::new()
-        .name("ottto-local-health-sync".to_string())
-        .spawn(move || loop {
+    crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name("ottto-local-health-sync".to_string()),
+        move || loop {
             if let Err(error) = upload_local_health_projection_now(&daemon) {
                 if !local_health_upload_can_wait_quietly(&error) {
                     eprintln!(
@@ -1340,8 +1352,9 @@ pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
                 }
             }
             std::thread::sleep(LOCAL_HEALTH_PROJECTION_INTERVAL);
-        })
-        .context("spawn local health projection sync")?;
+        },
+    )
+    .context("spawn local health projection sync")?;
     Ok(())
 }
 
@@ -1364,9 +1377,9 @@ const STARTUP_REVERIFY_SCHEDULE: &[Duration] = &[
 ];
 
 pub fn spawn_startup_source_reverify(daemon: LocalDaemon) {
-    let spawn_result = std::thread::Builder::new()
-        .name("ottto-startup-reverify".to_string())
-        .spawn(move || {
+    let spawn_result = crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name("ottto-startup-reverify".to_string()),
+        move || {
             for delay in STARTUP_REVERIFY_SCHEDULE {
                 std::thread::sleep(*delay);
                 let captured_at = current_rfc3339();
@@ -1386,7 +1399,8 @@ pub fn spawn_startup_source_reverify(daemon: LocalDaemon) {
                     }
                 }
             }
-        });
+        },
+    );
     if let Err(error) = spawn_result {
         eprintln!("startup source re-verify unavailable: {error}");
     }
@@ -1396,12 +1410,12 @@ pub fn spawn_startup_source_reverify(daemon: LocalDaemon) {
 /// This avoids a refresh-only worker winning the durable claim and leaving a
 /// concurrent collector with no post-refresh reading to upload.
 pub fn spawn_claude_agent_status_refresh(opportunity: &'static str) {
-    let Some(refresh_claim) = claim_claude_refresh_slot() else {
+    let Some(refresh_claim) = claim_claude_refresh_slot(&default_support_dir()) else {
         return;
     };
-    let spawn = std::thread::Builder::new()
-        .name(format!("ottto-claude-refresh-{opportunity}"))
-        .spawn(move || {
+    let spawn = crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name(format!("ottto-claude-refresh-{opportunity}")),
+        move || {
             let mut refresh_claim = refresh_claim;
             loop {
                 // Serialize with the cadence/full-sync path as well as other
@@ -1431,13 +1445,15 @@ pub fn spawn_claude_agent_status_refresh(opportunity: &'static str) {
                     break;
                 }
             }
-        });
+        },
+    );
     if let Err(error) = spawn {
         eprintln!("Claude agent-status {opportunity} refresh unavailable: {error}");
     }
 }
 
 struct ClaudeRefreshClaim {
+    support_dir: PathBuf,
     active: bool,
 }
 
@@ -1448,39 +1464,59 @@ impl ClaudeRefreshClaim {
         let mut activity = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if activity.pending {
-            activity.pending = false;
-            true
-        } else {
-            activity.running = false;
-            self.active = false;
-            false
+        let queued = activity
+            .workers
+            .get_mut(&self.support_dir)
+            .is_some_and(|worker| std::mem::take(&mut worker.trailing_run_queued));
+        if queued {
+            return true;
         }
+        activity.workers.remove(&self.support_dir);
+        self.active = false;
+        false
     }
 }
 
 impl Drop for ClaudeRefreshClaim {
     fn drop(&mut self) {
         if self.active {
-            reset_claude_refresh_activity();
+            release_claude_refresh_claim(&self.support_dir);
         }
     }
 }
 
-fn claim_claude_refresh_slot() -> Option<ClaudeRefreshClaim> {
+/// Release one installation's worker slot without disturbing any other.
+fn release_claude_refresh_claim(support_dir: &Path) {
+    CLAUDE_REFRESH_ACTIVITY
+        .get_or_init(|| Mutex::new(ClaudeRefreshActivity::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .workers
+        .remove(support_dir);
+}
+
+fn claim_claude_refresh_slot(support_dir: &Path) -> Option<ClaudeRefreshClaim> {
     let lock = CLAUDE_REFRESH_ACTIVITY.get_or_init(|| Mutex::new(ClaudeRefreshActivity::default()));
     let mut activity = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if activity.running {
-        activity.pending = true;
-        None
-    } else {
-        activity.running = true;
-        Some(ClaudeRefreshClaim { active: true })
+    if let Some(worker) = activity.workers.get_mut(support_dir) {
+        worker.trailing_run_queued = true;
+        return None;
     }
+    activity.workers.insert(
+        support_dir.to_path_buf(),
+        ClaudeRefreshWorkerState::default(),
+    );
+    Some(ClaudeRefreshClaim {
+        support_dir: support_dir.to_path_buf(),
+        active: true,
+    })
 }
 
+/// Clear every installation's worker slot. Tests share the process-global
+/// activity map, so each one starts and ends from a known-empty state.
+#[cfg(test)]
 fn reset_claude_refresh_activity() {
     let lock = CLAUDE_REFRESH_ACTIVITY.get_or_init(|| Mutex::new(ClaudeRefreshActivity::default()));
     *lock
@@ -1524,9 +1560,9 @@ struct ReverifySchedule {
 /// automatically with exponential backoff so the state converges on its own;
 /// the companion app already self-heals once the daemon reports healthy.
 pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
-    std::thread::Builder::new()
-        .name("ottto-failed-verify-retry".to_string())
-        .spawn(move || {
+    crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name("ottto-failed-verify-retry".to_string()),
+        move || {
             let mut schedules: Vec<ReverifySchedule> = Vec::new();
             loop {
                 std::thread::sleep(FAILED_VERIFY_POLL_INTERVAL);
@@ -1570,8 +1606,9 @@ pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
                         + reverify_backoff_delay(schedule.completed_attempts);
                 }
             }
-        })
-        .context("spawn failed-verification re-verify loop")?;
+        },
+    )
+    .context("spawn failed-verification re-verify loop")?;
     Ok(())
 }
 
@@ -1581,9 +1618,9 @@ pub fn spawn_one_shot_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
     if !claim_one_shot_sync_slot() {
         return Ok(());
     }
-    let spawn_result = std::thread::Builder::new()
-        .name("ottto-snapshot-sync-now".to_string())
-        .spawn(move || {
+    let spawn_result = crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name("ottto-snapshot-sync-now".to_string()),
+        move || {
             match sync_once(&home, &support_dir, &daemon) {
                 Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
                 Err(error) => {
@@ -1595,7 +1632,8 @@ pub fn spawn_one_shot_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                 }
             }
             set_one_shot_sync_in_flight(false);
-        });
+        },
+    );
     if let Err(error) = spawn_result {
         set_one_shot_sync_in_flight(false);
         return Err(error).context("spawn immediate local snapshot sync");
@@ -4297,9 +4335,9 @@ fn report_checkin_status_with_fresh_relay_token(
 /// during a multi-hour backlog drain.
 pub fn spawn_collector_checkin_heartbeat() -> Result<()> {
     let phase_offset = local_cadence_phase_offset(COLLECTOR_CHECKIN_INTERVAL);
-    std::thread::Builder::new()
-        .name("ottto-collector-checkin".to_string())
-        .spawn(move || {
+    crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name("ottto-collector-checkin".to_string()),
+        move || {
             std::thread::sleep(phase_offset);
             loop {
                 if let Err(error) = collector_checkin_once() {
@@ -4309,8 +4347,9 @@ pub fn spawn_collector_checkin_heartbeat() -> Result<()> {
                 }
                 std::thread::sleep(COLLECTOR_CHECKIN_INTERVAL);
             }
-        })
-        .context("spawn collector check-in heartbeat")?;
+        },
+    )
+    .context("spawn collector check-in heartbeat")?;
     Ok(())
 }
 
@@ -4914,9 +4953,10 @@ mod tests {
     #[serial]
     fn claude_refresh_hook_coalesces_and_raii_releases() {
         reset_claude_refresh_activity();
-        let mut first = claim_claude_refresh_slot().expect("first hook claim");
-        assert!(claim_claude_refresh_slot().is_none());
-        assert!(claim_claude_refresh_slot().is_none());
+        let support_dir = Path::new("/tmp/ottto-refresh-claim-installation");
+        let mut first = claim_claude_refresh_slot(support_dir).expect("first hook claim");
+        assert!(claim_claude_refresh_slot(support_dir).is_none());
+        assert!(claim_claude_refresh_slot(support_dir).is_none());
         assert!(
             first.take_pending_or_finish(),
             "triggers during startup queue one trailing wake run"
@@ -4925,9 +4965,35 @@ mod tests {
             !first.take_pending_or_finish(),
             "trailing run drains pending"
         );
-        let after_drop = claim_claude_refresh_slot().expect("RAII releases hook claim");
+        let after_drop = claim_claude_refresh_slot(support_dir).expect("RAII releases hook claim");
         drop(after_drop);
-        assert!(claim_claude_refresh_slot().is_some());
+        assert!(claim_claude_refresh_slot(support_dir).is_some());
+        reset_claude_refresh_activity();
+    }
+
+    /// A worker is pinned to one installation for its whole life, so a trigger
+    /// for a second installation must get its own claim rather than being
+    /// absorbed as a trailing run the first worker would spend on its own
+    /// directory.
+    #[test]
+    #[serial]
+    fn claude_refresh_claims_are_scoped_per_installation() {
+        reset_claude_refresh_activity();
+        let first_dir = Path::new("/tmp/ottto-refresh-claim-first");
+        let second_dir = Path::new("/tmp/ottto-refresh-claim-second");
+        let mut first = claim_claude_refresh_slot(first_dir).expect("first installation claim");
+        let mut second = claim_claude_refresh_slot(second_dir).expect("second installation claim");
+
+        assert!(claim_claude_refresh_slot(second_dir).is_none());
+        assert!(
+            !first.take_pending_or_finish(),
+            "a trigger for another installation must not queue a trailing run here"
+        );
+        assert!(
+            second.take_pending_or_finish(),
+            "the trailing run belongs to the installation it was triggered for"
+        );
+        assert!(!second.take_pending_or_finish());
         reset_claude_refresh_activity();
     }
 
