@@ -20,7 +20,7 @@ use ottto_protocol::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -45,7 +45,17 @@ static PRODUCTION_UPKEEP_QUEUE: OnceLock<Mutex<ProductionUpkeepQueue>> = OnceLoc
 struct ProductionUpkeepQueue {
     running: bool,
     queued_slot_ids: BTreeSet<String>,
-    descriptors: VecDeque<ClaudeConfigSlotDescriptorV1>,
+    queued: VecDeque<QueuedUpkeep>,
+}
+
+/// One queued attempt, with the installation it was queued for.
+///
+/// The worker outlives the collection pass that queued it, so it cannot ask the
+/// process which installation this descriptor came from; the answer may have
+/// changed. It carries that answer instead.
+struct QueuedUpkeep {
+    descriptor: ClaudeConfigSlotDescriptorV1,
+    support_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +194,7 @@ trait FinalSpawnGate {
         descriptor: &ClaudeConfigSlotDescriptorV1,
         process: &dyn DoctorProcessRunner,
         config_dir: &str,
+        staged_support_dir: &Path,
     ) -> Result<DoctorProcessStart, ClaudeConfigSlotUpkeepResultV1>;
 
     fn publish_preclaim_needs_login(
@@ -212,7 +223,12 @@ impl FinalSpawnGate for FixedFinalSpawnGate<'_> {
         _descriptor: &ClaudeConfigSlotDescriptorV1,
         process: &dyn DoctorProcessRunner,
         config_dir: &str,
+        staged_support_dir: &Path,
     ) -> Result<DoctorProcessStart, ClaudeConfigSlotUpkeepResultV1> {
+        assert_eq!(
+            staged_support_dir, self.support_dir,
+            "the observation must hand the gate the support directory it staged"
+        );
         if !self.network_enabled {
             return Err(ClaudeConfigSlotUpkeepResultV1::CollectionPaused);
         }
@@ -226,6 +242,19 @@ impl FinalSpawnGate for FixedFinalSpawnGate<'_> {
     }
 }
 
+/// Whether the live support directory is still the one this attempt staged.
+///
+/// Everything the production gate consults — the slot registry, the network
+/// switch, the operational stop file — resolves the support directory from the
+/// process, while the claim that authorized this attempt was taken against
+/// `staged`. If those two disagree the process moved between installations
+/// after the attempt began, so the accounts the gate is about to approve are
+/// not the accounts the attempt inspected. Refuse instead of running a vendor
+/// command against them.
+fn support_dir_still_matches(staged: &Path) -> bool {
+    default_support_dir() == staged
+}
+
 struct ProductionFinalSpawnGate;
 
 impl FinalSpawnGate for ProductionFinalSpawnGate {
@@ -234,7 +263,11 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
         descriptor: &ClaudeConfigSlotDescriptorV1,
         process: &dyn DoctorProcessRunner,
         config_dir: &str,
+        staged_support_dir: &Path,
     ) -> Result<DoctorProcessStart, ClaudeConfigSlotUpkeepResultV1> {
+        if !support_dir_still_matches(staged_support_dir) {
+            return Err(ClaudeConfigSlotUpkeepResultV1::ProbeFailed);
+        }
         FileClaudeConfigSlotSettingsStore::default()
             .with_locked_status(|status| {
                 if status.consent != ClaudeAccountUpkeepConsentState::Granted {
@@ -268,6 +301,9 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
         status: &ClaudeConfigSlotUpkeepStatusV1,
         now: OffsetDateTime,
     ) -> Result<Option<ClaudeConfigSlotUpkeepStatusV1>, ()> {
+        if !support_dir_still_matches(support_dir) {
+            return Err(());
+        }
         FileClaudeConfigSlotSettingsStore::default()
             .with_locked_status(|registry| {
                 if registry.consent != ClaudeAccountUpkeepConsentState::Granted
@@ -428,6 +464,7 @@ fn persisted_production_upkeep_observation(
 }
 
 fn enqueue_production_upkeep(descriptor: ClaudeConfigSlotDescriptorV1) {
+    let support_dir = default_support_dir();
     let queue =
         PRODUCTION_UPKEEP_QUEUE.get_or_init(|| Mutex::new(ProductionUpkeepQueue::default()));
     let should_spawn = {
@@ -435,7 +472,10 @@ fn enqueue_production_upkeep(descriptor: ClaudeConfigSlotDescriptorV1) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if queue.queued_slot_ids.insert(descriptor.slot_id.clone()) {
-            queue.descriptors.push_back(descriptor);
+            queue.queued.push_back(QueuedUpkeep {
+                descriptor,
+                support_dir,
+            });
         }
         if queue.running {
             false
@@ -456,7 +496,7 @@ fn enqueue_production_upkeep(descriptor: ClaudeConfigSlotDescriptorV1) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         queue.running = false;
         queue.queued_slot_ids.clear();
-        queue.descriptors.clear();
+        queue.queued.clear();
     }
 }
 
@@ -464,21 +504,30 @@ fn run_production_upkeep_queue() {
     let queue =
         PRODUCTION_UPKEEP_QUEUE.get_or_init(|| Mutex::new(ProductionUpkeepQueue::default()));
     loop {
-        let descriptor = {
+        let QueuedUpkeep {
+            descriptor,
+            support_dir,
+        } = {
             let mut queue = queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(descriptor) = queue.descriptors.pop_front() else {
+            let Some(queued) = queue.queued.pop_front() else {
                 queue.running = false;
                 break;
             };
-            descriptor
+            queued
         };
+        // Hold the queued installation for the whole attempt. Without this the
+        // registry read, the durable witness, and the `claude doctor` spawn
+        // below each re-resolve the support directory and can land on a
+        // different installation than the collection pass that queued this
+        // slot.
+        let _pin = ottto_core::pin_support_dir(support_dir.clone());
         let observation = observe_and_publish_registered_slot_upkeep_with_gate(
             &descriptor,
             true,
             true,
-            &default_support_dir(),
+            &support_dir,
             &SystemClock,
             &ProductionCredentialMetadataReader,
             &ProductionDoctorProcessRunner,
@@ -711,27 +760,27 @@ fn observe_registered_slot_upkeep_with_gate(
         ClaimOutcome::Claimed(token, status) => (token, status),
     };
 
-    let process_start = match final_gate.start_if_allowed(descriptor, process, config_dir) {
-        Ok(result) => result,
-        Err(result) => {
-            let completed = complete_attempt(support_dir, &token, result, clock.now()).unwrap_or(
-                ClaudeConfigSlotUpkeepStatusV1 {
-                    result: ClaudeConfigSlotUpkeepResultV1::ProbeFailed,
-                    ..in_progress
-                },
-            );
-            if result == ClaudeConfigSlotUpkeepResultV1::NeedsLogin {
-                // A removal may commit after the initial descriptor snapshot
-                // but before the final gate. Do not recreate its stale
-                // per-slot witness after the control path pruned it.
-                let _ = prune_slot_upkeep_state_at(support_dir, &descriptor.slot_id);
+    let process_start =
+        match final_gate.start_if_allowed(descriptor, process, config_dir, support_dir) {
+            Ok(result) => result,
+            Err(result) => {
+                let completed = complete_attempt(support_dir, &token, result, clock.now())
+                    .unwrap_or(ClaudeConfigSlotUpkeepStatusV1 {
+                        result: ClaudeConfigSlotUpkeepResultV1::ProbeFailed,
+                        ..in_progress
+                    });
+                if result == ClaudeConfigSlotUpkeepResultV1::NeedsLogin {
+                    // A removal may commit after the initial descriptor snapshot
+                    // but before the final gate. Do not recreate its stale
+                    // per-slot witness after the control path pruned it.
+                    let _ = prune_slot_upkeep_state_at(support_dir, &descriptor.slot_id);
+                }
+                return ClaudeUpkeepObservation {
+                    proceed_with_collection: false,
+                    status: completed,
+                };
             }
-            return ClaudeUpkeepObservation {
-                proceed_with_collection: false,
-                status: completed,
-            };
-        }
-    };
+        };
     let (result, proceed) = match process_start.wait(DOCTOR_TIMEOUT) {
         DoctorProcessResult::ExitZero => match credentials.read(
             &ClaudeConfigDirSlot::registered(config_dir.to_string())
@@ -1258,6 +1307,7 @@ mod tests {
                 &annotated,
                 &FixedProcess(DoctorProcessResult::ExitZero),
                 &config_dir,
+                &root,
             )
             .is_ok(),
             "a registered slot carrying collector annotations must reach the doctor spawn"
@@ -1271,6 +1321,7 @@ mod tests {
                     &unregistered,
                     &FixedProcess(DoctorProcessResult::ExitZero),
                     &config_dir,
+                    &root,
                 ),
                 Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin)
             ),
@@ -1285,6 +1336,7 @@ mod tests {
                     &moved,
                     &FixedProcess(DoctorProcessResult::ExitZero),
                     &config_dir,
+                    &root,
                 ),
                 Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin)
             ),
@@ -1366,6 +1418,196 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A background upkeep attempt that was staged against one installation
+    /// must never run `claude doctor` against another.
+    ///
+    /// This is the shape that refreshed the operator's real Claude credentials
+    /// from a library test run on 2026-09-12: a detached worker outlived the
+    /// staging guard, resolved the developer's own support directory, read its
+    /// registry, and approved a vendor command against accounts no test ever
+    /// staged.
+    #[test]
+    #[serial]
+    fn the_production_gate_refuses_a_support_dir_the_attempt_never_staged() {
+        let staged = temp_dir("gate-staged-support-dir");
+        let ambient = temp_dir("gate-ambient-support-dir");
+        let config_dir = ambient.join("registered-account");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+
+        // The ambient installation is fully willing: consent granted, the slot
+        // registered, no stop file. Only the staged/ambient mismatch stands
+        // between the worker and the vendor command.
+        let _support_guard = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            ambient.as_os_str().to_os_string(),
+        );
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let descriptor = store
+            .register_path(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                config_dir.to_string_lossy().into_owned(),
+            )
+            .expect("register anchor")
+            .external_slots
+            .last()
+            .expect("registered slot")
+            .clone();
+        store
+            .set_upkeep_consent(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                true,
+            )
+            .expect("grant upkeep consent");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let process = CountingProcess {
+            result: DoctorProcessResult::ExitZero,
+            calls: Arc::clone(&calls),
+        };
+        assert_eq!(
+            ProductionFinalSpawnGate
+                .start_if_allowed(
+                    &descriptor,
+                    &process,
+                    descriptor.config_dir.as_deref().expect("config"),
+                    &staged,
+                )
+                .map(|start| start.wait(DOCTOR_TIMEOUT)),
+            Err(ClaudeConfigSlotUpkeepResultV1::ProbeFailed)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no vendor command may run against an installation the attempt never staged"
+        );
+
+        // Same gate, same willing registry: staging against the installation
+        // the gate reads is what makes it proceed, so the refusal above is the
+        // mismatch and nothing else.
+        assert!(
+            ProductionFinalSpawnGate
+                .start_if_allowed(
+                    &descriptor,
+                    &process,
+                    descriptor.config_dir.as_deref().expect("config"),
+                    &ambient,
+                )
+                .is_ok(),
+            "the staged installation must still reach the doctor spawn"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let _ = fs::remove_dir_all(staged);
+        let _ = fs::remove_dir_all(ambient);
+    }
+
+    /// The background worker stays on the installation that queued the slot,
+    /// even when the environment names a different one before it runs.
+    ///
+    /// The staging guard is deliberately dropped while the worker is blocked
+    /// mid-attempt, which is the ordering that let a library test run reach the
+    /// operator's own accounts.
+    #[test]
+    #[serial]
+    fn a_queued_attempt_stays_on_the_installation_that_queued_it() {
+        let staged = temp_dir("queued-staged-support-dir");
+        let elsewhere = temp_dir("queued-elsewhere-support-dir");
+        let config_dir = staged.join("registered-account");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        // Expired access with a live refresh grant is the only shape that
+        // queues production upkeep at all.
+        fs::write(
+            config_dir.join(".credentials.json"),
+            br#"{"claudeAiOauth":{"accessToken":"test-access","refreshToken":"test-refresh","expiresAt":1000000000000,"refreshTokenExpiresAt":4000000000000}}"#,
+        )
+        .expect("write slot credential");
+        // An empty search path resolves neither `claude` nor `security`, so no
+        // vendor process can run whichever installation the worker picks.
+        let empty_bin = temp_dir("queued-empty-search-path");
+        let _commands = EnvGuard::set(
+            "OTTTO_COMMAND_SEARCH_PATH",
+            empty_bin.as_os_str().to_os_string(),
+        );
+
+        // Block the worker inside its claim so the environment provably moves
+        // mid-attempt rather than racing the drain.
+        let state_guard = upkeep_state_guard(&staged).expect("hold upkeep state");
+
+        // `elsewhere` is installed first so that dropping the staging guard
+        // restores it rather than unsetting the variable. An unset variable
+        // would resolve to the developer's own installation, which is the very
+        // thing this test exists to keep background work away from.
+        let _moved = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            elsewhere.as_os_str().to_os_string(),
+        );
+        let descriptor = {
+            let _support_guard = EnvGuard::set(
+                "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+                staged.as_os_str().to_os_string(),
+            );
+            let store = FileClaudeConfigSlotSettingsStore::default();
+            let descriptor = store
+                .register_path(
+                    ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                    config_dir.to_string_lossy().into_owned(),
+                )
+                .expect("register anchor")
+                .external_slots
+                .last()
+                .expect("registered slot")
+                .clone();
+            store
+                .set_upkeep_consent(
+                    ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                    true,
+                )
+                .expect("grant upkeep consent");
+            let mut due = descriptor.clone();
+            due.collection.access_expires_at = Some("2020-01-01T00:00:00Z".to_string());
+            due.collection.relogin_required_at = Some("2099-01-01T00:00:00Z".to_string());
+            assert_eq!(
+                observe_registered_slot_upkeep(&due, true, true)
+                    .status
+                    .result,
+                ClaudeConfigSlotUpkeepResultV1::InProgress
+            );
+            descriptor
+        };
+
+        drop(state_guard);
+
+        let drain_deadline = Instant::now() + Duration::from_secs(10);
+        while PRODUCTION_UPKEEP_QUEUE.get().is_some_and(|queue| {
+            !queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .queued_slot_ids
+                .is_empty()
+        }) && Instant::now() < drain_deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let witness = load_state(&staged).expect("staged upkeep state");
+        assert_eq!(
+            witness
+                .slots
+                .get(&descriptor.slot_id)
+                .map(|slot| slot.result),
+            Some(ClaudeConfigSlotUpkeepResultV1::MissingBinary),
+            "the attempt must complete against the installation that queued it"
+        );
+        assert!(
+            !elsewhere.join(UPKEEP_STATE_FILE).exists(),
+            "no durable upkeep state may reach an installation the attempt never staged"
+        );
+
+        let _ = fs::remove_dir_all(staged);
+        let _ = fs::remove_dir_all(elsewhere);
+        let _ = fs::remove_dir_all(empty_bin);
     }
 
     #[test]
@@ -1759,7 +2001,8 @@ mod tests {
                 .start_if_allowed(
                     &descriptor,
                     &process,
-                    descriptor.config_dir.as_deref().expect("config")
+                    descriptor.config_dir.as_deref().expect("config"),
+                    &root,
                 )
                 .map(|start| start.wait(DOCTOR_TIMEOUT)),
             Err(ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented)
@@ -1778,7 +2021,8 @@ mod tests {
                 .start_if_allowed(
                     &descriptor,
                     &process,
-                    descriptor.config_dir.as_deref().expect("config")
+                    descriptor.config_dir.as_deref().expect("config"),
+                    &root,
                 )
                 .map(|start| start.wait(DOCTOR_TIMEOUT)),
             Err(ClaudeConfigSlotUpkeepResultV1::CollectionPaused)
@@ -1792,7 +2036,8 @@ mod tests {
                 .start_if_allowed(
                     &descriptor,
                     &process,
-                    descriptor.config_dir.as_deref().expect("config")
+                    descriptor.config_dir.as_deref().expect("config"),
+                    &root,
                 )
                 .map(|start| start.wait(DOCTOR_TIMEOUT)),
             Err(ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled)
@@ -1810,7 +2055,8 @@ mod tests {
                 .start_if_allowed(
                     &descriptor,
                     &process,
-                    descriptor.config_dir.as_deref().expect("config")
+                    descriptor.config_dir.as_deref().expect("config"),
+                    &root,
                 )
                 .map(|start| start.wait(DOCTOR_TIMEOUT)),
             Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin)

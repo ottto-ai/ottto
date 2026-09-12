@@ -1220,9 +1220,9 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
     let home = home_dir()?;
     let support_dir = default_support_dir();
     let phase_offset = local_cadence_phase_offset(SNAPSHOT_SYNC_INTERVAL);
-    std::thread::Builder::new()
-        .name("ottto-snapshot-sync".to_string())
-        .spawn(move || {
+    crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name("ottto-snapshot-sync".to_string()),
+        move || {
             // Spread the fleet's cycle phase deterministically before the first
             // cycle. Otherwise phase is set by install or restart time, and every
             // fleet-wide event re-aligns every machine onto the same tick.
@@ -1328,9 +1328,9 @@ fn local_cadence_phase_offset(interval: Duration) -> Duration {
 }
 
 pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
-    std::thread::Builder::new()
-        .name("ottto-local-health-sync".to_string())
-        .spawn(move || loop {
+    crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name("ottto-local-health-sync".to_string()),
+        move || loop {
             if let Err(error) = upload_local_health_projection_now(&daemon) {
                 if !local_health_upload_can_wait_quietly(&error) {
                     eprintln!(
@@ -1340,8 +1340,9 @@ pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
                 }
             }
             std::thread::sleep(LOCAL_HEALTH_PROJECTION_INTERVAL);
-        })
-        .context("spawn local health projection sync")?;
+        },
+    )
+    .context("spawn local health projection sync")?;
     Ok(())
 }
 
@@ -1364,9 +1365,9 @@ const STARTUP_REVERIFY_SCHEDULE: &[Duration] = &[
 ];
 
 pub fn spawn_startup_source_reverify(daemon: LocalDaemon) {
-    let spawn_result = std::thread::Builder::new()
-        .name("ottto-startup-reverify".to_string())
-        .spawn(move || {
+    let spawn_result = crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name("ottto-startup-reverify".to_string()),
+        move || {
             for delay in STARTUP_REVERIFY_SCHEDULE {
                 std::thread::sleep(*delay);
                 let captured_at = current_rfc3339();
@@ -1386,7 +1387,8 @@ pub fn spawn_startup_source_reverify(daemon: LocalDaemon) {
                     }
                 }
             }
-        });
+        },
+    );
     if let Err(error) = spawn_result {
         eprintln!("startup source re-verify unavailable: {error}");
     }
@@ -1399,9 +1401,9 @@ pub fn spawn_claude_agent_status_refresh(opportunity: &'static str) {
     let Some(refresh_claim) = claim_claude_refresh_slot() else {
         return;
     };
-    let spawn = std::thread::Builder::new()
-        .name(format!("ottto-claude-refresh-{opportunity}"))
-        .spawn(move || {
+    let spawn = crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name(format!("ottto-claude-refresh-{opportunity}")),
+        move || {
             let mut refresh_claim = refresh_claim;
             loop {
                 // Serialize with the cadence/full-sync path as well as other
@@ -1431,7 +1433,8 @@ pub fn spawn_claude_agent_status_refresh(opportunity: &'static str) {
                     break;
                 }
             }
-        });
+        },
+    );
     if let Err(error) = spawn {
         eprintln!("Claude agent-status {opportunity} refresh unavailable: {error}");
     }
@@ -1524,9 +1527,9 @@ struct ReverifySchedule {
 /// automatically with exponential backoff so the state converges on its own;
 /// the companion app already self-heals once the daemon reports healthy.
 pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
-    std::thread::Builder::new()
-        .name("ottto-failed-verify-retry".to_string())
-        .spawn(move || {
+    crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name("ottto-failed-verify-retry".to_string()),
+        move || {
             let mut schedules: Vec<ReverifySchedule> = Vec::new();
             loop {
                 std::thread::sleep(FAILED_VERIFY_POLL_INTERVAL);
@@ -1570,8 +1573,9 @@ pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
                         + reverify_backoff_delay(schedule.completed_attempts);
                 }
             }
-        })
-        .context("spawn failed-verification re-verify loop")?;
+        },
+    )
+    .context("spawn failed-verification re-verify loop")?;
     Ok(())
 }
 
@@ -1581,9 +1585,9 @@ pub fn spawn_one_shot_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
     if !claim_one_shot_sync_slot() {
         return Ok(());
     }
-    let spawn_result = std::thread::Builder::new()
-        .name("ottto-snapshot-sync-now".to_string())
-        .spawn(move || {
+    let spawn_result = crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name("ottto-snapshot-sync-now".to_string()),
+        move || {
             match sync_once(&home, &support_dir, &daemon) {
                 Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
                 Err(error) => {
@@ -1595,7 +1599,8 @@ pub fn spawn_one_shot_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                 }
             }
             set_one_shot_sync_in_flight(false);
-        });
+        },
+    );
     if let Err(error) = spawn_result {
         set_one_shot_sync_in_flight(false);
         return Err(error).context("spawn immediate local snapshot sync");
@@ -4297,9 +4302,9 @@ fn report_checkin_status_with_fresh_relay_token(
 /// during a multi-hour backlog drain.
 pub fn spawn_collector_checkin_heartbeat() -> Result<()> {
     let phase_offset = local_cadence_phase_offset(COLLECTOR_CHECKIN_INTERVAL);
-    std::thread::Builder::new()
-        .name("ottto-collector-checkin".to_string())
-        .spawn(move || {
+    crate::support_dir_scope::spawn_pinned(
+        std::thread::Builder::new().name("ottto-collector-checkin".to_string()),
+        move || {
             std::thread::sleep(phase_offset);
             loop {
                 if let Err(error) = collector_checkin_once() {
@@ -4309,8 +4314,9 @@ pub fn spawn_collector_checkin_heartbeat() -> Result<()> {
                 }
                 std::thread::sleep(COLLECTOR_CHECKIN_INTERVAL);
             }
-        })
-        .context("spawn collector check-in heartbeat")?;
+        },
+    )
+    .context("spawn collector check-in heartbeat")?;
     Ok(())
 }
 
