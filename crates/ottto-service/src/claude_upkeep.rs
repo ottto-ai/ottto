@@ -240,12 +240,7 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
                 if status.consent != ClaudeAccountUpkeepConsentState::Granted {
                     return Err(ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented);
                 }
-                let still_registered = status
-                    .managed_slots
-                    .iter()
-                    .chain(status.external_slots.iter())
-                    .any(|current| current == descriptor);
-                if !still_registered {
+                if !slot_is_still_registered(status, descriptor) {
                     return Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin);
                 }
                 if crate::claude_browser_auth::collection_suppression(&descriptor.slot_id).is_some()
@@ -275,13 +270,8 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
     ) -> Result<Option<ClaudeConfigSlotUpkeepStatusV1>, ()> {
         FileClaudeConfigSlotSettingsStore::default()
             .with_locked_status(|registry| {
-                let still_registered = registry
-                    .managed_slots
-                    .iter()
-                    .chain(registry.external_slots.iter())
-                    .any(|current| current == descriptor);
                 if registry.consent != ClaudeAccountUpkeepConsentState::Granted
-                    || !still_registered
+                    || !slot_is_still_registered(registry, descriptor)
                     || crate::claude_browser_auth::collection_suppression(&descriptor.slot_id)
                         .is_some()
                     || crate::agent_status::claude_oauth_usage_network_disabled()
@@ -293,6 +283,32 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
             })
             .map_err(|_| ())?
     }
+}
+
+/// Whether the settings registry still holds this exact slot.
+///
+/// Compares registration identity only. `ClaudeConfigSlotDescriptorV1` also
+/// carries `collection`, which is collector-owned and changes on every pass:
+/// the registry builds descriptors with an empty collection status while the
+/// caller's copy has been annotated with live expiry, quota, and upkeep state.
+/// Comparing whole descriptors therefore answered "still registered?" with
+/// "no" for every slot that had ever collected, so consented upkeep returned
+/// `NeedsLogin`, pruned its own witness, and left the account's limits dark
+/// while its refresh grant was still valid.
+fn slot_is_still_registered(
+    registry: &ottto_protocol::ClaudeAccountsStatusV1,
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+) -> bool {
+    registry
+        .managed_slots
+        .iter()
+        .chain(registry.external_slots.iter())
+        .any(|current| {
+            current.slot_id == descriptor.slot_id
+                && current.ownership == descriptor.ownership
+                && current.config_dir == descriptor.config_dir
+                && current.service_name == descriptor.service_name
+        })
 }
 
 struct ProductionDoctorProcessRunner;
@@ -468,6 +484,19 @@ fn run_production_upkeep_queue() {
             &ProductionDoctorProcessRunner,
             &ProductionFinalSpawnGate,
         );
+        if observation.status.result == ClaudeConfigSlotUpkeepResultV1::Refreshed {
+            // The rejections that may have opened this account's usage breaker
+            // came from the access token upkeep just replaced.
+            if let (Some(account), Some(organization)) = (
+                descriptor.collection.account_identifier_hash.as_deref(),
+                descriptor
+                    .collection
+                    .organization_identifier_hash
+                    .as_deref(),
+            ) {
+                crate::agent_status::clear_claude_oauth_usage_auth_breaker(account, organization);
+            }
+        }
         if matches!(
             observation.status.result,
             ClaudeConfigSlotUpkeepResultV1::Refreshed | ClaudeConfigSlotUpkeepResultV1::NeedsLogin
@@ -1178,6 +1207,91 @@ mod tests {
             refresh_token_expires_at: Some(refresh.to_string()),
             has_refresh_token: true,
         }
+    }
+
+    /// The settings registry returns descriptors carrying registration
+    /// identity only; the collector hands upkeep the same slot annotated with
+    /// its live collection status. Comparing whole descriptors answers "is
+    /// this slot still registered?" with "no" for every slot that has ever
+    /// collected, so every consented refresh returns `NeedsLogin`, the witness
+    /// is pruned, and the account's limits stay dark while its refresh grant
+    /// is still valid.
+    #[test]
+    #[serial]
+    fn collector_annotated_descriptor_is_still_a_registered_slot() {
+        let root = temp_dir("gate-annotated-descriptor");
+        let _support_guard = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        store
+            .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, true)
+            .expect("grant upkeep consent");
+        let config_dir = root.join("registered-account");
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        let config_dir = config_dir.to_string_lossy().into_owned();
+        let registered = store
+            .register_path(
+                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                config_dir.clone(),
+            )
+            .expect("register anchor")
+            .external_slots
+            .last()
+            .expect("registered slot")
+            .clone();
+
+        let mut annotated = registered.clone();
+        annotated.collection.observed_at = Some("2026-09-12T18:44:32Z".to_string());
+        annotated.collection.access_expires_at = Some("2026-09-11T20:46:23Z".to_string());
+        annotated.collection.relogin_required_at = Some("2026-10-09T22:37:38Z".to_string());
+        annotated.collection.has_account_windows = true;
+        assert_ne!(
+            annotated, registered,
+            "the annotated descriptor must differ from its registry twin, or this proves nothing"
+        );
+
+        let gate = ProductionFinalSpawnGate;
+        assert!(
+            gate.start_if_allowed(
+                &annotated,
+                &FixedProcess(DoctorProcessResult::ExitZero),
+                &config_dir,
+            )
+            .is_ok(),
+            "a registered slot carrying collector annotations must reach the doctor spawn"
+        );
+
+        let mut unregistered = registered.clone();
+        unregistered.slot_id = "claude_slot_ffffffffffffffffffffffffffffffff".to_string();
+        assert!(
+            matches!(
+                gate.start_if_allowed(
+                    &unregistered,
+                    &FixedProcess(DoctorProcessResult::ExitZero),
+                    &config_dir,
+                ),
+                Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin)
+            ),
+            "a slot the registry no longer holds must still fail closed"
+        );
+
+        let mut moved = registered.clone();
+        moved.config_dir = Some(root.join("somewhere-else").to_string_lossy().into_owned());
+        assert!(
+            matches!(
+                gate.start_if_allowed(
+                    &moved,
+                    &FixedProcess(DoctorProcessResult::ExitZero),
+                    &config_dir,
+                ),
+                Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin)
+            ),
+            "the same slot id pointing at a different config dir must fail closed"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -6350,6 +6350,46 @@ fn clear_claude_oauth_usage_breaker_with_legacy(
     }
 }
 
+/// Clear an auth-class open breaker once consented upkeep has replaced the
+/// credential whose rejections opened it.
+///
+/// The breaker's own rule is that a changed call configuration resets it,
+/// because the thing that was failing is not the thing we would call next. An
+/// expired access token is exactly that: those 401s came from a credential
+/// that no longer exists, and holding the full cool-down against a fresh one
+/// leaves a healthy account's limits dark for up to a day. Only the auth class
+/// is cleared - an unreadable response shape or a sustained 429 is a statement
+/// about the endpoint rather than about our token, and keeps its cool-down.
+pub(crate) fn clear_claude_oauth_usage_auth_breaker(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) {
+    let opened_by_auth = |path: &Path| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|body| serde_json::from_str::<ClaudeOAuthUsageBreaker>(&body).ok())
+            .is_some_and(|breaker| {
+                breaker.opened_by == ClaudeOAuthUsageFailure::AuthRejected.code()
+                    && breaker.account_identifier_hash == account_identifier_hash
+                    && breaker.organization_identifier_hash == organization_identifier_hash
+            })
+    };
+    let lock =
+        claude_oauth_account_state_lock(account_identifier_hash, organization_identifier_hash);
+    let _transaction = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path =
+        claude_oauth_usage_breaker_path(account_identifier_hash, organization_identifier_hash);
+    if opened_by_auth(&path) {
+        let _ = fs::remove_file(&path);
+    }
+    let legacy = claude_oauth_usage_legacy_breaker_path();
+    if opened_by_auth(&legacy) {
+        let _ = fs::remove_file(&legacy);
+    }
+}
+
 fn migrate_legacy_claude_oauth_usage_breaker_locked(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
@@ -17652,6 +17692,61 @@ exit 1
             provider_calls_before,
             "the off-switch and cache-only resume must never admit a provider call"
         );
+
+        let _ = std::fs::remove_dir_all(&support_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn refreshed_credential_clears_only_the_auth_breaker() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-oauth-auth-breaker-clear-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&support_dir);
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let _home_guard = EnvVarGuard::set_os("HOME", support_dir.as_os_str().to_os_string());
+        let account = claude_oauth_account_identifier_hash();
+        let fingerprint = claude_oauth_usage_config_fingerprint();
+        let now = current_unix_seconds();
+
+        for _ in 0..CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD {
+            let _ = record_claude_oauth_usage_failure(
+                ClaudeOAuthUsageFailure::AuthRejected,
+                &account,
+                "organization-auth",
+                &fingerprint,
+                now,
+            );
+        }
+        let opened = read_claude_oauth_usage_breaker(&account, "organization-auth", &fingerprint)
+            .expect("the auth breaker must be open, or this test proves nothing");
+        assert!(claude_oauth_usage_breaker_is_open(&opened, now));
+
+        clear_claude_oauth_usage_auth_breaker(&account, "organization-auth");
+        assert!(
+            read_claude_oauth_usage_breaker(&account, "organization-auth", &fingerprint).is_none(),
+            "a replaced credential must retire the rejections the old one earned"
+        );
+
+        for _ in 0..CLAUDE_OAUTH_USAGE_BREAKER_RATE_LIMIT_THRESHOLD {
+            let _ = record_claude_oauth_usage_failure(
+                ClaudeOAuthUsageFailure::RateLimited,
+                &account,
+                "organization-rate",
+                &fingerprint,
+                now,
+            );
+        }
+        clear_claude_oauth_usage_auth_breaker(&account, "organization-rate");
+        let rate_limited =
+            read_claude_oauth_usage_breaker(&account, "organization-rate", &fingerprint)
+                .expect("a sustained 429 is about the endpoint and keeps its cool-down");
+        assert!(claude_oauth_usage_breaker_is_open(&rate_limited, now));
 
         let _ = std::fs::remove_dir_all(&support_dir);
     }

@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 370,
-  "content_sha256": "234c9d9b744919bd925eabe7f6d412bf5a97297bfc827fb71d4a8af63eae520f",
+  "candidate_file_count": 371,
+  "content_sha256": "635a972f877aaeb85bbdaa0ef187878b388833fc55a6c175bc9e6cda5bbc48c2",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "636dfb0a0eeab5f3ee883dcb4363d95780b2990cc1fd5039fa204310321e100e",
-      "size_bytes": 808013
+      "sha256": "dc657f3a67fc8d04cf9a8351b896ad9719e622d32ae7be9a38e3b9d159f26985",
+      "size_bytes": 812244
     },
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_upkeep.rs",
-      "sha256": "2a3747f937acb9fb3ce6afc70a9fd645380e1f3d8443c627088442a15ed78cf0",
-      "size_bytes": 79224
+      "sha256": "4bd6d1eaaa40ca2b21dac68275047e0848bc4edfce2a7c5420ce88b75de0e9b4",
+      "size_bytes": 84169
     },
     {
       "executable": false,
@@ -1604,6 +1604,13 @@
       "path": "docs/session-2026-09-11-pi-admin-disabled-verification.md",
       "sha256": "85c1533fd8ad7f13a76b077c24c71e68aa159b335a9f7977f64ff3ca0002bd0d",
       "size_bytes": 1991
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-09-12-claude-upkeep-registration-identity.md",
+      "sha256": "c42a51c43dba3207f6488ca80ed66e73f4229864e6d0691021aab94b2442e8d8",
+      "size_bytes": 3095
     },
     {
       "executable": false,
@@ -2593,9 +2600,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-11T20:09:58+00:00",
+  "generated_at": "2026-09-12T19:03:39+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 371,
+  "output_file_count": 372,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2629,5 +2636,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b5504989a2a654a1825cbe0160d3401a00abecdf"
+  "source_commit": "227397e06daf58afc94c3c95cd6719498567e37e"
 }
