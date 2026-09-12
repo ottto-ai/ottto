@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 373,
-  "content_sha256": "d226423218c0a0ba2ba6e674b2c564030a53251f7159af50c8c696a6ec1a2936",
+  "content_sha256": "509c84b6689a9fcf82c251e46b2d553fe46fa79e75d4834b7742fe5a29ece645",
   "files": [
     {
       "executable": false,
@@ -489,8 +489,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/account_store.rs",
-      "sha256": "0b4fe6d7f5e90774d0cf82deb4d0e14f640b2dff3ffa985bbafe3e7c057da640",
-      "size_bytes": 32509
+      "sha256": "ed87a7974ad77a7ec01d9506b480f1d7774f282e86ca9b16b2b5845166e3a9ee",
+      "size_bytes": 33179
     },
     {
       "executable": false,
@@ -867,8 +867,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "b284733935265e99a4c13247dbe6a79ad793278779862d1bd132bf46d30a80a9",
-      "size_bytes": 468194
+      "sha256": "ad978154832aa000fe23616928f47969bbbecaa675230e0b209adc750f3528b1",
+      "size_bytes": 471036
     },
     {
       "executable": false,
@@ -1616,8 +1616,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-09-12-background-support-dir-pin.md",
-      "sha256": "70f64805122e8549a6059137f42599f641b2716a831af3245b6a7e889f8b6f13",
-      "size_bytes": 5472
+      "sha256": "3f7a5124e04990e6fd91c7676c7fb5e38ea842271bb8408122df72243969b678",
+      "size_bytes": 6549
     },
     {
       "executable": false,
@@ -2614,7 +2614,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-12T20:19:22+00:00",
+  "generated_at": "2026-09-12T20:42:44+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 374,
   "public_roots": [
@@ -2650,5 +2650,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "8f6a7981b2a661bb9b06ddbfea1a5d5a778f721c"
+  "source_commit": "45aec2689b85bf844c4dbb34f04a9d6cc867b2f7"
 }

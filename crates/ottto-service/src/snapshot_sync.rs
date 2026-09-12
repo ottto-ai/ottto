@@ -88,9 +88,21 @@ static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
 static CLAUDE_REFRESH_ACTIVITY: OnceLock<Mutex<ClaudeRefreshActivity>> = OnceLock::new();
 
 #[derive(Default)]
+/// Which installations have a Claude refresh worker running, and whether each
+/// has a trailing run queued behind it.
+///
+/// Keyed by support directory because a worker is pinned to one installation
+/// for its whole life. A single global flag would let a trigger for one
+/// installation be absorbed by a worker serving another, so that installation
+/// would never be refreshed while the other was refreshed twice. A daemon has
+/// exactly one installation, so in production this holds at most one entry.
 struct ClaudeRefreshActivity {
-    running: bool,
-    pending: bool,
+    workers: BTreeMap<PathBuf, ClaudeRefreshWorkerState>,
+}
+
+#[derive(Default)]
+struct ClaudeRefreshWorkerState {
+    trailing_run_queued: bool,
 }
 static SNAPSHOT_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -1398,7 +1410,7 @@ pub fn spawn_startup_source_reverify(daemon: LocalDaemon) {
 /// This avoids a refresh-only worker winning the durable claim and leaving a
 /// concurrent collector with no post-refresh reading to upload.
 pub fn spawn_claude_agent_status_refresh(opportunity: &'static str) {
-    let Some(refresh_claim) = claim_claude_refresh_slot() else {
+    let Some(refresh_claim) = claim_claude_refresh_slot(&default_support_dir()) else {
         return;
     };
     let spawn = crate::support_dir_scope::spawn_pinned(
@@ -1441,6 +1453,7 @@ pub fn spawn_claude_agent_status_refresh(opportunity: &'static str) {
 }
 
 struct ClaudeRefreshClaim {
+    support_dir: PathBuf,
     active: bool,
 }
 
@@ -1451,39 +1464,59 @@ impl ClaudeRefreshClaim {
         let mut activity = lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if activity.pending {
-            activity.pending = false;
-            true
-        } else {
-            activity.running = false;
-            self.active = false;
-            false
+        let queued = activity
+            .workers
+            .get_mut(&self.support_dir)
+            .is_some_and(|worker| std::mem::take(&mut worker.trailing_run_queued));
+        if queued {
+            return true;
         }
+        activity.workers.remove(&self.support_dir);
+        self.active = false;
+        false
     }
 }
 
 impl Drop for ClaudeRefreshClaim {
     fn drop(&mut self) {
         if self.active {
-            reset_claude_refresh_activity();
+            release_claude_refresh_claim(&self.support_dir);
         }
     }
 }
 
-fn claim_claude_refresh_slot() -> Option<ClaudeRefreshClaim> {
+/// Release one installation's worker slot without disturbing any other.
+fn release_claude_refresh_claim(support_dir: &Path) {
+    CLAUDE_REFRESH_ACTIVITY
+        .get_or_init(|| Mutex::new(ClaudeRefreshActivity::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .workers
+        .remove(support_dir);
+}
+
+fn claim_claude_refresh_slot(support_dir: &Path) -> Option<ClaudeRefreshClaim> {
     let lock = CLAUDE_REFRESH_ACTIVITY.get_or_init(|| Mutex::new(ClaudeRefreshActivity::default()));
     let mut activity = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if activity.running {
-        activity.pending = true;
-        None
-    } else {
-        activity.running = true;
-        Some(ClaudeRefreshClaim { active: true })
+    if let Some(worker) = activity.workers.get_mut(support_dir) {
+        worker.trailing_run_queued = true;
+        return None;
     }
+    activity.workers.insert(
+        support_dir.to_path_buf(),
+        ClaudeRefreshWorkerState::default(),
+    );
+    Some(ClaudeRefreshClaim {
+        support_dir: support_dir.to_path_buf(),
+        active: true,
+    })
 }
 
+/// Clear every installation's worker slot. Tests share the process-global
+/// activity map, so each one starts and ends from a known-empty state.
+#[cfg(test)]
 fn reset_claude_refresh_activity() {
     let lock = CLAUDE_REFRESH_ACTIVITY.get_or_init(|| Mutex::new(ClaudeRefreshActivity::default()));
     *lock
@@ -4920,9 +4953,10 @@ mod tests {
     #[serial]
     fn claude_refresh_hook_coalesces_and_raii_releases() {
         reset_claude_refresh_activity();
-        let mut first = claim_claude_refresh_slot().expect("first hook claim");
-        assert!(claim_claude_refresh_slot().is_none());
-        assert!(claim_claude_refresh_slot().is_none());
+        let support_dir = Path::new("/tmp/ottto-refresh-claim-installation");
+        let mut first = claim_claude_refresh_slot(support_dir).expect("first hook claim");
+        assert!(claim_claude_refresh_slot(support_dir).is_none());
+        assert!(claim_claude_refresh_slot(support_dir).is_none());
         assert!(
             first.take_pending_or_finish(),
             "triggers during startup queue one trailing wake run"
@@ -4931,9 +4965,35 @@ mod tests {
             !first.take_pending_or_finish(),
             "trailing run drains pending"
         );
-        let after_drop = claim_claude_refresh_slot().expect("RAII releases hook claim");
+        let after_drop = claim_claude_refresh_slot(support_dir).expect("RAII releases hook claim");
         drop(after_drop);
-        assert!(claim_claude_refresh_slot().is_some());
+        assert!(claim_claude_refresh_slot(support_dir).is_some());
+        reset_claude_refresh_activity();
+    }
+
+    /// A worker is pinned to one installation for its whole life, so a trigger
+    /// for a second installation must get its own claim rather than being
+    /// absorbed as a trailing run the first worker would spend on its own
+    /// directory.
+    #[test]
+    #[serial]
+    fn claude_refresh_claims_are_scoped_per_installation() {
+        reset_claude_refresh_activity();
+        let first_dir = Path::new("/tmp/ottto-refresh-claim-first");
+        let second_dir = Path::new("/tmp/ottto-refresh-claim-second");
+        let mut first = claim_claude_refresh_slot(first_dir).expect("first installation claim");
+        let mut second = claim_claude_refresh_slot(second_dir).expect("second installation claim");
+
+        assert!(claim_claude_refresh_slot(second_dir).is_none());
+        assert!(
+            !first.take_pending_or_finish(),
+            "a trigger for another installation must not queue a trailing run here"
+        );
+        assert!(
+            second.take_pending_or_finish(),
+            "the trailing run belongs to the installation it was triggered for"
+        );
+        assert!(!second.take_pending_or_finish());
         reset_claude_refresh_activity();
     }
 

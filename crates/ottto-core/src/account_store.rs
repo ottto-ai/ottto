@@ -3,6 +3,7 @@ use ottto_protocol::{LocalAccountBinding, SourceHealth};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fs;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 pub const ACCOUNT_FILE_NAME: &str = "account.json";
@@ -26,14 +27,31 @@ thread_local! {
 /// ambient environment each time lets the worker silently change installations
 /// mid-flight if the environment moves after it was spawned. Pinning the value
 /// the spawner saw keeps one worker bound to one installation.
+///
+/// The guard is `!Send`, so it cannot be dropped on a thread other than the one
+/// it pinned:
+///
+/// ```compile_fail
+/// let pin = ottto_core::pin_support_dir(std::path::PathBuf::from("/tmp/pin"));
+/// std::thread::spawn(move || drop(pin)).join().unwrap();
+/// ```
 pub fn pin_support_dir(path: PathBuf) -> SupportDirPin {
     let previous = PINNED_SUPPORT_DIR.with(|pinned| pinned.replace(Some(path)));
-    SupportDirPin { previous }
+    SupportDirPin {
+        previous,
+        _not_send: PhantomData,
+    }
 }
 
 /// Restores the previous pin, so nested scopes unwind in order.
+///
+/// The pin it restores is thread-local, so the guard must not outlive the
+/// thread that took it. `PhantomData<*const ()>` keeps it `!Send`: moving the
+/// guard elsewhere and dropping it there would restore the wrong thread's pin
+/// and leave the pinned thread bound forever.
 pub struct SupportDirPin {
     previous: Option<PathBuf>,
+    _not_send: PhantomData<*const ()>,
 }
 
 impl Drop for SupportDirPin {

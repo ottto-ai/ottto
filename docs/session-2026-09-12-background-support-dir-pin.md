@@ -71,6 +71,14 @@ operator's own tokens happen to be stale.
   registry, network switch, and stop file ambiently while the claim that
   authorised the attempt was taken against a specific directory; a disagreement
   means those are two different installations.
+- The Claude refresh claim is keyed by support directory. A worker is now bound
+  to one installation for its whole life, so the old process-global
+  running/pending pair would let a trigger for one installation be absorbed as
+  a trailing run the other worker spends on its own directory. A daemon has one
+  installation, so the map holds at most one entry in production.
+- `SupportDirPin` is `!Send`. It restores a thread-local, so moving the guard to
+  another thread and dropping it there would restore that thread's pin and
+  leave the pinned thread bound for the rest of its life.
 
 ## Evidence
 
@@ -90,8 +98,16 @@ operator's own tokens happen to be stale.
   then asserts the same gate proceeds when the staged directory is the one it
   reads.
 - All three fail on this branch with their fix removed.
+- `claude_refresh_claims_are_scoped_per_installation` asserts a second
+  installation gets its own claim and that its trailing run is not spent on the
+  first. It fails when the claim ignores the support directory.
+- A `compile_fail` doctest on `pin_support_dir` proves the guard cannot cross
+  threads; it fails when the non-`Send` marker is relaxed to `PhantomData<()>`.
 - A full lib run with the write instrumentation reapplied on top of the fix
-  reports no writes under the real support directory; 1728 tests pass.
+  reports no writes under the real support directory.
+- `cargo test --workspace --locked` and
+  `cargo test -p ottto-service --lib --locked -- --test-threads=1`: 1729 passed,
+  2 ignored.
 
 ## Scope
 
