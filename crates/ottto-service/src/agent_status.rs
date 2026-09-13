@@ -2756,13 +2756,8 @@ fn collect_claude_status_snapshots(
     let has_healthy_custom_account = custom_slot_states
         .clone()
         .any(|status| status.state == ClaudeConfigSlotCollectionStateV1::Fresh);
-    let has_actionable_custom_slot = custom_slot_states.any(|status| {
-        !matches!(
-            status.state,
-            ClaudeConfigSlotCollectionStateV1::Fresh
-                | ClaudeConfigSlotCollectionStateV1::Unverified
-        )
-    });
+    let has_actionable_custom_slot =
+        custom_slot_states.any(|status| claude_custom_slot_needs_attention(&status.state));
     let default_has_full_meter_evidence = default_snapshot
         .quota_windows
         .iter()
@@ -2794,6 +2789,24 @@ fn collect_claude_status_snapshots(
         snapshots,
         source_health_snapshot,
     }
+}
+
+/// Whether one registered Claude slot's collection state is something the
+/// operator has to act on.
+///
+/// A duplicate registration is not. It means the slot resolves to an account
+/// another registered slot already owns, so its meters come from that owner and
+/// nothing is expired, mismatched, or waiting on a login. Codex has always
+/// treated its own `DuplicateAccount` this way; Claude counting it as
+/// actionable degraded a fully healthy source and told the operator their
+/// durable connections needed repair while every slot was fresh and metered.
+fn claude_custom_slot_needs_attention(state: &ClaudeConfigSlotCollectionStateV1) -> bool {
+    !matches!(
+        state,
+        ClaudeConfigSlotCollectionStateV1::Fresh
+            | ClaudeConfigSlotCollectionStateV1::Unverified
+            | ClaudeConfigSlotCollectionStateV1::DuplicateAccount
+    )
 }
 
 fn apply_claude_anchor_continuity(
@@ -11450,6 +11463,46 @@ mod tests {
             true,
             true,
         )
+    }
+
+    /// Codex and Claude both register a slot that turns out to resolve to an
+    /// account another slot already owns, and both mark it `DuplicateAccount`.
+    /// Codex treats that as benign. Claude counted it as a slot needing local
+    /// attention, which degraded a fully healthy source to `secret_expired` -
+    /// "Claude Code durable connections need attention" - while every slot was
+    /// fresh and reporting live limits.
+    #[test]
+    fn a_duplicate_claude_registration_does_not_need_attention() {
+        use ClaudeConfigSlotCollectionStateV1 as State;
+
+        for benign in [State::Fresh, State::Unverified, State::DuplicateAccount] {
+            assert!(
+                !claude_custom_slot_needs_attention(&benign),
+                "{benign:?} must not degrade a healthy Claude source"
+            );
+        }
+
+        for actionable in [
+            State::IdentityUnknown,
+            State::CredentialUnavailable,
+            State::IdentityMismatch,
+            State::ConcurrentMutation,
+            State::ProviderUnavailable,
+            State::CollectionPaused,
+            State::CollectionInProgress,
+            State::CapacityExceeded,
+            State::RefreshDue,
+            State::UpkeepNotConsented,
+            State::StaleAccessToken,
+            State::ProbeFailed,
+            State::ReloginApproaching,
+            State::NeedsLogin,
+        ] {
+            assert!(
+                claude_custom_slot_needs_attention(&actionable),
+                "{actionable:?} must still reach the operator"
+            );
+        }
     }
 
     #[test]
