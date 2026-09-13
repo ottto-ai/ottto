@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 371,
-  "content_sha256": "635a972f877aaeb85bbdaa0ef187878b388833fc55a6c175bc9e6cda5bbc48c2",
+  "candidate_file_count": 372,
+  "content_sha256": "ec872ec73f8a2db0b2ff0352ebed2aab7cb0a025ab8de53f77c375eaf06e7f9f",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "dc657f3a67fc8d04cf9a8351b896ad9719e622d32ae7be9a38e3b9d159f26985",
-      "size_bytes": 812244
+      "sha256": "acbf81aff833da29ec6a2660e87fba8d3dc804fd58c0ab82a0b639e36eacb44f",
+      "size_bytes": 814567
     },
     {
       "executable": false,
@@ -1611,6 +1611,13 @@
       "path": "docs/session-2026-09-12-claude-upkeep-registration-identity.md",
       "sha256": "c42a51c43dba3207f6488ca80ed66e73f4229864e6d0691021aab94b2442e8d8",
       "size_bytes": 3095
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-09-13-duplicate-claude-slot-is-not-attention.md",
+      "sha256": "eaa81ad7ca2ddd45fe5a37e67830405c8113454ad6121d57df78c99fe6c46ac8",
+      "size_bytes": 2276
     },
     {
       "executable": false,
@@ -2600,9 +2607,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-12T19:03:39+00:00",
+  "generated_at": "2026-09-13T03:38:18+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 372,
+  "output_file_count": 373,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2636,5 +2643,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "227397e06daf58afc94c3c95cd6719498567e37e"
+  "source_commit": "39d4b8beacb6fe0f7d8e71aac03fbe682d434f19"
 }
