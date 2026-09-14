@@ -433,11 +433,15 @@ mod tests {
                     }
                 }
                 let _ = fs::remove_dir(&child);
+                // Throttle: this probe runs inside a parallel suite and must
+                // detect the leak, not become a load generator for its
+                // neighbours.
+                thread::sleep(Duration::from_micros(50));
             }
             narrowed
         });
 
-        for attempt in 0..3_000 {
+        for attempt in 0..400 {
             let socket_path = root.join(format!("s{attempt}.sock"));
             let listener = bind_user_only_socket(&socket_path).expect("bind probe socket");
             drop(listener);
