@@ -4,6 +4,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -252,7 +253,13 @@ const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // the four existing attribution selectors. Tool labels are normalized to the
 // backend's selector identity before applying its 128-character and 100-row
 // admission bounds.
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v34";
+// v35 resolves progressive records for one Claude/Fable provider response in
+// provider-timestamp order rather than physical append order. Fable can append
+// an earlier partial observation after its later terminal observation; the
+// canonical fold accepts monotonic population of every usage counter while
+// retaining fail-closed handling for chronological regressions and incomparable
+// states at the same provider instant.
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v35";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -6793,11 +6800,43 @@ impl SelectorCapture {
     }
 }
 
+/// One physical Claude transcript observation for a provider response. Claude
+/// can append an earlier progressive content-block observation after a later
+/// one, so response-local observations are retained until the file is complete
+/// and then ordered by their provider timestamps.
+#[derive(Debug, Clone)]
+struct ClaudeResponseRecord {
+    physical_sequence: u64,
+    usage: UsageTotals,
+    model: Option<String>,
+    selector: SelectorCapture,
+    reasoning_effort: Option<String>,
+    request_id: Option<String>,
+    timestamp: Option<String>,
+    computed_effective_input_context: Option<u64>,
+    tool_uses: BTreeMap<String, String>,
+}
+
+// Response-local buffering exists only to repair provider-time ordering. Bound
+// both its pathological single-key amplification and its aggregate per-file
+// heap. Normal local evidence is far below these ceilings (the 91-file Fable
+// canary's affected root has 9,768 usage-bearing physical records total).
+const MAX_CLAUDE_RECORDS_PER_RESPONSE: usize = 4_096;
+const MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE: usize = 65_536;
+
 /// One Claude provider response assembled from its content-block transcript
 /// records. Usage is withheld from the session projection until this response
-/// is complete and internally consistent.
+/// is complete, canonically ordered, and internally consistent.
 #[derive(Debug, Clone)]
 struct ClaudeResponseObservation {
+    sequence: u64,
+    preceding_user_timestamp: Option<String>,
+    records: Vec<ClaudeResponseRecord>,
+    record_limit_exceeded: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedClaudeResponse {
     sequence: u64,
     usage: UsageTotals,
     model: Option<String>,
@@ -6809,7 +6848,6 @@ struct ClaudeResponseObservation {
     preceding_user_timestamp: Option<String>,
     computed_effective_input_context: Option<u64>,
     tool_uses: BTreeMap<String, String>,
-    conflict: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -6839,22 +6877,24 @@ impl ClaudeResponseObservation {
     ) -> Self {
         Self {
             sequence,
-            usage,
-            model,
-            selector,
-            reasoning_effort,
-            request_id,
-            first_timestamp: timestamp.clone(),
-            terminal_timestamp: timestamp,
             preceding_user_timestamp,
-            computed_effective_input_context,
-            tool_uses,
-            conflict: false,
+            records: vec![ClaudeResponseRecord {
+                physical_sequence: 0,
+                usage,
+                model,
+                selector,
+                reasoning_effort,
+                request_id,
+                timestamp,
+                computed_effective_input_context,
+                tool_uses,
+            }],
+            record_limit_exceeded: false,
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn merge(
+    fn push(
         &mut self,
         usage: UsageTotals,
         model: Option<String>,
@@ -6863,28 +6903,182 @@ impl ClaudeResponseObservation {
         request_id: Option<String>,
         timestamp: Option<String>,
         computed_effective_input_context: Option<u64>,
-    ) {
-        if !claude_usage_is_progressive_after(&usage, &self.usage)
-            || !merge_optional_claude_field(&mut self.model, model)
-            || !merge_optional_claude_field(&mut self.reasoning_effort, reasoning_effort)
-            || !merge_optional_claude_field(&mut self.request_id, request_id)
-            || !merge_claude_response_selector(&mut self.selector, selector)
+        tool_uses: BTreeMap<String, String>,
+    ) -> bool {
+        if self.records.len() >= MAX_CLAUDE_RECORDS_PER_RESPONSE {
+            self.record_limit_exceeded = true;
+            return false;
+        }
+        let physical_sequence = self.records.len() as u64;
+        self.records.push(ClaudeResponseRecord {
+            physical_sequence,
+            usage,
+            model,
+            selector,
+            reasoning_effort,
+            request_id,
+            timestamp,
+            computed_effective_input_context,
+            tool_uses,
+        });
+        true
+    }
+
+    fn resolve(mut self) -> Option<ResolvedClaudeResponse> {
+        if self.record_limit_exceeded {
+            return None;
+        }
+        // Provider time is authoritative only when it proves a complete order
+        // for this response. Mixed valid/missing timestamps retain physical
+        // append order, preserving the conservative legacy behavior instead
+        // of moving a stamped terminal record ahead of an unstamped partial.
+        if self
+            .records
+            .iter()
+            .all(|record| claude_response_provider_time(record).is_some())
         {
-            self.conflict = true;
-            return;
+            self.records.sort_by(claude_response_record_order);
+        } else {
+            self.records.sort_by_key(|record| record.physical_sequence);
         }
-        // The provider's terminal cumulative output is authoritative. Equal
-        // repeats remain harmless; a regression was rejected above.
-        self.usage = usage;
-        if let Some(next) = computed_effective_input_context {
-            self.computed_effective_input_context = Some(
-                self.computed_effective_input_context
-                    .map_or(next, |current| current.max(next)),
-            );
+        let mut canonical_records: Vec<ClaudeResponseRecord> = Vec::new();
+        for record in self.records {
+            if canonical_records.last().is_some_and(|previous| {
+                claude_response_records_share_provider_time(previous, &record)
+            }) {
+                // Same-instant observations are ordered by their cumulative
+                // usage tuple, then collapsed to that instant's terminal state.
+                // Incomparable tuples still fail the progressive merge below.
+                if !merge_claude_response_record(
+                    canonical_records.last_mut().expect("record exists"),
+                    record,
+                ) {
+                    return None;
+                }
+            } else {
+                canonical_records.push(record);
+            }
         }
-        if timestamp.is_some() {
-            self.terminal_timestamp = timestamp;
+
+        let mut records = canonical_records.into_iter();
+        let mut aggregate = records.next()?;
+        let first_timestamp = aggregate.timestamp.clone();
+        for record in records {
+            if !merge_claude_response_record(&mut aggregate, record) {
+                return None;
+            }
         }
+        Some(ResolvedClaudeResponse {
+            sequence: self.sequence,
+            usage: aggregate.usage,
+            model: aggregate.model,
+            selector: aggregate.selector,
+            reasoning_effort: aggregate.reasoning_effort,
+            request_id: aggregate.request_id,
+            first_timestamp,
+            terminal_timestamp: aggregate.timestamp,
+            preceding_user_timestamp: self.preceding_user_timestamp,
+            computed_effective_input_context: aggregate.computed_effective_input_context,
+            tool_uses: aggregate.tool_uses,
+        })
+    }
+}
+
+fn merge_claude_response_record(
+    current: &mut ClaudeResponseRecord,
+    next: ClaudeResponseRecord,
+) -> bool {
+    if !claude_usage_is_progressive_after(&next.usage, &current.usage)
+        || !merge_optional_claude_field(&mut current.model, next.model)
+        || !merge_optional_claude_field(&mut current.reasoning_effort, next.reasoning_effort)
+        || !merge_optional_claude_field(&mut current.request_id, next.request_id)
+        || !merge_claude_response_selector(&mut current.selector, next.selector)
+        || !merge_claude_response_tool_uses(&mut current.tool_uses, next.tool_uses)
+    {
+        return false;
+    }
+    current.usage = next.usage;
+    if let Some(next_context) = next.computed_effective_input_context {
+        current.computed_effective_input_context = Some(
+            current
+                .computed_effective_input_context
+                .map_or(next_context, |value| value.max(next_context)),
+        );
+    }
+    if next.timestamp.is_some() {
+        current.timestamp = next.timestamp;
+    }
+    true
+}
+
+fn claude_response_record_order(
+    left: &ClaudeResponseRecord,
+    right: &ClaudeResponseRecord,
+) -> Ordering {
+    match (
+        claude_response_provider_time(left),
+        claude_response_provider_time(right),
+    ) {
+        (Some(left_time), Some(right_time)) => left_time
+            .cmp(&right_time)
+            .then_with(|| claude_usage_deterministic_order(&left.usage, &right.usage))
+            .then_with(|| left.physical_sequence.cmp(&right.physical_sequence)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        // Preserve append order for missing or malformed timestamps. There is
+        // no provider chronology to justify reordering these observations.
+        (None, None) => left.physical_sequence.cmp(&right.physical_sequence),
+    }
+}
+
+fn claude_response_provider_time(record: &ClaudeResponseRecord) -> Option<OffsetDateTime> {
+    record
+        .timestamp
+        .as_deref()
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+}
+
+fn claude_usage_deterministic_order(left: &UsageTotals, right: &UsageTotals) -> Ordering {
+    left.input_tokens
+        .cmp(&right.input_tokens)
+        .then_with(|| left.output_tokens.cmp(&right.output_tokens))
+        .then_with(|| left.cache_read_tokens.cmp(&right.cache_read_tokens))
+        .then_with(|| {
+            left.cache_creation_5m_tokens
+                .cmp(&right.cache_creation_5m_tokens)
+        })
+        .then_with(|| {
+            left.cache_creation_1h_tokens
+                .cmp(&right.cache_creation_1h_tokens)
+        })
+        .then_with(|| {
+            left.reasoning_output_tokens
+                .cmp(&right.reasoning_output_tokens)
+        })
+        .then_with(|| {
+            left.unattributed_total_tokens
+                .cmp(&right.unattributed_total_tokens)
+        })
+        .then_with(|| left.request_count.cmp(&right.request_count))
+        .then_with(|| left.costs.observed.cmp(&right.costs.observed))
+        .then_with(|| left.costs.reported.cmp(&right.costs.reported))
+        .then_with(|| left.costs.total.cmp(&right.costs.total))
+        .then_with(|| left.costs.input.cmp(&right.costs.input))
+        .then_with(|| left.costs.output.cmp(&right.costs.output))
+        .then_with(|| left.costs.cache_read.cmp(&right.costs.cache_read))
+        .then_with(|| left.costs.cache_creation.cmp(&right.costs.cache_creation))
+}
+
+fn claude_response_records_share_provider_time(
+    left: &ClaudeResponseRecord,
+    right: &ClaudeResponseRecord,
+) -> bool {
+    match (
+        claude_response_provider_time(left),
+        claude_response_provider_time(right),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -6929,18 +7123,20 @@ fn merge_claude_response_selector(current: &mut SelectorCapture, next: SelectorC
     true
 }
 
-/// Claude content-block records repeat input/cache metadata while cumulative
-/// output grows. Everything except output is invariant for one response.
+/// Claude content-block records progressively fill cumulative response usage.
+/// Recent Fable writers can begin with zero input/cache counters and populate
+/// them on a later provider timestamp, so every counter must be monotonic; a
+/// chronological regression remains unsafe and fails the whole response.
 fn claude_usage_is_progressive_after(current: &UsageTotals, previous: &UsageTotals) -> bool {
-    current.input_tokens == previous.input_tokens
+    current.input_tokens >= previous.input_tokens
         && current.output_tokens >= previous.output_tokens
-        && current.cache_read_tokens == previous.cache_read_tokens
-        && current.cache_creation_5m_tokens == previous.cache_creation_5m_tokens
-        && current.cache_creation_1h_tokens == previous.cache_creation_1h_tokens
-        && current.reasoning_output_tokens == previous.reasoning_output_tokens
-        && current.unattributed_total_tokens == previous.unattributed_total_tokens
-        && current.request_count == previous.request_count
-        && current.costs == previous.costs
+        && current.cache_read_tokens >= previous.cache_read_tokens
+        && current.cache_creation_5m_tokens >= previous.cache_creation_5m_tokens
+        && current.cache_creation_1h_tokens >= previous.cache_creation_1h_tokens
+        && current.reasoning_output_tokens >= previous.reasoning_output_tokens
+        && current.unattributed_total_tokens >= previous.unattributed_total_tokens
+        && current.request_count >= previous.request_count
+        && current.costs.is_monotonic_after(&previous.costs)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -7830,6 +8026,7 @@ struct SnapshotAccumulator {
     // for a future scan-level legacy-fork ownership ledger.
     claude_responses: BTreeMap<String, ClaudeResponseObservation>,
     claude_response_sequence: u64,
+    claude_response_record_count: usize,
     // Exact provider response ids for the once-per-response Claude usage rows
     // above. Local-only; copied into SnapshotItem solely for account-evidence
     // coverage and never serialized.
@@ -7966,6 +8163,7 @@ impl SnapshotAccumulator {
             latency_ttft_ms_max: 0,
             claude_responses: BTreeMap::new(),
             claude_response_sequence: 0,
+            claude_response_record_count: 0,
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
             claude_context_curve_identity_complete: true,
@@ -8772,12 +8970,19 @@ impl SnapshotAccumulator {
                 format!("u\u{1f}{}", self.claude_response_sequence)
             }
         };
-        if let Some(existing) = self.claude_responses.get_mut(&key) {
-            if !merge_claude_response_tool_uses(&mut existing.tool_uses, tool_uses) {
-                existing.conflict = true;
-                return;
+        if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE {
+            if let Some(existing) = self.claude_responses.get_mut(&key) {
+                existing.record_limit_exceeded = true;
+            } else {
+                // No response object exists to carry the one-time overflow
+                // marker into finalization. Account for this refused positive
+                // usage row immediately so the enclosing file stays retryable.
+                self.note_dropped_usage();
             }
-            existing.merge(
+            return;
+        }
+        if let Some(existing) = self.claude_responses.get_mut(&key) {
+            if existing.push(
                 usage,
                 model,
                 selector,
@@ -8785,11 +8990,16 @@ impl SnapshotAccumulator {
                 request_id,
                 timestamp,
                 computed_effective_input_context,
-            );
+                tool_uses,
+            ) {
+                self.claude_response_record_count =
+                    self.claude_response_record_count.saturating_add(1);
+            }
             return;
         }
         let sequence = self.claude_response_sequence;
         self.claude_response_sequence = self.claude_response_sequence.saturating_add(1);
+        self.claude_response_record_count = self.claude_response_record_count.saturating_add(1);
         self.claude_responses.insert(
             key,
             ClaudeResponseObservation::new(
@@ -8815,14 +9025,27 @@ impl SnapshotAccumulator {
             .into_values()
             .collect::<Vec<_>>();
         responses.sort_by_key(|response| response.sequence);
-        for mut response in responses {
-            if response.conflict {
+        for response in responses {
+            let Some(mut response) = response.resolve() else {
                 self.note_dropped_usage();
                 continue;
-            }
+            };
             let effective_input_context = response
                 .computed_effective_input_context
                 .unwrap_or_else(|| response.usage.effective_input_context());
+            if !response.selector.context.contains_key("context_bucket") {
+                let context_bucket =
+                    if effective_input_context > CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS {
+                        "long"
+                    } else {
+                        "short"
+                    };
+                response.selector.insert(
+                    "context_bucket",
+                    context_bucket.to_string(),
+                    "derived_from_effective_input_volume",
+                );
+            }
             if let Some(request_id) = response.request_id.take() {
                 let request_id_was_new = self.claude_usage_request_ids.insert(request_id.clone());
                 let prior_occurrence = self.claude_usage_occurrences.insert(
@@ -13839,38 +14062,12 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             // claim this collapsed shape is an exact request-indexed curve.
             accumulator.claude_context_curve_request_index_complete = false;
         }
-        let mut selector = claude_code_selector_from_line(value);
-        // Tag the 1M-context attribution bucket from this turn's effective input
-        // volume. Claude Code logs the BASE model id (e.g. `claude-opus-4-8`)
-        // for BOTH the regular and the "(1M context)" picker variants and never
-        // persists the `anthropic-beta: context-1m` opt-in (a request header) to
-        // the transcript, so per-turn input volume is the only signal: a turn
-        // whose effective input context exceeds the regular 200K cap could only
-        // have run with the 1M window enabled. A 1M-enabled turn under the
-        // threshold is indistinguishable from a regular turn and correctly tags
-        // `short`. The bucket rides in selector_context, so the existing
-        // RowKey/selector_hash split already emits a session's long and short
-        // turns as separate model_usage rows; the backend honors this
-        // daemon-supplied bucket ahead of its own (request_count==1-gated)
-        // derivation, so aggregated hourly rows still tag `long` accurately. An
-        // explicit transcript-supplied bucket (none emitted today) is left as-is.
-        let has_explicit_bucket = selector
-            .context
-            .get("context_bucket")
-            .is_some_and(|value| !value.is_empty());
-        if !has_explicit_bucket {
-            let context_bucket =
-                if effective_input_context > CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS {
-                    "long"
-                } else {
-                    "short"
-                };
-            selector.insert(
-                "context_bucket",
-                context_bucket.to_string(),
-                "derived_from_effective_input_volume",
-            );
-        }
+        let selector = claude_code_selector_from_line(value);
+        // The derived context bucket is attached only after all content-block
+        // records for this response are canonically resolved. Early progressive
+        // records may still have zero input/cache counters; classifying those
+        // rows here would manufacture a short->long selector conflict. An
+        // explicit transcript-supplied bucket remains authoritative.
         // Current Claude Code stamps the applied tier on the assistant record
         // itself (`"effort":"high"`), so the transcript is authoritative and no
         // OTLP is required: the tier is already on the record whose usage this
@@ -33781,7 +33978,155 @@ mod tests {
     }
 
     #[test]
-    fn claude_conflicting_progressive_response_quarantines_the_file() {
+    fn claude_out_of_order_progressive_response_uses_provider_time() {
+        let path = temp_file("claude-progressive-provider-time");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-09-11T08:31:20Z\",\"sessionId\":\"claude-progressive-order\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"work\"}}\n",
+                // Fable appends the terminal observations first, then replays
+                // the earlier partial states for those same provider instants.
+                "{\"timestamp\":\"2026-09-11T08:31:22.985Z\",\"sessionId\":\"claude-progressive-order\",\"type\":\"assistant\",\"requestId\":\"req_progressive_order\",\"speed\":\"standard\",\"message\":{\"id\":\"msg_progressive_order\",\"model\":\"claude-fable-5-1\",\"usage\":{\"input_tokens\":32,\"output_tokens\":1026,\"cache_read_input_tokens\":960010,\"cache_creation\":{\"ephemeral_1h_input_tokens\":6006}}}}\n",
+                "{\"timestamp\":\"2026-09-11T08:31:29.473Z\",\"sessionId\":\"claude-progressive-order\",\"type\":\"assistant\",\"requestId\":\"req_progressive_order\",\"speed\":\"standard\",\"message\":{\"id\":\"msg_progressive_order\",\"model\":\"claude-fable-5-1\",\"usage\":{\"input_tokens\":32,\"output_tokens\":1026,\"cache_read_input_tokens\":960010,\"cache_creation\":{\"ephemeral_1h_input_tokens\":6006}}}}\n",
+                "{\"timestamp\":\"2026-09-11T08:31:22.985Z\",\"sessionId\":\"claude-progressive-order\",\"type\":\"assistant\",\"requestId\":\"req_progressive_order\",\"message\":{\"id\":\"msg_progressive_order\",\"model\":\"claude-fable-5-1\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_1h_input_tokens\":6006}}}}\n",
+                "{\"timestamp\":\"2026-09-11T08:31:29.473Z\",\"sessionId\":\"claude-progressive-order\",\"type\":\"assistant\",\"requestId\":\"req_progressive_order\",\"message\":{\"id\":\"msg_progressive_order\",\"model\":\"claude-fable-5-1\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_1h_input_tokens\":6006}}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-09-11T08:32:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        assert_eq!(item.input_tokens, 32);
+        assert_eq!(item.output_tokens, 1_026);
+        assert_eq!(item.cache_read_tokens, 960_010);
+        assert_eq!(item.cache_creation_1h_tokens, 6_006);
+        assert_eq!(item.request_count, 1);
+        assert_eq!(item.first_turn_context_tokens, Some(966_048));
+        assert_eq!(item.peak_context_fill_tokens, Some(966_048));
+        assert_eq!(item.avg_duration_ms, Some(2_985));
+        assert_eq!(
+            item.model_usage[0]
+                .selector_context
+                .get("context_bucket")
+                .map(String::as_str),
+            Some("long")
+        );
+        assert_eq!(
+            item.model_usage[0]
+                .selector_context
+                .get("speed_mode")
+                .map(String::as_str),
+            Some("standard")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_mixed_timestamp_progressive_response_preserves_physical_order() {
+        let path = temp_file("claude-progressive-mixed-time");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-09-11T08:31:20Z\",\"sessionId\":\"claude-progressive-mixed-time\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"work\"}}\n",
+                "{\"sessionId\":\"claude-progressive-mixed-time\",\"type\":\"assistant\",\"requestId\":\"req_progressive_mixed_time\",\"message\":{\"id\":\"msg_progressive_mixed_time\",\"model\":\"claude-fable-5-1\",\"usage\":{\"input_tokens\":0,\"output_tokens\":1}}}\n",
+                "{\"timestamp\":\"2026-09-11T08:31:29Z\",\"sessionId\":\"claude-progressive-mixed-time\",\"type\":\"assistant\",\"requestId\":\"req_progressive_mixed_time\",\"message\":{\"id\":\"msg_progressive_mixed_time\",\"model\":\"claude-fable-5-1\",\"usage\":{\"input_tokens\":32,\"output_tokens\":5,\"cache_read_input_tokens\":100}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-09-11T08:32:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        assert_eq!(
+            (
+                item.input_tokens,
+                item.output_tokens,
+                item.cache_read_tokens,
+                item.request_count,
+            ),
+            (32, 5, 100, 1)
+        );
+        assert_eq!(item.first_turn_context_tokens, Some(132));
+        assert_eq!(item.peak_context_fill_tokens, Some(132));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_response_record_caps_fail_closed_without_unbounded_buffering() {
+        let mut response = ClaudeResponseObservation::new(
+            0,
+            UsageTotals::default(),
+            None,
+            SelectorCapture::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            BTreeMap::new(),
+        );
+        for _ in 1..MAX_CLAUDE_RECORDS_PER_RESPONSE {
+            assert!(response.push(
+                UsageTotals::default(),
+                None,
+                SelectorCapture::default(),
+                None,
+                None,
+                None,
+                None,
+                BTreeMap::new(),
+            ));
+        }
+        assert!(!response.push(
+            UsageTotals::default(),
+            None,
+            SelectorCapture::default(),
+            None,
+            None,
+            None,
+            None,
+            BTreeMap::new(),
+        ));
+        assert_eq!(response.records.len(), MAX_CLAUDE_RECORDS_PER_RESPONSE);
+        assert!(response.resolve().is_none());
+
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+        accumulator.claude_response_record_count = MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE;
+        accumulator.observe_claude_response(
+            &json!({
+                "requestId": "request-at-total-cap",
+                "message": {"id": "message-at-total-cap"},
+            }),
+            UsageTotals {
+                input_tokens: 1,
+                request_count: 1,
+                ..UsageTotals::default()
+            },
+            None,
+            SelectorCapture::default(),
+            None,
+            None,
+            Some(1),
+        );
+        assert!(accumulator.claude_responses.is_empty());
+        assert_eq!(accumulator.dropped_usage_record_count, 1);
+    }
+
+    #[test]
+    fn claude_true_chronological_usage_regression_quarantines_the_file() {
         let root = temp_dir("claude-progressive-conflict");
         let path = root.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
         fs::write(
@@ -33805,6 +34150,38 @@ mod tests {
         .expect("scan");
         assert!(scan.snapshots.is_empty());
         assert!(scan.recognized_usage_drop_count > 0);
+        assert!(!index
+            .confirmed_empty_files
+            .contains(&local_index_key(&path)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_equal_provider_time_usage_conflict_quarantines_the_file() {
+        let root = temp_dir("claude-progressive-equal-time-conflict");
+        let path = root.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-02T10:00:01Z\",\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"requestId\":\"req_conflict\",\"message\":{\"id\":\"msg_conflict\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":3}}}\n",
+                "{\"timestamp\":\"2026-08-02T10:00:01+00:00\",\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"requestId\":\"req_conflict\",\"message\":{\"id\":\"msg_conflict\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":11,\"output_tokens\":2}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-09T10:01:00Z",
+            365,
+            10,
+            false,
+        )
+        .expect("scan");
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.recognized_usage_drop_count, 2);
+        assert_eq!(scan.dropped_usage_record_count, 2);
         assert!(!index
             .confirmed_empty_files
             .contains(&local_index_key(&path)));
