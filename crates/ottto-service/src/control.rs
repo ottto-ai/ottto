@@ -121,6 +121,8 @@ const VERIFICATION_MARKER_METRIC_NAME: &str = "ottto.verification.smoke";
 const VERIFICATION_MARKER_ATTRIBUTE: &str = "ottto.verification";
 const VERIFICATION_MARKER_HEADER: &str = "X-Ottto-Verification";
 const SMOKE_USAGE_LIMIT_ERROR_CODE: &str = "usage_limited";
+const CLAUDE_OAUTH_REAUTH_REQUIRED_CODE: &str =
+    crate::CLAUDE_OAUTH_REAUTH_REQUIRED_VERIFICATION_CODE;
 /// Verification message/error code for a source whose CLI is genuinely not
 /// installed on this machine. Reported instead of running a doomed smoke that
 /// would surface "not installed or not executable" as a blocking telemetry
@@ -10763,13 +10765,15 @@ fn run_smoke_prompt(source: &SourceKind) -> SmokeResult {
     } else {
         None
     };
-    run_bounded_command(
+    let mut result = run_bounded_command(
         command.program,
         &command.args,
         SMOKE_COMMAND_TIMEOUT,
         source_display_name(source),
         before_session_count,
-    )
+    );
+    classify_source_smoke_failure(source, &mut result);
+    result
 }
 
 struct SmokeCommand {
@@ -12069,7 +12073,10 @@ fn redact_command_diagnostic(input: &str) -> Option<String> {
                     '"' | '\'' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
                 )
             });
-            if trimmed.starts_with('/')
+            let command_token = trimmed.trim_end_matches(['.', ':']);
+            if command_token == "/login" {
+                token
+            } else if trimmed.starts_with('/')
                 || trimmed.starts_with("~/")
                 || trimmed.starts_with("file:/")
             {
@@ -12095,6 +12102,29 @@ fn truncate_diagnostic(value: &str) -> String {
 
 fn command_diagnostic_is_usage_limited(diagnostic: Option<&str>) -> bool {
     diagnostic.is_some_and(crate::text_indicates_usage_limited)
+}
+
+fn command_diagnostic_requires_claude_reauth(diagnostic: Option<&str>) -> bool {
+    let Some(diagnostic) = diagnostic else {
+        return false;
+    };
+    let normalized = diagnostic.to_ascii_lowercase();
+    normalized.contains("oauth session expired")
+        || normalized.contains("oauth token expired")
+        || (normalized.contains("token is expired")
+            && (normalized.contains("sign in again") || normalized.contains("/login")))
+        || (normalized.contains("failed to authenticate")
+            && normalized.contains("could not be refreshed"))
+}
+
+fn classify_source_smoke_failure(source: &SourceKind, result: &mut SmokeResult) {
+    if matches!(source, SourceKind::ClaudeCode)
+        && !result.succeeded
+        && command_diagnostic_requires_claude_reauth(result.diagnostic.as_deref())
+    {
+        result.error_code = Some(CLAUDE_OAUTH_REAUTH_REQUIRED_CODE.to_string());
+        result.message = "Claude Code sign-in expired. Open Claude Code, sign in again, then retry Verify. Ottto itself is still connected.".to_string();
+    }
 }
 
 fn usage_limited_smoke_message(display_name: &str) -> String {
@@ -12124,11 +12154,15 @@ fn smoke_failure_verification_result_with_config(
         return cli_unavailable_verification_result(source, config);
     }
     let usage_limited = smoke.error_code.as_deref() == Some(SMOKE_USAGE_LIMIT_ERROR_CODE);
+    let provider_reauth_required =
+        smoke.error_code.as_deref() == Some(CLAUDE_OAUTH_REAUTH_REQUIRED_CODE);
     verification_result_with_config(
         source,
         config,
         if usage_limited {
             SourceVerificationStatus::Warning
+        } else if provider_reauth_required {
+            SourceVerificationStatus::ReconnectRequired
         } else {
             SourceVerificationStatus::Failed
         },
@@ -13018,7 +13052,7 @@ fn verify_source(
             execute_write_config_repair(daemon, authorization, &source)?;
             config = source_config_state_for_daemon(daemon, &source)?;
         }
-        if !config.drift.is_empty() {
+        if !config.drift.is_empty() && source != SourceKind::ClaudeCode {
             let result = config_drift_verification_result(source, config, repair);
             daemon.record_verification_result(&result)?;
             return Ok(result);
@@ -13180,7 +13214,22 @@ fn verify_source(
 
     let smoke_after = current_rfc3339();
     let smoke = run_smoke_prompt(&source);
-    let result = if !smoke.succeeded {
+    let result = if !smoke.succeeded
+        && smoke.error_code.as_deref() == Some(CLAUDE_OAUTH_REAUTH_REQUIRED_CODE)
+    {
+        smoke_failure_verification_result_with_config(
+            source.clone(),
+            config,
+            &smoke,
+            Some(smoke_after),
+        )
+    } else if !config.drift.is_empty() {
+        // Claude auth is a higher-priority source blocker than telemetry config
+        // drift. Run the smoke first so an expired provider session gets the
+        // source-scoped sign-in action; otherwise preserve the normal Repair
+        // guidance for the outstanding drift.
+        config_drift_verification_result(source.clone(), config, repair)
+    } else if !smoke.succeeded {
         smoke_failure_verification_result_with_config(
             source.clone(),
             config,
@@ -24844,6 +24893,11 @@ mod tests {
         assert!(!diagnostic.contains("org_123"));
         assert!(!diagnostic.contains("sk-secret123"));
         assert!(!diagnostic.contains("show private repo"));
+
+        let login =
+            redact_command_diagnostic("Token is expired. Run /login.").expect("login diagnostic");
+        assert!(login.contains("/login"));
+        assert!(command_diagnostic_requires_claude_reauth(Some(&login)));
     }
 
     #[test]
@@ -26229,6 +26283,129 @@ log_user_prompt = true
         assert!(!result.verified);
         assert_eq!(result.message.code, "smoke_command_failed");
         assert_eq!(result.records_seen, 0);
+    }
+
+    #[test]
+    fn claude_expired_oauth_maps_to_source_reconnect_required() {
+        assert!(command_diagnostic_requires_claude_reauth(Some(
+            "Failed to authenticate: OAuth session expired and could not be refreshed"
+        )));
+        assert!(command_diagnostic_requires_claude_reauth(Some(
+            "Token is expired. Run /login to sign in again."
+        )));
+        assert!(!command_diagnostic_requires_claude_reauth(Some(
+            "Unable to fetch usage credits due to network error"
+        )));
+
+        let mut smoke = SmokeResult {
+            command_found: true,
+            succeeded: false,
+            exit_status: Some(1),
+            duration_ms: 12,
+            message: "Claude Code smoke session failed before verification could complete."
+                .to_string(),
+            diagnostic: Some(
+                "Failed to authenticate: OAuth session expired and could not be refreshed"
+                    .to_string(),
+            ),
+            error_code: Some("smoke_command_failed".to_string()),
+            local_session_observed: None,
+        };
+        classify_source_smoke_failure(&SourceKind::ClaudeCode, &mut smoke);
+
+        let result = smoke_failure_verification_result(
+            SourceKind::ClaudeCode,
+            &smoke,
+            Some("2026-09-14T12:00:00Z".to_string()),
+        );
+
+        assert_eq!(result.status, SourceVerificationStatus::ReconnectRequired);
+        assert!(!result.verified);
+        assert_eq!(result.message.code, CLAUDE_OAUTH_REAUTH_REQUIRED_CODE);
+        assert!(result
+            .message
+            .text
+            .contains("Ottto itself is still connected"));
+    }
+
+    #[test]
+    #[serial]
+    fn verify_claude_expired_oauth_precedes_config_drift() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("verify-claude-expired-auth-with-drift");
+        let support_root = root.join("support");
+        let secret_root = telemetry_key_store_root("verify-claude-expired-auth-with-drift-secret");
+        fs::create_dir_all(root.join(".claude")).expect("claude config dir");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        fs::write(
+            root.join(".claude/settings.json"),
+            r#"{"env":{"EXISTING":"keep"}}"#,
+        )
+        .expect("write drifted Claude settings");
+        let fake_claude = fake_binary_path(&root, "claude");
+        fs::write(
+            &fake_claude,
+            "#!/bin/sh\necho 'Token is expired. Run /login to sign in again.' >&2\nexit 1\n",
+        )
+        .expect("write fake Claude smoke");
+        #[cfg(unix)]
+        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755))
+            .expect("mark fake Claude executable");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let _path_guard = EnvVarGuard::set_os(
+            "OTTTO_COMMAND_SEARCH_PATH",
+            fake_claude
+                .parent()
+                .expect("fake binary parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["claude_code".to_string()],
+            })
+            .expect("persist relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .expect("persist relay device secret");
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_test")
+            .expect("persist setup token");
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(LocalConnectionBinding {
+                setup_run_id: "setup_test".to_string(),
+                setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                claim_code: None,
+                api_base_url: "https://api.ottto.net".to_string(),
+            }));
+
+        let result = verify_source(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            SourceKind::ClaudeCode,
+            false,
+        )
+        .expect("verification should classify provider auth before drift");
+
+        assert_eq!(result.status, SourceVerificationStatus::ReconnectRequired);
+        assert_eq!(result.message.code, CLAUDE_OAUTH_REAUTH_REQUIRED_CODE);
+        assert!(!result.config.drift.is_empty());
+        assert_eq!(
+            daemon
+                .status_for_trusted_client()
+                .expect("status")
+                .account
+                .state,
+            LocalAccountState::Connected
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
