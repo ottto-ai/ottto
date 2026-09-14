@@ -10562,7 +10562,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
     }
     for mut candidate in identified_candidates {
         let preflight_source_file_fingerprint =
-            claude_authority_preflight.then(|| candidate.source_file_fingerprint.clone());
+            claude_authority_preflight_fingerprint(index, &candidate);
         prepare_candidate_context(&mut candidate);
         let Some((candidate, opened_file)) = open_and_identify_scan_candidate(
             source,
@@ -11125,6 +11125,27 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         snapshots,
         pending_finalization,
     })
+}
+
+/// Preserve the two-open identity fence only for the Claude family whose
+/// authority reconstruction actually requested the preflight.
+///
+/// A quarantine anywhere enables the source-wide prepass so the scanner can
+/// discover every current member of that family. Unrelated healthy sessions
+/// must not inherit its equality check: their transcript or shared OTEL
+/// sidecars may advance between the prepass and the authoritative parse open.
+/// The second open remains fully revalidated for those sessions; only the
+/// quarantined family's cross-member snapshot must stay byte-identical across
+/// both phases.
+fn claude_authority_preflight_fingerprint(
+    index: &ScanIndex,
+    candidate: &CandidateFile,
+) -> Option<String> {
+    let (root_session_id, _) = claude_index_path_family_member(&candidate.path)?;
+    index
+        .claude_usage_authority_quarantine
+        .contains_key(&root_session_id)
+        .then(|| candidate.source_file_fingerprint.clone())
 }
 
 fn apply_codex_state_evidence(item: &mut SnapshotItem, metadata: &CodexTitleMetadata) {
@@ -21972,6 +21993,47 @@ mod tests {
             loaded.candidate_decision(&changed),
             CandidateDecision::Parse,
             "terminal loss still retries immediately after family evolution"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_authority_preflight_identity_fence_is_family_scoped() {
+        let root = temp_dir("claude-authority-preflight-family-scope");
+        let quarantined_root = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let healthy_root = "11111111-2222-3333-4444-555555555555";
+        let quarantined_path = root.join(format!("{quarantined_root}.jsonl"));
+        let healthy_path = root.join(format!("{healthy_root}.jsonl"));
+        fs::write(&quarantined_path, "{}\n").expect("write quarantined transcript");
+        fs::write(&healthy_path, "{}\n").expect("write healthy transcript");
+
+        let mut index = ScanIndex::default();
+        index.claude_usage_authority_quarantine.insert(
+            quarantined_root.to_string(),
+            ClaudeUsageAuthorityQuarantineRecord {
+                contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
+                proven_witness_fingerprint: "witness".to_string(),
+                member_source_file_fingerprints: BTreeMap::new(),
+                failed_reconstruction_count: 1,
+                disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+                retry_after_unix_seconds: u64::MAX,
+            },
+        );
+        let mut quarantined = test_candidate(quarantined_path);
+        quarantined.source_file_fingerprint = "quarantined-revision".to_string();
+        let mut healthy = test_candidate(healthy_path);
+        healthy.source_file_fingerprint = "healthy-revision".to_string();
+
+        assert_eq!(
+            claude_authority_preflight_fingerprint(&index, &quarantined).as_deref(),
+            Some("quarantined-revision"),
+            "the family under reconstruction keeps the exact preflight fence"
+        );
+        assert_eq!(
+            claude_authority_preflight_fingerprint(&index, &healthy),
+            None,
+            "an unrelated live session may advance before its authoritative parse open"
         );
 
         let _ = fs::remove_dir_all(root);

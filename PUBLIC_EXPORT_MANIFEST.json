@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 372,
-  "content_sha256": "ec872ec73f8a2db0b2ff0352ebed2aab7cb0a025ab8de53f77c375eaf06e7f9f",
+  "candidate_file_count": 373,
+  "content_sha256": "06e5636eb6e1c013ca6316a4815d2a4a2ecd541582e0a168624aac54e804167e",
   "files": [
     {
       "executable": false,
@@ -881,8 +881,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "358f0b75a83058b5a5fe3bb152dee4d3a7ca64f588e30ec21c07a1df7107410c",
-      "size_bytes": 1887539
+      "sha256": "2c79a25362fb55374979cafd87d12751a2df1fc135c204e223cd4bff63f96c8c",
+      "size_bytes": 1890499
     },
     {
       "executable": false,
@@ -1618,6 +1618,13 @@
       "path": "docs/session-2026-09-13-duplicate-claude-slot-is-not-attention.md",
       "sha256": "eaa81ad7ca2ddd45fe5a37e67830405c8113454ad6121d57df78c99fe6c46ac8",
       "size_bytes": 2276
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-09-14-claude-preflight-family-scope.md",
+      "sha256": "2e2aca96b9bc3c0e42442f5d3d1c2b89e4640bea267f9c87ecf68ee075b21d10",
+      "size_bytes": 1913
     },
     {
       "executable": false,
@@ -2607,9 +2614,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-13T03:38:18+00:00",
+  "generated_at": "2026-09-14T08:08:09+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 373,
+  "output_file_count": 374,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2643,5 +2650,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "39d4b8beacb6fe0f7d8e71aac03fbe682d434f19"
+  "source_commit": "a8d99a6578995f61e08ed7b98c48da9c4bba8f4f"
 }
