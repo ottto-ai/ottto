@@ -31,6 +31,8 @@ pub mod snapshot_client;
 pub mod snapshot_sync;
 pub mod snapshot_watcher;
 pub mod snapshots;
+#[cfg(test)]
+mod test_scratch;
 #[cfg(unix)]
 pub mod unix_socket;
 pub mod upload_receipts;

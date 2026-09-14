@@ -88,10 +88,46 @@ The receipts helper returns a `ScratchDir` guard instead of a `PathBuf`:
 Three tests cover it: the directory is owner-traversable, an existing path is
 refused with `AlreadyExists`, and a panicking body leaves nothing behind.
 
+## The same shape in seven other helpers
+
+`upload_receipts` was not the only helper keyed on a reusable path. Sweeping
+every scratch-directory helper in `ottto-service`:
+
+| helper | name keyed on | adopts an existing path |
+| --- | --- | --- |
+| `context_footprint::temp_dir` | pid + counter | yes, `create_dir_all` |
+| `cloud_sessions::temp_dir` | pid + counter | yes, `create_dir_all` |
+| `active_sessions::temp_dir` | pid only | yes, `create_dir_all` |
+| `command_env::scratch_home` | pid + counter | path only |
+| `provider_daily_reference::temp_dir` | pid + counter | path only |
+| `claude_browser_auth::temp_dir` | pid only | path only |
+| `snapshot_sync::test_dir` | pid + wall-clock second | path only |
+
+Pids are reused, so every one of these can hand a later run a directory an
+earlier run left behind. A poisoned mode is just the loudest way that goes
+wrong; a leftover carrying stale *files* corrupts a later run the same way and
+is far harder to read from the failure.
+
+Six other helpers - `launch_events`, `claude_upkeep`,
+`external_scheduler_attribution`, `backfill`, `snapshots`, `snapshot_audit` -
+name directories with a nanosecond timestamp and so cannot be reused.
+`control::control_test_root` already adds a counter and removes any leftover
+before it creates.
+
+All seven reusable helpers now route through `test_scratch`, a shared test-only
+module: names carry 64 random bits, directory creation uses `create_dir` so an
+existing path is refused, and the mode is pinned to `0o700` instead of
+inheriting a umask another thread can move.
+
 ## Left alone
 
-`snapshots.rs` has its own `temp_dir` that leaks on panic. It names directories
-with a nanosecond timestamp, so it cannot collide with a leftover and cannot
-reproduce this failure - but two of its August leftovers are still sitting in
-`$TMPDIR` at `drw-------`, which is independent confirmation that the umask
-window was poisoning directories across the crate, not just this one helper.
+Only `upload_receipts` uses the RAII `ScratchDir`; the other helpers still
+return a bare `PathBuf` and still leak their directory when a test panics
+before its trailing `remove_dir_all`. That is now inert: a leaked directory can
+never be adopted by a later run, so it is junk in `$TMPDIR` rather than a
+failure waiting to happen. Converting the remaining ~126 call sites to the
+guard is tidying, not a fix.
+
+Two August leftovers from `snapshots.rs` are still sitting in `$TMPDIR` at
+`drw-------`, which is independent confirmation that the umask window was
+poisoning directories across the crate, not just one helper.

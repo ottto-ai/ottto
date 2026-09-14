@@ -457,79 +457,11 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use crate::snapshot_client::{SnapshotBatchResponse, SnapshotEntityRef};
+    use crate::test_scratch::{create_private_dir, ScratchDir};
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
-
-    /// Owner-only scratch directory that is removed when it goes out of scope,
-    /// including while a failing test unwinds.
-    ///
-    /// Scratch directories were previously named `<pid>-<counter>` and created
-    /// with `create_dir_all`, which adopts whatever already sits at the path.
-    /// Pids are reused, so a directory left behind by a panicking run was handed
-    /// straight to a later run - and a directory created while some other thread
-    /// held a narrow umask is mode `0o600`, which has no execute bit and so
-    /// cannot be traversed: every write inside it fails with EACCES.
-    struct ScratchDir {
-        path: PathBuf,
-    }
-
-    impl ScratchDir {
-        fn new() -> Self {
-            for _ in 0..16 {
-                let mut suffix = [0_u8; 8];
-                getrandom::fill(&mut suffix).expect("random scratch directory name");
-                let path = std::env::temp_dir().join(format!(
-                    "ottto-upload-receipts-{}-{}-{:016x}",
-                    std::process::id(),
-                    NEXT_DIR.fetch_add(1, Ordering::Relaxed),
-                    u64::from_ne_bytes(suffix)
-                ));
-                match create_scratch_dir(&path) {
-                    Ok(()) => return Self { path },
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(error) => panic!("create scratch directory {}: {error}", path.display()),
-                }
-            }
-            panic!("no unique scratch directory name after 16 attempts");
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            // Restore traversal first so cleanup still works for a test that
-            // narrowed the directory on purpose.
-            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o700));
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
-    impl std::ops::Deref for ScratchDir {
-        type Target = Path;
-
-        fn deref(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl AsRef<Path> for ScratchDir {
-        fn as_ref(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    /// Creates `path` as an owner-only directory and refuses to adopt anything
-    /// already there: `create_dir` (unlike `create_dir_all`) fails with
-    /// `AlreadyExists`. The mode is pinned explicitly because `mkdir` masks its
-    /// requested mode with the process umask, which another thread can move.
-    fn create_scratch_dir(path: &Path) -> std::io::Result<()> {
-        std::fs::create_dir(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-    }
 
     fn temp_dir() -> ScratchDir {
-        ScratchDir::new()
+        ScratchDir::new("ottto-upload-receipts")
     }
 
     fn response(raw_id: &str) -> SnapshotBatchResponse {
@@ -715,7 +647,7 @@ mod tests {
         std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o600))
             .expect("narrow leftover directory");
 
-        let error = create_scratch_dir(&leftover).expect_err("an existing path must be refused");
+        let error = create_private_dir(&leftover).expect_err("an existing path must be refused");
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
 
         std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o700))

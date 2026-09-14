@@ -799,12 +799,7 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "ottto-active-sessions-{name}-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        path
+        crate::test_scratch::private_dir(&format!("ottto-active-sessions-{name}"))
     }
 
     #[test]

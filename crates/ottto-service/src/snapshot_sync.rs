@@ -10800,11 +10800,7 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "ottto-{name}-{}-{}",
-            std::process::id(),
-            current_rfc3339().replace([':', '-'], "")
-        ))
+        crate::test_scratch::unique_path(&format!("ottto-{name}"))
     }
 
     fn test_agent_status(source: SourceKind) -> AgentStatusSnapshot {
