@@ -49,8 +49,6 @@ fn serve_unix_socket_with_limit_and_handler(
     }
 
     let listener = bind_user_only_socket(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod socket {}", path.display()))?;
 
     let mut served = 0_usize;
     let mut workers = Vec::new();
@@ -112,29 +110,80 @@ fn invalid_request_response(message: &str) -> LocalControlResponse {
     }
 }
 
+/// Binds an owner-only control socket without touching the process umask.
+///
+/// A unix domain socket inherits its permissions from the umask in effect at
+/// bind time, so the obvious hardening is a scoped `umask(0o177)`. umask is
+/// process-global rather than per-thread, and the daemon binds this socket while
+/// its relay threads are already running, so such a window also narrows every
+/// file and directory those threads happen to create. A directory created under
+/// `0o177` lands at `0o600`: it keeps its read bit but loses its execute bit, so
+/// it can never be traversed again and every write inside it fails with EACCES.
+///
+/// Bind inside a private staging directory instead, tighten the socket there,
+/// then rename it into place. Renaming keeps the listening socket's inode, so
+/// clients connect through the published path as before, and that path only ever
+/// appears with owner-only permissions.
 fn bind_user_only_socket(path: &Path) -> Result<UnixListener> {
-    let _guard = RestrictiveSocketUmask::new();
-    UnixListener::bind(path).with_context(|| format!("bind socket {}", path.display()))
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staging = PrivateStagingDir::create_in(parent)?;
+    // Socket paths are capped at `sockaddr_un::sun_path`, so keep the staged
+    // name short: it replaces the final file name, it does not extend it.
+    let staged = staging.path().join("s");
+    let listener =
+        UnixListener::bind(&staged).with_context(|| format!("bind socket {}", path.display()))?;
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod socket {}", path.display()))?;
+    fs::rename(&staged, path).with_context(|| format!("publish socket {}", path.display()))?;
+    Ok(listener)
 }
 
-struct RestrictiveSocketUmask {
-    previous: libc::mode_t,
+/// Owner-only directory that is removed when it goes out of scope, including
+/// when the bind it was staging fails.
+struct PrivateStagingDir {
+    path: PathBuf,
 }
 
-impl RestrictiveSocketUmask {
-    fn new() -> Self {
-        // Unix domain sockets inherit permissions from the process umask at bind time.
-        // Use owner-only permissions before the socket appears, then restore immediately.
-        let previous = unsafe { libc::umask(0o177) };
-        Self { previous }
+impl PrivateStagingDir {
+    fn create_in(parent: &Path) -> Result<Self> {
+        for _ in 0..16 {
+            let mut suffix = [0_u8; 4];
+            getrandom::fill(&mut suffix)
+                .map_err(|error| anyhow::anyhow!("random socket staging name: {error}"))?;
+            let path = parent.join(format!(".s{:08x}", u32::from_ne_bytes(suffix)));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    // `mkdir` masks its requested mode with the umask, which
+                    // another thread can move underneath us, so pin the mode
+                    // explicitly instead of inheriting whatever is in effect.
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                        .with_context(|| format!("chmod socket staging {}", path.display()))?;
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("create socket staging {}", path.display())))
+                }
+            }
+        }
+        anyhow::bail!(
+            "could not create a unique socket staging directory in {}",
+            parent.display()
+        )
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
-impl Drop for RestrictiveSocketUmask {
+impl Drop for PrivateStagingDir {
     fn drop(&mut self) {
-        unsafe {
-            libc::umask(self.previous);
-        }
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -238,6 +287,7 @@ mod tests {
     };
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::{mpsc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -332,6 +382,81 @@ mod tests {
 
         server.join().expect("server thread should join").unwrap();
         let _ = fs::remove_file(path);
+    }
+
+    /// A bound AF_UNIX socket takes its mode from the process umask, so it is
+    /// tempting to tighten the umask around `bind`. umask is process-global:
+    /// every other thread that creates a file or directory inside that window
+    /// inherits the restriction. A directory created at `0o600` keeps its read
+    /// bit but loses its execute bit, so it can no longer be traversed and every
+    /// write inside it fails with `EACCES` - which is how a daemon relay (or a
+    /// sibling test) ends up with a state directory it can never write to again.
+    /// Bind repeatedly while another thread creates directories and require
+    /// every one of them to stay traversable.
+    #[test]
+    #[serial]
+    fn socket_bind_never_narrows_directories_created_by_other_threads() {
+        // Socket paths are capped at SUN_LEN (104 bytes on macOS) and $TMPDIR is
+        // already long here, so keep every component short.
+        let root = std::env::temp_dir().join(format!(
+            "ottto-um-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.subsec_nanos())
+                .unwrap_or_default()
+        ));
+        let dirs = root.join("d");
+        for path in [&root, &dirs] {
+            fs::create_dir_all(path).expect("probe directory");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("probe directory mode");
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let creator_stop = Arc::clone(&stop);
+        let creator_dirs = dirs.clone();
+        let creator = thread::spawn(move || {
+            let mut narrowed: Vec<String> = Vec::new();
+            let mut created = 0_u64;
+            while !creator_stop.load(AtomicOrdering::Relaxed) {
+                let child = creator_dirs.join(format!("{created}"));
+                created += 1;
+                if fs::create_dir(&child).is_err() {
+                    continue;
+                }
+                if let Ok(metadata) = fs::metadata(&child) {
+                    let mode = metadata.permissions().mode() & 0o777;
+                    if mode & 0o100 == 0 {
+                        narrowed.push(format!("{mode:o}"));
+                        let _ = fs::set_permissions(&child, fs::Permissions::from_mode(0o700));
+                    }
+                }
+                let _ = fs::remove_dir(&child);
+            }
+            narrowed
+        });
+
+        for attempt in 0..3_000 {
+            let socket_path = root.join(format!("s{attempt}.sock"));
+            let listener = bind_user_only_socket(&socket_path).expect("bind probe socket");
+            drop(listener);
+            let _ = fs::remove_file(&socket_path);
+        }
+
+        stop.store(true, AtomicOrdering::Relaxed);
+        let mut narrowed = creator.join().expect("probe creator thread");
+        let _ = fs::remove_dir_all(&root);
+
+        let observed = narrowed.len();
+        narrowed.sort();
+        narrowed.dedup();
+        assert!(
+            narrowed.is_empty(),
+            "binding the control socket narrowed {observed} directories created by \
+             another thread (modes {narrowed:?}); a directory without the owner \
+             execute bit cannot be traversed, so every write inside it fails"
+        );
     }
 
     #[test]

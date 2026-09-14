@@ -462,14 +462,74 @@ mod tests {
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
 
-    fn temp_dir() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "ottto-upload-receipts-{}-{}",
-            std::process::id(),
-            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        path
+    /// Owner-only scratch directory that is removed when it goes out of scope,
+    /// including while a failing test unwinds.
+    ///
+    /// Scratch directories were previously named `<pid>-<counter>` and created
+    /// with `create_dir_all`, which adopts whatever already sits at the path.
+    /// Pids are reused, so a directory left behind by a panicking run was handed
+    /// straight to a later run - and a directory created while some other thread
+    /// held a narrow umask is mode `0o600`, which has no execute bit and so
+    /// cannot be traversed: every write inside it fails with EACCES.
+    struct ScratchDir {
+        path: PathBuf,
+    }
+
+    impl ScratchDir {
+        fn new() -> Self {
+            for _ in 0..16 {
+                let mut suffix = [0_u8; 8];
+                getrandom::fill(&mut suffix).expect("random scratch directory name");
+                let path = std::env::temp_dir().join(format!(
+                    "ottto-upload-receipts-{}-{}-{:016x}",
+                    std::process::id(),
+                    NEXT_DIR.fetch_add(1, Ordering::Relaxed),
+                    u64::from_ne_bytes(suffix)
+                ));
+                match create_scratch_dir(&path) {
+                    Ok(()) => return Self { path },
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create scratch directory {}: {error}", path.display()),
+                }
+            }
+            panic!("no unique scratch directory name after 16 attempts");
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            // Restore traversal first so cleanup still works for a test that
+            // narrowed the directory on purpose.
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for ScratchDir {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    /// Creates `path` as an owner-only directory and refuses to adopt anything
+    /// already there: `create_dir` (unlike `create_dir_all`) fails with
+    /// `AlreadyExists`. The mode is pinned explicitly because `mkdir` masks its
+    /// requested mode with the process umask, which another thread can move.
+    fn create_scratch_dir(path: &Path) -> std::io::Result<()> {
+        std::fs::create_dir(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+
+    fn temp_dir() -> ScratchDir {
+        ScratchDir::new()
     }
 
     fn response(raw_id: &str) -> SnapshotBatchResponse {
@@ -548,7 +608,6 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         assert_eq!(state_files, vec![UPLOAD_RECEIPTS_FILENAME]);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -564,7 +623,6 @@ mod tests {
             .contains(".corrupt.")));
         append_transport_error(&dir, SourceKind::Pi, 3).unwrap();
         assert_eq!(read(&dir, 50, None, None).unwrap().receipts.len(), 1);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -633,6 +691,51 @@ mod tests {
             .unwrap()
             .receipts
             .is_empty());
-        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scratch_directory_is_owner_traversable() {
+        let dir = temp_dir();
+        let mode = std::fs::metadata(&dir)
+            .expect("scratch metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        // `0o600` on a directory reads as "private" but has no execute bit, so
+        // the directory cannot be traversed and every write inside it fails.
+        assert_eq!(mode, 0o700);
+        std::fs::write(dir.join("probe"), b"probe").expect("write inside scratch directory");
+    }
+
+    #[test]
+    fn scratch_directory_never_adopts_an_existing_path() {
+        let dir = temp_dir();
+        let leftover = dir.join("leftover");
+        std::fs::create_dir(&leftover).expect("leftover directory");
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o600))
+            .expect("narrow leftover directory");
+
+        let error = create_scratch_dir(&leftover).expect_err("an existing path must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o700))
+            .expect("restore leftover directory");
+    }
+
+    #[test]
+    fn scratch_directory_is_removed_when_a_test_panics() {
+        let dir = temp_dir();
+        let path = dir.to_path_buf();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _dir = dir;
+            panic!("failing test body");
+        }));
+
+        assert!(outcome.is_err());
+        assert!(
+            !path.exists(),
+            "a panicking test left {} behind for a later run to inherit",
+            path.display()
+        );
     }
 }
