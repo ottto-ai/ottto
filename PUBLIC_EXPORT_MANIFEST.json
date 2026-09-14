@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 375,
-  "content_sha256": "72762ad1b40b9a1bc00091dc8f0c441cd9c986064751d55020be09df855298ba",
+  "candidate_file_count": 376,
+  "content_sha256": "4c43f5681ad841b7e33c655868d7a5b67512e9f650aafab420711924a87ca6d3",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "acbf81aff833da29ec6a2660e87fba8d3dc804fd58c0ab82a0b639e36eacb44f",
-      "size_bytes": 814567
+      "sha256": "28707d0cea2fabaa3a31e804bab02e39fe12ae94204ac8dfbd9bfdabf9d49939",
+      "size_bytes": 821789
     },
     {
       "executable": false,
@@ -1643,6 +1643,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-09-14-transient-claude-read-failure-is-not-attention.md",
+      "sha256": "65189a063c056bdde1fe46b5fa0cf668c6e07ea24862ff95a907de24b72e940e",
+      "size_bytes": 3809
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-surfaces.md",
       "sha256": "b49df98bbf9dbdcbcc4a904c35f084019541451e53f46c3134ea5c9ff31920b9",
       "size_bytes": 2026
@@ -2628,9 +2635,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-14T14:49:53+00:00",
+  "generated_at": "2026-09-14T18:38:13+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 376,
+  "output_file_count": 377,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2664,5 +2671,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "bbe42224f88cc339dd90dab574b5957686f578c5"
+  "source_commit": "381cbb36341363edf8c759cf03200b254b4fe6bc"
 }

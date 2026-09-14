@@ -2763,8 +2763,10 @@ fn collect_claude_status_snapshots(
         .iter()
         .any(|window| window.organization_identifier_hash.is_some())
         || !default_snapshot.credit_balances.is_empty();
-    let default_full_meter_needs_attention = default_has_full_meter_evidence
-        && default_state.state != ClaudeConfigSlotCollectionStateV1::Fresh;
+    let default_full_meter_needs_attention = claude_default_full_meter_needs_attention(
+        default_has_full_meter_evidence,
+        &default_state.state,
+    );
     if has_actionable_custom_slot || default_full_meter_needs_attention {
         let current_login_available = source_health_snapshot.status == AgentStatusState::Available;
         if current_login_available {
@@ -2794,19 +2796,46 @@ fn collect_claude_status_snapshots(
 /// Whether one registered Claude slot's collection state is something the
 /// operator has to act on.
 ///
-/// A duplicate registration is not. It means the slot resolves to an account
-/// another registered slot already owns, so its meters come from that owner and
-/// nothing is expired, mismatched, or waiting on a login. Codex has always
-/// treated its own `DuplicateAccount` this way; Claude counting it as
-/// actionable degraded a fully healthy source and told the operator their
-/// durable connections needed repair while every slot was fresh and metered.
+/// "Needs attention" is reserved for a repair the operator can actually make in
+/// Ottto. Two families of state are not that:
+///
+/// - A duplicate registration resolves to an account another registered slot
+///   already owns, so its meters come from that owner and nothing is expired,
+///   mismatched, or waiting on a login. Codex has always treated its own
+///   `DuplicateAccount` this way; Claude counting it as actionable degraded a
+///   fully healthy source and told the operator their durable connections
+///   needed repair while every slot was fresh and metered.
+/// - A transient read failure means the meters could not be read right now.
+///   `projected_claude_quota_access_state` already classifies these
+///   `TemporarilyUnavailable`, the credential is untouched, background upkeep
+///   keeps running, and the failed-verification re-verify backoff clears them
+///   without the operator doing anything. Their approved copy names no action
+///   ("Ottto could not read current limits", "Staged"), unlike `NeedsLogin`,
+///   `StaleAccessToken`, `ReloginApproaching`, `IdentityMismatch` and
+///   `ConcurrentMutation`, which all tell the operator to sign in again and so
+///   stay actionable here.
 fn claude_custom_slot_needs_attention(state: &ClaudeConfigSlotCollectionStateV1) -> bool {
     !matches!(
         state,
         ClaudeConfigSlotCollectionStateV1::Fresh
             | ClaudeConfigSlotCollectionStateV1::Unverified
             | ClaudeConfigSlotCollectionStateV1::DuplicateAccount
+            | ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
+            | ClaudeConfigSlotCollectionStateV1::ProbeFailed
+            | ClaudeConfigSlotCollectionStateV1::CollectionInProgress
+            | ClaudeConfigSlotCollectionStateV1::RefreshDue
     )
+}
+
+/// The default slot's own path to the same warning. It carried its own
+/// `!= Fresh` comparison, so a default slot whose provider read failed raised
+/// the unactionable warning even once the custom-slot predicate stopped. Both
+/// branches ask the same question.
+fn claude_default_full_meter_needs_attention(
+    has_full_meter_evidence: bool,
+    state: &ClaudeConfigSlotCollectionStateV1,
+) -> bool {
+    has_full_meter_evidence && claude_custom_slot_needs_attention(state)
 }
 
 fn apply_claude_anchor_continuity(
@@ -11475,11 +11504,73 @@ mod tests {
     fn a_duplicate_claude_registration_does_not_need_attention() {
         use ClaudeConfigSlotCollectionStateV1 as State;
 
-        for benign in [State::Fresh, State::Unverified, State::DuplicateAccount] {
+        assert!(
+            !claude_custom_slot_needs_attention(&State::DuplicateAccount),
+            "a duplicate registration must not degrade a healthy Claude source"
+        );
+        assert!(
+            claude_custom_slot_needs_attention(&State::NeedsLogin),
+            "an expired sign-in must still reach the operator"
+        );
+    }
+
+    /// A provider-side read failure is not a repair the operator can make.
+    ///
+    /// `ProviderUnavailable`, `ProbeFailed`, `CollectionInProgress` and
+    /// `RefreshDue` all mean the meters could not be read right now: the
+    /// daemon already classifies them `TemporarilyUnavailable` in
+    /// `projected_claude_quota_access_state`, the credential is untouched, and
+    /// the app's own approved copy for them names no user action ("Ottto could
+    /// not read current limits", "Staged") - unlike `NeedsLogin`,
+    /// `StaleAccessToken`, `ReloginApproaching`, `IdentityMismatch` and
+    /// `ConcurrentMutation`, which all tell the operator to sign in again.
+    /// Counting them as actionable raised `secret_expired` - "Claude Code
+    /// durable connections need attention" - with a Verify button, for an
+    /// outage at Anthropic that Verify cannot fix and that the daemon's own
+    /// re-verify backoff clears on its own.
+    #[test]
+    fn a_transient_claude_read_failure_does_not_need_attention() {
+        use ClaudeConfigSlotCollectionStateV1 as State;
+
+        // Exhaustive by construction: adding a state to the protocol enum
+        // fails to compile here until someone decides which side it belongs
+        // on, rather than silently defaulting to "the operator must act".
+        fn classify(state: &ClaudeConfigSlotCollectionStateV1) -> bool {
+            match state {
+                State::Fresh
+                | State::Unverified
+                | State::DuplicateAccount
+                | State::ProviderUnavailable
+                | State::ProbeFailed
+                | State::CollectionInProgress
+                | State::RefreshDue => false,
+                State::IdentityUnknown
+                | State::CredentialUnavailable
+                | State::IdentityMismatch
+                | State::ConcurrentMutation
+                | State::CollectionPaused
+                | State::CapacityExceeded
+                | State::UpkeepNotConsented
+                | State::StaleAccessToken
+                | State::ReloginApproaching
+                | State::NeedsLogin => true,
+            }
+        }
+
+        for benign in [
+            State::Fresh,
+            State::Unverified,
+            State::DuplicateAccount,
+            State::ProviderUnavailable,
+            State::ProbeFailed,
+            State::CollectionInProgress,
+            State::RefreshDue,
+        ] {
             assert!(
                 !claude_custom_slot_needs_attention(&benign),
                 "{benign:?} must not degrade a healthy Claude source"
             );
+            assert!(!classify(&benign), "classifier drifted from the lists");
         }
 
         for actionable in [
@@ -11487,14 +11578,10 @@ mod tests {
             State::CredentialUnavailable,
             State::IdentityMismatch,
             State::ConcurrentMutation,
-            State::ProviderUnavailable,
             State::CollectionPaused,
-            State::CollectionInProgress,
             State::CapacityExceeded,
-            State::RefreshDue,
             State::UpkeepNotConsented,
             State::StaleAccessToken,
-            State::ProbeFailed,
             State::ReloginApproaching,
             State::NeedsLogin,
         ] {
@@ -11502,7 +11589,79 @@ mod tests {
                 claude_custom_slot_needs_attention(&actionable),
                 "{actionable:?} must still reach the operator"
             );
+            assert!(classify(&actionable), "classifier drifted from the lists");
         }
+    }
+
+    /// The default slot reaches the same conclusion through its own branch.
+    /// It used to compare against `Fresh` directly, so a default slot whose
+    /// provider read failed raised the same unactionable warning even when the
+    /// custom-slot predicate stayed quiet. Both branches must agree.
+    #[test]
+    fn default_slot_transient_read_failure_does_not_need_attention() {
+        use ClaudeConfigSlotCollectionStateV1 as State;
+
+        for benign in [State::ProviderUnavailable, State::ProbeFailed] {
+            assert!(
+                !claude_default_full_meter_needs_attention(true, &benign),
+                "{benign:?} default slot must not degrade a healthy Claude source"
+            );
+        }
+        assert!(
+            claude_default_full_meter_needs_attention(true, &State::NeedsLogin),
+            "an expired default sign-in must still reach the operator"
+        );
+        assert!(
+            !claude_default_full_meter_needs_attention(false, &State::NeedsLogin),
+            "no full-meter evidence means this branch stays silent"
+        );
+    }
+
+    /// The exact M4 slot set behind the 0.1.132 report, as data: one fresh
+    /// canonical anchor serving live meters, one duplicate anchor, one
+    /// canonical anchor whose provider read failed, and a default slot that
+    /// holds full-meter evidence and also failed its provider read.
+    ///
+    /// This is the boolean that gates the `secret_expired` warning, so it
+    /// reproduces the symptom rather than only the helper.
+    #[test]
+    fn live_provider_unavailable_slot_set_does_not_degrade_the_source() {
+        use ClaudeConfigSlotCollectionStateV1 as State;
+
+        let custom_slots = [
+            State::DuplicateAccount,
+            State::Fresh,
+            State::ProviderUnavailable,
+        ];
+        let default_state = State::ProviderUnavailable;
+        let default_has_full_meter_evidence = true;
+
+        let has_actionable_custom_slot =
+            custom_slots.iter().any(claude_custom_slot_needs_attention);
+        let default_full_meter_needs_attention = claude_default_full_meter_needs_attention(
+            default_has_full_meter_evidence,
+            &default_state,
+        );
+
+        assert!(
+            !has_actionable_custom_slot,
+            "no custom slot in this set is a repair the operator can make"
+        );
+        assert!(
+            !default_full_meter_needs_attention,
+            "the default slot's failed provider read is not a repair either"
+        );
+        assert!(
+            !(has_actionable_custom_slot || default_full_meter_needs_attention),
+            "this slot set must leave Claude Code healthy, not `needs attention`"
+        );
+
+        // The same set with one genuinely expired sign-in must still warn.
+        let with_expired = [State::Fresh, State::NeedsLogin];
+        assert!(
+            with_expired.iter().any(claude_custom_slot_needs_attention),
+            "an expired sign-in must still reach the operator"
+        );
     }
 
     #[test]
