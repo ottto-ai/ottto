@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 378,
-  "content_sha256": "87ffc313ea6424ec1eaea551ed402bf8a532791596fc30f5dc15b80da4b4c150",
+  "content_sha256": "b9fa8fbfc5d15afd80b1917952a0394cc165c9f29be7b8112be0930b99f8cbd8",
   "files": [
     {
       "executable": false,
@@ -48,7 +48,7 @@
       "executable": false,
       "mode": "0644",
       "path": "Cargo.lock",
-      "sha256": "f4c2d4e609d2299c24a48d892a0fc766ca544b93a295e6fdb250ce55ed3204a1",
+      "sha256": "d5bb570dd815fdd474ab73aec2d1a166394cb444051ba91dba83cbb8a0ed27ff",
       "size_bytes": 43347
     },
     {
@@ -2649,7 +2649,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-14T19:15:15+00:00",
+  "generated_at": "2026-09-14T19:26:35+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 379,
   "public_roots": [
@@ -2685,5 +2685,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "7d73af5903e415af0e4d4234de7457c039ec55a0"
+  "source_commit": "3c27c44bee7d147a903e2e869cca3c3e7679051a"
 }
