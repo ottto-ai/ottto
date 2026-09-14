@@ -82,6 +82,11 @@ const USAGE_LIMITED_MESSAGE_CODE: &str = "usage_limited";
 const SMOKE_QUOTA_LIMITED_MESSAGE_CODE: &str = "smoke_quota_limited";
 const PI_ROUTE_SMOKE_FAILED_MESSAGE_CODE: &str = "pi_route_smoke_failed";
 const PI_OAUTH_REAUTH_REQUIRED_MESSAGE_CODE: &str = "pi_oauth_reauth_required";
+/// Stable verification message/error code for an expired Claude Code login.
+/// Unlike setup-run reconnect failures, this is source-scoped: the Ottto
+/// account remains connected while the customer re-authenticates Claude.
+pub(crate) const CLAUDE_OAUTH_REAUTH_REQUIRED_VERIFICATION_CODE: &str =
+    "claude_oauth_reauth_required";
 /// Verification message code (also used as the API error code) for a source
 /// whose CLI is genuinely not installed on this machine. Shared with
 /// [`control`] so the health projection can map it to a non-blocking
@@ -3268,6 +3273,9 @@ fn source_health_from_verification(
     let telemetry_disabled_by_admin = result.message.code == "telemetry_disabled_by_admin";
     let usage_limited = verification_result_is_usage_limited(result);
     let pi_local_only = result.source == SourceKind::Pi && result.message.code == "pi_local_only";
+    let provider_reauth_required = result.message.code
+        == CLAUDE_OAUTH_REAUTH_REQUIRED_VERIFICATION_CODE
+        || result.message.code == PI_OAUTH_REAUTH_REQUIRED_MESSAGE_CODE;
     let source_not_installed = result.message.code == SOURCE_NOT_INSTALLED_VERIFICATION_CODE;
     let agent_cli_unavailable = result.message.code == AGENT_CLI_UNAVAILABLE_VERIFICATION_CODE;
     let (source_state, grade, problems) = if source_not_installed {
@@ -3304,7 +3312,7 @@ fn source_health_from_verification(
                 retryable: true,
             }],
         )
-    } else if config_has_drift {
+    } else if config_has_drift && !provider_reauth_required {
         (
             SourceState::NeedsRepair,
             HealthGrade::Warning,
@@ -3396,7 +3404,21 @@ fn source_health_from_verification(
             ),
         }
     };
-    let recommended_actions = if config_has_drift {
+    let recommended_actions = if provider_reauth_required {
+        vec![RepairAction {
+            action: RepairActionKind::ReauthProvider,
+            title: format!("Sign in to {} again", source_display_name(&result.source)),
+            detail: result.message.text.clone(),
+            requires_approval: false,
+            destructive: false,
+            approval: no_repair_approval(
+                true,
+                false,
+                "Provider sign-in remains under the customer's control.",
+            ),
+            backup: None,
+        }]
+    } else if config_has_drift {
         let authority = repair_authority_for_state(state);
         vec![RepairAction {
             action: RepairActionKind::WriteConfig,
@@ -6370,6 +6392,57 @@ mod tests {
             status.sources[0].recommended_actions[0].action,
             RepairActionKind::VerifyTelemetry
         );
+    }
+
+    #[test]
+    fn claude_oauth_reconnect_is_source_scoped_and_prioritizes_provider_sign_in() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        daemon
+            .update_sources(TOKEN, vec![codex_health()])
+            .expect("source health should update");
+        let result = SourceVerificationResult {
+            source: SourceKind::ClaudeCode,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.claude/settings.json".to_string()),
+                fingerprint: Some("sha256:test".to_string()),
+                drift: vec![ottto_protocol::ConfigDrift {
+                    key: "otel_headers".to_string(),
+                    expected: RedactedValue::String("current".to_string()),
+                    observed: RedactedValue::String("stale".to_string()),
+                }],
+            },
+            status: SourceVerificationStatus::ReconnectRequired,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-09-14T12:00:00Z".to_string()),
+            message: StableMessage {
+                code: CLAUDE_OAUTH_REAUTH_REQUIRED_VERIFICATION_CODE.to_string(),
+                text: "Claude Code sign-in expired. Ottto itself is still connected.".to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record Claude reconnect result");
+        let status = daemon.status(TOKEN).expect("status");
+        let source = status
+            .sources
+            .iter()
+            .find(|source| source.source == SourceKind::ClaudeCode)
+            .expect("Claude source");
+
+        assert_eq!(status.account.state, LocalAccountState::Connected);
+        assert_eq!(source.state, SourceState::Failed);
+        assert_eq!(source.recommended_actions.len(), 1);
+        assert_eq!(
+            source.recommended_actions[0].action,
+            RepairActionKind::ReauthProvider
+        );
+        assert!(source.recommended_actions[0].title.contains("Claude Code"));
     }
 
     #[test]

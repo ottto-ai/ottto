@@ -51,6 +51,12 @@ ottto fix --app claude-code --json
 ottto verify --app claude-code --json
 ```
 
+If Verify returns `claude_oauth_reauth_required`, Ottto and the Mac connection
+are still healthy; only Claude Code's default provider login expired. Open
+Claude Code without `CLAUDE_CONFIG_DIR`, type `/login`, complete Claude's
+sign-in, then run Verify again. Do not start a new Ottto setup or Mac claim for
+this source-scoped result.
+
 For Codex:
 
 ```bash
