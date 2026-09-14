@@ -3572,9 +3572,6 @@ mod tests {
     use serde_json::json;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
-    use std::sync::atomic::AtomicU64;
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     const INSTALLATION_ID: &str = "00000000-0000-4000-8000-000000000001";
     const GRANT_ID: &str = "00000000-0000-4000-8000-000000000002";
@@ -3583,11 +3580,7 @@ mod tests {
     const ACCOUNT_SCOPE: &str = "acct-fixture-private";
 
     fn temp_dir(name: &str) -> PathBuf {
-        let unique = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "ottto-codex-daily-aggregates-{name}-{}-{unique}",
-            std::process::id()
-        ))
+        crate::test_scratch::unique_path(&format!("ottto-codex-daily-aggregates-{name}"))
     }
 
     /// Every store gets an explicit path, so no test reads or mutates process

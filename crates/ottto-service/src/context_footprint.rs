@@ -1213,18 +1213,10 @@ pub(crate) fn workspace_label(workspace: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+    use crate::test_scratch;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "ottto-context-footprint-{name}-{}-{counter}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
+        test_scratch::private_dir(&format!("ottto-context-footprint-{name}"))
     }
 
     fn run_git(repo: &Path, args: &[&str]) {

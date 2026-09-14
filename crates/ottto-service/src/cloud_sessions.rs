@@ -4367,19 +4367,12 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
     const INSTALLATION_ID: &str = "00000000-0000-4000-8000-000000000001";
     const GRANT_ID: &str = "00000000-0000-4000-8000-000000000002";
     fn temp_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "ottto-cloud-sessions-{name}-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
+        crate::test_scratch::private_dir(&format!("ottto-cloud-sessions-{name}"))
     }
     fn now() -> OffsetDateTime {
         OffsetDateTime::parse("2026-07-21T12:00:00Z", &Rfc3339).unwrap()

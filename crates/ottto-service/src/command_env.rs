@@ -373,18 +373,15 @@ fn push_unique(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_scratch;
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::Path;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn scratch_home(name: &str) -> PathBuf {
-        let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
             .join("ottto-command-env-tests")
-            .join(format!("{}-{name}-{counter}", std::process::id()))
+            .join(test_scratch::unique_name(name))
     }
 
     #[test]

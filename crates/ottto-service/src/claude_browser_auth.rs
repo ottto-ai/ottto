@@ -3761,10 +3761,7 @@ mod tests {
     }
 
     fn temp_dir(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "ottto-claude-browser-auth-{label}-{}",
-            std::process::id()
-        ))
+        crate::test_scratch::unique_path(&format!("ottto-claude-browser-auth-{label}"))
     }
 
     #[test]
