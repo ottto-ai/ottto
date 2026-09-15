@@ -1238,6 +1238,7 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                     "local snapshot sync: filesystem watch unavailable; cadence follows the scan tiers only"
                 );
             }
+            let mut account_switch = ClaudeAccountSwitchProbe::default();
             loop {
                 match sync_once(&home, &support_dir, &daemon) {
                     Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
@@ -1249,7 +1250,11 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                 // The cycle cadence itself is unchanged. What the tiers gate is the
                 // expensive part — the local transcript scan and its upload — while
                 // agent-status/quota freshness keeps the cycle it already had.
-                collect_file_activity_for(SNAPSHOT_SYNC_INTERVAL, watcher.as_ref());
+                collect_file_activity_for(
+                    SNAPSHOT_SYNC_INTERVAL,
+                    watcher.as_ref(),
+                    &mut account_switch,
+                );
             }
         })
         .context("spawn local snapshot sync")?;
@@ -1281,35 +1286,85 @@ fn watch_snapshot_source_roots(home: &Path) -> Option<crate::snapshot_watcher::S
 /// promoted source becomes due at its floor on a later tick, so a transcript being
 /// written continuously cannot produce an upload per event — and a machine whose
 /// watcher never fires still collects on the tiers and the ceiling.
+///
+/// The one exception that ends a wait early is a Claude account switch (see
+/// [`ClaudeAccountSwitchProbe`]): the next cycle then re-reads agent status and
+/// re-attributes active sessions right away instead of up to a full interval
+/// later. The transcript scan itself stays on its cadence.
 fn collect_file_activity_for(
     wait: Duration,
     watcher: Option<&crate::snapshot_watcher::SnapshotWatcher>,
+    account_switch: &mut ClaudeAccountSwitchProbe,
 ) {
-    let Some(watcher) = watcher else {
-        std::thread::sleep(wait);
-        return;
-    };
     let deadline = Instant::now() + wait;
+    let mut watcher = watcher;
     loop {
         let now = Instant::now();
         if now >= deadline {
             return;
         }
         let slice = (deadline - now).min(CADENCE_WAIT_SLICE);
-        match watcher.events.recv_timeout(slice) {
-            Ok(event) => {
+        match watcher.map(|watcher| watcher.events.recv_timeout(slice)) {
+            None => std::thread::sleep(slice),
+            Some(Ok(event)) => {
                 with_source_cadence(event.source, |cadence| {
                     cadence.record_file_event(Instant::now())
                 });
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {}
             // The watcher thread is gone. Keep waiting plainly rather than
             // spinning: collection is not gated on the watcher.
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-                return;
+            Some(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => {
+                watcher = None;
             }
         }
+        if account_switch.observe(
+            Instant::now(),
+            crate::agent_status::claude_default_account_fingerprint,
+        ) {
+            eprintln!("local snapshot sync: Claude account switch detected; refreshing now");
+            with_source_cadence(SnapshotSource::ClaudeCode, |cadence| {
+                cadence.record_file_event(Instant::now())
+            });
+            return;
+        }
+    }
+}
+
+/// How often the default Claude account is re-read while the loop waits.
+const CLAUDE_ACCOUNT_SWITCH_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Notices when this Mac's default Claude account changes — the Claude Desktop
+/// app signing into another account, or `claude /login` in a terminal.
+///
+/// Neither touches a watched transcript root, so without this the switch waited
+/// for the next scheduled cycle (up to a full interval plus a slow cycle) before
+/// the new account's sessions stopped showing under the old one. The first
+/// observation only records a baseline; an unreadable fingerprint is never a
+/// switch.
+#[derive(Default)]
+struct ClaudeAccountSwitchProbe {
+    last_fingerprint: Option<String>,
+    checked_at: Option<Instant>,
+}
+
+impl ClaudeAccountSwitchProbe {
+    fn observe(&mut self, now: Instant, read: impl FnOnce() -> Option<String>) -> bool {
+        if self.checked_at.is_some_and(|checked| {
+            now.saturating_duration_since(checked) < CLAUDE_ACCOUNT_SWITCH_CHECK_INTERVAL
+        }) {
+            return false;
+        }
+        self.checked_at = Some(now);
+        let Some(current) = read() else {
+            return false;
+        };
+        let switched = self
+            .last_fingerprint
+            .as_ref()
+            .is_some_and(|previous| previous != &current);
+        self.last_fingerprint = Some(current);
+        switched
     }
 }
 
@@ -4771,6 +4826,24 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_account_switch_probe_fires_only_on_a_changed_account() {
+        let mut probe = ClaudeAccountSwitchProbe::default();
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let account = |uuid: &str| Some(format!("desktop={uuid};cli={uuid};org=org-1"));
+
+        // The first reading is a baseline, never a switch.
+        assert!(!probe.observe(at(0), || account("acct-a")));
+        // Re-reads are throttled between checks.
+        assert!(!probe.observe(at(5), || panic!("read inside the check interval")));
+        assert!(!probe.observe(at(20), || account("acct-a")));
+        // An unreadable fingerprint is not a switch and keeps the baseline.
+        assert!(!probe.observe(at(40), || None));
+        assert!(probe.observe(at(60), || account("acct-b")));
+        assert!(!probe.observe(at(80), || account("acct-b")));
+    }
     use crate::ControlToken;
     use ottto_core::{
         FileDeviceStore, LocalConnectionBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,

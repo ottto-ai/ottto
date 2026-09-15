@@ -299,6 +299,53 @@ fn add_to_resolution_memo(
     Ok(())
 }
 
+/// A Desktop session's `lastActivityAt`, as a tie-break between accounts.
+///
+/// Claude Desktop writes epoch milliseconds (a JSON number); older stores wrote
+/// RFC3339 UTC text, which sorts lexicographically. The two forms are never
+/// compared with each other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionActivityStamp {
+    Missing,
+    EpochMillis(i64),
+    Rfc3339(String),
+}
+
+impl SessionActivityStamp {
+    fn from_value(value: Option<&Value>) -> Self {
+        match value {
+            Some(Value::Number(number)) => number
+                .as_i64()
+                .or_else(|| number.as_f64().map(|millis| millis as i64))
+                .map_or(Self::Missing, Self::EpochMillis),
+            Some(Value::String(text)) if !text.trim().is_empty() => {
+                Self::Rfc3339(text.trim().to_string())
+            }
+            _ => Self::Missing,
+        }
+    }
+
+    /// The single greatest stamp, or `None` when there is no discriminator:
+    /// nothing was stamped, or claims mix the two forms.
+    fn newest<'a>(stamps: impl Iterator<Item = &'a Self>) -> Option<&'a Self> {
+        let mut newest: Option<&'a Self> = None;
+        for stamp in stamps {
+            newest = match (newest, stamp) {
+                (_, Self::Missing) => newest,
+                (None | Some(Self::Missing), _) => Some(stamp),
+                (Some(Self::EpochMillis(best)), Self::EpochMillis(at)) => {
+                    Some(if at > best { stamp } else { newest? })
+                }
+                (Some(Self::Rfc3339(best)), Self::Rfc3339(at)) => {
+                    Some(if at > best { stamp } else { newest? })
+                }
+                _ => return None,
+            };
+        }
+        newest
+    }
+}
+
 fn resolve_from_desktop_session_store(
     sessions_root: &Path,
     session_id: &str,
@@ -309,7 +356,7 @@ fn resolve_from_desktop_session_store(
     }
 
     // (account_identifier_hash, is_archived, last_activity_at)
-    let mut candidates: Vec<(String, bool, String)> = Vec::new();
+    let mut candidates: Vec<(String, bool, SessionActivityStamp)> = Vec::new();
 
     // Iterate account directories
     for account_entry in fs::read_dir(sessions_root).context("read sessions root")? {
@@ -373,13 +420,9 @@ fn resolve_from_desktop_session_store(
 
                     // `lastActivityAt` is the second tie-break for a session
                     // mirrored under two accounts (a session resumed under the
-                    // other account). Compared as a string: the store writes
-                    // RFC3339 UTC, which sorts lexicographically.
-                    let last_activity_at = session_obj
-                        .get("lastActivityAt")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
+                    // other account).
+                    let last_activity_at =
+                        SessionActivityStamp::from_value(session_obj.get("lastActivityAt"));
 
                     candidates.push((account_hash, is_archived, last_activity_at));
                 }
@@ -389,7 +432,7 @@ fn resolve_from_desktop_session_store(
 
     // Distinct accounts only: the same account claiming a session twice is not
     // an ambiguity, it is one owner.
-    let mut distinct: Vec<(String, bool, String)> = Vec::new();
+    let mut distinct: Vec<(String, bool, SessionActivityStamp)> = Vec::new();
     for candidate in candidates {
         if !distinct.iter().any(|(hash, _, _)| hash == &candidate.0) {
             distinct.push(candidate);
@@ -404,7 +447,7 @@ fn resolve_from_desktop_session_store(
         ))),
         _ => {
             // Tie-break 1: exactly one live (non-archived) claim wins.
-            let live: Vec<&(String, bool, String)> = distinct
+            let live: Vec<&(String, bool, SessionActivityStamp)> = distinct
                 .iter()
                 .filter(|(_, archived, _)| !archived)
                 .collect();
@@ -417,21 +460,15 @@ fn resolve_from_desktop_session_store(
             // Tie-break 2: among the remaining claims, a single strictly
             // greatest `lastActivityAt` wins - the account that touched the
             // session last is the one that hosted this render.
-            let pool: Vec<&(String, bool, String)> = if live.len() > 1 {
+            let pool: Vec<&(String, bool, SessionActivityStamp)> = if live.len() > 1 {
                 live
             } else {
                 distinct.iter().collect()
             };
-            let newest = pool
-                .iter()
-                .map(|(_, _, at)| at.as_str())
-                .max()
-                .unwrap_or_default();
-            if !newest.is_empty() {
-                let winners: Vec<&&(String, bool, String)> = pool
-                    .iter()
-                    .filter(|(_, _, at)| at.as_str() == newest)
-                    .collect();
+            let newest = SessionActivityStamp::newest(pool.iter().map(|(_, _, at)| at));
+            if let Some(newest) = newest {
+                let winners: Vec<&&(String, bool, SessionActivityStamp)> =
+                    pool.iter().filter(|(_, _, at)| at == newest).collect();
                 if winners.len() == 1 {
                     return Ok(Some((
                         winners[0].0.clone(),
@@ -1166,14 +1203,14 @@ mod tests {
         account_uuid: &str,
         cli_session_id: &str,
         is_archived: bool,
-        last_activity_at: &str,
+        last_activity_at: impl Into<Value>,
     ) {
         let dir = root.join(account_uuid).join("org-1");
         fs::create_dir_all(&dir).expect("create store dirs");
         let body = serde_json::json!({
             "cliSessionId": cli_session_id,
             "isArchived": is_archived,
-            "lastActivityAt": last_activity_at,
+            "lastActivityAt": last_activity_at.into(),
         });
         fs::write(
             dir.join(format!("local_{cli_session_id}.json")),
@@ -1287,6 +1324,48 @@ mod tests {
             ClaudeStatusLineAccountResolutionMethod::SessionStore
         );
         assert_eq!(hash, account_hash("acct-b"), "newest lastActivityAt wins");
+        let _ = fs::remove_dir_all(&support);
+    }
+
+    #[test]
+    fn mirrored_session_compares_desktop_epoch_millis() {
+        // Claude Desktop writes `lastActivityAt` as epoch milliseconds. After an
+        // account switch it mirrors every resumed session into the new
+        // account's bucket; the newer claim must win, not read as a tie.
+        let support = support_dir("resolve-mirrored-epoch");
+        let store = support.join("store");
+        write_store_session(&store, "acct-old", "sess-e", false, 1_789_483_787_621_i64);
+        write_store_session(&store, "acct-new", "sess-e", false, 1_789_484_678_275_i64);
+        let (hash, method) = resolve_claude_statusline_account_for_session(
+            &support,
+            &payload_for("sess-e"),
+            Some(&store),
+            None,
+            "cli-credential-hash",
+        )
+        .expect("resolve");
+        assert_eq!(
+            method,
+            ClaudeStatusLineAccountResolutionMethod::SessionStore
+        );
+        assert_eq!(hash, account_hash("acct-new"), "newest epoch millis wins");
+        let _ = fs::remove_dir_all(&support);
+
+        // One claim in each form has no comparable discriminator.
+        let support = support_dir("resolve-mirrored-mixed");
+        let store = support.join("store");
+        write_store_session(&store, "acct-a", "sess-f", false, 1_789_484_678_275_i64);
+        write_store_session(&store, "acct-b", "sess-f", false, "2026-07-29T10:00:00Z");
+        let (hash, method) = resolve_claude_statusline_account_for_session(
+            &support,
+            &payload_for("sess-f"),
+            Some(&store),
+            None,
+            "cli-credential-hash",
+        )
+        .expect("resolve");
+        assert_eq!(method, ClaudeStatusLineAccountResolutionMethod::Ambiguous);
+        assert!(hash.is_empty());
         let _ = fs::remove_dir_all(&support);
     }
 

@@ -5017,6 +5017,28 @@ fn claude_cli_config_path() -> PathBuf {
     ClaudeConfigDirSlot::Default.identity_path(&home_dir())
 }
 
+/// Which Claude account this Mac uses by default right now: the Claude Desktop
+/// app's last known account plus the default config dir's OAuth account and
+/// organization. Opaque, local-only, and cheap enough to re-read while the sync
+/// loop waits; it changes only when the user switches accounts.
+pub(crate) fn claude_default_account_fingerprint() -> Option<String> {
+    let desktop_account =
+        read_claude_desktop_config(&claude_desktop_support_dir()).last_known_account_uuid;
+    let cli_account = read_claude_cli_oauth_account(&claude_cli_config_path());
+    let (cli_account_uuid, cli_organization_uuid) = cli_account
+        .map(|account| (account.account_uuid, account.organization_uuid))
+        .unwrap_or_default();
+    if desktop_account.is_none() && cli_account_uuid.is_none() {
+        return None;
+    }
+    Some(format!(
+        "desktop={};cli={};org={}",
+        desktop_account.unwrap_or_default(),
+        cli_account_uuid.unwrap_or_default(),
+        cli_organization_uuid.unwrap_or_default()
+    ))
+}
+
 fn claude_desktop_metadata_present(root: &Path) -> bool {
     root.join("config.json").is_file()
         || root.join("claude-code-sessions").is_dir()
