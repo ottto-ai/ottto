@@ -10,11 +10,12 @@ WRITE_LAUNCH_AGENT="false"
 BOOTSTRAP_LAUNCH_AGENT="false"
 DRY_RUN="false"
 TRUST_DEV_COMPANION="false"
-# The daemon enforces a baked-in Developer ID code requirement before it grants
-# token-less trust to the Companion app. A dev/preview bundle is only ad-hoc
-# sealed, so it carries no Apple team and cannot satisfy that requirement. This
-# is the requirement a dev LaunchAgent installs instead: same bundle identifier,
-# no team assertion. Never use it for a customer install.
+# A Developer ID signed ottto-service demands a Developer ID signed Companion. A
+# dev/preview bundle is only ad-hoc sealed, so it carries no Apple team and
+# cannot satisfy that. This is the requirement a dev LaunchAgent installs
+# instead: same bundle identifier, no team assertion. Only needed when a release
+# daemon has to run against an internal Companion; an internal daemon already
+# accepts one. Never use it for a customer install.
 DEV_COMPANION_CODE_REQUIREMENT='identifier "net.ottto.Companion"'
 
 usage() {
@@ -33,10 +34,10 @@ Options:
   --write-launch-agent       Write the per-user ottto-service LaunchAgent plist.
   --bootstrap-launch-agent   Write and bootstrap the per-user LaunchAgent.
   --trust-dev-companion      QA only: make the LaunchAgent trust a locally built,
-                             ad-hoc-signed Ottto.app. Without it the daemon only
-                             grants token-less trust to a Developer ID signed
-                             Companion, so a dev app cannot drive the daemon
-                             without a control token.
+                             ad-hoc-signed Ottto.app even when the daemon is a
+                             signed release build. A normal dev install does not
+                             need this: an internal daemon already accepts an
+                             internal Companion.
   --dry-run                  Validate and print planned paths without installing.
   -h, --help                 Show help.
 USAGE
@@ -377,9 +378,16 @@ if [[ "$WRITE_LAUNCH_AGENT" == "true" ]]; then
     "$daemon_target" service write-launch-agent --executable "$daemon_target" \
       ${launch_agent_companion_args[@]+"${launch_agent_companion_args[@]}"} --json
   fi
-  if [[ "$TRUST_DEV_COMPANION" != "true" ]] && ! developer_id_signed "$app_target"; then
-    echo "Note: $app_target is not Developer ID signed, so the daemon will not grant it" >&2
-    echo "      token-less Companion trust. Rerun with --trust-dev-companion for local QA." >&2
+  # The daemon only demands a Developer ID Companion when the daemon itself is
+  # Developer ID signed, so a normal dev install (ad-hoc daemon + ad-hoc app)
+  # needs no flag. Warn only about the mismatch that does break: a release
+  # daemon next to an internal app.
+  if [[ "$TRUST_DEV_COMPANION" != "true" ]] &&
+    developer_id_signed "$daemon_target" &&
+    ! developer_id_signed "$app_target"; then
+    echo "Note: $daemon_target is Developer ID signed but $app_target is not, so the" >&2
+    echo "      daemon will refuse it token-less Companion trust. Rerun with" >&2
+    echo "      --trust-dev-companion for local QA." >&2
   fi
 fi
 

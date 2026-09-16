@@ -31,7 +31,7 @@ id. So on every real install, layer 3 was skipped and the answer was "yes" as
 soon as the path matched.
 
 `trusted_companion_paths()` includes `$HOME/Applications/Ottto.app`, which is
-user-writable. Verified on macOS 15 by putting an ad-hoc-signed bundle with
+user-writable. Verified by putting an ad-hoc-signed bundle with
 `CFBundleIdentifier = net.ottto.Companion` at that path: the daemon accepted it
 as the Companion.
 
@@ -45,10 +45,35 @@ the thing that is supposed to say "this is *our* app" — dead code in productio
 and the only reason a wrongly-signed build was ever rejected was that it sat at
 the wrong path.
 
+## The constraint that shaped the fix
+
+`LocalDaemonClient` sends `token: nil` on every request. Token-less trust is the
+Companion's only auth path, not a fast path with a fallback. A Companion that
+fails the requirement does not degrade; it stops working, with an opaque
+`local_client_not_trusted`.
+
+That makes "just enforce Developer ID" too blunt. `macos_package.sh` ad-hoc
+seals dev, preview, and RC artifacts, and an ad-hoc signature carries no Apple
+team, so a flat Developer ID rule would break every internal tester the moment
+they took a new daemon.
+
+The obvious patch — have the installers write `OTTTO_COMPANION_TEAM_ID` or an
+override into the LaunchAgent — does not hold either:
+
+- the LaunchAgent plist is user-writable, so it is a poor place to keep the
+  control that decides who is trusted;
+- `LocalServiceRegistrar.runBundledServiceBootstrap` in the Companion re-runs
+  `service bootstrap` on refresh and recovery, rewriting the plist without any
+  override, so an app-owned install would silently lose it;
+- an installer regression cannot be detected, which is exactly how the original
+  hole appeared.
+
+Anything a human or an installer has to remember will be forgotten. The decision
+has to live in the artifact.
+
 ## Fix
 
-The requirement is now baked into the binary at build time and enforced
-unconditionally.
+The daemon derives the requirement from its own code signature.
 
 ```rust
 const OTTTO_COMPANION_DEFAULT_TEAM_ID: &str =
@@ -58,36 +83,44 @@ const OTTTO_COMPANION_DEFAULT_TEAM_ID: &str =
     };
 ```
 
-`companion_code_requirement()` resolves, in order: the
-`OTTTO_COMPANION_CODE_REQUIREMENT` env var, the `OTTTO_COMPANION_TEAM_ID` env
-var, then the baked-in team id. Blank values are treated as unset and fall
-through to the next source, so an empty env var cannot silently switch
-enforcement off. The result is an enum with exactly two shapes:
+`resolve_companion_code_requirement` then applies, in order:
 
-```rust
-enum CompanionCodeRequirement {
-    Enforced(String),
-    Disabled,
-}
-```
+1. `OTTTO_COMPANION_CODE_REQUIREMENT` — a full requirement string.
+2. `OTTTO_COMPANION_TEAM_ID` — a team id to build the standard requirement from.
+3. an empty baked-in team id — a fork opting out; fails closed, no token-less
+   trust at all.
+4. **this daemon is itself signed by the baked-in team** → the Companion must be
+   `identifier "net.ottto.Companion" and certificate leaf[subject.OU] = "<team>"`.
+5. otherwise → the Companion must be `identifier "net.ottto.Companion"`.
 
-There is no "trust the path, skip the signature" outcome any more. A build with
-no baked-in team id and no override resolves to `Disabled` and grants no
-token-less Companion trust at all, rather than degrading to path-only trust.
+Blank env values are treated as unset and fall through, so an accidentally-empty
+var cannot silently change the outcome. The result is an enum with exactly two
+shapes — `Enforced(String)` and `Disabled` — so there is no "trust the path, skip
+the signature" outcome any more.
+
+Rule 4 vs 5 is the whole point. The daemon and the Companion beside it come out
+of the same `macos_package.sh` run and carry the same kind of signature, so the
+daemon's own signature already says which kind of install this is:
+
+| Installed daemon | Companion must be |
+| --- | --- |
+| Developer ID signed (stable, Homebrew) | Developer ID signed, same team |
+| ad-hoc sealed (dev, preview, RC) | signed with identifier `net.ottto.Companion` |
+
+Nothing in the installers, the LaunchAgent, or the app's own re-bootstrap has to
+carry the decision, and no tester has to be told anything.
+
+Be honest about rule 5: on Apple Silicon every running process already carries
+at least an ad-hoc signature, and whoever can place a bundle at a trusted path
+also writes its `Info.plist`, so the identifier is not a boundary against a
+deliberate attacker. Internal builds keep exactly the posture they have today —
+same-uid only. The real boundary lands where the customers are. Tightening rule 5
+further would mean pinning a cdhash the daemon cannot know for an app it does
+not ship with, and that pin would break on the next Sparkle update.
 
 The team id is not a secret: it is the `subject.OU` of the Developer ID
 certificate in every signed release, printed by `codesign -dv --verbose=4
-/Applications/Ottto.app`. Baking it in, rather than having the installer write
-`OTTTO_COMPANION_TEAM_ID` into the LaunchAgent, is deliberate:
-
-- the LaunchAgent plist is user-writable, so it is a poor place to keep the
-  control that decides who is trusted;
-- an install that predates any installer change still gets enforcement as soon
-  as the daemon binary is updated;
-- an installer regression cannot silently turn enforcement off again, which is
-  exactly how the original hole appeared.
-
-Forks override it at build time:
+/Applications/Ottto.app`. Forks override it at build time:
 
 ```
 OTTTO_COMPANION_DEFAULT_TEAM_ID=ABCDE12345 cargo build --release -p ottto-service
@@ -96,63 +129,58 @@ OTTTO_COMPANION_DEFAULT_TEAM_ID=ABCDE12345 cargo build --release -p ottto-servic
 Building with an empty value disables token-less Companion trust instead of
 weakening it.
 
-## Blast radius: the Companion has no token fallback
+## The one combination that needs a flag
 
-`LocalDaemonClient` sends `token: nil` on every request — token-less trust is
-the Companion's only auth path, not a fast path with a fallback. So a Companion
-that fails the requirement does not degrade; it stops working, with an opaque
-`local_client_not_trusted`. That cuts both ways:
-
-- the Developer ID signed app had to be validated against the real code path
-  before this could ship (see Validation below), and
-- an internal tester running an ad-hoc-signed dev build loses the app entirely
-  until their LaunchAgent carries the override.
-
-The daemon therefore logs, once per run, when something at a trusted Companion
-path fails the requirement, and names the dev flag in the message. Without that
-the only symptom is an app that silently does nothing.
-
-## Developing against a dev Companion
-
-`scripts/macos_package.sh` ad-hoc seals dev and preview bundles, and an ad-hoc
-signature carries no Apple team, so a locally built Companion cannot satisfy the
-Developer ID requirement. The replacement for "copy the dev build to
-`~/Applications/Ottto.app` and it just works" is an explicit override in the dev
-LaunchAgent:
+A Developer ID daemon next to a locally built app — for example testing app
+changes against an already-installed Homebrew daemon. That is a genuine
+mismatch, and it is explicit:
 
 ```bash
 ./scripts/macos_dev_install.sh --bootstrap-launch-agent --trust-dev-companion
 ```
 
-That writes `OTTTO_COMPANION_CODE_REQUIREMENT` into the LaunchAgent's
-`EnvironmentVariables`:
-
-```
-identifier "net.ottto.Companion"
-```
-
-— same bundle identifier, no team assertion. The daemon prints a warning when it
-writes that override, and `macos_dev_install.sh` tells you to pass the flag when
-it installs a bundle that is not Developer ID signed. Customer installs never
-get the key: `LaunchAgentConfig::companion_code_requirement` defaults to `None`
-and a blank value is not written at all.
+which passes `--companion-code-requirement 'identifier "net.ottto.Companion"'`
+to `service write-launch-agent` / `service bootstrap`, writing
+`OTTTO_COMPANION_CODE_REQUIREMENT` into the LaunchAgent's
+`EnvironmentVariables`. The daemon warns when it writes that override, and the
+installer only prints its "rerun with --trust-dev-companion" hint for that exact
+mismatch, so a normal dev install stays quiet. Customer installs never get the
+key: `LaunchAgentConfig::companion_code_requirement` defaults to `None` and a
+blank value is not written at all.
 
 Setting the env var in your own shell does not help — the daemon runs under
 launchd and does not inherit it.
 
+When the daemon does refuse, it says so once per run in
+`~/Library/Logs/Ottto/ottto-service.err.log`, naming the path, the reason, and
+which of the two expectations applied. Without that the only symptom is an app
+that silently does nothing.
+
 ## Validation
 
-On a Mac with the real signed app installed, against the shipped code path
-(`trusted_companion_pid`, `SecCode` + `check_validity`), not just `codesign`:
+On a Mac with the real signed app installed (`/Applications/Ottto.app`,
+Developer ID `YRNP9UD7WY`, notarized, stapled), driving the shipped code path —
+`trusted_companion_pid` → `SecCode` → `check_validity` — not `codesign`. The
+"release daemon" column is a test binary re-signed with the Developer ID
+identity; the "internal daemon" column is the ordinary `cargo test` binary,
+which is ad-hoc.
 
-| Peer | Default build | With `OTTTO_COMPANION_CODE_REQUIREMENT` |
+| Peer | Internal daemon | Release daemon |
 | --- | --- | --- |
-| `/Applications/Ottto.app` (Developer ID, notarized) | trusted | trusted |
-| ad-hoc-signed bundle at `~/Applications/Ottto.app` | **rejected** | trusted |
+| `/Applications/Ottto.app` (Developer ID) | trusted | trusted |
+| ad-hoc bundle at `~/Applications/Ottto.app` | trusted | **rejected** |
+| with `OTTTO_COMPANION_CODE_REQUIREMENT` set | trusted | trusted |
 | the test binary itself | rejected | rejected |
 
-The first row is the one that matters for "do not break legitimate signed
-Companion auth". The second is the finding, closed.
+Row 1 is "do not break legitimate signed Companion auth". Row 2, right column,
+is the finding, closed; row 2, left column, is the internal tester who is not
+disturbed by closing it.
+
+`daemon_is_release_signed()` was also confirmed on both binaries directly:
+`false` for the cargo build, `true` after `codesign --sign "Developer ID
+Application: …"`. A release `cargo build --release` embeds the team id, and
+`OTTTO_COMPANION_DEFAULT_TEAM_ID=… cargo build --release` replaces it (the
+`rerun-if-env-changed` in `build.rs` makes the rebuild happen).
 
 ## PID-reuse TOCTOU: still open, now less interesting
 
@@ -165,21 +193,26 @@ and writing the audit-token FFI, and the XPC side needs
 public SDK. Getting that wrong breaks legitimate Companion auth, which is worse
 than the bug.
 
-Enforcing the requirement shrinks the payoff. Winning the PID race is no longer
-enough: whatever process holds the recycled PID must also live at a trusted
-Companion path *and* carry a valid Ottto Developer ID signature — that is, it
-must be the real Companion. The residual is "a same-uid attacker substitutes one
-legitimately signed Ottto build for another", against a principal who can
-already read the control token.
+Enforcing the requirement shrinks the payoff on customer installs. Winning the
+PID race is no longer enough there: whatever process holds the recycled PID must
+also live at a trusted Companion path *and* carry a valid Ottto Developer ID
+signature — that is, it must be the real Companion. The residual is "a same-uid
+attacker substitutes one legitimately signed Ottto build for another", against a
+principal who can already read the control token.
 
 ## Tests
 
-- `control.rs`: the resolver's precedence (requirement override, team id
-  override, baked default), blank inputs falling through instead of disabling
-  enforcement, `Disabled` when nothing supplies a requirement, no input
-  combination yielding path-only trust, the shipped constant being non-empty and
-  reaching `companion_code_requirement()`, and both shipped requirement strings
-  parsing as `SecRequirement`s.
+- `control.rs`: each resolution rule, including a release daemon requiring the
+  team and an internal daemon not requiring it with otherwise identical inputs;
+  blank inputs falling through; `Disabled` only for a fork that bakes in no team;
+  no input combination yielding path-only trust; the shipped constant being
+  non-empty and reaching `companion_code_requirement()`; every requirement string
+  the daemon can produce parsing as a `SecRequirement`; and an anchor asserting
+  the `cargo test` binary is not release-signed, so the branch those tests
+  exercise is known.
 - `macos_service.rs`: a customer LaunchAgent carries no
-  `OTTTO_COMPANION_CODE_REQUIREMENT` key, a dev one does, and a blank override
-  is not written.
+  `OTTTO_COMPANION_CODE_REQUIREMENT` key, a dev one does, and a blank override is
+  not written.
+- `scripts/test_macos_installer_channel_policy.sh`: the `--trust-dev-companion`
+  escape hatch cannot be dropped without failing, since the daemon's refusal
+  message and the docs both point at it.
