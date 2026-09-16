@@ -21132,10 +21132,16 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[serial]
     fn shipped_build_bakes_in_a_companion_team_id() {
         // Guards the actual shipped constant, not just the resolver: a build
         // that loses its baked-in team id would silently drop back to no
         // token-less companion trust at all.
+        //
+        // #[serial] because it reads the real process env: it must not observe
+        // the override that
+        // `companion_code_requirement_reads_its_overrides_from_the_environment`
+        // sets mid-test.
         assert!(
             !OTTTO_COMPANION_DEFAULT_TEAM_ID.trim().is_empty(),
             "the default build must bake in the Companion Developer ID team"
