@@ -472,9 +472,16 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   serves the default per-user CLI/agent Unix socket for app-bundled launches,
   and a supplied debug socket overrides that fallback path
 - trusted native-app authorization that inspects the local peer process,
-  validates the Companion executable path, and can enforce a Developer ID code
-  requirement through `OTTTO_COMPANION_TEAM_ID` or
-  `OTTTO_COMPANION_CODE_REQUIREMENT`
+  requires it to run as the daemon's own uid, validates the Companion executable
+  path, and always enforces a code requirement against its signature. A
+  Developer ID signed daemon demands a Companion signed by the same Apple team,
+  baked in at build time, so a customer install enforces it with nothing
+  configured; an ad-hoc sealed internal daemon demands only the
+  `net.ottto.Companion` bundle identifier, so dev and preview builds keep
+  working unconfigured. `OTTTO_COMPANION_TEAM_ID` and
+  `OTTTO_COMPANION_CODE_REQUIREMENT` override both, for running a release daemon
+  against a locally built app (see
+  [`docs/session-2026-09-16-companion-code-requirement.md`](docs/session-2026-09-16-companion-code-requirement.md))
 - a macOS packaging rehearsal script that builds the SwiftUI app bundle, embeds
   Rust CLI/daemon helpers, ad-hoc seals dev/preview bundles, writes a release
   manifest, and separates those internal builds from stable

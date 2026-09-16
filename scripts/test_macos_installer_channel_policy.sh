@@ -24,6 +24,15 @@ if ! grep -Fq "LaunchServices registration helper" "$ROOT/scripts/macos_dev_inst
   exit 1
 fi
 
+# The QA escape hatch for a release daemon next to a locally built Companion.
+# Losing it silently would leave "reinstall with --trust-dev-companion", which
+# the daemon prints on refusal and the docs repeat, pointing at nothing.
+if ! grep -Fq -- "--trust-dev-companion" "$ROOT/scripts/macos_dev_install.sh" ||
+  ! grep -Fq -- "--companion-code-requirement" "$ROOT/scripts/macos_dev_install.sh"; then
+  echo "Local macOS installer must keep the --trust-dev-companion QA escape hatch" >&2
+  exit 1
+fi
+
 if grep -Fq "This installer only accepts dev/preview manifests" "$ROOT/scripts/macos_package.sh"; then
   echo "Generated hosted installer still has stale dev/preview-only text" >&2
   exit 1

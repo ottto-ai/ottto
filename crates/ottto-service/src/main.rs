@@ -127,6 +127,12 @@ enum ServiceCommand {
             help = "Deliberately replace a LaunchAgent owned by another install method"
         )]
         migrate_owner: bool,
+        #[arg(
+            long,
+            value_name = "REQUIREMENT",
+            help = "DEV/QA ONLY: code requirement the daemon accepts for token-less Companion trust, e.g. 'identifier \"net.ottto.Companion\"' for a locally built ad-hoc-signed app. Omit for customer installs so the baked-in Developer ID requirement applies."
+        )]
+        companion_code_requirement: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -138,6 +144,12 @@ enum ServiceCommand {
             help = "Deliberately replace a LaunchAgent owned by another install method"
         )]
         migrate_owner: bool,
+        #[arg(
+            long,
+            value_name = "REQUIREMENT",
+            help = "DEV/QA ONLY: code requirement the daemon accepts for token-less Companion trust, e.g. 'identifier \"net.ottto.Companion\"' for a locally built ad-hoc-signed app. Omit for customer installs so the baked-in Developer ID requirement applies."
+        )]
+        companion_code_requirement: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -386,27 +398,55 @@ fn load_registered_device_sources() -> Option<LocalDeviceBinding> {
 
 fn handle_service_command(command: ServiceCommand) -> Result<()> {
     let home = home_dir()?;
-    let (executable, write, execute, json, migrate_owner) = match command {
-        ServiceCommand::CleanupLegacy { json } => {
-            let report = ottto_service::legacy_service::cleanup_legacy_services(&home);
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+    let (executable, write, execute, json, migrate_owner, companion_code_requirement) =
+        match command {
+            ServiceCommand::CleanupLegacy { json } => {
+                let report = ottto_service::legacy_service::cleanup_legacy_services(&home);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        ServiceCommand::InstallPlan { executable, json } => (executable, false, false, json, false),
-        ServiceCommand::WriteLaunchAgent {
-            executable,
-            migrate_owner,
-            json,
-        } => (executable, true, false, json, migrate_owner),
-        ServiceCommand::Bootstrap {
-            executable,
-            migrate_owner,
-            json,
-        } => (executable, true, true, json, migrate_owner),
-    };
-    let config = macos_service::LaunchAgentConfig::local_user_default(&home, executable);
+            ServiceCommand::InstallPlan { executable, json } => {
+                (executable, false, false, json, false, None)
+            }
+            ServiceCommand::WriteLaunchAgent {
+                executable,
+                migrate_owner,
+                companion_code_requirement,
+                json,
+            } => (
+                executable,
+                true,
+                false,
+                json,
+                migrate_owner,
+                companion_code_requirement,
+            ),
+            ServiceCommand::Bootstrap {
+                executable,
+                migrate_owner,
+                companion_code_requirement,
+                json,
+            } => (
+                executable,
+                true,
+                true,
+                json,
+                migrate_owner,
+                companion_code_requirement,
+            ),
+        };
+    let mut config = macos_service::LaunchAgentConfig::local_user_default(&home, executable);
+    if companion_code_requirement.is_some() {
+        // Loud on purpose: this is the only way a LaunchAgent ends up trusting
+        // a Companion that is not signed by the Ottto Developer ID team.
+        eprintln!(
+            "warning: writing a dev Companion code requirement into the LaunchAgent; \
+             the daemon will accept a Companion that is not Developer ID signed"
+        );
+    }
+    config.companion_code_requirement = companion_code_requirement;
     let plist_path = macos_service::launch_agent_path(&home);
     let plan = if write {
         // Install, repair, and app-update registration paths all pass here.

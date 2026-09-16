@@ -88,6 +88,29 @@ setup claim handoff, Codex verification command, diagnostics redaction, and app
 launch. It is the current preview-build substitute for production
 notarization/Gatekeeper validation until Developer ID credentials are available.
 
+### Companion Trust On Internal Builds
+
+`ottto-service` grants the Companion token-less local-control access based on
+the app's code signature. What it demands depends on the daemon's own signature,
+so internal channels need no configuration:
+
+| Installed daemon | Companion must be |
+| --- | --- |
+| Developer ID signed (stable, Homebrew) | Developer ID signed, same team |
+| ad-hoc sealed (dev, preview, RC) | signed with identifier `net.ottto.Companion` |
+
+Both halves of a channel come out of the same `macos_package.sh` run, so they
+always match. A tester on a dev or preview build needs no flag, and the app's
+own LaunchAgent re-bootstrap cannot drop the setting, because there is no
+setting to drop.
+
+The one combination that does not work is a mismatch: a Developer ID daemon next
+to a locally built app. Pass `--trust-dev-companion` to `macos_dev_install.sh`
+for that, which writes `OTTTO_COMPANION_CODE_REQUIREMENT` into the LaunchAgent.
+The daemon logs the refusal and the fix once per run to
+`~/Library/Logs/Ottto/ottto-service.err.log`. Never pass it for a customer
+install. See [`docs/troubleshooting.md`](../docs/troubleshooting.md).
+
 For internal QA on local dev/preview/stable-candidate artifacts,
 `--clear-quarantine` removes the quarantine attribute from installed artifacts.
 The hosted internal installer does this by default because running the installer

@@ -77,6 +77,39 @@ If plan/account detection works but 5-hour or weekly quota windows are missing,
 use the same `verify --repair` / `fix` flow; repair recreates a missing or stale
 `claude-code-statusline.sh` wrapper before re-verifying.
 
+## Companion Cannot Reach The Daemon
+
+The Companion app authenticates to `ottto-service` by its code signature, not by
+a token. If a request comes back `local_client_not_trusted` — the app opens but
+shows nothing and never connects — the daemon refused it.
+
+Check the daemon error log; it records the reason once per run:
+
+```bash
+grep 'refused token-less Companion trust' ~/Library/Logs/Ottto/ottto-service.err.log
+```
+
+The rule is that a Developer ID signed `ottto-service` requires a Developer ID
+signed `Ottto.app` from the same Apple team. An internal (ad-hoc sealed) daemon
+only requires the `net.ottto.Companion` bundle identifier, so a normal internal
+install needs no configuration.
+
+So a customer install failing this way means `Ottto.app` is not the signed app
+it should be — reinstall from the official download rather than working around
+it. The combination that legitimately hits this is an internal one: a release
+daemon (Homebrew or a stable install) next to a locally built app. Point that
+daemon at the local app explicitly:
+
+```bash
+./scripts/macos_dev_install.sh --bootstrap-launch-agent --trust-dev-companion
+```
+
+which writes `OTTTO_COMPANION_CODE_REQUIREMENT` into the LaunchAgent.
+Equivalently, `ottto-service service write-launch-agent --executable <path>
+--companion-code-requirement 'identifier "net.ottto.Companion"'`. Setting the
+variable in your shell does nothing: the daemon runs under launchd and does not
+inherit it.
+
 ## Local Relay Port Conflict
 
 The default local OTLP relay listens on `127.0.0.1:43119`. If another macOS

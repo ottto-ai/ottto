@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 378,
-  "content_sha256": "5bc4c2aedc021b78b580184ad99cd9a34632a20faf848d84723478aa69111e69",
+  "candidate_file_count": 379,
+  "content_sha256": "ad4e421879ada96a40b83d450df1bfcad72eb3f22c86a0b88b8d1be0b478166e",
   "files": [
     {
       "executable": false,
@@ -76,8 +76,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "96c8f2acd08846a93e8fef2171226eefba613265a07c56f3a64f917f53f69855",
-      "size_bytes": 53665
+      "sha256": "70ff75b22656dc4d4b3b437ba38dd3ab9e3abaca9f3a7b9d6c3270eed283c8cd",
+      "size_bytes": 54228
     },
     {
       "executable": false,
@@ -594,8 +594,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/build.rs",
-      "sha256": "241bc1d11d1bbff58d4aea4fa6beb7fd0800b431926da29ccf18e73eefec442e",
-      "size_bytes": 1347
+      "sha256": "12147d6208b89ad01ad5fed77fa06b7fa9a9d77f37b78b31dfa6a50aeb6262f5",
+      "size_bytes": 1667
     },
     {
       "executable": false,
@@ -741,8 +741,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "4f52141330df7e60a13532bd244765969701ef346565a3a444bf733dde6c8c5c",
-      "size_bytes": 1146992
+      "sha256": "0d5de5290ba0e890b35f043ebde11d6f6be8226243a5540255a4b0ba4658abcb",
+      "size_bytes": 1171623
     },
     {
       "executable": false,
@@ -797,15 +797,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/macos_service.rs",
-      "sha256": "e18a66f3164da861b433a772a9c2369a96a4bb53ae6c123915b4cdf76e0e2acf",
-      "size_bytes": 20342
+      "sha256": "b9eda978a47c393f524fc455c524f2a6dd2303ed405ba6553e65ad4afdee082a",
+      "size_bytes": 23642
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/main.rs",
-      "sha256": "338152540b040fb768bb6beda58bc61eca2aeb0e2aff734ef948810b7d94457d",
-      "size_bytes": 35826
+      "sha256": "a9f14c3e743053e757be417a4cf523adf8f6e7293e5bfcdf8bb3030d794e755d",
+      "size_bytes": 37609
     },
     {
       "executable": false,
@@ -1664,6 +1664,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-09-16-companion-code-requirement.md",
+      "sha256": "0ccc026fc526545831ba6cf50c6cf313d67eaeb7cdced25b1d573d4bf029bfaa",
+      "size_bytes": 12684
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-surfaces.md",
       "sha256": "b49df98bbf9dbdcbcc4a904c35f084019541451e53f46c3134ea5c9ff31920b9",
       "size_bytes": 2026
@@ -1686,8 +1693,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/troubleshooting.md",
-      "sha256": "7a6fe391d39406fd31cfe8ac7c28a0664c01c1bc878816b3ac86f3935591def2",
-      "size_bytes": 4278
+      "sha256": "419ed0a0cd235e3c046b4ec0ba67f79df7532b702c54e10fe13d5a888a2e4a22",
+      "size_bytes": 5736
     },
     {
       "executable": false,
@@ -2211,8 +2218,8 @@
       "executable": false,
       "mode": "0644",
       "path": "release/README.md",
-      "sha256": "c66f0cf3f092f7ddf0be9f4dabfe2f8a5c32375ca194bbd19e60ce637ae64349",
-      "size_bytes": 24389
+      "sha256": "14adcfd154786d9dac71130042137abad890dcb830e3c5194a97751d4f710ddd",
+      "size_bytes": 25539
     },
     {
       "executable": false,
@@ -2302,8 +2309,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_dev_install.sh",
-      "sha256": "1238cdf1f5bfd9de87226917670766b71aee08f5582e47df2011e924b34b0299",
-      "size_bytes": 10747
+      "sha256": "ba0c46436ff828b639efbb3f628d3059586b7ef19db8637f67540207923789a1",
+      "size_bytes": 13224
     },
     {
       "executable": true,
@@ -2491,8 +2498,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_installer_channel_policy.sh",
-      "sha256": "49d25fb48580eeb65e26aea080592b2e32b29c8132ce6153018b33e06056e7a4",
-      "size_bytes": 1550
+      "sha256": "245650649bd2f02ac6db8ca5cc657b9a139e23c9f881ae26b5c2cc9610f603e7",
+      "size_bytes": 2051
     },
     {
       "executable": true,
@@ -2649,9 +2656,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-15T15:48:43+00:00",
+  "generated_at": "2026-09-16T08:56:49+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 379,
+  "output_file_count": 380,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2685,5 +2692,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "7db7a209e2764b2c6a7e6f1b728eb86b82d34e01"
+  "source_commit": "87fdeb73902588901f7405f61e8b79c953d00788"
 }

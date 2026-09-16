@@ -19,6 +19,11 @@ fn main() {
         registry_path.to_string_lossy()
     );
 
+    // The Companion Developer ID team id is baked into the binary at compile
+    // time (see `OTTTO_COMPANION_DEFAULT_TEAM_ID` in ottto-service/src/control.rs).
+    // Without this, changing the build-time value would not rebuild the crate.
+    println!("cargo:rerun-if-env-changed=OTTTO_COMPANION_DEFAULT_TEAM_ID");
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         cc::Build::new()
             .file("src/xpc_shim.c")
