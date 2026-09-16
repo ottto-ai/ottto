@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 379,
-  "content_sha256": "e2187db9823135ed4e798c445b8f1c740fb186e0354ba7690575b4acd7133a56",
+  "content_sha256": "16b464740928b831c90247693bd39b6b8d8381bf6ecc9388f6c1dd8635d4a6df",
   "files": [
     {
       "executable": false,
@@ -741,8 +741,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "da0de6ea36d59e0f18d4ba3f4ece3f06dd0376e94dd17ac1ed6b26fb381c6452",
-      "size_bytes": 1159121
+      "sha256": "8d92c35d5ad71c56a3f5f9fcc5577a33c1c3c7c09e1fa4642f487fe0ecaeca5b",
+      "size_bytes": 1160593
     },
     {
       "executable": false,
@@ -1665,8 +1665,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-09-16-companion-code-requirement.md",
-      "sha256": "1112f1b99067571ce2dbe77a83060422ae19fefb907aa722c7e5009231cd02e1",
-      "size_bytes": 7142
+      "sha256": "1fcb65df3dca1ec9aee86ead2a5f7d91ce0b9e0cee0da6319fd44d1158053d9f",
+      "size_bytes": 7957
     },
     {
       "executable": false,
@@ -2656,7 +2656,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-16T07:19:48+00:00",
+  "generated_at": "2026-09-16T07:34:23+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 380,
   "public_roots": [
@@ -2692,5 +2692,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "510f616a2e2d74a47a8e0edab42b82e22342cce9"
+  "source_commit": "87a9534323f524406a23aa604aeff27b9e4faa6f"
 }

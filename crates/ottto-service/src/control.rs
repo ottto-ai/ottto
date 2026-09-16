@@ -522,9 +522,41 @@ fn trusted_companion_pid(pid: u32) -> bool {
         CompanionCodeRequirement::Disabled => return false,
     };
     let Ok(requirement) = requirement_text.parse::<SecRequirement>() else {
+        log_companion_code_requirement_denial(&path, "code requirement is not valid csreq syntax");
         return false;
     };
-    code.check_validity(Flags::NONE, &requirement).is_ok()
+    if code.check_validity(Flags::NONE, &requirement).is_ok() {
+        return true;
+    }
+    log_companion_code_requirement_denial(&path, "signature does not satisfy the code requirement");
+    false
+}
+
+/// Log, at most once per daemon run, that something at a trusted Companion path
+/// failed the code requirement.
+///
+/// The Companion never sends a control token — token-less trust is its only
+/// auth path — so a signature failure makes the app stop working entirely. Log
+/// it or the only symptom is an opaque `local_client_not_trusted`. The most
+/// likely cause by far is an internal ad-hoc-signed dev build, so the message
+/// names the dev override. Once-per-process because the Companion polls: a
+/// broken setup would otherwise fill the daemon error log.
+#[cfg(target_os = "macos")]
+fn log_companion_code_requirement_denial(path: &Path, reason: &str) {
+    // Imported here rather than at module scope: everything in this file that
+    // uses it is macOS-only.
+    use std::sync::atomic::AtomicBool;
+
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "ottto-service: refused token-less Companion trust for {}: {reason}. \
+         A Developer ID signed Companion is required; for a local ad-hoc build, \
+         reinstall with scripts/macos_dev_install.sh --trust-dev-companion.",
+        path.display()
+    );
 }
 
 #[cfg(not(target_os = "macos"))]

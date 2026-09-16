@@ -96,6 +96,22 @@ OTTTO_COMPANION_DEFAULT_TEAM_ID=ABCDE12345 cargo build --release -p ottto-servic
 Building with an empty value disables token-less Companion trust instead of
 weakening it.
 
+## Blast radius: the Companion has no token fallback
+
+`LocalDaemonClient` sends `token: nil` on every request — token-less trust is
+the Companion's only auth path, not a fast path with a fallback. So a Companion
+that fails the requirement does not degrade; it stops working, with an opaque
+`local_client_not_trusted`. That cuts both ways:
+
+- the Developer ID signed app had to be validated against the real code path
+  before this could ship (see Validation below), and
+- an internal tester running an ad-hoc-signed dev build loses the app entirely
+  until their LaunchAgent carries the override.
+
+The daemon therefore logs, once per run, when something at a trusted Companion
+path fails the requirement, and names the dev flag in the message. Without that
+the only symptom is an app that silently does nothing.
+
 ## Developing against a dev Companion
 
 `scripts/macos_package.sh` ad-hoc seals dev and preview bundles, and an ad-hoc
