@@ -9,6 +9,13 @@ CLEAR_QUARANTINE="false"
 WRITE_LAUNCH_AGENT="false"
 BOOTSTRAP_LAUNCH_AGENT="false"
 DRY_RUN="false"
+TRUST_DEV_COMPANION="false"
+# The daemon enforces a baked-in Developer ID code requirement before it grants
+# token-less trust to the Companion app. A dev/preview bundle is only ad-hoc
+# sealed, so it carries no Apple team and cannot satisfy that requirement. This
+# is the requirement a dev LaunchAgent installs instead: same bundle identifier,
+# no team assertion. Never use it for a customer install.
+DEV_COMPANION_CODE_REQUIREMENT='identifier "net.ottto.Companion"'
 
 usage() {
   cat <<'USAGE'
@@ -25,6 +32,11 @@ Options:
   --clear-quarantine         Remove com.apple.quarantine from installed dev artifacts.
   --write-launch-agent       Write the per-user ottto-service LaunchAgent plist.
   --bootstrap-launch-agent   Write and bootstrap the per-user LaunchAgent.
+  --trust-dev-companion      QA only: make the LaunchAgent trust a locally built,
+                             ad-hoc-signed Ottto.app. Without it the daemon only
+                             grants token-less trust to a Developer ID signed
+                             Companion, so a dev app cannot drive the daemon
+                             without a control token.
   --dry-run                  Validate and print planned paths without installing.
   -h, --help                 Show help.
 USAGE
@@ -55,6 +67,10 @@ while [[ $# -gt 0 ]]; do
     --bootstrap-launch-agent)
       WRITE_LAUNCH_AGENT="true"
       BOOTSTRAP_LAUNCH_AGENT="true"
+      shift
+      ;;
+    --trust-dev-companion)
+      TRUST_DEV_COMPANION="true"
       shift
       ;;
     --dry-run)
@@ -136,6 +152,15 @@ deregister_legacy_smappservice() {
   if ! "$app_daemon" service cleanup-legacy --json >/dev/null; then
     echo "Warning: could not de-register the retired net.ottto.locald login item; Ottto will retry at daemon startup." >&2
   fi
+}
+
+# True when the bundle satisfies Apple's Developer ID designated-requirement
+# fragment, i.e. it could satisfy the daemon's baked-in team requirement. An
+# ad-hoc sealed dev/preview bundle does not.
+developer_id_signed() {
+  local app_target="$1"
+  codesign -v -R='anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' \
+    "$app_target" >/dev/null 2>&1
 }
 
 canonical_app_path() {
@@ -297,6 +322,7 @@ echo "  cli: $cli_target"
 echo "  daemon: $daemon_target"
 echo "  launch agent: $WRITE_LAUNCH_AGENT"
 echo "  bootstrap launch agent: $BOOTSTRAP_LAUNCH_AGENT"
+echo "  trust dev companion: $TRUST_DEV_COMPANION"
 
 if [[ "$DRY_RUN" == "true" ]]; then
   exit 0
@@ -330,18 +356,30 @@ fi
 register_installed_app "$app_target"
 deregister_legacy_smappservice
 
+launch_agent_companion_args=()
+if [[ "$TRUST_DEV_COMPANION" == "true" ]]; then
+  launch_agent_companion_args=(--companion-code-requirement "$DEV_COMPANION_CODE_REQUIREMENT")
+fi
+
 if [[ "$WRITE_LAUNCH_AGENT" == "true" ]]; then
   if [[ "$BOOTSTRAP_LAUNCH_AGENT" == "true" ]]; then
-    "$daemon_target" service bootstrap --executable "$daemon_target" --json
+    "$daemon_target" service bootstrap --executable "$daemon_target" \
+      ${launch_agent_companion_args[@]+"${launch_agent_companion_args[@]}"} --json
     if ! wait_for_daemon "$cli_target"; then
       echo "Warning: ottto-service did not become ready after bootstrap; retrying once." >&2
-      "$daemon_target" service bootstrap --executable "$daemon_target" --json >/dev/null 2>&1 || true
+      "$daemon_target" service bootstrap --executable "$daemon_target" \
+        ${launch_agent_companion_args[@]+"${launch_agent_companion_args[@]}"} --json >/dev/null 2>&1 || true
       if ! wait_for_daemon "$cli_target"; then
         echo "Warning: installed files, but ottto-service did not become ready. Open Ottto or rerun this installer with --bootstrap-launch-agent to retry." >&2
       fi
     fi
   else
-    "$daemon_target" service write-launch-agent --executable "$daemon_target" --json
+    "$daemon_target" service write-launch-agent --executable "$daemon_target" \
+      ${launch_agent_companion_args[@]+"${launch_agent_companion_args[@]}"} --json
+  fi
+  if [[ "$TRUST_DEV_COMPANION" != "true" ]] && ! developer_id_signed "$app_target"; then
+    echo "Note: $app_target is not Developer ID signed, so the daemon will not grant it" >&2
+    echo "      token-less Companion trust. Rerun with --trust-dev-companion for local QA." >&2
   fi
 fi
 

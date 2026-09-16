@@ -139,6 +139,33 @@ const MAX_CONFIG_BACKUPS_PER_SOURCE: usize = 10;
 const OTTTO_CONFIG_BACKUP_RETENTION_ENV: &str = "OTTTO_CONFIG_BACKUP_RETENTION";
 #[cfg(target_os = "macos")]
 const OTTTO_COMPANION_BUNDLE_IDENTIFIER: &str = "net.ottto.Companion";
+/// Apple Developer Team ID that signs the official Ottto Companion app, baked
+/// into the binary at compile time.
+///
+/// SECURITY: this is what makes the Companion code requirement enforced *by
+/// default*. It used to be supplied only through `OTTTO_COMPANION_TEAM_ID` /
+/// `OTTTO_COMPANION_CODE_REQUIREMENT`, and nothing in the shipped installers
+/// or LaunchAgents ever set either one — so every production install fell back
+/// to trusting any binary sitting at one of the [`trusted_companion_paths`]
+/// (including the user-writable `~/Applications/Ottto.app`). A compile-time
+/// default cannot be un-set by an installer regression, and — unlike a
+/// LaunchAgent `EnvironmentVariables` entry — it is not stored in a
+/// user-writable file.
+///
+/// The value is not a secret: it is the `subject.OU` of the Developer ID
+/// certificate in every signed, notarized Ottto release and is printed by
+/// `codesign -dv --verbose=4 /Applications/Ottto.app`.
+///
+/// Forks and downstream builds override it at build time:
+/// `OTTTO_COMPANION_DEFAULT_TEAM_ID=ABCDE12345 cargo build --release`.
+/// Building with an empty value (`OTTTO_COMPANION_DEFAULT_TEAM_ID=`) disables
+/// token-less Companion trust entirely rather than falling back to path-only
+/// trust — see [`resolve_companion_code_requirement`].
+#[cfg(target_os = "macos")]
+const OTTTO_COMPANION_DEFAULT_TEAM_ID: &str = match option_env!("OTTTO_COMPANION_DEFAULT_TEAM_ID") {
+    Some(team_id) => team_id,
+    None => "YRNP9UD7WY",
+};
 
 // Serializes every account/device identity mutation with Cloud sessions grant
 // admission. The same lock must cover the grant preflight and the identity
@@ -448,12 +475,24 @@ fn trusted_companion_pid(pid: u32) -> bool {
     // A wrong move here would break legitimate Companion auth, a worse
     // regression than this hard-to-exploit, same-uid bug.
     //
-    // The shipped mitigation is the connection-level euid gate in
+    // The shipped mitigations are (a) the connection-level euid gate in
     // `companion_peer_is_trusted`, which requires the peer to run as the
     // daemon's own uid before this PID check is even reached — closing the
-    // cross-uid attack surface. FOLLOW-UP: implement the audit-token upgrade
-    // above and validate it on-device against the signed Companion before
-    // release.
+    // cross-uid attack surface — and (b) the Developer ID code requirement
+    // below, which is now enforced by default (see
+    // `OTTTO_COMPANION_DEFAULT_TEAM_ID`). With (b) in place, winning the PID
+    // race is no longer enough: whatever process ends up holding the recycled
+    // PID must ALSO live at a trusted Companion path and carry a valid
+    // signature from the Ottto Developer ID team — i.e. it must be the real
+    // Companion. That leaves the residual risk at "a same-uid attacker
+    // substitutes one legitimately signed Ottto build for another", against a
+    // principal who can already read the 0600 control token.
+    //
+    // FOLLOW-UP (unchanged, still open): implement the audit-token upgrade
+    // above and validate it on-device against the signed Companion before a
+    // release. It remains deliberately unshipped — the two blockers above are
+    // unchanged, and the payoff shrank now that the signature check runs
+    // unconditionally.
     let mut attrs = GuestAttributes::new();
     attrs.set_pid(pid as libc::pid_t);
     let Ok(code) = SecCode::copy_guest_with_attribues(None, &attrs, Flags::NONE) else {
@@ -474,8 +513,13 @@ fn trusted_companion_pid(pid: u32) -> bool {
         return false;
     }
 
-    let Some(requirement_text) = companion_code_requirement() else {
-        return true;
+    // Fail closed: a build with no baked-in team id and no explicit override
+    // grants no token-less Companion trust at all. Path-only trust — the old
+    // behaviour whenever neither env var was set, which was every production
+    // install — is no longer reachable.
+    let requirement_text = match companion_code_requirement() {
+        CompanionCodeRequirement::Enforced(requirement_text) => requirement_text,
+        CompanionCodeRequirement::Disabled => return false,
     };
     let Ok(requirement) = requirement_text.parse::<SecRequirement>() else {
         return false;
@@ -539,16 +583,83 @@ fn same_path(expected: &Path, actual: &Path) -> bool {
     expected == actual
 }
 
+/// Outcome of resolving the code requirement a token-less Companion peer must
+/// satisfy. There is deliberately no "trust without checking the signature"
+/// variant: the only two outcomes are "check this requirement" and "grant no
+/// token-less trust".
 #[cfg(target_os = "macos")]
-fn companion_code_requirement() -> Option<String> {
-    if let Ok(requirement) = std::env::var("OTTTO_COMPANION_CODE_REQUIREMENT") {
-        return Some(requirement);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompanionCodeRequirement {
+    /// The peer's code signature must satisfy this requirement string.
+    Enforced(String),
+    /// Token-less Companion trust is unavailable in this build/configuration.
+    Disabled,
+}
+
+/// The code requirement enforced against a token-less Companion peer.
+///
+/// Precedence (first non-blank wins):
+///   1. `OTTTO_COMPANION_CODE_REQUIREMENT` — a full requirement string. The
+///      dev-build escape hatch: an ad-hoc-signed Companion carries no team OU,
+///      so local QA sets `identifier "net.ottto.Companion"`.
+///   2. `OTTTO_COMPANION_TEAM_ID` — a Developer ID team id to build the
+///      standard identifier + team requirement from.
+///   3. [`OTTTO_COMPANION_DEFAULT_TEAM_ID`], baked in at compile time. This is
+///      the production path; release builds enforce Developer ID without any
+///      runtime configuration.
+///
+/// Both env vars can only be set by something already running as the daemon's
+/// uid (the LaunchAgent plist and the daemon's own environment are
+/// user-owned), which is the same principal that can already read the 0600
+/// control token — so they weaken nothing that was not already reachable, and
+/// they exist so a dev build stays usable.
+#[cfg(target_os = "macos")]
+fn companion_code_requirement() -> CompanionCodeRequirement {
+    resolve_companion_code_requirement(
+        std::env::var("OTTTO_COMPANION_CODE_REQUIREMENT")
+            .ok()
+            .as_deref(),
+        std::env::var("OTTTO_COMPANION_TEAM_ID").ok().as_deref(),
+        OTTTO_COMPANION_DEFAULT_TEAM_ID,
+    )
+}
+
+/// Pure resolution of [`companion_code_requirement`], split out so the
+/// precedence and the fail-closed default are testable without mutating
+/// process env or rebuilding with a different baked-in team id.
+///
+/// Blank (empty or whitespace-only) inputs are treated as unset so an
+/// accidentally-empty env var cannot silently disable enforcement; it falls
+/// through to the next source instead.
+#[cfg(target_os = "macos")]
+fn resolve_companion_code_requirement(
+    requirement_override: Option<&str>,
+    team_id_override: Option<&str>,
+    default_team_id: &str,
+) -> CompanionCodeRequirement {
+    fn present(value: Option<&str>) -> Option<&str> {
+        value.map(str::trim).filter(|value| !value.is_empty())
     }
-    std::env::var("OTTTO_COMPANION_TEAM_ID").ok().map(|team_id| {
-        format!(
-            "identifier \"{OTTTO_COMPANION_BUNDLE_IDENTIFIER}\" and certificate leaf[subject.OU] = \"{team_id}\""
-        )
-    })
+
+    if let Some(requirement) = present(requirement_override) {
+        return CompanionCodeRequirement::Enforced(requirement.to_string());
+    }
+    let team_id = present(team_id_override).or_else(|| present(Some(default_team_id)));
+    match team_id {
+        Some(team_id) => {
+            CompanionCodeRequirement::Enforced(companion_team_code_requirement(team_id))
+        }
+        None => CompanionCodeRequirement::Disabled,
+    }
+}
+
+/// The Developer ID requirement string for `team_id`: the Companion bundle
+/// identifier signed by a leaf certificate belonging to that Apple team.
+#[cfg(target_os = "macos")]
+fn companion_team_code_requirement(team_id: &str) -> String {
+    format!(
+        "identifier \"{OTTTO_COMPANION_BUNDLE_IDENTIFIER}\" and certificate leaf[subject.OU] = \"{team_id}\""
+    )
 }
 
 fn handle_command(
@@ -20961,6 +21072,163 @@ mod tests {
         // be granted token-less companion trust.
         let peer = LocalClientPeer::from_pid_and_euid(Some(std::process::id()), None);
         assert!(!companion_peer_is_trusted(Some(&peer)));
+    }
+
+    /// The requirement a dev build uses for an ad-hoc-signed Companion: an
+    /// ad-hoc signature carries no team OU, so only the identifier can be
+    /// asserted. Kept next to the tests that document the dev escape hatch so
+    /// the string in the README/PR and the string under test cannot drift.
+    #[cfg(target_os = "macos")]
+    const DEV_ADHOC_COMPANION_REQUIREMENT: &str = "identifier \"net.ottto.Companion\"";
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn companion_code_requirement_is_enforced_by_default_in_release_builds() {
+        // The production configuration: no env overrides at all. Before this
+        // was baked in, that combination meant "no requirement", and any
+        // binary at a trusted path (including the user-writable
+        // ~/Applications/Ottto.app) was trusted.
+        let resolved = resolve_companion_code_requirement(None, None, "YRNP9UD7WY");
+        assert_eq!(
+            resolved,
+            CompanionCodeRequirement::Enforced(
+                "identifier \"net.ottto.Companion\" and certificate leaf[subject.OU] = \"YRNP9UD7WY\""
+                    .to_string()
+            )
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shipped_build_bakes_in_a_companion_team_id() {
+        // Guards the actual shipped constant, not just the resolver: a build
+        // that loses its baked-in team id would silently drop back to no
+        // token-less companion trust at all.
+        assert!(
+            !OTTTO_COMPANION_DEFAULT_TEAM_ID.trim().is_empty(),
+            "the default build must bake in the Companion Developer ID team"
+        );
+        assert_eq!(
+            companion_code_requirement(),
+            CompanionCodeRequirement::Enforced(companion_team_code_requirement(
+                OTTTO_COMPANION_DEFAULT_TEAM_ID
+            )),
+            "an unconfigured process must enforce the baked-in Developer ID requirement"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn path_only_companion_trust_is_never_resolved() {
+        // There is no input combination that yields "trust the path, skip the
+        // signature". Every resolution is either an enforced requirement or a
+        // refusal to grant token-less trust.
+        let inputs = [
+            (None, None, "YRNP9UD7WY"),
+            (None, Some("ABCDE12345"), "YRNP9UD7WY"),
+            (Some(DEV_ADHOC_COMPANION_REQUIREMENT), None, "YRNP9UD7WY"),
+            (Some("   "), Some("  "), "YRNP9UD7WY"),
+            (None, Some("ABCDE12345"), ""),
+        ];
+        for (requirement, team_id, default_team_id) in inputs {
+            assert!(
+                matches!(
+                    resolve_companion_code_requirement(requirement, team_id, default_team_id),
+                    CompanionCodeRequirement::Enforced(_)
+                ),
+                "expected an enforced requirement for {requirement:?}/{team_id:?}/{default_team_id:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn companion_trust_is_disabled_when_nothing_supplies_a_requirement() {
+        // A fork built with `OTTTO_COMPANION_DEFAULT_TEAM_ID=` and no runtime
+        // override fails closed rather than falling back to path-only trust.
+        for (requirement, team_id) in [(None, None), (Some(""), Some("   "))] {
+            assert_eq!(
+                resolve_companion_code_requirement(requirement, team_id, ""),
+                CompanionCodeRequirement::Disabled
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dev_requirement_override_wins_over_the_baked_default() {
+        // The documented dev-QA flow: an ad-hoc-signed local build, trusted by
+        // an explicit requirement in the dev LaunchAgent.
+        assert_eq!(
+            resolve_companion_code_requirement(
+                Some(DEV_ADHOC_COMPANION_REQUIREMENT),
+                Some("ABCDE12345"),
+                "YRNP9UD7WY"
+            ),
+            CompanionCodeRequirement::Enforced(DEV_ADHOC_COMPANION_REQUIREMENT.to_string())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn team_id_override_wins_over_the_baked_default() {
+        assert_eq!(
+            resolve_companion_code_requirement(None, Some(" ABCDE12345 "), "YRNP9UD7WY"),
+            CompanionCodeRequirement::Enforced(companion_team_code_requirement("ABCDE12345"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn blank_overrides_fall_through_instead_of_disabling_enforcement() {
+        // An empty env var is an operator slip, not an instruction to stop
+        // checking signatures.
+        assert_eq!(
+            resolve_companion_code_requirement(Some(""), Some("\t\n"), "YRNP9UD7WY"),
+            CompanionCodeRequirement::Enforced(companion_team_code_requirement("YRNP9UD7WY"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn companion_requirement_strings_parse_as_code_requirements() {
+        // A requirement string that does not parse makes `trusted_companion_pid`
+        // reject every peer, so the baked-in default and the documented dev
+        // override must both be valid csreq syntax.
+        use security_framework::os::macos::code_signing::SecRequirement;
+
+        for text in [
+            companion_team_code_requirement(OTTTO_COMPANION_DEFAULT_TEAM_ID),
+            DEV_ADHOC_COMPANION_REQUIREMENT.to_string(),
+        ] {
+            assert!(
+                text.parse::<SecRequirement>().is_ok(),
+                "requirement should parse: {text}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial]
+    fn companion_code_requirement_reads_its_overrides_from_the_environment() {
+        let _requirement = EnvVarGuard::remove("OTTTO_COMPANION_CODE_REQUIREMENT");
+        let _team_id = EnvVarGuard::remove("OTTTO_COMPANION_TEAM_ID");
+        assert_eq!(
+            companion_code_requirement(),
+            CompanionCodeRequirement::Enforced(companion_team_code_requirement(
+                OTTTO_COMPANION_DEFAULT_TEAM_ID
+            ))
+        );
+
+        let _override = EnvVarGuard::set_str(
+            "OTTTO_COMPANION_CODE_REQUIREMENT",
+            DEV_ADHOC_COMPANION_REQUIREMENT,
+        );
+        assert_eq!(
+            companion_code_requirement(),
+            CompanionCodeRequirement::Enforced(DEV_ADHOC_COMPANION_REQUIREMENT.to_string())
+        );
     }
 
     #[test]

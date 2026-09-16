@@ -12,6 +12,10 @@ use std::process::{Command, Stdio};
 
 pub const LAUNCH_AGENT_LABEL: &str = MACOS_LAUNCH_AGENT_LABEL;
 pub const MACH_SERVICE_NAME: &str = "net.ottto.service.xpc";
+/// Env var read by the daemon (see `control::companion_code_requirement`) to
+/// override the baked-in Developer ID requirement for token-less Companion
+/// trust. Dev/QA only.
+pub const OTTTO_COMPANION_CODE_REQUIREMENT_ENV: &str = "OTTTO_COMPANION_CODE_REQUIREMENT";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LaunchAgentConfig {
@@ -22,6 +26,15 @@ pub struct LaunchAgentConfig {
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
     pub control_token_env_name: String,
+    /// Dev-only override for the code requirement the daemon enforces against
+    /// a token-less Companion peer, written into the LaunchAgent's
+    /// `EnvironmentVariables` as `OTTTO_COMPANION_CODE_REQUIREMENT`.
+    ///
+    /// `None` for every customer install: the daemon then enforces its
+    /// baked-in Developer ID requirement, which no installer can un-set. Only
+    /// internal QA sets this, to trust a locally built, ad-hoc-signed
+    /// Companion that carries no Developer ID team.
+    pub companion_code_requirement: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -65,6 +78,7 @@ impl LaunchAgentConfig {
             stdout_path: log_dir.join("ottto-service.out.log"),
             stderr_path: log_dir.join("ottto-service.err.log"),
             control_token_env_name: OTTTO_CONTROL_TOKEN_ENV.to_string(),
+            companion_code_requirement: None,
         }
     }
 }
@@ -313,6 +327,17 @@ pub fn render_launch_agent_plist(config: &LaunchAgentConfig) -> Result<Vec<u8>> 
         OTTTO_SOCKET_ENV.to_string(),
         Value::String(config.socket_path.display().to_string()),
     );
+    if let Some(requirement) = config
+        .companion_code_requirement
+        .as_deref()
+        .map(str::trim)
+        .filter(|requirement| !requirement.is_empty())
+    {
+        env.insert(
+            OTTTO_COMPANION_CODE_REQUIREMENT_ENV.to_string(),
+            Value::String(requirement.to_string()),
+        );
+    }
     root.insert("EnvironmentVariables".to_string(), Value::Dictionary(env));
 
     let mut body = Vec::new();
@@ -435,6 +460,56 @@ mod tests {
                 .and_then(Value::as_boolean),
             Some(true)
         );
+    }
+
+    fn plist_environment(config: &LaunchAgentConfig) -> Dictionary {
+        let bytes = render_launch_agent_plist(config).expect("plist should render");
+        Value::from_reader_xml(bytes.as_slice())
+            .expect("plist should parse")
+            .as_dictionary()
+            .and_then(|root| root.get("EnvironmentVariables"))
+            .and_then(Value::as_dictionary)
+            .cloned()
+            .expect("launch agent should carry EnvironmentVariables")
+    }
+
+    #[test]
+    fn customer_launch_agent_carries_no_companion_requirement_override() {
+        // The security-relevant default: nothing an installer writes into the
+        // (user-writable) LaunchAgent can relax token-less Companion trust.
+        // The daemon's baked-in Developer ID requirement applies instead.
+        let env = plist_environment(&config());
+        assert!(
+            !env.contains_key(OTTTO_COMPANION_CODE_REQUIREMENT_ENV),
+            "default launch agent must not override the companion code requirement"
+        );
+    }
+
+    #[test]
+    fn dev_launch_agent_can_carry_a_companion_requirement_override() {
+        let mut config = config();
+        config.companion_code_requirement = Some("identifier \"net.ottto.Companion\"".to_string());
+        let env = plist_environment(&config);
+        assert_eq!(
+            env.get(OTTTO_COMPANION_CODE_REQUIREMENT_ENV)
+                .and_then(Value::as_string),
+            Some("identifier \"net.ottto.Companion\"")
+        );
+    }
+
+    #[test]
+    fn blank_companion_requirement_override_is_not_written() {
+        // A blank value would be read back as "unset" by the daemon anyway;
+        // keep it out of the plist so the file never implies an override that
+        // does not exist.
+        for blank in ["", "   "] {
+            let mut config = config();
+            config.companion_code_requirement = Some(blank.to_string());
+            assert!(
+                !plist_environment(&config).contains_key(OTTTO_COMPANION_CODE_REQUIREMENT_ENV),
+                "blank override should not be written"
+            );
+        }
     }
 
     #[test]
