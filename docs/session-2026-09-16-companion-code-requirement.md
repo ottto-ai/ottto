@@ -90,7 +90,9 @@ const OTTTO_COMPANION_DEFAULT_TEAM_ID: &str =
 3. an empty baked-in team id — a fork opting out; fails closed, no token-less
    trust at all.
 4. **this daemon is itself signed by the baked-in team** → the Companion must be
-   `identifier "net.ottto.Companion" and certificate leaf[subject.OU] = "<team>"`.
+   `identifier "net.ottto.Companion" and anchor apple generic and certificate
+   leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] =
+   "<team>"`.
 5. otherwise → the Companion must be `identifier "net.ottto.Companion"`.
 
 Blank env values are treated as unset and fall through, so an accidentally-empty
@@ -117,6 +119,22 @@ deliberate attacker. Internal builds keep exactly the posture they have today �
 same-uid only. The real boundary lands where the customers are. Tightening rule 5
 further would mean pinning a cdhash the daemon cannot know for an app it does
 not ship with, and that pin would break on the next Sparkle update.
+
+All three clauses in rule 4 matter, and `subject.OU` alone is the trap. A code
+requirement only checks the fields it names, so
+`certificate leaf[subject.OU] = "TEAM"` on its own is satisfied by *any*
+certificate carrying that OU — including a self-signed one, and the team id is
+public. A same-uid attacker could mint a cert with `OU=YRNP9UD7WY`, sign a
+bundle as `net.ottto.Companion`, drop it at `~/Applications/Ottto.app`, and pass
+the "Developer ID" rule — reopening the exact hole this change closes.
+`anchor apple generic` forces the chain back to Apple, and the leaf marker OID
+`1.2.840.113635.100.6.1.13` makes it Developer ID rather than a development or
+Mac App Store certificate from the same team. This is the shape of Apple's own
+generated designated requirement; `codesign -d -r- /Applications/Ottto.app`
+prints it. The first draft of this change carried the bare `subject.OU` clause
+inherited from the old `OTTTO_COMPANION_TEAM_ID` path — where it was at least
+opt-in — and promoting it to the default is what made it a real defect. A unit
+test now asserts both clauses are present in every requirement the daemon builds.
 
 The team id is not a secret: it is the `subject.OU` of the Developer ID
 certificate in every signed release, printed by `codesign -dv --verbose=4
@@ -176,6 +194,22 @@ Row 1 is "do not break legitimate signed Companion auth". Row 2, right column,
 is the finding, closed; row 2, left column, is the internal tester who is not
 disturbed by closing it.
 
+The anchored requirement was checked directly against the real artifacts too:
+it accepts `/Applications/Ottto.app`, the bundled
+`Contents/Helpers/ottto-service`, and the Homebrew
+`/opt/homebrew/opt/ottto/bin/ottto-service`; it rejects the same app under a
+different team id, and the daemon self-requirement rejects an Apple-signed
+system app, which shows the Developer ID leaf marker bites rather than passing
+anything Apple-chained.
+
+Not reproduced: signing a bundle with a self-signed `OU=YRNP9UD7WY`
+certificate, which is what the missing-anchor defect would have accepted. Doing
+that needs an identity in the keychain search list, i.e. changing the operator's
+keychain configuration for a test. The evidence stands without it — Apple's own
+designated requirement for this app pins the anchor and the leaf marker
+alongside the OU, which is only necessary if the OU clause alone is
+insufficient.
+
 `daemon_is_release_signed()` was also confirmed on both binaries directly:
 `false` for the cargo build, `true` after `codesign --sign "Developer ID
 Application: …"`. A release `cargo build --release` embeds the team id, and
@@ -202,8 +236,10 @@ principal who can already read the control token.
 
 ## Tests
 
-- `control.rs`: each resolution rule, including a release daemon requiring the
-  team and an internal daemon not requiring it with otherwise identical inputs;
+- `control.rs`: every requirement the daemon can build carrying
+  `anchor apple generic` plus the Developer ID leaf marker as well as the team
+  OU; each resolution rule, including a release daemon requiring the team and an
+  internal daemon not requiring it with otherwise identical inputs;
   blank inputs falling through; `Disabled` only for a fork that bakes in no team;
   no input combination yielding path-only trust; the shipped constant being
   non-empty and reaching `companion_code_requirement()`; every requirement string

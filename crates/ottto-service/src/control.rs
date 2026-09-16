@@ -724,12 +724,36 @@ fn resolve_companion_code_requirement(
     CompanionCodeRequirement::Enforced(companion_identity_code_requirement())
 }
 
+/// Requirement fragment pinning a signature to a Developer ID certificate
+/// issued by Apple to `team_id`.
+///
+/// SECURITY: all three clauses matter, and `subject.OU` alone is the trap. A
+/// code requirement only checks the fields it names, so
+/// `certificate leaf[subject.OU] = "TEAM"` on its own is satisfied by ANY
+/// certificate carrying that OU — including a self-signed one a same-uid
+/// attacker mints, since the team id is public. `anchor apple generic` is what
+/// forces the chain back to Apple, and the leaf marker OID
+/// `1.2.840.113635.100.6.1.13` is what makes it Developer ID rather than a
+/// development or Mac App Store certificate from the same team.
+///
+/// This is exactly the shape of Apple's own generated designated requirement;
+/// `codesign -d -r- /Applications/Ottto.app` prints it.
+#[cfg(target_os = "macos")]
+fn developer_id_requirement_fragment(team_id: &str) -> String {
+    format!(
+        "anchor apple generic \
+         and certificate leaf[field.1.2.840.113635.100.6.1.13] \
+         and certificate leaf[subject.OU] = \"{team_id}\""
+    )
+}
+
 /// The Developer ID requirement string for `team_id`: the Companion bundle
-/// identifier signed by a leaf certificate belonging to that Apple team.
+/// identifier, signed by a Developer ID certificate Apple issued to that team.
 #[cfg(target_os = "macos")]
 fn companion_team_code_requirement(team_id: &str) -> String {
     format!(
-        "identifier \"{OTTTO_COMPANION_BUNDLE_IDENTIFIER}\" and certificate leaf[subject.OU] = \"{team_id}\""
+        "identifier \"{OTTTO_COMPANION_BUNDLE_IDENTIFIER}\" and {}",
+        developer_id_requirement_fragment(team_id)
     )
 }
 
@@ -742,11 +766,12 @@ fn companion_identity_code_requirement() -> String {
 }
 
 /// The requirement this daemon's own code must satisfy for the install to count
-/// as a customer artifact: signed by the baked-in Apple team, under Apple's
-/// anchor.
+/// as a customer artifact: a Developer ID certificate Apple issued to the
+/// baked-in team. No `identifier` clause — the daemon ships under several
+/// (`ottto-service` standalone, and bundled inside the app).
 #[cfg(target_os = "macos")]
 fn daemon_release_code_requirement(team_id: &str) -> String {
-    format!("anchor apple generic and certificate leaf[subject.OU] = \"{team_id}\"")
+    developer_id_requirement_fragment(team_id)
 }
 
 /// Whether this running `ottto-service` is itself signed by the baked-in team.
@@ -21220,10 +21245,43 @@ mod tests {
         assert_eq!(
             resolve_companion_code_requirement(None, None, TEST_TEAM_ID, RELEASE_SIGNED),
             CompanionCodeRequirement::Enforced(
-                "identifier \"net.ottto.Companion\" and certificate leaf[subject.OU] = \"YRNP9UD7WY\""
+                "identifier \"net.ottto.Companion\" and anchor apple generic \
+                 and certificate leaf[field.1.2.840.113635.100.6.1.13] \
+                 and certificate leaf[subject.OU] = \"YRNP9UD7WY\""
                     .to_string()
             )
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_team_requirement_pins_the_apple_anchor() {
+        // `certificate leaf[subject.OU] = "TEAM"` on its own is satisfied by any
+        // certificate carrying that OU, self-signed included, and the team id is
+        // public. Without the anchor and the Developer ID leaf marker, a
+        // same-uid attacker mints a cert with OU=<team>, signs a bundle as
+        // net.ottto.Companion, drops it at ~/Applications/Ottto.app, and the
+        // "Developer ID" rule passes — the exact hole this change exists to
+        // close. Both requirements the daemon can build must carry both clauses.
+        for text in [
+            companion_team_code_requirement(TEST_TEAM_ID),
+            daemon_release_code_requirement(TEST_TEAM_ID),
+        ] {
+            assert!(
+                text.contains("anchor apple generic"),
+                "requirement must chain to Apple: {text}"
+            );
+            assert!(
+                text.contains("certificate leaf[field.1.2.840.113635.100.6.1.13]"),
+                "requirement must demand a Developer ID leaf: {text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "certificate leaf[subject.OU] = \"{TEST_TEAM_ID}\""
+                )),
+                "requirement must demand our team: {text}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
