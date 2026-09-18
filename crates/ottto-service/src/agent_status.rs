@@ -2786,6 +2786,7 @@ fn collect_claude_status_snapshots(
     } else if has_healthy_custom_account {
         source_health_snapshot.status = AgentStatusState::Available;
     }
+    append_registered_claude_plan_observations(&mut source_health_snapshot, &snapshots);
 
     AgentStatusCollection {
         snapshots,
@@ -7686,9 +7687,27 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
 }
 
 fn append_current_plan_observation(snapshot: &mut AgentStatusSnapshot) {
-    let Some(account) = &snapshot.account else {
+    let Some(account) = snapshot.account.as_ref() else {
         return;
     };
+    let is_current = account.login_state == AgentLoginState::SignedIn
+        && matches!(
+            account.confidence,
+            AgentStatusConfidence::High | AgentStatusConfidence::Medium
+        );
+    let Some(observation) = plan_observation_from_snapshot_account(snapshot, is_current) else {
+        return;
+    };
+    snapshot.plan_observations.push(observation);
+}
+
+/// Describe `snapshot`'s own account as a plan observation, stamped with that
+/// snapshot's provenance (capture time, collection method, model provider).
+fn plan_observation_from_snapshot_account(
+    snapshot: &AgentStatusSnapshot,
+    is_current: bool,
+) -> Option<AgentStatusPlanObservation> {
+    let account = snapshot.account.as_ref()?;
     if account.subscription_product.is_none()
         && account.plan_type.is_none()
         && account.account_id.is_none()
@@ -7699,9 +7718,9 @@ fn append_current_plan_observation(snapshot: &mut AgentStatusSnapshot) {
         && account.organization_id.is_none()
         && account.organization_label.is_none()
     {
-        return;
+        return None;
     }
-    snapshot.plan_observations.push(AgentStatusPlanObservation {
+    Some(AgentStatusPlanObservation {
         observed_at: Some(snapshot.captured_at.clone()),
         evidence_method: Some(collection_method_key(&snapshot.collection_method).to_string()),
         source_session_id: None,
@@ -7730,14 +7749,92 @@ fn append_current_plan_observation(snapshot: &mut AgentStatusSnapshot) {
         billing_identity_evidence: account.billing_identity_evidence.clone(),
         billing_identity_confidence: account.billing_identity_confidence.clone(),
         confidence: account.confidence.clone(),
-        is_current: Some(
-            account.login_state == AgentLoginState::SignedIn
-                && matches!(
-                    account.confidence,
-                    AgentStatusConfidence::High | AgentStatusConfidence::Medium
-                ),
-        ),
-    });
+        is_current: Some(is_current),
+    })
+}
+
+/// Most Claude accounts worth describing in one source-health snapshot. Slot
+/// capacity is already bounded well below this; the cap only keeps a corrupt
+/// registry from growing the payload without limit.
+const CLAUDE_PLAN_OBSERVATION_ACCOUNT_LIMIT: usize = 20;
+
+/// Carry every collected Claude account's product into the source-health
+/// snapshot.
+///
+/// That snapshot is the default slot's, so on its own it names the product of
+/// exactly one account: whichever one the CLI is signed into now. Each
+/// registered slot collects its own account, and only that slot's snapshot
+/// knows its product. Without this the app still lists the other accounts — a
+/// Claude Desktop session bucket supplies the email — but has no product to
+/// title them with, so they read as a bare email or as the source's own name
+/// ("Claude Code") instead of "Claude Max 20x".
+///
+/// Only the product observation is added here. Identity, meters and health for
+/// those accounts keep flowing through the Claude accounts control surface,
+/// which owns them.
+fn append_registered_claude_plan_observations(
+    source_health_snapshot: &mut AgentStatusSnapshot,
+    snapshots: &[AgentStatusSnapshot],
+) {
+    let current_identity = source_health_snapshot
+        .account
+        .as_ref()
+        .and_then(claude_plan_identity_from_account);
+    let mut described = source_health_snapshot
+        .plan_observations
+        .iter()
+        .filter(|observation| {
+            observation.subscription_product.is_some() || observation.plan_type.is_some()
+        })
+        .filter_map(claude_plan_identity_from_observation)
+        .collect::<BTreeSet<_>>();
+    for snapshot in snapshots.iter().take(CLAUDE_PLAN_OBSERVATION_ACCOUNT_LIMIT) {
+        let Some(account) = snapshot.account.as_ref() else {
+            continue;
+        };
+        if account.subscription_product.is_none() && account.plan_type.is_none() {
+            continue;
+        }
+        let Some(identity) = claude_plan_identity_from_account(account) else {
+            continue;
+        };
+        if !described.insert(identity.clone()) {
+            continue;
+        }
+        let is_current = current_identity.as_ref() == Some(&identity);
+        if let Some(observation) = plan_observation_from_snapshot_account(snapshot, is_current) {
+            source_health_snapshot.plan_observations.push(observation);
+        }
+    }
+}
+
+/// The account+organization pair an observation describes. Both halves are
+/// required: an account hash alone cannot tell two organizations of the same
+/// login apart, which is exactly what a Team seat alongside a personal
+/// organization produces.
+fn claude_plan_identity_from_observation(
+    observation: &AgentStatusPlanObservation,
+) -> Option<(String, String)> {
+    claude_plan_identity(
+        observation.account_identifier_hash.as_deref(),
+        observation.organization_identifier_hash.as_deref(),
+    )
+}
+
+fn claude_plan_identity_from_account(account: &AgentAccountStatus) -> Option<(String, String)> {
+    claude_plan_identity(
+        account.account_identifier_hash.as_deref(),
+        account.organization_identifier_hash.as_deref(),
+    )
+}
+
+fn claude_plan_identity(
+    account_identifier_hash: Option<&str>,
+    organization_identifier_hash: Option<&str>,
+) -> Option<(String, String)> {
+    let account = account_identifier_hash.filter(|hash| !hash.is_empty())?;
+    let organization = organization_identifier_hash.filter(|hash| !hash.is_empty())?;
+    Some((account.to_string(), organization.to_string()))
 }
 
 fn append_pi_route_plan_observations(snapshot: &mut AgentStatusSnapshot) {
@@ -15613,6 +15710,193 @@ for line in sys.stdin:
             observation.billing_identity_evidence.as_deref(),
             Some("provider_account_id")
         );
+    }
+
+    /// One collected Claude account: a snapshot whose account carries the
+    /// product, the hashes and the email, as a registered slot's collection
+    /// produces.
+    fn claude_account_snapshot(
+        email: &str,
+        subscription_product: &str,
+        account_hash: &str,
+        organization_hash: &str,
+    ) -> AgentStatusSnapshot {
+        let mut account = max_auth_account(email);
+        account.subscription_product = Some(subscription_product.to_string());
+        account.account_identifier_hash = Some(account_hash.to_string());
+        account.organization_identifier_hash = Some(organization_hash.to_string());
+        let mut snapshot = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-09-18T10:00:00Z".to_string(),
+            "2026-09-18T10:30:00Z".to_string(),
+        );
+        snapshot.account = Some(account);
+        snapshot
+    }
+
+    #[test]
+    fn registered_claude_accounts_carry_their_product_into_source_health() {
+        // The source-health snapshot is the default slot's, so it names only
+        // the signed-in account's product. Every other account's product lives
+        // on its own slot snapshot, and the app titles its rows from these
+        // observations — without the merge they read as a bare email.
+        let current = claude_account_snapshot(
+            "ron@ottto.net",
+            "claude_max_20x",
+            "hash-current",
+            "org-current",
+        );
+        let mut source_health = current.clone();
+        append_current_plan_observation(&mut source_health);
+        let snapshots = vec![
+            current,
+            claude_account_snapshot(
+                "ronshub88@gmail.com",
+                "claude_max_20x",
+                "hash-personal",
+                "org-personal",
+            ),
+            claude_account_snapshot(
+                "ron.s@singular.net",
+                "claude_team_premium",
+                "hash-team",
+                "org-team",
+            ),
+        ];
+
+        append_registered_claude_plan_observations(&mut source_health, &snapshots);
+
+        let described = source_health
+            .plan_observations
+            .iter()
+            .map(|observation| {
+                (
+                    observation.account_label.as_deref().unwrap_or_default(),
+                    observation
+                        .subscription_product
+                        .as_deref()
+                        .unwrap_or_default(),
+                    observation.is_current,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            described,
+            vec![
+                ("ron@ottto.net", "claude_max_20x", Some(true)),
+                ("ronshub88@gmail.com", "claude_max_20x", Some(false)),
+                ("ron.s@singular.net", "claude_team_premium", Some(false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn registered_claude_plan_observations_describe_each_account_once() {
+        // The signed-in account is collected twice: once as the default slot
+        // and again as its own registered slot. It must not gain a second
+        // observation, which would give the app two rows for one account.
+        let current = claude_account_snapshot(
+            "ron@ottto.net",
+            "claude_max_20x",
+            "hash-current",
+            "org-current",
+        );
+        let mut source_health = current.clone();
+        append_current_plan_observation(&mut source_health);
+        let snapshots = vec![current.clone(), current];
+
+        append_registered_claude_plan_observations(&mut source_health, &snapshots);
+
+        assert_eq!(source_health.plan_observations.len(), 1);
+        assert_eq!(
+            source_health.plan_observations[0].is_current,
+            Some(true),
+            "the already-described account keeps the current observation"
+        );
+    }
+
+    #[test]
+    fn registered_claude_plan_observations_separate_organizations_of_one_login() {
+        // A Team seat and a personal organization share one login, so the
+        // account hash alone cannot tell them apart. Each organization is its
+        // own subscription and earns its own observation.
+        let mut source_health = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-09-18T10:00:00Z".to_string(),
+            "2026-09-18T10:30:00Z".to_string(),
+        );
+        let snapshots = vec![
+            claude_account_snapshot(
+                "ron.s@singular.net",
+                "claude_max_20x",
+                "hash-one",
+                "org-personal",
+            ),
+            claude_account_snapshot(
+                "ron.s@singular.net",
+                "claude_team_premium",
+                "hash-one",
+                "org-team",
+            ),
+        ];
+
+        append_registered_claude_plan_observations(&mut source_health, &snapshots);
+
+        let products = source_health
+            .plan_observations
+            .iter()
+            .filter_map(|observation| observation.subscription_product.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(products, vec!["claude_max_20x", "claude_team_premium"]);
+    }
+
+    #[test]
+    fn registered_claude_plan_observations_skip_accounts_without_a_product() {
+        // An account Ottto cannot price adds nothing to say. Its row still
+        // comes from the evidence that named the account in the first place.
+        let mut source_health = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-09-18T10:00:00Z".to_string(),
+            "2026-09-18T10:30:00Z".to_string(),
+        );
+        let mut snapshot =
+            claude_account_snapshot("ron@ottto.net", "claude_max_20x", "hash-one", "org-one");
+        if let Some(account) = snapshot.account.as_mut() {
+            account.subscription_product = None;
+            account.plan_type = None;
+        }
+
+        append_registered_claude_plan_observations(&mut source_health, &[snapshot]);
+
+        assert!(source_health.plan_observations.is_empty());
+    }
+
+    #[test]
+    fn registered_claude_plan_observations_need_both_identity_halves() {
+        // Without an organization hash the observation cannot be matched to one
+        // subscription, so it is not worth emitting.
+        let mut source_health = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-09-18T10:00:00Z".to_string(),
+            "2026-09-18T10:30:00Z".to_string(),
+        );
+        let mut snapshot =
+            claude_account_snapshot("ron@ottto.net", "claude_max_20x", "hash-one", "org-one");
+        if let Some(account) = snapshot.account.as_mut() {
+            account.organization_identifier_hash = None;
+        }
+
+        append_registered_claude_plan_observations(&mut source_health, &[snapshot]);
+
+        assert!(source_health.plan_observations.is_empty());
     }
 
     #[test]
