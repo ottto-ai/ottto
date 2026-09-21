@@ -21,13 +21,15 @@ schema remains unchanged, so an existing audit index can continue incrementally.
 
 ## Local measurements
 
-Measurements used the current production scanner against local transcript
-roots with a private audit index. They performed no upload and did not mutate
-source logs.
+Measurements used the current scanner against local transcript roots with a
+private audit index. They performed no upload and did not mutate source logs.
+The Codex audit exercised the same evidence inputs as production parsing. The
+Claude audit was transcript-only: `snapshot-audit` intentionally did not load
+the local Claude OTLP API/trace sidecars used by the production sync path.
 
 | Source and window | First pass | Settled incremental pass | Curve result |
 | --- | --- | --- | --- |
-| Claude Code, 30 days | 3,581 files; 1,458 sessions; 458.45 s; 1.58 GB max RSS | 1 changed session; 23.88 s; 176 MB max RSS | 1,457 `ownership_unresolved`, 1 `payload_budget_exceeded`; zero usable points |
+| Claude Code, 30 days, transcript-only audit | 3,581 files; 1,458 sessions; 458.45 s; 1.58 GB max RSS | 1 changed session; 23.88 s; 176 MB max RSS | Without local OTLP sidecars, 1,457 `ownership_unresolved`, 1 `payload_budget_exceeded`; zero usable points |
 | Codex, 1 day | 140 files; 136 sessions; 114.22 s; 143 MB max RSS | 10 changed sessions; 40.91 s; 139 MB max RSS | 107 complete, 29 sampled; 15,430 retained points; 234 retained boundaries |
 
 The Codex curves occupied 4,145,009 serialized bytes in total. Per session,
@@ -54,11 +56,13 @@ on a UI request path.
 4. The current Codex representation is small enough for a bounded local cache
    after sampling. The measured 64 KiB per-session wire ceiling is an upper
    bound, not a recommended resident-cache allocation.
-5. Claude Code is not ready for a truthful graph. The parser intentionally
-   rejects ordinary sessions whose owned start cannot be proven; unique request
-   identifiers alone cannot exclude a missing predecessor with a copied prefix.
-   Cache and UI work must preserve that refusal instead of reviving the old
-   misleading first/peak/compaction values.
+5. The transcript-only Claude audit does not measure production curve
+   availability. Production can prove some owned starts by pairing transcript
+   occurrences with complete local OTLP API/trace evidence. The parser still
+   intentionally rejects sessions whose owned start cannot be proven; unique
+   request identifiers alone cannot exclude a missing predecessor with a copied
+   prefix. Cache and UI work must preserve that refusal instead of reviving the
+   old misleading first/peak/compaction values.
 
 ## Proposed versioned local cache contract
 
@@ -105,16 +109,21 @@ control API:
 
 ## Remaining gates
 
-1. Define a truthful Claude owned-start proof for ordinary root, continuation,
-   takeover, and resumed sessions. Until then the Claude graph is explicitly
-   unavailable.
-2. Prototype the cache behind a local opt-in using the existing parser; measure
+1. Add a production-equivalent, content-free Claude measurement that loads the
+   same local OTLP sidecars as sync. Quantify complete/sampled/unavailable
+   coverage without exporting request values, model names, paths, or session
+   identifiers.
+2. Pin and test the existing Claude owned-start proof across ordinary root,
+   continuation, takeover, resumed, restart, rotation, truncation, missing
+   predecessor, and partial-sidecar cases. Any session that fails the proof is
+   explicitly unavailable.
+3. Prototype the cache behind a local opt-in using the existing parser; measure
    disk bytes, resident bytes, write amplification, and CPU under watcher-driven
    updates.
-3. Add a versioned read-only local control response and session-detail graph,
+4. Add a versioned read-only local control response and session-detail graph,
    including loading, building, sampled, stale, unavailable, and accessibility
    states.
-4. Add local 24h/7d/30d cohort materialization only after the individual curve
+5. Add local 24h/7d/30d cohort materialization only after the individual curve
    is correct for both Codex and Claude Code.
-5. Keep daemon release and any backend aggregate activation separate from this
+6. Keep daemon release and any backend aggregate activation separate from this
    evidence-gathering change.

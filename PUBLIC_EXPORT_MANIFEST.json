@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 381,
-  "content_sha256": "440e0b843f61d8c9ecef65c5cb57dd97a20408eac7ae84747cd961b99a75bd32",
+  "content_sha256": "3f4fb2c0003a0ac50084a98578455a1bc16a6222e5625f3c92d616876b246cc0",
   "files": [
     {
       "executable": false,
@@ -1672,8 +1672,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-09-21-context-curve-local-measurement.md",
-      "sha256": "d2c36a180a722eef309232e0c0e2416a56883e510617c451750156d47087526f",
-      "size_bytes": 6711
+      "sha256": "5578daf2d0be9750af2383593e12b594c65c41de3a93b0c72ed3fc233373ff4f",
+      "size_bytes": 7470
     },
     {
       "executable": false,
@@ -2670,7 +2670,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-21T11:59:16+00:00",
+  "generated_at": "2026-09-21T12:09:48+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 382,
   "public_roots": [
@@ -2706,5 +2706,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "553aaabe16fe9ccdff357b547fb9e230709e726e"
+  "source_commit": "8d0d6ca5faa42f0d8b0249b53f8a04746cf6fe17"
 }
