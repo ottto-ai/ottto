@@ -15,9 +15,12 @@ Missing or non-authoritative curve evidence is unavailable, never zero.
 Only `complete` and `sampled` coverage are available. Every other parser
 coverage value is unavailable and must retain its reason.
 
-The additive measurements advance the audit report contract from
-`local_snapshot_audit:v2` to `local_snapshot_audit:v3`. The private audit-state
-schema remains unchanged, so an existing audit index can continue incrementally.
+The initial additive measurements advanced the audit report contract from
+`local_snapshot_audit:v2` to `local_snapshot_audit:v3`. Production-equivalent
+Claude evidence advances it again to `local_snapshot_audit:v4`, with an
+explicit evidence scope and content-free sidecar coverage counters. The private
+audit-state schema remains unchanged, so an existing audit index can continue
+incrementally.
 
 ## Local measurements
 
@@ -30,7 +33,17 @@ the local Claude OTLP API/trace sidecars used by the production sync path.
 | Source and window | First pass | Settled incremental pass | Curve result |
 | --- | --- | --- | --- |
 | Claude Code, 30 days, transcript-only audit | 3,581 files; 1,458 sessions; 458.45 s; 1.58 GB max RSS | 1 changed session; 23.88 s; 176 MB max RSS | Without local OTLP sidecars, 1,457 `ownership_unresolved`, 1 `payload_budget_exceeded`; zero usable points |
+| Claude Code, 7 days, production-local evidence | 982 files; 548 sessions; 86.02 s; 724 MB max RSS | Not measured in this pass | 120 roots had healthy paired API/trace sidecars; 89 sessions reached session-exclusive reported usage, but all 548 curves remained unavailable |
 | Codex, 1 day | 140 files; 136 sessions; 114.22 s; 143 MB max RSS | 10 changed sessions; 40.91 s; 139 MB max RSS | 107 complete, 29 sampled; 15,430 retained points; 234 retained boundaries |
+
+The production-local Claude pass loaded 48,483 API rows and 49,614 trace rows
+without exporting their request identities. Ninety-five roots had exactly the
+same request-id set in both sidecars. Twenty-five roots differed by one
+API-only request and 1,132 trace-only requests in total. The parser marked 546
+curves `ownership_unresolved`, one `parser_unsupported`, and one
+`payload_budget_exceeded`. This is evidence of an unresolved ownership-isolation
+gate, not permission to weaken it: 89 exact per-family usage proofs still did
+not establish that an unrelated invalid family could not hide a copied request.
 
 The Codex curves occupied 4,145,009 serialized bytes in total. Per session,
 serialized bytes were 23,039 at p50, 65,496 at p95, and 65,536 maximum.
@@ -63,6 +76,11 @@ on a UI request path.
    request identifiers alone cannot exclude a missing predecessor with a copied
    prefix. Cache and UI work must preserve that refusal instead of reviving the
    old misleading first/peak/compaction values.
+6. Production sidecars are present and materially improve usage ownership, but
+   they do not yet make a local Claude curve available on this corpus. Any fix
+   must isolate failures by an independent cross-family ownership proof, with a
+   counterexample where an invalid family hides a copied request. A per-family
+   contract label alone is insufficient.
 
 ## Proposed versioned local cache contract
 
@@ -109,11 +127,11 @@ control API:
 
 ## Remaining gates
 
-1. Add a production-equivalent, content-free Claude measurement that loads the
-   same local OTLP sidecars as sync. Quantify complete/sampled/unavailable
-   coverage without exporting request values, model names, paths, or session
-   identifiers.
-2. Pin and test the existing Claude owned-start proof across ordinary root,
+1. Resolve the Claude ownership-isolation gate without weakening copied-prefix
+   suppression. Pin a counterexample where an invalid family hides a request
+   copied from an apparently healthy session, then define the independent
+   global occurrence witness required to isolate failures safely.
+2. Pin and test the Claude owned-start proof across ordinary root,
    continuation, takeover, resumed, restart, rotation, truncation, missing
    predecessor, and partial-sidecar cases. Any session that fails the proof is
    explicitly unavailable.
@@ -127,3 +145,20 @@ control API:
    is correct for both Codex and Claude Code.
 6. Keep daemon release and any backend aggregate activation separate from this
    evidence-gathering change.
+
+For production-equivalent Claude audits, pass the local Ottto support directory
+with `--claude-support-dir`. Omitting it is intentionally labeled
+`transcript_only`. Supplying it is labeled
+`production_loader_sidecars_complete` only when every candidate root has a
+healthy pair; otherwise it is `production_loader_sidecars_partial`. A path
+argument alone never claims evidence coverage. The report contains only counts
+and health totals. It never emits sidecar request ids, provider ids, model
+names, timestamps, or filesystem paths.
+
+With production-local sidecars, the report measures the full local scan and
+names the count of revisions held by its local usage-authority quarantine.
+Claude audits always refuse private upload reproduction: an isolated audit
+index cannot prove the backend's durable authority history, even when its
+current sidecars are complete. Codex and Pi retain the existing optional
+private-payload surface. Local Claude coverage and uploadability are never
+silently conflated.

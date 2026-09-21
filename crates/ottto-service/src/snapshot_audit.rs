@@ -9,11 +9,11 @@
 use crate::session_attribution::{SessionAttributionContext, SESSION_ATTRIBUTION_HMAC_KEY_VERSION};
 use crate::snapshots::{
     apply_upload_policy, collector_version, finalize_scan_after_policy,
-    scan_source_roots_with_attribution, snapshot_fingerprint_from_component_hashes,
-    snapshot_semantic_component_hashes, snapshot_semantic_envelope, ScanIndex,
-    SnapshotBatchRequest, SnapshotItem, SnapshotSource, SnapshotUploadPolicy, BACKFILL_WINDOW_DAYS,
-    SNAPSHOT_REVISION_CONTRACT_VERSION, SNAPSHOT_SCHEMA_VERSION,
-    SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+    scan_source_roots_with_attribution_and_claude_effort_and_hints,
+    snapshot_fingerprint_from_component_hashes, snapshot_semantic_component_hashes,
+    snapshot_semantic_envelope, ScanIndex, SnapshotBatchRequest, SnapshotItem, SnapshotSource,
+    SnapshotUploadPolicy, BACKFILL_WINDOW_DAYS, SNAPSHOT_REVISION_CONTRACT_VERSION,
+    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
 };
 use anyhow::{anyhow, Context, Result};
 use hmac::{Hmac, Mac};
@@ -25,7 +25,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-const AUDIT_SCHEMA_VERSION: &str = "local_snapshot_audit:v3";
+const AUDIT_SCHEMA_VERSION: &str = "local_snapshot_audit:v4";
 const AUDIT_STATE_SCHEMA_VERSION: &str = "local_snapshot_audit_state:v3";
 const AUDIT_STATE_MARKER_FILE: &str = "audit-state.json";
 const AUDIT_SCAN_INDEX_FILE: &str = "scan-index.json";
@@ -47,6 +47,9 @@ pub struct SnapshotAuditOptions {
     pub audit_key_path: PathBuf,
     pub session_attribution_hmac_key_path: PathBuf,
     pub attribution_home: Option<PathBuf>,
+    /// Optional local Ottto support directory. Claude audits use it to load
+    /// the same content-free API/trace ownership sidecars as production sync.
+    pub claude_support_dir: Option<PathBuf>,
     pub machine_id: String,
     pub collected_at: String,
     pub backfill_window_days: u64,
@@ -64,6 +67,11 @@ pub struct SnapshotAuditReport {
     pub collector_version: String,
     pub parser_version: String,
     pub scan_identity_version: String,
+    pub context_curve_evidence_scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_local_evidence: Option<crate::snapshot_sync::ClaudeLocalEvidenceStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_locally_held_session_count: Option<usize>,
     pub backfill_window_days: u64,
     pub backfill_file_limit: usize,
     pub discovered_file_count: usize,
@@ -150,6 +158,7 @@ impl Default for SnapshotAuditOptions {
             audit_key_path: PathBuf::new(),
             session_attribution_hmac_key_path: PathBuf::new(),
             attribution_home: None,
+            claude_support_dir: None,
             machine_id: String::new(),
             collected_at: String::new(),
             backfill_window_days: BACKFILL_WINDOW_DAYS,
@@ -178,6 +187,17 @@ pub fn run_snapshot_audit<W: Write>(
     }
     if options.machine_id.trim().is_empty() {
         return Err(anyhow!("machine id cannot be empty"));
+    }
+    if options.claude_support_dir.is_some() && options.source != SnapshotSource::ClaudeCode {
+        return Err(anyhow!(
+            "Claude support directory is valid only for source claude_code"
+        ));
+    }
+    if options.source == SnapshotSource::ClaudeCode && options.private_upload_payload_out.is_some()
+    {
+        return Err(anyhow!(
+            "Claude private upload reproduction is unavailable because an isolated audit index cannot prove backend authority history"
+        ));
     }
     let audit_key = read_audit_key(&options.audit_key_path)?;
     let attribution_home = match options.attribution_home.as_ref() {
@@ -209,7 +229,7 @@ pub fn run_snapshot_audit<W: Write>(
     })?;
     let index_path = prepare_audit_state_dir(&options.audit_state_dir)?;
     let mut index = ScanIndex::load(&index_path)?;
-    let mut scan = scan_source_roots_with_attribution(
+    let mut scan = scan_source_roots_with_attribution_and_claude_effort_and_hints(
         options.source,
         &options.roots,
         &mut index,
@@ -217,7 +237,29 @@ pub fn run_snapshot_audit<W: Write>(
         options.backfill_window_days,
         true,
         Some(&attribution_context),
+        options.claude_support_dir.as_deref(),
+        true,
+        &[],
+        false,
     )?;
+    let mut claude_local_evidence = None;
+    let mut claude_authority_disposition =
+        crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+    if options.source == SnapshotSource::ClaudeCode {
+        if let Some(support_dir) = options.claude_support_dir.as_deref() {
+            let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+                support_dir,
+                &mut scan,
+                &mut index,
+            );
+            claude_authority_disposition = disposition;
+            claude_local_evidence = Some(stats);
+        }
+    }
+    let claude_locally_held_session_count = options
+        .claude_support_dir
+        .as_ref()
+        .map(|_| claude_authority_disposition.quarantined_entity_count());
     let pre_policy_snapshots = scan.snapshots.clone();
     let upload_policy = SnapshotUploadPolicy {
         session_titles_enabled: false,
@@ -342,12 +384,18 @@ pub fn run_snapshot_audit<W: Write>(
         .sum();
 
     if let Some(path) = options.private_upload_payload_out.as_deref() {
+        let mut uploadable_snapshots = scan.snapshots.clone();
+        // Production keeps the full scan for local consumers, then withholds
+        // only authority-demoting revisions at the network boundary. The
+        // audit report measures local curves; its optional private payload
+        // reproduces the narrower production upload exactly.
+        claude_authority_disposition.retain_uploadable(&mut uploadable_snapshots);
         let request = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: options.source.api_slug().to_string(),
             machine_id: options.machine_id.clone(),
             collector_version: Some(collector_version()),
-            snapshots: scan.snapshots.clone(),
+            snapshots: uploadable_snapshots,
             upload_policy,
             // The audit is an offline reproduction of one upload, so it reports
             // no losses of its own; the live counters belong to the sync loop.
@@ -369,6 +417,20 @@ pub fn run_snapshot_audit<W: Write>(
         collector_version: collector_version(),
         parser_version: parser_version.to_string(),
         scan_identity_version: scan_identity_version.to_string(),
+        context_curve_evidence_scope: match (options.source, claude_local_evidence.as_ref()) {
+            (SnapshotSource::ClaudeCode, Some(stats))
+                if !stats.effort_evidence_load_failed
+                    && stats.paired_sidecar_root_count == stats.candidate_root_count
+                    && stats.complete_sidecar_root_count == stats.paired_sidecar_root_count =>
+            {
+                "production_loader_sidecars_complete"
+            }
+            (SnapshotSource::ClaudeCode, Some(_)) => "production_loader_sidecars_partial",
+            (SnapshotSource::ClaudeCode, None) => "transcript_only",
+            _ => "source_native",
+        },
+        claude_local_evidence,
+        claude_locally_held_session_count,
         backfill_window_days: scan.backfill_window_days,
         backfill_file_limit: scan.backfill_file_limit,
         discovered_file_count: scan.discovered_file_count,
@@ -707,7 +769,7 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshots::scan_source_roots_with_artifacts;
+    use crate::snapshots::{scan_source_roots_with_artifacts, scan_source_roots_with_attribution};
     use base64::Engine as _;
     use std::io;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -810,6 +872,7 @@ mod tests {
                 audit_key_path: key_path,
                 session_attribution_hmac_key_path: attribution_key_file(&home),
                 attribution_home: Some(home.clone()),
+                claude_support_dir: None,
                 machine_id: "fixture-machine".to_string(),
                 collected_at: "2026-07-22T08:02:00Z".to_string(),
                 backfill_window_days: BACKFILL_WINDOW_DAYS,
@@ -830,7 +893,8 @@ mod tests {
             .as_str()
             .expect("raw source file fingerprint");
         assert_eq!(report.emitted_session_count, 1);
-        assert_eq!(report.schema_version, "local_snapshot_audit:v3");
+        assert_eq!(report.schema_version, "local_snapshot_audit:v4");
+        assert_eq!(report.context_curve_evidence_scope, "source_native");
         assert_eq!(report.component_contract_version, "snapshot_semantic:v1");
         assert_eq!(
             report.upload_policy,
@@ -870,7 +934,7 @@ mod tests {
                 <= MAX_LEGACY_POLICY_CANDIDATES
         );
         let golden: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../fixtures/snapshot-audit/v3-golden-keys.json"
+            "../../../fixtures/snapshot-audit/v4-golden-keys.json"
         ))
         .expect("parse golden keys");
         assert_eq!(
@@ -948,6 +1012,7 @@ mod tests {
             audit_key_path: key_path,
             session_attribution_hmac_key_path: attribution_key_file(&home),
             attribution_home: Some(home.clone()),
+            claude_support_dir: None,
             machine_id: "fixture-machine".to_string(),
             collected_at: "2026-07-22T08:02:00Z".to_string(),
             backfill_window_days: BACKFILL_WINDOW_DAYS,
@@ -1025,6 +1090,7 @@ mod tests {
                 audit_key_path,
                 session_attribution_hmac_key_path: attribution_key_path,
                 attribution_home: Some(home.clone()),
+                claude_support_dir: None,
                 machine_id: "fixture-machine".to_string(),
                 collected_at: "2026-05-29T00:05:00Z".to_string(),
                 backfill_window_days: BACKFILL_WINDOW_DAYS,
@@ -1033,9 +1099,39 @@ mod tests {
             &mut Vec::new(),
         )
         .expect("audit");
+        assert_eq!(report.context_curve_evidence_scope, "transcript_only");
         assert!(report.sessions[0]
             .legacy_policy_candidate_semantic_keys
             .contains(&expected_candidate));
+
+        let production_evidence_report = run_snapshot_audit(
+            SnapshotAuditOptions {
+                source: SnapshotSource::ClaudeCode,
+                roots: vec![home.join(".claude").join("projects").join("fixture")],
+                audit_state_dir: home.join("production-evidence-audit-state"),
+                audit_key_path: home.join("audit.key"),
+                session_attribution_hmac_key_path: attribution_key_file(&home),
+                attribution_home: Some(home.clone()),
+                claude_support_dir: Some(home.join("support")),
+                machine_id: "fixture-machine".to_string(),
+                collected_at: "2026-05-29T00:05:00Z".to_string(),
+                backfill_window_days: BACKFILL_WINDOW_DAYS,
+                private_upload_payload_out: None,
+            },
+            &mut Vec::new(),
+        )
+        .expect("production-evidence audit");
+        assert_eq!(
+            production_evidence_report.context_curve_evidence_scope,
+            "production_loader_sidecars_partial"
+        );
+        let evidence_stats = production_evidence_report
+            .claude_local_evidence
+            .expect("Claude evidence stats");
+        assert_eq!(evidence_stats.requested_session_count, 1);
+        assert_eq!(evidence_stats.candidate_root_count, 1);
+        assert_eq!(evidence_stats.paired_sidecar_root_count, 0);
+        assert_eq!(evidence_stats.complete_sidecar_root_count, 0);
         let _ = fs::remove_dir_all(home);
     }
 
@@ -1125,7 +1221,7 @@ mod tests {
         assert_ne!(original_sensitive, stripped_sensitive);
         let original_revision = snapshot_revision_key(key, SnapshotSource::Pi, &original);
         let golden: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../fixtures/snapshot-audit/v3-golden-keys.json"
+            "../../../fixtures/snapshot-audit/v4-golden-keys.json"
         ))
         .expect("parse golden keys");
         assert_eq!(
@@ -1173,6 +1269,58 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn claude_support_directory_is_rejected_for_other_sources() {
+        let error = run_snapshot_audit(
+            SnapshotAuditOptions {
+                source: SnapshotSource::Codex,
+                roots: vec![PathBuf::from("unused")],
+                machine_id: "fixture-machine".to_string(),
+                claude_support_dir: Some(PathBuf::from("unused-support")),
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        )
+        .expect_err("non-Claude sidecar scope rejected");
+        assert!(error
+            .to_string()
+            .contains("valid only for source claude_code"));
+    }
+
+    #[test]
+    fn claude_audit_cannot_reproduce_an_upload_from_an_isolated_index() {
+        let error = run_snapshot_audit(
+            SnapshotAuditOptions {
+                source: SnapshotSource::ClaudeCode,
+                roots: vec![PathBuf::from("unused")],
+                machine_id: "fixture-machine".to_string(),
+                private_upload_payload_out: Some(PathBuf::from("unused-payload")),
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        )
+        .expect_err("transcript-only upload reproduction rejected");
+        assert!(error
+            .to_string()
+            .contains("cannot prove backend authority history"));
+
+        let error_with_support_path = run_snapshot_audit(
+            SnapshotAuditOptions {
+                source: SnapshotSource::ClaudeCode,
+                roots: vec![PathBuf::from("unused")],
+                machine_id: "fixture-machine".to_string(),
+                claude_support_dir: Some(PathBuf::from("unused-support")),
+                private_upload_payload_out: Some(PathBuf::from("unused-payload")),
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        )
+        .expect_err("sidecar path cannot prove backend authority history");
+        assert!(error_with_support_path
+            .to_string()
+            .contains("cannot prove backend authority history"));
+    }
+
     struct ClosedOutput;
 
     impl Write for ClosedOutput {
@@ -1206,6 +1354,7 @@ mod tests {
                 audit_key_path: key_path,
                 session_attribution_hmac_key_path: attribution_key_file(&root),
                 attribution_home: Some(root.clone()),
+                claude_support_dir: None,
                 machine_id: "fixture-machine".to_string(),
                 collected_at: "2026-07-22T08:02:00Z".to_string(),
                 backfill_window_days: BACKFILL_WINDOW_DAYS,

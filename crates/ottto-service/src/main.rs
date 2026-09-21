@@ -91,6 +91,10 @@ enum Command {
         /// Home used to resolve local scheduler attribution inputs.
         #[arg(long)]
         attribution_home: Option<PathBuf>,
+        /// Local Ottto support directory containing Claude API/trace sidecars.
+        /// Valid only with `--source claude_code`; omit for transcript-only audit.
+        #[arg(long)]
+        claude_support_dir: Option<PathBuf>,
         /// Machine id used by the normal upload contract; never printed raw.
         #[arg(long)]
         machine_id: String,
@@ -210,6 +214,7 @@ fn main() -> Result<()> {
             audit_key_file,
             session_attribution_hmac_key_file,
             attribution_home,
+            claude_support_dir,
             machine_id,
             collected_at,
             backfill_window_days,
@@ -226,6 +231,7 @@ fn main() -> Result<()> {
                     audit_key_path: audit_key_file,
                     session_attribution_hmac_key_path: session_attribution_hmac_key_file,
                     attribution_home,
+                    claude_support_dir,
                     machine_id,
                     collected_at: collected_at
                         .unwrap_or_else(ottto_service::current_rfc3339_timestamp),

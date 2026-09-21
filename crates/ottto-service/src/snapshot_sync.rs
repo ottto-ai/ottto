@@ -2398,89 +2398,10 @@ fn sync_source(
     let mut claude_authority_disposition =
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
     if source == SnapshotSource::ClaudeCode {
-        let census_complete = scan_result.census_complete;
-        let mut session_ids = claude_evidence_session_ids(&scan_result.snapshots)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        if census_complete {
-            session_ids.extend(crate::snapshots::claude_pending_family_session_ids(&index));
-        }
-        if let Ok(evidence) =
-            crate::claude_local_otel::load_claude_effort_evidence(support_dir, session_ids)
-        {
-            let census_window_end = scan_result.census_window_end.clone();
-            crate::snapshots::apply_claude_effort_evidence_with_index(
-                &mut scan_result.snapshots,
-                &evidence,
-                &mut index,
-                census_complete,
-                &census_window_end,
-            );
-        }
-        let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
-            .into_iter()
-            .chain(crate::snapshots::claude_pending_family_session_ids(&index))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter(|session_id| {
-                !crate::claude_local_otel::claude_effort_sidecar_fingerprint(
-                    support_dir,
-                    session_id,
-                )
-                .is_empty()
-                    && !crate::claude_local_otel::claude_trace_ownership_sidecar_fingerprint(
-                        support_dir,
-                        session_id,
-                    )
-                    .is_empty()
-            })
-            .collect::<Vec<_>>();
-        // Health is family-scoped: one malformed historical sidecar must make
-        // that family unproven, not suppress an unrelated healthy family.
-        let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
-        let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
-        for root_session_id in usage_roots {
-            let api = crate::claude_local_otel::load_claude_api_request_evidence_report(
-                support_dir,
-                [root_session_id.clone()],
-            );
-            let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
-                support_dir,
-                [root_session_id.clone()],
-            );
-            if !api.health.is_complete() || !trace.is_complete() {
-                continue;
-            }
-            if let Some(rows) = api.evidence.get(&root_session_id) {
-                api_report
-                    .evidence
-                    .insert(root_session_id.clone(), rows.clone());
-            }
-            if let Some(rows) = trace.evidence.get(&root_session_id) {
-                trace_report.evidence.insert(root_session_id, rows.clone());
-            }
-        }
-        let census_window_end = scan_result.census_window_end.clone();
-        claude_authority_disposition = crate::snapshots::apply_claude_reported_usage_with_index(
-            &mut scan_result.snapshots,
-            &api_report,
-            &trace_report,
-            &mut index,
-            census_complete,
-            &census_window_end,
-        );
-        if index.account_claude_usage_authority_census_health(&mut scan_result) {
-            // These revisions were fully readable, but uploading them would
-            // demote a previously proven usage authority. They remain pending
-            // local work: healthy siblings may settle, while this census and
-            // any historical replay stay non-terminal until a complete family
-            // pass reconstructs the exact witness. Exhausted families are not
-            // pending here: the helper accounts each held entity through the
-            // backend-admitted ownership-incomplete status counter while
-            // allowing a complete-with-named-loss census.
-            scan_result.census_complete = false;
-            scan_result.scan_cap_hit = true;
-            index.mark_bounded_sweep_unsettled();
+        let (disposition, census_withheld, _) =
+            apply_claude_local_evidence_to_scan(support_dir, &mut scan_result, &mut index);
+        claude_authority_disposition = disposition;
+        if census_withheld {
             backfill_succeeded = false;
         }
     }
@@ -3172,6 +3093,183 @@ fn claude_evidence_root_session_ids(snapshots: &[SnapshotItem]) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// Apply the exact local Claude API/trace evidence path used by production.
+///
+/// Kept as one shared derivation so privacy-safe offline audits cannot drift
+/// from the sync loop's ownership, completeness, and quarantine semantics.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ClaudeLocalEvidenceStats {
+    pub requested_session_count: usize,
+    pub candidate_root_count: usize,
+    pub paired_sidecar_root_count: usize,
+    pub complete_sidecar_root_count: usize,
+    pub api_incomplete_root_count: usize,
+    pub trace_incomplete_root_count: usize,
+    pub api_evidence_row_count: usize,
+    pub trace_evidence_row_count: usize,
+    pub exact_request_set_root_count: usize,
+    pub request_set_mismatch_root_count: usize,
+    pub api_only_request_count: usize,
+    pub trace_only_request_count: usize,
+    pub identity_complete_session_count: usize,
+    pub request_index_complete_session_count: usize,
+    pub explicit_owned_start_session_count: usize,
+    pub session_exclusive_reported_usage_count: usize,
+    pub effort_evidence_load_failed: bool,
+}
+
+pub(crate) fn apply_claude_local_evidence_to_scan(
+    support_dir: &Path,
+    scan_result: &mut crate::snapshots::SourceScanResult,
+    index: &mut ScanIndex,
+) -> (
+    crate::snapshots::ClaudeUsageAuthorityDisposition,
+    bool,
+    ClaudeLocalEvidenceStats,
+) {
+    let census_complete = scan_result.census_complete;
+    let mut session_ids = claude_evidence_session_ids(&scan_result.snapshots)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if census_complete {
+        session_ids.extend(crate::snapshots::claude_pending_family_session_ids(index));
+    }
+    let mut stats = ClaudeLocalEvidenceStats {
+        requested_session_count: session_ids.len(),
+        ..Default::default()
+    };
+    match crate::claude_local_otel::load_claude_effort_evidence(support_dir, session_ids) {
+        Ok(evidence) => {
+            let census_window_end = scan_result.census_window_end.clone();
+            crate::snapshots::apply_claude_effort_evidence_with_index(
+                &mut scan_result.snapshots,
+                &evidence,
+                index,
+                census_complete,
+                &census_window_end,
+            );
+        }
+        Err(_) => stats.effort_evidence_load_failed = true,
+    }
+    let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
+        .into_iter()
+        .chain(crate::snapshots::claude_pending_family_session_ids(index))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    stats.candidate_root_count = usage_roots.len();
+    let usage_roots = usage_roots
+        .into_iter()
+        .filter(|session_id| {
+            !crate::claude_local_otel::claude_effort_sidecar_fingerprint(support_dir, session_id)
+                .is_empty()
+                && !crate::claude_local_otel::claude_trace_ownership_sidecar_fingerprint(
+                    support_dir,
+                    session_id,
+                )
+                .is_empty()
+        })
+        .collect::<Vec<_>>();
+    stats.paired_sidecar_root_count = usage_roots.len();
+    // Health is family-scoped: one malformed historical sidecar must make
+    // that family unproven, not suppress an unrelated healthy family.
+    let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+    let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+    for root_session_id in usage_roots {
+        let api = crate::claude_local_otel::load_claude_api_request_evidence_report(
+            support_dir,
+            [root_session_id.clone()],
+        );
+        let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+            support_dir,
+            [root_session_id.clone()],
+        );
+        if !api.health.is_complete() {
+            stats.api_incomplete_root_count += 1;
+        }
+        if !trace.is_complete() {
+            stats.trace_incomplete_root_count += 1;
+        }
+        if !api.health.is_complete() || !trace.is_complete() {
+            continue;
+        }
+        stats.complete_sidecar_root_count += 1;
+        let api_request_ids = api
+            .evidence
+            .get(&root_session_id)
+            .into_iter()
+            .flatten()
+            .map(|row| row.request_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let trace_request_ids = trace
+            .evidence
+            .get(&root_session_id)
+            .into_iter()
+            .flatten()
+            .map(|row| row.request_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if api_request_ids == trace_request_ids {
+            stats.exact_request_set_root_count += 1;
+        } else {
+            stats.request_set_mismatch_root_count += 1;
+            stats.api_only_request_count += api_request_ids.difference(&trace_request_ids).count();
+            stats.trace_only_request_count +=
+                trace_request_ids.difference(&api_request_ids).count();
+        }
+        if let Some(rows) = api.evidence.get(&root_session_id) {
+            stats.api_evidence_row_count += rows.len();
+            api_report
+                .evidence
+                .insert(root_session_id.clone(), rows.clone());
+        }
+        if let Some(rows) = trace.evidence.get(&root_session_id) {
+            stats.trace_evidence_row_count += rows.len();
+            trace_report.evidence.insert(root_session_id, rows.clone());
+        }
+    }
+    let census_window_end = scan_result.census_window_end.clone();
+    let disposition = crate::snapshots::apply_claude_reported_usage_with_index(
+        &mut scan_result.snapshots,
+        &api_report,
+        &trace_report,
+        index,
+        census_complete,
+        &census_window_end,
+    );
+    stats.identity_complete_session_count = scan_result
+        .snapshots
+        .iter()
+        .filter(|item| item.claude_context_curve_identity_complete)
+        .count();
+    stats.request_index_complete_session_count = scan_result
+        .snapshots
+        .iter()
+        .filter(|item| item.claude_context_curve_request_index_complete)
+        .count();
+    stats.explicit_owned_start_session_count = scan_result
+        .snapshots
+        .iter()
+        .filter(|item| item.claude_context_curve_owned_start_proven)
+        .count();
+    stats.session_exclusive_reported_usage_count = scan_result
+        .snapshots
+        .iter()
+        .filter(|item| {
+            item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
+        })
+        .count();
+    let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
+    if census_withheld {
+        // These revisions were fully readable, but uploading them would demote
+        // a previously proven usage authority. Keep the census non-terminal
+        // until a complete family pass reconstructs the exact witness.
+        scan_result.census_complete = false;
+        scan_result.scan_cap_hit = true;
+        index.mark_bounded_sweep_unsettled();
+    }
+    (disposition, census_withheld, stats)
 }
 
 #[derive(Debug, PartialEq, Eq)]
