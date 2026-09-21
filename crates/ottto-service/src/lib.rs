@@ -2597,6 +2597,8 @@ fn source_counts_toward_finish_setup(source: &LocalHealthSourceV1) -> bool {
         Some(reason)
             if reason == stable_problem_code_slug(&StableProblemCode::SourceNotInstalled)
                 || reason == stable_problem_code_slug(&StableProblemCode::AgentCliUnavailable)
+                || reason
+                    == stable_problem_code_slug(&StableProblemCode::TelemetryDisabledByAdmin)
     ) {
         return false;
     }
@@ -3773,8 +3775,8 @@ fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: 
     let preserve_failed_verification = existing.last_verified_at.is_some()
         && has_verification_failure_problem(existing)
         && !clear_failed_verification;
-    let preserve_telemetry_disabled_by_admin =
-        existing.last_verified_at.is_some() && has_telemetry_disabled_by_admin_problem(existing);
+    let preserve_telemetry_disabled_by_admin = has_telemetry_disabled_by_admin_problem(existing)
+        && verification_attention_is_current(existing, refreshed);
     if (preserve_config_drift && has_config_drift_problem(existing))
         || preserve_failed_verification
         || preserve_telemetry_disabled_by_admin
@@ -3785,6 +3787,36 @@ fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: 
         refreshed.recommended_actions = existing.recommended_actions.clone();
         refreshed.last_verified_at = existing.last_verified_at.clone();
     }
+}
+
+/// Verification warnings are point-in-time evidence. They may remain in the
+/// command ledger for support, but they must not hold a currently reachable
+/// source in warning state forever. A current local scan supersedes a warning
+/// after one day unless Verify confirms it again.
+fn verification_attention_is_current(existing: &SourceHealth, refreshed: &SourceHealth) -> bool {
+    const MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
+    let Some(verified_at) = existing
+        .last_verified_at
+        .as_deref()
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+    else {
+        return false;
+    };
+    let Some(refreshed_at) = refreshed
+        .agent_status
+        .as_ref()
+        .and_then(|snapshot| OffsetDateTime::parse(&snapshot.captured_at, &Rfc3339).ok())
+        .or_else(|| {
+            refreshed
+                .last_seen_at
+                .as_deref()
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        })
+    else {
+        return true;
+    };
+    let age = refreshed_at.unix_timestamp() - verified_at.unix_timestamp();
+    age <= MAX_AGE_SECONDS
 }
 
 fn source_health_from_agent_status(
@@ -5820,16 +5852,65 @@ mod tests {
             Some(&StableProblemCode::TelemetryDisabledByAdmin)
         );
         assert!(source.recommended_actions.is_empty());
-        let canonical = status
-            .canonical_health
-            .expect("canonical health")
+        let health = status.canonical_health.as_ref().expect("canonical health");
+        let canonical = health
             .sources
-            .into_iter()
+            .iter()
             .find(|source| source.app == SourceKind::Pi)
             .expect("canonical Pi source");
         assert_eq!(
             canonical.blocking_reason.as_deref(),
             Some("telemetry_disabled_by_admin")
+        );
+        assert_eq!(
+            health.overall.state,
+            LocalHealthOverallState::Healthy,
+            "workspace policy belongs on the Pi row, not machine health"
+        );
+    }
+
+    #[test]
+    fn current_agent_status_clears_day_old_workspace_policy_warning() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut stale = codex_health();
+        stale.source = SourceKind::Pi;
+        stale.descriptor = source_descriptor(&SourceKind::Pi);
+        stale.state = SourceState::NeedsConfirmation;
+        stale.grade = HealthGrade::Warning;
+        stale.last_seen_at = Some("2026-09-11T19:39:35Z".to_string());
+        stale.last_verified_at = Some("2026-09-11T19:39:35Z".to_string());
+        stale.problems = vec![HealthProblem {
+            code: StableProblemCode::TelemetryDisabledByAdmin,
+            title: "Pi data sharing is off".to_string(),
+            detail: "Turn on Live telemetry for Pi, then Verify.".to_string(),
+            retryable: false,
+        }];
+        stale.recommended_actions = Vec::new();
+        daemon
+            .update_sources(TOKEN, vec![stale])
+            .expect("seed old workspace policy");
+
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::Pi, "2026-09-21T12:06:33Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after current scan");
+        let source = status.sources.first().expect("Pi source");
+        assert_eq!(source.state, SourceState::Healthy);
+        assert_eq!(source.grade, HealthGrade::Ok);
+        assert!(source.last_verified_at.is_none());
+        assert!(source.problems.is_empty());
+        assert_eq!(
+            status
+                .canonical_health
+                .expect("canonical health")
+                .overall
+                .state,
+            LocalHealthOverallState::Healthy
         );
     }
 
