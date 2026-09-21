@@ -31473,6 +31473,104 @@ mod tests {
     }
 
     #[test]
+    fn claude_invalid_family_can_hide_copy_from_provider_owned_session() {
+        let (root, parent, mut items) = claude_account_family_fixture();
+        let hidden_copy_id = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let hidden_copy_path = root.join(format!("{hidden_copy_id}.jsonl"));
+        fs::write(
+            &hidden_copy_path,
+            format!(
+                "{{\"timestamp\":\"2026-08-02T07:00:05Z\",\"type\":\"assistant\",\"sessionId\":\"{hidden_copy_id}\",\"requestId\":\"req_5\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":1}}}}}}\n"
+            ),
+        )
+        .expect("write hidden-copy fixture");
+        let mut hidden_copy = parse_claude_code_jsonl_file(
+            &hidden_copy_path,
+            "2026-08-02T07:01:00Z",
+            "hidden-copy-fp".to_string(),
+        )
+        .expect("parse hidden-copy family")
+        .remove(0);
+        assert_eq!(hidden_copy.claude_usage_request_ids.len(), 1);
+        assert!(hidden_copy.claude_usage_request_ids.contains("req_5"));
+
+        // Model a bounded family whose transcript request identity was retained
+        // but whose occurrence proof could not be completed. The copied req_5
+        // is therefore invisible to the ordinary duplicate fold: only the
+        // invalid-family guard can stop the apparently healthy provider-owned
+        // child from claiming the same request and emitting a false curve.
+        hidden_copy.claude_usage_occurrences.clear();
+        items.push(hidden_copy);
+
+        let child_agent = "a4d1585d310070d0f";
+        let mut api_rows = (1..=4)
+            .map(|index| complete_api_row(&parent, &format!("req_{index}"), index, 10, 10, 0))
+            .collect::<Vec<_>>();
+        api_rows.push(complete_api_row(&parent, "req_5", 5, 10, 1, 0));
+        let mut trace_rows = (1..=4)
+            .map(|index| complete_trace_row(&parent, &format!("req_{index}"), ""))
+            .collect::<Vec<_>>();
+        trace_rows.push(complete_trace_row(&parent, "req_5", child_agent));
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), api_rows)]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), trace_rows)]),
+            ..Default::default()
+        };
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&root.join(format!("{parent}.jsonl"))),
+            manifest_index_entry(None),
+        );
+        index.files.insert(
+            local_index_key(
+                &root
+                    .join(&parent)
+                    .join("subagents")
+                    .join(format!("agent-{child_agent}.jsonl")),
+            ),
+            manifest_index_entry(None),
+        );
+        index.files.insert(
+            local_index_key(&hidden_copy_path),
+            manifest_index_entry(None),
+        );
+
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+
+        let child = &items[1];
+        assert_eq!(
+            child.usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1"),
+            "the healthy family's provider ledger remains exact"
+        );
+        assert_eq!(
+            child
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("ownership_unresolved"),
+            "an invalid peer family can hide a copied request, so posture must stay closed"
+        );
+        assert!(index.claude_duplicate_request_witness_overflowed);
+        assert!(!index
+            .claude_usage_family_pending
+            .contains_key(hidden_copy_id));
+        assert!(index.claude_duplicate_request_owners.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn claude_reported_usage_union_refuses_unknown_trace_owner() {
         let (root, parent, mut items) = claude_account_family_fixture();
         let api_rows = vec![complete_api_row(&parent, "req_1", 1, 10, 10, 0)];
