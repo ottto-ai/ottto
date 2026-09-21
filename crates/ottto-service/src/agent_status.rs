@@ -409,6 +409,98 @@ fn select_claude_snapshot_candidates(
     selection
 }
 
+/// Provider quota responses do not carry account identity. Ottto normally
+/// binds them to the exact slot credential that made the request. If the same
+/// complete meter payload appears under different strong identities, that
+/// binding is not trustworthy: a stale slot identity may be paired with a
+/// credential for another account. Prefer one durable registered slot over the
+/// mutable default login; if several registered slots disagree, hide them all.
+fn claude_cross_binding_meter_collisions(
+    candidates: &[ClaudeSnapshotCandidate],
+) -> BTreeSet<String> {
+    let mut by_fingerprint = BTreeMap::<String, Vec<usize>>::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let Some(fingerprint) = claude_provider_meter_fingerprint(candidate) else {
+            continue;
+        };
+        by_fingerprint.entry(fingerprint).or_default().push(index);
+    }
+
+    let mut quarantined = BTreeSet::new();
+    for group in by_fingerprint.values() {
+        let bindings = group
+            .iter()
+            .map(|index| &candidates[*index].binding)
+            .collect::<BTreeSet<_>>();
+        if bindings.len() < 2 {
+            continue;
+        }
+        let registered = group
+            .iter()
+            .filter(|index| candidates[**index].slot_class == ClaudeSnapshotSlotClass::Registered)
+            .copied()
+            .collect::<Vec<_>>();
+        if registered.len() == 1 {
+            let trusted = registered[0];
+            for index in group {
+                if *index != trusted {
+                    quarantined.insert(candidates[*index].slot_id.clone());
+                }
+            }
+        } else {
+            for index in group {
+                quarantined.insert(candidates[*index].slot_id.clone());
+            }
+        }
+    }
+    quarantined
+}
+
+fn claude_provider_meter_fingerprint(candidate: &ClaudeSnapshotCandidate) -> Option<String> {
+    if candidate.quality.tier != 4 {
+        return None;
+    }
+    let mut windows = candidate.snapshot.quota_windows.clone();
+    let mut window_rows = Vec::with_capacity(windows.len());
+    for window in &mut windows {
+        window.account_label = None;
+        window.account_identifier_hash = None;
+        window.organization_identifier_hash = None;
+        window.observed_at = None;
+        window_rows.push(serde_json::to_string(window).ok()?);
+    }
+    window_rows.sort();
+
+    let mut balances = candidate.snapshot.credit_balances.clone();
+    let mut balance_rows = Vec::with_capacity(balances.len());
+    for balance in &mut balances {
+        balance.account_label = None;
+        balance.account_identifier_hash = None;
+        balance.organization_identifier_hash = None;
+        balance.updated_at = None;
+        balance_rows.push(serde_json::to_string(balance).ok()?);
+    }
+    balance_rows.sort();
+    serde_json::to_string(&(window_rows, balance_rows)).ok()
+}
+
+fn quarantine_claude_cross_account_meters(status: &mut ClaudeConfigSlotCollectionStatusV1) {
+    status.state = ClaudeConfigSlotCollectionStateV1::IdentityMismatch;
+    status.last_full_quota_read_at = None;
+    status.has_account_windows = false;
+    status.has_scoped_limits = false;
+    status.has_credit_balances = false;
+    status.quota_snapshot = None;
+    status
+        .diagnostics
+        .retain(|diagnostic| diagnostic.code != ClaudeConfigSlotDiagnosticCodeV1::IdentityMismatch);
+    status.diagnostics.push(ClaudeConfigSlotDiagnosticV1 {
+        code: ClaudeConfigSlotDiagnosticCodeV1::IdentityMismatch,
+        message: "Limits matched another account and were hidden. Reconnect this Claude login."
+            .to_string(),
+    });
+}
+
 fn claude_snapshot_candidate_disposition(
     index: usize,
     candidate: &ClaudeSnapshotCandidate,
@@ -2635,6 +2727,21 @@ fn collect_claude_status_snapshots(
             }
         }
     }
+    let quarantined_slots = claude_cross_binding_meter_collisions(&candidates);
+    for slot_id in &quarantined_slots {
+        if let Some(status) = slot_states.get_mut(slot_id) {
+            quarantine_claude_cross_account_meters(status);
+        }
+        if slot_id == "default" {
+            default_snapshot.quota_windows.clear();
+            default_snapshot.credit_balances.clear();
+        }
+    }
+    candidates.retain(|candidate| !quarantined_slots.contains(&candidate.slot_id));
+    if let Some(status) = slot_states.get("default") {
+        default_state = status.clone();
+    }
+
     let selection = select_claude_snapshot_candidates(&candidates);
     let winning_accounts = selection
         .winning_by_binding
@@ -19118,6 +19225,127 @@ exit 1
         let selected = select_claude_snapshot_candidates(&candidates);
         assert_eq!(selected.winning_by_binding.len(), 2);
         assert_eq!(selected.preferred_anchor_by_binding.len(), 2);
+    }
+
+    #[test]
+    fn identical_full_meters_under_different_accounts_quarantine_the_mutable_default() {
+        let candidate = |slot_id: &str,
+                         slot_class: ClaudeSnapshotSlotClass,
+                         account: &str,
+                         organization: &str,
+                         weekly_used: u8| {
+            let mut snapshot = base_snapshot(
+                SourceKind::ClaudeCode,
+                AgentStatusState::Available,
+                AgentStatusCollectionMethod::CliJson,
+                "2026-09-21T11:00:00Z".to_string(),
+                "2026-09-21T11:15:00Z".to_string(),
+            );
+            snapshot.account = Some(AgentAccountStatus {
+                account_identifier_hash: Some(account.to_string()),
+                organization_identifier_hash: Some(organization.to_string()),
+                ..unsupported_account("anthropic")
+            });
+            snapshot.quota_windows = [
+                ("session", AgentQuotaWindowScope::Account, 2),
+                ("weekly", AgentQuotaWindowScope::Account, weekly_used),
+                ("fable", AgentQuotaWindowScope::Model, 100),
+            ]
+            .into_iter()
+            .map(|(name, scope, used_percent)| AgentQuotaWindow {
+                name: name.to_string(),
+                scope,
+                status: if used_percent == 100 {
+                    AgentQuotaWindowStatus::Exhausted
+                } else {
+                    AgentQuotaWindowStatus::Ok
+                },
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                observed_at: Some("2026-09-21T10:42:00Z".to_string()),
+                account_identifier_hash: Some(account.to_string()),
+                organization_identifier_hash: Some(organization.to_string()),
+                resets_at: Some("2026-09-26T04:59:00Z".to_string()),
+                used_percent: Some(used_percent),
+                left_percent: Some(100 - used_percent),
+                ..Default::default()
+            })
+            .collect();
+            ClaudeSnapshotCandidate {
+                slot_id: slot_id.to_string(),
+                slot_class,
+                binding: ClaudeStrongBinding {
+                    account_identifier_hash: account.to_string(),
+                    organization_identifier_hash: organization.to_string(),
+                },
+                quality: ClaudeSnapshotQuality {
+                    tier: 4,
+                    provider_observed_at: "2026-09-21T10:42:00Z".to_string(),
+                },
+                snapshot,
+            }
+        };
+
+        let default = candidate(
+            "default",
+            ClaudeSnapshotSlotClass::Default,
+            "singular-account",
+            "singular-org",
+            96,
+        );
+        let registered = candidate(
+            "claude_slot_gmail",
+            ClaudeSnapshotSlotClass::Registered,
+            "gmail-account",
+            "gmail-org",
+            96,
+        );
+        assert_eq!(
+            claude_cross_binding_meter_collisions(&[default, registered]),
+            BTreeSet::from(["default".to_string()]),
+            "the durable account keeps the reading; the mutable login cannot borrow it"
+        );
+
+        let distinct_default = candidate(
+            "default",
+            ClaudeSnapshotSlotClass::Default,
+            "singular-account",
+            "singular-org",
+            12,
+        );
+        let distinct_registered = candidate(
+            "claude_slot_gmail",
+            ClaudeSnapshotSlotClass::Registered,
+            "gmail-account",
+            "gmail-org",
+            96,
+        );
+        assert!(
+            claude_cross_binding_meter_collisions(&[distinct_default, distinct_registered])
+                .is_empty()
+        );
+
+        let mut state = ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::Fresh,
+            last_full_quota_read_at: Some("2026-09-21T10:42:00Z".to_string()),
+            has_account_windows: true,
+            has_scoped_limits: true,
+            quota_snapshot: Some(ClaudeConfigSlotQuotaSnapshotV1 {
+                state: ClaudeConfigSlotQuotaSnapshotStateV1::Fresh,
+                captured_at: "2026-09-21T11:00:00Z".to_string(),
+                observed_at: Some("2026-09-21T10:42:00Z".to_string()),
+                quota_windows: Vec::new(),
+                credit_balances: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        quarantine_claude_cross_account_meters(&mut state);
+        assert_eq!(
+            state.state,
+            ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        );
+        assert!(state.quota_snapshot.is_none());
+        assert!(!state.has_account_windows);
+        assert!(!state.has_scoped_limits);
     }
 
     #[test]
