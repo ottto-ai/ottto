@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 379,
-  "content_sha256": "10394d1f63383a606c4232305ee64b5db2af2f717487d97aa5fb7a283c694762",
+  "candidate_file_count": 381,
+  "content_sha256": "440e0b843f61d8c9ecef65c5cb57dd97a20408eac7ae84747cd961b99a75bd32",
   "files": [
     {
       "executable": false,
@@ -853,8 +853,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_audit.rs",
-      "sha256": "fddab7e75369d12cedcc17c56e1d9ed4991faa668f537fcec3fa186576610ea2",
-      "size_bytes": 45273
+      "sha256": "abb1e15957871159344ae5bdb25fc54284c7b4b64b01790285c05188a56a1a94",
+      "size_bytes": 51432
     },
     {
       "executable": false,
@@ -1671,6 +1671,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-09-21-context-curve-local-measurement.md",
+      "sha256": "d2c36a180a722eef309232e0c0e2416a56883e510617c451750156d47087526f",
+      "size_bytes": 6711
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-surfaces.md",
       "sha256": "b49df98bbf9dbdcbcc4a904c35f084019541451e53f46c3134ea5c9ff31920b9",
       "size_bytes": 2026
@@ -2156,6 +2163,13 @@
       "mode": "0644",
       "path": "fixtures/snapshot-audit/v2-golden-keys.json",
       "sha256": "29d6e6591f2c80c074ccced4747a0c84c2f8d343f93fcdc875b8173ae69b1221",
+      "size_bytes": 1055
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/snapshot-audit/v3-golden-keys.json",
+      "sha256": "e9c8daf0ede6119798f97e347150d591572b77996f55c562345eaf10eb3828b7",
       "size_bytes": 1055
     },
     {
@@ -2656,9 +2670,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-18T14:16:25+00:00",
+  "generated_at": "2026-09-21T11:59:16+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 380,
+  "output_file_count": 382,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2692,5 +2706,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c8efdcc7e56c7fcc0242cdba21a2d8bd4edccd89"
+  "source_commit": "553aaabe16fe9ccdff357b547fb9e230709e726e"
 }
