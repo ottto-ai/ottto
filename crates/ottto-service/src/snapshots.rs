@@ -19413,8 +19413,8 @@ mod tests {
     fn measure_synthetic_snapshots() {
         let root = PathBuf::from(std::env::var("OTTTO_COMPOSITION_FIXTURE_ROOT").unwrap());
         assert_eq!(
-            fs::read_to_string(root.join("synthetic-only")).unwrap(),
-            "collector-fixture-v1\n"
+            fs::read(root.join("synthetic-only")).unwrap(),
+            b"collector-fixture-v1\n"
         );
         let source = match std::env::var("OTTTO_COMPOSITION_FIXTURE_SOURCE")
             .unwrap()
