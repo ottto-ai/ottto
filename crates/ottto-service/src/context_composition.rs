@@ -255,15 +255,15 @@ fn extract_blocks_text_and_images(content: Option<&Value>) -> (String, u64) {
         Some(Value::String(s)) => return (s.clone(), 0),
         Some(other) => other,
     };
-    // Normalize a single object into a one-element list.
-    let blocks: Vec<Value> = match content {
-        Value::Array(items) => items.clone(),
-        Value::Object(_) => vec![content.clone()],
+    // Borrow blocks: image bodies are counted, so copying them serves no purpose.
+    let blocks: &[Value] = match content {
+        Value::Array(items) => items.as_slice(),
+        Value::Object(_) => std::slice::from_ref(content),
         other => return (python_json_dumps(other), 0),
     };
     let mut texts: Vec<String> = Vec::new();
     let mut images: u64 = 0;
-    for block in &blocks {
+    for block in blocks {
         let Some(obj) = block.as_object() else {
             // Non-dict element: str(block). For a JSON string that is the raw
             // string; otherwise the compact python repr length is dominated by
