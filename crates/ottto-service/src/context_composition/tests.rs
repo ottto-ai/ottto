@@ -39,6 +39,141 @@ fn wide_window() -> DateWindow {
     }
 }
 
+#[test]
+fn content_block_shapes_preserve_text_order_and_image_semantics() {
+    let cases = [
+        (Value::Null, "", 0),
+        (json!("שלום🙂"), "שלום🙂", 0),
+        (json!(17), "17", 0),
+        (json!(true), "true", 0),
+        (json!([]), "", 0),
+        (json!({"type":"text","text":"one"}), "one", 0),
+        (json!({"type":"text","text":17}), "", 0),
+        (json!({"type":"image","data":"ignored"}), "", 1),
+        (
+            json!(["a", null, 2, {"type":"input_text","text":"b"},
+            {"type":"input_image"}, {"type":"output_image"},
+            {"type":"output_text","text":"c"}, {"unknown":[1,2]}]),
+            "a\nnull\n2\nb\nc\n{\"unknown\": [1, 2]}",
+            2,
+        ),
+    ];
+    assert_eq!(extract_blocks_text_and_images(None), (String::new(), 0));
+    for (input, text, images) in cases {
+        assert_eq!(
+            extract_blocks_text_and_images(Some(&input)),
+            (text.into(), images)
+        );
+    }
+}
+
+#[test]
+fn image_body_size_does_not_enter_composition_tokens() {
+    for size in [0, 8, 1024 * 1024] {
+        let image = json!({"type":"image","source":{"data":"x".repeat(size)}});
+        for content in [image.clone(), json!([image])] {
+            assert_eq!(
+                extract_blocks_text_and_images(Some(&content)),
+                (String::new(), 1)
+            );
+        }
+    }
+}
+
+/// Offline measurement of existing discovery, cache admission and report code.
+/// Only accepts an explicitly marked synthetic fixture root, never the live service.
+/// Run in a separate process per sample to measure CPU/RSS with the OS time tool.
+#[test]
+#[ignore]
+fn measure_synthetic_workspace() {
+    let root = PathBuf::from(std::env::var("OTTTO_COMPOSITION_FIXTURE_ROOT").unwrap());
+    assert_eq!(
+        fs::read_to_string(root.join("synthetic-only")).unwrap(),
+        "collector-fixture-v1\n"
+    );
+    let source = match std::env::var("OTTTO_COMPOSITION_FIXTURE_SOURCE")
+        .unwrap()
+        .as_str()
+    {
+        "claude_code" => SnapshotSource::ClaudeCode,
+        "codex" => SnapshotSource::Codex,
+        _ => panic!("unsupported composition fixture source"),
+    };
+    let source_label = agent_source_label(source);
+    let start = Instant::now();
+    let scans = discover_workspaces(&root.join("transcripts"), SystemTime::now());
+    let discovery_us = start.elapsed().as_micros();
+    assert!(scans.len() <= 1, "fixture cache expects one workspace");
+    let mut reports = Vec::new();
+    let mut parsed_files = 0;
+    let mut skipped_files = 0;
+    let mut logical_parse_bytes = 0u64;
+    let mut cache_hits = 0;
+    for scan in &scans {
+        let signature = workspace_files_signature(&scan.files);
+        let cache_file = root.join("composition-cache.json");
+        let cached = read_cache(&cache_file);
+        let now = OffsetDateTime::now_utc();
+        if !should_rescan(cached.as_ref(), "synthetic", source_label, &signature, now) {
+            cache_hits += 1;
+            continue;
+        }
+        for (file, _) in &scan.files {
+            let bytes = fs::metadata(file).unwrap().len();
+            if bytes > MAX_TRANSCRIPT_BYTES {
+                skipped_files += 1;
+            } else {
+                parsed_files += 1;
+                logical_parse_bytes += bytes;
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let report = build_report_for_scan(scan, source, wide_window(), deadline);
+        // The stat-derived counters assume the bounded loop reached every file.
+        // Fail the sample instead of publishing those counters after a timeout.
+        assert!(
+            Instant::now() < deadline,
+            "measurement report deadline expired"
+        );
+        if let Some(mut request) =
+            build_request(&report, &scan.workspace, "synthetic", source_label, false)
+        {
+            request.captured_at = "2026-09-22T00:00:00Z".into();
+            // Normalize only ephemeral fixture-root identity for cross-run parity.
+            request.workspace_hash = "synthetic".into();
+            request.repository_hash = None;
+            request.repository_identity_source = None;
+            request.workspace_kind = Some("non_git".into());
+            reports.push(serde_json::to_value(&request).unwrap());
+            write_cache(
+                &cache_file,
+                &CompositionCacheEntry {
+                    identity: "synthetic".into(),
+                    agent_source: source_label.into(),
+                    files: signature,
+                    payload_sha256: request_content_hash(&request).unwrap(),
+                    posted_at: iso_utc(now),
+                },
+            );
+        }
+    }
+    let payload = serde_json::to_vec(&reports).unwrap();
+    let events: u64 = reports
+        .iter()
+        .flat_map(|r| r["daily_aggregates"].as_array().unwrap())
+        .map(|r| r["events"].as_u64().unwrap())
+        .sum();
+    println!(
+        "MEASUREMENT {}",
+        json!({
+            "discovery_us": discovery_us, "total_us": start.elapsed().as_micros(),
+            "workspaces": scans.len(), "parsed_files": parsed_files, "skipped_files": skipped_files,
+            "logical_parse_bytes": logical_parse_bytes, "cache_hits": cache_hits,
+            "output_events": events, "serialized_bytes": payload.len(), "payload_sha256": sha256_bytes(&payload),
+        })
+    );
+}
+
 // -------------------------------------------------------------------------
 // Session A: images. assistant ordinals [1,3,5,7]; no compaction.
 //   r1 Read /proj/app/main.py -> "ABCDEFGH"(8=2) code_reads @ord2 res{3,5,7}=3
