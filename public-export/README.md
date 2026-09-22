@@ -1,12 +1,12 @@
 # Public Export Gate
 
-This directory defines the local-platform files that are safe to export into
-the future public `ottto` repository and the checks that must pass before any
-public commit.
+This directory preserves the public-boundary inventory and validation rules for
+the live `ottto-ai/ottto` repository. The public repository is the runtime
+source of truth; ordinary changes follow the root [contributor checks](../CONTRIBUTING.md).
 
-The current private monorepo remains the temporary source until the public repo
-is reachable. This gate does not create a second runtime source of truth; it
-makes the cutover explicit and repeatable.
+The export and cutover commands below remain for boundary regression tests and
+recovery evidence. They do not make the private consumer repository an
+authoritative runtime source.
 
 ## Files
 
