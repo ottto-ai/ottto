@@ -12,7 +12,14 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long a worker waits for the client to finish sending its request.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a worker keeps a response in flight for a client that stopped
+/// reading. Clients wait at least `LOCAL_CONTROL_SOCKET_TIMEOUT` (45s) for the
+/// whole exchange, so this only reaps workers whose client is gone.
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 type RequestHandler =
     Arc<dyn Fn(LocalControlRequest, Option<LocalClientPeer>) -> LocalControlResponse + Send + Sync>;
@@ -49,12 +56,51 @@ fn serve_unix_socket_with_limit_and_handler(
     }
 
     let listener = bind_user_only_socket(path)?;
+    serve_listener(listener, path, max_requests, handler)
+}
+
+/// Accepts control connections on `listener` and serves each on its own worker.
+///
+/// No thread ever sleeps inside a socket syscall here. The listener and every
+/// accepted stream are non-blocking, and all waiting happens in `poll(2)`
+/// ([`wait_for_fd`]). On macOS this is load-bearing, not a style choice.
+///
+/// XNU marks a socket `SS_DRAINING` when a descriptor for it is closed while
+/// another thread is blocked on it. The flag never clears, and each connection
+/// accepted afterwards copies it from the listener (`sonewconn` copies
+/// `so_state`). From then on every *sleeping* socket wait fails. A blocking
+/// `accept` returns `ECONNABORTED` once per incoming connection. `sbwait`
+/// returns `EBADF`, so a read that has to wait for the request fails, and so
+/// does a write that has to wait for buffer space. That second case cuts every
+/// response larger than one unix-socket send buffer (8 KiB,
+/// `net.local.stream.sendspace`) off at exactly 8192 bytes while `write_all`
+/// reports `EBADF`. A daemon that reached this state kept failing every large
+/// `status` until it restarted.
+///
+/// Non-blocking calls never enter `sbwait`, and `poll` does not look at
+/// `SS_DRAINING`, so the same poisoned listener keeps serving complete
+/// responses in either direction.
+fn serve_listener(
+    listener: UnixListener,
+    path: &Path,
+    max_requests: Option<usize>,
+    handler: RequestHandler,
+) -> Result<()> {
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("set socket nonblocking {}", path.display()))?;
 
     let mut served = 0_usize;
     let mut workers = Vec::new();
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(stream) => stream,
+    loop {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                wait_for_fd(listener.as_raw_fd(), libc::POLLIN, None)
+                    .with_context(|| format!("wait for socket {}", path.display()))?;
+                continue;
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Err(error) => {
                 eprintln!("socket listener {} accept failed: {error}", path.display());
                 continue;
@@ -83,6 +129,15 @@ fn serve_unix_socket_with_limit_and_handler(
 }
 
 fn handle_stream(path: PathBuf, mut stream: UnixStream, handler: RequestHandler) {
+    // Whether an accepted socket inherits the listener's O_NONBLOCK differs by
+    // platform; the poll-driven I/O below requires it, so set it explicitly.
+    if let Err(error) = stream.set_nonblocking(true) {
+        eprintln!(
+            "socket listener {} set stream nonblocking failed: {error}",
+            path.display()
+        );
+        return;
+    }
     let peer = local_client_peer(&stream);
     let response = match read_request(&mut stream) {
         Ok(request) => handler(request, peer),
@@ -247,7 +302,7 @@ fn peer_pid(_stream: &UnixStream) -> Option<u32> {
 }
 
 fn read_request(stream: &mut UnixStream) -> Result<LocalControlRequest> {
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let deadline = Instant::now() + REQUEST_READ_TIMEOUT;
     let mut body = Vec::new();
     let mut chunk = [0_u8; 4096];
 
@@ -260,8 +315,13 @@ fn read_request(stream: &mut UnixStream) -> Result<LocalControlRequest> {
                     return Ok(request);
                 }
             }
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                break;
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                match wait_for_fd(stream.as_raw_fd(), libc::POLLIN, Some(deadline)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::TimedOut => break,
+                    Err(error) => return Err(error.into()),
+                }
             }
             Err(error) => return Err(error.into()),
         }
@@ -272,8 +332,65 @@ fn read_request(stream: &mut UnixStream) -> Result<LocalControlRequest> {
 
 fn write_response(stream: &mut UnixStream, response: &LocalControlResponse) -> Result<()> {
     let response = serde_json::to_vec(response)?;
-    stream.write_all(&response)?;
+    let deadline = Instant::now() + RESPONSE_WRITE_TIMEOUT;
+    let mut written = 0;
+    while written < response.len() {
+        match stream.write(&response[written..]) {
+            Ok(0) => return Err(std::io::Error::from(ErrorKind::WriteZero).into()),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                wait_for_fd(stream.as_raw_fd(), libc::POLLOUT, Some(deadline))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(())
+}
+
+/// Blocks in `poll(2)` until `fd` reports `events` (or an error/hang-up, which
+/// the caller's next read or write surfaces), or until `deadline` passes.
+///
+/// Every wait on the control socket goes through here instead of blocking
+/// inside `accept`/`read`/`write`; see [`serve_listener`] for why.
+fn wait_for_fd(
+    fd: libc::c_int,
+    events: libc::c_short,
+    deadline: Option<Instant>,
+) -> std::io::Result<()> {
+    loop {
+        let timeout_ms = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(ErrorKind::TimedOut.into());
+                }
+                // Round up so a sub-millisecond remainder still waits.
+                remaining
+                    .as_millis()
+                    .saturating_add(1)
+                    .min(libc::c_int::MAX as u128) as libc::c_int
+            }
+            None => -1,
+        };
+        let mut pollfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd on the stack, and nfds matches.
+        let rc = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if rc > 0 {
+            return Ok(());
+        }
+        if rc == 0 {
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -660,6 +777,201 @@ mod tests {
             .expect("slow request completes");
         server.join().expect("server thread should join").unwrap();
         let _ = fs::remove_file(path);
+    }
+
+    /// A unix stream socket on macOS only buffers `net.local.stream.sendspace`
+    /// bytes (8 KiB by default), so a large `status` payload can only reach the
+    /// client if the daemon keeps writing while the client drains it. Every
+    /// other socket test here uses a payload that fits in one buffer.
+    #[test]
+    #[serial]
+    fn unix_socket_round_trips_response_larger_than_socket_buffer() {
+        let path = std::env::temp_dir().join(format!(
+            "ottto-service-test-{}-{}.sock",
+            std::process::id(),
+            "large-response"
+        ));
+        let _ = fs::remove_file(&path);
+        let filler = "x".repeat(256 * 1024);
+        let expected = filler.clone();
+        let handler: RequestHandler = Arc::new(move |request, _peer| LocalControlResponse {
+            request_id: request.request_id,
+            ok: true,
+            payload: Some(serde_json::json!({"daemon": "running", "filler": filler})),
+            error: None,
+        });
+
+        let server_path = path.clone();
+        let server = thread::spawn(move || {
+            serve_unix_socket_with_limit_and_handler(&server_path, Some(1), handler)
+        });
+
+        wait_for_socket(&path);
+        let response = request_unix_socket(
+            &path,
+            &LocalControlRequest {
+                request_id: "req_large".to_string(),
+                protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Status {
+                    refresh_agent_status: false,
+                },
+            },
+        )
+        .expect("large socket response should round-trip");
+
+        assert_eq!(response.request_id, "req_large");
+        let payload = response.payload.expect("payload");
+        assert_eq!(
+            payload.get("filler").and_then(serde_json::Value::as_str),
+            Some(expected.as_str())
+        );
+        server.join().expect("server thread should join").unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// Reproduces the listener state a long-running macOS daemon was found in:
+    /// closing a descriptor for the listener while another thread is blocked in
+    /// `accept` on it leaves the socket permanently `SS_DRAINING`, and every
+    /// connection accepted afterwards inherits that. A blocking server then
+    /// cannot wait for a late request (`EBADF`) and cuts responses off at one
+    /// socket buffer, exactly 8192 bytes. Serving must stay complete in both
+    /// directions on such a listener.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial]
+    fn unix_socket_serves_complete_responses_on_a_drained_listener() {
+        let path = std::env::temp_dir().join(format!(
+            "ottto-service-test-{}-{}.sock",
+            std::process::id(),
+            "drained"
+        ));
+        let _ = fs::remove_file(&path);
+        let listener = bind_user_only_socket(&path).expect("bind listener");
+        drain_listener(&listener);
+
+        let filler = "y".repeat(256 * 1024);
+        let expected = filler.clone();
+        let handler: RequestHandler = Arc::new(move |request, _peer| LocalControlResponse {
+            request_id: request.request_id,
+            ok: true,
+            payload: Some(serde_json::json!({"daemon": "running", "filler": filler})),
+            error: None,
+        });
+        let server_path = path.clone();
+        let server =
+            thread::spawn(move || serve_listener(listener, &server_path, Some(2), handler));
+
+        // The CLI's own client sends its request immediately, so the worker's
+        // read finds it buffered and only the response write has to wait. This
+        // is the reported `ottto status --json` failure: "EOF while parsing a
+        // string at line 1 column 8192".
+        let response = request_unix_socket(
+            &path,
+            &LocalControlRequest {
+                request_id: "req_drained_immediate".to_string(),
+                protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Status {
+                    refresh_agent_status: false,
+                },
+            },
+        )
+        .expect("large response round-trips on a drained listener");
+        assert!(
+            response.ok,
+            "drained listener failed the request: {:?}",
+            response.error
+        );
+        assert_eq!(
+            response
+                .payload
+                .expect("payload")
+                .get("filler")
+                .and_then(serde_json::Value::as_str),
+            Some(expected.as_str())
+        );
+
+        let request = LocalControlRequest {
+            request_id: "req_drained".to_string(),
+            protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
+            token: Some("token".to_string()),
+            client_kind: Some(LocalClientKind::Cli),
+            client_install_owner: None,
+            command: LocalControlCommand::Status {
+                refresh_agent_status: false,
+            },
+        };
+        let mut stream = UnixStream::connect(&path).expect("connect socket");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        // Let the worker reach its read before the request exists, so it has to
+        // wait for it rather than finding it already buffered.
+        thread::sleep(Duration::from_millis(200));
+        stream
+            .write_all(&serde_json::to_vec(&request).expect("serialize request"))
+            .expect("write request");
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown write");
+
+        let mut body = Vec::new();
+        stream.read_to_end(&mut body).expect("read response");
+        let response: LocalControlResponse =
+            serde_json::from_slice(&body).unwrap_or_else(|error| {
+                panic!(
+                    "response of {} bytes did not parse on a drained listener: {error}",
+                    body.len()
+                )
+            });
+        assert_eq!(response.request_id, "req_drained");
+        assert_eq!(
+            response
+                .payload
+                .expect("payload")
+                .get("filler")
+                .and_then(serde_json::Value::as_str),
+            Some(expected.as_str())
+        );
+        server.join().expect("server thread should join").unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    /// Puts `listener` into XNU's `SS_DRAINING` state: block a thread in
+    /// `accept` on a duplicate descriptor, then close that duplicate. The close
+    /// drains the shared socket, waking the blocked `accept` with
+    /// `ECONNABORTED`, and the original descriptor stays open but poisoned.
+    #[cfg(target_os = "macos")]
+    fn drain_listener(listener: &UnixListener) {
+        // SAFETY: dup of a descriptor we own; the copy is closed below.
+        let duplicate = unsafe { libc::dup(listener.as_raw_fd()) };
+        assert!(duplicate >= 0, "dup listener");
+        let (done_tx, done_rx) = mpsc::channel();
+        let blocked = thread::spawn(move || {
+            // SAFETY: accept on an open listening descriptor; the peer address
+            // is not requested.
+            let rc = unsafe { libc::accept(duplicate, std::ptr::null_mut(), std::ptr::null_mut()) };
+            let error = std::io::Error::last_os_error();
+            let _ = done_tx.send((rc, error.raw_os_error()));
+        });
+        thread::sleep(Duration::from_millis(200));
+        // SAFETY: closes only the duplicate, while the thread above is blocked
+        // in accept on it.
+        unsafe { libc::close(duplicate) };
+        let (rc, errno) = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("closing the descriptor wakes the blocked accept");
+        blocked.join().expect("blocked accept thread joins");
+        assert_eq!(
+            (rc, errno),
+            (-1, Some(libc::ECONNABORTED)),
+            "the listener must now be draining for this test to mean anything"
+        );
     }
 
     fn wait_for_socket(path: &Path) {
