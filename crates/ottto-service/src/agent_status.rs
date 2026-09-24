@@ -460,28 +460,93 @@ fn claude_provider_meter_fingerprint(candidate: &ClaudeSnapshotCandidate) -> Opt
     if candidate.quality.tier != 4 {
         return None;
     }
-    let mut windows = candidate.snapshot.quota_windows.clone();
+    claude_provider_meter_payload_fingerprint(
+        &candidate.snapshot.quota_windows,
+        &candidate.snapshot.credit_balances,
+    )
+}
+
+fn claude_provider_meter_payload_fingerprint(
+    quota_windows: &[AgentQuotaWindow],
+    credit_balances: &[AgentCreditBalance],
+) -> Option<String> {
+    if quota_windows.is_empty() && credit_balances.is_empty() {
+        return None;
+    }
+    let mut windows = quota_windows.to_vec();
     let mut window_rows = Vec::with_capacity(windows.len());
     for window in &mut windows {
         window.account_label = None;
         window.account_identifier_hash = None;
         window.organization_identifier_hash = None;
         window.observed_at = None;
+        window.freshness = AgentQuotaWindowFreshness::Fresh;
         window_rows.push(serde_json::to_string(window).ok()?);
     }
     window_rows.sort();
 
-    let mut balances = candidate.snapshot.credit_balances.clone();
+    let mut balances = credit_balances.to_vec();
     let mut balance_rows = Vec::with_capacity(balances.len());
     for balance in &mut balances {
         balance.account_label = None;
         balance.account_identifier_hash = None;
         balance.organization_identifier_hash = None;
         balance.updated_at = None;
+        balance.freshness = AgentQuotaWindowFreshness::Fresh;
         balance_rows.push(serde_json::to_string(balance).ok()?);
     }
     balance_rows.sort();
     serde_json::to_string(&(window_rows, balance_rows)).ok()
+}
+
+/// A retained stale meter bundle can outlive the collection cycle that first
+/// paired it with the wrong account. Compare it with current complete provider
+/// readings and fail closed when the exact same identity-free payload now
+/// belongs to another strong account+organization binding.
+fn claude_stale_cross_binding_meter_collisions(
+    candidates: &[ClaudeSnapshotCandidate],
+    slot_states: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+) -> BTreeSet<String> {
+    let current = candidates
+        .iter()
+        .filter_map(|candidate| {
+            claude_provider_meter_fingerprint(candidate)
+                .map(|fingerprint| (fingerprint, &candidate.binding))
+        })
+        .collect::<Vec<_>>();
+    let mut quarantined = BTreeSet::new();
+    for (slot_id, status) in slot_states {
+        let Some(snapshot) = status
+            .quota_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.state == ClaudeConfigSlotQuotaSnapshotStateV1::Stale)
+        else {
+            continue;
+        };
+        let Some(binding) = status
+            .account_identifier_hash
+            .as_deref()
+            .zip(status.organization_identifier_hash.as_deref())
+            .and_then(|(account, organization)| ClaudeStrongBinding::new(account, organization))
+        else {
+            continue;
+        };
+        let Some(fingerprint) = claude_provider_meter_payload_fingerprint(
+            &snapshot.quota_windows,
+            &snapshot.credit_balances,
+        ) else {
+            continue;
+        };
+        if current
+            .iter()
+            .any(|(current_fingerprint, current_binding)| {
+                current_fingerprint.as_str() == fingerprint.as_str() && *current_binding != &binding
+            })
+        {
+            quarantined.insert(slot_id.clone());
+        }
+    }
+    quarantined
 }
 
 fn quarantine_claude_cross_account_meters(status: &mut ClaudeConfigSlotCollectionStatusV1) {
@@ -2727,7 +2792,7 @@ fn collect_claude_status_snapshots(
             }
         }
     }
-    let quarantined_slots = claude_cross_binding_meter_collisions(&candidates);
+    let mut quarantined_slots = claude_cross_binding_meter_collisions(&candidates);
     for slot_id in &quarantined_slots {
         if let Some(status) = slot_states.get_mut(slot_id) {
             quarantine_claude_cross_account_meters(status);
@@ -2737,6 +2802,18 @@ fn collect_claude_status_snapshots(
             default_snapshot.credit_balances.clear();
         }
     }
+    candidates.retain(|candidate| !quarantined_slots.contains(&candidate.slot_id));
+    let stale_collisions = claude_stale_cross_binding_meter_collisions(&candidates, &slot_states);
+    for slot_id in &stale_collisions {
+        if let Some(status) = slot_states.get_mut(slot_id) {
+            quarantine_claude_cross_account_meters(status);
+        }
+        if slot_id == "default" {
+            default_snapshot.quota_windows.clear();
+            default_snapshot.credit_balances.clear();
+        }
+    }
+    quarantined_slots.extend(stale_collisions);
     candidates.retain(|candidate| !quarantined_slots.contains(&candidate.slot_id));
     if let Some(status) = slot_states.get("default") {
         default_state = status.clone();
@@ -19322,6 +19399,49 @@ exit 1
         assert!(
             claude_cross_binding_meter_collisions(&[distinct_default, distinct_registered])
                 .is_empty()
+        );
+
+        let current = candidate(
+            "claude_slot_gmail",
+            ClaudeSnapshotSlotClass::Registered,
+            "gmail-account",
+            "gmail-org",
+            96,
+        );
+        let stale_copy = stale_local_claude_quota_snapshot(&local_claude_quota_snapshot(
+            &current.snapshot.captured_at,
+            &current.snapshot.quota_windows,
+            &current.snapshot.credit_balances,
+            true,
+            true,
+        ));
+        let stale_states = BTreeMap::from([(
+            "default".to_string(),
+            ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
+                account_identifier_hash: Some("singular-account".to_string()),
+                organization_identifier_hash: Some("singular-org".to_string()),
+                quota_snapshot: Some(stale_copy),
+                ..Default::default()
+            },
+        )]);
+        assert_eq!(
+            claude_stale_cross_binding_meter_collisions(&[current], &stale_states),
+            BTreeSet::from(["default".to_string()]),
+            "a retained copy must not survive under another account"
+        );
+
+        let different_current = candidate(
+            "claude_slot_gmail",
+            ClaudeSnapshotSlotClass::Registered,
+            "gmail-account",
+            "gmail-org",
+            12,
+        );
+        assert!(
+            claude_stale_cross_binding_meter_collisions(&[different_current], &stale_states)
+                .is_empty(),
+            "different retained values remain valid account history"
         );
 
         let mut state = ClaudeConfigSlotCollectionStatusV1 {
