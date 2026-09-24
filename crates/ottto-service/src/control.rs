@@ -13665,7 +13665,12 @@ fn run_one_pi_route_verification(
         return pi_route_result_from_smoke(route, &smoke, Some(smoke_after));
     }
     if let Err(error) = import_new_pi_route_sessions(api_base_url, route, &before_session_census) {
-        eprintln!("Pi route smoke session import failed: {error}");
+        // Workspace data sharing can be intentionally disabled. It is useful
+        // source status, but not a service error and should not pollute the
+        // daemon's error log.
+        if !is_telemetry_disabled_by_admin_error(&error) {
+            eprintln!("Pi route smoke session import failed: {error}");
+        }
         return pi_route_result_from_backend_error(route, &smoke, Some(smoke_after), &error);
     }
 
@@ -14454,9 +14459,7 @@ fn verification_result_for_backend_error_with_config(
         );
     }
     if let LocalApiError::Backend(details) = error {
-        if details.status == Some(403)
-            && backend_error_has_detail_code(details, "telemetry_disabled_by_admin")
-        {
+        if is_telemetry_disabled_by_admin_error(error) {
             return verification_result_with_config(
                 source.clone(),
                 config,
@@ -14532,6 +14535,15 @@ fn verification_result_for_backend_error_with_config(
         smoke_after,
         "verification_service_unavailable",
         "Could not reach Ottto verification. Check your network and retry.",
+    )
+}
+
+fn is_telemetry_disabled_by_admin_error(error: &LocalApiError) -> bool {
+    matches!(
+        error,
+        LocalApiError::Backend(details)
+            if details.status == Some(403)
+                && backend_error_has_detail_code(details, "telemetry_disabled_by_admin")
     )
 }
 
@@ -15733,6 +15745,7 @@ mod tests {
             status: Some(403),
             body_excerpt: Some(r#"{"detail":"telemetry_disabled_by_admin"}"#.to_string()),
         });
+        assert!(is_telemetry_disabled_by_admin_error(&error));
         let smoke = SmokeResult {
             command_found: true,
             succeeded: true,
