@@ -1077,6 +1077,13 @@ pub struct SnapshotStatusRequest {
     /// absence is liveness-only/unknown. Never fabricated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<SnapshotSourceManifest>,
+    /// Local control-plane health (public ottto#440), carried only by
+    /// check-ins; every other body leaves it `None`, which omits the key, so
+    /// their wire shape is unchanged. Additive: the backend's status model is
+    /// forward-tolerant, and `default` keeps journals written before the field
+    /// reloading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_plane: Option<crate::control_plane_health::ControlPlaneHealth>,
 }
 
 impl SnapshotStatusRequest {
@@ -1152,6 +1159,9 @@ impl SnapshotStatusRequest {
             // new, and a beat that says "alive" while the entity sets disagree
             // is exactly what the manifest exists to expose.
             manifest: _,
+            // Daemon process health, not scan evidence: a beat is exactly the
+            // cadence it is meant to travel on (public ottto#440).
+            control_plane: _,
         } = self;
         // A collector reporting itself disabled is making a durable state
         // report, which is the opposite of a liveness beat. The backend
@@ -2986,6 +2996,7 @@ mod tests {
             collector_version: Some("0.1.123".to_string()),
             parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
             manifest: None,
+            control_plane: None,
         }
     }
 
@@ -3287,6 +3298,7 @@ mod tests {
                 entity_count: 3,
                 rolling_hash: "b".repeat(64),
             }),
+            control_plane: None,
         };
         let serialized = serde_json::to_string(&status).expect("serialize");
         assert!(!serialized.contains(".codex"));
@@ -3360,6 +3372,7 @@ mod tests {
                 entity_count: 1,
                 rolling_hash: "b".repeat(64),
             }),
+            control_plane: None,
         }
     }
 

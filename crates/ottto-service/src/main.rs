@@ -265,6 +265,11 @@ fn main() -> Result<()> {
         Command::Serve { socket, once } => {
             #[cfg(unix)]
             {
+                // Before the relays start, so the first check-in already
+                // reports the transport.
+                ottto_service::control_plane_health::mark_serving(
+                    ottto_service::control_plane_health::ControlTransport::UnixSocket,
+                );
                 cleanup_legacy_services_at_startup();
                 if ottto_service::control::recover_pending_device_credential_at_startup().is_err() {
                     eprintln!("pending relay credential recovery deferred");
@@ -299,6 +304,14 @@ fn main() -> Result<()> {
             mach_service,
             socket,
         } => {
+            // Before the relays start, so the first check-in already reports
+            // the transport. Off macOS there is no XPC and only the socket
+            // serves.
+            ottto_service::control_plane_health::mark_serving(if cfg!(target_os = "macos") {
+                ottto_service::control_plane_health::ControlTransport::Xpc
+            } else {
+                ottto_service::control_plane_health::ControlTransport::UnixSocket
+            });
             cleanup_legacy_services_at_startup();
             if ottto_service::control::recover_pending_device_credential_at_startup().is_err() {
                 eprintln!("pending relay credential recovery deferred");

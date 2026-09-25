@@ -4096,6 +4096,8 @@ fn collector_status_request(
         collector_version: Some(collector_version()),
         parser_version: Some(status.source.parser_version().to_string()),
         manifest,
+        // A scan result, not a check-in: the field stays off this wire shape.
+        control_plane: None,
     };
     Ok(request)
 }
@@ -4411,6 +4413,11 @@ fn report_checkin_status(
         // "alive" while the entity sets disagree is exactly the state the
         // manifest exists to expose.
         manifest,
+        // Local control-plane health rides every check-in (public ottto#440):
+        // the beat proves uploads are alive, this says whether the socket/XPC
+        // plane Setup, Repair, Verify and the Companion use is too. `None`
+        // outside a serving daemon process.
+        control_plane: crate::control_plane_health::snapshot(),
     };
     client.report_status(relay_token, &request)?;
     Ok(())
@@ -8997,6 +9004,76 @@ mod tests {
         assert_eq!(marker["report_kind"], "checkin");
         assert_eq!(marker["last_scan_started_at"], "2026-06-01T10:00:00Z");
         assert!(marker["last_scan_finished_at"].is_null());
+    }
+
+    /// Public ottto#440: a serving daemon's check-in reports its local control
+    /// plane beside upload liveness.
+    #[test]
+    #[serial(source_manifests)]
+    fn a_serving_daemons_checkin_carries_control_plane_health() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        crate::control_plane_health::mark_serving(
+            crate::control_plane_health::ControlTransport::UnixSocket,
+        );
+
+        let beat = captured_checkin_receipt(None);
+
+        assert_eq!(beat["report_kind"], "checkin");
+        let control_plane = beat["control_plane"]
+            .as_object()
+            .expect("check-in carries a control_plane object");
+        assert_eq!(control_plane["transport"], "unix_socket");
+        assert!(control_plane["listener_bound"].is_boolean());
+        assert!(
+            control_plane["listener_draining"].is_boolean()
+                || control_plane["listener_draining"].is_null()
+        );
+        assert!(control_plane["requests_served"].is_u64());
+        assert!(control_plane["request_errors"].is_u64());
+        assert!(control_plane["started_at"].is_string());
+        assert!(control_plane.contains_key("last_request_served_at"));
+        // Never a socket path: it would carry the user's home directory.
+        let mut members: Vec<&str> = control_plane.keys().map(String::as_str).collect();
+        members.sort_unstable();
+        assert_eq!(
+            members,
+            [
+                "last_request_served_at",
+                "listener_bound",
+                "listener_draining",
+                "request_errors",
+                "requests_served",
+                "started_at",
+                "transport",
+            ]
+        );
+        // The check-in's other members are untouched, and so is its declared
+        // schema version: the field is additive.
+        assert_eq!(beat["schema_version"], SNAPSHOT_STATUS_SCHEMA_VERSION);
+    }
+
+    /// Only check-ins carry control-plane health. A scan result keeps the
+    /// exact wire shape it had before the field existed, even from a serving
+    /// daemon.
+    #[test]
+    #[serial(source_manifests)]
+    fn terminal_receipts_never_carry_control_plane_health() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        crate::control_plane_health::mark_serving(
+            crate::control_plane_health::ControlTransport::UnixSocket,
+        );
+        let mut counts = SyncCounts::for_policy(30);
+        counts.census_complete = true;
+
+        let terminal = captured_terminal_receipt(
+            counts,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            30,
+        );
+
+        assert_eq!(terminal["report_kind"], "scan_status");
+        assert!(terminal.get("control_plane").is_none(), "{terminal}");
     }
 
     /// A liveness beat may only repeat evidence the backend has already
