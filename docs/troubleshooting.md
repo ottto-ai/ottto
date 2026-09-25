@@ -83,10 +83,12 @@ The Companion app authenticates to `ottto-service` by its code signature, not by
 a token. If a request comes back `local_client_not_trusted` — the app opens but
 shows nothing and never connects — the daemon refused it.
 
-Check the daemon error log; it records the reason once per run:
+Check the daemon error log; it records the reason once per run. A Homebrew
+install logs to `ottto-service.error.log`; a LaunchAgent written by the app or
+`macos_dev_install.sh` logs to `ottto-service.err.log`. The glob covers both:
 
 ```bash
-grep 'refused token-less Companion trust' ~/Library/Logs/Ottto/ottto-service.err.log
+grep 'refused token-less Companion trust' ~/Library/Logs/Ottto/ottto-service.err*.log
 ```
 
 The rule is that a Developer ID signed `ottto-service` requires a Developer ID
