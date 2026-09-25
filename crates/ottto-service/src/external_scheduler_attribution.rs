@@ -794,28 +794,84 @@ fn live_launchd_labels(
         if candidate_labels.is_empty() {
             return BTreeSet::new();
         }
-        let modified = fs::metadata(session.transcript_path)
-            .and_then(|metadata| metadata.modified())
-            .ok();
-        if !transcript_may_have_live_owner(modified, SystemTime::now()) {
+        let Ok(metadata) = fs::metadata(session.transcript_path) else {
+            return BTreeSet::new();
+        };
+        let modified = metadata.modified().ok();
+        let now = SystemTime::now();
+        if !transcript_may_have_live_owner(modified, now) {
             return BTreeSet::new();
         }
-        let owner_pids = transcript_owner_pids(session.transcript_path);
-        if owner_pids.is_empty() {
-            return BTreeSet::new();
+        let version = (metadata.len(), modified);
+        {
+            let mut checks = live_owner_checks()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            checks.retain(|_, check| transcript_may_have_live_owner(check.version.1, now));
+            if let Some(check) = checks.get(session.transcript_path) {
+                if check.version == version {
+                    return check.labels.clone();
+                }
+            }
         }
-        let parent_map = process_parent_map();
-        let ancestors = owner_pids
-            .into_iter()
-            .flat_map(|pid| process_ancestors(pid, &parent_map))
-            .collect::<BTreeSet<_>>();
-        candidate_labels
-            .into_iter()
-            .filter_map(|label| launchd_job_pid(label).map(|pid| (label, pid)))
-            .filter(|(_, pid)| ancestors.contains(pid))
-            .map(|(label, _)| label.to_string())
-            .collect()
+        // The lock is released while the commands run so a slow `lsof` never
+        // stalls another scan thread.
+        let labels = live_launchd_labels_uncached(candidate_labels, session.transcript_path);
+        let mut checks = live_owner_checks()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if checks.len() < MAX_LIVE_OWNER_CHECKS {
+            checks.insert(
+                session.transcript_path.to_path_buf(),
+                LiveOwnerCheck {
+                    version,
+                    labels: labels.clone(),
+                },
+            );
+        }
+        labels
     }
+}
+
+/// The last live-owner answer for each recently written transcript, keyed by
+/// the file version it was computed for. A scan that finds the same size and
+/// modification time reuses it instead of running `lsof`, `ps`, and `launchctl`
+/// again: nothing was written, so no new owner can have appeared.
+#[cfg(target_os = "macos")]
+struct LiveOwnerCheck {
+    version: (u64, Option<SystemTime>),
+    labels: BTreeSet<String>,
+}
+
+#[cfg(target_os = "macos")]
+const MAX_LIVE_OWNER_CHECKS: usize = 1024;
+
+#[cfg(target_os = "macos")]
+fn live_owner_checks() -> &'static Mutex<BTreeMap<PathBuf, LiveOwnerCheck>> {
+    static CHECKS: OnceLock<Mutex<BTreeMap<PathBuf, LiveOwnerCheck>>> = OnceLock::new();
+    CHECKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(target_os = "macos")]
+fn live_launchd_labels_uncached(
+    candidate_labels: Vec<&str>,
+    transcript_path: &Path,
+) -> BTreeSet<String> {
+    let owner_pids = transcript_owner_pids(transcript_path);
+    if owner_pids.is_empty() {
+        return BTreeSet::new();
+    }
+    let parent_map = process_parent_map();
+    let ancestors = owner_pids
+        .into_iter()
+        .flat_map(|pid| process_ancestors(pid, &parent_map))
+        .collect::<BTreeSet<_>>();
+    candidate_labels
+        .into_iter()
+        .filter_map(|label| launchd_job_pid(label).map(|pid| (label, pid)))
+        .filter(|(_, pid)| ancestors.contains(pid))
+        .map(|(label, _)| label.to_string())
+        .collect()
 }
 
 /// Providers append to a transcript and close it, so only a transcript written
