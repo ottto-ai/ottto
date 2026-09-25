@@ -14,6 +14,7 @@ pub mod context_composition;
 pub mod context_footprint;
 pub mod context_posture;
 pub mod control;
+pub mod control_plane_health;
 pub mod detected_uses;
 mod external_scheduler_attribution;
 pub mod keychain;

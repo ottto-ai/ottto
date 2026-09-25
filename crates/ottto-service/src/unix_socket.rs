@@ -1,4 +1,5 @@
 use crate::control::{handle_request_with_peer, LocalClientPeer};
+use crate::control_plane_health::{self, PublishedListener};
 use crate::LocalDaemon;
 use anyhow::{Context, Result};
 use ottto_protocol::{CliError, CliErrorCode, LocalControlRequest, LocalControlResponse};
@@ -89,6 +90,11 @@ fn serve_listener(
     listener
         .set_nonblocking(true)
         .with_context(|| format!("set socket nonblocking {}", path.display()))?;
+    // Lets the check-in report whether this listener is draining. `listener`
+    // is a parameter, so this local drops (and unpublishes the descriptor)
+    // before it on every return path, before the descriptor can be closed and
+    // reused.
+    let published = PublishedListener::publish(listener.as_raw_fd());
 
     let mut served = 0_usize;
     let mut workers = Vec::new();
@@ -125,6 +131,7 @@ fn serve_listener(
             eprintln!("socket listener {} worker panicked", path.display());
         }
     }
+    drop(published);
     Ok(())
 }
 
@@ -136,18 +143,24 @@ fn handle_stream(path: PathBuf, mut stream: UnixStream, handler: RequestHandler)
             "socket listener {} set stream nonblocking failed: {error}",
             path.display()
         );
+        control_plane_health::record_request_error();
         return;
     }
     let peer = local_client_peer(&stream);
-    let response = match read_request(&mut stream) {
-        Ok(request) => handler(request, peer),
-        Err(error) => invalid_request_response(&error.to_string()),
+    let (response, read_failed) = match read_request(&mut stream) {
+        Ok(request) => (handler(request, peer), false),
+        Err(error) => (invalid_request_response(&error.to_string()), true),
     };
-    if let Err(error) = write_response(&mut stream, &response) {
-        eprintln!(
-            "socket listener {} response write failed: {error}",
-            path.display()
-        );
+    match write_response(&mut stream, &response) {
+        Ok(()) if !read_failed => control_plane_health::record_request_served(),
+        Ok(()) => control_plane_health::record_request_error(),
+        Err(error) => {
+            eprintln!(
+                "socket listener {} response write failed: {error}",
+                path.display()
+            );
+            control_plane_health::record_request_error();
+        }
     }
 }
 
@@ -850,7 +863,17 @@ mod tests {
         ));
         let _ = fs::remove_file(&path);
         let listener = bind_user_only_socket(&path).expect("bind listener");
+        assert_eq!(
+            control_plane_health::listener_draining(listener.as_raw_fd()),
+            Some(false),
+            "a freshly bound listener must probe as not draining"
+        );
         drain_listener(&listener);
+        assert_eq!(
+            control_plane_health::listener_draining(listener.as_raw_fd()),
+            Some(true),
+            "the drain probe must see SOI_S_DRAINING after drain_listener"
+        );
 
         let filler = "y".repeat(256 * 1024);
         let expected = filler.clone();
@@ -882,6 +905,12 @@ mod tests {
             },
         )
         .expect("large response round-trips on a drained listener");
+        // The serving listener is published for the check-in, and the
+        // check-in sees it as the drained listener it is.
+        assert_eq!(
+            control_plane_health::published_listener_draining(),
+            Some(true)
+        );
         assert!(
             response.ok,
             "drained listener failed the request: {:?}",
@@ -939,6 +968,70 @@ mod tests {
             Some(expected.as_str())
         );
         server.join().expect("server thread should join").unwrap();
+        // The listener is gone, so its descriptor is no longer published.
+        assert_eq!(control_plane_health::published_listener_draining(), None);
+        let _ = fs::remove_file(path);
+    }
+
+    /// Serving counts answered requests for the check-in, and a request that
+    /// could not be read counts as an error.
+    #[test]
+    #[serial]
+    fn unix_socket_counts_served_requests_and_read_failures() {
+        let path = std::env::temp_dir().join(format!(
+            "ottto-service-test-{}-{}.sock",
+            std::process::id(),
+            "health-counters"
+        ));
+        let _ = fs::remove_file(&path);
+        let handler: RequestHandler = Arc::new(move |request, _peer| LocalControlResponse {
+            request_id: request.request_id,
+            ok: true,
+            payload: Some(serde_json::json!({"daemon": "running"})),
+            error: None,
+        });
+        let server_path = path.clone();
+        let server = thread::spawn(move || {
+            serve_unix_socket_with_limit_and_handler(&server_path, Some(2), handler)
+        });
+        wait_for_socket(&path);
+        control_plane_health::mark_serving(control_plane_health::ControlTransport::UnixSocket);
+        let before = control_plane_health::snapshot().expect("serving health");
+
+        let response = request_unix_socket(
+            &path,
+            &LocalControlRequest {
+                request_id: "req_health_counters".to_string(),
+                protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Status {
+                    refresh_agent_status: false,
+                },
+            },
+        )
+        .expect("socket request should succeed");
+        assert!(response.ok);
+        {
+            let mut stream = UnixStream::connect(&path).expect("connect socket");
+            stream
+                .write_all(b"not json")
+                .expect("write malformed request");
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .expect("shutdown write");
+            let mut body = Vec::new();
+            stream
+                .read_to_end(&mut body)
+                .expect("read invalid-request reply");
+        }
+        server.join().expect("server thread should join").unwrap();
+
+        let after = control_plane_health::snapshot().expect("serving health");
+        assert!(after.requests_served > before.requests_served);
+        assert!(after.request_errors > before.request_errors);
+        assert!(after.last_request_served_at.is_some());
         let _ = fs::remove_file(path);
     }
 

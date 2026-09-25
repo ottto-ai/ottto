@@ -54,6 +54,7 @@ extern "C" fn handle_xpc_request(
     context: *mut c_void,
 ) -> *mut c_char {
     if request_json.is_null() || context.is_null() {
+        crate::control_plane_health::record_request_error();
         return null_response();
     }
 
@@ -95,11 +96,18 @@ where
 
     match worker {
         Ok(handle) => match handle.join() {
-            Ok(response) => response,
-            Err(_) => internal_error_response(),
+            Ok(response) => {
+                crate::control_plane_health::record_request_served();
+                response
+            }
+            Err(_) => {
+                crate::control_plane_health::record_request_error();
+                internal_error_response()
+            }
         },
         Err(error) => {
             eprintln!("failed to spawn XPC control worker: {error}");
+            crate::control_plane_health::record_request_error();
             internal_error_response()
         }
     }
