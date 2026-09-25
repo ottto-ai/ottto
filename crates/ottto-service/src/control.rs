@@ -1090,7 +1090,7 @@ fn handle_command(
         }
         LocalControlCommand::CodexAccountsStatus => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(load_codex_account_settings()?)
+            to_value(load_codex_account_settings_for_status_read()?)
         }
         LocalControlCommand::CodexAccountPrepare {
             schema_version,
@@ -2341,6 +2341,61 @@ fn load_codex_account_settings() -> Result<ottto_protocol::CodexAccountsStatusV1
         .load()
         .map_err(codex_account_slot_settings_error)
         .map(crate::agent_status::annotate_codex_accounts_status)
+}
+
+/// How long a status read may reuse the last annotated Codex accounts status.
+/// Annotation starts one `codex app-server` per connected Codex home, and each
+/// of those asks the provider for rate limits. The companion polls this read
+/// every few seconds while an accounts surface is visible, so without reuse a
+/// Mac with four homes ran four app-servers several times a minute.
+const CODEX_ACCOUNTS_STATUS_READ_REUSE: Duration = Duration::from_secs(30);
+
+struct CachedCodexAccountsStatus {
+    settings: ottto_protocol::CodexAccountsStatusV1,
+    annotated: ottto_protocol::CodexAccountsStatusV1,
+    annotated_at: Instant,
+}
+
+/// The polled read. Reuses a recent annotation while the stored settings are
+/// unchanged; any settings change (connect, remove, prepare) misses the cache.
+/// Holding the lock across annotation also collapses concurrent polls into one
+/// set of app-server runs.
+fn load_codex_account_settings_for_status_read(
+) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    static CACHE: Mutex<Option<CachedCodexAccountsStatus>> = Mutex::new(None);
+    let settings = FileCodexAccountSlotSettingsStore::default()
+        .load()
+        .map_err(codex_account_slot_settings_error)?;
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = cache.as_ref() {
+        if status_read_reusable(
+            &cached.settings,
+            cached.annotated_at,
+            &settings,
+            Instant::now(),
+        ) {
+            return Ok(cached.annotated.clone());
+        }
+    }
+    let annotated = crate::agent_status::annotate_codex_accounts_status(settings.clone());
+    *cache = Some(CachedCodexAccountsStatus {
+        settings,
+        annotated: annotated.clone(),
+        annotated_at: Instant::now(),
+    });
+    Ok(annotated)
+}
+
+fn status_read_reusable<T: PartialEq>(
+    cached_settings: &T,
+    annotated_at: Instant,
+    settings: &T,
+    now: Instant,
+) -> bool {
+    cached_settings == settings
+        && now.saturating_duration_since(annotated_at) < CODEX_ACCOUNTS_STATUS_READ_REUSE
 }
 
 fn prepare_codex_account(
@@ -15198,6 +15253,31 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codex_status_read_reuses_only_fresh_annotation_of_unchanged_settings() {
+        let annotated_at = std::time::Instant::now();
+        let within = annotated_at + std::time::Duration::from_secs(29);
+        let expired = annotated_at + super::CODEX_ACCOUNTS_STATUS_READ_REUSE;
+        assert!(super::status_read_reusable(
+            &"slots-a",
+            annotated_at,
+            &"slots-a",
+            within
+        ));
+        assert!(!super::status_read_reusable(
+            &"slots-a",
+            annotated_at,
+            &"slots-b",
+            within
+        ));
+        assert!(!super::status_read_reusable(
+            &"slots-a",
+            annotated_at,
+            &"slots-a",
+            expired
+        ));
+    }
+
     #[test]
     fn codex_prepare_target_resolves_only_daemon_authored_exact_composite() {
         let account_hash = "a".repeat(64);

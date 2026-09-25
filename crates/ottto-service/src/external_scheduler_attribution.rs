@@ -19,7 +19,7 @@ use std::process::Command;
 #[cfg(target_os = "macos")]
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
 
 const INVENTORY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -39,6 +39,8 @@ const MAX_ANCESTOR_DEPTH: usize = 8;
 const MAX_PROCESS_TABLE_BYTES: usize = 1024 * 1024;
 #[cfg(target_os = "macos")]
 const LOCAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const LIVE_OWNER_WRITE_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Default)]
 pub(crate) struct ExternalSchedulerInventory {
@@ -792,6 +794,12 @@ fn live_launchd_labels(
         if candidate_labels.is_empty() {
             return BTreeSet::new();
         }
+        let modified = fs::metadata(session.transcript_path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        if !transcript_may_have_live_owner(modified, SystemTime::now()) {
+            return BTreeSet::new();
+        }
         let owner_pids = transcript_owner_pids(session.transcript_path);
         if owner_pids.is_empty() {
             return BTreeSet::new();
@@ -807,6 +815,22 @@ fn live_launchd_labels(
             .filter(|(_, pid)| ancestors.contains(pid))
             .map(|(label, _)| label.to_string())
             .collect()
+    }
+}
+
+/// Providers append to a transcript and close it, so only a transcript written
+/// moments ago can still be open in a scheduled job's process tree. Every scan
+/// reparses every transcript, and `lsof` costs about a third of a CPU second,
+/// so checking untouched history made each scan spend a minute of CPU on a Mac
+/// with a few hundred scheduled sessions.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn transcript_may_have_live_owner(modified: Option<SystemTime>, now: SystemTime) -> bool {
+    match modified {
+        Some(modified) => now
+            .duration_since(modified)
+            .map(|idle| idle <= LIVE_OWNER_WRITE_WINDOW)
+            .unwrap_or(true),
+        None => false,
     }
 }
 
@@ -1035,6 +1059,29 @@ mod tests {
         assert!(inventory
             .correlate_with_live_labels(session, &BTreeSet::new())
             .is_none());
+    }
+
+    #[test]
+    fn only_recently_written_transcripts_are_checked_for_a_live_owner() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(transcript_may_have_live_owner(
+            Some(now - Duration::from_secs(30)),
+            now
+        ));
+        assert!(transcript_may_have_live_owner(
+            Some(now - LIVE_OWNER_WRITE_WINDOW),
+            now
+        ));
+        assert!(!transcript_may_have_live_owner(
+            Some(now - LIVE_OWNER_WRITE_WINDOW - Duration::from_secs(1)),
+            now
+        ));
+        // A clock step backwards must not hide a transcript being written now.
+        assert!(transcript_may_have_live_owner(
+            Some(now + Duration::from_secs(5)),
+            now
+        ));
+        assert!(!transcript_may_have_live_owner(None, now));
     }
 
     #[test]
