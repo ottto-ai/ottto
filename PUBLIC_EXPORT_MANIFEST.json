@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 386,
-  "content_sha256": "91125a90b478ba9ecefb48164a4b34c94274e04d751f531282a1256fa1a7ae9e",
+  "candidate_file_count": 387,
+  "content_sha256": "7c0c419ff6245f1b829d9da51a0868b0658eb4173d9d1b55c7ef28ebfa4b40d5",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "22c15032769b9fc3738742b8662d1b6c655bba0112853f1469116e08185d912e",
-      "size_bytes": 843179
+      "sha256": "8c070a17014ce7e303a02769ec29ef04e49fcbe4f3f74b2153a54b273bbb4403",
+      "size_bytes": 847686
     },
     {
       "executable": false,
@@ -741,8 +741,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "0d5de5290ba0e890b35f043ebde11d6f6be8226243a5540255a4b0ba4658abcb",
-      "size_bytes": 1171623
+      "sha256": "a8fa63d508c0067b3faa71236cd43fe45d7ac9bdbd8818de9ae9370b4d9871d9",
+      "size_bytes": 1172151
     },
     {
       "executable": false,
@@ -1706,6 +1706,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-09-24-claude-stale-meter-collision.md",
+      "sha256": "5909eb7d5200e66bccdc0cd9d83408cad8c6818b942a6fcac67f6fce546a28f8",
+      "size_bytes": 1317
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-surfaces.md",
       "sha256": "b49df98bbf9dbdcbcc4a904c35f084019541451e53f46c3134ea5c9ff31920b9",
       "size_bytes": 2026
@@ -1728,8 +1735,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/troubleshooting.md",
-      "sha256": "419ed0a0cd235e3c046b4ec0ba67f79df7532b702c54e10fe13d5a888a2e4a22",
-      "size_bytes": 5736
+      "sha256": "b4229525e68fb83cdc3b308e59c2b553f4c6248a4b61346d1a94ba7f52015bfb",
+      "size_bytes": 5905
     },
     {
       "executable": false,
@@ -2267,8 +2274,8 @@
       "executable": false,
       "mode": "0644",
       "path": "release/README.md",
-      "sha256": "14adcfd154786d9dac71130042137abad890dcb830e3c5194a97751d4f710ddd",
-      "size_bytes": 25539
+      "sha256": "50522c9978cd251b4f62bd141c6fa92848023fb6ceb124b87a72bb579c8405d6",
+      "size_bytes": 25614
     },
     {
       "executable": false,
@@ -2707,7 +2714,7 @@
   ],
   "generated_at": "2026-09-24T09:55:06+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 387,
+  "output_file_count": 388,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
