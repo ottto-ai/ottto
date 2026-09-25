@@ -108,7 +108,8 @@ The one combination that does not work is a mismatch: a Developer ID daemon next
 to a locally built app. Pass `--trust-dev-companion` to `macos_dev_install.sh`
 for that, which writes `OTTTO_COMPANION_CODE_REQUIREMENT` into the LaunchAgent.
 The daemon logs the refusal and the fix once per run to
-`~/Library/Logs/Ottto/ottto-service.err.log`. Never pass it for a customer
+`~/Library/Logs/Ottto/ottto-service.error.log` (Homebrew) or
+`ottto-service.err.log` (app or dev-installed LaunchAgent). Never pass it for a customer
 install. See [`docs/troubleshooting.md`](../docs/troubleshooting.md).
 
 For internal QA on local dev/preview/stable-candidate artifacts,
