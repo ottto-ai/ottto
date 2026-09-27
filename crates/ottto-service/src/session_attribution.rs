@@ -31,6 +31,15 @@ pub const MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES: usize = 32;
 pub const MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES: usize = 96;
 pub const MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES: usize = 96;
 pub const MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES: usize = 32;
+/// Path-like fragments the backend attribution validator rejects anywhere in a
+/// fact value or display label, by plain substring match. One rejected fact
+/// fails the WHOLE upload batch, so every token or label that would trip the
+/// remote check is redacted or dropped locally instead. Kept in sync with
+/// `_ARTIFACT_FORBIDDEN_FRAGMENTS` in the backend snapshot schema; its
+/// separator-bearing entries (`/users/`, `/home/`, and the backslash forms) are
+/// already covered by `looks_like_local_path`.
+pub(crate) const ATTRIBUTION_FORBIDDEN_FRAGMENTS: [&str; 4] =
+    [".codex", ".claude", "workspace_path", "transcript_path"];
 /// Wire budget for one session's attribution facts.
 ///
 /// Raised 2,048 → 4,096 → 8,192. This number and the backend's
@@ -802,6 +811,9 @@ fn looks_like_local_path(token: &str) -> bool {
         || lowered.contains("/private/")
         || lowered.contains("/var/folders/")
         || lowered.contains("/tmp/")
+        || ATTRIBUTION_FORBIDDEN_FRAGMENTS
+            .iter()
+            .any(|fragment| lowered.contains(fragment))
 }
 
 fn sha256_hex(value: &[u8]) -> String {
@@ -1373,6 +1385,7 @@ fn push_labeled_fact(
         (Some(label), Some(source))
             if !label.is_empty()
                 && label.len() <= MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES
+                && !label.split_whitespace().any(looks_like_local_path)
                 && !source.is_empty()
                 && source.len() <= MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES =>
         {
@@ -2039,6 +2052,69 @@ mod tests {
         assert!(!label.contains("private"));
         assert!(!label.contains('\n'));
         assert!(label.len() <= MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES);
+    }
+
+    /// Mirror of the backend's display-label path check: a plain,
+    /// case-insensitive substring match over the whole label.
+    fn backend_rejects_label(label: &str) -> bool {
+        let lowered = label.to_ascii_lowercase();
+        ["/users/", "\\users\\", "/home/", "\\home\\"]
+            .iter()
+            .chain(ATTRIBUTION_FORBIDDEN_FRAGMENTS.iter())
+            .any(|fragment| lowered.contains(fragment))
+    }
+
+    #[test]
+    fn prompt_prefix_label_redacts_slashless_tokens_the_backend_treats_as_paths() {
+        // Real Codex exec first prompt shape (2026-09-27): a dotted identifier
+        // containing `.claude` has no slash, yet the backend's substring check
+        // rejected the whole snapshot batch with HTTP 422.
+        let label = prompt_prefix_display_label(
+            "Fix `subscriptions.claude_account_coverage` then read .codex config and the workspace_path and transcript_path fields",
+        )
+        .expect("display label");
+
+        assert_eq!(
+            label,
+            "Fix [path] then read [path] config and the [path] and [path] fields"
+        );
+        assert!(!backend_rejects_label(&label));
+    }
+
+    #[test]
+    fn labeled_facts_drop_labels_the_backend_would_reject_but_keep_the_fact() {
+        let context = EvidenceContext {
+            source_session_id: "session-1",
+            observed_at: "2026-09-27T12:00:00Z",
+            source_version: "codex-v1",
+        };
+        let mut facts = Vec::new();
+        for label in ["team.claude-helper", "my.codex_skill", "workspace_path"] {
+            push_labeled_fact(
+                &mut facts,
+                "skill_id",
+                "hmac-sha256:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                Some(label),
+                Some("skill_name"),
+                "provider_artifact",
+                "direct",
+                &context,
+            );
+        }
+
+        assert_eq!(facts.len(), 3);
+        assert!(facts
+            .iter()
+            .all(|fact| fact.display_label.is_none() && fact.display_label_source.is_none()));
+        validate_fact_limits(&facts).expect("unlabeled facts fit the wire contract");
+
+        let mut leaked = facts[0].clone();
+        leaked.display_label = Some("Fix subscriptions.claude_account_coverage".to_string());
+        leaked.display_label_source = Some("skill_name".to_string());
+        assert!(backend_rejects_label(
+            leaked.display_label.as_deref().unwrap()
+        ));
+        validate_fact_limits(&[leaked]).expect_err("a backend-rejected label must not upload");
     }
 
     #[test]
