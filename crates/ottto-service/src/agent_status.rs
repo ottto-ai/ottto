@@ -192,6 +192,7 @@ struct CodexSlotCandidate {
     binding: Option<(String, String)>,
     workspace_targets: Vec<CodexWorkspaceTargetEvidence>,
     quality: u8,
+    auth_modified_at: Option<std::time::SystemTime>,
 }
 
 #[derive(Clone)]
@@ -269,6 +270,16 @@ struct ClaudeOAuthUsageOutcome {
 pub(crate) struct AgentStatusCollection {
     pub snapshots: Vec<AgentStatusSnapshot>,
     pub source_health_snapshot: AgentStatusSnapshot,
+    pub codex_scan_homes: Vec<PathBuf>,
+    pub codex_home_bindings: Vec<CodexHomeBinding>,
+}
+
+/// Hash-only identity observed for an exact Codex transcript home.
+pub(crate) struct CodexHomeBinding {
+    pub home: PathBuf,
+    pub account_identifier_hash: String,
+    pub workspace_identifier_hash: String,
+    pub auth_modified_at: std::time::SystemTime,
 }
 
 /// A validated exact-slot credential. Deliberately implements neither
@@ -964,6 +975,8 @@ fn single_agent_status_collection(snapshot: AgentStatusSnapshot) -> AgentStatusC
     AgentStatusCollection {
         snapshots: vec![snapshot.clone()],
         source_health_snapshot: snapshot,
+        codex_scan_homes: Vec::new(),
+        codex_home_bindings: Vec::new(),
     }
 }
 
@@ -978,6 +991,35 @@ fn collect_codex_status_snapshots(
         collect_codex_slot_candidates(settings, &captured_at, &expires_at);
     canonicalize_codex_candidates(&mut candidates);
     apply_codex_candidate_statuses(&mut status, &candidates);
+
+    let mut codex_scan_homes: Vec<PathBuf> = candidates
+        .iter()
+        .map(|candidate| candidate.slot.home.clone())
+        .collect();
+    // A separate SQLite home is a scan root, never proof of the credential
+    // home that authenticated the transcript's process.
+    if let Some(sqlite_home) = std::env::var_os("CODEX_SQLITE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        if !codex_scan_homes.contains(&sqlite_home) {
+            codex_scan_homes.push(sqlite_home);
+        }
+    }
+
+    let codex_home_bindings = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let (account_identifier_hash, workspace_identifier_hash) =
+                candidate.binding.as_ref()?;
+            Some(CodexHomeBinding {
+                home: candidate.slot.home.clone(),
+                account_identifier_hash: account_identifier_hash.clone(),
+                workspace_identifier_hash: workspace_identifier_hash.clone(),
+                auth_modified_at: candidate.auth_modified_at?,
+            })
+        })
+        .collect();
 
     let mut snapshots = Vec::new();
     let mut winning_by_binding = BTreeMap::<(String, String), usize>::new();
@@ -1004,6 +1046,8 @@ fn collect_codex_status_snapshots(
     AgentStatusCollection {
         snapshots,
         source_health_snapshot,
+        codex_scan_homes,
+        codex_home_bindings,
     }
 }
 
@@ -1159,6 +1203,19 @@ fn collect_codex_slot_candidates(
             });
         }
     }
+    if let Some(home) = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        if !slots.iter().any(|slot| slot.home == home) {
+            slots.push(CodexHomeSlot {
+                slot_id: "codex_home".to_string(),
+                ownership: CodexAccountSlotOwnershipV1::Managed,
+                home,
+                registered_binding: None,
+            });
+        }
+    }
     let candidates = thread::scope(|scope| {
         let handles = slots
             .into_iter()
@@ -1183,6 +1240,10 @@ fn collect_codex_home_candidate(
         CodexAccountSlotOwnershipV1::Default => CodexHomeTrust::ProviderDefault,
         CodexAccountSlotOwnershipV1::Managed => CodexHomeTrust::Managed,
     };
+    let auth_path = slot.home.join("auth.json");
+    let before = std::fs::metadata(&auth_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
     let (mut snapshot, _, workspace_targets) = collect_codex_status_for_home(
         captured_at.to_string(),
         expires_at.to_string(),
@@ -1192,6 +1253,9 @@ fn collect_codex_home_candidate(
     let mut status = codex_collection_status_from_snapshot(&snapshot);
     let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut status);
     let quality = codex_snapshot_quality(&snapshot, &status);
+    let after = std::fs::metadata(&auth_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
     CodexSlotCandidate {
         slot,
         snapshot,
@@ -1199,6 +1263,7 @@ fn collect_codex_home_candidate(
         binding,
         workspace_targets,
         quality,
+        auth_modified_at: (before == after).then_some(before).flatten(),
     }
 }
 
@@ -2975,6 +3040,8 @@ fn collect_claude_status_snapshots(
     AgentStatusCollection {
         snapshots,
         source_health_snapshot,
+        codex_scan_homes: Vec::new(),
+        codex_home_bindings: Vec::new(),
     }
 }
 
@@ -13698,6 +13765,7 @@ for line in sys.stdin:
             binding: Some((account_hash.to_string(), workspace_hash.to_string())),
             workspace_targets: Vec::new(),
             quality,
+            auth_modified_at: None,
         }
     }
 
