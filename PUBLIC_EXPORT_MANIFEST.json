@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 388,
-  "content_sha256": "e67adc56e972901a28e5dc86f5d4048de8c6e2ef73a5e5498771b5f2c1d359b5",
+  "content_sha256": "af47f41bc2f8e737b24ca7a336f86e53114f584b3e3d1695e1691f5dd9c6ecc4",
   "files": [
     {
       "executable": false,
@@ -748,8 +748,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control_plane_health.rs",
-      "sha256": "6e0f8ff5559c1788af55b8f316bb45b7420d2192c1185ef88453f817111b877d",
-      "size_bytes": 13308
+      "sha256": "ecf32ed9fd746e9e628bbed8a3f4564387e3fb7f03c98a276a06897a530e9871",
+      "size_bytes": 14112
     },
     {
       "executable": false,
@@ -839,8 +839,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/otlp_relay.rs",
-      "sha256": "3b3a438b4935211a6b2e37a788a76c43b91eec69c2b85634c41c94b7834ab829",
-      "size_bytes": 72152
+      "sha256": "9893ba48a75481fd80147cb092ff818d7f6279275658722615f89d476a2dd1c1",
+      "size_bytes": 95049
     },
     {
       "executable": false,
@@ -2719,7 +2719,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-25T13:25:12+00:00",
+  "generated_at": "2026-09-27T09:22:21+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 389,
   "public_roots": [
@@ -2755,5 +2755,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "81829ee7c9d6dc1fbaf065a611f9dec383f927ee"
+  "source_commit": "db9b597a54c4f8faca82d738daea42f2d119aa73"
 }
