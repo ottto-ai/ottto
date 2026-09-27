@@ -1121,7 +1121,7 @@ mod tests {
 
         let result = done_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("the loop must stop instead of spinning on a lost descriptor");
+            .expect("the loop must stop once its descriptor is taken away");
         let error = result.expect_err("a lost listener is an error");
         assert!(
             format!("{error:#}").contains("accept on socket listener"),
