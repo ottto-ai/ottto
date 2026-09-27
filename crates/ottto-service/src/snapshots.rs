@@ -19226,7 +19226,7 @@ fn safe_claude_agent_display_label(value: String) -> Option<String> {
         .take(MAX_CLAUDE_AGENT_LABEL_CHARS)
         .collect();
     let lowered = truncated.to_ascii_lowercase();
-    if ATTRIBUTION_TOKEN_FORBIDDEN_FRAGMENTS
+    if crate::session_attribution::ATTRIBUTION_FORBIDDEN_FRAGMENTS
         .iter()
         .any(|fragment| lowered.contains(fragment))
         || lowered.contains("/users/")
@@ -19396,15 +19396,6 @@ fn claude_usage_sidecars_fingerprint(support_dir: &Path, session_id: &str) -> St
     }
 }
 
-/// Path-like fragments the backend fact validator rejects outright. One
-/// rejected fact fails the WHOLE upload batch, so a provider-supplied token that
-/// would trip the remote check is dropped locally instead. Kept in sync with
-/// `_ARTIFACT_FORBIDDEN_FRAGMENTS` in the backend snapshot schema; the
-/// separator-bearing entries there are unreachable through the character
-/// allowlist below.
-const ATTRIBUTION_TOKEN_FORBIDDEN_FRAGMENTS: [&str; 4] =
-    [".codex", ".claude", "workspace_path", "transcript_path"];
-
 /// Conservative allowlist for provider-supplied identifiers that become
 /// attribution fact values. Anything outside `[A-Za-z0-9._:-]`, or longer than
 /// 64 characters, is dropped rather than sanitized: a value that does not look
@@ -19419,7 +19410,7 @@ fn safe_attribution_token(value: String) -> Option<String> {
         return None;
     }
     let lowered = value.to_ascii_lowercase();
-    ATTRIBUTION_TOKEN_FORBIDDEN_FRAGMENTS
+    crate::session_attribution::ATTRIBUTION_FORBIDDEN_FRAGMENTS
         .iter()
         .all(|fragment| !lowered.contains(fragment))
         .then_some(value)
