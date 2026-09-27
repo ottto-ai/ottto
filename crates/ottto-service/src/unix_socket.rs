@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, IntoRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -95,6 +95,10 @@ fn serve_listener(
     // before it on every return path, before the descriptor can be closed and
     // reused.
     let published = PublishedListener::publish(listener.as_raw_fd());
+    // Declared after `published`, so it drops (and unguards) first, and both
+    // drop before the `listener` parameter closes the descriptor.
+    let fd_guard =
+        crate::fd_guard::ListenerFdGuard::arm_if_enabled(listener.as_raw_fd(), "unix control");
 
     let mut served = 0_usize;
     let mut workers = Vec::new();
@@ -102,11 +106,43 @@ fn serve_listener(
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                wait_for_fd(listener.as_raw_fd(), libc::POLLIN, None)
-                    .with_context(|| format!("wait for socket {}", path.display()))?;
-                continue;
+                // A stale `close` or `dup2` elsewhere in the process can take
+                // the descriptor away during this wait, and XNU does not wake
+                // a `poll` whose descriptor is closed or replaced: the socket
+                // would go silent for good. Waking regularly lets the next
+                // `accept` report the loss.
+                match wait_for_fd(
+                    listener.as_raw_fd(),
+                    libc::POLLIN,
+                    Some(Instant::now() + LISTENER_RECHECK_INTERVAL),
+                ) {
+                    Ok(()) => continue,
+                    Err(error) if error.kind() == ErrorKind::TimedOut => continue,
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("wait for socket {}", path.display()))
+                    }
+                }
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if accept_error_means_listener_gone(&error) => {
+                // The descriptor was closed or now names another file. `poll`
+                // returns at once with POLLNVAL on a closed number, so retrying
+                // would spin. Stop, and leave the number alone: it may already
+                // belong to another file, and closing it would close that file.
+                let fd = listener.as_raw_fd();
+                eprintln!(
+                    "socket listener {} lost its descriptor: {error}; {}; {}; stopping",
+                    path.display(),
+                    crate::fd_guard::describe_descriptor(fd),
+                    crate::fd_guard::descriptor_census()
+                );
+                drop(fd_guard);
+                drop(published);
+                let _ = listener.into_raw_fd();
+                return Err(error)
+                    .with_context(|| format!("accept on socket listener {}", path.display()));
+            }
             Err(error) => {
                 eprintln!("socket listener {} accept failed: {error}", path.display());
                 continue;
@@ -131,8 +167,22 @@ fn serve_listener(
             eprintln!("socket listener {} worker panicked", path.display());
         }
     }
+    drop(fd_guard);
     drop(published);
     Ok(())
+}
+
+/// Longest `poll` wait between `accept` attempts on an idle control listener
+/// (see `serve_listener`).
+const LISTENER_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Whether a failed `accept` says the listening descriptor itself is gone,
+/// rather than one connection having failed.
+fn accept_error_means_listener_gone(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EBADF | libc::ENOTSOCK | libc::EINVAL)
+    )
 }
 
 fn handle_stream(path: PathBuf, mut stream: UnixStream, handler: RequestHandler) {
@@ -1032,6 +1082,54 @@ mod tests {
         assert!(after.requests_served > before.requests_served);
         assert!(after.request_errors > before.request_errors);
         assert!(after.last_request_served_at.is_some());
+        let _ = fs::remove_file(path);
+    }
+
+    /// A stale `close` or `dup2` elsewhere in the process can take the
+    /// listener's descriptor away while the loop waits in `poll`. XNU does not
+    /// wake that `poll`, so without the periodic recheck the socket goes
+    /// silent for good; the loop must notice and stop. `dup2` stands in for
+    /// the stale close because it keeps the number occupied: nothing else in
+    /// the test process can reuse it meanwhile.
+    #[test]
+    fn serve_listener_stops_when_its_descriptor_is_taken_away() {
+        let path = std::env::temp_dir().join(format!(
+            "ottto-service-test-{}-{}.sock",
+            std::process::id(),
+            "descriptor-gone"
+        ));
+        let _ = fs::remove_file(&path);
+        let listener = bind_user_only_socket(&path).expect("bind listener");
+        let fd = listener.as_raw_fd();
+        let handler: RequestHandler = Arc::new(|request, _peer| LocalControlResponse {
+            request_id: request.request_id,
+            ok: true,
+            payload: None,
+            error: None,
+        });
+        let server_path = path.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = done_tx.send(serve_listener(listener, &server_path, None, handler));
+        });
+        thread::sleep(Duration::from_millis(100));
+
+        let dev_null = fs::File::open("/dev/null").expect("open /dev/null");
+        // SAFETY: deliberately replaces the listener's descriptor, which is
+        // the bug being simulated; the replacement is closed below.
+        assert_eq!(unsafe { libc::dup2(dev_null.as_raw_fd(), fd) }, fd);
+
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the loop must stop once its descriptor is taken away");
+        let error = result.expect_err("a lost listener is an error");
+        assert!(
+            format!("{error:#}").contains("accept on socket listener"),
+            "{error:#}"
+        );
+        // The loop left the number alone; it now names /dev/null, closed here.
+        // SAFETY: closes the /dev/null copy that dup2 installed at `fd`.
+        unsafe { libc::close(fd) };
         let _ = fs::remove_file(path);
     }
 

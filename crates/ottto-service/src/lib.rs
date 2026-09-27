@@ -17,6 +17,8 @@ pub mod control;
 pub mod control_plane_health;
 pub mod detected_uses;
 mod external_scheduler_attribution;
+#[cfg(unix)]
+pub(crate) mod fd_guard;
 pub mod keychain;
 mod launch_events;
 pub mod legacy_service;
