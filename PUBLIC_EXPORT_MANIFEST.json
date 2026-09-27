@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 389,
-  "content_sha256": "d9b624a257092114748226ccf3f737398d89852d2f820dcef25f442874bc6e27",
+  "candidate_file_count": 391,
+  "content_sha256": "6106bef8de8cfde3bdb06f17c1ba3689e11b868e5ad0cf372cc3da270b60f5cf",
   "files": [
     {
       "executable": false,
@@ -580,8 +580,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "147be48e5d3d6711d50ba10222bb1e611b81c0567c711d2c6dab057a6363f19d",
-      "size_bytes": 270171
+      "sha256": "5cc964c6bc45bcd9910d88cac8b373c9c4d006356e322ef9959b5ff130db6938",
+      "size_bytes": 271611
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "8c070a17014ce7e303a02769ec29ef04e49fcbe4f3f74b2153a54b273bbb4403",
-      "size_bytes": 847686
+      "sha256": "b07e9c1e7b30421f0b4fd964298b5b5aba05a95945cbab7ccf031af34e2b9aa9",
+      "size_bytes": 851926
     },
     {
       "executable": false,
@@ -701,6 +701,13 @@
       "path": "crates/ottto-service/src/cloud_sessions.rs",
       "sha256": "b4c976d6051b81c37d3e4eae19441b5a1906466f2a14d809b29ec5d8faad6229",
       "size_bytes": 347827
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/codex_process_homes.rs",
+      "sha256": "de4611ba4db44508db97579f70b067fc40c2b4e31e582d62a76c2dc300650bf8",
+      "size_bytes": 3694
     },
     {
       "executable": false,
@@ -762,8 +769,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/external_scheduler_attribution.rs",
-      "sha256": "a4d7cd2ea7e5b2c5e1d9564476f535ec98303943781ab2693c1c1458d9945cd9",
-      "size_bytes": 43931
+      "sha256": "94be45a5cfe620393747ed38be8dc4f75a465db9e175940d7d8939d61aca887b",
+      "size_bytes": 43957
     },
     {
       "executable": false,
@@ -804,8 +811,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "d544a597c74b7d136fae4e520b7045a46f56a60e1ae411ac89daf850fcf313bb",
-      "size_bytes": 327290
+      "sha256": "adad527453c520222a4519bec74ecd7ed1cde2cf2712b4f1cd1eef7cb925bbc8",
+      "size_bytes": 327315
     },
     {
       "executable": false,
@@ -881,8 +888,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "f65bbbac4c527764eb5a47e20e3073d090641a2696a810a21615a0e26fa492c9",
-      "size_bytes": 477665
+      "sha256": "6c356e8f3b04f7c51fa53f566878ac589d597b07c4ae5c5152cc7ac5946a9a1f",
+      "size_bytes": 478445
     },
     {
       "executable": false,
@@ -895,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "984b7d55653e37d8a096f3f370d4bcc482b06d39c3909b1891fea3e1bce172c7",
-      "size_bytes": 1890325
+      "sha256": "7a8b6d25d1233ea48ff588be706716cebac032559081eab2faf47c91d1a72c6e",
+      "size_bytes": 1905444
     },
     {
       "executable": false,
@@ -1723,6 +1730,13 @@
       "path": "docs/session-2026-09-24-claude-stale-meter-collision.md",
       "sha256": "5909eb7d5200e66bccdc0cd9d83408cad8c6818b942a6fcac67f6fce546a28f8",
       "size_bytes": 1317
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-account-binding.md",
+      "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
+      "size_bytes": 1708
     },
     {
       "executable": false,
@@ -2726,9 +2740,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-27T12:58:18+00:00",
+  "generated_at": "2026-09-27T14:30:38+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 390,
+  "output_file_count": 392,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2762,5 +2776,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "bb11b5fb2eca508626d91cd90868442f4882c25e"
+  "source_commit": "f992bafe5d7ccc27e36779813c9fdc1ddac21c6f"
 }

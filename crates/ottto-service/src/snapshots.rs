@@ -1614,6 +1614,10 @@ pub struct ScanIndex {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     upload_context_fingerprint: Option<String>,
     pub files: BTreeMap<String, ScanIndexEntry>,
+    /// Hash-only owner proof keyed by machine and session in this source index.
+    /// A later current login can never replace it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    session_account_bindings: BTreeMap<String, SessionAccountBinding>,
     /// Files whose oversized physical lines were skipped once under a bounded
     /// parser generation. The path key plus exact opened-object-derived source
     /// fingerprint prevents both permanent condemnation after replacement and
@@ -1813,6 +1817,7 @@ impl Default for ScanIndex {
             generation: 0,
             upload_context_fingerprint: None,
             files: BTreeMap::new(),
+            session_account_bindings: BTreeMap::new(),
             terminal_jsonl_dispositions: BTreeMap::new(),
             known_configured_scan_roots: BTreeSet::new(),
             legacy_unresolved_root_file_witnesses: BTreeSet::new(),
@@ -1977,6 +1982,13 @@ pub struct ScanIndexEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionAccountBinding {
+    account_identifier_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_identifier_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ClaudeAccountFamilyWitness {
     account_identifier_hash: String,
     evidence_request_count: u128,
@@ -2079,6 +2091,10 @@ pub struct ClaudeUsageAuthorityDisposition {
 }
 
 impl ClaudeUsageAuthorityDisposition {
+    pub(crate) fn defer_sessions(&mut self, session_ids: BTreeSet<String>) {
+        self.quarantined_source_session_ids.extend(session_ids);
+    }
+
     pub(crate) fn quarantined_fingerprints(&self, snapshots: &[SnapshotItem]) -> BTreeSet<String> {
         snapshots
             .iter()
@@ -4863,6 +4879,27 @@ fn set_claude_account_hash(item: &mut SnapshotItem, target: Option<String>) -> b
         }
     }
     changed
+}
+
+fn exact_session_account_hash(item: &SnapshotItem) -> Option<String> {
+    let mut rows = item.model_usage.iter().chain(
+        item.usage_buckets
+            .iter()
+            .flat_map(|bucket| bucket.model_usage.iter()),
+    );
+    let first = rows.next()?.account_identifier_hash.as_deref()?;
+    rows.all(|row| row.account_identifier_hash.as_deref() == Some(first))
+        .then(|| first.to_string())
+}
+
+fn set_session_account_hash(item: &mut SnapshotItem, account_hash: Option<&str>) {
+    for row in item.model_usage.iter_mut().chain(
+        item.usage_buckets
+            .iter_mut()
+            .flat_map(|bucket| bucket.model_usage.iter_mut()),
+    ) {
+        row.account_identifier_hash = account_hash.map(str::to_string);
+    }
 }
 
 fn claude_account_evidence_covers_snapshot(
@@ -17132,6 +17169,98 @@ fn canonicalize_codex_identity_map<T: PartialEq>(values: &mut BTreeMap<String, T
 }
 
 impl ScanIndex {
+    /// Attach only the owner proved for this session. A missing or conflicting
+    /// Claude revision is held for a later complete scan; the durable proof
+    /// remains intact.
+    pub(crate) fn bind_session_accounts(
+        &mut self,
+        source: SnapshotSource,
+        machine_id: &str,
+        snapshots: &mut [SnapshotItem],
+        codex_homes: &[crate::agent_status::CodexHomeBinding],
+    ) -> BTreeSet<String> {
+        let mut deferred = BTreeSet::new();
+        for item in snapshots {
+            let session_id = &item.source_session_id;
+            let key = sha256_hex(&["session_owner:v1", machine_id, session_id]);
+            let existing = self.session_account_bindings.get(&key);
+            match source {
+                SnapshotSource::Codex => {
+                    if !codex_rows_prove_oauth(item) {
+                        set_session_account_hash(item, None);
+                        continue;
+                    }
+                    let owner = existing
+                        .cloned()
+                        .or_else(|| self.codex_owner_for_item(item, codex_homes));
+                    if let Some(owner) = owner {
+                        self.session_account_bindings
+                            .entry(key.clone())
+                            .or_insert_with(|| owner.clone());
+                        set_session_account_hash(item, Some(&owner.account_identifier_hash));
+                    }
+                }
+                SnapshotSource::ClaudeCode => {
+                    let observed = exact_session_account_hash(item);
+                    match (existing, observed.as_deref()) {
+                        (Some(owner), Some(hash)) if owner.account_identifier_hash == hash => {}
+                        (Some(_), _) => {
+                            deferred.insert(session_id.clone());
+                        }
+                        (None, Some(hash)) => {
+                            self.session_account_bindings.insert(
+                                key.clone(),
+                                SessionAccountBinding {
+                                    account_identifier_hash: hash.to_string(),
+                                    workspace_identifier_hash: None,
+                                },
+                            );
+                        }
+                        (None, None) => {}
+                    }
+                }
+                SnapshotSource::Pi => {}
+            }
+        }
+        deferred
+    }
+
+    fn codex_owner_for_item(
+        &self,
+        item: &SnapshotItem,
+        homes: &[crate::agent_status::CodexHomeBinding],
+    ) -> Option<SessionAccountBinding> {
+        let started = OffsetDateTime::parse(item.source_started_at.as_deref()?, &Rfc3339)
+            .ok()?
+            .unix_timestamp_nanos();
+        let fingerprint = item.source_file_fingerprint.as_deref()?;
+        let mut paths = self
+            .files
+            .iter()
+            .filter(|(_, entry)| entry.source_file_fingerprint == fingerprint)
+            .map(|(path, _)| Path::new(path));
+        let path = paths.next()?;
+        if paths.next().is_some() {
+            return None;
+        }
+        let mut matches = homes.iter().filter(|home| {
+            (path.starts_with(home.home.join("sessions"))
+                || path.starts_with(home.home.join("archived_sessions")))
+                && home
+                    .auth_modified_at
+                    .duration_since(UNIX_EPOCH)
+                    .is_ok_and(|age| age.as_nanos() <= started.max(0) as u128)
+        });
+        let home = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(SessionAccountBinding {
+            account_identifier_hash: home.account_identifier_hash.clone(),
+            workspace_identifier_hash: Some(home.workspace_identifier_hash.clone()),
+        })
+    }
+
     /// Persisted v36 draft indexes may contain pre-fix raw UUID casing. Treat
     /// deserialization as an identity ingress: normalize every Codex set/map
     /// once, and reject conflicting values that collapse to one UUID key.
@@ -18041,6 +18170,7 @@ impl ScanIndex {
             generation: previous.generation,
             upload_context_fingerprint: previous.upload_context_fingerprint.clone(),
             files,
+            session_account_bindings: self.session_account_bindings.clone(),
             terminal_jsonl_dispositions: previous.terminal_jsonl_dispositions.clone(),
             known_configured_scan_roots: self.known_configured_scan_roots.clone(),
             legacy_unresolved_root_file_witnesses: self
@@ -18428,6 +18558,17 @@ impl ScanIndex {
             })
             .map(|disposition| &disposition.loss)
     }
+}
+
+fn codex_rows_prove_oauth(item: &SnapshotItem) -> bool {
+    let mut rows = item.model_usage.iter().chain(
+        item.usage_buckets
+            .iter()
+            .flat_map(|bucket| bucket.model_usage.iter()),
+    );
+    rows.next()
+        .is_some_and(|row| matches!(row.auth_mode.as_deref(), Some("oauth" | "chatgpt")))
+        && rows.all(|row| matches!(row.auth_mode.as_deref(), Some("oauth" | "chatgpt")))
 }
 
 pub fn source_file_fingerprint(
@@ -42558,6 +42699,233 @@ mod tests {
         let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
 
         assert!(error.contains("model rows do not match"), "{error}");
+    }
+
+    #[test]
+    fn session_owner_binding_survives_login_switch_and_missing_evidence() {
+        use crate::agent_status::CodexHomeBinding;
+
+        let home_a = PathBuf::from("/synthetic/codex-a");
+        let home_b = PathBuf::from("/synthetic/codex-b");
+        let binding = |home: &Path, account: &str| CodexHomeBinding {
+            home: home.to_path_buf(),
+            account_identifier_hash: account.to_string(),
+            workspace_identifier_hash: format!("{account}-workspace"),
+            auth_modified_at: UNIX_EPOCH + std::time::Duration::from_secs(1),
+        };
+        let mut index = ScanIndex::default();
+        let mut item = valid_v6_batch_request().snapshots.remove(0);
+        item.model_usage[0].auth_mode = Some("oauth".to_string());
+        item.usage_buckets[0].model_usage[0].auth_mode = Some("oauth".to_string());
+        item.source_session_id = "session-a".to_string();
+        item.source_started_at = Some("2026-09-27T00:00:00Z".to_string());
+        item.source_file_fingerprint = Some("file-a".to_string());
+        index.files.insert(
+            home_a
+                .join("sessions/rollout-a.jsonl")
+                .display()
+                .to_string(),
+            ScanIndexEntry {
+                size_bytes: 1,
+                modified_unix_seconds: 1,
+                modified_unix_nanos: None,
+                source_file_fingerprint: "file-a".to_string(),
+                last_snapshot_fingerprint: None,
+                last_upload_body_witness: None,
+                scan_identity_version: None,
+            },
+        );
+        let a = binding(&home_a, "account-a");
+        let b = binding(&home_a, "account-b");
+        for current in [&a, &b, &a, &b] {
+            let mut scan = vec![item.clone()];
+            assert!(index
+                .bind_session_accounts(
+                    SnapshotSource::Codex,
+                    "machine-a",
+                    &mut scan,
+                    std::slice::from_ref(current)
+                )
+                .is_empty());
+            assert_eq!(
+                exact_session_account_hash(&scan[0]).as_deref(),
+                Some("account-a")
+            );
+        }
+        let mut missing = vec![item.clone()];
+        index.bind_session_accounts(SnapshotSource::Codex, "machine-a", &mut missing, &[]);
+        assert_eq!(
+            exact_session_account_hash(&missing[0]).as_deref(),
+            Some("account-a")
+        );
+        assert_eq!(
+            index.session_account_bindings
+                [&sha256_hex(&["session_owner:v1", "machine-a", "session-a"])]
+                .workspace_identifier_hash
+                .as_deref(),
+            Some("account-a-workspace")
+        );
+        let mut incomplete = vec![item.clone()];
+        incomplete[0].model_usage[0].auth_mode = None;
+        incomplete[0].usage_buckets[0].model_usage[0].auth_mode = None;
+        index.bind_session_accounts(
+            SnapshotSource::Codex,
+            "machine-a",
+            &mut incomplete,
+            std::slice::from_ref(&b),
+        );
+        assert!(exact_session_account_hash(&incomplete[0]).is_none());
+        assert_eq!(
+            index.session_account_bindings
+                [&sha256_hex(&["session_owner:v1", "machine-a", "session-a"])]
+                .account_identifier_hash,
+            "account-a"
+        );
+        let mut incompatible = vec![item.clone()];
+        incompatible[0].model_usage[0].auth_mode = Some("api_key".to_string());
+        incompatible[0].usage_buckets[0].model_usage[0].auth_mode = Some("api_key".to_string());
+        index.bind_session_accounts(
+            SnapshotSource::Codex,
+            "machine-a",
+            &mut incompatible,
+            std::slice::from_ref(&b),
+        );
+        assert!(exact_session_account_hash(&incompatible[0]).is_none());
+        index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+
+        let mut new_item = item.clone();
+        new_item.source_session_id = "session-b".to_string();
+        new_item.source_file_fingerprint = Some("file-b".to_string());
+        index.files.insert(
+            home_b
+                .join("sessions/rollout-b.jsonl")
+                .display()
+                .to_string(),
+            ScanIndexEntry {
+                source_file_fingerprint: "file-b".to_string(),
+                ..index.files.values().next().unwrap().clone()
+            },
+        );
+        let mut scan = vec![new_item.clone()];
+        index.bind_session_accounts(
+            SnapshotSource::Codex,
+            "machine-a",
+            &mut scan,
+            &[binding(&home_b, "account-b")],
+        );
+        assert_eq!(
+            exact_session_account_hash(&scan[0]).as_deref(),
+            Some("account-b")
+        );
+        let mut other_machine = vec![item.clone()];
+        index.bind_session_accounts(
+            SnapshotSource::Codex,
+            "machine-b",
+            &mut other_machine,
+            std::slice::from_ref(&b),
+        );
+        assert_eq!(
+            exact_session_account_hash(&other_machine[0]).as_deref(),
+            Some("account-b"),
+            "one machine's session id must not inherit another machine's owner"
+        );
+
+        let mut api_key = new_item.clone();
+        api_key.source_session_id = "session-api-key".to_string();
+        api_key.model_usage[0].auth_mode = Some("api_key".to_string());
+        api_key.usage_buckets[0].model_usage[0].auth_mode = Some("api_key".to_string());
+        let mut api_scan = vec![api_key];
+        index.bind_session_accounts(
+            SnapshotSource::Codex,
+            "machine-a",
+            &mut api_scan,
+            &[binding(&home_b, "account-b")],
+        );
+        assert!(exact_session_account_hash(&api_scan[0]).is_none());
+
+        let mut later_auth = binding(&home_b, "account-b");
+        later_auth.auth_modified_at = UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+        let mut too_late = vec![SnapshotItem {
+            source_session_id: "session-unproved".to_string(),
+            ..new_item.clone()
+        }];
+        index.bind_session_accounts(
+            SnapshotSource::Codex,
+            "machine-a",
+            &mut too_late,
+            &[later_auth],
+        );
+        assert!(exact_session_account_hash(&too_late[0]).is_none());
+
+        let mut no_proof = vec![SnapshotItem {
+            source_session_id: "session-c".to_string(),
+            ..new_item
+        }];
+        index.bind_session_accounts(SnapshotSource::Codex, "machine-a", &mut no_proof, &[]);
+        assert!(exact_session_account_hash(&no_proof[0]).is_none());
+        assert!(!index.session_account_bindings.contains_key(&sha256_hex(&[
+            "session_owner:v1",
+            "machine-a",
+            "session-c"
+        ])));
+    }
+
+    #[test]
+    fn claude_incomplete_revision_defers_without_forgetting_verified_owner() {
+        let mut index = ScanIndex::default();
+        let mut item = valid_v6_batch_request().snapshots.remove(0);
+        set_session_account_hash(&mut item, Some("verified-account"));
+        assert!(index
+            .bind_session_accounts(
+                SnapshotSource::ClaudeCode,
+                "machine-a",
+                &mut [item.clone()],
+                &[]
+            )
+            .is_empty());
+        set_session_account_hash(&mut item, None);
+        let deferred = index.bind_session_accounts(
+            SnapshotSource::ClaudeCode,
+            "machine-a",
+            &mut [item.clone()],
+            &[],
+        );
+        assert!(deferred.contains(&item.source_session_id));
+        let mut disposition = ClaudeUsageAuthorityDisposition::default();
+        disposition.defer_sessions(deferred);
+        let mut uploadable = vec![item.clone()];
+        disposition.retain_uploadable(&mut uploadable);
+        assert!(
+            uploadable.is_empty(),
+            "an incomplete revision cannot reach the wire"
+        );
+        assert_eq!(
+            index.session_account_bindings
+                [&sha256_hex(&["session_owner:v1", "machine-a", &item.source_session_id])]
+                .account_identifier_hash,
+            "verified-account"
+        );
+        set_session_account_hash(&mut item, Some("different-account"));
+        assert!(index
+            .bind_session_accounts(SnapshotSource::ClaudeCode, "machine-a", &mut [item], &[])
+            .contains("claude-vertex-session-1"));
+    }
+
+    #[test]
+    fn session_usage_upload_body_contains_only_account_hashes() {
+        let mut request = valid_v6_batch_request();
+        let raw_account = "raw-account-123";
+        set_session_account_hash(&mut request.snapshots[0], Some(raw_account));
+        let unsafe_body = serde_json::to_string(&request).expect("serialize negative control");
+        assert!(unsafe_body.contains(raw_account));
+
+        let hash = ottto_core::billing_identity_hash("openai", "account", raw_account)
+            .expect("account hash");
+        set_session_account_hash(&mut request.snapshots[0], Some(&hash));
+        let upload_body = serde_json::to_string(&request).expect("serialize upload body");
+        assert!(!upload_body.contains('@'));
+        assert!(!upload_body.contains(raw_account));
+        assert!(upload_body.contains(&hash));
     }
 
     fn valid_v6_batch_request() -> SnapshotBatchRequest {

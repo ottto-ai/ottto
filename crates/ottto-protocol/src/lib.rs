@@ -1202,7 +1202,9 @@ pub struct AgentStatusSnapshot {
 impl AgentStatusSnapshot {
     pub fn redacted_for_backend(mut self) -> Self {
         if let Some(account) = self.account.as_mut() {
-            account.email = safe_optional_text(account.email.take());
+            // Account labels stay on the machine. The backend receives only
+            // the existing domain-separated identity hashes.
+            account.email = None;
             account.account_id = None;
             account.organization_id = None;
             account.organization_label = None;
@@ -3970,6 +3972,9 @@ fn is_safe_backend_text(value: &str) -> bool {
     if normalized.trim().is_empty() {
         return false;
     }
+    if normalized.contains('@') {
+        return false;
+    }
     let forbidden_fragments = [
         "/users/",
         "\\users\\",
@@ -4067,9 +4072,9 @@ fn redact_plan_observation_for_backend(
     observation.gateway_provider = safe_optional_text(observation.gateway_provider.take());
     observation.subscription_product = safe_optional_text(observation.subscription_product.take());
     observation.plan_type = safe_optional_text(observation.plan_type.take());
-    observation.account_label = safe_optional_text(observation.account_label.take());
+    observation.account_label = None;
     observation.account_id = None;
-    observation.organization_label = safe_optional_text(observation.organization_label.take());
+    observation.organization_label = None;
     observation.organization_id = None;
     observation.account_identifier_hash =
         safe_optional_text(observation.account_identifier_hash.take());
@@ -4613,6 +4618,41 @@ mod tests {
             runtime_defaults: None,
         }
         .redacted_for_backend()
+    }
+
+    #[test]
+    fn backend_status_body_contains_only_hashed_account_identity() {
+        let mut snapshot = w3_multi_anchor_snapshot(
+            &"a".repeat(64),
+            &"b".repeat(64),
+            ClaudeAccountAnchorDurabilityV1::Anchored,
+            Some(ClaudeAccountAnchorHealthV1::Healthy),
+        );
+        let account = snapshot.account.as_mut().expect("account");
+        account.email = Some("owner@example.test".to_string());
+        account.account_id = Some("raw-account-123".to_string());
+        snapshot.plan_observations.push(
+            serde_json::from_value(serde_json::json!({
+                "account_label": "owner@example.test",
+                "account_id": "raw-account-123",
+                "organization_label": "raw-account-123",
+                "organization_id": "raw-account-123",
+                "account_identifier_hash": "a".repeat(64),
+                "confidence": "high"
+            }))
+            .expect("observation"),
+        );
+        let body = |item: AgentStatusSnapshot| {
+            serde_json::json!({"machine_id": "machine-test", "snapshots": [item]}).to_string()
+        };
+        let unsafe_body = body(snapshot.clone());
+        assert!(unsafe_body.contains("owner@example.test"));
+        assert!(unsafe_body.contains("raw-account-123"));
+
+        let safe_body = body(snapshot.redacted_for_backend());
+        assert!(!safe_body.contains('@'));
+        assert!(!safe_body.contains("raw-account-123"));
+        assert!(safe_body.contains(&"a".repeat(64)));
     }
 
     #[derive(Debug, serde::Serialize)]
@@ -5643,7 +5683,7 @@ mod tests {
         assert_eq!(account.provider.as_deref(), Some("openai"));
         assert_eq!(account.auth_method.as_deref(), Some("oauth"));
         assert_eq!(account.subscription_product.as_deref(), Some("ChatGPT Pro"));
-        assert_eq!(account.email.as_deref(), Some("ron@example.com"));
+        assert_eq!(account.email, None);
         assert_eq!(account.account_id, None);
         assert_eq!(account.organization_id, None);
         assert_eq!(account.organization_label, None);
@@ -5669,14 +5709,8 @@ mod tests {
                 .as_deref(),
             Some("ChatGPT Pro")
         );
-        assert_eq!(
-            snapshot.plan_observations[0].account_label.as_deref(),
-            Some("ron@example.com")
-        );
-        assert_eq!(
-            snapshot.plan_observations[0].organization_label.as_deref(),
-            Some("Private Org")
-        );
+        assert_eq!(snapshot.plan_observations[0].account_label, None);
+        assert_eq!(snapshot.plan_observations[0].organization_label, None);
         assert_eq!(
             snapshot.plan_observations[0]
                 .account_identifier_hash

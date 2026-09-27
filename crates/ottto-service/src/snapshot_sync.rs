@@ -2174,7 +2174,16 @@ fn sync_source(
         return Ok(());
     }
 
-    let roots = source.default_roots(home);
+    let mut roots = source.default_roots(home);
+    if source == SnapshotSource::Codex {
+        for home in &scan_agent_status_collection.codex_scan_homes {
+            for root in [home.join("sessions"), home.join("archived_sessions")] {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+        }
+    }
     let mut encoded_attribution_key = activity_hint.session_attribution_hmac_key.take();
     let attribution_context = SessionAttributionContext::from_activity_hint(
         source,
@@ -2406,6 +2415,14 @@ fn sync_source(
         }
     }
 
+    let deferred_accounts = index.bind_session_accounts(
+        source,
+        machine_id,
+        &mut scan_result.snapshots,
+        &scan_agent_status_collection.codex_home_bindings,
+    );
+    claude_authority_disposition.defer_sessions(deferred_accounts);
+
     apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
 
     // Account-switch backfill cutoff (server-issued at claim completion): a
@@ -2586,7 +2603,7 @@ fn sync_source(
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
-            if deferred_local_authority_count > 0 {
+            if deferred_local_authority_count > 0 || deferred_local_authority_entity_count > 0 {
                 let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
                 accepted_fingerprints
                     .retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
@@ -2603,15 +2620,15 @@ fn sync_source(
                 upload_fully_settled = false;
                 eprintln!(
                     "local snapshot sync retained {deferred_local_authority_count} Claude usage \
-                     family/families ({deferred_local_authority_entity_count} revised \
-                     entity/entities this pass) with unproven authority; healthy siblings settled \
+                     family/families and {deferred_local_authority_entity_count} revised \
+                     entity/entities with unproven authority or session ownership; healthy siblings settled \
                      and the retained revisions remain pending for bounded retry"
                 );
             }
         }
         Ok(ResumableUploadResult::Conflicted { count }) => {
             clear_shed_streak(source);
-            if deferred_local_authority_count > 0 {
+            if deferred_local_authority_count > 0 || deferred_local_authority_entity_count > 0 {
                 let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
                 accepted_fingerprints
                     .retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
@@ -8716,6 +8733,8 @@ mod tests {
         let collection = AgentStatusCollection {
             snapshots: vec![custom_upload],
             source_health_snapshot: default_health,
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
         };
 
         let reconciliation = reconciliation_agent_status(&collection);
