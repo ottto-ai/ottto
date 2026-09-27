@@ -186,8 +186,25 @@ fn format_unix_seconds(seconds: i64) -> Option<String> {
 /// fills exactly `sizeof(struct socket_fdinfo)` bytes. A different return
 /// size, or a descriptor that is not an AF_UNIX listening socket (layout
 /// drift, or the descriptor was reused), yields `None` instead of a guess.
-#[cfg(target_os = "macos")]
 pub(crate) fn listener_draining(fd: i32) -> Option<bool> {
+    socket_listener_draining(fd, ListenerFamily::Unix)
+}
+
+/// [`listener_draining`] for a loopback TCP listener, such as the local OTLP
+/// relay. The drain works the same way on TCP: once it is set, a blocking
+/// `accept` fails with `ECONNABORTED` for every incoming connection.
+pub(crate) fn tcp_listener_draining(fd: i32) -> Option<bool> {
+    socket_listener_draining(fd, ListenerFamily::Tcp)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ListenerFamily {
+    Unix,
+    Tcp,
+}
+
+#[cfg(target_os = "macos")]
+fn socket_listener_draining(fd: i32, family: ListenerFamily) -> Option<bool> {
     /// `sizeof(struct socket_fdinfo)`.
     const SOCKET_FDINFO_SIZE: usize = 792;
     /// `offsetof(struct socket_fdinfo, psi.soi_family)`.
@@ -199,6 +216,7 @@ pub(crate) fn listener_draining(fd: i32) -> Option<bool> {
     /// `offsetof(struct socket_fdinfo, psi.soi_kind)`.
     const SOI_KIND_OFFSET: usize = 256;
     const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+    const SOCKINFO_TCP: i32 = 2;
     const SOCKINFO_UN: i32 = 3;
     const SOI_S_DRAINING: i16 = 0x4000;
 
@@ -223,17 +241,21 @@ pub(crate) fn listener_draining(fd: i32) -> Option<bool> {
         |offset: usize| i32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("4 bytes"));
     let read_i16 =
         |offset: usize| i16::from_ne_bytes(bytes[offset..offset + 2].try_into().expect("2 bytes"));
-    let is_unix_listener = read_i32(SOI_FAMILY_OFFSET) == libc::AF_UNIX
-        && read_i32(SOI_KIND_OFFSET) == SOCKINFO_UN
+    let (families, kind): (&[i32], i32) = match family {
+        ListenerFamily::Unix => (&[libc::AF_UNIX], SOCKINFO_UN),
+        ListenerFamily::Tcp => (&[libc::AF_INET, libc::AF_INET6], SOCKINFO_TCP),
+    };
+    let is_listener = families.contains(&read_i32(SOI_FAMILY_OFFSET))
+        && read_i32(SOI_KIND_OFFSET) == kind
         && read_i16(SOI_OPTIONS_OFFSET) & libc::SO_ACCEPTCONN as i16 != 0;
-    if !is_unix_listener {
+    if !is_listener {
         return None;
     }
     Some(read_i16(SOI_STATE_OFFSET) & SOI_S_DRAINING != 0)
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn listener_draining(_fd: i32) -> Option<bool> {
+fn socket_listener_draining(_fd: i32, _family: ListenerFamily) -> Option<bool> {
     None
 }
 

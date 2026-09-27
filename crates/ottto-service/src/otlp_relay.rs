@@ -14,11 +14,15 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 pub const LOCAL_RELAY_DEFAULT_PORT: u16 = 43119;
 pub const CLAUDE_CODE_RELAY_PORT: u16 = LOCAL_RELAY_DEFAULT_PORT;
@@ -62,6 +66,36 @@ const MAX_CHUNK_FRAMING_BYTES: usize = 256 * 1024;
 /// radius of a local flood: connections over the cap are rejected with 503
 /// without spawning an unbounded worker.
 const MAX_CONCURRENT_RELAY_CONNECTIONS: usize = 16;
+
+/// Per-connection `accept` failures in a row, with no accepted connection in
+/// between, after which the listener is presumed broken and bound again.
+const RELAY_ACCEPT_FAILURE_LIMIT: u32 = 16;
+/// Pause between per-connection `accept` failures after the first, so a
+/// listener that fails instantly cannot spin the accept thread.
+const RELAY_ACCEPT_RETRY_PAUSE: Duration = Duration::from_millis(10);
+/// Bounded backoff after `accept` runs out of descriptors, buffers or memory.
+const RELAY_ACCEPT_BACKOFF_START: Duration = Duration::from_millis(50);
+const RELAY_ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(2);
+/// Bounded backoff between attempts to bind a replacement listener.
+const RELAY_REBIND_BACKOFF_START: Duration = Duration::from_millis(250);
+const RELAY_REBIND_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Writes one relay line to the daemon's error log with a UTC timestamp. The
+/// log has no timestamps of its own, so without one a relay failure cannot be
+/// matched to the gap it left in captured telemetry.
+macro_rules! relay_log {
+    ($($arg:tt)*) => {
+        eprintln!("{} {}", relay_log_timestamp(), format_args!($($arg)*))
+    };
+}
+
+fn relay_log_timestamp() -> String {
+    let now = OffsetDateTime::now_utc();
+    now.replace_nanosecond(u32::from(now.millisecond()) * 1_000_000)
+        .unwrap_or(now)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string())
+}
 
 /// Live count of in-flight relay connections, released via [`ConnectionGuard`].
 static ACTIVE_RELAY_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -132,8 +166,8 @@ pub fn spawn_claude_code_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
 }
 
 fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<SocketAddr> {
-    let (listener, _port) = match bind_local_relay_listener() {
-        Ok(bound) => bound,
+    let listener = match bind_local_relay_listener(None) {
+        Ok(listener) => listener,
         Err(error) => {
             let _ = daemon.set_relay_state_for_trusted_client(RelayState {
                 state: RelayRuntimeState::Failed,
@@ -150,76 +184,373 @@ fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<Soc
         }
     };
     let local_addr = listener.local_addr()?;
-    let endpoint = format!("http://{local_addr}");
-    let _ = daemon.set_relay_state_for_trusted_client(RelayState {
-        state: RelayRuntimeState::Connected,
-        endpoint: Some(endpoint.clone()),
-        last_connected_at: Some(current_rfc3339()),
-        last_error: None,
-    });
+    let _ = daemon.set_relay_state_for_trusted_client(relay_connected_state(local_addr));
 
-    thread::spawn(move || {
-        for incoming in listener.incoming() {
-            match incoming {
-                Ok(mut stream) => {
-                    // Bound per-connection I/O time before doing anything else
-                    // so a slow or stalled client trips the timeout instead of
-                    // blocking a worker thread forever.
-                    apply_relay_io_timeouts(&stream);
-
-                    // Cap simultaneously-handled connections. Over the cap we
-                    // reject with 503 on the accept thread without spawning an
-                    // unbounded worker, so a local flood can't exhaust threads
-                    // or memory. The guard releases the slot on handler exit.
-                    let Some(guard) = ConnectionGuard::acquire() else {
-                        let _ = write_json_response(
-                            &mut stream,
-                            503,
-                            json!({"error":"relay_busy","message":"Too many concurrent local relay connections"}),
-                        );
-                        continue;
-                    };
-
-                    let client_daemon = daemon.clone();
-                    thread::spawn(move || {
-                        let _guard = guard;
-                        if let Err(error) = handle_client(stream, source, client_daemon) {
-                            // BrokenPipe / ConnectionReset are routine when the
-                            // upstream agent (Codex / Claude Code) times out
-                            // before we finish writing the response — drop
-                            // those silently so we don't fill the daemon log
-                            // with one line per disconnected client. Slow-client
-                            // I/O timeouts are likewise routine. Everything else
-                            // still surfaces.
-                            if !client_disconnect_during_write(&error) {
-                                eprintln!("local OTLP relay request failed: {error}");
-                            }
-                        }
-                    });
-                }
-                Err(error) => {
-                    eprintln!("local OTLP relay listener failed: {error}");
-                    break;
-                }
-            }
-        }
-    });
+    let state_daemon = daemon.clone();
+    thread::Builder::new()
+        .name("ottto-otlp-relay".to_string())
+        .spawn(move || {
+            supervise_relay_listener(
+                listener,
+                |port| bind_local_relay_listener(Some(port)),
+                |state| {
+                    let _ = state_daemon.set_relay_state_for_trusted_client(state);
+                },
+                |stream| dispatch_relay_connection(stream, source, &daemon),
+            )
+        })
+        .context("spawn local OTLP relay accept thread")?;
 
     Ok(local_addr)
 }
 
-fn bind_local_relay_listener() -> Result<(TcpListener, u16)> {
-    let mut last_error = None;
+/// Hands one accepted relay connection to a worker thread.
+fn dispatch_relay_connection(mut stream: TcpStream, source: SnapshotSource, daemon: &LocalDaemon) {
+    // Bound per-connection I/O time before doing anything else so a slow or
+    // stalled client trips the timeout instead of blocking a worker thread
+    // forever.
+    apply_relay_io_timeouts(&stream);
+
+    // Cap simultaneously-handled connections. Over the cap we reject with 503
+    // on the accept thread without spawning an unbounded worker, so a local
+    // flood can't exhaust threads or memory. The guard releases the slot on
+    // handler exit.
+    let Some(guard) = ConnectionGuard::acquire() else {
+        let _ = write_json_response(
+            &mut stream,
+            503,
+            json!({"error":"relay_busy","message":"Too many concurrent local relay connections"}),
+        );
+        return;
+    };
+
+    let client_daemon = daemon.clone();
+    // `thread::spawn` panics when the OS refuses a thread, and that panic
+    // would end the accept thread with it. A refused worker drops only its
+    // own connection (and its guard, releasing the slot).
+    let spawned = thread::Builder::new().spawn(move || {
+        let _guard = guard;
+        if let Err(error) = handle_client(stream, source, client_daemon) {
+            // BrokenPipe / ConnectionReset are routine when the upstream agent
+            // (Codex / Claude Code) times out before we finish writing the
+            // response — drop those silently so we don't fill the daemon log
+            // with one line per disconnected client. Slow-client I/O timeouts
+            // are likewise routine. Everything else still surfaces.
+            if !client_disconnect_during_write(&error) {
+                relay_log!("local OTLP relay request failed: {error}");
+            }
+        }
+    });
+    if let Err(error) = spawned {
+        relay_log!("local OTLP relay dropped a connection: no worker thread: {error}");
+    }
+}
+
+/// Keeps the relay port served for the life of the daemon.
+///
+/// The accept loop used to end on the first failed `accept`, which dropped the
+/// listener while the relay state still read `Connected`: every OTLP request
+/// after that was refused until the daemon restarted. Now the loop only gives
+/// up when the listening socket itself is unusable. The relay then reads
+/// `Failed` until a fresh listener is bound, on the same port when possible so
+/// agents configured for it reconnect without any change.
+fn supervise_relay_listener(
+    mut listener: TcpListener,
+    mut rebind: impl FnMut(u16) -> Result<TcpListener>,
+    mut report: impl FnMut(RelayState),
+    mut dispatch: impl FnMut(TcpStream),
+) {
+    loop {
+        let bound_addr = listener.local_addr().ok();
+        let failure = run_relay_accept_loop(&mut listener, &mut dispatch);
+        relay_log!("local OTLP relay listener stopped: {failure}; binding a new listener");
+        report(relay_listener_failed_state(bound_addr));
+        release_relay_listener(listener, bound_addr);
+        let port = bound_addr.map_or(LOCAL_RELAY_DEFAULT_PORT, |addr| addr.port());
+        listener = rebind_relay_listener(port, &mut rebind);
+        match listener.local_addr() {
+            Ok(addr) => {
+                relay_log!("local OTLP relay listening again at http://{addr}");
+                report(relay_connected_state(addr));
+            }
+            Err(error) => relay_log!("local OTLP relay rebound on an unknown address: {error}"),
+        }
+    }
+}
+
+/// Why [`run_relay_accept_loop`] gave up on its listener.
+#[derive(Debug)]
+enum RelayListenerFailure {
+    /// `accept` failed in a way that only a broken listening socket produces.
+    Unusable(io::Error),
+    /// XNU's `SS_DRAINING` is set on the listener: a descriptor for it was
+    /// closed while a thread was blocked on it. From then on a blocking
+    /// `accept` fails with `ECONNABORTED` once per incoming connection, so the
+    /// socket never serves again (see `unix_socket::serve_listener`).
+    Draining(io::Error),
+    /// Per-connection failures kept coming without a single accepted
+    /// connection in between, the pattern of a drained listener where the
+    /// drain cannot be read directly.
+    RepeatedFailures { count: u32, last: io::Error },
+}
+
+impl std::fmt::Display for RelayListenerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unusable(error) => write!(formatter, "listener unusable ({error})"),
+            Self::Draining(error) => write!(formatter, "listener draining ({error})"),
+            Self::RepeatedFailures { count, last } => {
+                write!(formatter, "{count} accept failures in a row (last: {last})")
+            }
+        }
+    }
+}
+
+/// What the accept loop does after one failed `accept`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptErrorAction {
+    /// A per-connection failure, such as a client that hung up before the
+    /// connection was accepted. The listener is fine: accept the next one.
+    Retry,
+    /// The process or the kernel ran out of descriptors, buffers or memory.
+    /// Pause briefly so the loop does not spin, then accept again.
+    Backoff,
+    /// The listening socket itself is gone or broken: bind a new one.
+    Rebind,
+}
+
+fn classify_accept_error(error: &io::Error) -> AcceptErrorAction {
+    #[cfg(unix)]
+    if let Some(code) = error.raw_os_error() {
+        match code {
+            libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM => {
+                return AcceptErrorAction::Backoff;
+            }
+            libc::EBADF | libc::ENOTSOCK | libc::EINVAL | libc::EOPNOTSUPP | libc::EFAULT => {
+                return AcceptErrorAction::Rebind;
+            }
+            _ => {}
+        }
+    }
+    match error.kind() {
+        io::ErrorKind::OutOfMemory => AcceptErrorAction::Backoff,
+        io::ErrorKind::InvalidInput => AcceptErrorAction::Rebind,
+        // ConnectionAborted, ConnectionReset, Interrupted, WouldBlock,
+        // TimedOut, and anything unrecognised. Unrecognised errors still
+        // count toward RELAY_ACCEPT_FAILURE_LIMIT, so a listener that fails
+        // them forever is rebound rather than retried forever.
+        _ => AcceptErrorAction::Retry,
+    }
+}
+
+/// The accept side of a relay listener, split out so tests can inject
+/// `accept` failures.
+trait RelayAcceptor {
+    fn accept_stream(&mut self) -> io::Result<TcpStream>;
+    /// `Some(true)` when the listener is drained; `None` when that cannot be
+    /// measured on this platform.
+    fn draining(&self) -> Option<bool>;
+}
+
+impl RelayAcceptor for TcpListener {
+    fn accept_stream(&mut self) -> io::Result<TcpStream> {
+        self.accept().map(|(stream, _)| stream)
+    }
+
+    fn draining(&self) -> Option<bool> {
+        #[cfg(unix)]
+        {
+            crate::control_plane_health::tcp_listener_draining(self.as_raw_fd())
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+}
+
+/// Accepts relay connections until the listener cannot continue. It never
+/// returns because of one connection's failure.
+fn run_relay_accept_loop(
+    acceptor: &mut impl RelayAcceptor,
+    dispatch: &mut impl FnMut(TcpStream),
+) -> RelayListenerFailure {
+    let mut failures_in_a_row = 0_u32;
+    let mut retries_in_a_row = 0_u32;
+    loop {
+        let error = match acceptor.accept_stream() {
+            Ok(stream) => {
+                failures_in_a_row = 0;
+                retries_in_a_row = 0;
+                dispatch(stream);
+                continue;
+            }
+            Err(error) => error,
+        };
+        failures_in_a_row = failures_in_a_row.saturating_add(1);
+        match classify_accept_error(&error) {
+            AcceptErrorAction::Retry => {
+                retries_in_a_row = retries_in_a_row.saturating_add(1);
+                if error.kind() == io::ErrorKind::ConnectionAborted
+                    && acceptor.draining() == Some(true)
+                {
+                    return RelayListenerFailure::Draining(error);
+                }
+                if retries_in_a_row >= RELAY_ACCEPT_FAILURE_LIMIT {
+                    return RelayListenerFailure::RepeatedFailures {
+                        count: retries_in_a_row,
+                        last: error,
+                    };
+                }
+                relay_log!("local OTLP relay accept failed; still listening: {error}");
+                if retries_in_a_row > 1 {
+                    thread::sleep(RELAY_ACCEPT_RETRY_PAUSE);
+                }
+            }
+            AcceptErrorAction::Backoff => {
+                let pause = relay_accept_backoff(failures_in_a_row);
+                relay_log!("local OTLP relay accept failed; retrying in {pause:?}: {error}");
+                thread::sleep(pause);
+            }
+            AcceptErrorAction::Rebind => return RelayListenerFailure::Unusable(error),
+        }
+    }
+}
+
+fn relay_accept_backoff(failures_in_a_row: u32) -> Duration {
+    let doublings = failures_in_a_row.saturating_sub(1).min(16);
+    RELAY_ACCEPT_BACKOFF_START
+        .saturating_mul(1 << doublings)
+        .min(RELAY_ACCEPT_BACKOFF_MAX)
+}
+
+/// Binds a replacement listener, retrying with a bounded backoff for as long
+/// as it takes. The relay reads `Failed` in the meantime.
+fn rebind_relay_listener(
+    port: u16,
+    rebind: &mut impl FnMut(u16) -> Result<TcpListener>,
+) -> TcpListener {
+    let mut pause = RELAY_REBIND_BACKOFF_START;
+    loop {
+        match rebind(port) {
+            Ok(listener) => return listener,
+            Err(error) => {
+                relay_log!("local OTLP relay rebind failed; retrying in {pause:?}: {error:#}");
+                thread::sleep(pause);
+                pause = pause.saturating_mul(2).min(RELAY_REBIND_BACKOFF_MAX);
+            }
+        }
+    }
+}
+
+/// Closes a listener the accept loop gave up on, so its port can be bound
+/// again.
+///
+/// A drained listener can mean that something closed this listener's
+/// descriptor underneath it. The number may then already belong to another
+/// file, and closing it would close that file. So the descriptor is closed only
+/// while it still names this listening socket, and abandoned otherwise.
+fn release_relay_listener(listener: TcpListener, bound_addr: Option<SocketAddr>) {
+    let still_ours =
+        bound_addr.is_some() && listener.local_addr().ok() == bound_addr && is_listening(&listener);
+    if still_ours {
+        drop(listener);
+        return;
+    }
+    relay_log!(
+        "local OTLP relay listener descriptor no longer names the relay socket; leaving it open"
+    );
+    #[cfg(unix)]
+    {
+        let _ = listener.into_raw_fd();
+    }
+    #[cfg(not(unix))]
+    {
+        std::mem::forget(listener);
+    }
+}
+
+/// Whether the listener's descriptor still names a listening TCP socket.
+fn is_listening(listener: &TcpListener) -> bool {
+    // macOS refuses `getsockopt(SO_ACCEPTCONN)` with ENOPROTOOPT. The drain
+    // probe reads the same flag from kernel bookkeeping and answers only for
+    // a listening TCP socket.
+    #[cfg(target_os = "macos")]
+    {
+        crate::control_plane_health::tcp_listener_draining(listener.as_raw_fd()).is_some()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut accepting: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: getsockopt writes at most `length` bytes into `accepting`,
+        // which is a live c_int of exactly that size.
+        let rc = unsafe {
+            libc::getsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ACCEPTCONN,
+                (&mut accepting as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        };
+        rc == 0 && accepting != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = listener;
+        true
+    }
+}
+
+fn relay_connected_state(addr: SocketAddr) -> RelayState {
+    RelayState {
+        state: RelayRuntimeState::Connected,
+        endpoint: Some(format!("http://{addr}")),
+        last_connected_at: Some(current_rfc3339()),
+        last_error: None,
+    }
+}
+
+fn relay_listener_failed_state(bound_addr: Option<SocketAddr>) -> RelayState {
+    RelayState {
+        state: RelayRuntimeState::Failed,
+        endpoint: Some(
+            bound_addr
+                .map(|addr| format!("http://{addr}"))
+                .unwrap_or_else(default_local_relay_base_url),
+        ),
+        last_connected_at: None,
+        last_error: Some(StableMessage {
+            code: "relay_listener_failed".to_string(),
+            text:
+                "The local OTLP relay stopped accepting connections and is binding a new listener."
+                    .to_string(),
+        }),
+    }
+}
+
+/// Binds the relay listener. `preferred_port` (the port a failed listener
+/// held) is tried first, then the default port and the per-user fallbacks.
+fn bind_local_relay_listener(preferred_port: Option<u16>) -> Result<TcpListener> {
+    let mut ports = Vec::new();
+    if let Some(port) = preferred_port {
+        ports.push(port);
+    }
     for port in candidate_relay_ports(current_uid()) {
+        push_unique_port(&mut ports, port);
+    }
+    let mut last_error = None;
+    for port in ports {
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         match TcpListener::bind(bind_addr) {
             Ok(listener) => {
                 if port != LOCAL_RELAY_DEFAULT_PORT {
-                    eprintln!(
+                    relay_log!(
                         "local OTLP relay default port {LOCAL_RELAY_DEFAULT_PORT} is unavailable; using fallback port {port}"
                     );
                 }
-                return Ok((listener, port));
+                return Ok(listener);
             }
             Err(error) => {
                 last_error = Some(error);
@@ -372,7 +703,9 @@ fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDae
         ) {
             Ok(_) => {}
             Err(_error) => {
-                eprintln!("local Claude effort reduction skipped: invalid local OTLP logs payload");
+                relay_log!(
+                    "local Claude effort reduction skipped: invalid local OTLP logs payload"
+                );
             }
         }
     }
@@ -388,7 +721,7 @@ fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDae
         ) {
             Ok(_) => {}
             Err(_error) => {
-                eprintln!(
+                relay_log!(
                     "local Claude trace ownership reduction skipped: invalid local OTLP traces payload"
                 );
             }
@@ -1859,6 +2192,269 @@ mod tests {
 
         drop(guards);
         assert_eq!(ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst), baseline);
+    }
+
+    /// One scripted `accept` result for [`ScriptedAcceptor`].
+    enum AcceptStep {
+        /// Fail with this errno, as the kernel would.
+        Fail(i32),
+        /// Accept a real pending connection.
+        Accept,
+    }
+
+    /// A relay acceptor whose `accept` fails on cue, in front of a real
+    /// listener. Running out of script is a test failure: it means the loop
+    /// kept going after it should have given up.
+    struct ScriptedAcceptor {
+        listener: TcpListener,
+        steps: std::collections::VecDeque<AcceptStep>,
+        draining: Option<bool>,
+    }
+
+    impl ScriptedAcceptor {
+        fn new(steps: Vec<AcceptStep>, draining: Option<bool>) -> Self {
+            Self {
+                listener: TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind test listener"),
+                steps: steps.into(),
+                draining,
+            }
+        }
+
+        fn connect_client(&self) -> TcpStream {
+            let stream = TcpStream::connect(self.listener.local_addr().expect("local addr"))
+                .expect("connect to the test listener");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("client read timeout");
+            stream
+        }
+    }
+
+    impl RelayAcceptor for ScriptedAcceptor {
+        fn accept_stream(&mut self) -> io::Result<TcpStream> {
+            match self
+                .steps
+                .pop_front()
+                .expect("the accept loop kept going after its script ended")
+            {
+                AcceptStep::Fail(code) => Err(io::Error::from_raw_os_error(code)),
+                AcceptStep::Accept => self.listener.accept().map(|(stream, _)| stream),
+            }
+        }
+
+        fn draining(&self) -> Option<bool> {
+            self.draining
+        }
+    }
+
+    fn serve_marker(mut stream: TcpStream) {
+        let _ = stream.write_all(b"served");
+    }
+
+    fn read_marker(mut client: TcpStream) -> Vec<u8> {
+        let mut received = Vec::new();
+        let _ = client.read_to_end(&mut received);
+        received
+    }
+
+    #[test]
+    fn accept_errors_are_classified_by_what_they_say_about_the_listener() {
+        let action = |code| classify_accept_error(&io::Error::from_raw_os_error(code));
+        for code in [
+            libc::ECONNABORTED,
+            libc::ECONNRESET,
+            libc::EINTR,
+            libc::EAGAIN,
+            libc::EPROTO,
+        ] {
+            assert_eq!(action(code), AcceptErrorAction::Retry, "errno {code}");
+        }
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert_eq!(action(code), AcceptErrorAction::Backoff, "errno {code}");
+        }
+        for code in [libc::EBADF, libc::ENOTSOCK, libc::EINVAL, libc::EOPNOTSUPP] {
+            assert_eq!(action(code), AcceptErrorAction::Rebind, "errno {code}");
+        }
+    }
+
+    #[test]
+    fn accept_loop_keeps_serving_after_per_connection_and_resource_errors() {
+        // The incident: one ECONNABORTED ended the loop and the port stayed
+        // dead until the daemon restarted. Every error before the final EBADF
+        // must leave the loop serving.
+        let mut acceptor = ScriptedAcceptor::new(
+            vec![
+                AcceptStep::Fail(libc::ECONNABORTED),
+                AcceptStep::Accept,
+                AcceptStep::Fail(libc::ECONNRESET),
+                AcceptStep::Fail(libc::EINTR),
+                AcceptStep::Fail(libc::EAGAIN),
+                AcceptStep::Fail(libc::EMFILE),
+                AcceptStep::Fail(libc::ENOBUFS),
+                AcceptStep::Accept,
+                AcceptStep::Fail(libc::EBADF),
+            ],
+            Some(false),
+        );
+        let first = acceptor.connect_client();
+        let second = acceptor.connect_client();
+
+        let mut served = 0;
+        let failure = run_relay_accept_loop(&mut acceptor, &mut |stream| {
+            served += 1;
+            serve_marker(stream);
+        });
+
+        assert_eq!(served, 2);
+        assert_eq!(read_marker(first), b"served");
+        assert_eq!(read_marker(second), b"served");
+        assert!(acceptor.steps.is_empty());
+        assert!(
+            matches!(&failure, RelayListenerFailure::Unusable(error) if error.raw_os_error() == Some(libc::EBADF)),
+            "{failure}"
+        );
+    }
+
+    #[test]
+    fn accept_loop_gives_up_on_a_draining_listener() {
+        let mut acceptor = ScriptedAcceptor::new(
+            vec![AcceptStep::Accept, AcceptStep::Fail(libc::ECONNABORTED)],
+            Some(true),
+        );
+        let client = acceptor.connect_client();
+
+        let failure = run_relay_accept_loop(&mut acceptor, &mut serve_marker);
+
+        assert_eq!(read_marker(client), b"served");
+        assert!(
+            matches!(failure, RelayListenerFailure::Draining(_)),
+            "{failure}"
+        );
+    }
+
+    #[test]
+    fn accept_loop_rebinds_only_after_failures_with_no_success_between() {
+        // Where the drain cannot be read, a run of failures with no accepted
+        // connection is the signal. Aborts from clients that hung up early
+        // are interleaved with successes and must never add up to it.
+        let aborts = |count| (0..count).map(|_| AcceptStep::Fail(libc::ECONNABORTED));
+        let limit = RELAY_ACCEPT_FAILURE_LIMIT as usize;
+        let mut steps: Vec<AcceptStep> = aborts(limit - 1).collect();
+        steps.push(AcceptStep::Accept);
+        steps.extend(aborts(limit));
+        let mut acceptor = ScriptedAcceptor::new(steps, None);
+        let client = acceptor.connect_client();
+
+        let failure = run_relay_accept_loop(&mut acceptor, &mut serve_marker);
+
+        assert_eq!(read_marker(client), b"served");
+        assert!(acceptor.steps.is_empty());
+        assert!(
+            matches!(
+                failure,
+                RelayListenerFailure::RepeatedFailures { count, .. }
+                    if count == RELAY_ACCEPT_FAILURE_LIMIT
+            ),
+            "{failure}"
+        );
+    }
+
+    #[test]
+    fn relay_accept_backoff_is_bounded() {
+        assert_eq!(relay_accept_backoff(1), RELAY_ACCEPT_BACKOFF_START);
+        assert_eq!(relay_accept_backoff(2), RELAY_ACCEPT_BACKOFF_START * 2);
+        assert_eq!(relay_accept_backoff(u32::MAX), RELAY_ACCEPT_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn relay_log_timestamp_is_utc_rfc3339_to_the_millisecond() {
+        let stamp = relay_log_timestamp();
+        let parsed = OffsetDateTime::parse(&stamp, &Rfc3339).expect("rfc3339");
+        assert_eq!(parsed.offset(), time::UtcOffset::UTC, "{stamp}");
+        assert_eq!(parsed.nanosecond() % 1_000_000, 0, "{stamp}");
+        assert!(stamp.ends_with('Z'), "{stamp}");
+    }
+
+    /// Drains a live relay listener the way XNU does (see
+    /// `unix_socket::tests::drain_listener`) and proves the supervisor reports
+    /// `Failed`, binds a fresh listener on the same port, reports `Connected`
+    /// again, and serves.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn supervisor_rebinds_a_drained_listener_on_the_same_port() {
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind relay");
+        let addr = listener.local_addr().expect("relay addr");
+        // SAFETY: dup of a descriptor we own; the copy is closed below.
+        let duplicate = unsafe { libc::dup(listener.as_raw_fd()) };
+        assert!(duplicate >= 0, "dup listener");
+
+        let (state_tx, state_rx) = mpsc::channel();
+        thread::spawn(move || {
+            supervise_relay_listener(
+                listener,
+                |port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).context("rebind test relay"),
+                move |state| {
+                    let _ = state_tx.send(state);
+                },
+                serve_marker,
+            )
+        });
+        let served = || {
+            TcpStream::connect_timeout(&addr, Duration::from_secs(1))
+                .ok()
+                .map(|client| {
+                    let _ = client.set_read_timeout(Some(Duration::from_secs(1)));
+                    read_marker(client) == b"served"
+                })
+                .unwrap_or(false)
+        };
+        assert!(served(), "the relay serves before the drain");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            // SAFETY: accept on an open listening descriptor; the peer address
+            // is not requested.
+            let rc = unsafe { libc::accept(duplicate, std::ptr::null_mut(), std::ptr::null_mut()) };
+            let _ = done_tx.send((rc, io::Error::last_os_error().raw_os_error()));
+        });
+        thread::sleep(Duration::from_millis(200));
+        // SAFETY: closes only the duplicate, while the thread above is blocked
+        // in accept on it.
+        unsafe { libc::close(duplicate) };
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("closing the descriptor wakes the blocked accept"),
+            (-1, Some(libc::ECONNABORTED)),
+            "the listener must now be draining for this test to mean anything"
+        );
+
+        // A connection that reaches the drained listener is lost; the next
+        // one must reach its replacement.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !served() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the relay never served again after the drain"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let failed = state_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("failed state");
+        assert_eq!(failed.state, RelayRuntimeState::Failed);
+        assert_eq!(
+            failed.last_error.map(|error| error.code).as_deref(),
+            Some("relay_listener_failed")
+        );
+        let connected = state_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("connected state");
+        assert_eq!(connected.state, RelayRuntimeState::Connected);
+        assert_eq!(connected.endpoint, Some(format!("http://{addr}")));
     }
 
     #[test]
