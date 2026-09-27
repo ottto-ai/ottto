@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 390,
-  "content_sha256": "34edd1f2558af5cde24aa0ae3f131f6c124c7580d6539426be32d2c291f7107a",
+  "content_sha256": "64fcb1900c46a8809cf2c9bf52aeb43d2680ce88458723245631b31a85ac763c",
   "files": [
     {
       "executable": false,
@@ -704,7 +704,7 @@
     },
     {
       "executable": false,
-      "mode": "0600",
+      "mode": "0644",
       "path": "crates/ottto-service/src/codex_process_homes.rs",
       "sha256": "8a19bf8b06d34d18f4c34a6598b717ebda30b13e5e40dacfb316492ef96751b7",
       "size_bytes": 3702
