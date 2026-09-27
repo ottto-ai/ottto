@@ -127,7 +127,7 @@ impl Drop for ListenerFdGuard {
 
 /// Arbitrary nonzero guard value ("ottto").
 #[cfg(target_os = "macos")]
-const LISTENER_GUARD_ID: u64 = 0x6f74_7474_6f;
+const LISTENER_GUARD_ID: u64 = 0x006f_7474_746f;
 /// `GUARD_CLOSE | GUARD_DUP` from `<sys/guarded.h>`. The dup guard is what
 /// also catches a `dup2` onto the listener's number; spawned children still
 /// start normally (a guarded descriptor is close-on-exec).
