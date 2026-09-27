@@ -262,9 +262,22 @@ fn supervise_relay_listener(
 ) {
     loop {
         let bound_addr = listener.local_addr().ok();
+        #[cfg(unix)]
+        let fd = listener.as_raw_fd();
+        #[cfg(unix)]
+        let fd_guard = crate::fd_guard::ListenerFdGuard::arm_if_enabled(fd, "local OTLP relay");
         let failure = run_relay_accept_loop(&mut listener, &mut dispatch);
         relay_log!("local OTLP relay listener stopped: {failure}; binding a new listener");
+        #[cfg(unix)]
+        relay_log!(
+            "local OTLP relay listener {}; {}",
+            crate::fd_guard::describe_descriptor(fd),
+            crate::fd_guard::descriptor_census()
+        );
         report(relay_listener_failed_state(bound_addr));
+        // The guard must come off before the listener's own close.
+        #[cfg(unix)]
+        drop(fd_guard);
         release_relay_listener(listener, bound_addr);
         let port = bound_addr.map_or(LOCAL_RELAY_DEFAULT_PORT, |addr| addr.port());
         listener = rebind_relay_listener(port, &mut rebind);
