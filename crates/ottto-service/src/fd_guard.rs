@@ -181,21 +181,6 @@ pub(crate) fn describe_descriptor(fd: RawFd) -> String {
     format!("fd {fd} is a socket that is not listening")
 }
 
-/// `(st_dev, st_ino)` of what `fd` names, or `None` when it is closed. Unix
-/// sockets get a unique inode, so this tells whether a listener's number still
-/// names the same socket. (TCP sockets report inode 0 on macOS; the relay does
-/// not need this because a closed descriptor wakes its blocking `accept`.)
-pub(crate) fn descriptor_identity(fd: RawFd) -> Option<(u64, u64)> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: fstat writes one stat into the live buffer.
-    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    // SAFETY: fstat succeeded, so the buffer is initialized.
-    let stat = unsafe { stat.assume_init() };
-    Some((stat.st_dev as u64, stat.st_ino as u64))
-}
-
 /// A one-line count of this process's open descriptors by kind. A steadily
 /// growing count alongside a listener failure points at a descriptor leak.
 pub(crate) fn descriptor_census() -> String {

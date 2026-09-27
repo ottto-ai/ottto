@@ -100,35 +100,24 @@ fn serve_listener(
     let fd_guard =
         crate::fd_guard::ListenerFdGuard::arm_if_enabled(listener.as_raw_fd(), "unix control");
 
-    // What the descriptor names now. A stale `close` or `dup2` elsewhere in
-    // the process can take the number away while this loop sleeps in `poll`,
-    // and XNU does not wake a `poll` whose descriptor is closed or replaced:
-    // the socket would go silent for good. So the wait below wakes every
-    // LISTENER_RECHECK_INTERVAL and compares.
-    let identity = crate::fd_guard::descriptor_identity(listener.as_raw_fd());
-
     let mut served = 0_usize;
     let mut workers = Vec::new();
     loop {
-        let fd = listener.as_raw_fd();
-        let lost = match listener.accept() {
-            Ok((stream, _)) => Ok(stream),
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                // A stale `close` or `dup2` elsewhere in the process can take
+                // the descriptor away during this wait, and XNU does not wake
+                // a `poll` whose descriptor is closed or replaced: the socket
+                // would go silent for good. Waking regularly lets the next
+                // `accept` report the loss.
                 match wait_for_fd(
-                    fd,
+                    listener.as_raw_fd(),
                     libc::POLLIN,
                     Some(Instant::now() + LISTENER_RECHECK_INTERVAL),
                 ) {
                     Ok(()) => continue,
-                    Err(error)
-                        if error.kind() == ErrorKind::TimedOut
-                            && crate::fd_guard::descriptor_identity(fd) == identity =>
-                    {
-                        continue
-                    }
-                    Err(error) if error.kind() == ErrorKind::TimedOut => Err(
-                        std::io::Error::other("descriptor no longer names the listener"),
-                    ),
+                    Err(error) if error.kind() == ErrorKind::TimedOut => continue,
                     Err(error) => {
                         return Err(error)
                             .with_context(|| format!("wait for socket {}", path.display()))
@@ -136,19 +125,12 @@ fn serve_listener(
                 }
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            // `poll` returns at once with POLLNVAL on a closed number, so
-            // retrying these would spin.
-            Err(error) if accept_error_means_listener_gone(&error) => Err(error),
-            Err(error) => {
-                eprintln!("socket listener {} accept failed: {error}", path.display());
-                continue;
-            }
-        };
-        let stream = match lost {
-            Ok(stream) => stream,
-            Err(error) => {
-                // Stop, and leave the number alone: it may already belong to
-                // another file, and closing it would close that file.
+            Err(error) if accept_error_means_listener_gone(&error) => {
+                // The descriptor was closed or now names another file. `poll`
+                // returns at once with POLLNVAL on a closed number, so retrying
+                // would spin. Stop, and leave the number alone: it may already
+                // belong to another file, and closing it would close that file.
+                let fd = listener.as_raw_fd();
                 eprintln!(
                     "socket listener {} lost its descriptor: {error}; {}; {}; stopping",
                     path.display(),
@@ -160,6 +142,10 @@ fn serve_listener(
                 let _ = listener.into_raw_fd();
                 return Err(error)
                     .with_context(|| format!("accept on socket listener {}", path.display()));
+            }
+            Err(error) => {
+                eprintln!("socket listener {} accept failed: {error}", path.display());
+                continue;
             }
         };
         let path = path.to_path_buf();
@@ -186,8 +172,8 @@ fn serve_listener(
     Ok(())
 }
 
-/// How often an idle control listener checks that its descriptor still
-/// names its socket (see `serve_listener`).
+/// Longest `poll` wait between `accept` attempts on an idle control listener
+/// (see `serve_listener`).
 const LISTENER_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Whether a failed `accept` says the listening descriptor itself is gone,
