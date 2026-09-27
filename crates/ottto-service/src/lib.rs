@@ -9,6 +9,7 @@ pub mod claude_local_otel;
 pub mod claude_upkeep;
 pub mod client_report;
 pub mod cloud_sessions;
+mod codex_process_homes;
 pub(crate) mod command_env;
 pub mod context_composition;
 pub mod context_footprint;

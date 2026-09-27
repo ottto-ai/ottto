@@ -959,7 +959,11 @@ fn launchd_job_pid(label: &str) -> Option<u32> {
 }
 
 #[cfg(target_os = "macos")]
-fn bounded_command_stdout(program: &str, arguments: &[&str], maximum: usize) -> Option<Vec<u8>> {
+pub(crate) fn bounded_command_stdout(
+    program: &str,
+    arguments: &[&str],
+    maximum: usize,
+) -> Option<Vec<u8>> {
     let mut child = Command::new(program)
         .args(arguments)
         .stdin(Stdio::null())

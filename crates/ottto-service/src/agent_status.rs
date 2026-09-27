@@ -996,18 +996,7 @@ fn collect_codex_status_snapshots(
         .iter()
         .map(|candidate| candidate.slot.home.clone())
         .collect();
-    // A separate SQLite home is a scan root, never proof of the credential
-    // home that authenticated the transcript's process.
-    if let Some(sqlite_home) = std::env::var_os("CODEX_SQLITE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-    {
-        if !codex_scan_homes.contains(&sqlite_home) {
-            codex_scan_homes.push(sqlite_home);
-        }
-    }
-
-    let codex_home_bindings = candidates
+    let mut codex_home_bindings: Vec<CodexHomeBinding> = candidates
         .iter()
         .filter_map(|candidate| {
             let (account_identifier_hash, workspace_identifier_hash) =
@@ -1020,6 +1009,63 @@ fn collect_codex_status_snapshots(
             })
         })
         .collect();
+    let mut process_bindings: BTreeMap<PathBuf, Option<(String, String, std::time::SystemTime)>> =
+        codex_home_bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.home.clone(),
+                    Some((
+                        binding.account_identifier_hash.clone(),
+                        binding.workspace_identifier_hash.clone(),
+                        binding.auth_modified_at,
+                    )),
+                )
+            })
+            .collect();
+    for process in crate::codex_process_homes::running_codex_homes() {
+        // The process holds a rollout in this exact home. Do not publish a
+        // current status row for an unregistered home: it can contain labels.
+        let process_binding = process_bindings
+            .entry(process.auth_home.clone())
+            .or_insert_with(|| {
+                let candidate = collect_codex_home_candidate(
+                    CodexHomeSlot {
+                        slot_id: "process_home".to_string(),
+                        ownership: CodexAccountSlotOwnershipV1::Managed,
+                        home: process.auth_home.clone(),
+                        registered_binding: None,
+                    },
+                    &captured_at,
+                    &expires_at,
+                );
+                candidate
+                    .binding
+                    .zip(candidate.auth_modified_at)
+                    .map(|((account, workspace), modified)| (account, workspace, modified))
+            })
+            .clone();
+        if !codex_scan_homes.contains(&process.auth_home) {
+            codex_scan_homes.push(process.auth_home.clone());
+        }
+        if let Some((account_identifier_hash, workspace_identifier_hash, modified)) =
+            &process_binding
+        {
+            let binding = CodexHomeBinding {
+                home: process.auth_home,
+                account_identifier_hash: account_identifier_hash.clone(),
+                workspace_identifier_hash: workspace_identifier_hash.clone(),
+                auth_modified_at: *modified,
+            };
+            if !codex_home_bindings.iter().any(|existing| {
+                existing.home == binding.home
+                    && existing.account_identifier_hash == binding.account_identifier_hash
+                    && existing.workspace_identifier_hash == binding.workspace_identifier_hash
+            }) {
+                codex_home_bindings.push(binding);
+            }
+        }
+    }
 
     let mut snapshots = Vec::new();
     let mut winning_by_binding = BTreeMap::<(String, String), usize>::new();
@@ -1200,19 +1246,6 @@ fn collect_codex_slot_candidates(
                     binding.account_identifier_hash.clone(),
                     binding.workspace_identifier_hash.clone(),
                 )),
-            });
-        }
-    }
-    if let Some(home) = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-    {
-        if !slots.iter().any(|slot| slot.home == home) {
-            slots.push(CodexHomeSlot {
-                slot_id: "codex_home".to_string(),
-                ownership: CodexAccountSlotOwnershipV1::Managed,
-                home,
-                registered_binding: None,
             });
         }
     }

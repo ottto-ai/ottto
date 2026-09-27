@@ -17186,6 +17186,10 @@ impl ScanIndex {
             let existing = self.session_account_bindings.get(&key);
             match source {
                 SnapshotSource::Codex => {
+                    if !codex_rows_prove_oauth(item) {
+                        set_session_account_hash(item, None);
+                        continue;
+                    }
                     let owner = existing
                         .cloned()
                         .or_else(|| self.codex_owner_for_item(item, codex_homes));
@@ -17226,22 +17230,6 @@ impl ScanIndex {
         item: &SnapshotItem,
         homes: &[crate::agent_status::CodexHomeBinding],
     ) -> Option<SessionAccountBinding> {
-        if item
-            .model_usage
-            .iter()
-            .chain(
-                item.usage_buckets
-                    .iter()
-                    .flat_map(|bucket| bucket.model_usage.iter()),
-            )
-            .any(|row| {
-                row.auth_mode
-                    .as_deref()
-                    .is_some_and(|mode| mode != "oauth" && mode != "chatgpt")
-            })
-        {
-            return None;
-        }
         let started = OffsetDateTime::parse(item.source_started_at.as_deref()?, &Rfc3339)
             .ok()?
             .unix_timestamp_nanos();
@@ -18570,6 +18558,17 @@ impl ScanIndex {
             })
             .map(|disposition| &disposition.loss)
     }
+}
+
+fn codex_rows_prove_oauth(item: &SnapshotItem) -> bool {
+    let mut rows = item.model_usage.iter().chain(
+        item.usage_buckets
+            .iter()
+            .flat_map(|bucket| bucket.model_usage.iter()),
+    );
+    rows.next()
+        .is_some_and(|row| matches!(row.auth_mode.as_deref(), Some("oauth" | "chatgpt")))
+        && rows.all(|row| matches!(row.auth_mode.as_deref(), Some("oauth" | "chatgpt")))
 }
 
 pub fn source_file_fingerprint(
@@ -42766,6 +42765,32 @@ mod tests {
                 .as_deref(),
             Some("account-a-workspace")
         );
+        let mut incomplete = vec![item.clone()];
+        incomplete[0].model_usage[0].auth_mode = None;
+        incomplete[0].usage_buckets[0].model_usage[0].auth_mode = None;
+        index.bind_session_accounts(
+            SnapshotSource::Codex,
+            "machine-a",
+            &mut incomplete,
+            std::slice::from_ref(&b),
+        );
+        assert!(exact_session_account_hash(&incomplete[0]).is_none());
+        assert_eq!(
+            index.session_account_bindings
+                [&sha256_hex(&["session_owner:v1", "machine-a", "session-a"])]
+                .account_identifier_hash,
+            "account-a"
+        );
+        let mut incompatible = vec![item.clone()];
+        incompatible[0].model_usage[0].auth_mode = Some("api_key".to_string());
+        incompatible[0].usage_buckets[0].model_usage[0].auth_mode = Some("api_key".to_string());
+        index.bind_session_accounts(
+            SnapshotSource::Codex,
+            "machine-a",
+            &mut incompatible,
+            std::slice::from_ref(&b),
+        );
+        assert!(exact_session_account_hash(&incompatible[0]).is_none());
         index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
 
         let mut new_item = item.clone();
@@ -42884,6 +42909,23 @@ mod tests {
         assert!(index
             .bind_session_accounts(SnapshotSource::ClaudeCode, "machine-a", &mut [item], &[])
             .contains("claude-vertex-session-1"));
+    }
+
+    #[test]
+    fn session_usage_upload_body_contains_only_account_hashes() {
+        let mut request = valid_v6_batch_request();
+        let raw_account = "raw-account-123";
+        set_session_account_hash(&mut request.snapshots[0], Some(raw_account));
+        let unsafe_body = serde_json::to_string(&request).expect("serialize negative control");
+        assert!(unsafe_body.contains(raw_account));
+
+        let hash = ottto_core::billing_identity_hash("openai", "account", raw_account)
+            .expect("account hash");
+        set_session_account_hash(&mut request.snapshots[0], Some(&hash));
+        let upload_body = serde_json::to_string(&request).expect("serialize upload body");
+        assert!(!upload_body.contains('@'));
+        assert!(!upload_body.contains(raw_account));
+        assert!(upload_body.contains(&hash));
     }
 
     fn valid_v6_batch_request() -> SnapshotBatchRequest {
