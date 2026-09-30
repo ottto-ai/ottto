@@ -499,7 +499,7 @@ fn persisted_production_upkeep_observation(
     }
     let result_observed_at = if let Some(fence) = &witness.preclaim_descriptor {
         if preclaim_descriptor(descriptor).as_ref() != Some(fence)
-            || parse_timestamp(witness.result_observed_at.as_deref()).is_none_or(|at| at > now)
+            || parse_timestamp(witness.result_observed_at.as_deref()).map_or(true, |at| at > now)
         {
             return None;
         }
@@ -1137,7 +1137,7 @@ fn persist_preclaim_failure(
     }
     let fence = preclaim_descriptor(descriptor).ok_or(())?;
     let due = fence.collection.access_expires_at.as_deref().ok_or(())?;
-    if parse_timestamp(Some(due)).is_none_or(|at| at > now) {
+    if parse_timestamp(Some(due)).map_or(true, |at| at > now) {
         return Err(());
     }
     let _guard = upkeep_state_guard(support_dir).map_err(|_| ())?;

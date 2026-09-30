@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 399,
-  "content_sha256": "7f8c25c4d1c68754b7599115be08120ace3b8b008cab627565af69008dc359af",
+  "content_sha256": "9eb0b700d42bfe0a4f410a445e65364536c3cc9fac944c08dbfbf646fd3eed99",
   "files": [
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_upkeep.rs",
-      "sha256": "39c1f983052a53ba94e1bafc0eac47c97409c595ce5d986f9ff60d8f78581160",
-      "size_bytes": 109888
+      "sha256": "e1ed0ece0a7a13eb3f4fb4fe2f8bec605e34cf4ed80c8924576cc3992bf97f26",
+      "size_bytes": 109892
     },
     {
       "executable": false,
