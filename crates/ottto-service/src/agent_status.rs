@@ -13652,13 +13652,99 @@ exit 1
             "organization-secondary",
             "organization-tertiary",
             "fixture",
-            "claude_slot_",
         ] {
             assert!(
                 !backend_json.contains(forbidden),
                 "backend snapshots leaked forbidden local material"
             );
         }
+        for slot in status.managed_slots.iter().chain(&status.external_slots) {
+            assert!(!backend_json.contains(&slot.slot_id), "raw slot id leaked");
+            if let Some(path) = &slot.config_dir {
+                assert!(
+                    !backend_json.contains(path),
+                    "registered config path leaked"
+                );
+            }
+        }
+        fn assert_public_fields(value: &Value, context: &str) {
+            match value {
+                Value::Object(fields) => {
+                    for (key, child) in fields {
+                        assert!(
+                            ![
+                                "slot_id",
+                                "config_dir",
+                                "service_name",
+                                "account_profile",
+                                "quota_check_diagnostics",
+                                "access_token",
+                                "refresh_token",
+                                "identity_path",
+                                "credential_path",
+                            ]
+                            .contains(&key.as_str()),
+                            "private field leaked: {key}"
+                        );
+                        let next = if context == "diagnostic" && key == "code" {
+                            "diagnostic_code"
+                        } else if key == "diagnostics" {
+                            "diagnostics"
+                        } else {
+                            ""
+                        };
+                        assert_public_fields(child, next);
+                    }
+                }
+                Value::Array(items) => {
+                    for child in items {
+                        assert_public_fields(
+                            child,
+                            if context == "diagnostics" {
+                                "diagnostic"
+                            } else {
+                                ""
+                            },
+                        );
+                    }
+                }
+                Value::String(text) if text.contains("claude_slot_") => {
+                    // Only a diagnostic code from a closed enum is public;
+                    // the same prefix in any other field still fails privacy.
+                    let safe = text == "claude_slot_upkeep_attempt_started"
+                        || text
+                            .strip_prefix("claude_slot_collection_")
+                            .is_some_and(|suffix| {
+                                let value = Value::String(suffix.to_string());
+                                serde_json::from_value::<ClaudeConfigSlotCollectionStateV1>(
+                                    value.clone(),
+                                )
+                                .is_ok()
+                                    || serde_json::from_value::<ClaudeConfigSlotDiagnosticCodeV1>(
+                                        value,
+                                    )
+                                    .is_ok()
+                            })
+                        || text
+                            .strip_prefix("claude_slot_upkeep_")
+                            .is_some_and(|suffix| {
+                                serde_json::from_value::<ClaudeConfigSlotUpkeepResultV1>(
+                                    Value::String(suffix.to_string()),
+                                )
+                                .is_ok()
+                            });
+                    assert!(
+                        context == "diagnostic_code" && safe,
+                        "slot-identifying value leaked"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_public_fields(
+            &serde_json::from_str(&backend_json).expect("backend payload"),
+            "",
+        );
         let local_state =
             fs::read_to_string(claude_slot_collection_state_path()).expect("read local slot state");
         assert!(!local_state.contains(root.to_string_lossy().as_ref()));
