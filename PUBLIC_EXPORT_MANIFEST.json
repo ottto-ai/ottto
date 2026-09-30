@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 396,
-  "content_sha256": "e578b9a7ae71ab1034fb214b2826f4322b2aee32ba6e47c2108d885bdc7acc2b",
+  "candidate_file_count": 397,
+  "content_sha256": "a72fcb3cbb72d25bc86270bc6eabaf0420b45dc9532a4fb1b7893bc396e74952",
   "files": [
     {
       "executable": false,
@@ -671,8 +671,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_browser_auth.rs",
-      "sha256": "9d99674479668c9fec9bfd19264fd4c3551ba04c740ab77e7ef75f4bebe07a44",
-      "size_bytes": 305660
+      "sha256": "253829098f729de899bd38f0859ef8dbfddf319ed2fe3f2cd821021a31586b58",
+      "size_bytes": 312478
     },
     {
       "executable": false,
@@ -1734,6 +1734,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-09-30-claude-stale-auth-root.md",
+      "sha256": "6969d57365eba102605e59e1ac79fc0bcec2d802c5c72327d16e07e9b0b43632",
+      "size_bytes": 1598
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-09-30-configured-subscription-availability.md",
       "sha256": "59b4494785e59356c660c75a0043139f2739235883aaa64679b2390ab368ad75",
       "size_bytes": 2678
@@ -2775,9 +2782,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-30T12:54:44+00:00",
+  "generated_at": "2026-09-30T19:00:13+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 397,
+  "output_file_count": 398,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2811,5 +2818,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "333a193c0c055605850cf2f1dfacd7fa85ba92ae"
+  "source_commit": "55bedc7aa3613646545ff408283f8120cc883d62"
 }

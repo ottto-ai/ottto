@@ -688,56 +688,84 @@ fn synthetic_operation_with_state(
     }
 }
 
+fn reusable_root_candidate(
+    root: &QuarantinedRoot,
+    operation_id: &str,
+    strict_replay: bool,
+) -> Result<Option<String>, String> {
+    let reject = |message: String| {
+        if strict_replay {
+            Err(message)
+        } else {
+            Ok(None)
+        }
+    };
+    if root.pending_registry_removal {
+        return reject("Claude provisional root is pending registry removal".to_string());
+    }
+    let config_dir = if root.config_dir.is_empty() {
+        managed_root()
+            .join(&root.root_id)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        root.config_dir.clone()
+    };
+    if let Err(error) = ottto_core::validate_managed_claude_auth_root(&config_dir) {
+        return reject(error.to_string());
+    }
+    let service_alias = match ClaudeConfigDirSlot::registered(config_dir.clone()) {
+        Ok(slot) => slot.service_name(),
+        Err(error) => return reject(error.to_string()),
+    };
+    if !root.service_alias.is_empty() && root.service_alias != service_alias {
+        return reject("Claude provisional root service alias changed".to_string());
+    }
+    let registry = FileClaudeConfigSlotSettingsStore::default()
+        .load()
+        .map_err(|error| error.to_string())?;
+    let registered_slot = registry
+        .managed_slots
+        .iter()
+        .chain(registry.external_slots.iter())
+        .find(|slot| slot.config_dir.as_deref() == Some(config_dir.as_str()));
+    let exact_same_operation_registration = strict_replay
+        && registry.setup_operation.operation_id.as_deref() == Some(operation_id)
+        && registered_slot.is_some_and(|slot| {
+            registry.setup_operation.slot_id.as_deref() == Some(slot.slot_id.as_str())
+        });
+    if registered_slot.is_some() && !exact_same_operation_registration {
+        return reject("registered Claude root cannot be reused as provisional".to_string());
+    }
+    Ok(Some(config_dir))
+}
+
 pub(crate) fn claim_reusable_root(operation_id: &str) -> Result<Option<String>, String> {
     transact(|state| {
-        let same_operation_root = state
+        if let Some(root_index) = state
             .quarantined_roots
             .iter()
-            .position(|root| root.claimed_by.as_deref() == Some(operation_id));
-        let root_index = same_operation_root.or_else(|| {
-            state
-                .quarantined_roots
-                .iter()
-                .position(|root| root.claimed_by.is_none())
-        });
-        let Some(root_index) = root_index else {
-            return Ok(None);
-        };
-        let root = &mut state.quarantined_roots[root_index];
-        let config_dir = if root.config_dir.is_empty() {
-            managed_root()
-                .join(&root.root_id)
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            root.config_dir.clone()
-        };
-        ottto_core::validate_managed_claude_auth_root(&config_dir)
-            .map_err(|error| error.to_string())?;
-        let service_alias = ClaudeConfigDirSlot::registered(config_dir.clone())
-            .map_err(|error| error.to_string())?
-            .service_name();
-        if !root.service_alias.is_empty() && root.service_alias != service_alias {
-            return Err("Claude provisional root service alias changed".to_string());
+            .position(|root| root.claimed_by.as_deref() == Some(operation_id))
+        {
+            let config_dir =
+                reusable_root_candidate(&state.quarantined_roots[root_index], operation_id, true)?
+                    .ok_or_else(|| "Claude replay root could not be revalidated".to_string())?;
+            return Ok(Some(config_dir));
         }
-        let registry = FileClaudeConfigSlotSettingsStore::default()
-            .load()
-            .map_err(|error| error.to_string())?;
-        let registered_slot = registry
-            .managed_slots
-            .iter()
-            .chain(registry.external_slots.iter())
-            .find(|slot| slot.config_dir.as_deref() == Some(config_dir.as_str()));
-        let exact_same_operation_registration = same_operation_root.is_some()
-            && registry.setup_operation.operation_id.as_deref() == Some(operation_id)
-            && registered_slot.is_some_and(|slot| {
-                registry.setup_operation.slot_id.as_deref() == Some(slot.slot_id.as_str())
-            });
-        if registered_slot.is_some() && !exact_same_operation_registration {
-            return Err("registered Claude root cannot be reused as provisional".to_string());
+
+        for root_index in 0..state.quarantined_roots.len() {
+            if state.quarantined_roots[root_index].claimed_by.is_some() {
+                continue;
+            }
+            let Some(config_dir) =
+                reusable_root_candidate(&state.quarantined_roots[root_index], operation_id, false)?
+            else {
+                continue;
+            };
+            state.quarantined_roots[root_index].claimed_by = Some(operation_id.to_string());
+            return Ok(Some(config_dir));
         }
-        root.claimed_by = Some(operation_id.to_string());
-        Ok(Some(config_dir))
+        Ok(None)
     })
     .map_err(|error| error.to_string())?
 }
@@ -4848,6 +4876,141 @@ mod tests {
             .expect("claim succeeds")
             .expect("quarantined root is reusable");
         assert_eq!(reused, candidate_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn generic_prepare_skips_stale_unclaimed_root_and_allocates_current_root() {
+        let root = temp_dir("stale-unclaimed-root");
+        let support = root.join("support");
+        fs::create_dir_all(&support).expect("support");
+        #[cfg(unix)]
+        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
+        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let stale_root = root
+            .join("retired-installation")
+            .join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME)
+            .join("claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        transact(|state| {
+            state.quarantined_roots.push(QuarantinedRoot {
+                root_id: "claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                config_dir: stale_root.to_string_lossy().into_owned(),
+                service_alias: String::new(),
+                pending_registry_removal: false,
+                claimed_by: None,
+            });
+        })
+        .expect("stale state");
+
+        let operation_id = "claude_setup_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let status = FileClaudeConfigSlotSettingsStore::default()
+            .load()
+            .expect("registry");
+        prepare_generic(status, operation_id).expect("prepare current root");
+
+        let operation = read_operation(operation_id).expect("operation");
+        let current_managed_parent = support.join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME);
+        assert_eq!(
+            Path::new(&operation.config_dir).parent(),
+            Some(current_managed_parent.as_path())
+        );
+        assert!(Path::new(&operation.config_dir).is_dir());
+        let state = read_state();
+        assert!(state.quarantined_roots.iter().any(|candidate| {
+            candidate.config_dir == stale_root.to_string_lossy() && candidate.claimed_by.is_none()
+        }));
+        assert!(state.quarantined_roots.iter().any(|candidate| {
+            candidate.config_dir == operation.config_dir
+                && candidate.claimed_by.as_deref() == Some(operation_id)
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn reusable_root_selection_skips_stale_candidate_before_valid_root() {
+        let root = temp_dir("stale-before-valid-root");
+        let support = root.join("support");
+        fs::create_dir_all(&support).expect("support");
+        #[cfg(unix)]
+        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
+        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let stale_root = root
+            .join("retired-installation")
+            .join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME)
+            .join("claude_slot_dddddddddddddddddddddddddddddddd");
+        let (_, valid_root) = prepare_managed_claude_provisional_root(
+            "claude_setup_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )
+        .expect("valid root");
+        transact(|state| {
+            state.quarantined_roots.push(QuarantinedRoot {
+                root_id: "claude_slot_dddddddddddddddddddddddddddddddd".to_string(),
+                config_dir: stale_root.to_string_lossy().into_owned(),
+                service_alias: String::new(),
+                pending_registry_removal: false,
+                claimed_by: None,
+            });
+            state.quarantined_roots.push(QuarantinedRoot {
+                root_id: "claude_slot_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string(),
+                config_dir: valid_root.clone(),
+                service_alias: ClaudeConfigDirSlot::registered(valid_root.clone())
+                    .expect("valid slot")
+                    .service_name(),
+                pending_registry_removal: false,
+                claimed_by: None,
+            });
+        })
+        .expect("candidate state");
+
+        let operation_id = "claude_setup_ffffffffffffffffffffffffffffffff";
+        assert_eq!(
+            claim_reusable_root(operation_id).expect("claim"),
+            Some(valid_root.clone())
+        );
+        let state = read_state();
+        assert!(state.quarantined_roots.iter().any(|candidate| {
+            candidate.config_dir == stale_root.to_string_lossy() && candidate.claimed_by.is_none()
+        }));
+        assert!(state.quarantined_roots.iter().any(|candidate| {
+            candidate.config_dir == valid_root
+                && candidate.claimed_by.as_deref() == Some(operation_id)
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn same_operation_stale_root_remains_a_strict_replay_error() {
+        let root = temp_dir("stale-replay-root");
+        let support = root.join("support");
+        fs::create_dir_all(&support).expect("support");
+        #[cfg(unix)]
+        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
+        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let operation_id = "claude_setup_cccccccccccccccccccccccccccccccc";
+        let stale_root = root
+            .join("retired-installation")
+            .join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME)
+            .join("claude_slot_cccccccccccccccccccccccccccccccc");
+        transact(|state| {
+            state.quarantined_roots.push(QuarantinedRoot {
+                root_id: "claude_slot_cccccccccccccccccccccccccccccccc".to_string(),
+                config_dir: stale_root.to_string_lossy().into_owned(),
+                service_alias: String::new(),
+                pending_registry_removal: false,
+                claimed_by: Some(operation_id.to_string()),
+            });
+        })
+        .expect("stale replay state");
+
+        let error = claim_reusable_root(operation_id).expect_err("strict replay failure");
+        assert!(error.contains("not a direct managed child"));
+        assert_eq!(
+            read_state().quarantined_roots[0].claimed_by.as_deref(),
+            Some(operation_id)
+        );
         let _ = fs::remove_dir_all(root);
     }
 
