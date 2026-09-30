@@ -2803,6 +2803,10 @@ pub struct ClaudeConfigSlotCollectionStatusV1 {
     /// Safe local label derived only from a strong account hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_label: Option<String>,
+    /// Last exact-slot account labels, kept only on this machine. The embedded
+    /// binding prevents labels surviving an account or organization switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_profile: Option<ClaudeConfigSlotAccountProfileV1>,
     /// Credential deadlines read by the existing read-only exact-slot helper.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_expires_at: Option<Rfc3339Timestamp>,
@@ -2831,6 +2835,23 @@ pub struct ClaudeConfigSlotCollectionStatusV1 {
     pub relationship: Option<ClaudeConfigSlotRelationshipV1>,
     #[serde(default)]
     pub diagnostics: Vec<ClaudeConfigSlotDiagnosticV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeConfigSlotAccountProfileV1 {
+    pub account_identifier_hash: String,
+    pub organization_identifier_hash: String,
+    /// When these labels were read from verified local account evidence;
+    /// this is neither a quota observation nor a successful quota-check clock.
+    pub captured_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4462,6 +4483,26 @@ mod tests {
             legacy.collection.state,
             ClaudeConfigSlotCollectionStateV1::Unverified
         );
+        assert!(legacy.collection.account_profile.is_none());
+        let profile = ClaudeConfigSlotAccountProfileV1 {
+            account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "org-a".to_string(),
+            captured_at: "2026-09-01T10:00:00Z".to_string(),
+            email: Some("test@example.invalid".to_string()),
+            organization_label: None,
+            plan_type: None,
+            subscription_product: None,
+        };
+        let local = ClaudeConfigSlotCollectionStatusV1 {
+            account_profile: Some(profile.clone()),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(local).expect("local profile wire");
+        assert_eq!(wire["account_profile"]["email"], "test@example.invalid");
+        assert!(wire["account_profile"].get("plan_type").is_none());
+        let decoded: ClaudeConfigSlotCollectionStatusV1 =
+            serde_json::from_value(wire).expect("profile round trip");
+        assert_eq!(decoded.account_profile, Some(profile));
 
         let value = serde_json::to_value(ClaudeConfigSlotCollectionStatusV1 {
             state: ClaudeConfigSlotCollectionStateV1::IdentityMismatch,

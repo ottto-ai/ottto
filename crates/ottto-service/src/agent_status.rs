@@ -19,17 +19,17 @@ use ottto_protocol::{
     AgentStatusPlanObservation, AgentStatusSnapshot, AgentStatusState,
     ClaudeAccountAnchorCoverageV1, ClaudeAccountAnchorDescriptorV1,
     ClaudeAccountAnchorDurabilityV1, ClaudeAccountAnchorHealthV1,
-    ClaudeAccountAnchorSetupBlockerV1, ClaudeAccountsStatusV1, ClaudeConfigSlotCollectionStateV1,
-    ClaudeConfigSlotCollectionStatusV1, ClaudeConfigSlotDescriptorV1,
-    ClaudeConfigSlotDiagnosticCodeV1, ClaudeConfigSlotDiagnosticV1, ClaudeConfigSlotOwnership,
-    ClaudeConfigSlotQuotaSnapshotStateV1, ClaudeConfigSlotQuotaSnapshotV1,
-    ClaudeConfigSlotUpkeepResultV1, ClaudeQuotaAccessState, ClaudeUnresolvedAccountDescriptorV1,
-    ClaudeUnresolvedAccountEvidenceKind, CodexAccountSlotCollectionStateV1,
-    CodexAccountSlotCollectionStatusV1, CodexAccountSlotDescriptorV1, CodexAccountSlotDiagnosticV1,
-    CodexAccountSlotOwnershipV1, CodexAccountSlotQuotaSnapshotV1, CodexAccountSlotRelationshipV1,
-    CodexAccountTargetCoverageV1, CodexAccountTargetDescriptorV1, CodexAccountTargetDurabilityV1,
-    CodexAccountTargetHealthV1, CodexAccountTargetSetupBlockerV1, CodexAccountsStatusV1,
-    SourceKind,
+    ClaudeAccountAnchorSetupBlockerV1, ClaudeAccountsStatusV1, ClaudeConfigSlotAccountProfileV1,
+    ClaudeConfigSlotCollectionStateV1, ClaudeConfigSlotCollectionStatusV1,
+    ClaudeConfigSlotDescriptorV1, ClaudeConfigSlotDiagnosticCodeV1, ClaudeConfigSlotDiagnosticV1,
+    ClaudeConfigSlotOwnership, ClaudeConfigSlotQuotaSnapshotStateV1,
+    ClaudeConfigSlotQuotaSnapshotV1, ClaudeConfigSlotUpkeepResultV1, ClaudeQuotaAccessState,
+    ClaudeUnresolvedAccountDescriptorV1, ClaudeUnresolvedAccountEvidenceKind,
+    CodexAccountSlotCollectionStateV1, CodexAccountSlotCollectionStatusV1,
+    CodexAccountSlotDescriptorV1, CodexAccountSlotDiagnosticV1, CodexAccountSlotOwnershipV1,
+    CodexAccountSlotQuotaSnapshotV1, CodexAccountSlotRelationshipV1, CodexAccountTargetCoverageV1,
+    CodexAccountTargetDescriptorV1, CodexAccountTargetDurabilityV1, CodexAccountTargetHealthV1,
+    CodexAccountTargetSetupBlockerV1, CodexAccountsStatusV1, SourceKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -154,6 +154,8 @@ struct CodexUsageProbe {
     account: Option<AgentAccountStatus>,
     identity: Option<CodexStrongIdentity>,
     credential_read_failed: bool,
+    /// Successful local read completion, never a provider observation clock.
+    response_completed_at: Option<String>,
 }
 
 /// Strong active Codex identity from one exact credential home. This type is
@@ -1083,6 +1085,12 @@ fn collect_codex_status_snapshots(
     for index in winning_by_binding.into_values() {
         snapshots.push(candidates[index].snapshot.clone());
     }
+    append_configured_codex_unavailable_snapshots(
+        &mut snapshots,
+        &candidates,
+        &captured_at,
+        &expires_at,
+    );
 
     let source_health_snapshot =
         codex_source_health_snapshot(&candidates, &captured_at, &expires_at);
@@ -1094,6 +1102,81 @@ fn collect_codex_status_snapshots(
         source_health_snapshot,
         codex_scan_homes,
         codex_home_bindings,
+    }
+}
+
+fn append_configured_codex_unavailable_snapshots(
+    snapshots: &mut Vec<AgentStatusSnapshot>,
+    candidates: &[CodexSlotCandidate],
+    captured_at: &str,
+    expires_at: &str,
+) {
+    let mut represented = snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.account.as_ref())
+        .filter_map(|account| {
+            account
+                .account_identifier_hash
+                .clone()
+                .zip(account.organization_identifier_hash.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    for candidate in candidates {
+        if candidate.slot.ownership != CodexAccountSlotOwnershipV1::Managed
+            || candidate.binding.is_some()
+        {
+            continue;
+        }
+        // These are previously accepted registry bindings, not live credential
+        // proof. Never use this fallback for meters, transcript attribution,
+        // successful checks, or labels from the failed/different live identity.
+        let Some((account, workspace)) = candidate
+            .slot
+            .registered_binding
+            .as_ref()
+            .filter(|(account, workspace)| !account.is_empty() && !workspace.is_empty())
+        else {
+            continue;
+        };
+        if !represented.insert((account.clone(), workspace.clone())) {
+            continue;
+        }
+        let mut snapshot = base_snapshot(
+            SourceKind::Codex,
+            AgentStatusState::Degraded,
+            AgentStatusCollectionMethod::ConfigFile,
+            captured_at.to_string(),
+            expires_at.to_string(),
+        );
+        snapshot.account = Some(AgentAccountStatus {
+            login_state: AgentLoginState::Unknown,
+            provider: Some("openai".to_string()),
+            billing_channel: Some("subscription".to_string()),
+            account_identifier_hash: Some(account.clone()),
+            organization_identifier_hash: Some(workspace.clone()),
+            billing_identity_evidence: Some("provider_account_id".to_string()),
+            billing_identity_confidence: AgentStatusConfidence::High,
+            confidence: AgentStatusConfidence::High,
+            ..unsupported_account("openai")
+        });
+        snapshot.capabilities = vec![
+            unsupported_capability(
+                "quota_windows",
+                "Current limits are unavailable for this configured Codex account and workspace.",
+            ),
+            unsupported_capability(
+                "credits",
+                "Current credits are unavailable for this configured Codex account and workspace.",
+            ),
+        ];
+        snapshot.diagnostics.push(
+            AgentStatusDiagnostic::source(
+                "codex_configured_account_unavailable",
+                AgentDiagnosticSeverity::Warning,
+                "This previously accepted Codex account and workspace remains configured; its current identity and limits could not be verified.",
+            ).with_quota_binding(Some(account.clone()), Some(workspace.clone())),
+        );
+        snapshots.push(snapshot);
     }
 }
 
@@ -2117,6 +2200,13 @@ fn collect_codex_status_for_home(
                 account.account_identifier_hash.is_some()
                     && account.organization_identifier_hash.is_some()
             });
+            if let Some(diagnostic) = codex_app_server_success_diagnostic(
+                usage.response_completed_at,
+                strong_identity.as_ref(),
+                !usage.quota_windows.is_empty() || !usage.credit_balances.is_empty(),
+            ) {
+                snapshot.diagnostics.push(diagnostic);
+            }
             if quota_is_bound && !usage.quota_windows.is_empty() {
                 snapshot.collection_method = AgentStatusCollectionMethod::AppServer;
                 snapshot.quota_windows = usage.quota_windows;
@@ -2137,11 +2227,24 @@ fn collect_codex_status_for_home(
         }
         Err(message) => {
             snapshot.quota_windows = vec![unsupported_quota_window("usage")];
-            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
-                "codex_usage_probe_failed",
-                AgentDiagnosticSeverity::Warning,
-                message,
-            ));
+            snapshot.diagnostics.push(
+                AgentStatusDiagnostic::source(
+                    "codex_usage_probe_failed",
+                    AgentDiagnosticSeverity::Warning,
+                    message,
+                )
+                .with_observed_at(rfc3339_from_unix_seconds(current_unix_seconds()))
+                .with_quota_binding(
+                    snapshot
+                        .account
+                        .as_ref()
+                        .and_then(|account| account.account_identifier_hash.clone()),
+                    snapshot
+                        .account
+                        .as_ref()
+                        .and_then(|account| account.organization_identifier_hash.clone()),
+                ),
+            );
         }
     }
     snapshot.context = Some(AgentContextStatus {
@@ -2793,6 +2896,11 @@ fn collect_claude_status_snapshots(
 
     let mut slot_states = BTreeMap::new();
     let mut default_state = claude_default_slot_collection_status(&default_snapshot);
+    remember_claude_slot_account_profile(
+        &mut default_state,
+        default_snapshot.account.as_ref(),
+        &captured_at,
+    );
     retain_verified_claude_slot_binding(
         "default",
         &ClaudeConfigDirSlot::Default,
@@ -2916,6 +3024,10 @@ fn collect_claude_status_snapshots(
                 slot_states.insert(slot_id, state);
             }
         }
+    }
+    let previous_states = read_persisted_claude_slot_collection_state();
+    for (slot_id, status) in &mut slot_states {
+        inherit_claude_slot_account_profile(status, previous_states.slots.get(slot_id));
     }
     let mut quarantined_slots = claude_cross_binding_meter_collisions(&candidates);
     for slot_id in &quarantined_slots {
@@ -3478,6 +3590,7 @@ pub(crate) fn verify_claude_local_identity(
         false,
     );
     apply_credential_metadata(&mut collection, &resolved.credential);
+    remember_claude_slot_account_profile(&mut collection, Some(&resolved.account), observed_at);
     Ok(ClaudeLocalIdentityProof {
         account_identifier_hash: resolved.account_identifier_hash,
         organization_identifier_hash: resolved.organization_identifier_hash,
@@ -3582,6 +3695,11 @@ fn custom_claude_snapshot_from_usage(
                 ClaudeSlotProbeFailure::CredentialUnavailable.status(&captured_at)
             };
             apply_credential_metadata(&mut status, &resolved.credential);
+            remember_claude_slot_account_profile(
+                &mut status,
+                Some(&resolved.account),
+                &captured_at,
+            );
             return Err(status);
         }
     };
@@ -3666,6 +3784,7 @@ fn custom_claude_snapshot_from_usage(
         has_scoped_limits,
     ));
     apply_credential_metadata(&mut state, &resolved.credential);
+    remember_claude_slot_account_profile(&mut state, snapshot.account.as_ref(), &captured_at);
     Ok((snapshot, state))
 }
 
@@ -3900,6 +4019,77 @@ fn apply_claude_quota_access_state(
     }
 }
 
+fn exact_claude_slot_account_profile(
+    status: &ClaudeConfigSlotCollectionStatusV1,
+) -> Option<&ClaudeConfigSlotAccountProfileV1> {
+    let profile = status.account_profile.as_ref()?;
+    (status.account_identifier_hash.as_deref() == Some(profile.account_identifier_hash.as_str())
+        && status.organization_identifier_hash.as_deref()
+            == Some(profile.organization_identifier_hash.as_str())
+        && !profile.account_identifier_hash.is_empty()
+        && !profile.organization_identifier_hash.is_empty()
+        && bounded_claude_collection_timestamp(
+            Some(&profile.captured_at),
+            OffsetDateTime::now_utc(),
+        )
+        .is_some())
+    .then_some(profile)
+}
+
+fn remember_claude_slot_account_profile(
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+    account: Option<&AgentAccountStatus>,
+    captured_at: &str,
+) {
+    let Some(account) = account.filter(|account| {
+        account.login_state == AgentLoginState::SignedIn
+            && account.account_identifier_hash == status.account_identifier_hash
+            && account.organization_identifier_hash == status.organization_identifier_hash
+    }) else {
+        return;
+    };
+    let Some(binding) = account
+        .account_identifier_hash
+        .as_deref()
+        .zip(account.organization_identifier_hash.as_deref())
+        .and_then(|(account, organization)| ClaudeStrongBinding::new(account, organization))
+    else {
+        return;
+    };
+    if account.email.is_none()
+        && account.organization_label.is_none()
+        && account.plan_type.is_none()
+        && account.subscription_product.is_none()
+    {
+        return;
+    }
+    status.account_profile = Some(ClaudeConfigSlotAccountProfileV1 {
+        account_identifier_hash: binding.account_identifier_hash,
+        organization_identifier_hash: binding.organization_identifier_hash,
+        captured_at: captured_at.to_string(),
+        email: account.email.clone(),
+        organization_label: account.organization_label.clone(),
+        plan_type: account.plan_type.clone(),
+        subscription_product: account.subscription_product.clone(),
+    });
+}
+
+fn inherit_claude_slot_account_profile(
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+    previous: Option<&ClaudeConfigSlotCollectionStatusV1>,
+) {
+    if exact_claude_slot_account_profile(status).is_some() {
+        return;
+    }
+    status.account_profile = previous
+        .filter(|previous| {
+            previous.account_identifier_hash == status.account_identifier_hash
+                && previous.organization_identifier_hash == status.organization_identifier_hash
+        })
+        .and_then(exact_claude_slot_account_profile)
+        .cloned();
+}
+
 fn retain_exact_claude_slot_binding(
     status: &mut ClaudeConfigSlotCollectionStatusV1,
     account_hash: &str,
@@ -3930,6 +4120,7 @@ fn clear_claude_slot_binding(status: &mut ClaudeConfigSlotCollectionStatusV1) {
     status.account_identifier_hash = None;
     status.organization_identifier_hash = None;
     status.display_label = None;
+    status.account_profile = None;
     status.last_full_quota_read_at = None;
     status.has_account_windows = false;
     status.has_scoped_limits = false;
@@ -3990,6 +4181,7 @@ fn retain_verified_claude_slot_binding(
         return;
     }
     retain_exact_claude_slot_binding(status, &current_account, &current_organization);
+    inherit_claude_slot_account_profile(status, Some(&previous));
     let current_has_complete_read = status.last_full_quota_read_at.is_some()
         && status.has_account_windows
         && status.has_scoped_limits;
@@ -4064,6 +4256,13 @@ fn degraded_claude_slot_snapshot(
         billing_identity_confidence: AgentStatusConfidence::High,
         confidence: AgentStatusConfidence::High,
     });
+    if let Some(profile) = exact_claude_slot_account_profile(status) {
+        let account = snapshot.account.as_mut().expect("degraded account exists");
+        account.email = profile.email.clone();
+        account.organization_label = profile.organization_label.clone();
+        account.plan_type = profile.plan_type.clone();
+        account.subscription_product = profile.subscription_product.clone();
+    }
     if let Some(local) = status.quota_snapshot.as_ref().filter(|local| {
         local_claude_quota_snapshot_within_retention(local, OffsetDateTime::now_utc())
     }) {
@@ -4882,6 +5081,7 @@ fn merge_claude_slot_collection_state_at(
     });
     if replace {
         let mut candidate = candidate.clone();
+        inherit_claude_slot_account_profile(&mut candidate, slots.get(slot_id));
         let candidate_full_proof_is_bounded = candidate_observed.is_some()
             && candidate
                 .last_full_quota_read_at
@@ -8886,6 +9086,12 @@ fn collect_codex_app_server_usage_for_home(
     home_trust: CodexHomeTrust,
 ) -> Result<CodexUsageProbe, String> {
     let observation = call_codex_app_server_rate_limits_for_home(codex_home, home_trust)?;
+    Ok(codex_usage_probe_from_app_server_observation(observation))
+}
+
+fn codex_usage_probe_from_app_server_observation(
+    observation: CodexAppServerObservation,
+) -> CodexUsageProbe {
     let identity = observation
         .refreshed_credentials
         .as_ref()
@@ -8897,13 +9103,14 @@ fn collect_codex_app_server_usage_for_home(
                 true,
             )
         });
-    Ok(CodexUsageProbe {
+    CodexUsageProbe {
         quota_windows: codex_app_server_quota_windows(&observation.rate_limits),
         credit_balances: codex_app_server_credit_balances(&observation.rate_limits),
         account: codex_app_server_account(&observation.account),
         identity,
         credential_read_failed: observation.credential_read_failed,
-    })
+        response_completed_at: observation.response_completed_at,
+    }
 }
 
 struct CodexAppServerObservation {
@@ -8911,6 +9118,29 @@ struct CodexAppServerObservation {
     rate_limits: Value,
     refreshed_credentials: Option<CodexAuthCredentials>,
     credential_read_failed: bool,
+    response_completed_at: Option<String>,
+}
+
+fn codex_app_server_success_diagnostic(
+    response_completed_at: Option<String>,
+    identity: Option<&CodexStrongIdentity>,
+    has_usage: bool,
+) -> Option<AgentStatusDiagnostic> {
+    let identity = identity.filter(|_| has_usage)?;
+    let completed_at = response_completed_at?;
+    bounded_claude_collection_timestamp(Some(&completed_at), OffsetDateTime::now_utc())?;
+    Some(
+        AgentStatusDiagnostic::source(
+            "codex_app_server_usage_response",
+            AgentDiagnosticSeverity::Info,
+            "Codex app-server account and quota read completed successfully; original quota observation time is not reported.",
+        )
+        .with_observed_at(Some(completed_at))
+        .with_quota_binding(
+            Some(identity.account_identifier_hash.clone()),
+            Some(identity.workspace_identifier_hash.clone()),
+        ),
+    )
 }
 
 fn call_codex_app_server_rate_limits_for_home(
@@ -9055,6 +9285,7 @@ fn call_codex_app_server_rate_limits_for_home(
                     rate_limits_requested = true;
                 }
                 if account_result.is_some() && rate_limits_result.is_some() {
+                    let response_completed_at = rfc3339_from_unix_seconds(current_unix_seconds());
                     let account = account_result.take().expect("checked account result");
                     let rate_limits = rate_limits_result
                         .take()
@@ -9072,6 +9303,7 @@ fn call_codex_app_server_rate_limits_for_home(
                         rate_limits,
                         refreshed_credentials,
                         credential_read_failed,
+                        response_completed_at,
                     });
                 }
             }
@@ -9546,6 +9778,7 @@ fn collect_codex_oauth_usage_at(
         account: None,
         identity,
         credential_read_failed: false,
+        response_completed_at: None,
     })
 }
 
@@ -13569,6 +13802,34 @@ for line in sys.stdin:
             .iter()
             .all(|window| window.account_identifier_hash.is_some()));
 
+        assert!(snapshot
+            .quota_windows
+            .iter()
+            .all(|window| window.observed_at.is_none()));
+        let check = snapshot
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "codex_app_server_usage_response")
+            .expect("successful completion witness");
+        assert_eq!(
+            check.account_identifier_hash,
+            account.account_identifier_hash
+        );
+        assert_eq!(
+            check.organization_identifier_hash,
+            account.organization_identifier_hash
+        );
+        assert!(bounded_claude_collection_timestamp(
+            check.observed_at.as_deref(),
+            OffsetDateTime::now_utc()
+        )
+        .is_some());
+        assert_ne!(
+            check.observed_at.as_deref(),
+            Some(snapshot.captured_at.as_str()),
+            "snapshot capture is not the read clock"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -13595,8 +13856,65 @@ for line in sys.stdin:
         }));
         assert!(snapshot.quota_windows.is_empty());
         assert!(snapshot.credit_balances.is_empty());
+        assert!(snapshot
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "codex_app_server_usage_response"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_app_server_check_clock_requires_bound_usage_and_keeps_observation_unknown() {
+        let completed_at = "2026-09-01T10:00:00Z".to_string();
+        let probe = codex_usage_probe_from_app_server_observation(CodexAppServerObservation {
+            account: serde_json::json!({"account": {"type": "chatgpt", "planType": "pro"}}),
+            rate_limits: serde_json::json!({"rateLimits": {"primary": {"usedPercent": 12, "windowDurationMins": 10080}}}),
+            refreshed_credentials: None,
+            credential_read_failed: false,
+            response_completed_at: Some(completed_at.clone()),
+        });
+        assert_eq!(
+            probe.response_completed_at.as_deref(),
+            Some(completed_at.as_str())
+        );
+        assert!(!probe.quota_windows.is_empty());
+        assert!(probe
+            .quota_windows
+            .iter()
+            .all(|window| window.observed_at.is_none()));
+        let identity = CodexStrongIdentity {
+            account_identifier_hash: "account-a".to_string(),
+            workspace_identifier_hash: "workspace-a".to_string(),
+            raw_workspace_id: "unused".to_string(),
+            superseded_account_identifier_hash: None,
+            superseded_organization_identifier_hash: None,
+        };
+        let diagnostic =
+            codex_app_server_success_diagnostic(Some(completed_at.clone()), Some(&identity), true)
+                .expect("bound check");
+        assert_eq!(
+            diagnostic.observed_at.as_deref(),
+            Some(completed_at.as_str())
+        );
+        assert_eq!(
+            diagnostic.organization_identifier_hash.as_deref(),
+            Some("workspace-a")
+        );
+        assert!(codex_app_server_success_diagnostic(None, Some(&identity), true).is_none());
+        assert!(
+            codex_app_server_success_diagnostic(Some(completed_at.clone()), None, true).is_none()
+        );
+        assert!(
+            codex_app_server_success_diagnostic(Some(completed_at), Some(&identity), false)
+                .is_none()
+        );
+        assert!(codex_app_server_success_diagnostic(
+            Some("2099-01-01T00:00:00Z".to_string()),
+            Some(&identity),
+            true
+        )
+        .is_none());
     }
 
     #[test]
@@ -13989,6 +14307,116 @@ for line in sys.stdin:
             quality,
             auth_modified_at: None,
         }
+    }
+
+    #[test]
+    fn configured_codex_unavailable_witness_preserves_registration_without_live_authority() {
+        let mut unavailable = codex_candidate_for_test(
+            "codex_slot_a",
+            CodexAccountSlotOwnershipV1::Managed,
+            "account-a",
+            "workspace-a",
+            1,
+        );
+        unavailable.binding = None;
+        unavailable.status = CodexAccountSlotCollectionStatusV1::default();
+        unavailable.snapshot.account = None;
+        let mut snapshots = Vec::new();
+        append_configured_codex_unavailable_snapshots(
+            &mut snapshots,
+            &[unavailable],
+            "2026-09-01T10:00:00Z",
+            "2026-09-01T10:15:00Z",
+        );
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        let account = snapshot.account.as_ref().expect("configured account");
+        assert_eq!(
+            account.account_identifier_hash.as_deref(),
+            Some("account-a")
+        );
+        assert_eq!(
+            account.organization_identifier_hash.as_deref(),
+            Some("workspace-a")
+        );
+        assert_eq!(account.login_state, AgentLoginState::Unknown);
+        assert!(account.email.is_none());
+        assert!(account.plan_type.is_none());
+        assert!(account.subscription_product.is_none());
+        assert_eq!(snapshot.status, AgentStatusState::Degraded);
+        assert_eq!(
+            snapshot.collection_method,
+            AgentStatusCollectionMethod::ConfigFile
+        );
+        assert!(snapshot.quota_windows.is_empty());
+        assert!(snapshot.credit_balances.is_empty());
+        assert_eq!(snapshot.diagnostics.len(), 1);
+        assert_eq!(
+            snapshot.diagnostics[0].code,
+            "codex_configured_account_unavailable"
+        );
+        assert!(snapshot.diagnostics[0].observed_at.is_none());
+    }
+
+    #[test]
+    fn configured_codex_unavailable_witness_rejects_unknowns_and_deduplicates_live_accounts() {
+        let mut unavailable = codex_candidate_for_test(
+            "codex_slot_a",
+            CodexAccountSlotOwnershipV1::Managed,
+            "account-a",
+            "workspace-a",
+            1,
+        );
+        unavailable.binding = None;
+        // Labels on a failed different identity must never leak to registration.
+        unavailable
+            .snapshot
+            .account
+            .as_mut()
+            .expect("account")
+            .email = Some("other@example.invalid".to_string());
+        unavailable
+            .snapshot
+            .account
+            .as_mut()
+            .expect("account")
+            .plan_type = Some("team".to_string());
+        let mut unknown = codex_candidate_for_test(
+            "unknown",
+            CodexAccountSlotOwnershipV1::Managed,
+            "",
+            "workspace-a",
+            1,
+        );
+        unknown.binding = None;
+        let mut unregistered = codex_candidate_for_test(
+            "unregistered",
+            CodexAccountSlotOwnershipV1::Managed,
+            "account-b",
+            "workspace-b",
+            1,
+        );
+        unregistered.binding = None;
+        unregistered.slot.registered_binding = None;
+        let live = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            "account-a",
+            "workspace-a",
+            5,
+        );
+        let mut snapshots = vec![live.snapshot.clone()];
+        append_configured_codex_unavailable_snapshots(
+            &mut snapshots,
+            &[unavailable, unknown, unregistered],
+            "2026-09-01T10:00:00Z",
+            "2026-09-01T10:15:00Z",
+        );
+        assert_eq!(
+            snapshots,
+            vec![live.snapshot],
+            "no duplicate or identifier-less observation"
+        );
     }
 
     fn codex_workspace_target_token_for(
@@ -20925,6 +21353,124 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             .capabilities
             .iter()
             .any(|capability| capability.capability == CLAUDE_QUOTA_ACCESS_CAPABILITY));
+    }
+
+    #[test]
+    fn degraded_claude_slot_preserves_only_exact_known_profile_and_redacts_upload() {
+        let account = AgentAccountStatus {
+            login_state: AgentLoginState::SignedIn,
+            email: Some("test@example.invalid".to_string()),
+            organization_label: Some("Test organization".to_string()),
+            plan_type: Some("max_20x".to_string()),
+            subscription_product: Some("claude_max_20x".to_string()),
+            account_identifier_hash: Some("account-a".to_string()),
+            organization_identifier_hash: Some("org-a".to_string()),
+            ..unsupported_account("anthropic")
+        };
+        let mut previous =
+            provider_unavailable_status("2026-09-01T10:00:00Z", "account-a", "org-a");
+        remember_claude_slot_account_profile(&mut previous, Some(&account), "2026-09-01T10:00:00Z");
+        let mut slots = BTreeMap::from([("slot-a".to_string(), previous)]);
+        let current = provider_unavailable_status("2026-09-01T11:00:00Z", "account-a", "org-a");
+        merge_claude_slot_collection_state(&mut slots, "slot-a", &current);
+        let current = slots.get("slot-a").expect("retained slot");
+        let snapshot = degraded_claude_slot_snapshot(
+            current,
+            ClaudeAccountAnchorDurabilityV1::Anchored,
+            None,
+            "2026-09-01T11:00:00Z",
+            "2026-09-01T11:05:00Z",
+        )
+        .expect("degraded witness");
+        let local = snapshot.account.as_ref().expect("account");
+        assert_eq!(local.email, account.email);
+        assert_eq!(local.organization_label, account.organization_label);
+        assert_eq!(local.plan_type, account.plan_type);
+        assert_eq!(local.subscription_product, account.subscription_product);
+        assert!(snapshot.quota_windows.is_empty());
+        assert!(
+            current.last_full_quota_read_at.is_none(),
+            "labels cannot create quota proof"
+        );
+        let upload = snapshot
+            .redacted_for_backend()
+            .account
+            .expect("upload account");
+        assert!(upload.email.is_none());
+        assert!(upload.organization_label.is_none());
+        assert_eq!(upload.plan_type, account.plan_type);
+        assert_eq!(
+            upload.account_identifier_hash,
+            account.account_identifier_hash
+        );
+
+        for (account_hash, org_hash) in [
+            ("account-b", "org-a"),
+            ("account-a", "org-b"),
+            ("", "org-a"),
+        ] {
+            let mut changed =
+                provider_unavailable_status("2026-09-01T12:00:00Z", account_hash, org_hash);
+            inherit_claude_slot_account_profile(&mut changed, Some(current));
+            assert!(
+                changed.account_profile.is_none(),
+                "changed composite cannot inherit labels"
+            );
+            changed.account_profile = current.account_profile.clone();
+            assert!(
+                exact_claude_slot_account_profile(&changed).is_none(),
+                "mismatched persisted profile fails closed"
+            );
+        }
+        let mut future = current.clone();
+        future
+            .account_profile
+            .as_mut()
+            .expect("profile")
+            .captured_at = "2099-01-01T00:00:00Z".to_string();
+        assert!(exact_claude_slot_account_profile(&future).is_none());
+        clear_claude_slot_binding(&mut future);
+        assert!(future.account_profile.is_none());
+    }
+
+    #[test]
+    fn unavailable_claude_read_keeps_verified_slot_labels_without_quota() {
+        let resolved = ResolvedClaudeSlot {
+            descriptor: ClaudeConfigDirSlot::Default
+                .descriptor("default", ClaudeConfigSlotOwnership::External),
+            account: AgentAccountStatus {
+                login_state: AgentLoginState::SignedIn,
+                email: Some("test@example.invalid".to_string()),
+                plan_type: Some("team".to_string()),
+                account_identifier_hash: Some("account-a".to_string()),
+                organization_identifier_hash: Some("org-a".to_string()),
+                ..unsupported_account("anthropic")
+            },
+            account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "org-a".to_string(),
+            credential: ClaudeOAuthCredential {
+                access_token: None,
+                has_refresh_token: true,
+                access_expires_at: None,
+                relogin_required_at: None,
+            },
+        };
+        let status = custom_claude_snapshot_from_usage(
+            resolved,
+            ClaudeOAuthUsageOutcome::from(Err("quota unavailable".to_string())),
+            true,
+            "2026-09-01T10:00:00Z".to_string(),
+            "2026-09-01T10:05:00Z".to_string(),
+        )
+        .expect_err("quota unavailable");
+        let profile = exact_claude_slot_account_profile(&status).expect("verified local labels");
+        assert_eq!(profile.email.as_deref(), Some("test@example.invalid"));
+        assert_eq!(profile.plan_type.as_deref(), Some("team"));
+        assert!(
+            profile.subscription_product.is_none(),
+            "missing product stays unknown"
+        );
+        assert!(status.quota_snapshot.is_none());
     }
 
     #[test]
