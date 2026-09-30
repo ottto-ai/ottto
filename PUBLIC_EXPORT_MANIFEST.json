@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 399,
-  "content_sha256": "ca4884fb11151ffe651f3c0391bbc00e951ff8d69715f383441198c980e6bf11",
+  "content_sha256": "7f8c25c4d1c68754b7599115be08120ace3b8b008cab627565af69008dc359af",
   "files": [
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_upkeep.rs",
-      "sha256": "cf9a730a943a4654ef117120b3b4755193df9cea7785102c37909b223bf39132",
-      "size_bytes": 107584
+      "sha256": "39c1f983052a53ba94e1bafc0eac47c97409c595ce5d986f9ff60d8f78581160",
+      "size_bytes": 109888
     },
     {
       "executable": false,
@@ -1763,8 +1763,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-01-claude-upkeep-terminal-readback.md",
-      "sha256": "c32358712e9d5121f92a013b46664b0060077756b15ecd79544a7e05a0bf7d43",
-      "size_bytes": 3379
+      "sha256": "5b7befe5852ddd07158fb7471c6bcf0dbeb39bd1aa57dfeb3868854514196983",
+      "size_bytes": 4235
     },
     {
       "executable": false,

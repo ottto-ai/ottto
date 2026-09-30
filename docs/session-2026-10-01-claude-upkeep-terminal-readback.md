@@ -40,6 +40,18 @@ fixtures verify receipt replacement and six prior failures retaining their
 exponential retry bound. A focused review follows that repair; no provider/model
 substitution or broad review repeat.
 
+Independent native review found one additional P2: a claimed/legacy witness
+without a recorded descriptor fence could expose its new terminal clock after
+the same slot/access-expiry was rebound. Readback now exposes that clock only
+after the stored descriptor fence passes existing exact binding/deadline/time
+checks. Unfenced witnesses retain their original status, attempt and retry
+budget, but no certified exact-pair result time. A mocked claim→complete fixture
+covers both the original pair and a changed pair at the same expiry, including
+unchanged persisted status/backoff; existing fenced preclaim clocks remain.
+The new fixture fails against the prior candidate. The focused AutoReview budget
+was already spent: this repair uses targeted tests and a written risk decision,
+with the independent native reviewer assigned the repaired exact head.
+
 This change makes local upkeep continuity diagnosable. It does not identify or
 recover the installed binding's actual acquisition failure. Only the two
 approved public status commands were run; no follow-up auth/provider probes.

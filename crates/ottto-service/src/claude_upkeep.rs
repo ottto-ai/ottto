@@ -497,13 +497,18 @@ fn persisted_production_upkeep_observation(
     if witness.due_access_expires_at != due_access_expires_at {
         return None;
     }
-    if let Some(fence) = &witness.preclaim_descriptor {
+    let result_observed_at = if let Some(fence) = &witness.preclaim_descriptor {
         if preclaim_descriptor(descriptor).as_ref() != Some(fence)
             || parse_timestamp(witness.result_observed_at.as_deref()).is_none_or(|at| at > now)
         {
             return None;
         }
-    }
+        witness.result_observed_at.clone()
+    } else {
+        // Legacy/claimed witnesses keep their status and retry budget, but
+        // cannot certify a result clock for an unrecorded account binding.
+        None
+    };
     let retry_pending =
         parse_timestamp(Some(&witness.next_allowed_attempt_at)).is_some_and(|next| now < next);
     if witness.result != ClaudeConfigSlotUpkeepResultV1::NeedsLogin && !retry_pending {
@@ -512,7 +517,7 @@ fn persisted_production_upkeep_observation(
     Some(ClaudeUpkeepObservation {
         proceed_with_collection: witness.result == ClaudeConfigSlotUpkeepResultV1::Refreshed,
         status: witness.local_status(),
-        result_observed_at: witness.result_observed_at.clone(),
+        result_observed_at,
     })
 }
 
@@ -1654,6 +1659,57 @@ mod tests {
         descriptor.collection.access_expires_at = Some("2026-08-04T10:00:00Z".to_string());
         descriptor.collection.relogin_required_at = Some("2026-09-01T00:00:00Z".to_string());
         descriptor
+    }
+
+    #[test]
+    #[serial]
+    fn unfenced_claimed_terminal_readback_never_certifies_same_or_rebound_pair_clock() {
+        let root = temp_dir("unfenced-claimed-terminal-clock");
+        let _support_guard = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let descriptor = bound_preclaim_descriptor();
+        let now = at("2026-08-04T10:00:00Z");
+        let ClaimOutcome::Claimed(token, _) = claim_attempt(
+            &root,
+            &descriptor.slot_id,
+            descriptor.collection.access_expires_at.as_deref().unwrap(),
+            descriptor.collection.relogin_required_at.clone(),
+            now,
+        )
+        .unwrap() else {
+            panic!("claim");
+        };
+        complete_attempt(
+            &root,
+            &token,
+            ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
+            now + TimeDuration::seconds(1),
+        )
+        .unwrap();
+        let witness = load_state(&root).unwrap().slots[&descriptor.slot_id].clone();
+        assert_eq!(witness.preclaim_descriptor, None);
+        assert!(witness.result_observed_at.is_some());
+
+        for rebound in [false, true] {
+            let mut current = descriptor.clone();
+            if rebound {
+                current.collection.account_identifier_hash = Some("rebound-account".to_string());
+                current.collection.organization_identifier_hash = Some("rebound-org".to_string());
+            }
+            let receipt =
+                persisted_production_upkeep_observation(&current, now + TimeDuration::seconds(2))
+                    .expect("legacy status/backoff remains visible without a certified pair clock");
+            assert_eq!(receipt.status, witness.local_status());
+            assert_eq!(receipt.result_observed_at, None, "rebound={rebound}");
+            assert!(!receipt.proceed_with_collection);
+        }
+        assert_eq!(
+            load_state(&root).unwrap().slots[&descriptor.slot_id],
+            witness
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
