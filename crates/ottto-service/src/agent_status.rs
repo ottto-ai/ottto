@@ -2533,46 +2533,52 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
         claude_desktop_plan_observations_from_root(&claude_desktop_root, &snapshot.captured_at);
     let observable_account_identifier_hashes =
         claude_account_identifier_hashes_from_observations(&desktop_plan_observations);
-    let apply_statusline_quota =
-        |snapshot: &mut AgentStatusSnapshot, quota_capability: &mut AgentCapabilityGap| -> bool {
-            match collect_claude_statusline_quota_windows(
-                &claude_account_identifier_hash,
-                &observable_account_identifier_hashes,
-            ) {
-                Ok(ClaudeStatusLineQuota::Windows(windows)) if !windows.is_empty() => {
-                    snapshot.collection_method = AgentStatusCollectionMethod::StatusLine;
-                    snapshot.quota_windows = windows;
-                    *quota_capability = supported_capability(
-                        "quota_windows",
-                        "Collected from Claude Code's local statusLine rate_limits payload.",
-                    );
-                    true
-                }
-                Ok(ClaudeStatusLineQuota::Unattributable(reason)) => {
-                    snapshot.quota_windows = vec![unsupported_quota_window("usage")];
-                    *quota_capability = unsupported_capability("quota_windows", reason.detail());
-                    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
-                        reason.code(),
-                        AgentDiagnosticSeverity::Warning,
-                        reason.detail(),
-                    ));
-                    false
-                }
-                Ok(_) => {
-                    snapshot.quota_windows = vec![unsupported_quota_window("usage")];
-                    false
-                }
-                Err(message) => {
-                    snapshot.quota_windows = vec![unsupported_quota_window("usage")];
-                    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
-                        "claude_statusline_cache_unavailable",
-                        AgentDiagnosticSeverity::Warning,
-                        message,
-                    ));
-                    false
-                }
+    let apply_statusline_quota = |snapshot: &mut AgentStatusSnapshot,
+                                  quota_capability: &mut AgentCapabilityGap|
+     -> bool {
+        match collect_claude_statusline_quota_windows(
+            &claude_account_identifier_hash,
+            &observable_account_identifier_hashes,
+        ) {
+            Ok(ClaudeStatusLineQuota::Windows(windows)) if !windows.is_empty() => {
+                snapshot.collection_method = AgentStatusCollectionMethod::StatusLine;
+                snapshot.diagnostics.push(claude_quota_check_diagnostic(
+                        "claude_statusline_read_succeeded",
+                        "The supported local statusLine cache was read successfully; its quota windows retain their original observation times.",
+                        current_unix_seconds(),
+                    ).with_quota_binding(windows[0].account_identifier_hash.clone(), windows[0].organization_identifier_hash.clone()));
+                snapshot.quota_windows = windows;
+                *quota_capability = supported_capability(
+                    "quota_windows",
+                    "Collected from Claude Code's local statusLine rate_limits payload.",
+                );
+                true
             }
-        };
+            Ok(ClaudeStatusLineQuota::Unattributable(reason)) => {
+                snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+                *quota_capability = unsupported_capability("quota_windows", reason.detail());
+                snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                    reason.code(),
+                    AgentDiagnosticSeverity::Warning,
+                    reason.detail(),
+                ));
+                false
+            }
+            Ok(_) => {
+                snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+                false
+            }
+            Err(message) => {
+                snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+                snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                    "claude_statusline_cache_unavailable",
+                    AgentDiagnosticSeverity::Warning,
+                    message,
+                ));
+                false
+            }
+        }
+    };
     if let (Some(stable), Some((account_hash, organization_hash)), Some(account)) = (
         stable_default_credential.as_ref().ok(),
         strong_oauth_identity.as_ref(),
@@ -2593,13 +2599,13 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
         );
     }
     let oauth_outcome = match (
-        strong_oauth_identity,
+        strong_oauth_identity.as_ref(),
         stable_default_credential.as_ref().ok(),
     ) {
         (Some((account_hash, organization_hash)), Some(stable)) => {
             collect_claude_oauth_usage_with_access_token(
-                &account_hash,
-                &organization_hash,
+                account_hash,
+                organization_hash,
                 stable.credential.access_token.clone(),
                 true,
             )
@@ -2621,6 +2627,27 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
             snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
             snapshot.quota_windows = usage.windows;
             snapshot.credit_balances = usage.credit_balances;
+            // StatusLine may be newer than the locally cached OAuth answer.
+            // Only a source-proven exact account/workspace pair can replace
+            // that pair's meter; scoped windows/credits stay independently dated.
+            if let Ok(ClaudeStatusLineQuota::Windows(windows)) =
+                collect_claude_statusline_quota_windows(
+                    &claude_account_identifier_hash,
+                    &observable_account_identifier_hashes,
+                )
+            {
+                if prefer_newer_exact_claude_statusline_windows(
+                    &mut snapshot.quota_windows,
+                    windows,
+                ) {
+                    snapshot.collection_method = AgentStatusCollectionMethod::StatusLine;
+                    snapshot.diagnostics.push(claude_quota_check_diagnostic(
+                        "claude_statusline_newer_exact_binding_selected",
+                        "Newer local statusLine readings replaced the matching account/workspace OAuth meters; other meters retain their own observation times.",
+                        current_unix_seconds(),
+                    ).with_quota_binding(Some(claude_account_identifier_hash.clone()), strong_oauth_identity.as_ref().map(|(_, organization)| organization.clone())));
+                }
+            }
             quota_capability = supported_capability(
                 "quota_windows",
                 "Collected from Claude Code's local OAuth usage endpoint.",
@@ -6087,6 +6114,10 @@ fn collect_claude_oauth_usage_with_access_token(
             Some(organization_identifier_hash),
         );
     }
+    for diagnostic in &mut outcome.diagnostics {
+        diagnostic.account_identifier_hash = Some(account_identifier_hash.to_string());
+        diagnostic.organization_identifier_hash = Some(organization_identifier_hash.to_string());
+    }
     outcome
 }
 
@@ -6147,7 +6178,8 @@ fn collect_claude_oauth_usage_unstamped(
                 && now.saturating_sub(cache.observed_at_epoch_seconds)
                     <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
         }) {
-            return ClaudeOAuthUsageOutcome::from(Ok(claude_oauth_usage_from_cache(cache, now)));
+            return ClaudeOAuthUsageOutcome::from(Ok(claude_oauth_usage_from_cache(cache, now)))
+                .with_check_outcome("claude_oauth_usage_cache_reused", "A locally cached quota reading was reused while collection is in progress; no duplicate provider check was made.", now);
         }
         return ClaudeOAuthUsageOutcome {
             result: Err("Claude usage collection is already in progress for this account.".to_string()),
@@ -6192,7 +6224,8 @@ fn collect_claude_oauth_usage_unstamped(
                 )
                 || now < cache.next_refresh_after_epoch_seconds)
         {
-            return ClaudeOAuthUsageOutcome::from(Ok(claude_oauth_usage_from_cache(cache, now)));
+            return ClaudeOAuthUsageOutcome::from(Ok(claude_oauth_usage_from_cache(cache, now)))
+                .with_check_outcome("claude_oauth_usage_cache_reused", "A locally cached quota reading was reused under the local refresh or retry-after gate; no provider check was made.", now);
         }
         if now < cache.next_refresh_after_epoch_seconds {
             return ClaudeOAuthUsageOutcome::from(Err(
@@ -6213,13 +6246,23 @@ fn collect_claude_oauth_usage_unstamped(
                     .map(|breaker| claude_oauth_usage_circuit_open_diagnostic(breaker, now))
                     .into_iter()
                     .collect(),
-            };
+            }
+            .with_check_outcome(
+                "claude_oauth_usage_cache_reused",
+                "A prior local quota reading was reused; no provider request was made.",
+                now,
+            );
         }
         if let Some(breaker) = open_breaker {
             return ClaudeOAuthUsageOutcome {
                 result: Err("Claude OAuth usage endpoint is not being called.".to_string()),
                 diagnostics: vec![claude_oauth_usage_circuit_open_diagnostic(&breaker, now)],
-            };
+            }
+            .with_check_outcome(
+                "claude_oauth_usage_check_suppressed",
+                "The local quota breaker suppressed this provider request.",
+                now,
+            );
         }
         return ClaudeOAuthUsageOutcome::from(Err(
             "Claude OAuth credentials were not available locally.".to_string(),
@@ -6230,12 +6273,17 @@ fn collect_claude_oauth_usage_unstamped(
             return ClaudeOAuthUsageOutcome {
                 result: Ok(claude_oauth_usage_from_cache(cache, now)),
                 diagnostics: vec![claude_oauth_usage_circuit_open_diagnostic(&breaker, now)],
-            };
+            }.with_check_outcome("claude_oauth_usage_check_suppressed", "The local quota breaker suppressed this provider request; last-known local readings were reused.", now);
         }
         return ClaudeOAuthUsageOutcome {
             result: Err("Claude OAuth usage endpoint is not being called.".to_string()),
             diagnostics: vec![claude_oauth_usage_circuit_open_diagnostic(&breaker, now)],
-        };
+        }
+        .with_check_outcome(
+            "claude_oauth_usage_check_suppressed",
+            "The local quota breaker suppressed this provider request.",
+            now,
+        );
     }
     let authorization = format!("Bearer {token}");
     let user_agent = ottto_user_agent();
@@ -6278,7 +6326,7 @@ fn collect_claude_oauth_usage_unstamped(
             }
             // The retry-after backoff above still handles the transient case
             // unchanged; the breaker only fires once 429s outlive it.
-            let diagnostics = record_claude_oauth_usage_failure_with_legacy(
+            let mut diagnostics = record_claude_oauth_usage_failure_with_legacy(
                 ClaudeOAuthUsageFailure::RateLimited,
                 account_identifier_hash,
                 organization_identifier_hash,
@@ -6286,6 +6334,7 @@ fn collect_claude_oauth_usage_unstamped(
                 now,
                 mirror_legacy_default,
             );
+            diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed with rate limiting; any served readings remain locally cached evidence.", current_unix_seconds()));
             if !cache.windows.is_empty()
                 && now.saturating_sub(cache.observed_at_epoch_seconds)
                     <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
@@ -6301,7 +6350,7 @@ fn collect_claude_oauth_usage_unstamped(
             };
         }
         Err(error) => {
-            let diagnostics = match claude_oauth_usage_failure_class(&error) {
+            let mut diagnostics = match claude_oauth_usage_failure_class(&error) {
                 Some(failure) => record_claude_oauth_usage_failure_with_legacy(
                     failure,
                     account_identifier_hash,
@@ -6312,6 +6361,7 @@ fn collect_claude_oauth_usage_unstamped(
                 ),
                 None => Vec::new(),
             };
+            diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed; any served readings remain locally cached evidence.", current_unix_seconds()));
             if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
                 account_identifier_hash,
                 organization_identifier_hash,
@@ -6344,7 +6394,12 @@ fn collect_claude_oauth_usage_unstamped(
                 now,
                 mirror_legacy_default,
             ),
-        };
+        }
+        .with_check_outcome(
+            "claude_oauth_usage_check_failed",
+            "The latest Claude OAuth response could not be read as quota data.",
+            current_unix_seconds(),
+        );
     };
     let mut usage = ClaudeOAuthUsage {
         windows: claude_oauth_quota_windows(&value),
@@ -6364,18 +6419,30 @@ fn collect_claude_oauth_usage_unstamped(
                 now,
                 mirror_legacy_default,
             ),
-        };
+        }
+        .with_check_outcome(
+            "claude_oauth_usage_check_failed",
+            "The latest Claude OAuth response contained no supported quota windows.",
+            current_unix_seconds(),
+        );
     }
     claude_oauth_stamp_account_identity(
         &mut usage,
         account_identifier_hash,
         Some(organization_identifier_hash),
     );
+    // This is the local successful response time, never a provider-supplied
+    // timestamp. Cache reuse preserves it rather than stamping a later upload.
+    let observed_at_epoch_seconds = current_unix_seconds();
+    let observed_at = rfc3339_from_unix_seconds(observed_at_epoch_seconds);
+    for window in &mut usage.windows {
+        window.observed_at = observed_at.clone();
+    }
     let cache = ClaudeOAuthUsageCache {
         schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
         account_identifier_hash: account_identifier_hash.to_string(),
         organization_identifier_hash: organization_identifier_hash.to_string(),
-        observed_at_epoch_seconds: now,
+        observed_at_epoch_seconds,
         next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
         windows: usage.windows.clone(),
         credit_balances: usage.credit_balances.clone(),
@@ -6391,7 +6458,11 @@ fn collect_claude_oauth_usage_unstamped(
         organization_identifier_hash,
         mirror_legacy_default,
     );
-    ClaudeOAuthUsageOutcome::from(Ok(usage))
+    ClaudeOAuthUsageOutcome::from(Ok(usage)).with_check_outcome(
+        "claude_oauth_usage_check_succeeded",
+        "A supported Claude OAuth quota response was collected successfully.",
+        current_unix_seconds(),
+    )
 }
 
 impl From<Result<ClaudeOAuthUsage, String>> for ClaudeOAuthUsageOutcome {
@@ -6401,6 +6472,19 @@ impl From<Result<ClaudeOAuthUsage, String>> for ClaudeOAuthUsageOutcome {
             diagnostics: Vec::new(),
         }
     }
+}
+
+impl ClaudeOAuthUsageOutcome {
+    fn with_check_outcome(mut self, code: &str, detail: &str, now: u64) -> Self {
+        self.diagnostics
+            .push(claude_quota_check_diagnostic(code, detail, now));
+        self
+    }
+}
+
+fn claude_quota_check_diagnostic(code: &str, detail: &str, now: u64) -> AgentStatusDiagnostic {
+    AgentStatusDiagnostic::source(code, AgentDiagnosticSeverity::Info, detail)
+        .with_observed_at(rfc3339_from_unix_seconds(now))
 }
 
 /// Effective freshness gate for the Claude OAuth usage read: the ~60-minute
@@ -7700,6 +7784,7 @@ fn claude_statusline_quota_windows_from_cache(
             model: None,
             account_label: None,
             account_identifier_hash: account_identifier_hash.clone(),
+            organization_identifier_hash: cache.observed_under_organization_identifier_hash.clone(),
             window_seconds,
             started_at: None,
             resets_at: Some(resets_at),
@@ -7711,6 +7796,70 @@ fn claude_statusline_quota_windows_from_cache(
         });
     }
     windows
+}
+
+/// Replace only a comparable meter whose two clocks and exact binding prove
+/// the statusLine reading newer. No account-only, inferred-time or cross-pool
+/// merge is allowed. Unreported OAuth meters remain in the original vector.
+fn prefer_newer_exact_claude_statusline_windows(
+    oauth_windows: &mut [AgentQuotaWindow],
+    statusline_windows: Vec<AgentQuotaWindow>,
+) -> bool {
+    let mut replaced = false;
+    for newer in statusline_windows {
+        if newer.used_percent.is_none() && newer.left_percent.is_none() {
+            continue;
+        }
+        let Some(account) = newer
+            .account_identifier_hash
+            .as_deref()
+            .filter(|hash| !hash.is_empty())
+        else {
+            continue;
+        };
+        let Some(organization) = newer
+            .organization_identifier_hash
+            .as_deref()
+            .filter(|hash| !hash.is_empty())
+        else {
+            continue;
+        };
+        let Some(new_time) = newer
+            .observed_at
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        else {
+            continue;
+        };
+        if new_time.unix_timestamp() > current_unix_seconds() as i64 + 60 {
+            continue;
+        }
+        for older in oauth_windows.iter_mut() {
+            if older.account_identifier_hash.as_deref() != Some(account)
+                || older.organization_identifier_hash.as_deref() != Some(organization)
+                || older.name != newer.name
+                || older.scope != newer.scope
+                || older.window_seconds != newer.window_seconds
+                || older.model != newer.model
+                || older.group != newer.group
+                || older.limit_id != newer.limit_id
+            {
+                continue;
+            }
+            let Some(old_time) = older
+                .observed_at
+                .as_deref()
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            else {
+                continue;
+            };
+            if new_time > old_time {
+                *older = newer.clone();
+                replaced = true;
+            }
+        }
+    }
+    replaced
 }
 
 fn claude_statusline_context_from_cache(
@@ -18903,6 +19052,7 @@ exit 1
             &ClaudeStatusLineRateLimitCache {
                 schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
                 observed_under_account_identifier_hash: account_a.clone(),
+                observed_under_organization_identifier_hash: None,
                 observed_under_account_method: "config_dir".to_string(),
                 observed_at_epoch_seconds: now,
                 windows: vec![ClaudeStatusLineRateLimitWindow {
@@ -18974,10 +19124,77 @@ exit 1
     }
 
     #[test]
+    fn prefer_newer_exact_statusline_keeps_meter_coverage_and_refuses_weak_or_other_binding() {
+        let meter =
+            |name: &str, organization: Option<&str>, time: &str, used: u8| AgentQuotaWindow {
+                name: name.to_string(),
+                scope: AgentQuotaWindowScope::Account,
+                account_identifier_hash: Some("account-a".to_string()),
+                organization_identifier_hash: organization.map(str::to_string),
+                observed_at: Some(time.to_string()),
+                used_percent: Some(used),
+                ..Default::default()
+            };
+        let old = "2026-09-29T10:00:00Z";
+        let new = "2026-09-29T10:05:00Z";
+        let mut oauth = vec![
+            meter("session", Some("org-a"), old, 40),
+            meter("weekly", Some("org-a"), old, 70),
+            meter("scoped", Some("org-a"), old, 80),
+        ];
+        for organization in [None, Some("org-b")] {
+            assert!(!prefer_newer_exact_claude_statusline_windows(
+                &mut oauth,
+                vec![meter("session", organization, new, 46)]
+            ));
+            assert_eq!(oauth[0].used_percent, Some(40));
+        }
+        let mut other_pool = meter("session", Some("org-a"), new, 96);
+        other_pool.limit_id = Some("another-pool".to_string());
+        assert!(!prefer_newer_exact_claude_statusline_windows(
+            &mut oauth,
+            vec![other_pool]
+        ));
+        assert!(!prefer_newer_exact_claude_statusline_windows(
+            &mut oauth,
+            vec![meter("session", Some("org-a"), "2099-01-01T00:00:00Z", 96)]
+        ));
+        let mut no_reading = meter("session", Some("org-a"), new, 96);
+        no_reading.used_percent = None;
+        assert!(!prefer_newer_exact_claude_statusline_windows(
+            &mut oauth,
+            vec![no_reading]
+        ));
+        assert!(prefer_newer_exact_claude_statusline_windows(
+            &mut oauth,
+            vec![meter("session", Some("org-a"), new, 46)]
+        ));
+        assert_eq!(
+            oauth
+                .iter()
+                .map(|window| window.used_percent)
+                .collect::<Vec<_>>(),
+            vec![Some(46), Some(70), Some(80)]
+        );
+        assert_eq!(oauth[0].observed_at.as_deref(), Some(new));
+        assert_eq!(oauth[1].observed_at.as_deref(), Some(old));
+        assert!(!prefer_newer_exact_claude_statusline_windows(
+            &mut oauth,
+            vec![meter("session", Some("org-a"), old, 30)]
+        ));
+        oauth[0].observed_at = None;
+        assert!(!prefer_newer_exact_claude_statusline_windows(
+            &mut oauth,
+            vec![meter("session", Some("org-a"), new, 50)]
+        ));
+    }
+
+    #[test]
     fn claude_statusline_cache_maps_fresh_windows() {
         let cache = ClaudeStatusLineRateLimitCache {
             schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
             observed_under_account_identifier_hash: "account-a".to_string(),
+            observed_under_organization_identifier_hash: None,
             observed_under_account_method: "config_dir".to_string(),
             observed_at_epoch_seconds: 100,
             windows: vec![
@@ -19027,6 +19244,7 @@ exit 1
         let cache = ClaudeStatusLineRateLimitCache {
             schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
             observed_under_account_identifier_hash: String::new(),
+            observed_under_organization_identifier_hash: None,
             observed_under_account_method: "config_dir".to_string(),
             observed_at_epoch_seconds: 100,
             windows: vec![ClaudeStatusLineRateLimitWindow {
@@ -19782,6 +20000,7 @@ exit 1
         let cache = ClaudeStatusLineRateLimitCache {
             schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
             observed_under_account_identifier_hash: "account-a".to_string(),
+            observed_under_organization_identifier_hash: None,
             observed_under_account_method: "config_dir".to_string(),
             observed_at_epoch_seconds: 100,
             windows: vec![
@@ -19816,6 +20035,7 @@ exit 1
         let cache = ClaudeStatusLineRateLimitCache {
             schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
             observed_under_account_identifier_hash: "account-a".to_string(),
+            observed_under_organization_identifier_hash: None,
             observed_under_account_method: "config_dir".to_string(),
             observed_at_epoch_seconds: 100,
             windows: vec![ClaudeStatusLineRateLimitWindow {

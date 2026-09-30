@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "leaves": [
+    {
+      "path": "$[0].account_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].code",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].message",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].observed_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].organization_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[0].severity",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].account_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].code",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].message",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].observed_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].organization_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[1].severity",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].account_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].code",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].message",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].observed_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].organization_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[2].severity",
+      "value_type": "string"
+    },
+    {
+      "path": "$[3].account_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[3].code",
+      "value_type": "string"
+    },
+    {
+      "path": "$[3].message",
+      "value_type": "string"
+    },
+    {
+      "path": "$[3].observed_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[3].organization_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[3].severity",
+      "value_type": "string"
+    },
+    {
+      "path": "$[4].account_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[4].code",
+      "value_type": "string"
+    },
+    {
+      "path": "$[4].message",
+      "value_type": "string"
+    },
+    {
+      "path": "$[4].observed_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[4].organization_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[4].severity",
+      "value_type": "string"
+    },
+    {
+      "path": "$[5].account_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[5].code",
+      "value_type": "string"
+    },
+    {
+      "path": "$[5].message",
+      "value_type": "string"
+    },
+    {
+      "path": "$[5].observed_at",
+      "value_type": "string"
+    },
+    {
+      "path": "$[5].organization_identifier_hash",
+      "value_type": "string"
+    },
+    {
+      "path": "$[5].severity",
+      "value_type": "string"
+    }
+  ]
+}
+
