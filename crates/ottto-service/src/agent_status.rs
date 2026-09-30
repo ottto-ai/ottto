@@ -3702,6 +3702,11 @@ fn custom_claude_snapshot_from_usage(
                 Some(&resolved.account),
                 &captured_at,
             );
+            status.quota_check_diagnostics = safe_claude_slot_check_diagnostics(
+                &diagnostics,
+                &resolved.account_identifier_hash,
+                &resolved.organization_identifier_hash,
+            );
             return Err(status);
         }
     };
@@ -3787,7 +3792,67 @@ fn custom_claude_snapshot_from_usage(
     ));
     apply_credential_metadata(&mut state, &resolved.credential);
     remember_claude_slot_account_profile(&mut state, snapshot.account.as_ref(), &captured_at);
+    state.quota_check_diagnostics = safe_claude_slot_check_diagnostics(
+        &snapshot.diagnostics,
+        &resolved.account_identifier_hash,
+        &resolved.organization_identifier_hash,
+    );
     Ok((snapshot, state))
+}
+
+/// Persist only known producer outcomes, never provider errors, slot paths or
+/// caller-supplied messages. Both hashes must already match the proven slot.
+fn safe_claude_slot_check_diagnostics(
+    diagnostics: &[AgentStatusDiagnostic],
+    account: &str,
+    organization: &str,
+) -> Vec<AgentStatusDiagnostic> {
+    let mut result = Vec::new();
+    for diagnostic in diagnostics {
+        if account.is_empty()
+            || organization.is_empty()
+            || diagnostic.account_identifier_hash.as_deref() != Some(account)
+            || diagnostic.organization_identifier_hash.as_deref() != Some(organization)
+            || result
+                .iter()
+                .any(|existing: &AgentStatusDiagnostic| existing.code == diagnostic.code)
+        {
+            continue;
+        }
+        let message = match diagnostic.code.as_str() {
+            "claude_oauth_usage_check_failed" => "The exact-account quota provider request failed.",
+            "claude_oauth_usage_check_suppressed" => "The local quota breaker suppressed the provider request; no provider check was made.",
+            "claude_oauth_usage_cache_reused" => "Locally cached quota evidence was reused; no provider check was made.",
+            "claude_oauth_usage_check_succeeded" => "A supported exact-account quota response was collected successfully.",
+            "claude_oauth_usage_network_disabled" => "Quota network collection is disabled on this machine.",
+            "claude_oauth_usage_collection_in_progress" => "Quota collection is already in progress; no duplicate provider check was made.",
+            "claude_oauth_usage_circuit_open" => {
+                // These classifications come from the existing typed breaker,
+                // not an arbitrary transport error or credential string.
+                if diagnostic.message == "The local quota circuit is open after authentication rejection."
+                    || diagnostic.message.starts_with("Stopped calling the Claude OAuth usage endpoint after auth rejected;") {
+                    "The local quota circuit is open after authentication rejection."
+                } else if diagnostic.message == "The local quota circuit is open after unsupported response shape."
+                    || diagnostic.message.starts_with("Stopped calling the Claude OAuth usage endpoint after response shape;") {
+                    "The local quota circuit is open after unsupported response shape."
+                } else {
+                    "The local quota circuit is open after repeated failures."
+                }
+            }
+            _ => continue,
+        };
+        let clock = bounded_claude_collection_timestamp(
+            diagnostic.observed_at.as_deref(),
+            OffsetDateTime::now_utc(),
+        )
+        .and(diagnostic.observed_at.clone());
+        result.push(
+            AgentStatusDiagnostic::source(&diagnostic.code, diagnostic.severity.clone(), message)
+                .with_observed_at(clock)
+                .with_quota_binding(Some(account.to_string()), Some(organization.to_string())),
+        );
+    }
+    result
 }
 
 fn local_claude_quota_snapshot(
@@ -4173,6 +4238,7 @@ fn clear_claude_slot_binding(status: &mut ClaudeConfigSlotCollectionStatusV1) {
     status.has_scoped_limits = false;
     status.has_credit_balances = false;
     status.quota_snapshot = None;
+    status.quota_check_diagnostics.clear();
 }
 
 fn retain_verified_claude_slot_binding(
@@ -4352,11 +4418,78 @@ fn degraded_claude_slot_snapshot(
         ),
         ClaudeQuotaAccessState::Full | ClaudeQuotaAccessState::Partial => unreachable!(),
     };
-    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
-        code,
-        AgentDiagnosticSeverity::Warning,
-        message,
-    ));
+    snapshot.diagnostics.push(
+        AgentStatusDiagnostic::source(code, AgentDiagnosticSeverity::Warning, message)
+            .with_quota_binding(
+                status.account_identifier_hash.clone(),
+                status.organization_identifier_hash.clone(),
+            ),
+    );
+    snapshot
+        .diagnostics
+        .extend(safe_claude_slot_check_diagnostics(
+            &status.quota_check_diagnostics,
+            status.account_identifier_hash.as_deref()?,
+            status.organization_identifier_hash.as_deref()?,
+        ));
+    // Enum-derived codes describe local collection/upkeep state only. Their
+    // clocks are intentionally absent: slot captured_at is not a provider check.
+    let state_code = serde_json::to_value(&status.state)
+        .ok()?
+        .as_str()?
+        .to_string();
+    snapshot.diagnostics.push(
+        AgentStatusDiagnostic::source(
+            format!("claude_slot_collection_{state_code}"),
+            AgentDiagnosticSeverity::Warning,
+            "The exact registered slot reported this local collection state.",
+        )
+        .with_quota_binding(
+            status.account_identifier_hash.clone(),
+            status.organization_identifier_hash.clone(),
+        ),
+    );
+    for diagnostic in &status.diagnostics {
+        let code = serde_json::to_value(diagnostic.code)
+            .ok()?
+            .as_str()?
+            .to_string();
+        let code = format!("claude_slot_collection_{code}");
+        if !snapshot.diagnostics.iter().any(|item| item.code == code) {
+            snapshot.diagnostics.push(
+                AgentStatusDiagnostic::source(
+                    code,
+                    AgentDiagnosticSeverity::Warning,
+                    "The exact registered slot reported this local collection state.",
+                )
+                .with_quota_binding(
+                    status.account_identifier_hash.clone(),
+                    status.organization_identifier_hash.clone(),
+                ),
+            );
+        }
+    }
+    if let Some(upkeep) = &status.upkeep {
+        let result = serde_json::to_value(upkeep.result)
+            .ok()?
+            .as_str()?
+            .to_string();
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            format!("claude_slot_upkeep_{result}"), AgentDiagnosticSeverity::Info,
+            "The exact registered slot reported this local credential-upkeep result; it is not a quota provider check.",
+        ).with_quota_binding(status.account_identifier_hash.clone(), status.organization_identifier_hash.clone()));
+        if bounded_claude_collection_timestamp(
+            upkeep.attempted_at.as_deref(),
+            OffsetDateTime::now_utc(),
+        )
+        .is_some()
+        {
+            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                "claude_slot_upkeep_attempt_started", AgentDiagnosticSeverity::Info,
+                "The last recorded local credential-upkeep attempt started at this time; completion time is unavailable.",
+            ).with_observed_at(upkeep.attempted_at.clone()).with_quota_binding(status.account_identifier_hash.clone(), status.organization_identifier_hash.clone()));
+        }
+    }
     Some(snapshot)
 }
 
@@ -21605,7 +21738,16 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         };
         let status = custom_claude_snapshot_from_usage(
             resolved,
-            ClaudeOAuthUsageOutcome::from(Err("quota unavailable".to_string())),
+            ClaudeOAuthUsageOutcome {
+                result: Err("private provider error must not be retained".to_string()),
+                diagnostics: vec![AgentStatusDiagnostic::source(
+                    "claude_oauth_usage_check_failed",
+                    AgentDiagnosticSeverity::Warning,
+                    "private transport detail must not be retained",
+                )
+                .with_observed_at(Some("2026-09-01T09:59:00Z".to_string()))
+                .with_quota_binding(Some("account-a".to_string()), Some("org-a".to_string()))],
+            },
             true,
             "2026-09-01T10:00:00Z".to_string(),
             "2026-09-01T10:05:00Z".to_string(),
@@ -21619,6 +21761,186 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             "missing product stays unknown"
         );
         assert!(status.quota_snapshot.is_none());
+        assert_eq!(status.quota_check_diagnostics.len(), 1);
+        let persisted: ClaudeConfigSlotCollectionStatusV1 =
+            serde_json::from_slice(&serde_json::to_vec(&status).expect("serialize exact slot"))
+                .expect("reload exact slot");
+        let snapshot = degraded_claude_slot_snapshot(
+            &persisted,
+            ClaudeAccountAnchorDurabilityV1::Anchored,
+            None,
+            "2026-09-01T11:00:00Z",
+            "2026-09-01T11:05:00Z",
+        )
+        .expect("degraded exact slot");
+        let receipt = snapshot
+            .diagnostics
+            .iter()
+            .find(|item| item.code == "claude_oauth_usage_check_failed")
+            .expect("failure retained");
+        assert_eq!(receipt.observed_at.as_deref(), Some("2026-09-01T09:59:00Z"));
+        assert_eq!(
+            receipt.account_identifier_hash.as_deref(),
+            Some("account-a")
+        );
+        assert_eq!(
+            receipt.organization_identifier_hash.as_deref(),
+            Some("org-a")
+        );
+        assert!(!serde_json::to_string(&snapshot)
+            .expect("snapshot json")
+            .contains("private"));
+    }
+
+    #[test]
+    fn claude_slot_diagnostics_keep_suppression_and_cache_distinct_without_inventing_clocks() {
+        let codes = [
+            "claude_oauth_usage_check_failed",
+            "claude_oauth_usage_check_suppressed",
+            "claude_oauth_usage_cache_reused",
+        ];
+        for code in codes {
+            let mut status =
+                provider_unavailable_status("2026-09-01T10:00:00Z", "account-a", "org-a");
+            status.quota_check_diagnostics = vec![AgentStatusDiagnostic::for_account(
+                code,
+                AgentDiagnosticSeverity::Info,
+                "private message",
+                "private email",
+            )
+            .with_observed_at(Some("2026-09-01T09:00:00Z".to_string()))
+            .with_quota_binding(Some("account-a".to_string()), Some("org-a".to_string()))];
+            let snapshot = degraded_claude_slot_snapshot(
+                &status,
+                ClaudeAccountAnchorDurabilityV1::Anchored,
+                None,
+                "2026-09-01T11:00:00Z",
+                "2026-09-01T11:05:00Z",
+            )
+            .expect("degraded");
+            let receipt = snapshot
+                .diagnostics
+                .iter()
+                .find(|item| item.code == code)
+                .expect("outcome");
+            assert_eq!(receipt.observed_at.as_deref(), Some("2026-09-01T09:00:00Z"));
+            assert!(receipt.account_label.is_none() && receipt.scope.is_none());
+            assert_eq!(
+                snapshot
+                    .diagnostics
+                    .iter()
+                    .filter(|item| codes.contains(&item.code.as_str()))
+                    .count(),
+                1
+            );
+            assert!(snapshot.quota_windows.is_empty());
+            assert!(snapshot
+                .diagnostics
+                .iter()
+                .filter(|item| item.code != code)
+                .all(|item| item.observed_at.is_none()));
+            let receipt = receipt.clone();
+            let upload = snapshot.redacted_for_backend();
+            assert!(upload.diagnostics.iter().any(|item| item == &receipt));
+        }
+    }
+
+    #[test]
+    fn claude_slot_diagnostics_reject_foreign_unknown_and_invalid_times() {
+        let diagnostic = AgentStatusDiagnostic::source(
+            "claude_oauth_usage_check_failed",
+            AgentDiagnosticSeverity::Info,
+            "unsafe detail",
+        )
+        .with_observed_at(Some("2026-09-01T09:00:00Z".to_string()))
+        .with_quota_binding(Some("account-a".to_string()), Some("org-a".to_string()));
+        let mut foreign = diagnostic.clone();
+        foreign.organization_identifier_hash = Some("org-b".to_string());
+        let mut unknown = diagnostic.clone();
+        unknown.code = "private_unknown_error".to_string();
+        assert!(
+            safe_claude_slot_check_diagnostics(&[foreign, unknown], "account-a", "org-a")
+                .is_empty()
+        );
+        let mut circuit = diagnostic.clone();
+        circuit.code = "claude_oauth_usage_circuit_open".to_string();
+        circuit.observed_at = None;
+        circuit.message = "Stopped calling the Claude OAuth usage endpoint after auth rejected; private remainder".to_string();
+        let safe = safe_claude_slot_check_diagnostics(&[circuit], "account-a", "org-a");
+        assert_eq!(
+            safe[0].message,
+            "The local quota circuit is open after authentication rejection."
+        );
+        assert_eq!(
+            safe_claude_slot_check_diagnostics(&safe, "account-a", "org-a"),
+            safe,
+            "canonicalization must survive persistence/projection"
+        );
+        for clock in [None, Some("not-a-clock"), Some("9999-01-01T00:00:00Z")] {
+            let mut missing = diagnostic.clone();
+            missing.observed_at = clock.map(ToString::to_string);
+            let safe = safe_claude_slot_check_diagnostics(
+                &[missing.clone(), missing],
+                "account-a",
+                "org-a",
+            );
+            assert_eq!(safe.len(), 1);
+            assert!(safe[0].observed_at.is_none());
+        }
+        let mut cleared = provider_unavailable_status("2026-09-01T10:00:00Z", "account-a", "org-a");
+        cleared.quota_check_diagnostics.push(diagnostic);
+        clear_claude_slot_binding(&mut cleared);
+        assert!(cleared.quota_check_diagnostics.is_empty());
+        let legacy: ClaudeConfigSlotCollectionStatusV1 =
+            serde_json::from_str("{\"state\":\"provider_unavailable\"}").expect("legacy slot");
+        assert!(legacy.quota_check_diagnostics.is_empty());
+        assert!(!serde_json::to_string(&legacy)
+            .expect("legacy json")
+            .contains("quota_check_diagnostics"));
+    }
+
+    #[test]
+    fn claude_slot_diagnostics_expose_safe_upkeep_result_and_only_real_attempt_start() {
+        let mut status = provider_unavailable_status("2026-09-01T10:00:00Z", "account-a", "org-a");
+        status.upkeep = Some(ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+            result: ClaudeConfigSlotUpkeepResultV1::Backoff,
+            attempted_at: Some("2026-09-01T08:00:00Z".to_string()),
+            due_access_expires_at: None,
+            refresh_token_expires_at: None,
+            next_allowed_attempt_at: None,
+            consecutive_failures: 0,
+        });
+        let snapshot = degraded_claude_slot_snapshot(
+            &status,
+            ClaudeAccountAnchorDurabilityV1::Anchored,
+            None,
+            "2026-09-01T11:00:00Z",
+            "2026-09-01T11:05:00Z",
+        )
+        .expect("degraded");
+        let backoff = snapshot
+            .diagnostics
+            .iter()
+            .find(|item| item.code == "claude_slot_upkeep_backoff")
+            .expect("typed backoff");
+        assert!(
+            backoff.observed_at.is_none(),
+            "older attempt is not current backoff outcome time"
+        );
+        let attempt = snapshot
+            .diagnostics
+            .iter()
+            .find(|item| item.code == "claude_slot_upkeep_attempt_started")
+            .expect("real start");
+        assert_eq!(attempt.observed_at.as_deref(), Some("2026-09-01T08:00:00Z"));
+        assert_eq!(
+            attempt.organization_identifier_hash.as_deref(),
+            Some("org-a")
+        );
+        assert!(snapshot
+            .diagnostics
+            .iter()
+            .all(|item| !item.code.starts_with("claude_oauth_usage_check_")));
     }
 
     #[test]
