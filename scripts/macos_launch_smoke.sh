@@ -12,6 +12,11 @@ Usage: macos_launch_smoke.sh --app <Ottto.app> --output <evidence.json> [options
 Launches a packaged macOS app, verifies it survives a short startup window,
 records redacted JSON evidence, then terminates the process.
 
+The app runs with CFFIXED_USER_HOME pointed at a throwaway directory so the
+Companion single-instance lock (Application Support/Ottto/companion.lock)
+cannot collide with an Ottto app already running for this user. An early
+clean exit still fails the smoke.
+
 Options:
   --app <path>            Packaged .app bundle to launch.
   --output <path>         JSON evidence output path.
@@ -106,6 +111,10 @@ MARKER="$TMP_DIR/launch-start.marker"
 REPORTS_FILE="$TMP_DIR/crash-reports.txt"
 STDOUT_LOG="$TMP_DIR/stdout.log"
 STDERR_LOG="$TMP_DIR/stderr.log"
+# Foundation resolves Application Support from CFFIXED_USER_HOME, not HOME.
+SMOKE_HOME="$TMP_DIR/home"
+SINGLETON_LOCK="$SMOKE_HOME/Library/Application Support/Ottto/companion.lock"
+mkdir -p "$SMOKE_HOME/Library/Application Support"
 touch "$MARKER"
 
 PID=""
@@ -125,14 +134,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+PREEXISTING_APP_PROCESSES="$( (pgrep -x "$EXECUTABLE_NAME" 2>/dev/null || true) | wc -l | tr -d ' ')"
+
 CHECKED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-OTTTO_SKIP_BUNDLED_AGENT_REGISTRATION=1 "$EXECUTABLE" >"$STDOUT_LOG" 2>"$STDERR_LOG" &
+CFFIXED_USER_HOME="$SMOKE_HOME" OTTTO_SKIP_BUNDLED_AGENT_REGISTRATION=1 \
+  "$EXECUTABLE" >"$STDOUT_LOG" 2>"$STDERR_LOG" &
 PID="$!"
 
 PROCESS_SURVIVED="false"
 EXIT_CODE_JSON="null"
-deadline=$((SECONDS + WAIT_SECONDS))
-while (( SECONDS < deadline )); do
+# Count 0.2s polls rather than comparing whole-second SECONDS values, which
+# can shorten the survival window by up to a second.
+for ((poll = 0; poll < WAIT_SECONDS * 5; poll += 1)); do
   if ! kill -0 "$PID" >/dev/null 2>&1; then
     set +e
     wait "$PID"
@@ -146,6 +159,10 @@ done
 
 if kill -0 "$PID" >/dev/null 2>&1; then
   PROCESS_SURVIVED="true"
+fi
+SINGLETON_LOCK_ISOLATED="false"
+if [[ -e "$SINGLETON_LOCK" ]]; then
+  SINGLETON_LOCK_ISOLATED="true"
 fi
 
 # CrashReporter can lag process exit slightly; give it a short window before
@@ -165,7 +182,15 @@ fi
 CRASH_REPORTS_JSON="$(jq -R -s 'split("\n") | map(select(length > 0))' "$REPORTS_FILE")"
 CRASH_REPORT_COUNT="$(jq 'length' <<<"$CRASH_REPORTS_JSON")"
 STATUS="passed"
-if [[ "$PROCESS_SURVIVED" != "true" || "$CRASH_REPORT_COUNT" != "0" ]]; then
+FAILURE_REASON=""
+if [[ "$CRASH_REPORT_COUNT" != "0" ]]; then
+  FAILURE_REASON="crash_report"
+elif [[ "$PROCESS_SURVIVED" != "true" && "$EXIT_CODE_JSON" == "0" ]]; then
+  FAILURE_REASON="clean_exit_before_wait"
+elif [[ "$PROCESS_SURVIVED" != "true" ]]; then
+  FAILURE_REASON="exited_before_wait"
+fi
+if [[ -n "$FAILURE_REASON" ]]; then
   STATUS="failed"
 fi
 
@@ -182,6 +207,9 @@ jq -n \
   --argjson process_survived_wait "$PROCESS_SURVIVED" \
   --argjson exit_code "$EXIT_CODE_JSON" \
   --argjson crash_reports "$CRASH_REPORTS_JSON" \
+  --arg failure_reason "$FAILURE_REASON" \
+  --argjson singleton_lock_isolated "$SINGLETON_LOCK_ISOLATED" \
+  --argjson preexisting_app_process_count "$PREEXISTING_APP_PROCESSES" \
   '{
     schema_version: 1,
     gate: $gate,
@@ -195,11 +223,27 @@ jq -n \
     wait_seconds: $wait_seconds,
     process_survived_wait: $process_survived_wait,
     exit_code: $exit_code,
-    crash_reports: $crash_reports
+    crash_reports: $crash_reports,
+    failure_reason: (if $failure_reason == "" then null else $failure_reason end),
+    isolated_user_home: true,
+    singleton_lock_isolated: $singleton_lock_isolated,
+    preexisting_app_process_count: $preexisting_app_process_count
   }' > "$OUTPUT"
 
 if [[ "$STATUS" != "passed" ]]; then
-  echo "Packaged app launch smoke failed for $APP; evidence: $OUTPUT" >&2
+  if [[ "$FAILURE_REASON" == "clean_exit_before_wait" ]]; then
+    cat >&2 <<MSG
+Packaged app exited with code 0 before the ${WAIT_SECONDS}s survival window.
+That matches the Companion single-instance handoff: the new process found
+companion.lock held and deferred to an existing Ottto app. The smoke isolates
+that lock with CFFIXED_USER_HOME (lock created in isolated home:
+$SINGLETON_LOCK_ISOLATED; Ottto processes running before launch:
+$PREEXISTING_APP_PROCESSES). If the lock was not isolated, the guard's lock
+path no longer derives from Foundation's Application Support directory: fix
+the isolation, or quit Ottto.app on this Mac to unblock.
+MSG
+  fi
+  echo "Packaged app launch smoke failed ($FAILURE_REASON) for $APP; evidence: $OUTPUT" >&2
   exit 1
 fi
 
