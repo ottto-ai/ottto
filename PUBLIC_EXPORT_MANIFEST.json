@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 395,
-  "content_sha256": "94eedff9e4ca35a411adb4b65cadea7c33fd72b929761984aaf9ad6bf8aabc3d",
+  "candidate_file_count": 396,
+  "content_sha256": "8222a550b1ad52197a131e0ec9e4660b8cf2228ea991cff3022059b6d42f3848",
   "files": [
     {
       "executable": false,
@@ -671,8 +671,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_browser_auth.rs",
-      "sha256": "9d99674479668c9fec9bfd19264fd4c3551ba04c740ab77e7ef75f4bebe07a44",
-      "size_bytes": 305660
+      "sha256": "253829098f729de899bd38f0859ef8dbfddf319ed2fe3f2cd821021a31586b58",
+      "size_bytes": 312478
     },
     {
       "executable": false,
@@ -1734,6 +1734,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-09-30-claude-stale-auth-root.md",
+      "sha256": "6969d57365eba102605e59e1ac79fc0bcec2d802c5c72327d16e07e9b0b43632",
+      "size_bytes": 1598
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-09-30-quota-observation-evidence.md",
       "sha256": "2f83c48f3c1fd8fb4c877401bde7c77d686f5b6bf0cecdb88034adde96b7d7a0",
       "size_bytes": 1666
@@ -2768,9 +2775,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-30T09:35:59+00:00",
+  "generated_at": "2026-09-30T15:40:44+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 396,
+  "output_file_count": 397,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2804,5 +2811,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "46dee25ea933b2176e02f00052739ef63f5eb75b"
+  "source_commit": "e2ee821dacc22491da7e2ac8267fdf0ff2c476a9"
 }
