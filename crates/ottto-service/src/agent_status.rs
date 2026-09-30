@@ -7798,9 +7798,9 @@ fn claude_statusline_quota_windows_from_cache(
     windows
 }
 
-/// Replace only a comparable meter whose two clocks and exact binding prove
-/// the statusLine reading newer. No account-only, inferred-time or cross-pool
-/// merge is allowed. Unreported OAuth meters remain in the original vector.
+/// Replace only a percentage-only meter whose clocks, exact binding and reset
+/// prove the statusLine reading newer. Money-bearing readings remain intact;
+/// unreported OAuth meters remain in the original vector.
 fn prefer_newer_exact_claude_statusline_windows(
     oauth_windows: &mut [AgentQuotaWindow],
     statusline_windows: Vec<AgentQuotaWindow>,
@@ -7846,6 +7846,44 @@ fn prefer_newer_exact_claude_statusline_windows(
             {
                 continue;
             }
+            // A statusLine percentage cannot represent independently dated
+            // OAuth dollars/totals. Retain the whole reading rather than erase
+            // coverage or copy old monetary evidence onto a newer clock.
+            if older.limit_cents.is_some()
+                || older.used_cents.is_some()
+                || older.remaining_cents.is_some()
+                || older.quota.is_some()
+                || older.remaining.is_some()
+            {
+                continue;
+            }
+            let Some(old_reset) = older
+                .resets_at
+                .as_deref()
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            else {
+                continue;
+            };
+            let Some(new_reset) = newer
+                .resets_at
+                .as_deref()
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            else {
+                continue;
+            };
+            if old_reset != new_reset {
+                continue;
+            }
+            // A start is a period boundary, not a reading clock. It can survive
+            // only when the same verified reset/duration derives that boundary.
+            if let Some(start) = older.started_at.as_deref() {
+                let derived = newer.window_seconds.and_then(|seconds| {
+                    rfc3339_minus_seconds(newer.resets_at.as_deref().unwrap_or_default(), seconds)
+                });
+                if start != derived.as_deref().unwrap_or_default() {
+                    continue;
+                }
+            }
             let Some(old_time) = older
                 .observed_at
                 .as_deref()
@@ -7854,7 +7892,9 @@ fn prefer_newer_exact_claude_statusline_windows(
                 continue;
             };
             if new_time > old_time {
-                *older = newer.clone();
+                let mut selected = newer.clone();
+                selected.started_at = older.started_at.clone().or(selected.started_at);
+                *older = selected;
                 replaced = true;
             }
         }
@@ -19132,6 +19172,7 @@ exit 1
                 account_identifier_hash: Some("account-a".to_string()),
                 organization_identifier_hash: organization.map(str::to_string),
                 observed_at: Some(time.to_string()),
+                resets_at: Some("2026-10-01T00:00:00Z".to_string()),
                 used_percent: Some(used),
                 ..Default::default()
             };
@@ -19187,6 +19228,93 @@ exit 1
             &mut oauth,
             vec![meter("session", Some("org-a"), new, 50)]
         ));
+    }
+
+    #[test]
+    fn prefer_newer_exact_statusline_preserves_actual_oauth_money_and_start_coverage() {
+        let parsed = |money: Option<&str>| {
+            let mut response = serde_json::json!({
+                "five_hour": {"utilization": 40, "resets_at": "1970-01-01T00:03:20Z"},
+                "seven_day": {"utilization": 70, "resets_at": "1970-01-01T00:05:00Z"},
+                "spend": {"enabled": true, "used": 6, "cap": 25}
+            });
+            if let Some(field) = money {
+                response["five_hour"][field] = serde_json::json!(25);
+            }
+            let mut usage = ClaudeOAuthUsage {
+                windows: claude_oauth_quota_windows(&response),
+                credit_balances: claude_oauth_credit_balances(&response),
+            };
+            claude_oauth_stamp_account_identity(&mut usage, "account-a", Some("org-a"));
+            for window in &mut usage.windows {
+                window.observed_at = rfc3339_from_unix_seconds(100);
+            }
+            usage
+        };
+        let local = || {
+            claude_statusline_quota_windows_from_cache(
+                ClaudeStatusLineRateLimitCache {
+                    schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
+                    observed_under_account_identifier_hash: "account-a".to_string(),
+                    observed_under_organization_identifier_hash: Some("org-a".to_string()),
+                    observed_under_account_method: "session_store".to_string(),
+                    observed_at_epoch_seconds: 180,
+                    windows: vec![ClaudeStatusLineRateLimitWindow {
+                        name: "five_hour".to_string(),
+                        used_percent: 46,
+                        resets_at_epoch_seconds: 200,
+                    }],
+                },
+                150,
+            )
+        };
+        for field in ["limit_dollars", "used_dollars", "remaining_dollars"] {
+            let mut usage = parsed(Some(field));
+            let before = usage.clone();
+            assert!(!prefer_newer_exact_claude_statusline_windows(
+                &mut usage.windows,
+                local()
+            ));
+            assert_eq!(usage.windows, before.windows);
+            assert_eq!(usage.credit_balances, before.credit_balances);
+        }
+        let original = parsed(None);
+        assert_eq!(original.windows.len(), 2);
+        assert_eq!(original.credit_balances.len(), 1);
+        let mut usage = original.clone();
+        assert!(prefer_newer_exact_claude_statusline_windows(
+            &mut usage.windows,
+            local()
+        ));
+        assert_eq!(usage.windows[0].used_percent, Some(46));
+        assert_eq!(usage.windows[0].observed_at, rfc3339_from_unix_seconds(180));
+        assert_eq!(usage.windows[0].started_at, original.windows[0].started_at);
+        assert_eq!(usage.windows[1], original.windows[1]);
+        assert_eq!(usage.credit_balances, original.credit_balances);
+        for case in 0..4 {
+            let mut usage = original.clone();
+            let mut candidate = local();
+            match case {
+                0 => candidate[0].resets_at = rfc3339_from_unix_seconds(300),
+                1 => candidate[0].window_seconds = Some(6 * 60 * 60),
+                2 => candidate[0].observed_at = None,
+                _ => candidate[0].observed_at = Some("2099-01-01T00:00:00Z".to_string()),
+            }
+            assert!(!prefer_newer_exact_claude_statusline_windows(
+                &mut usage.windows,
+                candidate
+            ));
+            assert_eq!(usage.windows, original.windows);
+            assert_eq!(usage.credit_balances, original.credit_balances);
+        }
+        let mut conflicting_start = original.clone();
+        conflicting_start.windows[0].started_at = rfc3339_from_unix_seconds(5);
+        let before = conflicting_start.windows.clone();
+        assert!(!prefer_newer_exact_claude_statusline_windows(
+            &mut conflicting_start.windows,
+            local()
+        ));
+        assert_eq!(conflicting_start.windows, before);
     }
 
     #[test]

@@ -13,7 +13,11 @@ ambiguous. Existing account-only cache readings do not invent a workspace.
 A supported statusLine meter may replace an older OAuth meter only with matching
 account/workspace and comparable window/pool metadata, newer supported observation
 time and an actual reading. Missing identity/clocks, future clocks, different pools
-and unreported windows cannot replace or erase a known meter. Other meters and
+and unreported windows cannot replace or erase a known meter. Money-bearing OAuth
+meters stay intact: this wire has one reading clock, so retained old dollars must
+not acquire a newer percentage's timestamp. Percentage-only replacement also
+requires the same parsed reset/duration; a valid derived period start survives.
+Other meters and
 credits remain independently dated. Existing refresh/retry/breaker policy is unchanged.
 
 Backend admission of the additive diagnostic timestamp/binding fields must deploy
