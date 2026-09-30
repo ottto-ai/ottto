@@ -1842,6 +1842,14 @@ pub struct AgentStatusDiagnostic {
     pub code: String,
     pub severity: AgentDiagnosticSeverity,
     pub message: String,
+    /// Time this collector outcome occurred, not a quota observation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    /// Exact quota binding; display labels remain local-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
     /// Account/subscription this diagnostic is about. `None` means the
     /// diagnostic is provider-wide (applies to the whole source / all accounts).
     /// Populated only for account-attributed diagnostics. Stripped from the
@@ -1868,6 +1876,9 @@ impl AgentStatusDiagnostic {
             code: code.into(),
             severity,
             message: message.into(),
+            observed_at: None,
+            account_identifier_hash: None,
+            organization_identifier_hash: None,
             account_label: None,
             scope: None,
         }
@@ -1886,9 +1897,27 @@ impl AgentStatusDiagnostic {
             code: code.into(),
             severity,
             message: message.into(),
+            observed_at: None,
+            account_identifier_hash: None,
+            organization_identifier_hash: None,
             account_label: Some(account_label.into()),
             scope: Some(AgentDiagnosticScope::Account),
         }
+    }
+
+    pub fn with_observed_at(mut self, observed_at: Option<Rfc3339Timestamp>) -> Self {
+        self.observed_at = observed_at;
+        self
+    }
+
+    pub fn with_quota_binding(
+        mut self,
+        account: Option<String>,
+        organization: Option<String>,
+    ) -> Self {
+        self.account_identifier_hash = account;
+        self.organization_identifier_hash = organization;
+        self
     }
 }
 
@@ -4099,6 +4128,10 @@ fn redact_diagnostic_for_backend(mut diagnostic: AgentStatusDiagnostic) -> Agent
     // unchanged from before these fields existed.
     diagnostic.account_label = None;
     diagnostic.scope = None;
+    diagnostic.account_identifier_hash =
+        safe_optional_text(diagnostic.account_identifier_hash.take());
+    diagnostic.organization_identifier_hash =
+        safe_optional_text(diagnostic.organization_identifier_hash.take());
     diagnostic
 }
 
@@ -4712,6 +4745,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn quota_check_diagnostic_fixture_and_leaf_manifest_match_backend_wire() {
+        let diagnostics = [
+            (
+                "claude_oauth_usage_check_succeeded",
+                "Successful supported quota response.",
+            ),
+            (
+                "claude_oauth_usage_check_failed",
+                "Latest quota request failed; local fallback may remain.",
+            ),
+            (
+                "claude_oauth_usage_check_suppressed",
+                "Local breaker suppressed this request.",
+            ),
+            (
+                "claude_oauth_usage_cache_reused",
+                "A local cached reading was reused; no provider request was made.",
+            ),
+            (
+                "claude_statusline_read_succeeded",
+                "Read the supported local cache; original observation time preserved.",
+            ),
+            (
+                "claude_statusline_newer_exact_binding_selected",
+                "Newer supported local reading selected for this account/workspace.",
+            ),
+        ]
+        .into_iter()
+        .map(|(code, message)| {
+            redact_diagnostic_for_backend(
+                AgentStatusDiagnostic::source(code, AgentDiagnosticSeverity::Info, message)
+                    .with_observed_at(Some("2026-09-29T10:05:00Z".to_string()))
+                    .with_quota_binding(Some("account-a".to_string()), Some("org-a".to_string())),
+            )
+        })
+        .collect::<Vec<_>>();
+        let value = serde_json::to_value(diagnostics).expect("typed diagnostic wire");
+        assert_eq!(
+            value,
+            serde_json::from_str::<serde_json::Value>(include_str!(
+                "../../../fixtures/agent-status/quota-check-diagnostics.v1.json"
+            ))
+            .expect("fixture")
+        );
+        let mut leaves = Vec::new();
+        collect_golden_leaf_types(&value, "$", &mut leaves);
+        leaves.sort_by(|left, right| left.path.cmp(&right.path));
+        let manifest = serde_json::to_value(GoldenLeafManifest {
+            schema_version: 1,
+            leaves,
+        })
+        .expect("manifest");
+        assert_eq!(
+            manifest,
+            serde_json::from_str::<serde_json::Value>(include_str!(
+                "../../../fixtures/agent-status/quota-check-diagnostics-leaf-types.v1.json"
+            ))
+            .expect("manifest fixture")
+        );
+    }
+
+    #[test]
+    fn quota_check_binding_is_redacted_if_it_contains_secret_text() {
+        let diagnostic =
+            AgentStatusDiagnostic::source("check", AgentDiagnosticSeverity::Info, "Outcome")
+                .with_quota_binding(
+                    Some("sk-ant-secret-value".to_string()),
+                    Some("Bearer secret-value".to_string()),
+                );
+        let redacted = redact_diagnostic_for_backend(diagnostic);
+        assert!(redacted.account_identifier_hash.is_none());
+        assert!(redacted.organization_identifier_hash.is_none());
     }
 
     #[test]

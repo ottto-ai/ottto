@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 391,
-  "content_sha256": "10404af0ba0c95c92f6d277b29aaf4a09fd4777811d3d3d2bca48f6a0e49de36",
+  "candidate_file_count": 394,
+  "content_sha256": "27e36b06f1b98706b7b33bcc67044565836a7568c9b9288417b5e99f3e504616",
   "files": [
     {
       "executable": false,
@@ -510,8 +510,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/claude_statusline.rs",
-      "sha256": "b406a50075a303b63232f29137c2d8ba61b2267c22612cc162943a6b018be4bc",
-      "size_bytes": 57886
+      "sha256": "339d4d876290bb6ab5d41a9ed7a956880945813d10a1f4556a6dba54cab45521",
+      "size_bytes": 64248
     },
     {
       "executable": false,
@@ -580,8 +580,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "5cc964c6bc45bcd9910d88cac8b373c9c4d006356e322ef9959b5ff130db6938",
-      "size_bytes": 271611
+      "sha256": "552471e906ac39714a7a143a1cd22f52301ce18418aa6f51794969bceb357405",
+      "size_bytes": 275983
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "b07e9c1e7b30421f0b4fd964298b5b5aba05a95945cbab7ccf031af34e2b9aa9",
-      "size_bytes": 851926
+      "sha256": "b21ff4b5bf2325ade31432cda608554e233d0a6ec91e5c01d600c974d9406262",
+      "size_bytes": 868112
     },
     {
       "executable": false,
@@ -1734,6 +1734,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-09-30-quota-observation-evidence.md",
+      "sha256": "2f83c48f3c1fd8fb4c877401bde7c77d686f5b6bf0cecdb88034adde96b7d7a0",
+      "size_bytes": 1666
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -1786,6 +1793,20 @@
       "path": "fixtures/agent-status/claude-quota-access-witness.json",
       "sha256": "60a0c55ffed9141d1d68029754656306bfb75e9191cac97d2b026c5cd39d5600",
       "size_bytes": 1418
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/quota-check-diagnostics-leaf-types.v1.json",
+      "sha256": "30c1e1a06405e3080c268985aa64fecbde626b63ca055e6973dc0c93def2a3bc",
+      "size_bytes": 2870
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/quota-check-diagnostics.v1.json",
+      "sha256": "86ad6e4867970669e049ace005f35b1a899d53592ea793f74ea7a20ab39b5d8c",
+      "size_bytes": 1733
     },
     {
       "executable": false,
@@ -2740,9 +2761,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-27T14:30:38+00:00",
+  "generated_at": "2026-09-30T00:38:08+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 392,
+  "output_file_count": 395,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2776,5 +2797,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f992bafe5d7ccc27e36779813c9fdc1ddac21c6f"
+  "source_commit": "72490c4c2306230782d4fc781abab82259c87da8"
 }
