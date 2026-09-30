@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 394,
-  "content_sha256": "27e36b06f1b98706b7b33bcc67044565836a7568c9b9288417b5e99f3e504616",
+  "candidate_file_count": 395,
+  "content_sha256": "94eedff9e4ca35a411adb4b65cadea7c33fd72b929761984aaf9ad6bf8aabc3d",
   "files": [
     {
       "executable": false,
@@ -2428,8 +2428,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_launch_smoke.sh",
-      "sha256": "4c9fbc799554bf89dde93b586dff618b580d38872a7a834d65b90e5df598b45b",
-      "size_bytes": 5397
+      "sha256": "3f5e9e72ae69468c2864761ac031449e3f7b600ddfe8d81f8eaf816f29508262",
+      "size_bytes": 7594
     },
     {
       "executable": true,
@@ -2568,8 +2568,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_surface_ci.sh",
-      "sha256": "aec0b8944c527c186a09ea9c2b3fca6f933c2081b421cfe2814e908a0e162660",
-      "size_bytes": 7395
+      "sha256": "1aec056d5336d718dd3370d5921c4fb660e417fe4d8e66ccb640babb09649387",
+      "size_bytes": 7470
     },
     {
       "executable": true,
@@ -2605,6 +2605,13 @@
       "path": "scripts/test_macos_installer_channel_policy.sh",
       "sha256": "245650649bd2f02ac6db8ca5cc657b9a139e23c9f881ae26b5c2cc9610f603e7",
       "size_bytes": 2051
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_macos_launch_smoke.sh",
+      "sha256": "82c7fb582ea22ca1047fa177a14291e2efd59b549f52c01ae03bab421253e659",
+      "size_bytes": 3465
     },
     {
       "executable": true,
@@ -2761,9 +2768,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-30T00:38:08+00:00",
+  "generated_at": "2026-09-30T09:35:59+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 395,
+  "output_file_count": 396,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2797,5 +2804,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "72490c4c2306230782d4fc781abab82259c87da8"
+  "source_commit": "46dee25ea933b2176e02f00052739ef63f5eb75b"
 }
