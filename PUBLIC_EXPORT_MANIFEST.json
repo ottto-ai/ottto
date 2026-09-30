@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 397,
-  "content_sha256": "a72fcb3cbb72d25bc86270bc6eabaf0420b45dc9532a4fb1b7893bc396e74952",
+  "candidate_file_count": 398,
+  "content_sha256": "f3660e864f422cde5cb72ead19c12dc432de4ff0780bbaad1486455c626a6d70",
   "files": [
     {
       "executable": false,
@@ -580,8 +580,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "f038215384e582bc6c63c4602640cafca94a276100800b52cf1035173b9bde69",
-      "size_bytes": 278112
+      "sha256": "84e67444989ce02308575f7c20243067c80fe3e3112ef2b9d09f7581ddb7b991",
+      "size_bytes": 278382
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "4fee7f94335a9d3a8e8f00dd050da703725d0234f1452ed743815ae3d8212ba8",
-      "size_bytes": 896754
+      "sha256": "8c82cb605f0f30facf3e8adc2667a532d75080fdf0f0ed990370835a50320036",
+      "size_bytes": 915385
     },
     {
       "executable": false,
@@ -1734,6 +1734,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-09-30-claude-slot-quota-diagnostics.md",
+      "sha256": "de5bcba97218cb7a4e9d339a6841c8d7a674a05d9cc2fb164650e556c7206f06",
+      "size_bytes": 2883
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-09-30-claude-stale-auth-root.md",
       "sha256": "6969d57365eba102605e59e1ac79fc0bcec2d802c5c72327d16e07e9b0b43632",
       "size_bytes": 1598
@@ -2782,9 +2789,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-09-30T19:00:13+00:00",
+  "generated_at": "2026-09-30T19:57:04+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 398,
+  "output_file_count": 399,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2818,5 +2825,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "55bedc7aa3613646545ff408283f8120cc883d62"
+  "source_commit": "98790c05a7780602b9e2d7a909542528987f7c1d"
 }

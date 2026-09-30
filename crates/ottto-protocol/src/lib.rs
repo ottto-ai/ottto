@@ -2833,6 +2833,10 @@ pub struct ClaudeConfigSlotCollectionStatusV1 {
     /// clients ignore this additive field and continue decoding `state`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relationship: Option<ClaudeConfigSlotRelationshipV1>,
+    /// Safe exact-binding collector outcomes, retained without replacing their
+    /// original clocks with a later slot or snapshot capture time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota_check_diagnostics: Vec<AgentStatusDiagnostic>,
     #[serde(default)]
     pub diagnostics: Vec<ClaudeConfigSlotDiagnosticV1>,
 }
