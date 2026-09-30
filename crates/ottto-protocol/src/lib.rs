@@ -2841,7 +2841,7 @@ pub struct ClaudeConfigSlotCollectionStatusV1 {
 pub struct ClaudeConfigSlotAccountProfileV1 {
     pub account_identifier_hash: String,
     pub organization_identifier_hash: String,
-    /// When these labels were read from verified local account evidence;
+    /// Oldest contributing verified local account-label capture;
     /// this is neither a quota observation nor a successful quota-check clock.
     pub captured_at: Rfc3339Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]

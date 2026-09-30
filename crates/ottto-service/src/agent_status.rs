@@ -3504,6 +3504,8 @@ pub(crate) fn collect_registered_claude_slot_status(
         }
     };
     apply_claude_upkeep_observation(&mut status, upkeep.status);
+    let previous_states = read_persisted_claude_slot_collection_state();
+    inherit_claude_slot_account_profile(&mut status, previous_states.slots.get(slot_id));
     let _ = persist_one_claude_slot_collection_state(slot_id, &status);
     status
 }
@@ -4078,16 +4080,61 @@ fn inherit_claude_slot_account_profile(
     status: &mut ClaudeConfigSlotCollectionStatusV1,
     previous: Option<&ClaudeConfigSlotCollectionStatusV1>,
 ) {
-    if exact_claude_slot_account_profile(status).is_some() {
-        return;
-    }
-    status.account_profile = previous
+    let previous = previous
         .filter(|previous| {
             previous.account_identifier_hash == status.account_identifier_hash
                 && previous.organization_identifier_hash == status.organization_identifier_hash
         })
         .and_then(exact_claude_slot_account_profile)
         .cloned();
+    let Some(mut current) = exact_claude_slot_account_profile(status).cloned() else {
+        status.account_profile = previous;
+        return;
+    };
+    let Some(previous) = previous else {
+        return;
+    };
+    // Plan and product describe one tier. A newly reported different tier
+    // wins; never complete it with a label from the previous tier.
+    let tier_compatible = (current.plan_type.is_none() && current.subscription_product.is_none())
+        || (current.plan_type.is_some()
+            && current.plan_type == previous.plan_type
+            && (current.subscription_product.is_none()
+                || current.subscription_product == previous.subscription_product))
+        || (current.subscription_product.is_some()
+            && current.subscription_product == previous.subscription_product
+            && (current.plan_type.is_none() || current.plan_type == previous.plan_type));
+    let mut retained = false;
+    let mut fill_missing = |current: &mut Option<String>, previous: &Option<String>| {
+        if current.is_none() && previous.is_some() {
+            *current = previous.clone();
+            retained = true;
+        }
+    };
+    fill_missing(&mut current.email, &previous.email);
+    fill_missing(
+        &mut current.organization_label,
+        &previous.organization_label,
+    );
+    if tier_compatible {
+        fill_missing(&mut current.plan_type, &previous.plan_type);
+        fill_missing(
+            &mut current.subscription_product,
+            &previous.subscription_product,
+        );
+    }
+    if retained {
+        // One conservative profile clock: retained old fields do not acquire
+        // the later auth-response time. This is never quota/check freshness.
+        let previous_at = OffsetDateTime::parse(&previous.captured_at, &Rfc3339)
+            .expect("exact profile clock was validated");
+        let current_at = OffsetDateTime::parse(&current.captured_at, &Rfc3339)
+            .expect("exact profile clock was validated");
+        if previous_at < current_at {
+            current.captured_at = previous.captured_at;
+        }
+    }
+    status.account_profile = Some(current);
 }
 
 fn retain_exact_claude_slot_binding(
@@ -21431,6 +21478,107 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         assert!(exact_claude_slot_account_profile(&future).is_none());
         clear_claude_slot_binding(&mut future);
         assert!(future.account_profile.is_none());
+    }
+
+    #[test]
+    fn sparse_claude_slot_profile_retains_known_fields_without_combining_changed_tiers() {
+        let account = AgentAccountStatus {
+            login_state: AgentLoginState::SignedIn,
+            email: Some("previous@example.invalid".to_string()),
+            organization_label: Some("Known organization".to_string()),
+            plan_type: Some("max_20x".to_string()),
+            subscription_product: Some("claude_max_20x".to_string()),
+            account_identifier_hash: Some("account-a".to_string()),
+            organization_identifier_hash: Some("org-a".to_string()),
+            ..unsupported_account("anthropic")
+        };
+        let mut previous =
+            provider_unavailable_status("2026-09-01T10:00:00Z", "account-a", "org-a");
+        remember_claude_slot_account_profile(&mut previous, Some(&account), "2026-09-01T10:00:00Z");
+        for (plan, product, expected_plan, expected_product) in [
+            (None, None, Some("max_20x"), Some("claude_max_20x")),
+            (
+                Some("max_20x"),
+                None,
+                Some("max_20x"),
+                Some("claude_max_20x"),
+            ),
+            (
+                None,
+                Some("claude_max_20x"),
+                Some("max_20x"),
+                Some("claude_max_20x"),
+            ),
+            (Some("team"), None, Some("team"), None),
+            (None, Some("claude_team"), None, Some("claude_team")),
+            (
+                Some("team"),
+                Some("claude_team"),
+                Some("team"),
+                Some("claude_team"),
+            ),
+        ] {
+            let mut sparse = account.clone();
+            sparse.email = Some("current@example.invalid".to_string());
+            sparse.organization_label = None;
+            sparse.plan_type = plan.map(str::to_string);
+            sparse.subscription_product = product.map(str::to_string);
+            let mut current =
+                provider_unavailable_status("2026-09-01T11:00:00Z", "account-a", "org-a");
+            remember_claude_slot_account_profile(
+                &mut current,
+                Some(&sparse),
+                "2026-09-01T11:00:00Z",
+            );
+            inherit_claude_slot_account_profile(&mut current, Some(&previous));
+            let profile = exact_claude_slot_account_profile(&current).expect("same pair profile");
+            assert_eq!(
+                profile.email.as_deref(),
+                Some("current@example.invalid"),
+                "new authoritative email wins"
+            );
+            assert_eq!(profile.organization_label, account.organization_label);
+            assert_eq!(profile.plan_type.as_deref(), expected_plan);
+            assert_eq!(profile.subscription_product.as_deref(), expected_product);
+            assert_eq!(
+                profile.captured_at, "2026-09-01T10:00:00Z",
+                "retained fields cannot acquire the new capture clock"
+            );
+            let degraded = degraded_claude_slot_snapshot(
+                &current,
+                ClaudeAccountAnchorDurabilityV1::Anchored,
+                None,
+                "2026-09-01T11:00:00Z",
+                "2026-09-01T11:05:00Z",
+            )
+            .expect("degraded same pair");
+            assert_eq!(
+                degraded.account.expect("account").plan_type.as_deref(),
+                expected_plan
+            );
+        }
+
+        let mut sparse = account.clone();
+        sparse.email = None;
+        sparse.organization_label = None;
+        let mut current = provider_unavailable_status("2026-09-01T11:00:00Z", "account-a", "org-a");
+        remember_claude_slot_account_profile(&mut current, Some(&sparse), "2026-09-01T11:00:00Z");
+        inherit_claude_slot_account_profile(&mut current, Some(&previous));
+        assert_eq!(
+            exact_claude_slot_account_profile(&current)
+                .expect("profile")
+                .email,
+            account.email
+        );
+        let mut other = previous.clone();
+        other.organization_identifier_hash = Some("other-org".to_string());
+        let mut changed =
+            provider_unavailable_status("2026-09-01T11:00:00Z", "account-a", "other-org");
+        inherit_claude_slot_account_profile(&mut changed, Some(&other));
+        assert!(
+            changed.account_profile.is_none(),
+            "mismatched embedded profile must not transfer labels"
+        );
     }
 
     #[test]

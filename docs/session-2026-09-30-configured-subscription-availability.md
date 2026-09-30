@@ -11,7 +11,11 @@ registration never becomes live credential, quota, or transcript authority.
 Claude slot collection adds an optional machine-local `account_profile`: the
 exact account and organization hashes, profile capture time, and independently
 reported email, organization label, plan, and product. Degraded snapshots retain
-these labels only for the same complete binding. Missing values stay unknown;
+these labels only for the same complete binding. Sparse same-pair reads retain
+known email/organization labels; plan and product retention also requires both
+new fields absent or a compatible reported tier. A newly reported changed tier
+wins and cannot borrow its missing counterpart from the old tier. The profile
+clock stays at the oldest contributing label capture. Missing values stay unknown;
 changed or missing bindings and future profile clocks fail closed. This profile
 is not quota freshness evidence. Backend uploads still redact email, raw account
 and organization IDs, and organization labels.
