@@ -126,13 +126,14 @@ fn bootstrap_cache_heads(
             }
         }
         let mut accepted = 0;
-        let outcome = upload_resumable_batches_with_body_witness(
+        let outcome = upload_resumable_batches_with_body_witness_partitioned(
             probes,
             poison_scope,
             progress,
             &mut accepted,
             |item| item.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
+            |_| false,
             |items| upload(items, enforce_head_cas),
             |progress| persist(progress),
         )?;

@@ -49,7 +49,7 @@ pub struct Observation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Operation {
-    Upsert { observation: Observation },
+    Upsert { observation: Box<Observation> },
     Retract { event_id: String },
 }
 
@@ -281,7 +281,7 @@ pub(crate) fn reconcile(
             .iter()
             .filter(|(id, row)| prior.get(*id) != Some(*row))
             .map(|(_, row)| Operation::Upsert {
-                observation: row.clone(),
+                observation: Box::new(row.clone()),
             }),
     );
     CacheObservations {

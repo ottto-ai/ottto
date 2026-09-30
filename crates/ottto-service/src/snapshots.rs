@@ -12931,7 +12931,7 @@ pub(crate) fn cache_state_from_patch(previous: Option<&Value>, patch: &CacheObse
     for operation in &patch.operations {
         match operation {
             cache_observations::Operation::Upsert { observation } => {
-                observations.insert(observation.event_id.clone(), observation.clone());
+                observations.insert(observation.event_id.clone(), observation.as_ref().clone());
             }
             cache_observations::Operation::Retract { event_id } => {
                 observations.remove(event_id);
@@ -13034,10 +13034,9 @@ fn codex_cache_request(value: &Value, accumulator: &SnapshotAccumulator) -> Opti
         .compaction_timestamps
         .last()
         .is_some_and(|timestamp| {
-            accumulator
-                .cache_requests
-                .last()
-                .is_none_or(|prior| timestamp_is_after(timestamp, &prior.slot.occurred_at))
+            accumulator.cache_requests.last().map_or(true, |prior| {
+                timestamp_is_after(timestamp, &prior.slot.occurred_at)
+            })
         });
     Some(OwnedRequest {
         slot,
@@ -44753,7 +44752,7 @@ pub(crate) mod cache_adapter_tests {
         );
         let mut cumulative_read = 0;
         for (index, read) in [90_000, 0, 90_000].into_iter().enumerate() {
-            let timestamp = format!("2026-09-30T10:00:0{}Z", index);
+            let timestamp = format!("2026-09-30T10:00:0{index}Z");
             apply_codex_line(
                 &json!({"type":"token_usage_record","timestamp":timestamp,"payload":{"response_id":format!("resp_cache_fixture_{index}"),"usage":{"input_tokens":100_000,"cached_input_tokens":read,"cache_write_input_tokens":0,"output_tokens":1}}}),
                 &mut parser,
@@ -44823,7 +44822,7 @@ pub(crate) mod cache_adapter_tests {
                 let changed = slot_index > 0
                     && !example["changed_metadata_fields"]
                         .as_array()
-                        .is_none_or(|fields| fields.is_empty());
+                        .map_or(true, |fields| fields.is_empty());
                 if source == SnapshotSource::Codex {
                     apply_codex_line(
                         &json!({"type":"turn_context","payload":{"model":slot["model"],"effort":slot["effort"],"fixture_recorded_config":changed}}),
