@@ -1,0 +1,238 @@
+{
+  "body_witness_digest": "0f94a7ae8d064c5135fee319f27e494685a00d8ce5e11e3f7493c7f4e29f12d2",
+  "body_witness_version": 15,
+  "cache_observations_state": {
+    "coverage": "complete",
+    "observations": [
+      {
+        "affected": {
+          "cache_creation_tokens": 0,
+          "cache_read_tokens": 0,
+          "effort": null,
+          "model": "claude-opus-4-8",
+          "occurred_at": "2026-09-30T10:00:01Z",
+          "output_tokens": 2,
+          "prompt_tokens": 100000,
+          "request_ref": "req_cache_fixture_1",
+          "uncached_tokens": 100000
+        },
+        "affected_request_ref": "req_cache_fixture_1",
+        "baseline_request_ref": "req_cache_fixture_0",
+        "detector_version": "v1",
+        "episode_anchor_request_ref": "req_cache_fixture_1",
+        "event_id": "cache:2bd30c72860e1c8bfe2c66c5821178e9ba663a3578c1c2dbd7b32d03ff2369c5",
+        "explanation_code": "unclear",
+        "idle_seconds": null,
+        "immediate_next": {
+          "cache_creation_tokens": 0,
+          "cache_read_tokens": 90000,
+          "effort": null,
+          "model": "claude-opus-4-8",
+          "occurred_at": "2026-09-30T10:00:02Z",
+          "output_tokens": 2,
+          "prompt_tokens": 100000,
+          "request_ref": "req_cache_fixture_2",
+          "uncached_tokens": 10000
+        },
+        "observation_kind": "unexpected_loss",
+        "occurred_at": "2026-09-30T10:00:01Z",
+        "ordering_confidence": "sequential",
+        "previous": {
+          "cache_creation_tokens": 0,
+          "cache_read_tokens": 90000,
+          "effort": null,
+          "model": "claude-opus-4-8",
+          "occurred_at": "2026-09-30T10:00:00Z",
+          "output_tokens": 2,
+          "prompt_tokens": 100000,
+          "request_ref": "req_cache_fixture_0",
+          "uncached_tokens": 10000
+        },
+        "report_gap_seconds": 1,
+        "status": "complete",
+        "supporting_conditions": []
+      }
+    ],
+    "omitted_observation_count": null,
+    "schema_version": 1
+  },
+  "snapshot": {
+    "activity_summary": {
+      "capability_collection_version": "agent_capability_usage:v1",
+      "changed_files": 0,
+      "lines_added": 0,
+      "lines_deleted": 0,
+      "mcp_calls": 0,
+      "patch_operations": 0,
+      "shell_commands": 0,
+      "subagent_spawns": 0,
+      "tool_calls": 0,
+      "web_searches": 0
+    },
+    "cache_creation_1h_tokens": 0,
+    "cache_creation_5m_tokens": 0,
+    "cache_observations": {
+      "coverage": "complete",
+      "omitted_observation_count": null,
+      "operations": [
+        {
+          "observation": {
+            "affected": {
+              "cache_creation_tokens": 0,
+              "cache_read_tokens": 0,
+              "effort": null,
+              "model": "claude-opus-4-8",
+              "occurred_at": "2026-09-30T10:00:01Z",
+              "output_tokens": 2,
+              "prompt_tokens": 100000,
+              "request_ref": "req_cache_fixture_1",
+              "uncached_tokens": 100000
+            },
+            "affected_request_ref": "req_cache_fixture_1",
+            "baseline_request_ref": "req_cache_fixture_0",
+            "detector_version": "v1",
+            "episode_anchor_request_ref": "req_cache_fixture_1",
+            "event_id": "cache:2bd30c72860e1c8bfe2c66c5821178e9ba663a3578c1c2dbd7b32d03ff2369c5",
+            "explanation_code": "unclear",
+            "idle_seconds": null,
+            "immediate_next": {
+              "cache_creation_tokens": 0,
+              "cache_read_tokens": 90000,
+              "effort": null,
+              "model": "claude-opus-4-8",
+              "occurred_at": "2026-09-30T10:00:02Z",
+              "output_tokens": 2,
+              "prompt_tokens": 100000,
+              "request_ref": "req_cache_fixture_2",
+              "uncached_tokens": 10000
+            },
+            "observation_kind": "unexpected_loss",
+            "occurred_at": "2026-09-30T10:00:01Z",
+            "ordering_confidence": "sequential",
+            "previous": {
+              "cache_creation_tokens": 0,
+              "cache_read_tokens": 90000,
+              "effort": null,
+              "model": "claude-opus-4-8",
+              "occurred_at": "2026-09-30T10:00:00Z",
+              "output_tokens": 2,
+              "prompt_tokens": 100000,
+              "request_ref": "req_cache_fixture_0",
+              "uncached_tokens": 10000
+            },
+            "report_gap_seconds": 1,
+            "status": "complete",
+            "supporting_conditions": []
+          },
+          "op": "upsert"
+        }
+      ],
+      "schema_version": 1
+    },
+    "cache_read_tokens": 180000,
+    "collected_at": "2026-09-30T10:00:03Z",
+    "compaction_count": 0,
+    "first_turn_context_tokens": 100000,
+    "input_tokens": 120000,
+    "last_turn_context_tokens": 100000,
+    "model_usage": [
+      {
+        "cache_creation_1h_tokens": 0,
+        "cache_creation_5m_tokens": 0,
+        "cache_read_tokens": 180000,
+        "gateway_provider": "anthropic",
+        "input_tokens": 120000,
+        "model": "claude-opus-4-8",
+        "model_provider": "anthropic",
+        "output_tokens": 6,
+        "reasoning_output_tokens": 0,
+        "request_count": 3,
+        "selector_context": {
+          "context_bucket": "short"
+        },
+        "selector_sources": {
+          "context_bucket": "derived_from_effective_input_volume"
+        }
+      }
+    ],
+    "origin": {
+      "used_workflow_orchestration": false
+    },
+    "output_tokens": 6,
+    "peak_context_fill_tokens": 100000,
+    "provenance": {
+      "collector": "claude_code_jsonl",
+      "input_token_scope": "uncached",
+      "source_file_count": 1
+    },
+    "reasoning_output_tokens": 0,
+    "request_count": 3,
+    "semantic_envelope": {
+      "component_contract_version": "snapshot_semantic:v1",
+      "component_hashes": {
+        "activity_summary": "348307e04856d6c750d45c50ceda5974e7f256ad6111c437f459b1a3345ef97f",
+        "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
+        "attribution": "86de76d9019f2a92b6b57c83e055c2ec94a7da1625966e920c196efd779cf8e2",
+        "context_posture": "09bf0e9a129e80ccea506b9f7b8e3d982d76cb62950192e6c99f69f1acd72cc5",
+        "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
+        "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
+        "lifecycle_activity": "95c24d9640f43a112ba680558c8b0af3a27cf9f6f5fdca388076356bb305f341",
+        "usage_accounting": "72d92709986a094e4f12fe8fd4de32cee39854f5aff8b31080d0f12138fdd289"
+      },
+      "content_hash": "64faee18f6189eb2aa7f617704700f26954116dd6cc1bd4dbe151398eb6dc9bb",
+      "hash_epoch": 1,
+      "revision_contract_version": "snapshot_revision:v1",
+      "revision_hash": "ffe38a190211f083a552a16de346bd8641e645e974c1764bfb26b662f55651be",
+      "revision_v2_canonicalization": "rfc8785:integers-only:v1",
+      "revision_v2_contract_version": "snapshot_revision:v2",
+      "revision_v2_hash": "137fbe2c2d53b1d6488d52c431d36be2ca29feee09ff9399621b690de960460a",
+      "revision_v2_parser_version": "claude_code_jsonl:v36",
+      "revision_v2_scan_identity_version": "claude_code_jsonl:v29",
+      "upload_policy": {
+        "session_artifacts_enabled": false,
+        "session_attribution_enabled": false,
+        "session_attribution_labels_enabled": false,
+        "session_titles_enabled": true,
+        "workspace_labels_enabled": true
+      }
+    },
+    "session_display_name": null,
+    "session_display_name_source": null,
+    "snapshot_fingerprint": "a3f068db848d3471ba14e062b1fcc45a4f58dd660d4b51b3007536df412ee4c4",
+    "source_ended_at": null,
+    "source_file_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "source_last_activity_at": "2026-09-30T10:00:02Z",
+    "source_session_id": "00000000-0000-7000-8000-000000000002",
+    "source_started_at": "2026-09-30T10:00:00Z",
+    "status": "final",
+    "tool_usage": [],
+    "usage_buckets": [
+      {
+        "bucket_start": "2026-09-30T10:00:00Z",
+        "first_activity_at": "2026-09-30T10:00:00Z",
+        "last_activity_at": "2026-09-30T10:00:02Z",
+        "model_usage": [
+          {
+            "cache_creation_1h_tokens": 0,
+            "cache_creation_5m_tokens": 0,
+            "cache_read_tokens": 180000,
+            "gateway_provider": "anthropic",
+            "input_tokens": 120000,
+            "model": "claude-opus-4-8",
+            "model_provider": "anthropic",
+            "output_tokens": 6,
+            "reasoning_output_tokens": 0,
+            "request_count": 3,
+            "selector_context": {
+              "context_bucket": "short"
+            },
+            "selector_sources": {
+              "context_bucket": "derived_from_effective_input_volume"
+            }
+          }
+        ]
+      }
+    ],
+    "workspace_hash": null
+  }
+}
