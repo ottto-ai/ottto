@@ -1,5 +1,5 @@
 {
-  "body_witness_digest": "0d37c87d497dc9cb4cba7dea49fbd05a0233d3235fb62f2d7b01cb7761cc0013",
+  "body_witness_digest": "783c6eec9f21352990e06315765b265c7dee9ff82cd136aef995a53baf51ba7e",
   "body_witness_version": 20,
   "cache_observations_state": {
     "coverage": "complete",
@@ -251,6 +251,7 @@
     "source_session_id": "00000000-0000-7000-8000-000000000001",
     "source_started_at": "2026-09-30T10:00:00Z",
     "status": "final",
+    "tool_usage": [],
     "usage_accounting_contract": "session_exclusive_reported_usage:v1",
     "usage_buckets": [
       {
