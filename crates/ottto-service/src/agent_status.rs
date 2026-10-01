@@ -5730,7 +5730,6 @@ fn retain_claude_worker_receipt_for_blocked_candidate(
     now: OffsetDateTime,
 ) {
     if candidate.state != ClaudeConfigSlotCollectionStateV1::RefreshDue
-        || current.collection.state != ClaudeConfigSlotCollectionStateV1::RefreshDue
         || bounded_claude_collection_timestamp(candidate.observed_at.as_deref(), now).is_none()
     {
         return;
@@ -5770,6 +5769,14 @@ fn retain_claude_worker_receipt_for_blocked_candidate(
     let Some((receipt, clock)) = latest(&current.collection) else {
         return;
     };
+    // A saved enum can remain Fresh after its deadline expires. Only a
+    // collection observation newer than this actual local receipt supersedes
+    // it; the blocked candidate/map already proves the expired-access branch.
+    if bounded_claude_collection_timestamp(current.collection.observed_at.as_deref(), clock)
+        .is_none()
+    {
+        return;
+    }
     if latest(candidate).is_some_and(|(_, candidate_clock)| candidate_clock >= clock) {
         return;
     }
@@ -14111,7 +14118,7 @@ mod tests {
                 8 => candidate.state = ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
                 9 => candidate.account_identifier_hash = Some("foreign".to_string()),
                 10 => candidate.access_expires_at = Some("2026-08-05T03:00:00Z".to_string()),
-                _ => current.collection.state = ClaudeConfigSlotCollectionStateV1::Fresh,
+                _ => current.collection.observed_at = Some("2026-08-05T02:30:01Z".to_string()),
             }
             let original = candidate.clone();
             retain_claude_worker_receipt_for_blocked_candidate(
@@ -14127,6 +14134,44 @@ mod tests {
         assert_eq!(
             same.quota_check_diagnostics.last().unwrap().code,
             "claude_slot_worker_reconciliation_refused"
+        );
+        for state in [
+            ClaudeConfigSlotCollectionStateV1::Fresh,
+            ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
+        ] {
+            let mut current = slot.clone();
+            current.collection.state = state;
+            let mut candidate = stale.clone();
+            retain_claude_worker_receipt_for_blocked_candidate(
+                &slot,
+                &current,
+                &mut candidate,
+                now,
+            );
+            assert_eq!(
+                candidate.quota_check_diagnostics.last().unwrap().code,
+                "claude_slot_worker_reconciliation_refused",
+                "old saved enum is not new collection proof"
+            );
+        }
+        let mut newer_collection = slot.clone();
+        newer_collection.collection.observed_at = Some("2026-08-05T02:30:00Z".to_string());
+        newer_collection
+            .collection
+            .quota_check_diagnostics
+            .last_mut()
+            .unwrap()
+            .observed_at = Some("2026-08-05T02:29:59Z".to_string());
+        let mut candidate = stale.clone();
+        retain_claude_worker_receipt_for_blocked_candidate(
+            &slot,
+            &newer_collection,
+            &mut candidate,
+            now,
+        );
+        assert_eq!(
+            candidate, stale,
+            "older local receipt cannot cross genuinely newer collection"
         );
         let mut newer = stale.clone();
         append_claude_worker_diagnostic(
@@ -14184,16 +14229,20 @@ mod tests {
         let mut slot = registered.external_slots[0].clone();
         let (fixture, mut upkeep, _, _) = valid_access_reconciliation_fixture();
         slot.collection = fixture.collection;
+        slot.collection.state = ClaudeConfigSlotCollectionStateV1::Fresh;
         upkeep.result = ClaudeConfigSlotUpkeepResultV1::RefreshDue;
         upkeep.due_access_expires_at = slot.collection.access_expires_at.clone();
         persist_one_claude_slot_collection_state(&slot.slot_id, &slot.collection).unwrap();
-        // t1: actual blocked collector cloned before the t2 worker publication.
+        // First expiry: saved enum is still Fresh; the actual blocked branch
+        // makes RefreshDue before the t2 worker's diagnostic-only publication.
         let stale = blocked_claude_upkeep_status(&slot.slot_id, "2026-08-05T02:29:00Z", upkeep);
+        assert_eq!(stale.state, ClaudeConfigSlotCollectionStateV1::RefreshDue);
         record_registered_claude_worker_observation(
             &slot,
             ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
         );
         let worker = read_persisted_claude_slot_collection_state().slots[&slot.slot_id].clone();
+        assert_eq!(worker.state, ClaudeConfigSlotCollectionStateV1::Fresh);
         let receipt = worker.quota_check_diagnostics.last().unwrap().clone();
         assert_eq!(receipt.code, "claude_slot_worker_credential_unreadable");
         let candidates = BTreeMap::from([(slot.slot_id.clone(), stale.clone())]);

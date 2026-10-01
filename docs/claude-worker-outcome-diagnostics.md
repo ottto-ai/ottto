@@ -22,7 +22,10 @@ The next blocked saved-expiry collection retains the receipt and original local
 clock, including a blocked candidate cloned before worker completion. The
 existing batch owner checks an ephemeral blocked-branch descriptor under
 registration then collection locks: unchanged root/service/owner, both hashes
-and deadlines, no suppression and no newer candidate local receipt. No descriptor
+and deadlines, no suppression and no newer candidate local receipt. Retention
+refuses a collection observation newer than the original local receipt.
+A historical saved enum may still be fresh when its access expires;
+the actual blocked branch, not that stale enum, gates receipt retention. No descriptor
 is supplied by fresh/provider or suppressed collection branches. Registration
 failure refuses guarded persistence instead of falling back to unfenced retention.
 A genuine new collection can replace it with that collection's own
