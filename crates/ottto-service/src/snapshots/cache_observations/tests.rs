@@ -163,3 +163,15 @@ fn bounded_pathological_loss_chain_measurement() {
         serde_json::to_vec(&patch).unwrap().len()
     );
 }
+#[test]
+fn non_comparable_next_is_unavailable_without_slot() {
+    let mut switched = request("C", 90_000);
+    switched.slot.model = Some("other".into());
+    let rows = detect("s", &[request("A", 90_000), request("B", 0), switched]);
+    let b = &rows[&event_id("s", "B")];
+    assert_eq!(b.status, "next_unavailable");
+    assert!(b.immediate_next.is_none());
+    for row in rows.values() {
+        assert_eq!(row.status == "complete", row.immediate_next.is_some());
+    }
+}
