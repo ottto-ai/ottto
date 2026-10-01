@@ -277,13 +277,7 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
         }
         FileClaudeConfigSlotSettingsStore::default()
             .with_locked_status(|registry| {
-                if registry.consent != ClaudeAccountUpkeepConsentState::Granted
-                    || !slot_is_still_registered(registry, descriptor)
-                    || crate::claude_browser_auth::collection_suppression(&descriptor.slot_id)
-                        .is_some()
-                    || crate::agent_status::claude_oauth_usage_network_disabled()
-                    || support_dir.join(UPKEEP_DISABLED_FILE).is_file()
-                {
+                if !registered_slot_publication_allowed(registry, descriptor, support_dir) {
                     return Err(());
                 }
                 let current =
@@ -342,13 +336,7 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
     ) -> Result<Option<ClaudeConfigSlotUpkeepStatusV1>, ()> {
         FileClaudeConfigSlotSettingsStore::default()
             .with_locked_status(|registry| {
-                if registry.consent != ClaudeAccountUpkeepConsentState::Granted
-                    || !slot_is_still_registered(registry, descriptor)
-                    || crate::claude_browser_auth::collection_suppression(&descriptor.slot_id)
-                        .is_some()
-                    || crate::agent_status::claude_oauth_usage_network_disabled()
-                    || support_dir.join(UPKEEP_DISABLED_FILE).is_file()
-                {
+                if !registered_slot_publication_allowed(registry, descriptor, support_dir) {
                     return Ok(None);
                 }
                 persist_preclaim_needs_login(support_dir, slot_id, status, now).map(Some)
@@ -384,6 +372,20 @@ fn slot_is_still_registered(
 }
 
 struct ProductionDoctorProcessRunner;
+
+/// Shared final consent/registration/suppression fence for local status writes;
+/// process spawning keeps its existing typed refusal owner above.
+pub(crate) fn registered_slot_publication_allowed(
+    registry: &ottto_protocol::ClaudeAccountsStatusV1,
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    support_dir: &Path,
+) -> bool {
+    registry.consent == ClaudeAccountUpkeepConsentState::Granted
+        && slot_is_still_registered(registry, descriptor)
+        && crate::claude_browser_auth::collection_suppression(&descriptor.slot_id).is_none()
+        && !crate::agent_status::claude_oauth_usage_network_disabled()
+        && !support_dir.join(UPKEEP_DISABLED_FILE).is_file()
+}
 
 impl DoctorProcessRunner for ProductionDoctorProcessRunner {
     fn run(&self, config_dir: &str, timeout: Duration) -> DoctorProcessResult {
@@ -619,7 +621,12 @@ fn run_production_upkeep_queue() {
         if matches!(
             observation.status.result,
             ClaudeConfigSlotUpkeepResultV1::Refreshed | ClaudeConfigSlotUpkeepResultV1::NeedsLogin
-        ) {
+        ) || (observation.proceed_with_collection
+            && crate::agent_status::reconcile_registered_claude_valid_access(
+                &descriptor,
+                &observation.status,
+            ))
+        {
             crate::snapshot_sync::spawn_claude_agent_status_refresh("upkeep");
         }
         queue
@@ -1102,7 +1109,7 @@ fn preclaim_failure_result(result: ClaudeConfigSlotUpkeepResultV1) -> bool {
     )
 }
 
-fn preclaim_descriptor(
+pub(crate) fn preclaim_descriptor(
     descriptor: &ClaudeConfigSlotDescriptorV1,
 ) -> Option<ClaudeConfigSlotDescriptorV1> {
     let account = descriptor

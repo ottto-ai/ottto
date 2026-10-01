@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 399,
-  "content_sha256": "9eb0b700d42bfe0a4f410a445e65364536c3cc9fac944c08dbfbf646fd3eed99",
+  "candidate_file_count": 400,
+  "content_sha256": "df0b2ba0e6b9095c202b91acf63ca42aa7ab8836f1cc978785c4201c447f1354",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "75227fc5a4d553046b2843057fff1511e2411eeca51cb6663c8d9bdb18a42e59",
-      "size_bytes": 921891
+      "sha256": "1750f200aeb34d329caf7e90a0a9469004b11406dcad9039bd6e5dabe961547d",
+      "size_bytes": 936928
     },
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_upkeep.rs",
-      "sha256": "e1ed0ece0a7a13eb3f4fb4fe2f8bec605e34cf4ed80c8924576cc3992bf97f26",
-      "size_bytes": 109892
+      "sha256": "19723a52316ce2d2ed27cef62fb621511ce4210ce2d1f51f9bed590d9e232495",
+      "size_bytes": 110078
     },
     {
       "executable": false,
@@ -1769,6 +1769,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-01-claude-valid-access-continuity.md",
+      "sha256": "816d6011b871edf6f70f9de6aa8af02dd9bbaf2fd662f5b39094fd8ac07cf75f",
+      "size_bytes": 1832
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -2798,7 +2805,7 @@
   ],
   "generated_at": "2026-09-30T21:59:50+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 400,
+  "output_file_count": 401,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
