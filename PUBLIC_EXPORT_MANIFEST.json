@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 406,
-  "content_sha256": "83ab9ad3548db506b4eb088671be34dcedb39e6e4326e82717edf42e1f8b10ec",
+  "candidate_file_count": 407,
+  "content_sha256": "16d807605f9088598131732d779435c4bd6e722f6d4eac3ad8ad676f188450e5",
   "files": [
     {
       "executable": false,
@@ -678,8 +678,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_local_otel.rs",
-      "sha256": "bcbdd5d36c43380abbe9ed58b42f5ec4a4fdebdc2f5120c64406fb7822384f1c",
-      "size_bytes": 57523
+      "sha256": "b35b544955269ec60a383e7082f953f25974953497f231e0cff6b4da31d7eb95",
+      "size_bytes": 87477
     },
     {
       "executable": false,
@@ -902,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "efc97ec634119af9d87995b8868289374fbc254b2451f43c7fbc4b927794b959",
-      "size_bytes": 1992177
+      "sha256": "b013e03f60d108edfd536b382e9ce3f0a80e02b49462a406e71824ed67a889ec",
+      "size_bytes": 2001701
     },
     {
       "executable": false,
@@ -1779,6 +1779,13 @@
       "path": "docs/session-2026-09-30-quota-observation-evidence.md",
       "sha256": "2f83c48f3c1fd8fb4c877401bde7c77d686f5b6bf0cecdb88034adde96b7d7a0",
       "size_bytes": 1666
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-01-claude-original-organization-capture.md",
+      "sha256": "3f8ebd271cea016087b5bcabbdc6fb501878e4866d27b00942c58cfd03cd1e23",
+      "size_bytes": 2390
     },
     {
       "executable": false,
@@ -2847,7 +2854,7 @@
   ],
   "generated_at": "2026-10-01T13:36:24+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 407,
+  "output_file_count": 408,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
