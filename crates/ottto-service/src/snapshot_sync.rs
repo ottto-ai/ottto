@@ -5931,7 +5931,7 @@ mod tests {
         );
         progress.retire_pending_cache_heads(
             &index,
-            &[item.clone()],
+            std::slice::from_ref(&item),
             &BTreeSet::new(),
             true,
             &progress.pending_cache_head_file_witnesses(&index),
@@ -5961,7 +5961,7 @@ mod tests {
         );
         progress.retire_pending_cache_heads(
             &index,
-            &[item.clone()],
+            std::slice::from_ref(&item),
             &BTreeSet::new(),
             true,
             &progress.pending_cache_head_file_witnesses(&index),
