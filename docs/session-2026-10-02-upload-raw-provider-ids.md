@@ -26,6 +26,13 @@ came from.
   URL-shaped, secret-shaped, whitespace, `|`-containing and over-long ids are
   dropped. The multi-slot Claude test now allows the raw ids only inside their
   own `account_id` / `organization_id` fields.
+- Wire fixture: `fixtures/agent-status/raw-provider-ids-backend-wire.v1.json`
+  holds one synthetic Claude and one synthetic Codex snapshot exactly as
+  uploaded (real hash function, real account-to-plan-observation copy, real
+  backend redaction). `raw_provider_id_backend_wire_fixture_matches_collector_upload`
+  pins it; set `OTTTO_WRITE_RAW_PROVIDER_ID_FIXTURE=1` to regenerate after an
+  intentional wire change. Consumers can use the same file as their input
+  fixture so both sides fail on a contract change.
 - Docs: `docs/privacy.md`, `README.md`, and the Claude Code and Codex source
   policies describe the new boundary.
 
@@ -55,6 +62,7 @@ Caveats checked while reading the producers:
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - `cargo test -p ottto-protocol` (65 passed)
 - `cargo test -p ottto-service --lib -- agent_status:: snapshot_sync:: control::`
-  (637 passed) and `-- snapshots::` (446 passed)
+  (637 passed before the fixture test was added) and `-- snapshots::`
+  (446 passed); `-- raw_provider_id_backend_wire` (1 passed)
 - `cargo test --manifest-path crates/Cargo.toml -p ottto-connector-testkit --test first_party_sources`
 - `bash scripts/public_repo_export_check.sh`

@@ -1,0 +1,98 @@
+[
+  {
+    "account": {
+      "account_id": "00000000-0000-4000-8000-00000000c1a1",
+      "account_identifier_hash": "74d634f106c37b4cee14702e79ebafc86a18142b70c3bf1c7cd1f2529fc65b59",
+      "auth_method": "oauth",
+      "billing_channel": "subscription",
+      "billing_identity_confidence": "high",
+      "billing_identity_evidence": "provider_account_id",
+      "confidence": "high",
+      "email": null,
+      "login_state": "signed_in",
+      "organization_id": "00000000-0000-4000-8000-00000000c1b2",
+      "organization_identifier_hash": "79df0acdc22d160b4255901ee94bd2005d8464f430d1616fdbf21f2d0deb55bd",
+      "organization_label": null,
+      "plan_type": "max_20x",
+      "provider": "anthropic",
+      "subscription_product": "claude_max_20x"
+    },
+    "capabilities": [],
+    "captured_at": "2026-10-02T08:00:00Z",
+    "collection_method": "cli_json",
+    "credit_balances": [],
+    "diagnostics": [],
+    "expires_at": "2026-10-02T08:05:00Z",
+    "plan_observations": [
+      {
+        "account_id": "00000000-0000-4000-8000-00000000c1a1",
+        "account_identifier_hash": "74d634f106c37b4cee14702e79ebafc86a18142b70c3bf1c7cd1f2529fc65b59",
+        "auth_mode": "oauth",
+        "billing_channel": "subscription",
+        "billing_identity_confidence": "high",
+        "billing_identity_evidence": "provider_account_id",
+        "billing_provider": "anthropic",
+        "confidence": "high",
+        "evidence_method": "cli_json",
+        "is_current": true,
+        "observed_at": "2026-10-02T08:00:00Z",
+        "organization_id": "00000000-0000-4000-8000-00000000c1b2",
+        "organization_identifier_hash": "79df0acdc22d160b4255901ee94bd2005d8464f430d1616fdbf21f2d0deb55bd",
+        "plan_type": "max_20x",
+        "provider": "anthropic",
+        "subscription_product": "claude_max_20x"
+      }
+    ],
+    "quota_windows": [],
+    "source": "claude_code",
+    "status": "available"
+  },
+  {
+    "account": {
+      "account_id": "user-SyntheticCodexUser01",
+      "account_identifier_hash": "738543b7d40c26b07b2bddac467103af74d597a72472ee44379ec527861636b2",
+      "auth_method": "oauth",
+      "billing_channel": "subscription",
+      "billing_identity_confidence": "high",
+      "billing_identity_evidence": "provider_account_id",
+      "confidence": "high",
+      "email": null,
+      "login_state": "signed_in",
+      "organization_id": "00000000-0000-4000-8000-00000000c0d3",
+      "organization_identifier_hash": "3356d64578b5316e8b5a3f05ded65057db4f0728d8f03f0408716e898390e4bd",
+      "organization_label": null,
+      "plan_type": "pro",
+      "provider": "openai",
+      "subscription_product": "chatgpt_pro"
+    },
+    "capabilities": [],
+    "captured_at": "2026-10-02T08:00:00Z",
+    "collection_method": "cli_json",
+    "credit_balances": [],
+    "diagnostics": [],
+    "expires_at": "2026-10-02T08:05:00Z",
+    "plan_observations": [
+      {
+        "account_id": "user-SyntheticCodexUser01",
+        "account_identifier_hash": "738543b7d40c26b07b2bddac467103af74d597a72472ee44379ec527861636b2",
+        "auth_mode": "oauth",
+        "billing_channel": "subscription",
+        "billing_identity_confidence": "high",
+        "billing_identity_evidence": "provider_account_id",
+        "billing_provider": "openai",
+        "confidence": "high",
+        "evidence_method": "cli_json",
+        "is_current": true,
+        "observed_at": "2026-10-02T08:00:00Z",
+        "organization_id": "00000000-0000-4000-8000-00000000c0d3",
+        "organization_identifier_hash": "3356d64578b5316e8b5a3f05ded65057db4f0728d8f03f0408716e898390e4bd",
+        "plan_type": "pro",
+        "provider": "openai",
+        "subscription_product": "chatgpt_pro"
+      }
+    ],
+    "quota_windows": [],
+    "source": "codex",
+    "status": "available"
+  }
+]
