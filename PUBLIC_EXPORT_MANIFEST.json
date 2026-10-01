@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 409,
-  "content_sha256": "023fa3cd54ea2769e3712ef24decd26ab73880ef221db2ea0cb3a4775b3e217c",
+  "candidate_file_count": 410,
+  "content_sha256": "a9bb0c6b907add338686466c2b0494f278091928bd4cffa624fb435f6d2ee84c",
   "files": [
     {
       "executable": false,
@@ -902,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "acb847481bf56c0797014ae8294764e6b16aeab82ee790c3970a44e69a2d4a29",
-      "size_bytes": 2009731
+      "sha256": "22aa83e400e981554a54c7136aeeab8ddf7604f244ade27b83b06258c96fef2c",
+      "size_bytes": 2028149
     },
     {
       "executable": false,
@@ -1807,6 +1807,13 @@
       "path": "docs/session-2026-10-01-claude-valid-access-continuity.md",
       "sha256": "816d6011b871edf6f70f9de6aa8af02dd9bbaf2fd662f5b39094fd8ac07cf75f",
       "size_bytes": 1832
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-02-effective-projection-adoption.md",
+      "sha256": "80963e68fd562300f180fda07b74937893d76ef3eb1cb5d9f4c22fef5cb93b6b",
+      "size_bytes": 2100
     },
     {
       "executable": false,
@@ -2866,9 +2873,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-01T21:12:27+00:00",
+  "generated_at": "2026-10-01T21:50:20+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 410,
+  "output_file_count": 411,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
