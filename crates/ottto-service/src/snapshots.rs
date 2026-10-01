@@ -20,7 +20,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
+pub(crate) mod cache_observations;
 mod context_curve;
+use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
 
 pub(crate) use context_curve::CONTEXT_CURVE_CONTRACT_VERSION;
 use context_curve::{
@@ -251,7 +253,7 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // codex v37 promotes allowlisted SKILL.md reads from the existing activity
 // summary into canonical opaque skill attribution facts. This makes the
 // Sessions skill facet work for Codex without uploading paths or prompt text.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v37";
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v38";
 const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // claude_code v30: retain the exact response ids for counted transcript usage
 // in local memory. Account attribution can then prove that every billed request
@@ -279,7 +281,7 @@ const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // canonical fold accepts monotonic population of every usage counter while
 // retaining fail-closed handling for chronological regressions and incomparable
 // states at the same provider instant.
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v35";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v36";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -325,7 +327,7 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // the version that emitted no label.
 // codex v32 revisits existing rollouts once so activity-derived skill facts
 // backfill naturally instead of appearing only on sessions touched later.
-pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v32";
+pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v33";
 // v28 revisits Claude history once because the v34 MCP-tool selector changes
 // transcript-derived session semantics for operators who enabled attribution
 // capture. Sessions parsed with capture off remain semantic no-ops.
@@ -343,7 +345,7 @@ pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v32";
 // compactions still came from the raw transcript. Revisit Claude history once
 // so proven successors replace those scalars and unresolved predecessors omit
 // them instead of publishing inherited context as child-owned.
-pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v28";
+pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v29";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
 const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v2";
@@ -934,7 +936,13 @@ fn serialize_snapshot_batch<S: Serializer>(
 
 impl Serialize for SnapshotBatchRequest {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serialize_snapshot_batch(self, false, serializer)
+        serialize_snapshot_batch(
+            self,
+            self.snapshots
+                .iter()
+                .any(|item| item.cache_observations.is_some()),
+            serializer,
+        )
     }
 }
 
@@ -1062,8 +1070,24 @@ impl SnapshotOrigin {
     }
 }
 
+/// Original provider creator identity only; this does not prove a paid route.
+/// Raw provider identifiers are converted in memory with the same namespace as
+/// CodexHomeBinding and never enter the snapshot or billing rows.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionAccountEvidence {
+    pub provider: &'static str,
+    pub account_identifier_hash: String,
+    pub provider_workspace_hash: String,
+    pub identity_hash_scheme: &'static str,
+    pub evidence_source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_created_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_account_evidence: Option<SessionAccountEvidence>,
     pub source_session_id: String,
     pub snapshot_fingerprint: String,
     pub status: String,
@@ -1094,6 +1118,16 @@ pub struct SnapshotItem {
     /// Raw request ids and response observations never cross the snapshot wire.
     #[serde(skip)]
     pub(crate) claude_usage_occurrences: BTreeMap<String, ClaudeTranscriptUsageOccurrence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_observations: Option<CacheObservations>,
+    #[serde(skip)]
+    pub(crate) cache_observations_state: Option<Value>,
+    #[serde(skip)]
+    pub(crate) cache_base_head_etag: Option<String>,
+    #[serde(skip)]
+    pub(crate) cache_requests: Vec<OwnedRequest>,
+    #[serde(skip)]
+    pub(crate) cache_requests_complete: bool,
     // Session-level Codex latency (avg across the session's `task_complete`
     // turns). Codex emits duration/ttft only in the rollout `task_complete`
     // event (never over OTLP), so the daemon aggregates them here. Absent for
@@ -3337,6 +3371,56 @@ fn apply_claude_reported_usage_with_index_and_limits(
                 clear_claude_context_posture(item);
             }
         }
+        if posture_owned
+            && item.claude_context_curve_identity_complete
+            && item.claude_context_curve_request_index_complete
+            && (census_complete || claude_owned_start_was_census_verified(item, index))
+            && !index
+                .claude_usage_family_pending
+                .get(&root_session_id)
+                .is_some_and(|pending| {
+                    pending.invalid || pending.census_window_end != census_window_end
+                })
+        {
+            let owned = item
+                .cache_requests
+                .iter()
+                .filter(|request| {
+                    let hash = format!("{:x}", Sha256::digest(request.slot.request_ref.as_bytes()));
+                    !excluded_request_hashes.contains(&hash)
+                })
+                .map(|request| {
+                    let mut request = request.clone();
+                    if request.slot.effort.is_none() {
+                        let efforts = family
+                            .and_then(|family| family.rows_by_member.get(&item.source_session_id))
+                            .into_iter()
+                            .flatten()
+                            .filter(|row| {
+                                row.request_id == request.slot.request_ref
+                                    && CLAUDE_EFFORT_TIERS.contains(&row.effort.as_str())
+                            })
+                            .map(|row| row.effort.clone())
+                            .collect::<BTreeSet<_>>();
+                        if efforts.len() == 1 {
+                            request.slot.effort = efforts.into_iter().next();
+                        }
+                    }
+                    request
+                })
+                .collect::<Vec<_>>();
+            item.cache_observations = cache_wire_for_requests(&item.source_session_id, &owned);
+            if !item.cache_requests_complete {
+                item.cache_observations = Some(CacheObservations {
+                    schema_version: 1,
+                    operations: Vec::new(),
+                    coverage: "partial".into(),
+                    omitted_observation_count: None,
+                });
+            }
+        } else {
+            item.cache_observations = None;
+        }
         // Context posture participates in semantic identity. Recompute after
         // the ownership fold even when curve admission is disabled.
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
@@ -5478,16 +5562,32 @@ pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION: u64 = 9;
 pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION: u64 = 10;
 pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION: u64 = 11;
 pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION: u64 = 12;
+pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION: u64 = 23;
+pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION: u64 = 24;
 
 /// Backend-compatible, hash-neutral witness version for additive snapshot-body
-/// evidence. Every current wire item carries a semantic envelope, so curve-bearing
-/// bodies use v11/v12 and tool-only bodies use v9/v10. The digest projection is
-/// unchanged from legacy v3-v6; the version records which semantic identity domain
-/// the backend durably settled. Semantic identity remains owned exclusively by the
-/// component/content hashes.
+/// evidence. Creator-bearing bodies use v23/v24 (public ACK v7/v8), retaining
+/// existing curve/tool fields in the same projection. Missing creator evidence
+/// preserves previous versions and digests. Semantic identity remains owned
+/// exclusively by the component/content hashes.
 pub(crate) fn snapshot_upload_body_witness_version(item: &SnapshotItem) -> Option<u64> {
     let exclusive =
         item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1");
+    if item.session_account_evidence.is_some() {
+        return Some(if exclusive {
+            SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION
+        } else {
+            SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION
+        });
+    }
+    if item.cache_observations.is_some() {
+        return Some(match (item.context_curve.is_some(), exclusive) {
+            (false, false) => 15,
+            (false, true) => 16,
+            (true, false) => 19,
+            (true, true) => 20,
+        });
+    }
     if item.context_curve.is_some() {
         return Some(if exclusive {
             SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION
@@ -5507,8 +5607,32 @@ pub(crate) fn snapshot_upload_body_witness_version(item: &SnapshotItem) -> Optio
 
 fn snapshot_upload_body_witness_payload(item: &SnapshotItem) -> serde_json::Value {
     let mut payload = serde_json::Map::new();
+    if let Some(evidence) = &item.session_account_evidence {
+        payload.insert("session_account_evidence".to_string(), json!(evidence));
+    }
+    if let Some(observations) = &item.cache_observations {
+        payload.insert(
+            "cache_observations_state".into(),
+            item.cache_observations_state
+                .clone()
+                .unwrap_or_else(|| cache_state_from_patch(None, observations)),
+        );
+    }
     if let Some(context_curve) = &item.context_curve {
         payload.insert("context_curve".to_string(), json!(context_curve));
+    }
+    // Curve-free legacy tool witnesses include both defaults whenever either
+    // tool leaf is declared. Creator/cache/curve domains retain wire presence.
+    if payload.is_empty() && (item.tool_usage.is_some() || item.tool_usage_truncated) {
+        payload.insert(
+            "tool_usage".into(),
+            json!(item.tool_usage.as_deref().unwrap_or(&[])),
+        );
+        payload.insert(
+            "tool_usage_truncated".into(),
+            json!(item.tool_usage_truncated),
+        );
+        return Value::Object(payload);
     }
     // Mirror wire declaration exactly. Serde omits `None` and false; backend
     // witnesses include only fields actually declared in the accepted item.
@@ -5712,7 +5836,7 @@ pub(crate) fn snapshot_semantic_envelope(
         revision_v2_hash: snapshot_revision_v2_hash(source, item, upload_policy, &component_hashes),
         content_hash: snapshot_content_hash(source, &item.source_session_id, &component_hashes),
         hash_epoch: SNAPSHOT_CONTENT_HASH_EPOCH,
-        base_head_etag: None,
+        base_head_etag: item.cache_base_head_etag.clone(),
         component_hashes,
     }
 }
@@ -6195,6 +6319,7 @@ impl SelectorCapture {
 /// and then ordered by their provider timestamps.
 #[derive(Debug, Clone)]
 struct ClaudeResponseRecord {
+    cache_slot: RequestSlot,
     physical_sequence: u64,
     usage: UsageTotals,
     model: Option<String>,
@@ -6226,6 +6351,7 @@ struct ClaudeResponseObservation {
 
 #[derive(Debug, Clone)]
 struct ResolvedClaudeResponse {
+    cache_slot: RequestSlot,
     sequence: u64,
     usage: UsageTotals,
     model: Option<String>,
@@ -6263,11 +6389,13 @@ impl ClaudeResponseObservation {
         preceding_user_timestamp: Option<String>,
         computed_effective_input_context: Option<u64>,
         tool_uses: BTreeMap<String, String>,
+        cache_slot: RequestSlot,
     ) -> Self {
         Self {
             sequence,
             preceding_user_timestamp,
             records: vec![ClaudeResponseRecord {
+                cache_slot,
                 physical_sequence: 0,
                 usage,
                 model,
@@ -6293,6 +6421,7 @@ impl ClaudeResponseObservation {
         timestamp: Option<String>,
         computed_effective_input_context: Option<u64>,
         tool_uses: BTreeMap<String, String>,
+        cache_slot: RequestSlot,
     ) -> bool {
         if self.records.len() >= MAX_CLAUDE_RECORDS_PER_RESPONSE {
             self.record_limit_exceeded = true;
@@ -6300,6 +6429,7 @@ impl ClaudeResponseObservation {
         }
         let physical_sequence = self.records.len() as u64;
         self.records.push(ClaudeResponseRecord {
+            cache_slot,
             physical_sequence,
             usage,
             model,
@@ -6358,6 +6488,7 @@ impl ClaudeResponseObservation {
             }
         }
         Some(ResolvedClaudeResponse {
+            cache_slot: aggregate.cache_slot,
             sequence: self.sequence,
             usage: aggregate.usage,
             model: aggregate.model,
@@ -6386,6 +6517,7 @@ fn merge_claude_response_record(
     {
         return false;
     }
+    current.cache_slot = next.cache_slot;
     current.usage = next.usage;
     if let Some(next_context) = next.computed_effective_input_context {
         current.computed_effective_input_context = Some(
@@ -7269,6 +7401,10 @@ enum CodexOwnershipBoundary {
 
 struct SnapshotAccumulator {
     source: SnapshotSource,
+    cache_configuration_witness: Option<String>,
+    cache_task_complete_at: Option<String>,
+    cache_pending_idle: Option<u64>,
+    cache_active_turns: BTreeSet<String>,
     context_curve_enabled: bool,
     source_session_id: Option<String>,
     account_identifier_hash: Option<String>,
@@ -7305,6 +7441,10 @@ struct SnapshotAccumulator {
     current_selector: SelectorCapture,
     session_cumulative_usage: Option<UsageTotals>,
     codex_session_meta_seen: bool,
+    codex_record_seen: bool,
+    codex_creator_header_id: Option<String>,
+    codex_creator_evidence: Option<SessionAccountEvidence>,
+    codex_creator_evidence_conflicted: bool,
     codex_ownership_boundary: CodexOwnershipBoundary,
     codex_legacy_trigger_seen: bool,
     codex_legacy_bootstrap_valid: bool,
@@ -7421,6 +7561,9 @@ struct SnapshotAccumulator {
     // coverage and never serialized.
     claude_usage_request_ids: BTreeSet<String>,
     claude_usage_occurrences: BTreeMap<String, ClaudeTranscriptUsageOccurrence>,
+    cache_observations: Option<CacheObservations>,
+    pub(crate) cache_requests: Vec<OwnedRequest>,
+    cache_requests_complete: bool,
     claude_context_curve_identity_complete: bool,
     claude_context_curve_request_index_complete: bool,
     claude_context_curve_owned_start_proven: bool,
@@ -7466,6 +7609,10 @@ impl SnapshotAccumulator {
     fn new(source: SnapshotSource) -> Self {
         Self {
             source,
+            cache_configuration_witness: None,
+            cache_task_complete_at: None,
+            cache_pending_idle: None,
+            cache_active_turns: BTreeSet::new(),
             context_curve_enabled: true,
             source_session_id: None,
             account_identifier_hash: None,
@@ -7486,6 +7633,10 @@ impl SnapshotAccumulator {
             current_selector: SelectorCapture::default(),
             session_cumulative_usage: None,
             codex_session_meta_seen: false,
+            codex_record_seen: false,
+            codex_creator_header_id: None,
+            codex_creator_evidence: None,
+            codex_creator_evidence_conflicted: false,
             codex_ownership_boundary: CodexOwnershipBoundary::Undetermined,
             codex_legacy_trigger_seen: false,
             codex_legacy_bootstrap_valid: true,
@@ -7555,6 +7706,9 @@ impl SnapshotAccumulator {
             claude_response_record_count: 0,
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
+            cache_observations: None,
+            cache_requests: Vec::new(),
+            cache_requests_complete: true,
             claude_context_curve_identity_complete: true,
             claude_context_curve_request_index_complete: true,
             claude_context_curve_owned_start_proven: false,
@@ -8347,6 +8501,12 @@ impl SnapshotAccumulator {
         computed_effective_input_context: Option<u64>,
     ) {
         let tool_uses = claude_response_tool_uses(value);
+        let cache_slot = claude_cache_request_slot(
+            value,
+            model.clone(),
+            reasoning_effort.clone(),
+            timestamp.clone(),
+        );
         let request_id =
             string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]));
         let key = match claude_code_usage_dedup_key(value) {
@@ -8380,6 +8540,7 @@ impl SnapshotAccumulator {
                 timestamp,
                 computed_effective_input_context,
                 tool_uses,
+                cache_slot,
             ) {
                 self.claude_response_record_count =
                     self.claude_response_record_count.saturating_add(1);
@@ -8402,6 +8563,7 @@ impl SnapshotAccumulator {
                 self.claude_last_user_ts.clone(),
                 computed_effective_input_context,
                 tool_uses,
+                cache_slot,
             ),
         );
     }
@@ -8419,6 +8581,19 @@ impl SnapshotAccumulator {
                 self.note_dropped_usage();
                 continue;
             };
+            if !response.cache_slot.request_ref.is_empty() {
+                self.cache_requests.push(OwnedRequest {
+                    slot: response.cache_slot.clone(),
+                    ordering: "sequential".into(),
+                    compaction_before: self
+                        .claude_compaction_observations
+                        .iter()
+                        .any(|b| b.response_count_before == response.sequence),
+                    configuration_changed: false,
+                    configuration_witness: None,
+                    idle_seconds: None,
+                });
+            }
             let effective_input_context = response
                 .computed_effective_input_context
                 .unwrap_or_else(|| response.usage.effective_input_context());
@@ -8879,6 +9054,36 @@ impl SnapshotAccumulator {
         }
         let codex_usage_accounting_proven =
             self.source == SnapshotSource::Codex && self.codex_session_meta_seen;
+        let expected_path_id = self
+            .codex_resolved_path_identity
+            .as_deref()
+            .map(str::to_string)
+            .or_else(|| codex_session_id_from_path(path));
+        let session_account_evidence = (self.source == SnapshotSource::Codex
+            && !self.codex_creator_evidence_conflicted
+            && self.codex_creator_header_id.as_deref() == Some(source_session_id.as_str())
+            && expected_path_id.as_deref() == Some(source_session_id.as_str())
+            && (!self.codex_is_fork
+                || self.codex_ownership_boundary == CodexOwnershipBoundary::NativeCreatedThread))
+            .then(|| self.codex_creator_evidence.clone())
+            .flatten()
+            .filter(|evidence| {
+                let created = evidence
+                    .source_created_at
+                    .as_deref()
+                    .and_then(|timestamp| OffsetDateTime::parse(timestamp, &Rfc3339).ok());
+                created.is_some_and(|created| {
+                    [self.started_at.as_deref(), Some(collected_at)]
+                        .into_iter()
+                        .all(|timestamp| {
+                            timestamp
+                                .and_then(|timestamp| {
+                                    OffsetDateTime::parse(timestamp, &Rfc3339).ok()
+                                })
+                                .is_some_and(|observed| created <= observed)
+                        })
+                })
+            });
         // A Claude Code subagent transcript (Task tool or Workflow tool) shares
         // its parent's `sessionId`; re-key it from its PATH to a distinct id so
         // it ingests as its own `isSidechain=true` (ai_agent) session instead of
@@ -9108,7 +9313,20 @@ impl SnapshotAccumulator {
                 SnapshotSource::Pi => None,
             }
         };
+        if self.source == SnapshotSource::Codex && codex_usage_accounting_proven {
+            self.cache_observations =
+                cache_wire_for_requests(&source_session_id, &self.cache_requests);
+            if !self.cache_requests_complete {
+                self.cache_observations = Some(CacheObservations {
+                    schema_version: 1,
+                    operations: Vec::new(),
+                    coverage: "partial".into(),
+                    omitted_observation_count: None,
+                });
+            }
+        }
         let mut item = SnapshotItem {
+            session_account_evidence,
             source_session_id: source_session_id.clone(),
             snapshot_fingerprint: String::new(),
             status: "final".to_string(),
@@ -9124,6 +9342,11 @@ impl SnapshotAccumulator {
                 .then(|| "session_exclusive_reported_usage:v1".to_string()),
             claude_usage_request_ids: self.claude_usage_request_ids,
             claude_usage_occurrences: self.claude_usage_occurrences,
+            cache_observations: self.cache_observations,
+            cache_observations_state: None,
+            cache_base_head_etag: None,
+            cache_requests: self.cache_requests,
+            cache_requests_complete: self.cache_requests_complete,
             avg_duration_ms: (self.latency_duration_ms_count > 0)
                 .then(|| self.latency_duration_ms_sum / self.latency_duration_ms_count),
             avg_time_to_first_token_ms: (self.latency_ttft_ms_count > 0)
@@ -10907,8 +11130,14 @@ fn codex_state_only_snapshot(
         unattributed_total_tokens: thread.tokens_used,
         request_count: 0,
         usage_accounting_contract: None,
+        session_account_evidence: None,
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
+        cache_observations: None,
+        cache_observations_state: None,
+        cache_base_head_etag: None,
+        cache_requests: Vec::new(),
+        cache_requests_complete: true,
         avg_duration_ms: None,
         avg_time_to_first_token_ms: None,
         max_duration_ms: None,
@@ -11415,6 +11644,12 @@ fn parse_opened_jsonl_file(
             ledger.scan_complete = false;
             ledger.signatures.clear();
         }
+    }
+    // An unread physical record could contain an earlier/copied/conflicting
+    // header. Preserve legacy partial usage behavior, but do not certify the
+    // optional original creator witness from an incomplete physical stream.
+    if source == SnapshotSource::Codex && !report.complete() {
+        accumulator.codex_creator_evidence_conflicted = true;
     }
     let snapshots = accumulator.into_items(
         path,
@@ -12728,15 +12963,69 @@ fn codex_legacy_trigger_turn(value: &Value) -> bool {
 }
 
 /// Capture the first physical header before applying the ownership boundary.
-/// Copied parent `session_meta` records later in legacy full-history forks are
-/// deliberately ignored, so identity and graph evidence cannot be overwritten
-/// by inherited context.
+/// Raw creator fields are accepted only as a complete provider pair/time.
+/// The caller separately proves first physical record and logical-session ownership.
+fn codex_creator_header_evidence(value: &Value, meta: &Value) -> Option<SessionAccountEvidence> {
+    let id = resolve_codex_identity_option(codex_identity_at(meta, &["id"]))?;
+    if meta.get("session_id").is_some()
+        && resolve_codex_identity_option(codex_identity_at(meta, &["session_id"])) != Some(id)
+    {
+        return None;
+    }
+    // A later physical ordinal cannot prove original logical-session creation.
+    if value.get("ordinal").is_some() && u64_at(value, &["ordinal"]) != Some(0) {
+        return None;
+    }
+    let account_identifier_hash = ottto_core::billing_identity_hash(
+        "openai",
+        "account",
+        meta.get("creator_user_id")?.as_str()?,
+    )?;
+    let provider_workspace_hash = ottto_core::billing_identity_hash(
+        "openai",
+        "workspace",
+        meta.get("creator_account_id")?.as_str()?,
+    )?;
+    let envelope_time = OffsetDateTime::parse(value.get("timestamp")?.as_str()?, &Rfc3339).ok()?;
+    let created = match meta.get("timestamp") {
+        Some(timestamp) => OffsetDateTime::parse(timestamp.as_str()?, &Rfc3339).ok()?,
+        None => envelope_time,
+    };
+    if created.unix_timestamp() < 0 || created > envelope_time {
+        return None;
+    }
+    Some(SessionAccountEvidence {
+        provider: "openai",
+        account_identifier_hash,
+        provider_workspace_hash,
+        identity_hash_scheme: "provider-sha256:v1",
+        evidence_source: "codex_creator_header:v1",
+        source_created_at: Some(created.format(&Rfc3339).ok()?),
+    })
+}
+
+/// First physical header remains the identity/graph owner. Later copied headers
+/// cannot replace it, and contradictory creator evidence permanently clears
+/// only the optional creator witness for this scan.
 fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    let first_record = !accumulator.codex_record_seen;
+    accumulator.codex_record_seen = true;
     let Some(meta) = codex_session_meta_payload(value) else {
         return;
     };
+    let header_id = resolve_codex_identity_option(codex_identity_at(meta, &["id"]));
+    let evidence = codex_creator_header_evidence(value, meta);
     if accumulator.codex_session_meta_seen {
+        if header_id != accumulator.codex_creator_header_id
+            || evidence != accumulator.codex_creator_evidence
+        {
+            accumulator.codex_creator_evidence_conflicted = true;
+        }
         return;
+    }
+    if first_record {
+        accumulator.codex_creator_header_id = header_id;
+        accumulator.codex_creator_evidence = evidence;
     }
     accumulator.source_session_id = resolve_codex_identity_option(
         codex_identity_at(meta, &["id"]).or_else(|| codex_identity_at(meta, &["session_id"])),
@@ -12766,6 +13055,177 @@ fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulato
     accumulator.codex_session_meta_seen = true;
 }
 
+pub(crate) fn cache_state_from_patch(previous: Option<&Value>, patch: &CacheObservations) -> Value {
+    let mut observations = BTreeMap::<String, cache_observations::Observation>::new();
+    if let Some(rows) = previous
+        .and_then(|state| state.get("observations"))
+        .and_then(Value::as_array)
+    {
+        for row in rows {
+            if let Ok(row) = serde_json::from_value::<cache_observations::Observation>(row.clone())
+            {
+                observations.insert(row.event_id.clone(), row);
+            }
+        }
+    }
+    for operation in &patch.operations {
+        match operation {
+            cache_observations::Operation::Upsert { observation } => {
+                observations.insert(observation.event_id.clone(), observation.as_ref().clone());
+            }
+            cache_observations::Operation::Retract { event_id } => {
+                observations.remove(event_id);
+            }
+        }
+    }
+    json!({"schema_version":1,"observations":observations.into_values().collect::<Vec<_>>(),"coverage":patch.coverage,"omitted_observation_count":patch.omitted_observation_count})
+}
+
+pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<&Value>) {
+    let Some(patch) = item.cache_observations.as_ref() else {
+        return;
+    };
+    // A lossy parse never retracts previously accepted observations.
+    let current = if patch.coverage == "complete" {
+        cache_state_from_patch(None, patch)
+    } else {
+        cache_state_from_patch(prior, patch)
+    };
+    let ids = current["observations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["event_id"].as_str())
+        .collect::<BTreeSet<_>>();
+    let mut wire = patch.clone();
+    if patch.coverage == "complete" {
+        for row in prior
+            .and_then(|p| p["observations"].as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(id) = row["event_id"].as_str() {
+                if !ids.contains(id) {
+                    wire.operations
+                        .push(cache_observations::Operation::Retract {
+                            event_id: id.into(),
+                        });
+                }
+            }
+        }
+    }
+    if !wire.validate() {
+        wire.operations.clear();
+        wire.coverage = "partial".into();
+        wire.omitted_observation_count = Some(ids.len() as u64);
+    }
+    item.cache_observations_state = Some(cache_state_from_patch(prior, &wire));
+    item.cache_observations = Some(wire);
+}
+
+fn cache_wire_for_requests(session: &str, requests: &[OwnedRequest]) -> Option<CacheObservations> {
+    let mut seen = BTreeMap::new();
+    let mut conflict = false;
+    let mut unique = Vec::new();
+    for request in requests {
+        if OffsetDateTime::parse(&request.slot.occurred_at, &Rfc3339).is_err() {
+            conflict = true;
+        }
+        match seen.get(&request.slot.request_ref) {
+            Some(prior) if prior != &request.slot => conflict = true,
+            Some(_) => {}
+            None => {
+                seen.insert(request.slot.request_ref.clone(), request.slot.clone());
+                unique.push(request.clone());
+            }
+        }
+    }
+    if conflict {
+        return Some(CacheObservations {
+            schema_version: 1,
+            operations: Vec::new(),
+            coverage: "partial".into(),
+            omitted_observation_count: None,
+        });
+    }
+    let (rows, overflow) =
+        cache_observations::detect_bounded(session, &unique, cache_observations::MAX_OPERATIONS);
+    let patch = cache_observations::reconcile(&BTreeMap::new(), &rows);
+    let omitted = rows.len() as u64 + overflow;
+    if overflow == 0 && patch.validate() {
+        Some(patch)
+    } else {
+        Some(CacheObservations {
+            schema_version: 1,
+            operations: Vec::new(),
+            coverage: "partial".into(),
+            omitted_observation_count: Some(omitted),
+        })
+    }
+}
+
+fn codex_cache_request(value: &Value, accumulator: &SnapshotAccumulator) -> Option<OwnedRequest> {
+    let slot = cache_observations::codex_slot(
+        value,
+        accumulator.latest_model.clone(),
+        accumulator.latest_reasoning_effort.clone(),
+    )?;
+    let compaction_before = accumulator
+        .compaction_timestamps
+        .last()
+        .is_some_and(|timestamp| {
+            accumulator.cache_requests.last().map_or(true, |prior| {
+                timestamp_is_after(timestamp, &prior.slot.occurred_at)
+            })
+        });
+    Some(OwnedRequest {
+        slot,
+        ordering: if accumulator.cache_active_turns.len() > 1 {
+            "ambiguous"
+        } else {
+            "sequential"
+        }
+        .into(),
+        compaction_before,
+        configuration_changed: false,
+        configuration_witness: accumulator.cache_configuration_witness.clone(),
+        idle_seconds: accumulator.cache_pending_idle,
+    })
+}
+
+fn claude_cache_request_slot(
+    value: &Value,
+    model: Option<String>,
+    effort: Option<String>,
+    timestamp: Option<String>,
+) -> RequestSlot {
+    let usage = claude_code_usage_root(value);
+    let field = |name: &str| {
+        usage
+            .and_then(|usage| usage.get(name))
+            .and_then(Value::as_u64)
+    };
+    let uncached = field("input_tokens");
+    let read = field("cache_read_input_tokens");
+    let write = field("cache_creation_input_tokens");
+    RequestSlot {
+        request_ref: string_at(value, &["requestId"])
+            .or_else(|| string_at(value, &["request_id"]))
+            .unwrap_or_default(),
+        occurred_at: timestamp.unwrap_or_default(),
+        model,
+        effort,
+        prompt_tokens: uncached
+            .zip(read)
+            .zip(write)
+            .and_then(|((u, r), w)| u.checked_add(r)?.checked_add(w)),
+        cache_read_tokens: read,
+        cache_creation_tokens: write,
+        uncached_tokens: uncached,
+        output_tokens: field("output_tokens"),
+    }
+}
+
 fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     accumulator.note_codex_physical_signature(value);
     apply_codex_envelope_line(value, accumulator);
@@ -12781,6 +13241,55 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
 }
 
 fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    if string_eq_at(value, &["type"], "turn_context") {
+        if let Some(payload) = value.get("payload").and_then(Value::as_object) {
+            let metadata = payload
+                .iter()
+                .filter(|(field, _)| {
+                    !matches!(
+                        field.as_str(),
+                        "turn_id" | "root_turn_id" | "summary" | "timestamp" | "usage"
+                    )
+                })
+                .map(|(field, value)| (field.clone(), value.clone()))
+                .collect::<serde_json::Map<_, _>>();
+            if !metadata.is_empty() {
+                accumulator.cache_configuration_witness =
+                    Some(sha256_hex(&[Value::Object(metadata).to_string().as_str()]));
+            }
+        }
+    }
+    if string_eq_at(value, &["payload", "type"], "task_complete") {
+        accumulator.cache_task_complete_at = string_at(value, &["timestamp"]);
+        if let Some(turn) = string_at(value, &["payload", "turn_id"]) {
+            accumulator.cache_active_turns.remove(&turn);
+        }
+    }
+    if string_eq_at(value, &["payload", "type"], "task_started") {
+        if let Some(turn) = string_at(value, &["payload", "turn_id"]) {
+            accumulator.cache_active_turns.insert(turn);
+        }
+        accumulator.cache_pending_idle = accumulator
+            .cache_task_complete_at
+            .as_deref()
+            .zip(value.get("timestamp").and_then(Value::as_str))
+            .and_then(|(end, start)| {
+                let end = OffsetDateTime::parse(end, &Rfc3339).ok()?;
+                let start = OffsetDateTime::parse(start, &Rfc3339).ok()?;
+                if start < end {
+                    return None;
+                }
+                u64::try_from((start - end).whole_seconds()).ok()
+            });
+    }
+    if let Some(request) = codex_cache_request(value, accumulator) {
+        if accumulator.cache_requests.len() < MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE {
+            accumulator.cache_requests.push(request);
+        } else {
+            accumulator.cache_requests_complete = false;
+        }
+        accumulator.cache_pending_idle = None;
+    }
     if accumulator.source_session_id.is_none() {
         accumulator.source_session_id = resolve_codex_identity_option(
             codex_identity_at(value, &["session_meta", "payload", "id"])
@@ -13915,6 +14424,10 @@ fn codex_usage_event_identity(value: &Value) -> Option<String> {
 }
 
 fn codex_ownership_signature(value: &Value) -> Option<String> {
+    if string_eq_at(value, &["type"], "token_usage_record") {
+        let response = string_at(value, &["payload", "response_id"])?;
+        return Some(sha256_hex(&["codex_parent_response:v1", &response]));
+    }
     if string_eq_at(value, &["type"], "turn_context") {
         let turn_id = string_at(value, &["payload", "turn_id"])?;
         return Some(sha256_hex(&["codex_parent_turn:v2", turn_id.as_str()]));
@@ -27942,7 +28455,7 @@ mod tests {
         assert_eq!(enabled[0].snapshot_fingerprint, original_fingerprint);
     }
 
-    fn sample_session_artifact_item() -> SnapshotItem {
+    pub(super) fn sample_session_artifact_item() -> SnapshotItem {
         let mut item = SnapshotItem {
             source_session_id: "artifact-session".to_string(),
             snapshot_fingerprint: String::new(),
@@ -27956,8 +28469,14 @@ mod tests {
             unattributed_total_tokens: 0,
             request_count: 1,
             usage_accounting_contract: None,
+            session_account_evidence: None,
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
+            cache_observations: None,
+            cache_observations_state: None,
+            cache_base_head_etag: None,
+            cache_requests: Vec::new(),
+            cache_requests_complete: true,
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
             max_duration_ms: None,
@@ -33770,6 +34289,7 @@ mod tests {
             None,
             None,
             BTreeMap::new(),
+            RequestSlot::default(),
         );
         for _ in 1..MAX_CLAUDE_RECORDS_PER_RESPONSE {
             assert!(response.push(
@@ -33781,6 +34301,7 @@ mod tests {
                 None,
                 None,
                 BTreeMap::new(),
+                RequestSlot::default(),
             ));
         }
         assert!(!response.push(
@@ -33792,6 +34313,7 @@ mod tests {
             None,
             None,
             BTreeMap::new(),
+            RequestSlot::default(),
         ));
         assert_eq!(response.records.len(), MAX_CLAUDE_RECORDS_PER_RESPONSE);
         assert!(response.resolve().is_none());
@@ -36529,16 +37051,125 @@ mod tests {
         let mut exclusive = nonexclusive.clone();
         exclusive.usage_accounting_contract =
             Some("session_exclusive_reported_usage:v1".to_string());
-        let mappings = (7_u64..=12)
-            .map(|internal_version| {
-                json!({
-                    "internal_version": internal_version,
-                    "released_ack_version": internal_version - 6,
-                })
+        // Evidence-bearing legacy bodies reserve v21/v22. Envelope evidence
+        // uses v23/v24, so public normalization must be an explicit mapping.
+        let mappings = [
+            (7_u64, 1_u64),
+            (8, 2),
+            (9, 3),
+            (10, 4),
+            (11, 5),
+            (12, 6),
+            (15, 13),
+            (16, 14),
+            (19, 17),
+            (20, 18),
+            (23, 7),
+            (24, 8),
+        ]
+        .into_iter()
+        .map(|(internal_version, released_ack_version)| {
+            json!({
+                "internal_version": internal_version,
+                "released_ack_version": released_ack_version,
             })
-            .collect::<Vec<_>>();
+        })
+        .collect::<Vec<_>>();
+        let header = codex_creator_header();
+        let creator_case = |exclusive: bool, with_curve: bool| {
+            // Exercise the actual original-session parser and its model/hourly
+            // usage fold rather than a metadata-only item with positive totals.
+            let mut item =
+                codex_creator_item(&[header.clone()], header["payload"]["id"].as_str().unwrap());
+            item.cache_observations = None;
+            item.cache_observations_state = None;
+            if !exclusive {
+                item.usage_accounting_contract = None;
+            }
+            if !with_curve {
+                item.context_curve = None;
+            }
+            assert_eq!(
+                (item.input_tokens, item.output_tokens, item.request_count),
+                (100, 5, 1)
+            );
+            assert_eq!(item.model_usage.len(), 1);
+            assert_eq!(item.usage_buckets.len(), 1);
+            let bucket = &item.usage_buckets[0];
+            assert_eq!(bucket.bucket_start, "2026-09-30T10:00:00Z");
+            assert_eq!(bucket.model_usage, item.model_usage);
+            assert_eq!(
+                (
+                    item.model_usage[0].input_tokens,
+                    item.model_usage[0].output_tokens,
+                    item.model_usage[0].request_count
+                ),
+                (100, 5, 1)
+            );
+            assert!(item
+                .source_file_fingerprint
+                .as_deref()
+                .is_some_and(|fp| fp.len() == 64));
+            let mut request = valid_v6_batch_request();
+            request.source = "codex".into();
+            request.snapshots = vec![item.clone()];
+            apply_upload_policy(
+                SnapshotSource::Codex,
+                &mut request.snapshots,
+                request.upload_policy,
+            );
+            let item = &mut request.snapshots[0];
+            item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, item);
+            let wire = serde_json::to_value(&request).unwrap();
+            let item = &request.snapshots[0];
+            let envelope =
+                snapshot_semantic_envelope(SnapshotSource::Codex, item, request.upload_policy);
+            assert_eq!(
+                wire["snapshots"][0]["semantic_envelope"],
+                serde_json::to_value(&envelope).unwrap()
+            );
+            assert_eq!(
+                item.snapshot_fingerprint,
+                snapshot_fingerprint_from_component_hashes(
+                    SnapshotSource::Codex,
+                    &item.source_session_id,
+                    &envelope.component_hashes
+                )
+            );
+            let canonical =
+                crate::canonical_json::canonicalize(&snapshot_upload_body_witness_payload(item))
+                    .unwrap();
+            assert_eq!(
+                snapshot_upload_body_witness(item),
+                format!("{:x}", Sha256::digest(canonical))
+            );
+            assert_eq!(
+                wire["snapshots"][0]["usage_buckets"][0]["model_usage"],
+                wire["snapshots"][0]["model_usage"]
+            );
+            json!({
+                "wire": wire,
+                "internal_version": snapshot_upload_body_witness_version(&item),
+                "released_ack_version": if exclusive { 8 } else { 7 },
+                "digest": snapshot_upload_body_witness(&item),
+                "body_projection": snapshot_upload_body_witness_payload(&item),
+            })
+        };
         let fixture = json!({
             "contract_version": "snapshot_body_witness_ack_normalization:v1",
+            "session_account_omission_contract": {
+                "session_account_evidence": "omitted when absent; never serialized as null",
+                "source_created_at": "omitted when absent; never serialized as null",
+                "source_created_at_spelling": "RFC3339 formatted original own-header time; fixture 2026-09-30T10:00:00Z",
+                "requires_semantic_envelope_for_internal_versions_23_24": true,
+                "reserved_legacy_session_account_witness_domain": [21, 22],
+                "legacy_content_hash_epoch": SNAPSHOT_CONTENT_HASH_EPOCH,
+            },
+            "session_account_cases": {
+                "nonexclusive": creator_case(false, false),
+                "exclusive": creator_case(true, false),
+                "exclusive_with_curve": creator_case(true, true),
+            },
             "mappings": mappings,
             "curve_cases": {
                 "nonexclusive": {
@@ -36566,6 +37197,182 @@ mod tests {
             canonical,
             "run UPDATE_BODY_WITNESS_ACK_GOLDEN=1 cargo test -p ottto-service --lib body_witness_ack_normalization_fixture_is_canonical_and_current"
         );
+    }
+
+    #[test]
+    fn paired_creator_cache_wire_corpus_matches_exact_ack() {
+        // One physical source stream supplies both creator and owned canonical
+        // cache requests. No source identity is grafted onto another session.
+        let header = codex_creator_header();
+        let session = header["payload"]["id"].as_str().unwrap().to_string();
+        let mut records = vec![
+            header,
+            json!({"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"high","current_date":"2026-09-30"}}),
+        ];
+        let mut read_total = 0;
+        for (index, read) in [90_000, 0, 90_000].into_iter().enumerate() {
+            let timestamp = format!("2026-09-30T10:00:0{index}Z");
+            read_total += read;
+            records.push(json!({"type":"token_usage_record","timestamp":timestamp,"payload":{"response_id":format!("resp_paired_{index}"),"usage":{"input_tokens":100_000,"cached_input_tokens":read,"cache_write_input_tokens":0,"output_tokens":1}}}));
+            records.push(json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100_000*(index+1),"cached_input_tokens":read_total,"output_tokens":index+1},"last_token_usage":{"input_tokens":100_000,"cached_input_tokens":read,"output_tokens":1}}}}));
+        }
+        let root = temp_dir("paired-creator-cache");
+        let path = root.join(format!("rollout-2026-09-30T10-00-00-{session}.jsonl"));
+        fs::write(
+            &path,
+            records
+                .iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let mut parsed = parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", "f".repeat(64))
+            .unwrap()
+            .remove(0);
+        fs::remove_dir_all(root).unwrap();
+        prepare_cache_observations(&mut parsed, None);
+        assert!(parsed.session_account_evidence.is_some());
+        assert!(parsed.cache_observations.is_some());
+        assert!(parsed.context_curve.is_some());
+        assert_eq!((parsed.input_tokens, parsed.output_tokens), (300_000, 3));
+        let mut cases = Vec::new();
+        for capability in ["creator", "cache", "combined", "legacy"] {
+            for exclusive in [false, true] {
+                for curve in [false, true] {
+                    for tools in [
+                        "omitted",
+                        "empty_default_only",
+                        "nonempty",
+                        "truncated_only",
+                    ] {
+                        let mut item = parsed.clone();
+                        if capability == "cache" || capability == "legacy" {
+                            item.session_account_evidence = None;
+                        }
+                        if capability == "creator" || capability == "legacy" {
+                            item.cache_observations = None;
+                            item.cache_observations_state = None;
+                        }
+                        if !exclusive {
+                            item.usage_accounting_contract = None;
+                        }
+                        if !curve {
+                            item.context_curve = None;
+                        }
+                        item.tool_usage = match tools {
+                            "empty_default_only" => Some(vec![]),
+                            "nonempty" => Some(vec![SnapshotToolUsage {
+                                name: "Read".into(),
+                                count: 2,
+                            }]),
+                            _ => None,
+                        };
+                        item.tool_usage_truncated = tools == "truncated_only";
+                        let mut request = valid_v6_batch_request();
+                        request.source = "codex".into();
+                        request.snapshots = vec![item];
+                        apply_upload_policy(
+                            SnapshotSource::Codex,
+                            &mut request.snapshots,
+                            request.upload_policy,
+                        );
+                        request.snapshots[0].snapshot_fingerprint =
+                            snapshot_fingerprint(SnapshotSource::Codex, &request.snapshots[0]);
+                        let item = &request.snapshots[0];
+                        // These are exact normal HTTP body bytes, not reconstructed
+                        // canonical JSON or a mutation of the serialized leaves.
+                        let wire_bytes = serde_json::to_vec(&request).unwrap();
+                        let wire: Value = serde_json::from_slice(&wire_bytes).unwrap();
+                        let projection = snapshot_upload_body_witness_payload(item);
+                        let internal = snapshot_upload_body_witness_version(item);
+                        let public = internal.map(|version| match version {
+                            9 => 3,
+                            10 => 4,
+                            11 => 5,
+                            12 => 6,
+                            15 => 13,
+                            16 => 14,
+                            19 => 17,
+                            20 => 18,
+                            23 => 7,
+                            24 => 8,
+                            _ => panic!("unexpected paired domain"),
+                        });
+                        let digest = internal.map(|_| snapshot_upload_body_witness(item));
+                        for field in [
+                            "context_curve",
+                            "tool_usage",
+                            "tool_usage_truncated",
+                            "session_account_evidence",
+                        ] {
+                            if let Some(declared) = wire["snapshots"][0].get(field) {
+                                assert_eq!(projection.get(field), Some(declared));
+                            } else if capability != "legacy" || curve || tools == "omitted" {
+                                assert!(projection.get(field).is_none());
+                            }
+                        }
+                        let response = |version, proof, unchanged| {
+                            let reference = crate::snapshot_client::SnapshotEntityRef {
+                                source_session_id: item.source_session_id.clone(),
+                                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                                occurrence_count: 1,
+                                body_witness_version: version,
+                                body_witness_digest: proof,
+                                head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
+                                head_challenge: None,
+                            };
+                            crate::snapshot_client::SnapshotBatchResponse {
+                                accepted: 1,
+                                sessions_reconciled: 0,
+                                session_ids: vec![],
+                                disabled: false,
+                                disabled_reason: None,
+                                entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+                                accepted_entities: if unchanged {
+                                    vec![]
+                                } else {
+                                    vec![reference.clone()]
+                                },
+                                unchanged_entities: if unchanged {
+                                    vec![reference]
+                                } else {
+                                    vec![]
+                                },
+                                rejected_entities: vec![],
+                                conflict_entities: vec![],
+                            }
+                        };
+                        for unchanged in [false, true] {
+                            response(public, digest.clone(), unchanged)
+                                .validate_entity_ack(&request)
+                                .unwrap();
+                            if capability != "legacy" || curve {
+                                assert!(response(public, Some("0".repeat(64)), unchanged)
+                                    .validate_entity_ack(&request)
+                                    .is_err());
+                                assert!(response(None, None, unchanged)
+                                    .validate_entity_ack(&request)
+                                    .is_err());
+                                assert!(response(Some(99), digest.clone(), unchanged)
+                                    .validate_entity_ack(&request)
+                                    .is_err());
+                            }
+                        }
+                        cases.push(json!({"capability":capability,"exclusive":exclusive,"curve":curve,"tools":tools,
+                            "provenance":"real Codex parser and normal SnapshotBatchRequest serializer",
+                            "wire":wire,"wire_body_utf8":String::from_utf8(wire_bytes).unwrap(),
+                            "internal_version":internal,"released_ack_version":public,"digest":digest,
+                            "body_projection":projection,"cache_observations_state":item.cache_observations_state}));
+                    }
+                }
+            }
+        }
+        assert_eq!(cases.len(), 64);
+        let corpus =
+            json!({"contract_version":"paired_creator_cache_wire_corpus:v1","cases":cases});
+        if let Ok(output) = std::env::var("OTTTO_PAIRED_CREATOR_CACHE_CORPUS_OUT") {
+            fs::write(output, serde_json::to_vec_pretty(&corpus).unwrap()).unwrap();
+        }
     }
 
     #[test]
@@ -40048,7 +40855,7 @@ mod tests {
             ),
         ];
         let child = vec![
-            json!({"timestamp":"2026-08-02T08:20:00.500Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-02T08:20:00Z","thread_source":"agent_created_thread","history_mode":"paginated","history_base":{"cursor":"external"},"source":"vscode"}}),
+            json!({"timestamp":"2026-08-02T08:20:00.500Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-02T08:20:00Z","thread_source":"agent_created_thread","history_mode":"paginated","history_base":{"cursor":"external"},"source":"vscode","creator_user_id":"synthetic-user","creator_account_id":"synthetic-workspace"}}),
             json!({"timestamp":"2026-08-02T08:20:00.501Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":"01a03e99-5000-7000-8000-000000000001","trace_id":"0123456789abcdef0123456789abcdef","started_at":1_785_658_800_u64}}),
             json!({"timestamp":"2026-08-02T08:20:01Z","ordinal":2,"type":"turn_context","payload":{"turn_id":"01a03e99-5000-7000-8000-000000000001","model":"gpt-5.6-sol"}}),
             json!({"timestamp":"2026-08-02T08:20:02Z","ordinal":3,"type":"compacted","payload":{"replacement_history":[]}}),
@@ -40076,6 +40883,18 @@ mod tests {
             let item = parsed.snapshots.into_iter().next().expect("child snapshot");
             assert_eq!((item.input_tokens, item.request_count), (12, 1));
             assert_eq!(item.compaction_count, Some(1));
+            let evidence = item
+                .session_account_evidence
+                .as_ref()
+                .expect("native own creator");
+            assert_eq!(
+                evidence.source_created_at.as_deref(),
+                Some("2026-08-02T08:20:00Z")
+            );
+            assert_eq!(
+                evidence.account_identifier_hash,
+                ottto_core::billing_identity_hash("openai", "account", "synthetic-user").unwrap()
+            );
             assert_eq!(item.context_curve.is_some(), context_curve_enabled);
             let _ = fs::remove_dir_all(root);
         }
@@ -42402,8 +43221,14 @@ mod tests {
             unattributed_total_tokens: 0,
             request_count: 1,
             usage_accounting_contract: None,
+            session_account_evidence: None,
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
+            cache_observations: None,
+            cache_observations_state: None,
+            cache_base_head_etag: None,
+            cache_requests: Vec::new(),
+            cache_requests_complete: true,
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
             max_duration_ms: None,
@@ -42902,6 +43727,346 @@ mod tests {
             .contains("claude-vertex-session-1"));
     }
 
+    fn codex_creator_header() -> Value {
+        json!({"timestamp":"2026-09-30T10:00:00Z", "ordinal":0,
+            "type":"session_meta", "payload":{
+                "id":"019e253c-1111-7000-9000-aaaaaaaaaaaa",
+                "session_id":"019e253c-1111-7000-9000-aaaaaaaaaaaa",
+                "timestamp":"2026-09-30T10:00:00Z", "source":"cli",
+                "creator_user_id":"synthetic-user",
+                "creator_account_id":"synthetic-workspace"}})
+    }
+
+    fn codex_creator_item(headers: &[Value], path_session_id: &str) -> SnapshotItem {
+        let root = temp_dir("codex-creator");
+        let path = root.join(format!(
+            "rollout-2026-09-30T10-00-00-{path_session_id}.jsonl"
+        ));
+        let usage = json!({"timestamp":"2026-09-30T10:01:00Z", "type":"event_msg",
+            "payload":{"type":"token_count", "info":{
+                "total_token_usage":{"input_tokens":100,"output_tokens":5},
+                "model":"gpt-5.5"}}});
+        let mut records = headers.to_vec();
+        records.push(usage);
+        let body = records.iter().map(|v| format!("{v}\n")).collect::<String>();
+        fs::write(&path, &body).expect("write creator fixture");
+        let source_file_fingerprint = sha256_hex(&["codex_creator_fixture_source:v1"]);
+        let item = parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", source_file_fingerprint)
+            .expect("parse creator fixture")
+            .into_iter()
+            .next()
+            .expect("usage snapshot");
+        fs::remove_dir_all(root).expect("remove creator fixture");
+        item
+    }
+
+    #[test]
+    fn codex_creator_header_uses_proved_provider_namespace_without_billing_changes() {
+        let header = codex_creator_header();
+        let item = codex_creator_item(&[header.clone()], header["payload"]["id"].as_str().unwrap());
+        let evidence = item
+            .session_account_evidence
+            .as_ref()
+            .expect("original creator evidence");
+        assert_eq!(
+            evidence.account_identifier_hash,
+            ottto_core::billing_identity_hash("openai", "account", "synthetic-user").unwrap()
+        );
+        assert_eq!(
+            evidence.account_identifier_hash,
+            "b3a7a2aca1f0d45805d1d450bb56bcc3659a24d285f90fa443b2f4dc3a5fe444"
+        );
+        assert_eq!(
+            evidence.provider_workspace_hash,
+            "5d7d185726a8b37913d3c51dc8ce109e48f4c73715f2ab34505acf94183fff00"
+        );
+        assert_eq!(
+            evidence.provider_workspace_hash,
+            ottto_core::billing_identity_hash("openai", "workspace", "synthetic-workspace")
+                .unwrap()
+        );
+        assert_ne!(
+            Some(&evidence.provider_workspace_hash),
+            item.workspace_hash.as_ref()
+        );
+        assert_eq!(
+            evidence.source_created_at.as_deref(),
+            Some("2026-09-30T10:00:00Z")
+        );
+        assert!(item
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
+        assert!(item.cost.is_none());
+        let mut legacy_header = header.clone();
+        legacy_header["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("creator_user_id");
+        legacy_header["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("creator_account_id");
+        let legacy =
+            codex_creator_item(&[legacy_header], header["payload"]["id"].as_str().unwrap());
+        assert_eq!(
+            snapshot_semantic_component_hashes(SnapshotSource::Codex, &item),
+            snapshot_semantic_component_hashes(SnapshotSource::Codex, &legacy)
+        );
+        let mut body = serde_json::to_value(&item).unwrap();
+        assert!(body
+            .as_object_mut()
+            .unwrap()
+            .remove("session_account_evidence")
+            .is_some());
+        assert_eq!(
+            body,
+            serde_json::to_value(&legacy).unwrap(),
+            "missing evidence retains legacy wire"
+        );
+    }
+
+    #[test]
+    fn codex_creator_header_copied_parent_and_conflicts_fail_closed() {
+        let header = codex_creator_header();
+        let id = header["payload"]["id"].as_str().unwrap();
+        let copied = codex_creator_item(&[header.clone()], "019e253c-2222-7000-9000-bbbbbbbbbbbb");
+        assert!(copied.session_account_evidence.is_none());
+        let mut conflict = header.clone();
+        conflict["payload"]["creator_account_id"] = json!("synthetic-other-workspace");
+        assert!(
+            codex_creator_item(&[header.clone(), conflict, header.clone()], id)
+                .session_account_evidence
+                .is_none(),
+            "conflict stays closed"
+        );
+        assert!(
+            codex_creator_item(&[header.clone(), header.clone()], id)
+                .session_account_evidence
+                .is_some(),
+            "exact duplicate does not replace creator"
+        );
+        assert!(
+            codex_creator_item(&[json!({"type":"turn_context"}), header.clone()], id)
+                .session_account_evidence
+                .is_none(),
+            "later header cannot prove original creation"
+        );
+    }
+
+    #[test]
+    fn codex_creator_header_missing_malformed_and_time_fail_closed() {
+        let header = codex_creator_header();
+        let id = header["payload"]["id"].as_str().unwrap();
+        for (key, value) in [
+            ("creator_user_id", Value::Null),
+            ("creator_account_id", json!(" ")),
+            ("creator_user_id", json!({"id":"synthetic-user"})),
+            ("timestamp", json!("bad-time")),
+            ("timestamp", json!("2026-09-30T10:02:00Z")),
+            ("session_id", json!("other-session")),
+        ] {
+            let mut malformed = header.clone();
+            malformed["payload"][key] = value;
+            assert!(
+                codex_creator_item(&[malformed], id)
+                    .session_account_evidence
+                    .is_none(),
+                "{key}"
+            );
+        }
+        let mut late = header.clone();
+        late["ordinal"] = json!(1);
+        assert!(codex_creator_item(&[late], id)
+            .session_account_evidence
+            .is_none());
+        let mut no_time = header.clone();
+        no_time.as_object_mut().unwrap().remove("timestamp");
+        assert!(codex_creator_item(&[no_time], id)
+            .session_account_evidence
+            .is_none());
+    }
+
+    #[test]
+    fn codex_creator_header_unread_physical_prefix_cannot_certify_creation() {
+        let header = codex_creator_header();
+        let root = temp_dir("codex-creator-malformed-prefix");
+        let id = header["payload"]["id"].as_str().unwrap();
+        let path = root.join(format!("rollout-2026-09-30T10-00-00-{id}.jsonl"));
+        let usage = json!({"timestamp":"2026-09-30T10:01:00Z", "type":"event_msg",
+            "payload":{"type":"token_count", "info":{
+                "total_token_usage":{"input_tokens":100,"output_tokens":5},"model":"gpt-5.5"}}});
+        fs::write(&path, format!("malformed\n{header}\n{usage}\n")).unwrap();
+        let item = parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", "fp".into())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(item.session_account_evidence.is_none());
+        assert_eq!(
+            item.input_tokens, 100,
+            "legacy partial parse behavior is unchanged"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_creator_evidence_body_corrections_upload_once_and_preserve_existing_owner() {
+        let header = codex_creator_header();
+        let evidence = codex_creator_header_evidence(&header, &header["payload"]).unwrap();
+        let root = temp_dir("codex-creator-noop");
+        let id = header["payload"]["id"].as_str().unwrap();
+        let path = root.join(format!("rollout-2026-09-30T10-00-00-{id}.jsonl"));
+        let mut missing = header.clone();
+        missing["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("creator_user_id");
+        let base = format!(
+            "{missing}\n{}\n",
+            json!({"timestamp":"2026-09-30T10:01:00Z",
+            "type":"event_msg", "payload":{"type":"token_count", "info":{
+                "total_token_usage":{"input_tokens":100,"output_tokens":5},"model":"gpt-5.5"}}})
+        );
+        let mut index = ScanIndex::default();
+        let mut revision = 0;
+        let mut run = |evidence: Option<SessionAccountEvidence>| {
+            revision += 1;
+            fs::write(&path, format!("{base}{}", "{}\n".repeat(revision))).unwrap();
+            let mut result = scan_source_roots_with_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-09-30T10:05:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap();
+            assert_eq!(result.snapshots.len(), 1);
+            result.snapshots[0].session_account_evidence = evidence;
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+            (result.snapshots.len(), result.semantic_noop_count)
+        };
+        assert_eq!(run(None).0, 1);
+        assert_eq!(run(Some(evidence.clone())).0, 1);
+        assert_eq!(run(Some(evidence.clone())), (0, 1));
+        let mut changed = evidence.clone();
+        changed.provider_workspace_hash = "f".repeat(64);
+        assert_eq!(run(Some(changed)).0, 1);
+        assert_eq!(run(None).0, 1, "clearing evidence is delivered");
+        assert_eq!(run(None), (0, 1));
+        let mut item = codex_creator_item(&[header.clone()], id);
+        item.model_usage[0].auth_mode = Some("oauth".into());
+        let key = sha256_hex(&["session_owner:v1", "machine", id]);
+        let owner = SessionAccountBinding {
+            account_identifier_hash: "existing-owner".into(),
+            workspace_identifier_hash: Some("existing-workspace".into()),
+        };
+        index
+            .session_account_bindings
+            .insert(key.clone(), owner.clone());
+        index.bind_session_accounts(
+            SnapshotSource::Codex,
+            "machine",
+            std::slice::from_mut(&mut item),
+            &[],
+        );
+        assert_eq!(index.session_account_bindings[&key], owner);
+        assert_eq!(item.session_account_evidence, Some(evidence));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_creator_upload_privacy_and_exact_ack_preserve_hashes_only() {
+        let header = codex_creator_header();
+        let mut request = valid_v6_batch_request();
+        request.source = "codex".into();
+        request.snapshots = vec![codex_creator_item(
+            &[header.clone()],
+            header["payload"]["id"].as_str().unwrap(),
+        )];
+        request.snapshots[0].cache_observations = None;
+        request.snapshots[0].cache_observations_state = None;
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut request.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        let item = &request.snapshots[0];
+        let evidence = item.session_account_evidence.as_ref().unwrap();
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            wire["snapshots"][0]["session_account_evidence"],
+            serde_json::to_value(evidence).unwrap()
+        );
+        let body = wire.to_string();
+        assert!(!body.contains("synthetic-user"));
+        assert!(!body.contains("synthetic-workspace"));
+        assert!(!body.contains("creator_user_id"));
+        assert!(!body.contains("creator_account_id"));
+        let response = |version, digest| crate::snapshot_client::SnapshotBatchResponse {
+            accepted: 1,
+            sessions_reconciled: 0,
+            session_ids: vec![],
+            disabled: false,
+            disabled_reason: None,
+            entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+            accepted_entities: vec![crate::snapshot_client::SnapshotEntityRef {
+                source_session_id: item.source_session_id.clone(),
+                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                occurrence_count: 1,
+                body_witness_version: version,
+                body_witness_digest: digest,
+                head_etag: None,
+                head_challenge: None,
+            }],
+            unchanged_entities: vec![],
+            rejected_entities: vec![],
+            conflict_entities: vec![],
+        };
+        assert_eq!(snapshot_upload_body_witness_version(item), Some(24));
+        response(Some(8), Some(snapshot_upload_body_witness(item)))
+            .validate_entity_ack(&request)
+            .unwrap();
+        for internal_domain in [21, 22, 23, 24] {
+            assert!(
+                response(
+                    Some(internal_domain),
+                    Some(snapshot_upload_body_witness(item))
+                )
+                .validate_entity_ack(&request)
+                .is_err(),
+                "internal legacy/envelope domain cannot replace public ACK version"
+            );
+        }
+        assert!(response(Some(6), Some(snapshot_upload_body_witness(item)))
+            .validate_entity_ack(&request)
+            .is_err());
+        assert!(response(Some(8), Some("0".repeat(64)))
+            .validate_entity_ack(&request)
+            .is_err());
+        assert!(response(None, None).validate_entity_ack(&request).is_err());
+        // The same new evidence still requires ACK proof without a context curve.
+        let mut no_curve = request.clone();
+        no_curve.snapshots[0].context_curve = None;
+        assert!(response(None, None).validate_entity_ack(&no_curve).is_err());
+        let mut legacy = response(None, None);
+        legacy.entity_ack_contract = None;
+        legacy.accepted_entities.clear();
+        assert!(
+            legacy.validate_entity_ack(&no_curve).is_err(),
+            "legacy ACK cannot settle creator evidence without a curve"
+        );
+        let mut absent_time = evidence.clone();
+        absent_time.source_created_at = None;
+        let absent_time_wire = serde_json::to_value(absent_time).unwrap();
+        assert!(
+            absent_time_wire.get("source_created_at").is_none(),
+            "optional time omits, never null"
+        );
+    }
+
     #[test]
     fn session_usage_upload_body_contains_only_account_hashes() {
         let mut request = valid_v6_batch_request();
@@ -42970,8 +44135,14 @@ mod tests {
                 unattributed_total_tokens: 0,
                 request_count: 1,
                 usage_accounting_contract: None,
+                session_account_evidence: None,
                 claude_usage_request_ids: BTreeSet::new(),
                 claude_usage_occurrences: BTreeMap::new(),
+                cache_observations: None,
+                cache_observations_state: None,
+                cache_base_head_etag: None,
+                cache_requests: Vec::new(),
+                cache_requests_complete: true,
                 avg_duration_ms: None,
                 avg_time_to_first_token_ms: None,
                 max_duration_ms: None,
@@ -44343,5 +45514,448 @@ mod tests {
             index.traversal.is_none(),
             "a terminal-unhealthy traversal is still dropped so discovery restarts"
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod cache_adapter_tests {
+    use super::*;
+    pub(crate) fn cache_fixture_item() -> SnapshotItem {
+        let mut parser = SnapshotAccumulator::new(SnapshotSource::Codex);
+        apply_codex_line(
+            &json!({"type":"session_meta","timestamp":"2026-09-30T10:00:00Z","payload":{"id":"00000000-0000-7000-8000-000000000001"}}),
+            &mut parser,
+        );
+        apply_codex_line(
+            &json!({"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"high","current_date":"2026-09-30"}}),
+            &mut parser,
+        );
+        let mut cumulative_read = 0;
+        for (index, read) in [90_000, 0, 90_000].into_iter().enumerate() {
+            let timestamp = format!("2026-09-30T10:00:0{index}Z");
+            apply_codex_line(
+                &json!({"type":"token_usage_record","timestamp":timestamp,"payload":{"response_id":format!("resp_cache_fixture_{index}"),"usage":{"input_tokens":100_000,"cached_input_tokens":read,"cache_write_input_tokens":0,"output_tokens":1}}}),
+                &mut parser,
+            );
+            cumulative_read += read;
+            apply_codex_line(
+                &json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100_000*(index+1),"cached_input_tokens":cumulative_read,"output_tokens":index+1},"last_token_usage":{"input_tokens":100_000,"cached_input_tokens":read,"output_tokens":1}}}}),
+                &mut parser,
+            );
+        }
+        let mut item = parser
+            .into_items(
+                Path::new("cache-fixture.jsonl"),
+                "2026-09-30T10:00:03Z",
+                "f".repeat(64),
+                None,
+            )
+            .remove(0);
+        prepare_cache_observations(&mut item, None);
+        item
+    }
+    fn cache_fixture_snapshot_value(source: SnapshotSource, item: &SnapshotItem) -> Value {
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: source.api_slug().into(),
+            machine_id: "a".repeat(64),
+            collector_version: Some(collector_version()),
+            snapshots: vec![item.clone()],
+            upload_policy: SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        serde_json::to_value(request).unwrap()["snapshots"][0].clone()
+    }
+    /// Optional bounded replay of sanitized numeric research evidence; source text stays outside the public tree.
+    #[test]
+    fn cache_research_numeric_adapter_replay() {
+        let Ok(path) = std::env::var("OTTTO_CACHE_RESEARCH_REPLAY") else {
+            return;
+        };
+        let evidence: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut examined = 0;
+        for (case_index, example) in evidence["examples"].as_array().unwrap().iter().enumerate() {
+            let provider = example["provider"].as_str().unwrap();
+            let source = if provider == "Codex" {
+                SnapshotSource::Codex
+            } else {
+                SnapshotSource::ClaudeCode
+            };
+            let mut parser = SnapshotAccumulator::new(source);
+            let session = format!("00000000-0000-7000-8000-{:012}", case_index + 100);
+            if source == SnapshotSource::Codex {
+                apply_codex_line(
+                    &json!({"type":"session_meta","payload":{"id":session}}),
+                    &mut parser,
+                );
+            } else {
+                apply_claude_code_line(
+                    &json!({"type":"assistant","sessionId":session,"forkedFrom":{"sessionId":"fixture_parent","messageUuid":"fixture_copy"}}),
+                    &mut parser,
+                );
+            }
+            let mut total_input = 0u64;
+            let mut total_read = 0u64;
+            let mut total_output = 0u64;
+            for (slot_index, slot) in example["slots"].as_array().unwrap().iter().enumerate() {
+                let timestamp = slot["timestamp"].as_str().unwrap();
+                let changed = slot_index > 0
+                    && !example["changed_metadata_fields"]
+                        .as_array()
+                        .map_or(true, |fields| fields.is_empty());
+                if source == SnapshotSource::Codex {
+                    apply_codex_line(
+                        &json!({"type":"turn_context","payload":{"model":slot["model"],"effort":slot["effort"],"fixture_recorded_config":changed}}),
+                        &mut parser,
+                    );
+                    if slot_index == 1
+                        && example["label"]
+                            .as_str()
+                            .unwrap()
+                            .to_lowercase()
+                            .contains("compaction")
+                    {
+                        apply_codex_line(
+                            &json!({"type":"compacted","timestamp":timestamp}),
+                            &mut parser,
+                        );
+                    }
+                    apply_codex_line(
+                        &json!({"type":"token_usage_record","timestamp":timestamp,"payload":{"response_id":format!("resp_replay_{case_index}_{slot_index}"),"usage":{"input_tokens":slot["prompt"],"cached_input_tokens":slot["cache_read"],"cache_write_input_tokens":slot["cache_write"],"output_tokens":slot["output"]}}}),
+                        &mut parser,
+                    );
+                    total_input += slot["prompt"].as_u64().unwrap();
+                    total_read += slot["cache_read"].as_u64().unwrap();
+                    total_output += slot["output"].as_u64().unwrap();
+                    apply_codex_line(
+                        &json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":total_input,"cached_input_tokens":total_read,"output_tokens":total_output},"last_token_usage":{"input_tokens":slot["prompt"],"cached_input_tokens":slot["cache_read"],"output_tokens":slot["output"]}}}}),
+                        &mut parser,
+                    );
+                } else {
+                    if slot_index == 1
+                        && example["label"]
+                            .as_str()
+                            .unwrap()
+                            .to_lowercase()
+                            .contains("compaction")
+                    {
+                        apply_claude_code_line(
+                            &json!({"type":"system","subtype":"compact_boundary","sessionId":session,"timestamp":timestamp,"compactMetadata":{"trigger":"auto"}}),
+                            &mut parser,
+                        );
+                    }
+                    apply_claude_code_line(
+                        &json!({"type":"assistant","sessionId":session,"requestId":format!("req_replay_{case_index}_{slot_index}"),"timestamp":timestamp,"message":{"id":format!("msg_replay_{case_index}_{slot_index}"),"model":slot["model"],"usage":{"input_tokens":slot["uncached"],"cache_read_input_tokens":slot["cache_read"],"cache_creation_input_tokens":slot["cache_write"],"output_tokens":slot["output"]}}}),
+                        &mut parser,
+                    );
+                }
+            }
+            if source == SnapshotSource::ClaudeCode {
+                parser.finalize_claude_responses();
+            }
+            assert_eq!(parser.cache_requests.len(), 3);
+            // Effort and actual measured inactivity are additional verified source evidence,
+            // supplied explicitly rather than inferred from response-report timestamps.
+            for (request, slot) in parser
+                .cache_requests
+                .iter_mut()
+                .zip(example["slots"].as_array().unwrap())
+            {
+                request.slot.effort = slot["effort"].as_str().map(str::to_string);
+                assert_eq!(request.slot.prompt_tokens, slot["prompt"].as_u64());
+                assert_eq!(request.slot.cache_read_tokens, slot["cache_read"].as_u64());
+            }
+            if source == SnapshotSource::Codex {
+                parser.cache_requests[1].idle_seconds = example["idle_seconds"]
+                    .as_f64()
+                    .map(|seconds| seconds.floor() as u64);
+            }
+            let wire = cache_wire_for_requests(&session, &parser.cache_requests).unwrap();
+            let affected = wire
+                .operations
+                .iter()
+                .find_map(|operation| match operation {
+                    cache_observations::Operation::Upsert { observation }
+                        if observation.affected_request_ref.ends_with("_1") =>
+                    {
+                        Some(observation)
+                    }
+                    _ => None,
+                });
+            let (kind, explanation) = affected
+                .map(|row| (row.observation_kind.as_str(), row.explanation_code.as_str()))
+                .unwrap_or(("warm", "none"));
+            match case_index {
+                0 | 1 | 4 => assert_eq!(explanation, "configuration_change"),
+                2 => assert_eq!(explanation, "likely_expiry"),
+                3 | 10 | 11 | 15 => assert_eq!(explanation, "unclear"),
+                6 | 13 => assert_eq!(explanation, "compaction"),
+                7 | 12 => assert_eq!(explanation, "model_change"),
+                5 | 8 => assert_eq!(kind, "warm"),
+                14 => assert_eq!(explanation, "configuration_change"),
+                _ => {}
+            }
+            eprintln!("cache research case={} provider={} classification={} explanation={} operations={} bytes={}",case_index+1,provider,kind,explanation,wire.operations.len(),serde_json::to_vec(&wire).unwrap().len());
+            examined += 3;
+        }
+        assert_eq!(examined, 48);
+    }
+    #[test]
+    fn cache_claude_owned_fixture_is_independent_of_curve_sampling() {
+        let session = "00000000-0000-7000-8000-000000000002";
+        let mut parser = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+        parser.context_curve_enabled = false;
+        apply_claude_code_line(
+            &json!({"type":"assistant","sessionId":session,"forkedFrom":{"sessionId":"parent","messageUuid":"copied"},"timestamp":"2026-09-30T09:59:00Z","requestId":"copied","message":{"id":"copied","model":"claude-opus-4-8","usage":{"input_tokens":100_000,"output_tokens":1}}}),
+            &mut parser,
+        );
+        for (index, read) in [90_000, 0, 90_000].into_iter().enumerate() {
+            for output in [1, 2] {
+                apply_claude_code_line(
+                    &json!({"type":"assistant","sessionId":session,"requestId":format!("req_cache_fixture_{index}"),"timestamp":format!("2026-09-30T10:00:0{index}Z"),"message":{"id":format!("msg_cache_fixture_{index}"),"model":"claude-opus-4-8","usage":{"input_tokens":100_000-read,"cache_read_input_tokens":read,"cache_creation_input_tokens":0,"output_tokens":output}}}),
+                    &mut parser,
+                );
+            }
+        }
+        parser.finalize_claude_responses();
+        let mut items = parser.into_items(
+            Path::new("cache-claude-fixture.jsonl"),
+            "2026-09-30T10:00:03Z",
+            "f".repeat(64),
+            None,
+        );
+        let mut index = ScanIndex::default();
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            true,
+            "2026-09-30T10:00:03Z",
+        );
+        let item = &mut items[0];
+        assert!(item.context_curve.is_none());
+        assert_eq!(
+            item.cache_observations.as_ref().unwrap().operations.len(),
+            1
+        );
+        prepare_cache_observations(item, None);
+        let fixture = json!({"snapshot":cache_fixture_snapshot_value(SnapshotSource::ClaudeCode,item),"cache_observations_state":item.cache_observations_state,"body_witness_version":snapshot_upload_body_witness_version(item),"body_witness_digest":snapshot_upload_body_witness(item)});
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshot-audit/cache_observation_claude_v1.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            fixture, golden,
+            "production claude cache fixture must remain exact"
+        );
+        if let Ok(output) = std::env::var("OTTTO_CACHE_CLAUDE_FIXTURE_OUT") {
+            std::fs::write(output, serde_json::to_string_pretty(&fixture).unwrap()).unwrap();
+        }
+    }
+    #[test]
+    fn cache_generated_wire_fixture_and_witness() {
+        let item = cache_fixture_item();
+        assert_eq!(
+            item.cache_observations.as_ref().unwrap().operations.len(),
+            1
+        );
+        assert_eq!(snapshot_upload_body_witness_version(&item), Some(20));
+        let fixture = json!({"snapshot":cache_fixture_snapshot_value(SnapshotSource::Codex,&item),"cache_observations_state":item.cache_observations_state,"body_witness_version":snapshot_upload_body_witness_version(&item),"body_witness_digest":snapshot_upload_body_witness(&item)});
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshot-audit/cache_observation_codex_v1.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            fixture, golden,
+            "production codex cache fixture must remain exact"
+        );
+        if let Ok(output) = std::env::var("OTTTO_CACHE_FIXTURE_OUT") {
+            std::fs::write(output, serde_json::to_string_pretty(&fixture).unwrap()).unwrap();
+        }
+    }
+    /// Export metadata from the already generated production-wire fixtures.
+    #[test]
+    fn cache_contract_manifest_generated_from_provider_wires() {
+        let output = std::env::var("OTTTO_CACHE_MANIFEST_OUT").ok();
+        let mut fixtures = serde_json::Map::new();
+        for (provider, env, source, expected_version, normalized) in [
+            (
+                "codex",
+                "OTTTO_CACHE_FIXTURE_OUT",
+                SnapshotSource::Codex,
+                20,
+                18,
+            ),
+            (
+                "claude",
+                "OTTTO_CACHE_CLAUDE_FIXTURE_OUT",
+                SnapshotSource::ClaudeCode,
+                15,
+                13,
+            ),
+        ] {
+            let path = std::env::var(env).unwrap_or_else(|_| {
+                format!(
+                    "{}/../../fixtures/snapshot-audit/cache_observation_{provider}_v1.json",
+                    env!("CARGO_MANIFEST_DIR")
+                )
+            });
+            let fixture: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                fixture["snapshot"]["cache_observations"]["schema_version"],
+                1
+            );
+            assert!(fixture["snapshot"].get("semantic_envelope").is_some());
+            assert_eq!(fixture["body_witness_version"], expected_version);
+            let canonical = crate::canonical_json::canonicalize(&fixture).unwrap();
+            fixtures.insert(
+                provider.into(),
+                json!({
+                    "fixture_file":format!("cache_observation_{provider}_v1.json"),
+                    "fixture_canonical_sha256":format!("{:x}", Sha256::digest(&canonical)),
+                    "fixture_wire_bytes":serde_json::to_vec(&fixture).unwrap().len(),
+                    "parser_revision":source.parser_version(),
+                    "scan_identity_revision":source.scan_identity_version(),
+                    "body_witness_version":expected_version,
+                    "normalized_public_body_witness_version":normalized,
+                    "body_witness_digest":fixture["body_witness_digest"],
+                }),
+            );
+        }
+        let manifest = json!({
+            "manifest_version":"local_cache_observations_wire_manifest:v1",
+            "contract_version":"session_cache_observations:v1",
+            "schema_version":1,
+            "detector_revision":"v1",
+            "canonicalization":crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION,
+            "caps":{"operations":cache_observations::MAX_OPERATIONS,"wire_bytes":cache_observations::MAX_WIRE_BYTES,"canonical_rows":128,"canonical_bytes":128*1024},
+            "duration_policy":"nonnegative_whole_seconds_floor",
+            "head_cas_contract":SNAPSHOT_HEAD_CAS_CONTRACT,
+            "entity_ack_contract":SNAPSHOT_ENTITY_ACK_CONTRACT,
+            "normalized_public_body_witness_map":{"15":13,"16":14,"19":17,"20":18},
+            "fixtures":fixtures,
+        });
+        if let Some(output) = output {
+            std::fs::write(output, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+        } else {
+            let expected: Value = serde_json::from_str(include_str!(
+                "../../../fixtures/snapshot-audit/cache-observations-v1-manifest.json"
+            ))
+            .unwrap();
+            assert_eq!(
+                manifest, expected,
+                "cache wire manifest must match production fixtures"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_codex_adapter_canonical_records_skip_echoes_and_copied_prefix() {
+        let mut parser = SnapshotAccumulator::new(SnapshotSource::Codex);
+        apply_codex_line(
+            &json!({"type":"session_meta","payload":{"id":"session"}}),
+            &mut parser,
+        );
+        apply_codex_line(
+            &json!({"type":"turn_context","payload":{"model":"model","effort":"high","current_date":"2026-09-30"}}),
+            &mut parser,
+        );
+        for (index, read) in [90_000, 0, 90_000].into_iter().enumerate() {
+            apply_codex_line(
+                &json!({"type":"token_usage_record","timestamp":format!("2026-09-30T10:00:0{}Z",index),"payload":{"response_id":format!("resp_{index}"),"usage":{"input_tokens":100_000,"cached_input_tokens":read,"cache_write_input_tokens":0,"output_tokens":0}}}),
+                &mut parser,
+            );
+            apply_codex_line(
+                &json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100_000},"last_token_usage":{"input_tokens":100_000}}}}),
+                &mut parser,
+            );
+        }
+        assert_eq!(parser.cache_requests.len(), 3);
+        let wire = cache_wire_for_requests("session", &parser.cache_requests).unwrap();
+        assert_eq!(wire.operations.len(), 1);
+        assert_eq!(parser.cache_requests[1].slot.uncached_tokens, Some(100_000));
+        let mut child = SnapshotAccumulator::new(SnapshotSource::Codex);
+        apply_codex_line(
+            &json!({"type":"session_meta","payload":{"id":"child","forked_from_id":"missing-parent"}}),
+            &mut child,
+        );
+        apply_codex_line(
+            &json!({"type":"token_usage_record","timestamp":"2026-09-30T10:00:00Z","payload":{"response_id":"copied","usage":{"input_tokens":100_000,"cached_input_tokens":0}}}),
+            &mut child,
+        );
+        assert!(child.cache_requests.is_empty());
+    }
+    #[test]
+    fn cache_claude_resolved_chunks_preserve_nullable_fields() {
+        let mut parser = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+        for (index, read) in [90_000, 0, 90_000].into_iter().enumerate() {
+            for output in [1, 2] {
+                apply_claude_code_line(
+                    &json!({"type":"assistant","sessionId":"session","requestId":format!("req_{index}"),"timestamp":format!("2026-09-30T10:00:0{}Z",index),"message":{"id":format!("msg_{index}"),"model":"claude","usage":{"input_tokens":100_000-read,"cache_read_input_tokens":read,"cache_creation_input_tokens":0,"output_tokens":output}}}),
+                    &mut parser,
+                );
+            }
+        }
+        parser.finalize_claude_responses();
+        assert_eq!(parser.cache_requests.len(), 3);
+        assert_eq!(parser.cache_requests[1].slot.output_tokens, Some(2));
+        assert_eq!(
+            cache_wire_for_requests("session", &parser.cache_requests)
+                .unwrap()
+                .operations
+                .len(),
+            1
+        );
+        let absent = claude_cache_request_slot(
+            &json!({"requestId":"req_absent","message":{"usage":{"input_tokens":10,"output_tokens":0}}}),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(absent.cache_read_tokens, None);
+        assert_eq!(absent.cache_creation_tokens, None);
+        assert_eq!(absent.prompt_tokens, None);
+    }
+    #[test]
+    fn cache_wire_overflow_discloses_and_preserves_prior_on_correction() {
+        let warm = OwnedRequest {
+            slot: RequestSlot {
+                request_ref: "A".into(),
+                occurred_at: "2026-09-30T10:00:00Z".into(),
+                model: Some("m".into()),
+                prompt_tokens: Some(100_000),
+                cache_read_tokens: Some(90_000),
+                ..Default::default()
+            },
+            ordering: "sequential".into(),
+            compaction_before: false,
+            configuration_changed: false,
+            configuration_witness: None,
+            idle_seconds: None,
+        };
+        let mut cold = warm.clone();
+        cold.slot.request_ref = "B".into();
+        cold.slot.cache_read_tokens = Some(0);
+        let mut pathological = vec![warm.clone()];
+        for index in 0..65 {
+            let mut cold = cold.clone();
+            cold.slot.request_ref = format!("cold_{index}");
+            pathological.push(cold);
+        }
+        let overflow = cache_wire_for_requests("s", &pathological).unwrap();
+        assert!(overflow.operations.is_empty());
+        assert_eq!(overflow.coverage, "partial");
+        assert_eq!(overflow.omitted_observation_count, Some(65));
+        let patch = cache_wire_for_requests("s", &[warm.clone(), cold]).unwrap();
+        let prior = cache_state_from_patch(None, &patch);
+        let current = cache_wire_for_requests("s", &[warm]).unwrap();
+        let mut item = super::tests::sample_session_artifact_item();
+        item.cache_observations = Some(current);
+        prepare_cache_observations(&mut item, Some(&prior));
+        assert!(matches!(
+            item.cache_observations.unwrap().operations[0],
+            cache_observations::Operation::Retract { .. }
+        ));
     }
 }

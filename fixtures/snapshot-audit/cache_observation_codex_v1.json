@@ -1,0 +1,280 @@
+{
+  "body_witness_digest": "0d37c87d497dc9cb4cba7dea49fbd05a0233d3235fb62f2d7b01cb7761cc0013",
+  "body_witness_version": 20,
+  "cache_observations_state": {
+    "coverage": "complete",
+    "observations": [
+      {
+        "affected": {
+          "cache_creation_tokens": 0,
+          "cache_read_tokens": 0,
+          "effort": "high",
+          "model": "gpt-5.6-sol",
+          "occurred_at": "2026-09-30T10:00:01Z",
+          "output_tokens": 1,
+          "prompt_tokens": 100000,
+          "request_ref": "resp_cache_fixture_1",
+          "uncached_tokens": 100000
+        },
+        "affected_request_ref": "resp_cache_fixture_1",
+        "baseline_request_ref": "resp_cache_fixture_0",
+        "detector_version": "v1",
+        "episode_anchor_request_ref": "resp_cache_fixture_1",
+        "event_id": "cache:864f4749b71d7b3319ca511149579610a75f9519aefe8712888475be215401ca",
+        "explanation_code": "unclear",
+        "idle_seconds": null,
+        "immediate_next": {
+          "cache_creation_tokens": 0,
+          "cache_read_tokens": 90000,
+          "effort": "high",
+          "model": "gpt-5.6-sol",
+          "occurred_at": "2026-09-30T10:00:02Z",
+          "output_tokens": 1,
+          "prompt_tokens": 100000,
+          "request_ref": "resp_cache_fixture_2",
+          "uncached_tokens": 10000
+        },
+        "observation_kind": "unexpected_loss",
+        "occurred_at": "2026-09-30T10:00:01Z",
+        "ordering_confidence": "sequential",
+        "previous": {
+          "cache_creation_tokens": 0,
+          "cache_read_tokens": 90000,
+          "effort": "high",
+          "model": "gpt-5.6-sol",
+          "occurred_at": "2026-09-30T10:00:00Z",
+          "output_tokens": 1,
+          "prompt_tokens": 100000,
+          "request_ref": "resp_cache_fixture_0",
+          "uncached_tokens": 10000
+        },
+        "report_gap_seconds": 1,
+        "status": "complete",
+        "supporting_conditions": []
+      }
+    ],
+    "omitted_observation_count": null,
+    "schema_version": 1
+  },
+  "snapshot": {
+    "activity_summary": {
+      "capability_collection_version": "agent_capability_usage:v1",
+      "changed_files": 0,
+      "lines_added": 0,
+      "lines_deleted": 0,
+      "mcp_calls": 0,
+      "patch_operations": 0,
+      "shell_commands": 0,
+      "subagent_spawns": 0,
+      "tool_calls": 0,
+      "web_searches": 0
+    },
+    "cache_creation_1h_tokens": 0,
+    "cache_creation_5m_tokens": 0,
+    "cache_observations": {
+      "coverage": "complete",
+      "omitted_observation_count": null,
+      "operations": [
+        {
+          "observation": {
+            "affected": {
+              "cache_creation_tokens": 0,
+              "cache_read_tokens": 0,
+              "effort": "high",
+              "model": "gpt-5.6-sol",
+              "occurred_at": "2026-09-30T10:00:01Z",
+              "output_tokens": 1,
+              "prompt_tokens": 100000,
+              "request_ref": "resp_cache_fixture_1",
+              "uncached_tokens": 100000
+            },
+            "affected_request_ref": "resp_cache_fixture_1",
+            "baseline_request_ref": "resp_cache_fixture_0",
+            "detector_version": "v1",
+            "episode_anchor_request_ref": "resp_cache_fixture_1",
+            "event_id": "cache:864f4749b71d7b3319ca511149579610a75f9519aefe8712888475be215401ca",
+            "explanation_code": "unclear",
+            "idle_seconds": null,
+            "immediate_next": {
+              "cache_creation_tokens": 0,
+              "cache_read_tokens": 90000,
+              "effort": "high",
+              "model": "gpt-5.6-sol",
+              "occurred_at": "2026-09-30T10:00:02Z",
+              "output_tokens": 1,
+              "prompt_tokens": 100000,
+              "request_ref": "resp_cache_fixture_2",
+              "uncached_tokens": 10000
+            },
+            "observation_kind": "unexpected_loss",
+            "occurred_at": "2026-09-30T10:00:01Z",
+            "ordering_confidence": "sequential",
+            "previous": {
+              "cache_creation_tokens": 0,
+              "cache_read_tokens": 90000,
+              "effort": "high",
+              "model": "gpt-5.6-sol",
+              "occurred_at": "2026-09-30T10:00:00Z",
+              "output_tokens": 1,
+              "prompt_tokens": 100000,
+              "request_ref": "resp_cache_fixture_0",
+              "uncached_tokens": 10000
+            },
+            "report_gap_seconds": 1,
+            "status": "complete",
+            "supporting_conditions": []
+          },
+          "op": "upsert"
+        }
+      ],
+      "schema_version": 1
+    },
+    "cache_read_tokens": 180000,
+    "collected_at": "2026-09-30T10:00:03Z",
+    "compaction_count": 0,
+    "context_curve": {
+      "boundaries": [],
+      "contract_version": "session_context_curve:v1",
+      "coverage": "complete",
+      "model_windows": [
+        {
+          "context_window_tokens": null,
+          "evidence_kind": "provider_reported_model",
+          "evidence_revision": "codex_token_count_model_context_window:v1",
+          "model": "gpt-5.6-sol",
+          "model_window_index": 0
+        }
+      ],
+      "ownership_revision": "codex_owned_rollout_occurrences:v1",
+      "parser_revision": "codex_jsonl:v38",
+      "points": [
+        {
+          "compaction_after_request_boundary_index": null,
+          "compaction_before_request_boundary_index": null,
+          "effective_input_tokens": 100000,
+          "model_window_index": 0,
+          "observed_at": "2026-09-30T10:00:00Z",
+          "owned_request_ordinal": 1,
+          "retention_flags": 17,
+          "segment_ordinal": 0
+        },
+        {
+          "compaction_after_request_boundary_index": null,
+          "compaction_before_request_boundary_index": null,
+          "effective_input_tokens": 100000,
+          "model_window_index": 0,
+          "observed_at": "2026-09-30T10:00:01Z",
+          "owned_request_ordinal": 2,
+          "retention_flags": 17,
+          "segment_ordinal": 0
+        },
+        {
+          "compaction_after_request_boundary_index": null,
+          "compaction_before_request_boundary_index": null,
+          "effective_input_tokens": 100000,
+          "model_window_index": 0,
+          "observed_at": "2026-09-30T10:00:02Z",
+          "owned_request_ordinal": 3,
+          "retention_flags": 24,
+          "segment_ordinal": 0
+        }
+      ],
+      "retained_boundary_count": 0,
+      "retained_point_count": 3,
+      "sampling_revision": "deterministic_even_gap:v1",
+      "total_compaction_boundary_count": 0,
+      "total_owned_request_count": 3
+    },
+    "first_turn_context_tokens": 100000,
+    "input_tokens": 300000,
+    "last_turn_context_tokens": 100000,
+    "model_usage": [
+      {
+        "cache_creation_1h_tokens": 0,
+        "cache_creation_5m_tokens": 0,
+        "cache_read_tokens": 180000,
+        "input_tokens": 300000,
+        "model": "gpt-5.6-sol",
+        "model_provider": "openai",
+        "output_tokens": 3,
+        "reasoning_effort": "high",
+        "reasoning_output_tokens": 0,
+        "request_count": 3,
+        "selector_context": {},
+        "selector_sources": {}
+      }
+    ],
+    "output_tokens": 3,
+    "peak_context_fill_tokens": 100000,
+    "provenance": {
+      "collector": "codex_jsonl",
+      "input_token_scope": "inclusive_cached",
+      "source_file_count": 1
+    },
+    "reasoning_output_tokens": 0,
+    "request_count": 3,
+    "semantic_envelope": {
+      "component_contract_version": "snapshot_semantic:v1",
+      "component_hashes": {
+        "activity_summary": "348307e04856d6c750d45c50ceda5974e7f256ad6111c437f459b1a3345ef97f",
+        "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
+        "attribution": "1b2a8916ff336a10f9102221472500fd0ea1874ca7a56957faf50285384a4b7c",
+        "context_posture": "09bf0e9a129e80ccea506b9f7b8e3d982d76cb62950192e6c99f69f1acd72cc5",
+        "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
+        "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
+        "lifecycle_activity": "95c24d9640f43a112ba680558c8b0af3a27cf9f6f5fdca388076356bb305f341",
+        "usage_accounting": "b13e1ddc2c6f47ffb4754cde2debc4e6ef2680083cb487e846fe40437fb92f5a"
+      },
+      "content_hash": "7d3bbac2652260a3ae9147f7bb5b0b9a55bd0160e758adb6e80df874e5c48fae",
+      "hash_epoch": 1,
+      "revision_contract_version": "snapshot_revision:v1",
+      "revision_hash": "1528e31f6b5cfeb71e01cb828f0051c00414c5b07d4672ac0fced2aa22a2bcf6",
+      "revision_v2_canonicalization": "rfc8785:integers-only:v1",
+      "revision_v2_contract_version": "snapshot_revision:v2",
+      "revision_v2_hash": "88cad3c1e13a5715415e5e4e6fd3b01c9c12029574eda454dc64a72725345c12",
+      "revision_v2_parser_version": "codex_jsonl:v38",
+      "revision_v2_scan_identity_version": "codex_jsonl:v33",
+      "upload_policy": {
+        "session_artifacts_enabled": false,
+        "session_attribution_enabled": false,
+        "session_attribution_labels_enabled": false,
+        "session_titles_enabled": true,
+        "workspace_labels_enabled": true
+      }
+    },
+    "session_display_name": null,
+    "session_display_name_source": null,
+    "snapshot_fingerprint": "83d1f920175d4759ea1c4165bdd04597f4c8657b0b979b7c102d17668f2d8d36",
+    "source_ended_at": null,
+    "source_file_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "source_last_activity_at": "2026-09-30T10:00:02Z",
+    "source_session_id": "00000000-0000-7000-8000-000000000001",
+    "source_started_at": "2026-09-30T10:00:00Z",
+    "status": "final",
+    "usage_accounting_contract": "session_exclusive_reported_usage:v1",
+    "usage_buckets": [
+      {
+        "bucket_start": "2026-09-30T10:00:00Z",
+        "first_activity_at": "2026-09-30T10:00:00Z",
+        "last_activity_at": "2026-09-30T10:00:02Z",
+        "model_usage": [
+          {
+            "cache_creation_1h_tokens": 0,
+            "cache_creation_5m_tokens": 0,
+            "cache_read_tokens": 180000,
+            "input_tokens": 300000,
+            "model": "gpt-5.6-sol",
+            "model_provider": "openai",
+            "output_tokens": 3,
+            "reasoning_effort": "high",
+            "reasoning_output_tokens": 0,
+            "request_count": 3,
+            "selector_context": {},
+            "selector_sources": {}
+          }
+        ]
+      }
+    ],
+    "workspace_hash": null
+  }
+}
