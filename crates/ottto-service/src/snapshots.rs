@@ -6747,7 +6747,8 @@ struct CodexRolloutExtent {
 /// source of the real title for most Claude Code sessions — including
 /// CLI-launched sessions later opened in the app.
 ///
-/// Privacy: only `cliSessionId`, `title`, and `titleSource` are read; the rest
+/// Privacy: only session/title metadata and the presence of an import tag are read;
+/// the account/organization directory UUIDs are retained only as canonical hashes. The rest
 /// of the file (MCP tool catalogs, permission state) is never retained. Title
 /// upload stays governed by the org/user `session_titles_enabled` policy via
 /// `apply_upload_policy`, exactly like Codex titles.
@@ -6758,6 +6759,7 @@ struct CodexRolloutExtent {
 struct ClaudeTitleMetadata {
     titles: BTreeMap<String, ClaudeTitleCandidate>,
     account_identifier_hashes: BTreeMap<String, BTreeSet<String>>,
+    original_identity_evidence: BTreeMap<String, BTreeSet<ClaudeDesktopIdentityEvidence>>,
     legacy_sidecar_fingerprint: String,
     sidecar_census_incomplete: bool,
 }
@@ -6779,6 +6781,17 @@ struct ClaudeDesktopTitleIndexEntry {
     user_set: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_identity: Option<ClaudeDesktopIdentityEvidence>,
+}
+
+/// Directory identity is original only for a native, unimported session. Desktop's
+/// `importedFrom` is an origin tag, not a reference to the original account or org.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+struct ClaudeDesktopIdentityEvidence {
+    account_identifier_hash: Option<String>,
+    provider_workspace_hash: Option<String>,
+    imported: bool,
 }
 
 // The desktop store holds one ~80KB JSON per session; both caps are far above
@@ -6803,7 +6816,12 @@ impl ClaudeTitleMetadata {
             Some(_) => "ambiguous",
             None => "",
         };
-        sha256_hex(&[
+        let original_identity = self
+            .original_identity_evidence
+            .get(source_session_id)
+            .map(|evidence| serde_json::to_string(evidence).expect("identity fields serialize"))
+            .unwrap_or_default();
+        let mut parts = vec![
             "claude_session_sidecar:v2",
             source_session_id,
             candidate.map(|value| value.title.as_str()).unwrap_or(""),
@@ -6811,7 +6829,11 @@ impl ClaudeTitleMetadata {
                 .map(|value| if value.user_set { "user" } else { "auto" })
                 .unwrap_or(""),
             account_identity,
-        ])
+        ];
+        if !original_identity.is_empty() {
+            parts.extend(["original_native_identity:v1", &original_identity]);
+        }
+        sha256_hex(&parts)
     }
 
     #[cfg(test)]
@@ -6891,7 +6913,14 @@ impl ClaudeTitleMetadata {
             let account_identifier_hash = store_dirs
                 .iter()
                 .find_map(|store_dir| claude_desktop_account_identifier_hash(store_dir, path));
-            match load_claude_desktop_session_title(path, account_identifier_hash) {
+            let original_identity = store_dirs
+                .iter()
+                .find_map(|store_dir| claude_desktop_original_identity(store_dir, path));
+            match load_claude_desktop_session_title(
+                path,
+                account_identifier_hash,
+                original_identity,
+            ) {
                 Ok(Some(entry)) => {
                     index
                         .claude_desktop_title_files
@@ -6947,6 +6976,13 @@ impl ClaudeTitleMetadata {
 
     fn from_durable_index_with_metadata(index: &ScanIndex, mut metadata: Self) -> Self {
         for entry in index.claude_desktop_title_files.values() {
+            if let Some(original_identity) = &entry.original_identity {
+                metadata
+                    .original_identity_evidence
+                    .entry(entry.cli_session_id.clone())
+                    .or_default()
+                    .insert(original_identity.clone());
+            }
             if let Some(account_identifier_hash) = &entry.account_identifier_hash {
                 metadata
                     .account_identifier_hashes
@@ -7146,9 +7182,30 @@ fn claude_desktop_account_identifier_hash(store_dir: &Path, path: &Path) -> Opti
     account_uuid.and_then(|uuid| ottto_core::billing_identity_hash("anthropic", "account", uuid))
 }
 
+fn claude_desktop_original_identity(
+    store_dir: &Path,
+    path: &Path,
+) -> Option<ClaudeDesktopIdentityEvidence> {
+    let relative = path.strip_prefix(store_dir).ok()?;
+    let mut parts = relative.components();
+    let mut native_hash = |role: &str| {
+        let Component::Normal(part) = parts.next()? else {
+            return None;
+        };
+        let value = crate::claude_local_otel::canonical_uuid(part.to_str()?)?;
+        ottto_core::billing_identity_hash("anthropic", role, &value)
+    };
+    Some(ClaudeDesktopIdentityEvidence {
+        account_identifier_hash: native_hash("account"),
+        provider_workspace_hash: native_hash("organization"),
+        imported: false,
+    })
+}
+
 fn load_claude_desktop_session_title(
     path: &Path,
     account_identifier_hash: Option<String>,
+    mut original_identity: Option<ClaudeDesktopIdentityEvidence>,
 ) -> Result<Option<ClaudeDesktopTitleIndexEntry>> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -7194,11 +7251,17 @@ fn load_claude_desktop_session_title(
     };
     let user_set =
         title.is_some() && string_at(&value, &["titleSource"]).as_deref() == Some("user");
+    if let Some(identity) = &mut original_identity {
+        // Any present import marker (including malformed/unknown tags) vetoes
+        // treating the destination bucket as original. Never retain its raw value.
+        identity.imported = value.get("importedFrom").is_some();
+    }
     Ok(Some(ClaudeDesktopTitleIndexEntry {
         cli_session_id,
         title,
         user_set,
         account_identifier_hash,
+        original_identity,
     }))
 }
 
@@ -37836,6 +37899,162 @@ mod tests {
         fs::create_dir_all(&store_dir).expect("create store dir");
         fs::write(store_dir.join("local_desktop-1.json"), desktop_json).expect("write store");
         (home, transcript_path, projects_root)
+    }
+
+    #[test]
+    fn claude_desktop_original_identity_preserves_full_native_pair() {
+        let store = Path::new("native-store");
+        let account = "123e4567-e89b-12d3-a456-426614174000";
+        let org = "123e4567-e89b-12d3-a456-426614174001";
+        let evidence = claude_desktop_original_identity(
+            store,
+            &store
+                .join(account.to_uppercase())
+                .join(org)
+                .join("native.json"),
+        )
+        .expect("in-scope native file");
+        assert_eq!(
+            evidence.account_identifier_hash,
+            ottto_core::billing_identity_hash("anthropic", "account", account)
+        );
+        assert_eq!(
+            evidence.provider_workspace_hash,
+            ottto_core::billing_identity_hash("anthropic", "organization", org)
+        );
+        assert!(!evidence.imported);
+        let encoded = serde_json::to_string(&evidence).expect("encode evidence");
+        assert!(!encoded.contains(account));
+        assert!(!encoded.contains(org));
+        for (account, org) in [
+            ("account-ctx", org),
+            (account, "short-org"),
+            ("device", "synthetic"),
+        ] {
+            let incomplete = claude_desktop_original_identity(
+                store,
+                &store.join(account).join(org).join("native.json"),
+            )
+            .expect("in-scope incomplete identity");
+            assert!(
+                incomplete.account_identifier_hash.is_none()
+                    || incomplete.provider_workspace_hash.is_none()
+            );
+        }
+        assert!(claude_desktop_original_identity(store, Path::new("other/file.json")).is_none());
+    }
+
+    #[test]
+    fn claude_desktop_original_identity_retains_import_veto_without_raw_tag() {
+        let home = temp_dir("claude-original-import-origin");
+        let store = home.join("store");
+        let path = store
+            .join("123e4567-e89b-12d3-a456-426614174000")
+            .join("123e4567-e89b-12d3-a456-426614174001")
+            .join("native.json");
+        fs::create_dir_all(path.parent().expect("parent")).expect("directories");
+        for marker in [
+            None,
+            Some(serde_json::json!("terminal-cli")),
+            Some(serde_json::json!("unknown-sensitive-tag")),
+            Some(serde_json::Value::Null),
+        ] {
+            let mut body = serde_json::json!({"cliSessionId":"native-session", "title":"Title", "titleSource":"auto"});
+            if let Some(marker) = &marker {
+                body["importedFrom"] = marker.clone();
+            }
+            fs::write(&path, body.to_string()).expect("write metadata");
+            let entry = load_claude_desktop_session_title(
+                &path,
+                claude_desktop_account_identifier_hash(&store, &path),
+                claude_desktop_original_identity(&store, &path),
+            )
+            .expect("load metadata")
+            .expect("entry");
+            assert_eq!(
+                entry.original_identity.as_ref().expect("identity").imported,
+                marker.is_some()
+            );
+            assert!(entry.account_identifier_hash.is_some());
+            assert_eq!(entry.title.as_deref(), Some("Title"));
+            let encoded = serde_json::to_string(&entry).expect("encode index entry");
+            assert!(!encoded.contains("terminal-cli"));
+            assert!(!encoded.contains("unknown-sensitive-tag"));
+        }
+        fs::remove_dir_all(home).expect("remove fixture");
+    }
+
+    #[test]
+    fn claude_desktop_original_identity_distinguishes_same_account_org_conflict() {
+        let home = temp_dir("claude-original-org-conflict");
+        let store = home.join("store");
+        let account = "123e4567-e89b-12d3-a456-426614174000";
+        let mut index = ScanIndex::default();
+        let mut first_fingerprint = None;
+        for org in [
+            "123e4567-e89b-12d3-a456-426614174001",
+            "123e4567-e89b-12d3-a456-426614174002",
+        ] {
+            let path = store.join(account).join(org).join("native.json");
+            fs::create_dir_all(path.parent().expect("parent")).expect("directories");
+            fs::write(
+                &path,
+                r#"{"cliSessionId":"same-session","title":"Title","titleSource":"auto"}"#,
+            )
+            .expect("metadata");
+            let entry = load_claude_desktop_session_title(
+                &path,
+                claude_desktop_account_identifier_hash(&store, &path),
+                claude_desktop_original_identity(&store, &path),
+            )
+            .expect("load")
+            .expect("entry");
+            index
+                .claude_desktop_title_files
+                .insert(local_index_key(&path), entry);
+            let metadata = ClaudeTitleMetadata::from_durable_index(&index, false);
+            assert!(metadata.account_identifier_hash("same-session").is_some());
+            let fingerprint = metadata.session_sidecar_fingerprint("same-session");
+            if let Some(first) = &first_fingerprint {
+                assert_ne!(&fingerprint, first);
+            } else {
+                first_fingerprint = Some(fingerprint);
+            }
+        }
+        let encoded = serde_json::to_vec(&index).expect("persist durable index");
+        let restored: ScanIndex = serde_json::from_slice(&encoded).expect("restore index");
+        let metadata = ClaudeTitleMetadata::from_durable_index(&restored, false);
+        assert_eq!(metadata.original_identity_evidence["same-session"].len(), 2);
+        assert!(!metadata
+            .original_identity_evidence
+            .contains_key("unrelated-session"));
+        fs::remove_dir_all(home).expect("remove fixture");
+    }
+
+    #[test]
+    fn claude_desktop_original_identity_legacy_omission_keeps_previous_fingerprint() {
+        let entry: ClaudeDesktopTitleIndexEntry = serde_json::from_value(serde_json::json!({
+            "cli_session_id":"legacy-session", "title":"Title", "user_set":true,
+            "account_identifier_hash":"legacy-account-hash"
+        }))
+        .expect("read released index entry");
+        assert!(entry.original_identity.is_none());
+        let mut index = ScanIndex::default();
+        index
+            .claude_desktop_title_files
+            .insert("legacy-path".to_string(), entry);
+        let metadata = ClaudeTitleMetadata::from_durable_index(&index, false);
+        assert_eq!(
+            metadata.session_sidecar_fingerprint("legacy-session"),
+            sha256_hex(&[
+                "claude_session_sidecar:v2",
+                "legacy-session",
+                "Title",
+                "user",
+                "legacy-account-hash"
+            ])
+        );
+        assert!(metadata.original_identity_evidence.is_empty());
     }
 
     #[test]

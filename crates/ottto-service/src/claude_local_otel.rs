@@ -28,6 +28,8 @@ const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
 const MAX_EVIDENCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+// Keep the usage-ledger revision: request_identity is additive local evidence,
+// and does not change the existing request ownership/counter contract.
 const API_REQUEST_CAPTURE_REVISION: &str = "claude_api_request:v2";
 const TRACE_OWNERSHIP_CAPTURE_REVISION: &str = "claude_llm_request_ownership:v1";
 
@@ -85,6 +87,124 @@ pub struct ClaudeLocalOtelEvidence {
     pub account_identity_checked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_identifier_hash: Option<String>,
+    /// Identity observed on this request, not a session creator or entitlement.
+    /// Legacy rows have no evaluation; absence never fills an organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_identity: Option<ClaudeRequestIdentityEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeRequestIdentityEvidence {
+    pub identity_hash_scheme: String,
+    pub account: ClaudeIdentityAttributeEvidence,
+    pub organization: ClaudeIdentityAttributeEvidence,
+    /// Complete means full, consistent UUID observations, not provider authority.
+    pub disposition: ClaudeIdentityDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeIdentityAttributeEvidence {
+    pub origin: ClaudeIdentityAttributeOrigin,
+    pub disposition: ClaudeIdentityDisposition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_record_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeIdentityAttributeOrigin {
+    Missing,
+    Resource,
+    LogRecord,
+    ResourceAndLogRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeIdentityDisposition {
+    Missing,
+    Invalid,
+    Conflict,
+    Complete,
+}
+
+impl ClaudeIdentityAttributeEvidence {
+    fn unambiguous_hash(&self) -> Option<String> {
+        (self.disposition == ClaudeIdentityDisposition::Complete)
+            .then(|| {
+                self.log_record_hash
+                    .clone()
+                    .or_else(|| self.resource_hash.clone())
+            })
+            .flatten()
+    }
+}
+
+fn request_identity_evidence(
+    resource_attrs: &BTreeMap<String, String>,
+    log_attrs: &BTreeMap<String, String>,
+) -> ClaudeRequestIdentityEvidence {
+    let account =
+        identity_attribute_evidence(resource_attrs, log_attrs, "user.account_uuid", "account");
+    let organization =
+        identity_attribute_evidence(resource_attrs, log_attrs, "organization.id", "organization");
+    use ClaudeIdentityDisposition::{Complete, Conflict, Invalid, Missing};
+    let disposition = if account.disposition == Conflict || organization.disposition == Conflict {
+        Conflict
+    } else if account.disposition == Invalid || organization.disposition == Invalid {
+        Invalid
+    } else if account.disposition == Complete && organization.disposition == Complete {
+        Complete
+    } else {
+        Missing
+    };
+    ClaudeRequestIdentityEvidence {
+        identity_hash_scheme: "provider-sha256:v1".to_string(),
+        account,
+        organization,
+        disposition,
+    }
+}
+
+fn identity_attribute_evidence(
+    resource_attrs: &BTreeMap<String, String>,
+    log_attrs: &BTreeMap<String, String>,
+    key: &str,
+    kind: &str,
+) -> ClaudeIdentityAttributeEvidence {
+    let resource = resource_attrs.get(key);
+    let record = log_attrs.get(key);
+    let hash = |raw: Option<&String>| {
+        raw.and_then(|raw| canonical_uuid(raw))
+            .and_then(|uuid| ottto_core::billing_identity_hash("anthropic", kind, &uuid))
+    };
+    let resource_hash = hash(resource);
+    let log_record_hash = hash(record);
+    let origin = match (resource.is_some(), record.is_some()) {
+        (false, false) => ClaudeIdentityAttributeOrigin::Missing,
+        (true, false) => ClaudeIdentityAttributeOrigin::Resource,
+        (false, true) => ClaudeIdentityAttributeOrigin::LogRecord,
+        (true, true) => ClaudeIdentityAttributeOrigin::ResourceAndLogRecord,
+    };
+    let disposition = if resource.is_none() && record.is_none() {
+        ClaudeIdentityDisposition::Missing
+    } else if resource.is_some() && resource_hash.is_none()
+        || record.is_some() && log_record_hash.is_none()
+    {
+        ClaudeIdentityDisposition::Invalid
+    } else if resource.is_some() && record.is_some() && resource_hash != log_record_hash {
+        ClaudeIdentityDisposition::Conflict
+    } else {
+        ClaudeIdentityDisposition::Complete
+    };
+    ClaudeIdentityAttributeEvidence {
+        origin,
+        disposition,
+        resource_hash,
+        log_record_hash,
+    }
 }
 
 /// Health diagnostics for a strict sidecar read. The legacy loader intentionally
@@ -203,9 +323,15 @@ fn api_evidence_from_json(body: &[u8]) -> Result<Vec<ClaudeLocalOtelEvidence>> {
                 if any_value(record.get("body")).as_deref() != Some("claude_code.api_request") {
                     continue;
                 }
+                let record_attrs = attributes_at(record.get("attributes"));
+                let identity = request_identity_evidence(
+                    &json_identity_attributes(resource_logs.pointer("/resource/attributes")),
+                    &json_identity_attributes(record.get("attributes")),
+                );
                 let mut attrs = resource_attrs.clone();
-                attrs.extend(attributes_at(record.get("attributes")));
-                if let Some(item) = api_evidence_from_attrs(&attrs, timestamp_at(record)) {
+                attrs.extend(record_attrs);
+                if let Some(item) = api_evidence_from_attrs(&attrs, timestamp_at(record), identity)
+                {
                     evidence.push(item);
                 }
             }
@@ -233,14 +359,25 @@ fn api_evidence_from_protobuf(body: &[u8]) -> Result<Vec<ClaudeLocalOtelEvidence
                 {
                     continue;
                 }
+                let record_attrs = proto_attributes(&record.attributes);
+                let identity = request_identity_evidence(
+                    &proto_identity_attributes(
+                        resource_logs
+                            .resource
+                            .as_ref()
+                            .map(|resource| resource.attributes.as_slice())
+                            .unwrap_or_default(),
+                    ),
+                    &proto_identity_attributes(&record.attributes),
+                );
                 let mut attrs = resource_attrs.clone();
-                attrs.extend(proto_attributes(&record.attributes));
+                attrs.extend(record_attrs);
                 let observed_at = format_nanos(i128::from(if record.time_unix_nano > 0 {
                     record.time_unix_nano
                 } else {
                     record.observed_time_unix_nano
                 }));
-                if let Some(item) = api_evidence_from_attrs(&attrs, observed_at) {
+                if let Some(item) = api_evidence_from_attrs(&attrs, observed_at, identity) {
                     evidence.push(item);
                 }
             }
@@ -389,6 +526,56 @@ fn trace_evidence_from_attrs(
     Some(item)
 }
 
+// Only the additive identity field may differ across a v2 upgrade replay.
+// Comparing the whole typed row protects every pre-existing usage/ownership field.
+fn identity_upgrade_replay(
+    previous: &ClaudeLocalOtelEvidence,
+    incoming: &ClaudeLocalOtelEvidence,
+) -> bool {
+    if previous.capture_revision != API_REQUEST_CAPTURE_REVISION
+        || incoming.capture_revision != API_REQUEST_CAPTURE_REVISION
+        || previous.request_identity.is_none() == incoming.request_identity.is_none()
+    {
+        return false;
+    }
+    let mut previous = previous.clone();
+    let mut incoming = incoming.clone();
+    previous.fingerprint.clear();
+    incoming.fingerprint.clear();
+    previous.request_identity = None;
+    incoming.request_identity = None;
+    previous == incoming
+}
+
+/// Append one distinct request row; report a same-request fingerprint conflict.
+/// A compatible upgrade replay keeps one usage row and the richer local witness.
+fn append_request_evidence(
+    rows: &mut Vec<ClaudeLocalOtelEvidence>,
+    seen_fingerprints: &mut BTreeSet<String>,
+    request_rows: &mut BTreeMap<String, usize>,
+    item: ClaudeLocalOtelEvidence,
+) -> bool {
+    if !seen_fingerprints.insert(item.fingerprint.clone()) {
+        return false;
+    }
+    let mut conflict = false;
+    if !item.request_id.is_empty() {
+        if let Some(index) = request_rows.get(&item.request_id).copied() {
+            if identity_upgrade_replay(&rows[index], &item) {
+                if item.request_identity.is_some() {
+                    rows[index] = item;
+                }
+                return false;
+            }
+            conflict = true;
+        } else {
+            request_rows.insert(item.request_id.clone(), rows.len());
+        }
+    }
+    rows.push(item);
+    conflict
+}
+
 pub fn load_claude_effort_evidence(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
@@ -404,16 +591,17 @@ pub fn load_claude_effort_evidence(
         }
         let file = File::open(&path).context("open Claude effort evidence")?;
         let mut seen = BTreeSet::new();
+        let mut request_rows = BTreeMap::new();
         let mut rows = Vec::new();
         for line in BufReader::new(file).lines() {
             let Ok(line) = line else { continue };
             let Ok(item) = serde_json::from_str::<ClaudeLocalOtelEvidence>(&line) else {
                 continue;
             };
-            if item.session_id != session_id || !seen.insert(item.fingerprint.clone()) {
+            if item.session_id != session_id {
                 continue;
             }
-            rows.push(item);
+            append_request_evidence(&mut rows, &mut seen, &mut request_rows, item);
         }
         if !rows.is_empty() {
             result.insert(session_id, rows);
@@ -458,7 +646,7 @@ pub fn load_claude_api_request_evidence_report(
             continue;
         };
         let mut seen_fingerprints = BTreeSet::new();
-        let mut request_fingerprints = BTreeMap::<String, String>::new();
+        let mut request_rows = BTreeMap::new();
         let mut rows = Vec::new();
         for line in BufReader::new(file).lines() {
             let line = match line {
@@ -481,18 +669,10 @@ pub fn load_claude_api_request_evidence_report(
             }
             if item.request_id.is_empty() {
                 report.health.missing_request_ids += 1;
-            } else if let Some(previous) =
-                request_fingerprints.insert(item.request_id.clone(), item.fingerprint.clone())
-            {
-                if previous != item.fingerprint {
-                    report
-                        .health
-                        .conflicting_request_ids
-                        .insert(item.request_id.clone());
-                }
             }
-            if seen_fingerprints.insert(item.fingerprint.clone()) {
-                rows.push(item);
+            let request_id = item.request_id.clone();
+            if append_request_evidence(&mut rows, &mut seen_fingerprints, &mut request_rows, item) {
+                report.health.conflicting_request_ids.insert(request_id);
             }
         }
         if !rows.is_empty() {
@@ -678,6 +858,7 @@ fn sidecar_fingerprint(path: PathBuf, namespace: &str) -> String {
 fn api_evidence_from_attrs(
     attrs: &BTreeMap<String, String>,
     observed_at: Option<String>,
+    request_identity: ClaudeRequestIdentityEvidence,
 ) -> Option<ClaudeLocalOtelEvidence> {
     let session_id = first_attr(attrs, &["session.id", "session_id"])?;
     let model = first_attr(attrs, &["model", "gen_ai.request.model"])?;
@@ -766,15 +947,42 @@ fn api_evidence_from_attrs(
         ),
         request_count: 1,
         account_identity_checked: true,
-        account_identifier_hash: first_attr(attrs, &["user.account_uuid"])
-            .and_then(canonical_uuid)
-            .and_then(|uuid| {
-                ottto_core::billing_identity_hash("anthropic", "account", uuid.as_str())
-            }),
+        account_identifier_hash: request_identity.account.unambiguous_hash(),
+        request_identity: Some(request_identity),
     };
     let bytes = serde_json::to_vec(&item).ok()?;
     item.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
     Some(item)
+}
+
+// Generic usage extraction may ignore opaque values. Identity must preserve
+// their presence as invalid, without storing their raw contents.
+fn identity_attributes<'a>(
+    items: impl Iterator<Item = (&'a str, Option<String>)>,
+) -> BTreeMap<String, String> {
+    items
+        .filter(|(key, _)| matches!(*key, "user.account_uuid" | "organization.id"))
+        .map(|(key, value)| (key.to_string(), value.unwrap_or_default()))
+        .collect()
+}
+
+fn json_identity_attributes(value: Option<&Value>) -> BTreeMap<String, String> {
+    identity_attributes(
+        value
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| Some((item.get("key")?.as_str()?, any_value(item.get("value"))))),
+    )
+}
+
+fn proto_identity_attributes(items: &[otlp_proto::KeyValue]) -> BTreeMap<String, String> {
+    identity_attributes(items.iter().map(|item| {
+        (
+            item.key.as_str(),
+            item.value.as_ref().and_then(proto_any_value),
+        )
+    }))
 }
 
 fn attributes_at(value: Option<&Value>) -> BTreeMap<String, String> {
@@ -857,7 +1065,7 @@ fn first_decimal_usd_micros(attrs: &BTreeMap<String, String>, keys: &[&str]) -> 
     whole.checked_add(fraction)
 }
 
-fn canonical_uuid(value: &str) -> Option<String> {
+pub(crate) fn canonical_uuid(value: &str) -> Option<String> {
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.len() != 36 {
         return None;
@@ -1124,6 +1332,529 @@ mod otlp_proto {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ACCOUNT: &str = "123e4567-e89b-12d3-a456-426614174000";
+    const ORGANIZATION: &str = "123e4567-e89b-12d3-a456-426614174001";
+    const OTHER_ORGANIZATION: &str = "123e4567-e89b-12d3-a456-426614174002";
+
+    fn identity_json(resource: &[(&str, &str)], record: &[(&str, &str)]) -> Vec<u8> {
+        let attributes = |values: &[(&str, &str)]| {
+            values
+                .iter()
+                .map(|(key, value)| serde_json::json!({"key":key,"value":{"stringValue":value}}))
+                .collect::<Vec<_>>()
+        };
+        let mut record_values = vec![
+            ("session.id", "identity-session"),
+            ("request_id", "identity-request"),
+            ("model", "claude-test"),
+            ("input_tokens", "12"),
+            ("output_tokens", "3"),
+        ];
+        record_values.extend_from_slice(record);
+        serde_json::to_vec(&serde_json::json!({"resourceLogs":[{
+            "resource":{"attributes":attributes(resource)},
+            "scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000",
+                "body":{"stringValue":"claude_code.api_request"},
+                "attributes":attributes(&record_values)}]}]}]}))
+        .unwrap()
+    }
+
+    #[test]
+    fn request_pair_malformed_json_identity_preserves_presence_both_origins() {
+        for key in ["user.account_uuid", "organization.id"] {
+            for malformed in [
+                serde_json::json!({"arrayValue":{"values":[]}}),
+                serde_json::json!({"kvlistValue":{"values":[]}}),
+                serde_json::json!({"bytesValue":"AA=="}),
+                serde_json::json!({}),
+                serde_json::Value::Null,
+            ] {
+                for resource_invalid in [false, true] {
+                    let mut payload: Value = serde_json::from_slice(&identity_json(
+                        &[
+                            ("user.account_uuid", ACCOUNT),
+                            ("organization.id", ORGANIZATION),
+                        ],
+                        &[
+                            ("user.account_uuid", ACCOUNT),
+                            ("organization.id", ORGANIZATION),
+                        ],
+                    ))
+                    .unwrap();
+                    let pointer = if resource_invalid {
+                        "/resourceLogs/0/resource/attributes"
+                    } else {
+                        "/resourceLogs/0/scopeLogs/0/logRecords/0/attributes"
+                    };
+                    let items = payload
+                        .pointer_mut(pointer)
+                        .unwrap()
+                        .as_array_mut()
+                        .unwrap();
+                    let item = items.iter_mut().find(|item| item["key"] == key).unwrap();
+                    item["value"] = malformed.clone();
+                    let row = api_evidence_from_json(&serde_json::to_vec(&payload).unwrap())
+                        .unwrap()
+                        .remove(0);
+                    let pair = row.request_identity.as_ref().unwrap();
+                    let attribute = if key == "user.account_uuid" {
+                        &pair.account
+                    } else {
+                        &pair.organization
+                    };
+                    assert_eq!(
+                        attribute.origin,
+                        ClaudeIdentityAttributeOrigin::ResourceAndLogRecord
+                    );
+                    assert_eq!(attribute.disposition, ClaudeIdentityDisposition::Invalid);
+                    assert_eq!(pair.disposition, ClaudeIdentityDisposition::Invalid);
+                    assert_eq!(row.input_tokens, 12);
+                    assert_eq!(row.output_tokens, 3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn request_pair_malformed_protobuf_identity_preserves_presence_both_origins() {
+        use otlp_proto::any_value::Value as ProtoValue;
+        for key in ["user.account_uuid", "organization.id"] {
+            for malformed in [
+                Some(ProtoValue::ArrayValue(otlp_proto::ArrayValue {
+                    values: vec![],
+                })),
+                Some(ProtoValue::KvlistValue(otlp_proto::KeyValueList {
+                    values: vec![],
+                })),
+                Some(ProtoValue::BytesValue(vec![0])),
+                None,
+            ] {
+                for resource_invalid in [false, true] {
+                    let valid = vec![
+                        proto_string("user.account_uuid", ACCOUNT),
+                        proto_string("organization.id", ORGANIZATION),
+                    ];
+                    let mut resource = valid.clone();
+                    let mut record = valid;
+                    let attrs = if resource_invalid {
+                        &mut resource
+                    } else {
+                        &mut record
+                    };
+                    attrs.iter_mut().find(|item| item.key == key).unwrap().value =
+                        Some(otlp_proto::AnyValue {
+                            value: malformed.clone(),
+                        });
+                    record.extend([
+                        proto_string("model", "claude-test"),
+                        proto_string("session.id", "identity-session"),
+                        proto_string("request_id", "identity-request"),
+                        proto_string("input_tokens", "12"),
+                        proto_string("output_tokens", "3"),
+                    ]);
+                    let payload = otlp_proto::ExportLogsServiceRequest {
+                        resource_logs: vec![otlp_proto::ResourceLogs {
+                            resource: Some(otlp_proto::Resource {
+                                attributes: resource,
+                            }),
+                            scope_logs: vec![otlp_proto::ScopeLogs {
+                                log_records: vec![otlp_proto::LogRecord {
+                                    time_unix_nano: 1783728000000000000,
+                                    observed_time_unix_nano: 0,
+                                    body: proto_string("body", "claude_code.api_request").value,
+                                    attributes: record,
+                                }],
+                            }],
+                        }],
+                    };
+                    let row = api_evidence_from_protobuf(&payload.encode_to_vec())
+                        .unwrap()
+                        .remove(0);
+                    assert_eq!(row.input_tokens, 12);
+                    assert_eq!(row.output_tokens, 3);
+                    let pair = row.request_identity.as_ref().unwrap();
+                    let attribute = if key == "user.account_uuid" {
+                        &pair.account
+                    } else {
+                        &pair.organization
+                    };
+                    assert_eq!(
+                        attribute.origin,
+                        ClaudeIdentityAttributeOrigin::ResourceAndLogRecord
+                    );
+                    assert_eq!(attribute.disposition, ClaudeIdentityDisposition::Invalid);
+                    assert_eq!(pair.disposition, ClaudeIdentityDisposition::Invalid);
+                }
+            }
+            // Missing AnyValue also means present invalid evidence.
+            let missing = otlp_proto::KeyValue {
+                key: key.to_string(),
+                value: None,
+            };
+            assert_eq!(proto_identity_attributes(&[missing])[key], "");
+        }
+    }
+
+    #[test]
+    fn request_pair_preserves_json_attribute_origins_and_counters() {
+        for (resource, record, expected_origin) in [
+            (
+                vec![],
+                vec![
+                    ("user.account_uuid", ACCOUNT),
+                    ("organization.id", ORGANIZATION),
+                ],
+                ClaudeIdentityAttributeOrigin::LogRecord,
+            ),
+            (
+                vec![
+                    ("user.account_uuid", ACCOUNT),
+                    ("organization.id", ORGANIZATION),
+                ],
+                vec![],
+                ClaudeIdentityAttributeOrigin::Resource,
+            ),
+            (
+                vec![
+                    ("user.account_uuid", ACCOUNT),
+                    ("organization.id", ORGANIZATION),
+                ],
+                vec![
+                    ("user.account_uuid", ACCOUNT),
+                    ("organization.id", ORGANIZATION),
+                ],
+                ClaudeIdentityAttributeOrigin::ResourceAndLogRecord,
+            ),
+        ] {
+            let row = api_evidence_from_json(&identity_json(&resource, &record))
+                .unwrap()
+                .remove(0);
+            let pair = row.request_identity.as_ref().unwrap();
+            assert_eq!(pair.disposition, ClaudeIdentityDisposition::Complete);
+            assert_eq!(pair.account.origin, expected_origin);
+            assert_eq!(pair.organization.origin, expected_origin);
+            assert_eq!(pair.identity_hash_scheme, "provider-sha256:v1");
+            assert_eq!(
+                pair.organization.unambiguous_hash(),
+                ottto_core::billing_identity_hash("anthropic", "organization", ORGANIZATION)
+            );
+            assert_eq!(
+                row.account_identifier_hash,
+                ottto_core::billing_identity_hash("anthropic", "account", ACCOUNT)
+            );
+            assert_eq!(
+                (row.input_tokens, row.output_tokens, row.request_count),
+                (12, 3, 1)
+            );
+            assert_eq!(row.observed_at, "2026-07-11T00:00:00Z");
+            let stored = serde_json::to_string(&row).unwrap();
+            assert!(!stored.contains(ACCOUNT));
+            assert!(!stored.contains(ORGANIZATION));
+        }
+    }
+
+    #[test]
+    fn request_pair_missing_and_malformed_org_do_not_change_account_evidence() {
+        for organization in [
+            None,
+            Some(""),
+            Some("short-org"),
+            Some("123e4567-e89b-12d3-a456-42661417400g"),
+        ] {
+            let mut record = vec![("user.account_uuid", ACCOUNT)];
+            if let Some(organization) = organization {
+                record.push(("organization.id", organization));
+            }
+            let row = api_evidence_from_json(&identity_json(&[], &record))
+                .unwrap()
+                .remove(0);
+            let pair = row.request_identity.as_ref().unwrap();
+            assert_eq!(
+                pair.disposition,
+                if organization.is_none() {
+                    ClaudeIdentityDisposition::Missing
+                } else {
+                    ClaudeIdentityDisposition::Invalid
+                }
+            );
+            assert!(pair.organization.unambiguous_hash().is_none());
+            assert!(pair.organization.resource_hash.is_none());
+            assert!(pair.organization.log_record_hash.is_none());
+            assert_eq!(
+                row.account_identifier_hash,
+                ottto_core::billing_identity_hash("anthropic", "account", ACCOUNT)
+            );
+            assert_eq!((row.input_tokens, row.output_tokens), (12, 3));
+        }
+    }
+
+    #[test]
+    fn request_pair_resource_record_conflict_keeps_both_safe_witnesses() {
+        for key in ["user.account_uuid", "organization.id"] {
+            let resource = [(key, OTHER_ORGANIZATION)];
+            let record = [
+                ("user.account_uuid", ACCOUNT),
+                ("organization.id", ORGANIZATION),
+            ];
+            let row = api_evidence_from_json(&identity_json(&resource, &record))
+                .unwrap()
+                .remove(0);
+            let pair = row.request_identity.as_ref().unwrap();
+            assert_eq!(pair.disposition, ClaudeIdentityDisposition::Conflict);
+            let attribute = if key == "user.account_uuid" {
+                &pair.account
+            } else {
+                &pair.organization
+            };
+            assert_eq!(
+                attribute.origin,
+                ClaudeIdentityAttributeOrigin::ResourceAndLogRecord
+            );
+            assert!(attribute.resource_hash.is_some() && attribute.log_record_hash.is_some());
+            assert_ne!(attribute.resource_hash, attribute.log_record_hash);
+            assert!(attribute.unambiguous_hash().is_none());
+            assert_eq!(
+                row.account_identifier_hash.is_none(),
+                key == "user.account_uuid"
+            );
+        }
+    }
+
+    #[test]
+    fn request_pair_protobuf_retains_resource_and_record_origins_and_conflict() {
+        for resource_org in [ORGANIZATION, OTHER_ORGANIZATION] {
+            let body = otlp_proto::ExportLogsServiceRequest {
+                resource_logs: vec![otlp_proto::ResourceLogs {
+                    resource: Some(otlp_proto::Resource {
+                        attributes: vec![
+                            proto_string("user.account_uuid", ACCOUNT),
+                            proto_string("organization.id", resource_org),
+                        ],
+                    }),
+                    scope_logs: vec![otlp_proto::ScopeLogs {
+                        log_records: vec![otlp_proto::LogRecord {
+                            time_unix_nano: 1_783_728_000_000_000_000,
+                            observed_time_unix_nano: 0,
+                            body: Some(otlp_proto::AnyValue {
+                                value: Some(otlp_proto::any_value::Value::StringValue(
+                                    "claude_code.api_request".into(),
+                                )),
+                            }),
+                            attributes: vec![
+                                proto_string("session.id", "identity-session"),
+                                proto_string("request_id", "identity-request"),
+                                proto_string("model", "claude-test"),
+                                proto_string("organization.id", ORGANIZATION),
+                                proto_string("input_tokens", "12"),
+                            ],
+                        }],
+                    }],
+                }],
+            }
+            .encode_to_vec();
+            let row = api_evidence_from_protobuf(&body).unwrap().remove(0);
+            let pair = row.request_identity.unwrap();
+            assert_eq!(pair.account.origin, ClaudeIdentityAttributeOrigin::Resource);
+            assert_eq!(
+                pair.organization.origin,
+                ClaudeIdentityAttributeOrigin::ResourceAndLogRecord
+            );
+            assert_eq!(
+                pair.disposition,
+                if resource_org == ORGANIZATION {
+                    ClaudeIdentityDisposition::Complete
+                } else {
+                    ClaudeIdentityDisposition::Conflict
+                }
+            );
+            assert_eq!(row.input_tokens, 12);
+        }
+    }
+
+    #[test]
+    fn request_pair_changes_sidecar_fingerprint_and_strict_request_conflict() {
+        let dir = std::env::temp_dir().join(format!("ottto-org-conflict-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for organization in [ORGANIZATION, ORGANIZATION, OTHER_ORGANIZATION] {
+            capture_claude_api_request_logs(
+                &dir,
+                &identity_json(
+                    &[],
+                    &[
+                        ("user.account_uuid", ACCOUNT),
+                        ("organization.id", organization),
+                    ],
+                ),
+                "application/json",
+            )
+            .unwrap();
+        }
+        let report =
+            load_claude_api_request_evidence_report(&dir, ["identity-session".to_string()]);
+        let rows = &report.evidence["identity-session"];
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].fingerprint, rows[1].fingerprint);
+        assert_ne!(
+            serde_json::to_vec(&rows[0]).unwrap(),
+            serde_json::to_vec(&rows[1]).unwrap()
+        );
+        assert_eq!(
+            report.health.conflicting_request_ids,
+            BTreeSet::from(["identity-request".to_string()])
+        );
+        assert!(!report.health.is_complete());
+        let bytes = fs::read_to_string(evidence_path(&dir, "identity-session")).unwrap();
+        for raw in [ACCOUNT, ORGANIZATION, OTHER_ORGANIZATION] {
+            assert!(!bytes.contains(raw));
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn request_pair_legacy_omission_is_neutral_and_byte_preserved() {
+        let row = api_evidence_from_json(&identity_json(&[], &[("user.account_uuid", ACCOUNT)]))
+            .unwrap()
+            .remove(0);
+        let mut legacy = serde_json::to_value(&row).unwrap();
+        legacy.as_object_mut().unwrap().remove("request_identity");
+        legacy["capture_revision"] = serde_json::json!("claude_api_request:v2");
+        let read: ClaudeLocalOtelEvidence = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(read.request_identity.is_none());
+        assert_eq!(serde_json::to_value(&read).unwrap(), legacy);
+        assert_eq!(read.account_identifier_hash, row.account_identifier_hash);
+        assert_eq!(read.fingerprint, row.fingerprint);
+    }
+
+    fn with_canonical_fingerprint(mut row: ClaudeLocalOtelEvidence) -> ClaudeLocalOtelEvidence {
+        row.fingerprint.clear();
+        row.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&row).unwrap())
+        );
+        row
+    }
+
+    fn write_identity_replays(dir: &Path, rows: &[ClaudeLocalOtelEvidence]) {
+        let path = evidence_path(dir, "identity-session");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn request_pair_v2_upgrade_replay_deduplicates_both_orders_without_usage_change() {
+        let dir = std::env::temp_dir().join(format!("ottto-org-upgrade-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let richer = api_evidence_from_json(&identity_json(
+            &[],
+            &[
+                ("user.account_uuid", ACCOUNT),
+                ("organization.id", ORGANIZATION),
+            ],
+        ))
+        .unwrap()
+        .remove(0);
+        let mut old = richer.clone();
+        old.request_identity = None;
+        let old = with_canonical_fingerprint(old);
+        assert_eq!(old.capture_revision, "claude_api_request:v2");
+        assert_ne!(old.fingerprint, richer.fingerprint);
+        assert!(!serde_json::to_string(&old)
+            .unwrap()
+            .contains("request_identity"));
+        for rows in [
+            vec![old.clone(), richer.clone()],
+            vec![richer.clone(), old.clone()],
+        ] {
+            write_identity_replays(&dir, &rows);
+            let report = load_claude_api_request_evidence_report(&dir, ["identity-session".into()]);
+            assert!(report.health.is_complete());
+            assert_eq!(report.evidence["identity-session"], vec![richer.clone()]);
+            let compatibility =
+                load_claude_effort_evidence(&dir, ["identity-session".into()]).unwrap();
+            assert_eq!(compatibility["identity-session"], vec![richer.clone()]);
+            assert_eq!(
+                compatibility["identity-session"]
+                    .iter()
+                    .map(|row| row.input_tokens)
+                    .sum::<u64>(),
+                12
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn request_pair_upgrade_neutrality_never_hides_known_identity_or_usage_conflicts() {
+        let dir =
+            std::env::temp_dir().join(format!("ottto-org-upgrade-conflict-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let richer = api_evidence_from_json(&identity_json(
+            &[],
+            &[
+                ("user.account_uuid", ACCOUNT),
+                ("organization.id", ORGANIZATION),
+            ],
+        ))
+        .unwrap()
+        .remove(0);
+        let mut old = richer.clone();
+        old.request_identity = None;
+        let old = with_canonical_fingerprint(old);
+        let different_org = api_evidence_from_json(&identity_json(
+            &[],
+            &[
+                ("user.account_uuid", ACCOUNT),
+                ("organization.id", OTHER_ORGANIZATION),
+            ],
+        ))
+        .unwrap()
+        .remove(0);
+        let different_origin = api_evidence_from_json(&identity_json(
+            &[
+                ("user.account_uuid", ACCOUNT),
+                ("organization.id", ORGANIZATION),
+            ],
+            &[],
+        ))
+        .unwrap()
+        .remove(0);
+        let account_conflict = api_evidence_from_json(&identity_json(
+            &[("user.account_uuid", OTHER_ORGANIZATION)],
+            &[
+                ("user.account_uuid", ACCOUNT),
+                ("organization.id", ORGANIZATION),
+            ],
+        ))
+        .unwrap()
+        .remove(0);
+        assert!(account_conflict.account_identifier_hash.is_none());
+        let mut changed_counter = richer.clone();
+        changed_counter.input_tokens += 1;
+        let changed_counter = with_canonical_fingerprint(changed_counter);
+        for rows in [
+            vec![old.clone(), richer.clone(), different_org],
+            vec![richer.clone(), old.clone(), different_origin],
+            vec![old.clone(), changed_counter],
+            vec![old, account_conflict],
+        ] {
+            write_identity_replays(&dir, &rows);
+            let report = load_claude_api_request_evidence_report(&dir, ["identity-session".into()]);
+            assert!(!report.health.is_complete());
+            assert_eq!(
+                report.health.conflicting_request_ids,
+                BTreeSet::from(["identity-request".into()])
+            );
+            assert_eq!(report.evidence["identity-session"].len(), 2);
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
 
     /// One OTLP export carrying a parent turn and a subagent turn, exactly as
     /// Claude Code emits them: same `session.id`, different `request_id`, and
