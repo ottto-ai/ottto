@@ -37220,6 +37220,7 @@ mod tests {
             json!({"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"high"}})
         );
         let mut suffix = String::new();
+        let mut lost_request = String::new();
         let mut reads = 0;
         for (index, read) in [90_000, 0, 90_000].into_iter().enumerate() {
             reads += read;
@@ -37234,11 +37235,14 @@ mod tests {
                 .collect::<String>();
             if index == 0 {
                 prefix.push_str(&text);
+            } else if index == 1 {
+                lost_request = rows[0].to_string();
+                suffix.push_str(&format!("{}\n", rows[1]));
             } else {
                 suffix.push_str(&text);
             }
         }
-        fs::write(&path, format!("{prefix}{suffix}")).unwrap();
+        fs::write(&path, format!("{prefix}{lost_request}\n{suffix}")).unwrap();
         let clean = parse_codex_test_with_ledgers(&path, BTreeMap::new());
         assert!(clean.complete());
         let mut prior_item = clean.snapshots[0].clone();
@@ -37250,7 +37254,9 @@ mod tests {
             file.write_all(prefix.as_bytes()).unwrap();
             match loss {
                 "oversized" => {
-                    file.write_all(b"{\"skipped_boundary\":\"").unwrap();
+                    file.write_all(lost_request.trim_end_matches('}').as_bytes())
+                        .unwrap();
+                    file.write_all(b",\"padding\":\"").unwrap();
                     file.seek(SeekFrom::Current((MAX_JSONL_LINE_BYTES + 1) as i64))
                         .unwrap();
                     file.write_all(b"\"}\n").unwrap();
@@ -37271,6 +37277,30 @@ mod tests {
             assert_eq!((item.input_tokens, item.output_tokens), (300_000, 3));
             assert_eq!(item.model_usage, clean.snapshots[0].model_usage);
             assert_eq!(item.usage_buckets, clean.snapshots[0].usage_buckets);
+            assert_eq!(
+                item.cache_requests.len(),
+                2,
+                "the skipped owned response is absent"
+            );
+            // Without the read-completeness fence, the unchanged detector calls
+            // these two surviving warm requests complete and retracts the
+            // previously accepted loss anchored on the missing cold request.
+            let mut unfenced = item.clone();
+            unfenced.cache_observations = cache_wire_for_requests(id, &item.cache_requests);
+            prepare_cache_observations(&mut unfenced, Some(&prior));
+            assert!(matches!(
+                unfenced
+                    .cache_observations
+                    .as_ref()
+                    .unwrap()
+                    .operations
+                    .as_slice(),
+                [cache_observations::Operation::Retract { .. }]
+            ));
+            assert_eq!(
+                unfenced.cache_observations_state.unwrap()["observations"],
+                json!([])
+            );
             assert!(
                 !item.cache_requests_complete,
                 "{loss}: skipped physical boundary is unknown"
