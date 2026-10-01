@@ -15045,6 +15045,19 @@ exit 1
                 .collect::<Vec<_>>(),
         )
         .expect("serialize backend snapshots");
+        // Raw provider account and organization ids are uploaded on purpose,
+        // but only in their own `account_id` / `organization_id` fields. Strip
+        // exactly those field values; the ids must not appear anywhere else.
+        let mut residual_json = backend_json.clone();
+        for slot in ["primary", "secondary", "tertiary"] {
+            residual_json = residual_json
+                .replace(&format!("\"account_id\":\"account-{slot}\""), "")
+                .replace(&format!("\"organization_id\":\"organization-{slot}\""), "");
+        }
+        assert!(
+            backend_json.contains("\"account_id\":\"account-secondary\""),
+            "raw provider account id must reach the backend"
+        );
         for forbidden in [
             root.to_string_lossy().as_ref(),
             "account-primary",
@@ -15056,7 +15069,7 @@ exit 1
             "fixture",
         ] {
             assert!(
-                !backend_json.contains(forbidden),
+                !residual_json.contains(forbidden),
                 "backend snapshots leaked forbidden local material"
             );
         }

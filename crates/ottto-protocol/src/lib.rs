@@ -1202,11 +1202,14 @@ pub struct AgentStatusSnapshot {
 impl AgentStatusSnapshot {
     pub fn redacted_for_backend(mut self) -> Self {
         if let Some(account) = self.account.as_mut() {
-            // Account labels stay on the machine. The backend receives only
-            // the existing domain-separated identity hashes.
+            // Emails and labels stay on the machine. The raw provider account
+            // id and the selected organization/workspace id are identifiers,
+            // not credentials, and are uploaded beside their domain-separated
+            // hashes so the backend can recompute the hashes from the original
+            // roles. Anything that is not a plain provider id is dropped.
             account.email = None;
-            account.account_id = None;
-            account.organization_id = None;
+            account.account_id = safe_provider_identifier(account.account_id.take());
+            account.organization_id = safe_provider_identifier(account.organization_id.take());
             account.organization_label = None;
             account.provider = safe_optional_text(account.provider.take());
             account.auth_method = safe_optional_text(account.auth_method.take());
@@ -4021,6 +4024,35 @@ fn safe_optional_text(value: Option<String>) -> Option<String> {
     value.filter(|text| is_safe_backend_text(text))
 }
 
+/// Longest raw provider account or organization/workspace id sent to the
+/// backend. The backend account schema caps these fields at 128 characters and
+/// rejects the whole snapshot above that, so a longer value is dropped here.
+const BACKEND_PROVIDER_IDENTIFIER_MAX_CHARS: usize = 128;
+
+/// Keep a raw provider account or organization/workspace id for the backend.
+///
+/// The documented producers emit UUIDs (Anthropic account and organization,
+/// ChatGPT workspace) or `user-...` ids (ChatGPT user), so only ASCII letters,
+/// digits and `-` are accepted. That excludes emails, paths, URLs, whitespace
+/// and every secret-shaped fragment by construction; the shared backend-text
+/// guard still runs as a second check. Anything else is dropped, never
+/// rewritten, so the backend can only see the exact value the hash was made
+/// from.
+fn safe_provider_identifier(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > BACKEND_PROVIDER_IDENTIFIER_MAX_CHARS
+        || !trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        || !is_safe_backend_text(trimmed)
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 fn is_safe_backend_text(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
     if normalized.trim().is_empty() {
@@ -4127,9 +4159,9 @@ fn redact_plan_observation_for_backend(
     observation.subscription_product = safe_optional_text(observation.subscription_product.take());
     observation.plan_type = safe_optional_text(observation.plan_type.take());
     observation.account_label = None;
-    observation.account_id = None;
+    observation.account_id = safe_provider_identifier(observation.account_id.take());
     observation.organization_label = None;
-    observation.organization_id = None;
+    observation.organization_id = safe_provider_identifier(observation.organization_id.take());
     observation.account_identifier_hash =
         safe_optional_text(observation.account_identifier_hash.take());
     observation.organization_identifier_hash =
@@ -4699,7 +4731,9 @@ mod tests {
     }
 
     #[test]
-    fn backend_status_body_contains_only_hashed_account_identity() {
+    fn backend_status_body_carries_raw_provider_ids_but_no_labels_or_email() {
+        let raw_account = "00000000-0000-4000-8000-0000000000a1";
+        let raw_organization = "00000000-0000-4000-8000-0000000000b2";
         let mut snapshot = w3_multi_anchor_snapshot(
             &"a".repeat(64),
             &"b".repeat(64),
@@ -4708,13 +4742,15 @@ mod tests {
         );
         let account = snapshot.account.as_mut().expect("account");
         account.email = Some("owner@example.test".to_string());
-        account.account_id = Some("raw-account-123".to_string());
+        account.account_id = Some(format!("  {raw_account}  "));
+        account.organization_id = Some(raw_organization.to_string());
+        account.organization_label = Some("Private Org Label".to_string());
         snapshot.plan_observations.push(
             serde_json::from_value(serde_json::json!({
                 "account_label": "owner@example.test",
-                "account_id": "raw-account-123",
-                "organization_label": "raw-account-123",
-                "organization_id": "raw-account-123",
+                "account_id": raw_account,
+                "organization_label": "Private Org Label",
+                "organization_id": raw_organization,
                 "account_identifier_hash": "a".repeat(64),
                 "confidence": "high"
             }))
@@ -4725,12 +4761,76 @@ mod tests {
         };
         let unsafe_body = body(snapshot.clone());
         assert!(unsafe_body.contains("owner@example.test"));
-        assert!(unsafe_body.contains("raw-account-123"));
+        assert!(unsafe_body.contains("Private Org Label"));
 
-        let safe_body = body(snapshot.redacted_for_backend());
+        let redacted = snapshot.redacted_for_backend();
+        let account = redacted.account.as_ref().expect("account");
+        assert_eq!(account.account_id.as_deref(), Some(raw_account));
+        assert_eq!(account.organization_id.as_deref(), Some(raw_organization));
+        assert_eq!(account.email, None);
+        assert_eq!(account.organization_label, None);
+        let observation = redacted.plan_observations.last().expect("observation");
+        assert_eq!(observation.account_id.as_deref(), Some(raw_account));
+        assert_eq!(
+            observation.organization_id.as_deref(),
+            Some(raw_organization)
+        );
+        assert_eq!(observation.account_label, None);
+        assert_eq!(observation.organization_label, None);
+
+        let safe_body = body(redacted);
         assert!(!safe_body.contains('@'));
-        assert!(!safe_body.contains("raw-account-123"));
+        assert!(!safe_body.contains("Private Org Label"));
+        assert!(safe_body.contains(raw_account));
+        assert!(safe_body.contains(raw_organization));
         assert!(safe_body.contains(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn backend_redaction_drops_raw_ids_that_are_not_plain_provider_ids() {
+        let unsafe_ids = [
+            "owner@example.test".to_string(),
+            "/Users/owner/.claude/account".to_string(),
+            "https://example.test/account".to_string(),
+            "Bearer abcdef".to_string(),
+            "sk-ant-synthetic".to_string(),
+            "otdev_synthetic".to_string(),
+            "google-oauth2|1234567890".to_string(),
+            "has space".to_string(),
+            "   ".to_string(),
+            "a".repeat(BACKEND_PROVIDER_IDENTIFIER_MAX_CHARS + 1),
+        ];
+        for unsafe_id in unsafe_ids {
+            let mut snapshot = w3_multi_anchor_snapshot(
+                &"a".repeat(64),
+                &"b".repeat(64),
+                ClaudeAccountAnchorDurabilityV1::Anchored,
+                Some(ClaudeAccountAnchorHealthV1::Healthy),
+            );
+            let account = snapshot.account.as_mut().expect("account");
+            account.account_id = Some(unsafe_id.clone());
+            account.organization_id = Some(unsafe_id.clone());
+            snapshot.plan_observations.push(
+                serde_json::from_value(serde_json::json!({
+                    "account_id": unsafe_id,
+                    "organization_id": unsafe_id,
+                    "confidence": "high"
+                }))
+                .expect("observation"),
+            );
+            let redacted = snapshot.redacted_for_backend();
+            let account = redacted.account.as_ref().expect("account");
+            assert_eq!(account.account_id, None, "{unsafe_id}");
+            assert_eq!(account.organization_id, None, "{unsafe_id}");
+            let observation = redacted.plan_observations.last().expect("observation");
+            assert_eq!(observation.account_id, None, "{unsafe_id}");
+            assert_eq!(observation.organization_id, None, "{unsafe_id}");
+        }
+        let longest = "a".repeat(BACKEND_PROVIDER_IDENTIFIER_MAX_CHARS);
+        assert_eq!(
+            safe_provider_identifier(Some(longest.clone())).as_deref(),
+            Some(longest.as_str())
+        );
     }
 
     #[derive(Debug, serde::Serialize)]
@@ -5715,8 +5815,8 @@ mod tests {
                 provider: Some("openai".to_string()),
                 auth_method: Some("oauth".to_string()),
                 email: Some("ron@example.com".to_string()),
-                account_id: Some("acct_private".to_string()),
-                organization_id: Some("org_private".to_string()),
+                account_id: Some("user-SyntheticUser01".to_string()),
+                organization_id: Some("00000000-0000-4000-8000-00000000a001".to_string()),
                 organization_label: Some("Private Org".to_string()),
                 plan_type: Some("individual".to_string()),
                 subscription_product: Some("ChatGPT Pro".to_string()),
@@ -5795,9 +5895,9 @@ mod tests {
                 subscription_product: Some("ChatGPT Pro".to_string()),
                 plan_type: Some("individual".to_string()),
                 account_label: Some("ron@example.com".to_string()),
-                account_id: Some("acct_private".to_string()),
+                account_id: Some("user-SyntheticUser01".to_string()),
                 organization_label: Some("Private Org".to_string()),
-                organization_id: Some("org_private".to_string()),
+                organization_id: Some("00000000-0000-4000-8000-00000000a001".to_string()),
                 account_identifier_hash: Some("abc123hash".to_string()),
                 organization_identifier_hash: Some("def456hash".to_string()),
                 superseded_account_identifier_hash: None,
@@ -5837,8 +5937,13 @@ mod tests {
         assert_eq!(account.auth_method.as_deref(), Some("oauth"));
         assert_eq!(account.subscription_product.as_deref(), Some("ChatGPT Pro"));
         assert_eq!(account.email, None);
-        assert_eq!(account.account_id, None);
-        assert_eq!(account.organization_id, None);
+        // Raw provider ids are identifiers, not credentials: they survive so
+        // the backend can recompute the hashes; labels and email do not.
+        assert_eq!(account.account_id.as_deref(), Some("user-SyntheticUser01"));
+        assert_eq!(
+            account.organization_id.as_deref(),
+            Some("00000000-0000-4000-8000-00000000a001")
+        );
         assert_eq!(account.organization_label, None);
         assert_eq!(
             account.account_identifier_hash.as_deref(),
@@ -5864,6 +5969,14 @@ mod tests {
         );
         assert_eq!(snapshot.plan_observations[0].account_label, None);
         assert_eq!(snapshot.plan_observations[0].organization_label, None);
+        assert_eq!(
+            snapshot.plan_observations[0].account_id.as_deref(),
+            Some("user-SyntheticUser01")
+        );
+        assert_eq!(
+            snapshot.plan_observations[0].organization_id.as_deref(),
+            Some("00000000-0000-4000-8000-00000000a001")
+        );
         assert_eq!(
             snapshot.plan_observations[0]
                 .account_identifier_hash

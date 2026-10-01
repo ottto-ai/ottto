@@ -817,10 +817,12 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   identifiers, machine identifiers, raw prompts, and command output), redacted
   fields, and intentionally preserved fields.
 - setup scan publication uses protocol-owned agent-status redaction: safe
-  provider, auth, plan, billing, account email, confidence, and model-route
-  metadata is kept, while raw account/org ids and labels, path-like diagnostics,
-  and secret-shaped values are nulled before leaving the machine. Provider
-  account hashes remain the stable grouping key when an email is unavailable.
+  provider, auth, plan, billing, confidence, and model-route metadata is kept,
+  together with the raw provider account id and selected organization/workspace
+  id (plain ids only) beside their hashes. Account emails, account and
+  organization labels, path-like diagnostics, and secret-shaped values are
+  nulled before leaving the machine. Provider account hashes remain the stable
+  grouping key.
 - bounded local command execution resolves agent CLIs from launchd-safe macOS
   candidate paths including `~/.local/bin`, Homebrew, `/usr/local/bin`, and
   system directories in addition to the inherited `PATH`; daemon-launched
