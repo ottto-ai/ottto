@@ -37086,8 +37086,10 @@ mod tests {
         let creator_case = |exclusive: bool, with_curve: bool| {
             // Exercise the actual original-session parser and its model/hourly
             // usage fold rather than a metadata-only item with positive totals.
-            let mut item =
-                codex_creator_item(&[header.clone()], header["payload"]["id"].as_str().unwrap());
+            let mut item = codex_creator_item(
+                std::slice::from_ref(&header),
+                header["payload"]["id"].as_str().unwrap(),
+            );
             item.cache_observations = None;
             item.cache_observations_state = None;
             if !exclusive {
@@ -37156,10 +37158,10 @@ mod tests {
             );
             json!({
                 "wire": wire,
-                "internal_version": snapshot_upload_body_witness_version(&item),
+                "internal_version": snapshot_upload_body_witness_version(item),
                 "released_ack_version": if exclusive { 8 } else { 7 },
-                "digest": snapshot_upload_body_witness(&item),
-                "body_projection": snapshot_upload_body_witness_payload(&item),
+                "digest": snapshot_upload_body_witness(item),
+                "body_projection": snapshot_upload_body_witness_payload(item),
             })
         };
         let fixture = json!({
@@ -43903,7 +43905,10 @@ mod tests {
     #[test]
     fn codex_creator_header_uses_proved_provider_namespace_without_billing_changes() {
         let header = codex_creator_header();
-        let item = codex_creator_item(&[header.clone()], header["payload"]["id"].as_str().unwrap());
+        let item = codex_creator_item(
+            std::slice::from_ref(&header),
+            header["payload"]["id"].as_str().unwrap(),
+        );
         let evidence = item
             .session_account_evidence
             .as_ref()
@@ -43970,7 +43975,10 @@ mod tests {
     fn codex_creator_header_copied_parent_and_conflicts_fail_closed() {
         let header = codex_creator_header();
         let id = header["payload"]["id"].as_str().unwrap();
-        let copied = codex_creator_item(&[header.clone()], "019e253c-2222-7000-9000-bbbbbbbbbbbb");
+        let copied = codex_creator_item(
+            std::slice::from_ref(&header),
+            "019e253c-2222-7000-9000-bbbbbbbbbbbb",
+        );
         assert!(copied.session_account_evidence.is_none());
         let mut conflict = header.clone();
         conflict["payload"]["creator_account_id"] = json!("synthetic-other-workspace");
@@ -44096,7 +44104,7 @@ mod tests {
         assert_eq!(run(Some(changed)).0, 1);
         assert_eq!(run(None).0, 1, "clearing evidence is delivered");
         assert_eq!(run(None), (0, 1));
-        let mut item = codex_creator_item(&[header.clone()], id);
+        let mut item = codex_creator_item(std::slice::from_ref(&header), id);
         item.model_usage[0].auth_mode = Some("oauth".into());
         let key = sha256_hex(&["session_owner:v1", "machine", id]);
         let owner = SessionAccountBinding {
@@ -44123,7 +44131,7 @@ mod tests {
         let mut request = valid_v6_batch_request();
         request.source = "codex".into();
         request.snapshots = vec![codex_creator_item(
-            &[header.clone()],
+            std::slice::from_ref(&header),
             header["payload"]["id"].as_str().unwrap(),
         )];
         request.snapshots[0].cache_observations = None;
