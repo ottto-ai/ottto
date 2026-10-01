@@ -2593,6 +2593,24 @@ pub fn finalize_scan_after_policy(
     result: &mut SourceScanResult,
     index: &mut ScanIndex,
 ) {
+    finalize_scan_after_policy_with_body_witness(
+        source,
+        result,
+        index,
+        snapshot_upload_body_witness,
+    );
+}
+
+/// Finalize using the additive body witness of the effective upload projection.
+/// The witness function sees recomputed semantic fingerprints and must return
+/// a stable witness for both file no-op suppression and quarantine retries.
+/// It does not modify the local snapshot items or semantic entity identity.
+pub fn finalize_scan_after_policy_with_body_witness(
+    source: SnapshotSource,
+    result: &mut SourceScanResult,
+    index: &mut ScanIndex,
+    body_witness: impl Fn(&SnapshotItem) -> String,
+) {
     for snapshot in &mut result.snapshots {
         snapshot.snapshot_fingerprint = snapshot_fingerprint(source, snapshot);
         index.snapshot_activity_at.insert(
@@ -2612,7 +2630,7 @@ pub fn finalize_scan_after_policy(
             by_source_file_body_witness
                 .entry(source_file_fingerprint.clone())
                 .or_default()
-                .insert(snapshot_upload_body_witness(snapshot));
+                .insert(body_witness(snapshot));
         }
     }
 
@@ -2649,7 +2667,7 @@ pub fn finalize_scan_after_policy(
                 == Some(pending.source_file_fingerprint.as_str())
                 && index.quarantine_requires_retry_body(
                     &snapshot.snapshot_fingerprint,
-                    &snapshot_upload_body_witness(snapshot),
+                    &body_witness(snapshot),
                 )
         });
         if let Some(entry) = index.files.get_mut(&pending.index_key) {
@@ -37723,6 +37741,170 @@ mod tests {
         if let Ok(output) = std::env::var("OTTTO_PAIRED_CREATOR_CACHE_CORPUS_OUT") {
             fs::write(output, serde_json::to_vec_pretty(&corpus).unwrap()).unwrap();
         }
+    }
+
+    fn body_witness_finalizer_scan(
+        root: &Path,
+        index: &mut ScanIndex,
+        revision: usize,
+    ) -> SourceScanResult {
+        let base = "{\"timestamp\":\"2026-08-20T12:00:01Z\",\"sessionId\":\"curve-session\",\"requestId\":\"req_curve_1\",\"message\":{\"id\":\"msg_curve_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"output_tokens\":5}}}\n";
+        fs::write(
+            root.join("curve-session.jsonl"),
+            format!("{base}{}", "{}\n".repeat(revision)),
+        )
+        .expect("write forced-parse fixture");
+        let mut result = scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            &[root.to_path_buf()],
+            index,
+            "2026-08-20T12:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("scan forced-parse fixture");
+        assert_eq!(result.snapshots.len(), 1);
+        result.snapshots[0].context_curve = Some(unavailable_context_curve(
+            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+            "claude_owned_request_start_proof:v1",
+            "ownership_unresolved",
+            0,
+            0,
+        ));
+        result
+    }
+
+    fn curve_omitted_body_witness(item: &SnapshotItem) -> String {
+        assert_eq!(
+            item.snapshot_fingerprint,
+            snapshot_fingerprint(SnapshotSource::ClaudeCode, item),
+            "effective witness runs after semantic fingerprint recomputation"
+        );
+        let mut effective = item.clone();
+        effective.context_curve = None;
+        snapshot_upload_body_witness(&effective)
+    }
+
+    #[test]
+    fn body_witness_finalizer_default_wrapper_preserves_bytes_and_noops() {
+        let root = temp_dir("body-witness-finalizer-default");
+        let mut index = ScanIndex::default();
+        for (revision, expected_count) in [(1, 1), (2, 0)] {
+            let mut wrapped = body_witness_finalizer_scan(&root, &mut index, revision);
+            let mut explicit = wrapped.clone();
+            let mut explicit_index = index.clone();
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut wrapped, &mut index);
+            finalize_scan_after_policy_with_body_witness(
+                SnapshotSource::ClaudeCode,
+                &mut explicit,
+                &mut explicit_index,
+                snapshot_upload_body_witness,
+            );
+            assert_eq!(wrapped.snapshots.len(), expected_count);
+            assert_eq!(wrapped.semantic_noop_count, 1 - expected_count);
+            assert_eq!(format!("{wrapped:?}"), format!("{explicit:?}"));
+            assert_eq!(
+                serde_json::to_vec(&wrapped.snapshots).unwrap(),
+                serde_json::to_vec(&explicit.snapshots).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_vec(&index).unwrap(),
+                serde_json::to_vec(&explicit_index).unwrap()
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn body_witness_finalizer_effective_projection_changes_only_delivery() {
+        let root = temp_dir("body-witness-finalizer-effective");
+        let mut index = ScanIndex::default();
+        let mut first = body_witness_finalizer_scan(&root, &mut index, 1);
+        let mut raw = first.snapshots[0].clone();
+        raw.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &raw);
+        let raw_bytes = serde_json::to_vec(&raw).unwrap();
+        first.snapshots[0].snapshot_fingerprint = "provisional".into();
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::ClaudeCode,
+            &mut first,
+            &mut index,
+            curve_omitted_body_witness,
+        );
+        assert_eq!(serde_json::to_vec(&first.snapshots[0]).unwrap(), raw_bytes);
+        let semantic_state = index.file_snapshot_fingerprints.clone();
+        let activity_state = index.snapshot_activity_at.clone();
+        for (revision, omitted, expected_count) in [(2, true, 0), (3, false, 1), (4, false, 0)] {
+            let mut scan = body_witness_finalizer_scan(&root, &mut index, revision);
+            let mut local_item = scan.snapshots[0].clone();
+            local_item.snapshot_fingerprint =
+                snapshot_fingerprint(SnapshotSource::ClaudeCode, &local_item);
+            let local_bytes = serde_json::to_vec(&local_item).unwrap();
+            scan.snapshots[0].snapshot_fingerprint = "provisional".into();
+            finalize_scan_after_policy_with_body_witness(
+                SnapshotSource::ClaudeCode,
+                &mut scan,
+                &mut index,
+                |item| {
+                    if omitted {
+                        curve_omitted_body_witness(item)
+                    } else {
+                        assert_eq!(item.snapshot_fingerprint, raw.snapshot_fingerprint);
+                        snapshot_upload_body_witness(item)
+                    }
+                },
+            );
+            assert_eq!(scan.snapshots.len(), expected_count);
+            assert_eq!(scan.semantic_noop_count, 1 - expected_count);
+            assert_eq!(index.file_snapshot_fingerprints, semantic_state);
+            assert_eq!(index.snapshot_activity_at, activity_state);
+            if expected_count == 1 {
+                assert_eq!(serde_json::to_vec(&scan.snapshots[0]).unwrap(), local_bytes);
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn body_witness_finalizer_quarantine_uses_effective_projection() {
+        let root = temp_dir("body-witness-finalizer-quarantine");
+        let mut index = ScanIndex::default();
+        let mut first = body_witness_finalizer_scan(&root, &mut index, 1);
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::ClaudeCode,
+            &mut first,
+            &mut index,
+            curve_omitted_body_witness,
+        );
+        let item = &first.snapshots[0];
+        let raw_witness = snapshot_upload_body_witness(item);
+        let effective_witness = curve_omitted_body_witness(item);
+        assert_ne!(raw_witness, effective_witness);
+        let scan = body_witness_finalizer_scan(&root, &mut index, 2);
+        for (witness, expected_count) in [(effective_witness, 0), (raw_witness, 1)] {
+            let mut retry_index = index.clone();
+            let mut retry = scan.clone();
+            let mut record = snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+            record.upload_body_witness = Some(witness);
+            retry_index
+                .quarantined_snapshot_fingerprints
+                .insert(item.snapshot_fingerprint.clone(), record);
+            retry.snapshots[0].snapshot_fingerprint = "provisional".into();
+            let calls = std::cell::Cell::new(0);
+            finalize_scan_after_policy_with_body_witness(
+                SnapshotSource::ClaudeCode,
+                &mut retry,
+                &mut retry_index,
+                |item| {
+                    calls.set(calls.get() + 1);
+                    curve_omitted_body_witness(item)
+                },
+            );
+            assert_eq!(calls.get(), 2, "file fold and quarantine share the witness");
+            assert_eq!(retry.snapshots.len(), expected_count);
+            assert_eq!(retry.semantic_noop_count, 1 - expected_count);
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

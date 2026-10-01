@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 408,
-  "content_sha256": "51da6a9ed025ae00f05c7c6f653d0699bbf1228121b9785d1af5385c2c623d28",
+  "candidate_file_count": 409,
+  "content_sha256": "023fa3cd54ea2769e3712ef24decd26ab73880ef221db2ea0cb3a4775b3e217c",
   "files": [
     {
       "executable": false,
@@ -902,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "b013e03f60d108edfd536b382e9ce3f0a80e02b49462a406e71824ed67a889ec",
-      "size_bytes": 2001701
+      "sha256": "acb847481bf56c0797014ae8294764e6b16aeab82ee790c3970a44e69a2d4a29",
+      "size_bytes": 2009731
     },
     {
       "executable": false,
@@ -1807,6 +1807,13 @@
       "path": "docs/session-2026-10-01-claude-valid-access-continuity.md",
       "sha256": "816d6011b871edf6f70f9de6aa8af02dd9bbaf2fd662f5b39094fd8ac07cf75f",
       "size_bytes": 1832
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-02-effective-wire-finalizer-api.md",
+      "sha256": "4d196e0e0137f9278d80353a33516b5a9ef9aced43a5f4b333a5f40ef137f8db",
+      "size_bytes": 1337
     },
     {
       "executable": false,
@@ -2859,9 +2866,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-01T19:39:48+00:00",
+  "generated_at": "2026-10-01T21:12:27+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 409,
+  "output_file_count": 410,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
