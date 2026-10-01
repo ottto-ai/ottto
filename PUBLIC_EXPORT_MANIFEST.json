@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 405,
-  "content_sha256": "73a14a21f33991554f78a58de6d83e600247429f719ab5863872cdbcf78db23b",
+  "content_sha256": "78caa9c35d6461b858ca4199805fe7f6f44c61ad5063c928d95c65f7290bb013",
   "files": [
     {
       "executable": false,
@@ -881,15 +881,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "6a79798d37df9aeb662546b919925bf19266bc644219acf795eb35d574d9e53f",
-      "size_bytes": 160197
+      "sha256": "b324680dadc25cb44ea7f9c69bc90af5428f11f5e1032f9a37f54313f0812263",
+      "size_bytes": 160479
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "a18274e989f65e0ddfbe09202f0b9e51d54a957e030117508a82a04381dbc078",
-      "size_bytes": 498434
+      "sha256": "2736df5c34c037196c6f59d43fd4910762d3f15c3516d2e32c7ec8a30b210f2f",
+      "size_bytes": 513756
     },
     {
       "executable": false,
@@ -902,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "7ea91aa0c092dd650907d3249df91f3154d83aeef958ba85f23164a8f3c940b6",
-      "size_bytes": 1978916
+      "sha256": "f694b206063f41129ccd8cf05e70c1adcd875d2d211030e5de63b29fca9cc6f5",
+      "size_bytes": 1984315
     },
     {
       "executable": false,
@@ -2225,8 +2225,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/body-witness-ack-normalization-v1.json",
-      "sha256": "f051231a54aa25051b4034c0271039259e99436ea687d2877c509d8592700156",
-      "size_bytes": 16182
+      "sha256": "5f2fc88252aa89452613dc5d1afc5f45cb07bb9c1b574811517cee02715feaf2",
+      "size_bytes": 16246
     },
     {
       "executable": false,

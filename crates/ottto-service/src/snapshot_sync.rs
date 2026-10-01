@@ -405,7 +405,11 @@ impl SnapshotUploadProgress {
         self.active_quarantine_retries.remove(fingerprint);
     }
 
-    fn record_cache_state<T: Serialize>(&mut self, item: &T) -> Result<()> {
+    fn record_cache_state<T: Serialize>(
+        &mut self,
+        item: &T,
+        head_changed_without_proof: bool,
+    ) -> Result<()> {
         let value = serde_json::to_value(item)?;
         let Some(session) = value
             .get("source_session_id")
@@ -413,11 +417,17 @@ impl SnapshotUploadProgress {
         else {
             return Ok(());
         };
+        let key = cache_session_key(session);
+        // Count-only legacy ACKs cannot distinguish changed from unchanged.
+        // Recover authority through the same bootstrap rather than retaining
+        // a token whose continued validity the response cannot certify.
+        if head_changed_without_proof {
+            self.accepted_cache_heads.remove(&key);
+        }
         let Some(patch) = value.get("cache_observations") else {
             return Ok(());
         };
         let patch = serde_json::from_value(patch.clone())?;
-        let key = cache_session_key(session);
         let state =
             crate::snapshots::cache_state_from_patch(self.accepted_cache_states.get(&key), &patch);
         self.accepted_cache_states.insert(key, state);
@@ -3899,6 +3909,17 @@ where
                     }));
                 }
                 if entity_ack {
+                    // An ordinary changed write may omit CAS/head proof while
+                    // cache is disabled. Its old predecessor no longer grants
+                    // authority; the existing bootstrap must recover it later.
+                    // An unchanged ACK leaves the saved head valid.
+                    for entity in &response.accepted_entities {
+                        if entity.head_etag.is_none() {
+                            progress
+                                .accepted_cache_heads
+                                .remove(&cache_session_key(&entity.source_session_id));
+                        }
+                    }
                     for entity in response
                         .accepted_entities
                         .iter()
@@ -3921,7 +3942,7 @@ where
                         let item_fingerprint = fingerprint(item);
                         if settled.contains(item_fingerprint) {
                             progress.record_body(item_fingerprint, &body_witness(item));
-                            progress.record_cache_state(item)?;
+                            progress.record_cache_state(item, false)?;
                         }
                     }
                     let rejected = response
@@ -3963,7 +3984,7 @@ where
                     for index in &indices {
                         let item = &items[*index];
                         progress.record_body(fingerprint(item), &body_witness(item));
-                        progress.record_cache_state(item)?;
+                        progress.record_cache_state(item, true)?;
                     }
                 }
                 // The remote write happened first. If this local atomic save
@@ -5265,6 +5286,290 @@ mod tests {
         .is_err());
         assert_eq!(attempts, [true]);
         assert!(progress.accepted_cache_heads.is_empty());
+    }
+
+    #[test]
+    fn cache_capability_toggle_headless_settlement_recovers_current_predecessor() {
+        for outcome in ["accepted", "unchanged", "legacy"] {
+            let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+            item.context_curve = None;
+            item.cache_observations = None;
+            item.cache_observations_state = None;
+            let key = cache_session_key(&item.source_session_id);
+            let mut progress = test_upload_progress();
+            progress
+                .accepted_cache_heads
+                .insert(key.clone(), "1".repeat(64));
+            let state = serde_json::json!({"schema_version":1,"observations":[],"coverage":"complete","omitted_observation_count":null});
+            progress
+                .accepted_cache_states
+                .insert(key.clone(), state.clone());
+            let request = SnapshotBatchRequest {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                source: "codex".into(),
+                machine_id: "a".repeat(64),
+                collector_version: Some(collector_version()),
+                snapshots: vec![item.clone()],
+                upload_policy: SnapshotUploadPolicy::default(),
+                client_report: crate::client_report::ClientReport::empty(),
+            };
+            let mut response = accepted_batch(1);
+            if outcome != "legacy" {
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                let reference = crate::snapshot_client::SnapshotEntityRef {
+                    source_session_id: item.source_session_id.clone(),
+                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                    occurrence_count: 1,
+                    body_witness_version: None,
+                    body_witness_digest: None,
+                    head_etag: None,
+                    head_challenge: None,
+                };
+                if outcome == "accepted" {
+                    response.accepted_entities.push(reference);
+                } else {
+                    response.unchanged_entities.push(reference);
+                }
+            }
+            response.validate_entity_ack(&request).unwrap();
+            let mut accepted = 0;
+            upload_resumable_batches_with_body_witness(
+                &[item.clone()],
+                &unique_poison_scope(),
+                &mut progress,
+                &mut accepted,
+                |item| item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |_| Ok(response.clone()),
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(
+                progress.accepted_cache_states[&key], state,
+                "disabled cache retains numeric evidence"
+            );
+            if outcome == "unchanged" {
+                assert_eq!(progress.accepted_cache_heads[&key], "1".repeat(64));
+                continue;
+            }
+            assert!(
+                !progress.accepted_cache_heads.contains_key(&key),
+                "{outcome}: head-changing ACK has no predecessor proof"
+            );
+            let mut stages = Vec::new();
+            bootstrap_cache_heads(
+                &[item.clone()],
+                &unique_poison_scope(),
+                &mut progress,
+                true,
+                |items, enforce| {
+                    stages.push(enforce);
+                    assert!(enforce, "ordinary exact bytes were already acknowledged");
+                    let mut response = accepted_batch(1);
+                    response.entity_ack_contract =
+                        Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                    response
+                        .unchanged_entities
+                        .push(crate::snapshot_client::SnapshotEntityRef {
+                            source_session_id: item.source_session_id.clone(),
+                            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                            occurrence_count: 1,
+                            body_witness_version: None,
+                            body_witness_digest: None,
+                            head_etag: Some("2".repeat(64)),
+                            head_challenge: None,
+                        });
+                    let mut request = request.clone();
+                    request.snapshots = items;
+                    response.validate_entity_ack_with_head_cas(&request, enforce)?;
+                    Ok(response)
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(stages, [true]);
+            item.cache_base_head_etag = progress.accepted_cache_heads.get(&key).cloned();
+            assert_eq!(
+                item.cache_base_head_etag,
+                Some("2".repeat(64)),
+                "re-enable uses refreshed head"
+            );
+        }
+    }
+
+    #[test]
+    fn combined_revision_wire_uses_same_scan_index_and_ack_predecessor() {
+        use serde_json::json;
+        let root =
+            std::env::temp_dir().join(format!("ottto-combined-revision-{}", unique_poison_scope()));
+        std::fs::create_dir_all(&root).unwrap();
+        let id = "019e253c-3333-7000-9000-cccccccccccc";
+        let path = root.join(format!("rollout-2026-09-30T10-00-00-{id}.jsonl"));
+        let header = json!({"type":"session_meta","ordinal":0,"timestamp":"2026-09-30T10:00:00Z",
+            "payload":{"id":id,"session_id":id,"source":"cli","timestamp":"2026-09-30T10:00:00Z",
+                "creator_user_id":"synthetic-user","creator_account_id":"synthetic-workspace"}});
+        let mut records = vec![
+            header,
+            json!({"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"high"}}),
+        ];
+        let mut reads = 0;
+        let mut index = ScanIndex::default();
+        let mut progress = test_upload_progress();
+        let progress_path = root.join("progress.json");
+        let key = cache_session_key(id);
+        let mut cases = Vec::new();
+        let mut first_wire = serde_json::Value::Null;
+        let mut first_state = serde_json::Value::Null;
+        for (step, count) in [(0, 3), (1, 4)] {
+            let start = if step == 0 { 0 } else { 3 };
+            for request in start..count {
+                let read = if request % 2 == 0 { 90_000 } else { 0 };
+                reads += read;
+                let timestamp = format!("2026-09-30T10:00:0{request}Z");
+                records.push(json!({"type":"token_usage_record","timestamp":timestamp,"payload":{"response_id":format!("resp_revision_{request}"),"usage":{"input_tokens":100_000,"cached_input_tokens":read,"cache_write_input_tokens":0,"output_tokens":1}}}));
+                records.push(json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100_000*(request+1),"cached_input_tokens":reads,"output_tokens":request+1},"last_token_usage":{"input_tokens":100_000,"cached_input_tokens":read,"output_tokens":1}}}}));
+            }
+            std::fs::write(
+                &path,
+                records
+                    .iter()
+                    .map(|row| format!("{row}\n"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-09-30T10:05:00Z",
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap();
+            assert_eq!(scan.snapshots.len(), 1);
+            assert!(scan.census_complete);
+            apply_upload_policy(
+                SnapshotSource::Codex,
+                &mut scan.snapshots,
+                SnapshotUploadPolicy::default(),
+            );
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+            let mut item = scan.snapshots.remove(0);
+            assert!(item.session_account_evidence.is_some());
+            assert_eq!(
+                (item.input_tokens, item.output_tokens),
+                (100_000 * count, count)
+            );
+            // Identical to sync_source: predecessor and completed numeric state
+            // are read from the acknowledged destination-scoped ledger.
+            item.cache_base_head_etag = progress.accepted_cache_heads.get(&key).cloned();
+            crate::snapshots::prepare_cache_observations(
+                &mut item,
+                progress.accepted_cache_states.get(&key),
+            );
+            let request = SnapshotBatchRequest {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                source: "codex".into(),
+                machine_id: "a".repeat(64),
+                collector_version: Some(collector_version()),
+                snapshots: vec![item.clone()],
+                upload_policy: SnapshotUploadPolicy::default(),
+                client_report: crate::client_report::ClientReport::empty(),
+            };
+            validate_snapshot_batch_request(&request).unwrap();
+            let wire_bytes = serde_json::to_vec(&request).unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(&wire_bytes).unwrap();
+            let predecessor = wire["snapshots"][0]["semantic_envelope"].get("base_head_etag");
+            if step == 0 {
+                assert!(predecessor.is_none());
+                first_wire = wire.clone();
+                first_state = item.cache_observations_state.clone().unwrap();
+            } else {
+                assert_eq!(predecessor.unwrap(), &json!("65".repeat(32)));
+                assert_ne!(
+                    wire["snapshots"][0]["snapshot_fingerprint"],
+                    first_wire["snapshots"][0]["snapshot_fingerprint"]
+                );
+                assert_ne!(
+                    wire["snapshots"][0]["semantic_envelope"]["revision_v2_hash"],
+                    first_wire["snapshots"][0]["semantic_envelope"]["revision_v2_hash"]
+                );
+                assert_eq!(
+                    item.cache_observations_state.as_ref().unwrap()["observations"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    2
+                );
+            }
+            let mut response = accepted_batch(1);
+            response.entity_ack_contract =
+                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            response
+                .accepted_entities
+                .push(crate::snapshot_client::SnapshotEntityRef {
+                    source_session_id: id.into(),
+                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                    occurrence_count: 1,
+                    body_witness_version: Some(14),
+                    body_witness_digest: Some(snapshot_upload_body_witness(&item)),
+                    head_etag: Some(if step == 0 {
+                        "65".repeat(32)
+                    } else {
+                        "66".repeat(32)
+                    }),
+                    head_challenge: None,
+                });
+            response.validate_entity_ack(&request).unwrap();
+            let mut accepted = 0;
+            upload_resumable_batches_with_body_witness(
+                &[item.clone()],
+                &unique_poison_scope(),
+                &mut progress,
+                &mut accepted,
+                |item| item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |_| Ok(response.clone()),
+                |progress| progress.save(&progress_path),
+            )
+            .unwrap();
+            let mut projection = json!({"session_account_evidence":wire["snapshots"][0]["session_account_evidence"],
+                "cache_observations_state":item.cache_observations_state});
+            for leaf in ["context_curve", "tool_usage", "tool_usage_truncated"] {
+                if let Some(value) = wire["snapshots"][0].get(leaf) {
+                    projection[leaf] = value.clone();
+                }
+            }
+            assert_eq!(
+                format!(
+                    "{:x}",
+                    Sha256::digest(crate::canonical_json::canonicalize(&projection).unwrap())
+                ),
+                snapshot_upload_body_witness(&item)
+            );
+            cases.push(json!({"admission":if step==0 {"first_admission"} else {"revision"},"capability":"combined",
+                "provenance":"same physical source and ScanIndex; validated ACK and existing persisted progress ledger; normal SnapshotBatchRequest serializer",
+                "wire":wire,"wire_body_utf8":String::from_utf8(wire_bytes).unwrap(),
+                "internal_version":crate::snapshots::snapshot_upload_body_witness_version(&item),"released_ack_version":14,
+                "digest":snapshot_upload_body_witness(&item),"cache_observations_state":item.cache_observations_state,
+                "predecessor_wire":if step==0 {serde_json::Value::Null} else {first_wire.clone()},
+                "predecessor_cache_observations_state":if step==0 {serde_json::Value::Null} else {first_state.clone()},
+                "predecessor_head_etag":if step==0 {serde_json::Value::Null} else {json!("65".repeat(32))},
+                "body_projection":projection,"accepted_head_etag":response.accepted_entities[0].head_etag}));
+            progress.finish_cycle(&progress_path).unwrap();
+            progress = SnapshotUploadProgress::load(
+                &progress_path,
+                &progress.destination_namespace_hash,
+                progress.active_quarantine_witness.clone().unwrap(),
+            )
+            .unwrap();
+        }
+        if let Ok(output) = std::env::var("OTTTO_PAIRED_CREATOR_CACHE_REVISION_CORPUS_OUT") {
+            std::fs::write(output, serde_json::to_vec_pretty(&json!({"contract_version":"paired_creator_cache_revision_corpus:v1","cases":cases})).unwrap()).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

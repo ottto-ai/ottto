@@ -5566,8 +5566,8 @@ pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION: u64 = 2
 pub(crate) const SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION: u64 = 24;
 
 /// Backend-compatible, hash-neutral witness version for additive snapshot-body
-/// evidence. Creator-bearing bodies use v23/v24 (public ACK v7/v8), retaining
-/// existing curve/tool fields in the same projection. Missing creator evidence
+/// evidence. Creator-bearing bodies use v23/v24, retaining curve/tool fields.
+/// Public ACKs select v7/v8 for creator-only and v13/v14 when cache is declared. Missing creator evidence
 /// preserves previous versions and digests. Semantic identity remains owned
 /// exclusively by the component/content hashes.
 pub(crate) fn snapshot_upload_body_witness_version(item: &SnapshotItem) -> Option<u64> {
@@ -11644,6 +11644,13 @@ fn parse_opened_jsonl_file(
             ledger.scan_complete = false;
             ledger.signatures.clear();
         }
+    }
+    // Missing physical request/boundary records cannot certify cache order or
+    // complete coverage. Existing cache consumers withhold observations and
+    // preserve accepted rows when this completeness bit is false. Usage loss
+    // and terminal oversized-line settlement retain their existing meaning.
+    if !report.complete() {
+        accumulator.cache_requests_complete = false;
     }
     // An unread physical record could contain an earlier/copied/conflicting
     // header. Preserve legacy partial usage behavior, but do not certify the
@@ -37171,6 +37178,7 @@ mod tests {
                 "exclusive_with_curve": creator_case(true, true),
             },
             "mappings": mappings,
+            "declared_cache_session_account_ack_mappings": {"23": 13, "24": 14},
             "curve_cases": {
                 "nonexclusive": {
                     "internal_version": snapshot_upload_body_witness_version(&nonexclusive),
@@ -37197,6 +37205,96 @@ mod tests {
             canonical,
             "run UPDATE_BODY_WITNESS_ACK_GOLDEN=1 cargo test -p ottto-service --lib body_witness_ack_normalization_fixture_is_canonical_and_current"
         );
+    }
+
+    #[test]
+    fn cache_physical_record_loss_preserves_usage_and_accepted_observations() {
+        use std::io::Write;
+        let root = temp_dir("cache-physical-record-loss");
+        let id = "00000000-0000-7000-8000-000000000001";
+        let path = root.join(format!("rollout-{id}.jsonl"));
+        let header =
+            json!({"type":"session_meta","timestamp":"2026-09-30T10:00:00Z","payload":{"id":id}});
+        let mut prefix = format!(
+            "{header}\n{}\n",
+            json!({"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"high"}})
+        );
+        let mut suffix = String::new();
+        let mut reads = 0;
+        for (index, read) in [90_000, 0, 90_000].into_iter().enumerate() {
+            reads += read;
+            let timestamp = format!("2026-09-30T10:00:0{index}Z");
+            let rows = [
+                json!({"type":"token_usage_record","timestamp":timestamp,"payload":{"response_id":format!("resp_cache_fixture_{index}"),"usage":{"input_tokens":100_000,"cached_input_tokens":read,"cache_write_input_tokens":0,"output_tokens":1}}}),
+                json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100_000*(index+1),"cached_input_tokens":reads,"output_tokens":index+1},"last_token_usage":{"input_tokens":100_000,"cached_input_tokens":read,"output_tokens":1}}}}),
+            ];
+            let text = rows
+                .iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>();
+            if index == 0 {
+                prefix.push_str(&text);
+            } else {
+                suffix.push_str(&text);
+            }
+        }
+        fs::write(&path, format!("{prefix}{suffix}")).unwrap();
+        let clean = parse_codex_test_with_ledgers(&path, BTreeMap::new());
+        assert!(clean.complete());
+        let mut prior_item = clean.snapshots[0].clone();
+        prepare_cache_observations(&mut prior_item, None);
+        let prior = prior_item.cache_observations_state.unwrap();
+        assert_eq!(prior["observations"].as_array().unwrap().len(), 1);
+        for loss in ["oversized", "malformed", "invalid_utf8"] {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(prefix.as_bytes()).unwrap();
+            match loss {
+                "oversized" => {
+                    file.write_all(b"{\"skipped_boundary\":\"").unwrap();
+                    file.seek(SeekFrom::Current((MAX_JSONL_LINE_BYTES + 1) as i64))
+                        .unwrap();
+                    file.write_all(b"\"}\n").unwrap();
+                }
+                "malformed" => file.write_all(b"{broken boundary\n").unwrap(),
+                _ => file.write_all(b"\xff\n").unwrap(),
+            }
+            file.write_all(suffix.as_bytes()).unwrap();
+            drop(file);
+            let parsed = parse_codex_test_with_ledgers(&path, BTreeMap::new());
+            assert!(!parsed.report.complete());
+            assert_eq!(
+                parsed.complete(),
+                loss == "oversized",
+                "terminal usage loss policy unchanged"
+            );
+            let mut item = parsed.snapshots[0].clone();
+            assert_eq!((item.input_tokens, item.output_tokens), (300_000, 3));
+            assert_eq!(item.model_usage, clean.snapshots[0].model_usage);
+            assert_eq!(item.usage_buckets, clean.snapshots[0].usage_buckets);
+            assert!(
+                !item.cache_requests_complete,
+                "{loss}: skipped physical boundary is unknown"
+            );
+            let patch = item.cache_observations.as_ref().unwrap();
+            assert_eq!(patch.coverage, "partial");
+            assert!(
+                patch.operations.is_empty(),
+                "no inferred requests across lost records"
+            );
+            prepare_cache_observations(&mut item, Some(&prior));
+            assert!(item
+                .cache_observations
+                .as_ref()
+                .unwrap()
+                .operations
+                .is_empty());
+            assert_eq!(
+                item.cache_observations_state.as_ref().unwrap()["observations"],
+                prior["observations"],
+                "loss cannot retract accepted evidence"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -37294,8 +37392,20 @@ mod tests {
                             16 => 14,
                             19 => 17,
                             20 => 18,
-                            23 => 7,
-                            24 => 8,
+                            23 => {
+                                if item.cache_observations.is_some() {
+                                    13
+                                } else {
+                                    7
+                                }
+                            }
+                            24 => {
+                                if item.cache_observations.is_some() {
+                                    14
+                                } else {
+                                    8
+                                }
+                            }
                             _ => panic!("unexpected paired domain"),
                         });
                         let digest = internal.map(|_| snapshot_upload_body_witness(item));
@@ -37358,7 +37468,7 @@ mod tests {
                                     .is_err());
                             }
                         }
-                        cases.push(json!({"capability":capability,"exclusive":exclusive,"curve":curve,"tools":tools,
+                        cases.push(json!({"admission":"first_admission","capability":capability,"exclusive":exclusive,"curve":curve,"tools":tools,
                             "provenance":"real Codex parser and normal SnapshotBatchRequest serializer",
                             "wire":wire,"wire_body_utf8":String::from_utf8(wire_bytes).unwrap(),
                             "internal_version":internal,"released_ack_version":public,"digest":digest,

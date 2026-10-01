@@ -771,10 +771,18 @@ impl SnapshotBatchResponse {
                 19 => 17,
                 20 => 18,
                 SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION => {
-                    SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION
+                    if item.cache_observations.is_some() {
+                        13
+                    } else {
+                        SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION
+                    }
                 }
                 SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION => {
-                    SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION
+                    if item.cache_observations.is_some() {
+                        14
+                    } else {
+                        SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION
+                    }
                 }
                 _ => unreachable!("the supported-version filter is exhaustive"),
             };
