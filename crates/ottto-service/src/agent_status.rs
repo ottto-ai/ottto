@@ -2927,6 +2927,7 @@ fn collect_claude_status_snapshots(
         }
     }
 
+    let mut blocked_worker_receipt_descriptors = BTreeMap::new();
     let mut custom_descriptors = descriptors
         .into_iter()
         .filter(|descriptor| descriptor.slot_id != "default")
@@ -2966,6 +2967,10 @@ fn collect_claude_status_snapshots(
                 clear_claude_slot_binding(&mut status);
             }
             append_claude_upkeep_result_receipt(&mut status, &descriptor, result_observed_at);
+            if status.state == ClaudeConfigSlotCollectionStateV1::RefreshDue {
+                blocked_worker_receipt_descriptors
+                    .insert(descriptor.slot_id.clone(), descriptor.clone());
+            }
             slot_states.insert(descriptor.slot_id, status);
             continue;
         }
@@ -3169,7 +3174,11 @@ fn collect_claude_status_snapshots(
         &slot_states,
         OffsetDateTime::parse(&captured_at, &Rfc3339).unwrap_or_else(|_| OffsetDateTime::now_utc()),
     );
-    let _ = persist_claude_slot_collection_states(&slot_states, &unresolved_accounts);
+    let _ = persist_claude_slot_collection_states(
+        &slot_states,
+        &unresolved_accounts,
+        &blocked_worker_receipt_descriptors,
+    );
 
     let mut source_health_snapshot = default_snapshot.clone();
     let mut custom_slot_states = slot_states
@@ -3604,6 +3613,174 @@ pub(crate) fn verify_claude_local_identity(
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ClaudeWorkerDiagnostic {
+    Observed(ClaudeConfigSlotUpkeepResultV1),
+    IdentityFailed(ClaudeLocalIdentityFailure),
+    ReconciliationRefused,
+    Reconciled,
+}
+
+impl ClaudeWorkerDiagnostic {
+    fn code(self) -> &'static str {
+        use ClaudeConfigSlotUpkeepResultV1 as R;
+        match self {
+            Self::Observed(R::NotRequired) => "claude_slot_worker_not_required",
+            Self::Observed(R::RefreshDue) => "claude_slot_worker_refresh_due",
+            Self::Observed(R::Refreshed) => "claude_slot_worker_refreshed",
+            Self::Observed(R::UpkeepNotConsented) => "claude_slot_worker_upkeep_not_consented",
+            Self::Observed(R::CollectionPaused) => "claude_slot_worker_collection_paused",
+            Self::Observed(R::UpkeepDisabled) => "claude_slot_worker_upkeep_disabled",
+            Self::Observed(R::Backoff) => "claude_slot_worker_backoff",
+            Self::Observed(R::MissingBinary) => "claude_slot_worker_missing_binary",
+            Self::Observed(R::SpawnFailed) => "claude_slot_worker_spawn_failed",
+            Self::Observed(R::TimedOut) => "claude_slot_worker_timed_out",
+            Self::Observed(R::NonzeroExit) => "claude_slot_worker_nonzero_exit",
+            Self::Observed(R::CredentialUnreadable) => "claude_slot_worker_credential_unreadable",
+            Self::Observed(R::ExpiryUnchanged) => "claude_slot_worker_expiry_unchanged",
+            Self::Observed(R::ProbeFailed) => "claude_slot_worker_probe_failed",
+            Self::Observed(R::ReloginApproaching) => "claude_slot_worker_relogin_approaching",
+            Self::Observed(R::NeedsLogin) => "claude_slot_worker_needs_login",
+            Self::Observed(R::InProgress) => "claude_slot_worker_in_progress",
+            Self::IdentityFailed(ClaudeLocalIdentityFailure::IdentityUnknown) => {
+                "claude_slot_worker_identity_unknown"
+            }
+            Self::IdentityFailed(ClaudeLocalIdentityFailure::CredentialUnavailable) => {
+                "claude_slot_worker_identity_credential_unavailable"
+            }
+            Self::IdentityFailed(ClaudeLocalIdentityFailure::IdentityMismatch) => {
+                "claude_slot_worker_identity_mismatch"
+            }
+            Self::IdentityFailed(ClaudeLocalIdentityFailure::ConcurrentMutation) => {
+                "claude_slot_worker_identity_concurrent_mutation"
+            }
+            Self::ReconciliationRefused => "claude_slot_worker_reconciliation_refused",
+            Self::Reconciled => "claude_slot_worker_metadata_reconciled",
+        }
+    }
+}
+
+fn claude_worker_diagnostic_message(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "claude_slot_worker_not_required" | "claude_slot_worker_relogin_approaching" => "The local worker observed valid access metadata; this does not establish saved-pair reconciliation or a quota check.",
+        "claude_slot_worker_refresh_due" | "claude_slot_worker_refreshed" | "claude_slot_worker_upkeep_not_consented" | "claude_slot_worker_collection_paused" | "claude_slot_worker_upkeep_disabled" | "claude_slot_worker_backoff" | "claude_slot_worker_missing_binary" | "claude_slot_worker_spawn_failed" | "claude_slot_worker_timed_out" | "claude_slot_worker_nonzero_exit" | "claude_slot_worker_credential_unreadable" | "claude_slot_worker_expiry_unchanged" | "claude_slot_worker_probe_failed" | "claude_slot_worker_needs_login" | "claude_slot_worker_in_progress" => "The local worker returned this upkeep outcome; no quota provider check, vendor-command attempt, or current limits observation is implied.",
+        "claude_slot_worker_identity_unknown" => "The local worker observed valid access metadata, but its exact-root identity was unknown; saved metadata was not reconciled.",
+        "claude_slot_worker_identity_credential_unavailable" => "The local worker observed valid access metadata, but the exact-root identity verifier found no usable credential; saved metadata was not reconciled.",
+        "claude_slot_worker_identity_mismatch" => "The local worker observed valid access metadata, but the exact-root identity verifier found conflicting identities; saved metadata was not reconciled.",
+        "claude_slot_worker_identity_concurrent_mutation" => "The local worker observed valid access metadata, but the exact-root identity changed during verification; saved metadata was not reconciled.",
+        "claude_slot_worker_reconciliation_refused" => "The local worker observed valid access metadata, but the same-fence proof or observation clocks did not permit saved metadata reconciliation.",
+        "claude_slot_worker_metadata_reconciled" => "The local worker reconciled verified same-root, same-pair access metadata; quota/check clocks and saved limits state were not refreshed.",
+        _ => return None,
+    })
+}
+
+fn append_claude_worker_diagnostic(
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+    diagnostic: ClaudeWorkerDiagnostic,
+    completed_at: &str,
+    now: OffsetDateTime,
+) -> Option<()> {
+    let completed = bounded_claude_collection_timestamp(Some(completed_at), now)?;
+    if status.quota_check_diagnostics.iter().any(|entry| {
+        claude_worker_diagnostic_message(&entry.code).is_some()
+            && bounded_claude_collection_timestamp(entry.observed_at.as_deref(), now)
+                .is_some_and(|at| at > completed)
+    }) {
+        return None;
+    }
+    let account = status.account_identifier_hash.as_ref()?.clone();
+    let organization = status.organization_identifier_hash.as_ref()?.clone();
+    if account.is_empty() || organization.is_empty() {
+        return None;
+    }
+    let code = diagnostic.code();
+    status
+        .quota_check_diagnostics
+        .retain(|entry| claude_worker_diagnostic_message(&entry.code).is_none());
+    status.quota_check_diagnostics.push(
+        AgentStatusDiagnostic::source(
+            code,
+            AgentDiagnosticSeverity::Info,
+            claude_worker_diagnostic_message(code)?,
+        )
+        .with_observed_at(Some(completed_at.to_string()))
+        .with_quota_binding(Some(account), Some(organization)),
+    );
+    Some(())
+}
+
+fn claude_worker_receipt_status(
+    queued: &ClaudeConfigSlotDescriptorV1,
+    current: &ClaudeConfigSlotDescriptorV1,
+    diagnostic: ClaudeWorkerDiagnostic,
+    completed_at: &str,
+    now: OffsetDateTime,
+) -> Option<ClaudeConfigSlotCollectionStatusV1> {
+    let fence = crate::claude_upkeep::preclaim_descriptor(queued)?;
+    if crate::claude_upkeep::preclaim_descriptor(current).as_ref() != Some(&fence) {
+        return None;
+    }
+    let completed = bounded_claude_collection_timestamp(Some(completed_at), now)?;
+    if current
+        .collection
+        .observed_at
+        .as_deref()
+        .is_some_and(|at| bounded_claude_collection_timestamp(Some(at), completed).is_none())
+    {
+        return None;
+    }
+    let mut status = current.collection.clone();
+    append_claude_worker_diagnostic(&mut status, diagnostic, completed_at, now)?;
+    Some(status)
+}
+
+pub(crate) fn record_registered_claude_worker_observation(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    result: ClaudeConfigSlotUpkeepResultV1,
+) {
+    record_registered_claude_worker_diagnostic(
+        descriptor,
+        ClaudeWorkerDiagnostic::Observed(result),
+    );
+}
+
+fn record_registered_claude_worker_diagnostic(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    diagnostic: ClaudeWorkerDiagnostic,
+) {
+    let completed_at = crate::current_rfc3339_timestamp();
+    // A refused/unavailable publication remains unknown. Never recreate a
+    // removed slot or override consent/suppression merely to expose a reason.
+    let _ = FileClaudeConfigSlotSettingsStore::default().with_locked_status(|registry| {
+        if !crate::claude_upkeep::registered_slot_publication_allowed(
+            registry,
+            descriptor,
+            &default_support_dir(),
+        ) {
+            return;
+        }
+        let Some(current) = registry
+            .managed_slots
+            .iter()
+            .chain(&registry.external_slots)
+            .find(|slot| slot.slot_id == descriptor.slot_id)
+        else {
+            return;
+        };
+        let _ = persist_one_claude_slot_collection_state_with(&descriptor.slot_id, |previous| {
+            let mut current = current.clone();
+            current.collection = previous?.clone();
+            claude_worker_receipt_status(
+                descriptor,
+                &current,
+                diagnostic,
+                &completed_at,
+                OffsetDateTime::now_utc(),
+            )
+        });
+    });
+}
+
 /// A worker can find already-valid access after a login/refresh while the
 /// foreground still gates on the old saved deadline. Reconcile only through
 /// the existing exact-root identity verifier and collection-state owner.
@@ -3613,6 +3790,7 @@ pub(crate) fn reconcile_registered_claude_valid_access(
 ) -> bool {
     let now = OffsetDateTime::now_utc();
     if !valid_access_reconciliation_due(descriptor, upkeep, now) {
+        record_registered_claude_worker_observation(descriptor, upkeep.result);
         return false;
     }
     let Ok(registry) = FileClaudeConfigSlotSettingsStore::default().load() else {
@@ -3629,9 +3807,15 @@ pub(crate) fn reconcile_registered_claude_valid_access(
         return false;
     };
     let observed_at = crate::current_rfc3339_timestamp();
-    let Ok(proof) = verify_claude_local_identity(&descriptor.slot_id, config_dir, &observed_at)
-    else {
-        return false;
+    let proof = match verify_claude_local_identity(&descriptor.slot_id, config_dir, &observed_at) {
+        Ok(proof) => proof,
+        Err(reason) => {
+            record_registered_claude_worker_diagnostic(
+                descriptor,
+                ClaudeWorkerDiagnostic::IdentityFailed(reason),
+            );
+            return false;
+        }
     };
     let completed_at = crate::current_rfc3339_timestamp();
     FileClaudeConfigSlotSettingsStore::default()
@@ -3653,18 +3837,31 @@ pub(crate) fn reconcile_registered_claude_valid_access(
             };
             // Compare the collection fence under its existing transaction lock,
             // not against an annotation that a concurrent collector can replace.
+            let mut metadata_reconciled = false;
             persist_one_claude_slot_collection_state_with(&descriptor.slot_id, |previous| {
                 let mut current = current.clone();
                 current.collection = previous?.clone();
-                reconciled_valid_access_status(
+                if let Some(status) = reconciled_valid_access_status_with_worker_receipt(
                     descriptor,
                     &current,
                     upkeep,
                     &proof,
                     &completed_at,
                     OffsetDateTime::now_utc(),
-                )
+                ) {
+                    metadata_reconciled = true;
+                    Some(status)
+                } else {
+                    claude_worker_receipt_status(
+                        descriptor,
+                        &current,
+                        ClaudeWorkerDiagnostic::ReconciliationRefused,
+                        &completed_at,
+                        OffsetDateTime::now_utc(),
+                    )
+                }
             })
+            .map(|changed| changed && metadata_reconciled)
             .unwrap_or(false)
         })
         .unwrap_or(false)
@@ -3729,6 +3926,27 @@ fn reconciled_valid_access_status(
     status.access_expires_at = proof.collection.access_expires_at.clone();
     status.relogin_required_at = proof.collection.relogin_required_at.clone();
     status.upkeep = Some(upkeep.clone());
+    Some(status)
+}
+
+fn reconciled_valid_access_status_with_worker_receipt(
+    queued: &ClaudeConfigSlotDescriptorV1,
+    current: &ClaudeConfigSlotDescriptorV1,
+    upkeep: &ottto_protocol::ClaudeConfigSlotUpkeepStatusV1,
+    proof: &ClaudeLocalIdentityProof,
+    completed_at: &str,
+    now: OffsetDateTime,
+) -> Option<ClaudeConfigSlotCollectionStatusV1> {
+    let mut status =
+        reconciled_valid_access_status(queued, current, upkeep, proof, completed_at, now)?;
+    // A superseded diagnostic must never become a new access-recovery gate.
+    // Keep a newer local receipt while accepting the original metadata proof.
+    let _ = append_claude_worker_diagnostic(
+        &mut status,
+        ClaudeWorkerDiagnostic::Reconciled,
+        completed_at,
+        now,
+    );
     Some(status)
 }
 
@@ -3972,6 +4190,9 @@ fn safe_claude_slot_check_diagnostics(
                     "The local quota circuit is open after repeated failures."
                 }
             }
+            code if claude_worker_diagnostic_message(code).is_some() => {
+                claude_worker_diagnostic_message(code).expect("matched closed local worker code")
+            }
             _ => continue,
         };
         let clock = bounded_claude_collection_timestamp(
@@ -3979,6 +4200,9 @@ fn safe_claude_slot_check_diagnostics(
             OffsetDateTime::now_utc(),
         )
         .and(diagnostic.observed_at.clone());
+        if claude_worker_diagnostic_message(&diagnostic.code).is_some() && clock.is_none() {
+            continue;
+        }
         result.push(
             AgentStatusDiagnostic::source(&diagnostic.code, diagnostic.severity.clone(), message)
                 .with_observed_at(clock)
@@ -5196,12 +5420,71 @@ fn claude_slot_collection_state_path() -> PathBuf {
 fn persist_claude_slot_collection_states(
     slots: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
     unresolved_accounts: &[ClaudeUnresolvedAccountDescriptorV1],
+    blocked_descriptors: &BTreeMap<String, ClaudeConfigSlotDescriptorV1>,
+) -> std::io::Result<()> {
+    if blocked_descriptors.is_empty() {
+        return persist_claude_slot_collection_states_with_registry(
+            slots,
+            unresolved_accounts,
+            blocked_descriptors,
+            None,
+        );
+    }
+    // Same lock order as worker publication: registration before collection.
+    // Do not fall back to an unfenced retention write if registration is unavailable.
+    FileClaudeConfigSlotSettingsStore::default()
+        .with_locked_status(|registry| {
+            persist_claude_slot_collection_states_with_registry(
+                slots,
+                unresolved_accounts,
+                blocked_descriptors,
+                Some(registry),
+            )
+        })
+        .map_err(|_| {
+            std::io::Error::other("Claude registration unavailable for blocked receipt retention")
+        })?
+}
+
+fn persist_claude_slot_collection_states_with_registry(
+    slots: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+    unresolved_accounts: &[ClaudeUnresolvedAccountDescriptorV1],
+    blocked_descriptors: &BTreeMap<String, ClaudeConfigSlotDescriptorV1>,
+    registry: Option<&ottto_protocol::ClaudeAccountsStatusV1>,
 ) -> std::io::Result<()> {
     let _guard = claude_slot_collection_state_guard()?;
     let mut persisted = read_persisted_claude_slot_collection_state();
     for (slot_id, candidate) in slots {
         let previous = persisted.slots.get(slot_id).cloned();
-        merge_claude_slot_collection_state(&mut persisted.slots, slot_id, candidate);
+        let mut candidate = candidate.clone();
+        if let (Some(queued), Some(registry), Some(previous)) = (
+            blocked_descriptors.get(slot_id),
+            registry,
+            previous.as_ref(),
+        ) {
+            if crate::claude_upkeep::registered_slot_publication_allowed(
+                registry,
+                queued,
+                &default_support_dir(),
+            ) {
+                if let Some(current) = registry
+                    .managed_slots
+                    .iter()
+                    .chain(&registry.external_slots)
+                    .find(|slot| slot.slot_id == *slot_id)
+                {
+                    let mut current = current.clone();
+                    current.collection = previous.clone();
+                    retain_claude_worker_receipt_for_blocked_candidate(
+                        queued,
+                        &current,
+                        &mut candidate,
+                        OffsetDateTime::now_utc(),
+                    );
+                }
+            }
+        }
+        merge_claude_slot_collection_state(&mut persisted.slots, slot_id, &candidate);
         if persisted.slots.get(slot_id) != previous.as_ref() {
             record_claude_anchor_transitions(
                 &mut persisted.anchor_transitions,
@@ -5221,8 +5504,10 @@ fn persist_claude_slot_collection_states(
     // trusting the scheduled collector's stale view. Restrict the proof to
     // slots that are still registered so an orphaned best-effort state file
     // entry cannot suppress a real unresolved account after slot removal.
-    let current_slot_ids = FileClaudeConfigSlotSettingsStore::default()
-        .load()
+    let current_slot_ids = registry
+        .cloned()
+        .map(Ok)
+        .unwrap_or_else(|| FileClaudeConfigSlotSettingsStore::default().load())
         .map(|status| {
             std::iter::once(status.default_slot.slot_id)
                 .chain(status.managed_slots.into_iter().map(|slot| slot.slot_id))
@@ -5436,6 +5721,71 @@ fn merge_claude_slot_collection_state(
     candidate: &ClaudeConfigSlotCollectionStatusV1,
 ) {
     merge_claude_slot_collection_state_at(slots, slot_id, candidate, OffsetDateTime::now_utc());
+}
+
+fn retain_claude_worker_receipt_for_blocked_candidate(
+    queued: &ClaudeConfigSlotDescriptorV1,
+    current: &ClaudeConfigSlotDescriptorV1,
+    candidate: &mut ClaudeConfigSlotCollectionStatusV1,
+    now: OffsetDateTime,
+) {
+    if candidate.state != ClaudeConfigSlotCollectionStateV1::RefreshDue
+        || bounded_claude_collection_timestamp(candidate.observed_at.as_deref(), now).is_none()
+    {
+        return;
+    }
+    let Some(fence) = crate::claude_upkeep::preclaim_descriptor(queued) else {
+        return;
+    };
+    let candidate_descriptor = ClaudeConfigSlotDescriptorV1 {
+        collection: candidate.clone(),
+        ..current.clone()
+    };
+    if crate::claude_upkeep::preclaim_descriptor(current).as_ref() != Some(&fence)
+        || crate::claude_upkeep::preclaim_descriptor(&candidate_descriptor).as_ref() != Some(&fence)
+    {
+        return;
+    }
+    let account = fence
+        .collection
+        .account_identifier_hash
+        .as_deref()
+        .expect("strong fence");
+    let organization = fence
+        .collection
+        .organization_identifier_hash
+        .as_deref()
+        .expect("strong fence");
+    let latest = |status: &ClaudeConfigSlotCollectionStatusV1| {
+        safe_claude_slot_check_diagnostics(&status.quota_check_diagnostics, account, organization)
+            .into_iter()
+            .filter(|entry| claude_worker_diagnostic_message(&entry.code).is_some())
+            .filter_map(|entry| {
+                bounded_claude_collection_timestamp(entry.observed_at.as_deref(), now)
+                    .map(|clock| (entry, clock))
+            })
+            .max_by_key(|(_, clock)| *clock)
+    };
+    let Some((receipt, clock)) = latest(&current.collection) else {
+        return;
+    };
+    // A saved enum can remain Fresh after its deadline expires. Only a
+    // collection observation newer than this actual local receipt supersedes
+    // it; the blocked candidate/map already proves the expired-access branch.
+    if bounded_claude_collection_timestamp(current.collection.observed_at.as_deref(), clock)
+        .is_none()
+    {
+        return;
+    }
+    if latest(candidate).is_some_and(|(_, candidate_clock)| candidate_clock >= clock) {
+        return;
+    }
+    // Only an actually blocked, same immutable registration/deadline candidate
+    // can inherit this lock-time receipt. Real provider/fresh writes replace it.
+    candidate
+        .quota_check_diagnostics
+        .retain(|entry| claude_worker_diagnostic_message(&entry.code).is_none());
+    candidate.quota_check_diagnostics.push(receipt);
 }
 
 fn bounded_claude_collection_timestamp(
@@ -13423,6 +13773,624 @@ mod tests {
     }
 
     #[test]
+    fn claude_worker_receipt_preserves_saved_health_all_original_clocks_and_backoff() {
+        let (mut slot, upkeep, _, now) = valid_access_reconciliation_fixture();
+        slot.collection.upkeep = Some(ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+            result: ClaudeConfigSlotUpkeepResultV1::Backoff,
+            attempted_at: Some("2026-08-05T01:55:00Z".to_string()),
+            next_allowed_attempt_at: Some("2026-08-05T02:40:00Z".to_string()),
+            consecutive_failures: 2,
+            ..upkeep
+        });
+        let receipt = claude_worker_receipt_status(
+            &slot,
+            &slot,
+            ClaudeWorkerDiagnostic::IdentityFailed(ClaudeLocalIdentityFailure::IdentityUnknown),
+            "2026-08-05T02:30:00Z",
+            now,
+        )
+        .unwrap();
+        let mut without_receipt = receipt.clone();
+        without_receipt.quota_check_diagnostics = slot.collection.quota_check_diagnostics.clone();
+        assert_eq!(without_receipt, slot.collection);
+        let local = receipt.quota_check_diagnostics.last().unwrap();
+        assert_eq!(local.observed_at.as_deref(), Some("2026-08-05T02:30:00Z"));
+        assert_eq!(
+            local.account_identifier_hash,
+            slot.collection.account_identifier_hash
+        );
+        assert_eq!(
+            local.organization_identifier_hash,
+            slot.collection.organization_identifier_hash
+        );
+        assert!(local.code.starts_with("claude_slot_worker_"));
+        assert!(!local.code.starts_with("claude_oauth_usage_"));
+    }
+
+    #[test]
+    fn claude_worker_receipt_refuses_every_changed_descriptor_and_newer_observation() {
+        let (slot, _, _, now) = valid_access_reconciliation_fixture();
+        for mutation in 0..9 {
+            let mut current = slot.clone();
+            match mutation {
+                0 => current.config_dir = Some("/fixture/other-root".to_string()),
+                1 => current.slot_id = "other-slot".to_string(),
+                2 => current.service_name = "other-service".to_string(),
+                3 => current.ownership = ClaudeConfigSlotOwnership::Managed,
+                4 => current.collection.account_identifier_hash = Some("other-account".to_string()),
+                5 => {
+                    current.collection.organization_identifier_hash = Some("other-org".to_string())
+                }
+                6 => {
+                    current.collection.access_expires_at = Some("2026-08-05T02:01:00Z".to_string())
+                }
+                7 => current.collection.relogin_required_at = None,
+                _ => current.collection.observed_at = Some("2026-08-05T02:30:01Z".to_string()),
+            }
+            assert!(
+                claude_worker_receipt_status(
+                    &slot,
+                    &current,
+                    ClaudeWorkerDiagnostic::ReconciliationRefused,
+                    "2026-08-05T02:30:00Z",
+                    now
+                )
+                .is_none(),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_worker_receipt_refuses_missing_fence_future_and_older_result_clocks() {
+        let (mut slot, _, _, now) = valid_access_reconciliation_fixture();
+        for completed in ["invalid", "2026-08-05T02:30:01Z"] {
+            assert!(claude_worker_receipt_status(
+                &slot,
+                &slot,
+                ClaudeWorkerDiagnostic::Reconciled,
+                completed,
+                now
+            )
+            .is_none());
+        }
+        append_claude_worker_diagnostic(
+            &mut slot.collection,
+            ClaudeWorkerDiagnostic::Observed(ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable),
+            "2026-08-05T02:30:00Z",
+            now,
+        )
+        .unwrap();
+        assert!(claude_worker_receipt_status(
+            &slot,
+            &slot,
+            ClaudeWorkerDiagnostic::Reconciled,
+            "2026-08-05T02:29:59Z",
+            now
+        )
+        .is_none());
+        slot.collection.organization_identifier_hash = None;
+        assert!(claude_worker_receipt_status(
+            &slot,
+            &slot,
+            ClaudeWorkerDiagnostic::Reconciled,
+            "2026-08-05T02:30:00Z",
+            now
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn claude_worker_receipt_exact_binding_sanitizer_is_closed_and_never_provider_success() {
+        use ClaudeConfigSlotUpkeepResultV1 as R;
+        let (slot, _, _, now) = valid_access_reconciliation_fixture();
+        let mut outcomes = [
+            R::NotRequired,
+            R::RefreshDue,
+            R::Refreshed,
+            R::UpkeepNotConsented,
+            R::CollectionPaused,
+            R::UpkeepDisabled,
+            R::Backoff,
+            R::MissingBinary,
+            R::SpawnFailed,
+            R::TimedOut,
+            R::NonzeroExit,
+            R::CredentialUnreadable,
+            R::ExpiryUnchanged,
+            R::ProbeFailed,
+            R::ReloginApproaching,
+            R::NeedsLogin,
+            R::InProgress,
+        ]
+        .into_iter()
+        .map(ClaudeWorkerDiagnostic::Observed)
+        .collect::<Vec<_>>();
+        outcomes.extend([
+            ClaudeWorkerDiagnostic::ReconciliationRefused,
+            ClaudeWorkerDiagnostic::Reconciled,
+        ]);
+        outcomes.extend(
+            [
+                ClaudeLocalIdentityFailure::IdentityUnknown,
+                ClaudeLocalIdentityFailure::CredentialUnavailable,
+                ClaudeLocalIdentityFailure::IdentityMismatch,
+                ClaudeLocalIdentityFailure::ConcurrentMutation,
+            ]
+            .into_iter()
+            .map(ClaudeWorkerDiagnostic::IdentityFailed),
+        );
+        for outcome in outcomes {
+            let status =
+                claude_worker_receipt_status(&slot, &slot, outcome, "2026-08-05T02:30:00Z", now)
+                    .unwrap();
+            let diagnostics = safe_claude_slot_check_diagnostics(
+                &status.quota_check_diagnostics,
+                "account-a",
+                "org-a",
+            );
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, outcome.code());
+            assert_eq!(
+                diagnostics[0].observed_at.as_deref(),
+                Some("2026-08-05T02:30:00Z")
+            );
+            assert!(diagnostics[0].code.starts_with("claude_slot_worker_"));
+            assert_ne!(diagnostics[0].code, "claude_oauth_usage_check_succeeded");
+            assert!(
+                safe_claude_slot_check_diagnostics(&diagnostics, "account-a", "foreign-org")
+                    .is_empty()
+            );
+            let mut forged = diagnostics[0].clone();
+            forged.code = "claude_slot_worker_arbitrary_secret".to_string();
+            assert!(safe_claude_slot_check_diagnostics(&[forged], "account-a", "org-a").is_empty());
+        }
+    }
+
+    #[test]
+    fn claude_worker_receipt_reconciliation_success_changes_only_existing_metadata_plus_local_receipt(
+    ) {
+        let (slot, upkeep, proof, now) = valid_access_reconciliation_fixture();
+        let mut accepted = reconciled_valid_access_status(
+            &slot,
+            &slot,
+            &upkeep,
+            &proof,
+            "2026-08-05T02:30:00Z",
+            now,
+        )
+        .unwrap();
+        let expected = accepted.clone();
+        append_claude_worker_diagnostic(
+            &mut accepted,
+            ClaudeWorkerDiagnostic::Reconciled,
+            "2026-08-05T02:30:00Z",
+            now,
+        )
+        .unwrap();
+        let sanitized = safe_claude_slot_check_diagnostics(
+            &accepted.quota_check_diagnostics,
+            "account-a",
+            "org-a",
+        );
+        assert_eq!(sanitized[0].code, "claude_slot_worker_metadata_reconciled");
+        accepted.quota_check_diagnostics = expected.quota_check_diagnostics.clone();
+        assert_eq!(accepted, expected);
+        assert_eq!(
+            accepted.last_full_quota_read_at,
+            slot.collection.last_full_quota_read_at
+        );
+        assert_eq!(accepted.quota_snapshot, slot.collection.quota_snapshot);
+        assert_eq!(
+            accepted.state,
+            ClaudeConfigSlotCollectionStateV1::RefreshDue
+        );
+        assert!(accepted.upkeep.unwrap().attempted_at.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn claude_worker_receipt_survives_next_blocked_collection_roundtrip() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-worker-receipt-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("new isolated fixture root");
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let (slot, mut upkeep, _, now) = valid_access_reconciliation_fixture();
+        let receipt = claude_worker_receipt_status(
+            &slot,
+            &slot,
+            ClaudeWorkerDiagnostic::ReconciliationRefused,
+            "2026-08-05T02:30:00Z",
+            now,
+        )
+        .unwrap();
+        persist_one_claude_slot_collection_state(&slot.slot_id, &receipt).unwrap();
+        upkeep.result = ClaudeConfigSlotUpkeepResultV1::RefreshDue;
+        upkeep.due_access_expires_at = slot.collection.access_expires_at.clone();
+        let blocked = blocked_claude_upkeep_status(&slot.slot_id, "2026-08-05T02:31:00Z", upkeep);
+        persist_one_claude_slot_collection_state(&slot.slot_id, &blocked).unwrap();
+        let persisted = read_persisted_claude_slot_collection_state();
+        let status = persisted.slots.get(&slot.slot_id).unwrap();
+        let safe = safe_claude_slot_check_diagnostics(
+            &status.quota_check_diagnostics,
+            "account-a",
+            "org-a",
+        );
+        assert_eq!(safe.len(), 1);
+        assert_eq!(safe[0].code, "claude_slot_worker_reconciliation_refused");
+        assert_eq!(safe[0].observed_at.as_deref(), Some("2026-08-05T02:30:00Z"));
+        assert_eq!(
+            status.last_full_quota_read_at,
+            slot.collection.last_full_quota_read_at
+        );
+        assert_eq!(status.access_expires_at, slot.collection.access_expires_at);
+        assert_eq!(status.state, ClaudeConfigSlotCollectionStateV1::RefreshDue);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_worker_receipt_superseded_diagnostic_cannot_block_valid_metadata_advancement() {
+        let (mut slot, upkeep, proof, now) = valid_access_reconciliation_fixture();
+        append_claude_worker_diagnostic(
+            &mut slot.collection,
+            ClaudeWorkerDiagnostic::Observed(ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable),
+            "2026-08-05T02:30:00Z",
+            now,
+        )
+        .unwrap();
+        let completed = "2026-08-05T02:29:59Z";
+        assert!(
+            claude_worker_receipt_status(
+                &slot,
+                &slot,
+                ClaudeWorkerDiagnostic::Reconciled,
+                completed,
+                now
+            )
+            .is_none(),
+            "diagnostic-only old result refused"
+        );
+        let expected =
+            reconciled_valid_access_status(&slot, &slot, &upkeep, &proof, completed, now).unwrap();
+        let accepted = reconciled_valid_access_status_with_worker_receipt(
+            &slot, &slot, &upkeep, &proof, completed, now,
+        )
+        .unwrap();
+        assert_eq!(
+            accepted, expected,
+            "original valid proof advances metadata; newer local receipt unchanged"
+        );
+        assert_eq!(
+            accepted.access_expires_at,
+            proof.collection.access_expires_at
+        );
+        assert_eq!(
+            accepted
+                .quota_check_diagnostics
+                .last()
+                .unwrap()
+                .observed_at
+                .as_deref(),
+            Some("2026-08-05T02:30:00Z")
+        );
+        assert_eq!(
+            accepted.state,
+            ClaudeConfigSlotCollectionStateV1::RefreshDue
+        );
+        assert_eq!(
+            accepted.last_full_quota_read_at,
+            slot.collection.last_full_quota_read_at
+        );
+    }
+
+    #[test]
+    fn claude_worker_receipt_blocked_retention_requires_complete_fence_and_local_clock_precedence()
+    {
+        let (mut slot, _, _, now) = valid_access_reconciliation_fixture();
+        let mut stale = slot.collection.clone();
+        stale.observed_at = Some("2026-08-05T02:29:00Z".to_string());
+        append_claude_worker_diagnostic(
+            &mut slot.collection,
+            ClaudeWorkerDiagnostic::ReconciliationRefused,
+            "2026-08-05T02:30:00Z",
+            now,
+        )
+        .unwrap();
+        for mutation in 0..12 {
+            let mut current = slot.clone();
+            let mut candidate = stale.clone();
+            match mutation {
+                0 => current.config_dir = Some("/fixture/changed".to_string()),
+                1 => current.slot_id = "changed".to_string(),
+                2 => current.service_name = "changed".to_string(),
+                3 => current.ownership = ClaudeConfigSlotOwnership::Managed,
+                4 => current.collection.organization_identifier_hash = Some("foreign".to_string()),
+                5 => {
+                    current.collection.access_expires_at = Some("2026-08-05T03:00:00Z".to_string())
+                }
+                6 => current.collection.relogin_required_at = None,
+                7 => candidate.state = ClaudeConfigSlotCollectionStateV1::Fresh,
+                8 => candidate.state = ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
+                9 => candidate.account_identifier_hash = Some("foreign".to_string()),
+                10 => candidate.access_expires_at = Some("2026-08-05T03:00:00Z".to_string()),
+                _ => current.collection.observed_at = Some("2026-08-05T02:30:01Z".to_string()),
+            }
+            let original = candidate.clone();
+            retain_claude_worker_receipt_for_blocked_candidate(
+                &slot,
+                &current,
+                &mut candidate,
+                now,
+            );
+            assert_eq!(candidate, original, "negative fence {mutation}");
+        }
+        let mut same = stale.clone();
+        retain_claude_worker_receipt_for_blocked_candidate(&slot, &slot, &mut same, now);
+        assert_eq!(
+            same.quota_check_diagnostics.last().unwrap().code,
+            "claude_slot_worker_reconciliation_refused"
+        );
+        for state in [
+            ClaudeConfigSlotCollectionStateV1::Fresh,
+            ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
+        ] {
+            let mut current = slot.clone();
+            current.collection.state = state;
+            let mut candidate = stale.clone();
+            retain_claude_worker_receipt_for_blocked_candidate(
+                &slot,
+                &current,
+                &mut candidate,
+                now,
+            );
+            assert_eq!(
+                candidate.quota_check_diagnostics.last().unwrap().code,
+                "claude_slot_worker_reconciliation_refused",
+                "old saved enum is not new collection proof"
+            );
+        }
+        let mut newer_collection = slot.clone();
+        newer_collection.collection.observed_at = Some("2026-08-05T02:30:00Z".to_string());
+        newer_collection
+            .collection
+            .quota_check_diagnostics
+            .last_mut()
+            .unwrap()
+            .observed_at = Some("2026-08-05T02:29:59Z".to_string());
+        let mut candidate = stale.clone();
+        retain_claude_worker_receipt_for_blocked_candidate(
+            &slot,
+            &newer_collection,
+            &mut candidate,
+            now,
+        );
+        assert_eq!(
+            candidate, stale,
+            "older local receipt cannot cross genuinely newer collection"
+        );
+        let mut newer = stale.clone();
+        append_claude_worker_diagnostic(
+            &mut newer,
+            ClaudeWorkerDiagnostic::Observed(ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable),
+            "2026-08-05T02:30:00Z",
+            now,
+        )
+        .unwrap();
+        let original = newer.clone();
+        retain_claude_worker_receipt_for_blocked_candidate(&slot, &slot, &mut newer, now);
+        assert_eq!(newer, original, "equal/newer actual local receipt wins");
+        append_claude_worker_diagnostic(
+            &mut newer,
+            ClaudeWorkerDiagnostic::Observed(ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable),
+            "2026-08-05T02:30:01Z",
+            now + time::Duration::seconds(1),
+        )
+        .unwrap();
+        let original = newer.clone();
+        retain_claude_worker_receipt_for_blocked_candidate(
+            &slot,
+            &slot,
+            &mut newer,
+            now + time::Duration::seconds(1),
+        );
+        assert_eq!(newer, original, "genuinely newer local receipt wins");
+    }
+
+    #[test]
+    #[serial]
+    fn claude_worker_receipt_stale_clone_worker_batch_interleaving_is_fenced_at_lock_time() {
+        use ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION;
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-worker-interleaving-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let config = root.join("registered");
+        fs::create_dir(&config).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let registered = store
+            .register_path(
+                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                config.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+        store
+            .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, true)
+            .unwrap();
+        let mut slot = registered.external_slots[0].clone();
+        let (fixture, mut upkeep, _, _) = valid_access_reconciliation_fixture();
+        slot.collection = fixture.collection;
+        slot.collection.state = ClaudeConfigSlotCollectionStateV1::Fresh;
+        upkeep.result = ClaudeConfigSlotUpkeepResultV1::RefreshDue;
+        upkeep.due_access_expires_at = slot.collection.access_expires_at.clone();
+        persist_one_claude_slot_collection_state(&slot.slot_id, &slot.collection).unwrap();
+        // First expiry: saved enum is still Fresh; the actual blocked branch
+        // makes RefreshDue before the t2 worker's diagnostic-only publication.
+        let stale = blocked_claude_upkeep_status(&slot.slot_id, "2026-08-05T02:29:00Z", upkeep);
+        assert_eq!(stale.state, ClaudeConfigSlotCollectionStateV1::RefreshDue);
+        record_registered_claude_worker_observation(
+            &slot,
+            ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
+        );
+        let worker = read_persisted_claude_slot_collection_state().slots[&slot.slot_id].clone();
+        assert_eq!(worker.state, ClaudeConfigSlotCollectionStateV1::Fresh);
+        let receipt = worker.quota_check_diagnostics.last().unwrap().clone();
+        assert_eq!(receipt.code, "claude_slot_worker_credential_unreadable");
+        let candidates = BTreeMap::from([(slot.slot_id.clone(), stale.clone())]);
+        let descriptors = BTreeMap::from([(slot.slot_id.clone(), slot.clone())]);
+        // t3: real delayed batch owner sees lock-time receipt, not stale clone.
+        persist_claude_slot_collection_states(&candidates, &[], &descriptors).unwrap();
+        let merged = read_persisted_claude_slot_collection_state().slots[&slot.slot_id].clone();
+        assert_eq!(merged.quota_check_diagnostics.last(), Some(&receipt));
+        let mut expected = stale.clone();
+        expected.quota_check_diagnostics.push(receipt.clone());
+        assert_eq!(merged, expected);
+
+        // Suppression may commit after clone/publication but before batch lock.
+        fs::write(root.join("claude-browser-auth-state.json"), b"{corrupt").unwrap();
+        persist_claude_slot_collection_states(&candidates, &[], &descriptors).unwrap();
+        let suppressed = read_persisted_claude_slot_collection_state().slots[&slot.slot_id].clone();
+        assert_eq!(
+            suppressed.quota_check_diagnostics,
+            stale.quota_check_diagnostics
+        );
+        fs::remove_file(root.join("claude-browser-auth-state.json")).unwrap();
+        // No descriptor transport for a genuine/new provider collection.
+        let mut worker = worker;
+        worker.observed_at = stale.observed_at.clone();
+        persist_one_claude_slot_collection_state(&slot.slot_id, &worker).unwrap();
+        assert!(
+            read_persisted_claude_slot_collection_state().slots[&slot.slot_id]
+                .quota_check_diagnostics
+                .iter()
+                .any(|entry| claude_worker_diagnostic_message(&entry.code).is_some())
+        );
+        let mut fresh = stale.clone();
+        fresh.state = ClaudeConfigSlotCollectionStateV1::Fresh;
+        persist_claude_slot_collection_states(
+            &BTreeMap::from([(slot.slot_id.clone(), fresh)]),
+            &[],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(
+            !read_persisted_claude_slot_collection_state().slots[&slot.slot_id]
+                .quota_check_diagnostics
+                .iter()
+                .any(|entry| claude_worker_diagnostic_message(&entry.code).is_some())
+        );
+        let before = read_persisted_claude_slot_collection_state().slots.clone();
+        fs::write(store.path(), b"{corrupt").unwrap();
+        assert!(
+            persist_claude_slot_collection_states(&candidates, &[], &descriptors).is_err(),
+            "unavailable registration is surfaced, never unsafe retention success"
+        );
+        assert_eq!(read_persisted_claude_slot_collection_state().slots, before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn claude_worker_receipt_publication_respects_controls_rebind_and_removal() {
+        use ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION;
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-worker-publication-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("new isolated fixture root");
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let config = root.join("registered");
+        fs::create_dir(&config).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let registered = store
+            .register_path(
+                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                config.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+        let mut slot = registered.external_slots[0].clone();
+        slot.collection = valid_access_reconciliation_fixture().0.collection;
+        persist_one_claude_slot_collection_state(&slot.slot_id, &slot.collection).unwrap();
+        let publish = || {
+            record_registered_claude_worker_observation(
+                &slot,
+                ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
+            )
+        };
+        let unchanged = || {
+            assert_eq!(
+                read_persisted_claude_slot_collection_state()
+                    .slots
+                    .get(&slot.slot_id),
+                Some(&slot.collection)
+            )
+        };
+        publish();
+        unchanged(); // Consent not granted.
+        store
+            .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, true)
+            .unwrap();
+        fs::write(
+            root.join(CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE),
+            b"disabled",
+        )
+        .unwrap();
+        publish();
+        unchanged();
+        fs::remove_file(root.join(CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE)).unwrap();
+        fs::write(
+            root.join(crate::claude_upkeep::UPKEEP_DISABLED_FILE),
+            b"disabled",
+        )
+        .unwrap();
+        publish();
+        unchanged();
+        fs::remove_file(root.join(crate::claude_upkeep::UPKEEP_DISABLED_FILE)).unwrap();
+        fs::write(root.join("claude-browser-auth-state.json"), b"{corrupt").unwrap();
+        publish();
+        unchanged();
+        fs::remove_file(root.join("claude-browser-auth-state.json")).unwrap();
+        publish();
+        let receipt = read_persisted_claude_slot_collection_state().slots[&slot.slot_id].clone();
+        assert_eq!(
+            receipt.quota_check_diagnostics.last().unwrap().code,
+            "claude_slot_worker_credential_unreadable"
+        );
+        let mut rebound = receipt.clone();
+        rebound.organization_identifier_hash = Some("other-org".to_string());
+        rebound.observed_at = Some(crate::current_rfc3339_timestamp());
+        rebound.quota_check_diagnostics.clear();
+        persist_one_claude_slot_collection_state(&slot.slot_id, &rebound).unwrap();
+        publish();
+        assert_eq!(
+            read_persisted_claude_slot_collection_state().slots[&slot.slot_id],
+            rebound
+        );
+        store
+            .remove(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, &slot.slot_id)
+            .unwrap();
+        let removed = read_persisted_claude_slot_collection_state();
+        publish();
+        assert_eq!(
+            serde_json::to_value(read_persisted_claude_slot_collection_state()).unwrap(),
+            serde_json::to_value(removed).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn claude_valid_access_reconciliation_refuses_rebound_changed_root_and_newer_expiry() {
         let (slot, upkeep, proof, now) = valid_access_reconciliation_fixture();
         for mutation in 0..7 {
@@ -14058,10 +15026,22 @@ exit 1
             assert_eq!(slot.collection.state, expected);
         }
 
+        let worker_code = "claude_slot_worker_reconciliation_refused";
         let backend_json = serde_json::to_string(
             &snapshots
                 .into_iter()
-                .map(AgentStatusSnapshot::redacted_for_backend)
+                .enumerate()
+                .map(|(index, mut snapshot)| {
+                    if index == 0 {
+                        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                            worker_code,
+                            AgentDiagnosticSeverity::Info,
+                            claude_worker_diagnostic_message(worker_code)
+                                .expect("closed local worker code"),
+                        ));
+                    }
+                    snapshot.redacted_for_backend()
+                })
                 .collect::<Vec<_>>(),
         )
         .expect("serialize backend snapshots");
@@ -14133,7 +15113,8 @@ exit 1
                 Value::String(text) if text.contains("claude_slot_") => {
                     // Only a diagnostic code from a closed enum is public;
                     // the same prefix in any other field still fails privacy.
-                    let safe = text == "claude_slot_upkeep_attempt_started"
+                    let safe = claude_worker_diagnostic_message(text).is_some()
+                        || text == "claude_slot_upkeep_attempt_started"
                         || text
                             .strip_prefix("claude_slot_collection_")
                             .is_some_and(|suffix| {
@@ -14167,6 +15148,14 @@ exit 1
             &serde_json::from_str(&backend_json).expect("backend payload"),
             "",
         );
+        assert!(backend_json.contains(worker_code));
+        for forbidden in [
+            serde_json::json!({"diagnostics": [{"code": "claude_slot_worker_arbitrary_suffix"}]}),
+            serde_json::json!({"diagnostics": [{"message": worker_code}]}),
+            serde_json::json!({"code": worker_code}),
+        ] {
+            assert!(std::panic::catch_unwind(|| assert_public_fields(&forbidden, "")).is_err());
+        }
         let local_state =
             fs::read_to_string(claude_slot_collection_state_path()).expect("read local slot state");
         assert!(!local_state.contains(root.to_string_lossy().as_ref()));
@@ -23164,8 +24153,12 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         )
         .expect("persist exact full proof");
 
-        persist_claude_slot_collection_states(&BTreeMap::new(), &[stale_unresolved])
-            .expect("persist delayed stale scheduled state");
+        persist_claude_slot_collection_states(
+            &BTreeMap::new(),
+            &[stale_unresolved],
+            &BTreeMap::new(),
+        )
+        .expect("persist delayed stale scheduled state");
 
         assert!(
             read_persisted_claude_slot_collection_state()

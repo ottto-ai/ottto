@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 407,
-  "content_sha256": "16d807605f9088598131732d779435c4bd6e722f6d4eac3ad8ad676f188450e5",
+  "candidate_file_count": 408,
+  "content_sha256": "51da6a9ed025ae00f05c7c6f653d0699bbf1228121b9785d1af5385c2c623d28",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "1750f200aeb34d329caf7e90a0a9469004b11406dcad9039bd6e5dabe961547d",
-      "size_bytes": 936928
+      "sha256": "aeef9ffaec67fbb644fbf30db76576a10937a3ebff7ccd9f00e770653d5710be",
+      "size_bytes": 979683
     },
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_upkeep.rs",
-      "sha256": "19723a52316ce2d2ed27cef62fb621511ce4210ce2d1f51f9bed590d9e232495",
-      "size_bytes": 110078
+      "sha256": "172db5d8e7fed4edf86805a91f08fa670cc7301c962a40952f48a68787d510a4",
+      "size_bytes": 110680
     },
     {
       "executable": false,
@@ -995,6 +995,13 @@
       "path": "docs/claude-accounts.md",
       "sha256": "762cd2f2e3b296986c37172caab17162d4a9081cdea261b7dca344553a51bcde",
       "size_bytes": 17331
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/claude-worker-outcome-diagnostics.md",
+      "sha256": "6dcf9658f8088a9f8cbe54c3ce63c49a7c7587b849a595a8caebefcc9174800d",
+      "size_bytes": 2399
     },
     {
       "executable": false,
@@ -2852,9 +2859,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-01T13:36:24+00:00",
+  "generated_at": "2026-10-01T19:39:48+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 408,
+  "output_file_count": 409,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2888,5 +2895,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "93ed1aa1d2aaa7b4754cbe4e0dc714bd54080b7f"
+  "source_commit": "0b5d1b3771155df31ba5ac9476130b620b718373"
 }
