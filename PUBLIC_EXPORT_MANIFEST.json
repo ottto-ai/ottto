@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 410,
-  "content_sha256": "a9bb0c6b907add338686466c2b0494f278091928bd4cffa624fb435f6d2ee84c",
+  "content_sha256": "f6fe4e48288216fe0022c336302f7da14996828c7f1aa96868a45516528e68e1",
   "files": [
     {
       "executable": false,
@@ -902,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "22aa83e400e981554a54c7136aeeab8ddf7604f244ade27b83b06258c96fef2c",
-      "size_bytes": 2028149
+      "sha256": "142434cc1424264009cb8146042a7200bca8c6f00405e9db0ff3d67f1ae9e305",
+      "size_bytes": 2028167
     },
     {
       "executable": false,

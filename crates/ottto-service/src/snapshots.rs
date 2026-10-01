@@ -37973,7 +37973,7 @@ mod tests {
     fn projection_adoption_partial_file_never_stamps_while_sibling_progresses() {
         let (home, root, mut index) = projection_adoption_fixture("projection-adoption-partial", 2);
         let partial_key = index.files.keys().next().unwrap().clone();
-        let body = fs::read_to_string(&partial_key).unwrap();
+        let body = String::from_utf8(fs::read(&partial_key).unwrap()).unwrap();
         fs::write(&partial_key, format!("{body}not valid json\n")).unwrap();
         index.activate_effective_upload_body_witness_revision(1);
         let previous = index.clone();
