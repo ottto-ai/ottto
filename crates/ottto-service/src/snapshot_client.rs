@@ -1,7 +1,9 @@
 use crate::snapshots::{
     snapshot_upload_body_witness, snapshot_upload_body_witness_version, SnapshotBatchRequest,
     SnapshotSource, SnapshotSourceManifest, SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION,
-    SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION, SNAPSHOT_ENTITY_ACK_CONTRACT,
+    SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION,
+    SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION,
+    SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION, SNAPSHOT_ENTITY_ACK_CONTRACT,
 };
 use anyhow::{anyhow, Result};
 use flate2::write::GzEncoder;
@@ -22,6 +24,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_CONTEXT_CURVE_VERSION: u64 = 5;
 pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION: u64 = 6;
+pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION: u64 = 7;
+pub(crate) const SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION: u64 = 8;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
@@ -546,6 +550,12 @@ pub struct ActivityHintResponse {
     /// emits curves that the server cannot durably acknowledge.
     #[serde(default)]
     pub session_context_curve_contract: Option<String>,
+    /// Exact accepted-log cache evidence capability; absent or unknown disables wire emission.
+    #[serde(default)]
+    pub session_cache_observations_contract: Option<String>,
+    /// Existing server mandate: ordinary bootstrap may not bypass required CAS.
+    #[serde(default)]
+    pub snapshot_head_cas_required: bool,
     /// Backend admission of the `census_residue` collector error code
     /// (`CENSUS_RESIDUE_STATUS_CONTRACT`). The backend's error-code set is a
     /// closed list and its forward tolerance covers unknown FIELDS, never
@@ -627,6 +637,11 @@ impl SnapshotBatchResponse {
         request: &SnapshotBatchRequest,
         enforce_head_cas: bool,
     ) -> Result<()> {
+        let enforce_head_cas = enforce_head_cas
+            || request
+                .snapshots
+                .iter()
+                .any(|item| item.cache_observations.is_some());
         if self.disabled {
             if self.accepted != 0
                 || !self.accepted_entities.is_empty()
@@ -645,13 +660,13 @@ impl SnapshotBatchResponse {
                 if self.accepted != request.snapshots.len() as u64 {
                     return Err(anyhow!("legacy snapshot response accepted count mismatch"));
                 }
-                if request
-                    .snapshots
-                    .iter()
-                    .any(|item| item.context_curve.is_some())
-                {
+                if request.snapshots.iter().any(|item| {
+                    item.context_curve.is_some()
+                        || item.session_account_evidence.is_some()
+                        || item.cache_observations.is_some()
+                }) {
                     return Err(anyhow!(
-                        "legacy snapshot response cannot durably acknowledge context curve evidence"
+                        "legacy snapshot response cannot durably acknowledge snapshot evidence"
                     ));
                 }
                 return Ok(());
@@ -717,7 +732,10 @@ impl SnapshotBatchResponse {
     fn validate_body_witness_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
         let mut expected = std::collections::BTreeMap::new();
         for item in &request.snapshots {
-            if item.context_curve.is_none() {
+            if item.context_curve.is_none()
+                && item.session_account_evidence.is_none()
+                && item.cache_observations.is_none()
+            {
                 continue;
             }
             let version = snapshot_upload_body_witness_version(item)
@@ -726,9 +744,17 @@ impl SnapshotBatchResponse {
                         *version,
                         SNAPSHOT_BODY_WITNESS_ENVELOPE_CONTEXT_CURVE_VERSION
                             | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION
+                            | 15
+                            | 16
+                            | 19
+                            | 20
+                            | SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION
+                            | SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION
                     )
                 })
-                .ok_or_else(|| anyhow!("context curve has no supported body witness version"))?;
+                .ok_or_else(|| {
+                    anyhow!("snapshot evidence has no supported body witness version")
+                })?;
             let key = (
                 item.source_session_id.clone(),
                 item.snapshot_fingerprint.clone(),
@@ -740,6 +766,24 @@ impl SnapshotBatchResponse {
                 SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_CONTEXT_CURVE_VERSION => {
                     SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_CONTEXT_CURVE_VERSION
                 }
+                15 => 13,
+                16 => 14,
+                19 => 17,
+                20 => 18,
+                SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION => {
+                    if item.cache_observations.is_some() {
+                        13
+                    } else {
+                        SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION
+                    }
+                }
+                SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION => {
+                    if item.cache_observations.is_some() {
+                        14
+                    } else {
+                        SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION
+                    }
+                }
                 _ => unreachable!("the supported-version filter is exhaustive"),
             };
             let proof = (public_version, snapshot_upload_body_witness(item));
@@ -748,7 +792,7 @@ impl SnapshotBatchResponse {
                 .is_some_and(|previous| previous != proof)
             {
                 return Err(anyhow!(
-                    "snapshot request contains conflicting context curve body witnesses"
+                    "snapshot request contains conflicting snapshot evidence body witnesses"
                 ));
             }
         }
@@ -920,7 +964,7 @@ fn validate_snapshot_entity_ref(reference: &SnapshotEntityRef) -> Result<()> {
     ) {
         (None, None) => {}
         (Some(version), Some(digest))
-            if matches!(version, 3..=6 | 9..=12)
+            if matches!(version, 3..=20)
                 && digest.len() == 64
                 && digest
                     .bytes()
@@ -1531,6 +1575,11 @@ impl SnapshotApiClient {
         request: &SnapshotBatchRequest,
         enforce_head_cas: bool,
     ) -> Result<SnapshotBatchResponse> {
+        let enforce_head_cas = enforce_head_cas
+            || request
+                .snapshots
+                .iter()
+                .any(|item| item.cache_observations.is_some());
         let body = if enforce_head_cas {
             serde_json::to_vec(&request.wire_with_head_cas())
         } else {
@@ -2603,6 +2652,30 @@ mod tests {
         ))
         .expect("new activity hint");
         assert!(new_backend.session_attribution_labels_enabled);
+    }
+
+    #[test]
+    fn cache_capability_defaults_off_and_requires_exact_contract() {
+        for extra in [
+            "",
+            r#", "session_cache_observations_contract":null"#,
+            r#", "session_cache_observations_contract":"unknown""#,
+        ] {
+            let hint: ActivityHintResponse =
+                serde_json::from_str(&activity_hint_json(extra)).unwrap();
+            assert_ne!(
+                hint.session_cache_observations_contract.as_deref(),
+                Some("session_cache_observations:v1")
+            );
+        }
+        let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+            r#", "session_cache_observations_contract":"session_cache_observations:v1""#,
+        ))
+        .unwrap();
+        assert_eq!(
+            hint.session_cache_observations_contract.as_deref(),
+            Some("session_cache_observations:v1")
+        );
     }
 
     #[test]

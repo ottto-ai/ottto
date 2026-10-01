@@ -1,0 +1,44 @@
+{
+  "canonicalization": "rfc8785:integers-only:v1",
+  "caps": {
+    "canonical_bytes": 131072,
+    "canonical_rows": 128,
+    "operations": 64,
+    "wire_bytes": 131072
+  },
+  "contract_version": "session_cache_observations:v1",
+  "detector_revision": "v1",
+  "duration_policy": "nonnegative_whole_seconds_floor",
+  "entity_ack_contract": "snapshot_entity_ack:v1",
+  "fixtures": {
+    "claude": {
+      "body_witness_digest": "0f94a7ae8d064c5135fee319f27e494685a00d8ce5e11e3f7493c7f4e29f12d2",
+      "body_witness_version": 15,
+      "fixture_canonical_sha256": "d9300168b8768ab8aa3a274a4c6f24f8fe88554cf48441aa1b5020dd7c4d6c21",
+      "fixture_file": "cache_observation_claude_v1.json",
+      "fixture_wire_bytes": 6442,
+      "normalized_public_body_witness_version": 13,
+      "parser_revision": "claude_code_jsonl:v36",
+      "scan_identity_revision": "claude_code_jsonl:v29"
+    },
+    "codex": {
+      "body_witness_digest": "0d37c87d497dc9cb4cba7dea49fbd05a0233d3235fb62f2d7b01cb7761cc0013",
+      "body_witness_version": 20,
+      "fixture_canonical_sha256": "b1a57be3081ca95045293952c021270c2890172f7f479aebdefd050a0796e631",
+      "fixture_file": "cache_observation_codex_v1.json",
+      "fixture_wire_bytes": 7597,
+      "normalized_public_body_witness_version": 18,
+      "parser_revision": "codex_jsonl:v38",
+      "scan_identity_revision": "codex_jsonl:v33"
+    }
+  },
+  "head_cas_contract": "snapshot_head_etag:v1",
+  "manifest_version": "local_cache_observations_wire_manifest:v1",
+  "normalized_public_body_witness_map": {
+    "15": 13,
+    "16": 14,
+    "19": 17,
+    "20": 18
+  },
+  "schema_version": 1
+}
