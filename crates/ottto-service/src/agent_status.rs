@@ -2927,6 +2927,7 @@ fn collect_claude_status_snapshots(
         }
     }
 
+    let mut blocked_worker_receipt_descriptors = BTreeMap::new();
     let mut custom_descriptors = descriptors
         .into_iter()
         .filter(|descriptor| descriptor.slot_id != "default")
@@ -2966,6 +2967,10 @@ fn collect_claude_status_snapshots(
                 clear_claude_slot_binding(&mut status);
             }
             append_claude_upkeep_result_receipt(&mut status, &descriptor, result_observed_at);
+            if status.state == ClaudeConfigSlotCollectionStateV1::RefreshDue {
+                blocked_worker_receipt_descriptors
+                    .insert(descriptor.slot_id.clone(), descriptor.clone());
+            }
             slot_states.insert(descriptor.slot_id, status);
             continue;
         }
@@ -3169,7 +3174,11 @@ fn collect_claude_status_snapshots(
         &slot_states,
         OffsetDateTime::parse(&captured_at, &Rfc3339).unwrap_or_else(|_| OffsetDateTime::now_utc()),
     );
-    let _ = persist_claude_slot_collection_states(&slot_states, &unresolved_accounts);
+    let _ = persist_claude_slot_collection_states(
+        &slot_states,
+        &unresolved_accounts,
+        &blocked_worker_receipt_descriptors,
+    );
 
     let mut source_health_snapshot = default_snapshot.clone();
     let mut custom_slot_states = slot_states
@@ -5411,12 +5420,71 @@ fn claude_slot_collection_state_path() -> PathBuf {
 fn persist_claude_slot_collection_states(
     slots: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
     unresolved_accounts: &[ClaudeUnresolvedAccountDescriptorV1],
+    blocked_descriptors: &BTreeMap<String, ClaudeConfigSlotDescriptorV1>,
+) -> std::io::Result<()> {
+    if blocked_descriptors.is_empty() {
+        return persist_claude_slot_collection_states_with_registry(
+            slots,
+            unresolved_accounts,
+            blocked_descriptors,
+            None,
+        );
+    }
+    // Same lock order as worker publication: registration before collection.
+    // Do not fall back to an unfenced retention write if registration is unavailable.
+    FileClaudeConfigSlotSettingsStore::default()
+        .with_locked_status(|registry| {
+            persist_claude_slot_collection_states_with_registry(
+                slots,
+                unresolved_accounts,
+                blocked_descriptors,
+                Some(registry),
+            )
+        })
+        .map_err(|_| {
+            std::io::Error::other("Claude registration unavailable for blocked receipt retention")
+        })?
+}
+
+fn persist_claude_slot_collection_states_with_registry(
+    slots: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+    unresolved_accounts: &[ClaudeUnresolvedAccountDescriptorV1],
+    blocked_descriptors: &BTreeMap<String, ClaudeConfigSlotDescriptorV1>,
+    registry: Option<&ottto_protocol::ClaudeAccountsStatusV1>,
 ) -> std::io::Result<()> {
     let _guard = claude_slot_collection_state_guard()?;
     let mut persisted = read_persisted_claude_slot_collection_state();
     for (slot_id, candidate) in slots {
         let previous = persisted.slots.get(slot_id).cloned();
-        merge_claude_slot_collection_state(&mut persisted.slots, slot_id, candidate);
+        let mut candidate = candidate.clone();
+        if let (Some(queued), Some(registry), Some(previous)) = (
+            blocked_descriptors.get(slot_id),
+            registry,
+            previous.as_ref(),
+        ) {
+            if crate::claude_upkeep::registered_slot_publication_allowed(
+                registry,
+                queued,
+                &default_support_dir(),
+            ) {
+                if let Some(current) = registry
+                    .managed_slots
+                    .iter()
+                    .chain(&registry.external_slots)
+                    .find(|slot| slot.slot_id == *slot_id)
+                {
+                    let mut current = current.clone();
+                    current.collection = previous.clone();
+                    retain_claude_worker_receipt_for_blocked_candidate(
+                        queued,
+                        &current,
+                        &mut candidate,
+                        OffsetDateTime::now_utc(),
+                    );
+                }
+            }
+        }
+        merge_claude_slot_collection_state(&mut persisted.slots, slot_id, &candidate);
         if persisted.slots.get(slot_id) != previous.as_ref() {
             record_claude_anchor_transitions(
                 &mut persisted.anchor_transitions,
@@ -5436,8 +5504,10 @@ fn persist_claude_slot_collection_states(
     // trusting the scheduled collector's stale view. Restrict the proof to
     // slots that are still registered so an orphaned best-effort state file
     // entry cannot suppress a real unresolved account after slot removal.
-    let current_slot_ids = FileClaudeConfigSlotSettingsStore::default()
-        .load()
+    let current_slot_ids = registry
+        .cloned()
+        .map(Ok)
+        .unwrap_or_else(|| FileClaudeConfigSlotSettingsStore::default().load())
         .map(|status| {
             std::iter::once(status.default_slot.slot_id)
                 .chain(status.managed_slots.into_iter().map(|slot| slot.slot_id))
@@ -5651,6 +5721,64 @@ fn merge_claude_slot_collection_state(
     candidate: &ClaudeConfigSlotCollectionStatusV1,
 ) {
     merge_claude_slot_collection_state_at(slots, slot_id, candidate, OffsetDateTime::now_utc());
+}
+
+fn retain_claude_worker_receipt_for_blocked_candidate(
+    queued: &ClaudeConfigSlotDescriptorV1,
+    current: &ClaudeConfigSlotDescriptorV1,
+    candidate: &mut ClaudeConfigSlotCollectionStatusV1,
+    now: OffsetDateTime,
+) {
+    if candidate.state != ClaudeConfigSlotCollectionStateV1::RefreshDue
+        || current.collection.state != ClaudeConfigSlotCollectionStateV1::RefreshDue
+        || bounded_claude_collection_timestamp(candidate.observed_at.as_deref(), now).is_none()
+    {
+        return;
+    }
+    let Some(fence) = crate::claude_upkeep::preclaim_descriptor(queued) else {
+        return;
+    };
+    let candidate_descriptor = ClaudeConfigSlotDescriptorV1 {
+        collection: candidate.clone(),
+        ..current.clone()
+    };
+    if crate::claude_upkeep::preclaim_descriptor(current).as_ref() != Some(&fence)
+        || crate::claude_upkeep::preclaim_descriptor(&candidate_descriptor).as_ref() != Some(&fence)
+    {
+        return;
+    }
+    let account = fence
+        .collection
+        .account_identifier_hash
+        .as_deref()
+        .expect("strong fence");
+    let organization = fence
+        .collection
+        .organization_identifier_hash
+        .as_deref()
+        .expect("strong fence");
+    let latest = |status: &ClaudeConfigSlotCollectionStatusV1| {
+        safe_claude_slot_check_diagnostics(&status.quota_check_diagnostics, account, organization)
+            .into_iter()
+            .filter(|entry| claude_worker_diagnostic_message(&entry.code).is_some())
+            .filter_map(|entry| {
+                bounded_claude_collection_timestamp(entry.observed_at.as_deref(), now)
+                    .map(|clock| (entry, clock))
+            })
+            .max_by_key(|(_, clock)| *clock)
+    };
+    let Some((receipt, clock)) = latest(&current.collection) else {
+        return;
+    };
+    if latest(candidate).is_some_and(|(_, candidate_clock)| candidate_clock >= clock) {
+        return;
+    }
+    // Only an actually blocked, same immutable registration/deadline candidate
+    // can inherit this lock-time receipt. Real provider/fresh writes replace it.
+    candidate
+        .quota_check_diagnostics
+        .retain(|entry| claude_worker_diagnostic_message(&entry.code).is_none());
+    candidate.quota_check_diagnostics.push(receipt);
 }
 
 fn bounded_claude_collection_timestamp(
@@ -13951,6 +14079,174 @@ mod tests {
             accepted.last_full_quota_read_at,
             slot.collection.last_full_quota_read_at
         );
+    }
+
+    #[test]
+    fn claude_worker_receipt_blocked_retention_requires_complete_fence_and_local_clock_precedence()
+    {
+        let (mut slot, _, _, now) = valid_access_reconciliation_fixture();
+        let mut stale = slot.collection.clone();
+        stale.observed_at = Some("2026-08-05T02:29:00Z".to_string());
+        append_claude_worker_diagnostic(
+            &mut slot.collection,
+            ClaudeWorkerDiagnostic::ReconciliationRefused,
+            "2026-08-05T02:30:00Z",
+            now,
+        )
+        .unwrap();
+        for mutation in 0..12 {
+            let mut current = slot.clone();
+            let mut candidate = stale.clone();
+            match mutation {
+                0 => current.config_dir = Some("/fixture/changed".to_string()),
+                1 => current.slot_id = "changed".to_string(),
+                2 => current.service_name = "changed".to_string(),
+                3 => current.ownership = ClaudeConfigSlotOwnership::Managed,
+                4 => current.collection.organization_identifier_hash = Some("foreign".to_string()),
+                5 => {
+                    current.collection.access_expires_at = Some("2026-08-05T03:00:00Z".to_string())
+                }
+                6 => current.collection.relogin_required_at = None,
+                7 => candidate.state = ClaudeConfigSlotCollectionStateV1::Fresh,
+                8 => candidate.state = ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
+                9 => candidate.account_identifier_hash = Some("foreign".to_string()),
+                10 => candidate.access_expires_at = Some("2026-08-05T03:00:00Z".to_string()),
+                _ => current.collection.state = ClaudeConfigSlotCollectionStateV1::Fresh,
+            }
+            let original = candidate.clone();
+            retain_claude_worker_receipt_for_blocked_candidate(
+                &slot,
+                &current,
+                &mut candidate,
+                now,
+            );
+            assert_eq!(candidate, original, "negative fence {mutation}");
+        }
+        let mut same = stale.clone();
+        retain_claude_worker_receipt_for_blocked_candidate(&slot, &slot, &mut same, now);
+        assert_eq!(
+            same.quota_check_diagnostics.last().unwrap().code,
+            "claude_slot_worker_reconciliation_refused"
+        );
+        let mut newer = stale.clone();
+        append_claude_worker_diagnostic(
+            &mut newer,
+            ClaudeWorkerDiagnostic::Observed(ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable),
+            "2026-08-05T02:30:00Z",
+            now,
+        )
+        .unwrap();
+        let original = newer.clone();
+        retain_claude_worker_receipt_for_blocked_candidate(&slot, &slot, &mut newer, now);
+        assert_eq!(newer, original, "equal/newer actual local receipt wins");
+        append_claude_worker_diagnostic(
+            &mut newer,
+            ClaudeWorkerDiagnostic::Observed(ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable),
+            "2026-08-05T02:30:01Z",
+            now + time::Duration::seconds(1),
+        )
+        .unwrap();
+        let original = newer.clone();
+        retain_claude_worker_receipt_for_blocked_candidate(
+            &slot,
+            &slot,
+            &mut newer,
+            now + time::Duration::seconds(1),
+        );
+        assert_eq!(newer, original, "genuinely newer local receipt wins");
+    }
+
+    #[test]
+    #[serial]
+    fn claude_worker_receipt_stale_clone_worker_batch_interleaving_is_fenced_at_lock_time() {
+        use ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION;
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-worker-interleaving-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let config = root.join("registered");
+        fs::create_dir(&config).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let registered = store
+            .register_path(
+                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                config.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+        store
+            .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, true)
+            .unwrap();
+        let mut slot = registered.external_slots[0].clone();
+        let (fixture, mut upkeep, _, _) = valid_access_reconciliation_fixture();
+        slot.collection = fixture.collection;
+        upkeep.result = ClaudeConfigSlotUpkeepResultV1::RefreshDue;
+        upkeep.due_access_expires_at = slot.collection.access_expires_at.clone();
+        persist_one_claude_slot_collection_state(&slot.slot_id, &slot.collection).unwrap();
+        // t1: actual blocked collector cloned before the t2 worker publication.
+        let stale = blocked_claude_upkeep_status(&slot.slot_id, "2026-08-05T02:29:00Z", upkeep);
+        record_registered_claude_worker_observation(
+            &slot,
+            ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
+        );
+        let worker = read_persisted_claude_slot_collection_state().slots[&slot.slot_id].clone();
+        let receipt = worker.quota_check_diagnostics.last().unwrap().clone();
+        assert_eq!(receipt.code, "claude_slot_worker_credential_unreadable");
+        let candidates = BTreeMap::from([(slot.slot_id.clone(), stale.clone())]);
+        let descriptors = BTreeMap::from([(slot.slot_id.clone(), slot.clone())]);
+        // t3: real delayed batch owner sees lock-time receipt, not stale clone.
+        persist_claude_slot_collection_states(&candidates, &[], &descriptors).unwrap();
+        let merged = read_persisted_claude_slot_collection_state().slots[&slot.slot_id].clone();
+        assert_eq!(merged.quota_check_diagnostics.last(), Some(&receipt));
+        let mut expected = stale.clone();
+        expected.quota_check_diagnostics.push(receipt.clone());
+        assert_eq!(merged, expected);
+
+        // Suppression may commit after clone/publication but before batch lock.
+        fs::write(root.join("claude-browser-auth-state.json"), b"{corrupt").unwrap();
+        persist_claude_slot_collection_states(&candidates, &[], &descriptors).unwrap();
+        let suppressed = read_persisted_claude_slot_collection_state().slots[&slot.slot_id].clone();
+        assert_eq!(
+            suppressed.quota_check_diagnostics,
+            stale.quota_check_diagnostics
+        );
+        fs::remove_file(root.join("claude-browser-auth-state.json")).unwrap();
+        // No descriptor transport for a genuine/new provider collection.
+        let mut worker = worker;
+        worker.observed_at = stale.observed_at.clone();
+        persist_one_claude_slot_collection_state(&slot.slot_id, &worker).unwrap();
+        assert!(
+            read_persisted_claude_slot_collection_state().slots[&slot.slot_id]
+                .quota_check_diagnostics
+                .iter()
+                .any(|entry| claude_worker_diagnostic_message(&entry.code).is_some())
+        );
+        let mut fresh = stale.clone();
+        fresh.state = ClaudeConfigSlotCollectionStateV1::Fresh;
+        persist_claude_slot_collection_states(
+            &BTreeMap::from([(slot.slot_id.clone(), fresh)]),
+            &[],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(
+            !read_persisted_claude_slot_collection_state().slots[&slot.slot_id]
+                .quota_check_diagnostics
+                .iter()
+                .any(|entry| claude_worker_diagnostic_message(&entry.code).is_some())
+        );
+        let before = read_persisted_claude_slot_collection_state().slots.clone();
+        fs::write(store.path(), b"{corrupt").unwrap();
+        assert!(
+            persist_claude_slot_collection_states(&candidates, &[], &descriptors).is_err(),
+            "unavailable registration is surfaced, never unsafe retention success"
+        );
+        assert_eq!(read_persisted_claude_slot_collection_state().slots, before);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -23787,8 +24083,12 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         )
         .expect("persist exact full proof");
 
-        persist_claude_slot_collection_states(&BTreeMap::new(), &[stale_unresolved])
-            .expect("persist delayed stale scheduled state");
+        persist_claude_slot_collection_states(
+            &BTreeMap::new(),
+            &[stale_unresolved],
+            &BTreeMap::new(),
+        )
+        .expect("persist delayed stale scheduled state");
 
         assert!(
             read_persisted_claude_slot_collection_state()

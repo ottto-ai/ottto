@@ -19,7 +19,13 @@ not evidence of no worker or a successful check. Old unfenced upkeep witnesses
 are not promoted into these diagnostics.
 
 The next blocked saved-expiry collection retains the receipt and original local
-clock. A genuine new collection can replace it with that collection's own
+clock, including a blocked candidate cloned before worker completion. The
+existing batch owner checks an ephemeral blocked-branch descriptor under
+registration then collection locks: unchanged root/service/owner, both hashes
+and deadlines, no suppression and no newer candidate local receipt. No descriptor
+is supplied by fresh/provider or suppressed collection branches. Registration
+failure refuses guarded persistence instead of falling back to unfenced retention.
+A genuine new collection can replace it with that collection's own
 evidence; this is not a worker history or a new retry mechanism. Unsupported UI
 consumers may ignore the new closed codes without treating them as provider
 success. Supported JSON consumers must likewise distinguish these local codes
