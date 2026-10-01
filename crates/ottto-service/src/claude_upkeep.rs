@@ -618,14 +618,29 @@ fn run_production_upkeep_queue() {
                 crate::agent_status::clear_claude_oauth_usage_auth_breaker(account, organization);
             }
         }
+        // Record an actual completed local worker observation, not queue
+        // admission, a vendor-command attempt, or a quota provider check.
+        let reconciled = if observation.proceed_with_collection
+            && !matches!(
+                observation.status.result,
+                ClaudeConfigSlotUpkeepResultV1::Refreshed
+                    | ClaudeConfigSlotUpkeepResultV1::NeedsLogin
+            ) {
+            crate::agent_status::reconcile_registered_claude_valid_access(
+                &descriptor,
+                &observation.status,
+            )
+        } else {
+            crate::agent_status::record_registered_claude_worker_observation(
+                &descriptor,
+                observation.status.result,
+            );
+            false
+        };
         if matches!(
             observation.status.result,
             ClaudeConfigSlotUpkeepResultV1::Refreshed | ClaudeConfigSlotUpkeepResultV1::NeedsLogin
-        ) || (observation.proceed_with_collection
-            && crate::agent_status::reconcile_registered_claude_valid_access(
-                &descriptor,
-                &observation.status,
-            ))
+        ) || reconciled
         {
             crate::snapshot_sync::spawn_claude_agent_status_refresh("upkeep");
         }
