@@ -2957,6 +2957,7 @@ fn collect_claude_status_snapshots(
             !claude_oauth_usage_network_disabled(),
         );
         if !upkeep.proceed_with_collection {
+            let result_observed_at = upkeep.result_observed_at.clone();
             let mut status =
                 blocked_claude_upkeep_status(&descriptor.slot_id, &captured_at, upkeep.status);
             if let Some(slot) = claude_config_slot_for_descriptor(&descriptor) {
@@ -2964,6 +2965,7 @@ fn collect_claude_status_snapshots(
             } else {
                 clear_claude_slot_binding(&mut status);
             }
+            append_claude_upkeep_result_receipt(&mut status, &descriptor, result_observed_at);
             slot_states.insert(descriptor.slot_id, status);
             continue;
         }
@@ -3462,12 +3464,14 @@ pub(crate) fn collect_registered_claude_slot_status(
         !claude_oauth_usage_network_disabled(),
     );
     if !upkeep.proceed_with_collection {
+        let result_observed_at = upkeep.result_observed_at.clone();
         let mut status = blocked_claude_upkeep_status(slot_id, &captured_at, upkeep.status);
         if let Some(slot) = claude_config_slot_for_descriptor(&descriptor) {
             retain_verified_claude_slot_binding(slot_id, &slot, &mut status);
         } else {
             clear_claude_slot_binding(&mut status);
         }
+        append_claude_upkeep_result_receipt(&mut status, &descriptor, result_observed_at);
         let _ = persist_one_claude_slot_collection_state(slot_id, &status);
         return status;
     }
@@ -3826,6 +3830,7 @@ fn safe_claude_slot_check_diagnostics(
             "claude_oauth_usage_check_succeeded" => "A supported exact-account quota response was collected successfully.",
             "claude_oauth_usage_network_disabled" => "Quota network collection is disabled on this machine.",
             "claude_oauth_usage_collection_in_progress" => "Quota collection is already in progress; no duplicate provider check was made.",
+            "claude_slot_upkeep_credential_unreadable" | "claude_slot_upkeep_probe_failed" | "claude_slot_upkeep_spawn_failed" => "The exact-slot local upkeep result was observed at this time; no quota provider check or vendor-command attempt is implied.",
             "claude_oauth_usage_circuit_open" => {
                 // These classifications come from the existing typed breaker,
                 // not an arbitrary transport error or credential string.
@@ -4474,10 +4479,17 @@ fn degraded_claude_slot_snapshot(
             .ok()?
             .as_str()?
             .to_string();
-        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
-            format!("claude_slot_upkeep_{result}"), AgentDiagnosticSeverity::Info,
+        let result_code = format!("claude_slot_upkeep_{result}");
+        if !snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == result_code)
+        {
+            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            result_code, AgentDiagnosticSeverity::Info,
             "The exact registered slot reported this local credential-upkeep result; it is not a quota provider check.",
         ).with_quota_binding(status.account_identifier_hash.clone(), status.organization_identifier_hash.clone()));
+        }
         if bounded_claude_collection_timestamp(
             upkeep.attempted_at.as_deref(),
             OffsetDateTime::now_utc(),
@@ -4778,6 +4790,53 @@ fn apply_claude_upkeep_observation(
     status.upkeep = Some(upkeep);
 }
 
+fn append_claude_upkeep_result_receipt(
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    observed_at: Option<String>,
+) {
+    if status.account_identifier_hash != descriptor.collection.account_identifier_hash
+        || status.organization_identifier_hash != descriptor.collection.organization_identifier_hash
+    {
+        return;
+    }
+    let Some(clock) = observed_at.filter(|at| {
+        bounded_claude_collection_timestamp(Some(at), OffsetDateTime::now_utc()).is_some()
+    }) else {
+        return;
+    };
+    let Some(upkeep) = &status.upkeep else {
+        return;
+    };
+    let suffix = match upkeep.result {
+        ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable => "credential_unreadable",
+        ClaudeConfigSlotUpkeepResultV1::ProbeFailed => "probe_failed",
+        ClaudeConfigSlotUpkeepResultV1::SpawnFailed => "spawn_failed",
+        _ => return,
+    };
+    let diagnostic = AgentStatusDiagnostic::source(format!("claude_slot_upkeep_{suffix}"), AgentDiagnosticSeverity::Info,
+        "The exact-slot local upkeep result was observed at this time; no quota provider check or vendor-command attempt is implied.")
+        .with_observed_at(Some(clock)).with_quota_binding(status.account_identifier_hash.clone(), status.organization_identifier_hash.clone());
+    status.quota_check_diagnostics.retain(|existing| {
+        existing.code != diagnostic.code
+            || existing.account_identifier_hash != diagnostic.account_identifier_hash
+            || existing.organization_identifier_hash != diagnostic.organization_identifier_hash
+    });
+    status
+        .quota_check_diagnostics
+        .extend(safe_claude_slot_check_diagnostics(
+            &[diagnostic],
+            status
+                .account_identifier_hash
+                .as_deref()
+                .unwrap_or_default(),
+            status
+                .organization_identifier_hash
+                .as_deref()
+                .unwrap_or_default(),
+        ));
+}
+
 fn registered_claude_failure_status(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     failure: ClaudeSlotProbeFailure,
@@ -4832,8 +4891,12 @@ fn upkeep_state_diagnostic(
             ClaudeConfigSlotDiagnosticCodeV1::StaleAccessToken,
             "This expired Claude slot is waiting for its durable upkeep retry deadline; no duplicate command was started.",
         ),
-        ClaudeConfigSlotUpkeepResultV1::RefreshDue
-        | ClaudeConfigSlotUpkeepResultV1::InProgress => (
+        ClaudeConfigSlotUpkeepResultV1::RefreshDue => (
+            ClaudeConfigSlotCollectionStateV1::RefreshDue,
+            ClaudeConfigSlotDiagnosticCodeV1::RefreshDue,
+            "This expired Claude slot is queued for background upkeep; no vendor-command attempt has been claimed yet.",
+        ),
+        ClaudeConfigSlotUpkeepResultV1::InProgress => (
             ClaudeConfigSlotCollectionStateV1::RefreshDue,
             ClaudeConfigSlotDiagnosticCodeV1::RefreshDue,
             "This expired Claude slot has one background upkeep attempt in progress.",
@@ -22027,6 +22090,93 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             .diagnostics
             .iter()
             .all(|item| !item.code.starts_with("claude_oauth_usage_check_")));
+    }
+
+    #[test]
+    fn claude_slot_diagnostics_keep_terminal_upkeep_clock_separate_from_attempt() {
+        let mut descriptor =
+            ClaudeConfigDirSlot::Default.descriptor("fixture", ClaudeConfigSlotOwnership::External);
+        descriptor.collection.account_identifier_hash = Some("account-a".to_string());
+        descriptor.collection.organization_identifier_hash = Some("org-a".to_string());
+        let mut status = provider_unavailable_status("2026-09-01T11:00:00Z", "account-a", "org-a");
+        status.upkeep = Some(ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+            result: ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
+            due_access_expires_at: Some("2026-09-01T10:00:00Z".to_string()),
+            refresh_token_expires_at: None,
+            attempted_at: None,
+            next_allowed_attempt_at: None,
+            consecutive_failures: 0,
+        });
+        append_claude_upkeep_result_receipt(
+            &mut status,
+            &descriptor,
+            Some("2026-09-01T10:59:00Z".to_string()),
+        );
+        for _ in 0..3 {
+            append_claude_upkeep_result_receipt(
+                &mut status,
+                &descriptor,
+                Some("2026-09-01T11:10:00Z".to_string()),
+            );
+        }
+        assert_eq!(
+            status.quota_check_diagnostics.len(),
+            1,
+            "repeated reads replace the exact-code receipt"
+        );
+        let persisted: ClaudeConfigSlotCollectionStatusV1 =
+            serde_json::from_slice(&serde_json::to_vec(&status).unwrap()).unwrap();
+        let snapshot = degraded_claude_slot_snapshot(
+            &persisted,
+            ClaudeAccountAnchorDurabilityV1::Anchored,
+            None,
+            "2026-09-01T12:00:00Z",
+            "2026-09-01T12:05:00Z",
+        )
+        .unwrap()
+        .redacted_for_backend();
+        let receipts = snapshot
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "claude_slot_upkeep_credential_unreadable")
+            .collect::<Vec<_>>();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            receipts[0].observed_at.as_deref(),
+            Some("2026-09-01T11:10:00Z")
+        );
+        assert!(!snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.contains("attempt_started")
+                || diagnostic.code.contains("check_succeeded")));
+        let mut rebound = status.clone();
+        rebound.quota_check_diagnostics.clear();
+        rebound.organization_identifier_hash = Some("other-org".to_string());
+        append_claude_upkeep_result_receipt(
+            &mut rebound,
+            &descriptor,
+            Some("2026-09-01T10:59:00Z".to_string()),
+        );
+        assert!(rebound.quota_check_diagnostics.is_empty());
+        let mut future = status;
+        future.quota_check_diagnostics.clear();
+        append_claude_upkeep_result_receipt(
+            &mut future,
+            &descriptor,
+            Some("2099-09-01T10:59:00Z".to_string()),
+        );
+        assert!(future.quota_check_diagnostics.is_empty());
+        assert!(
+            upkeep_state_diagnostic(ClaudeConfigSlotUpkeepResultV1::RefreshDue)
+                .2
+                .contains("queued")
+        );
+        assert!(
+            upkeep_state_diagnostic(ClaudeConfigSlotUpkeepResultV1::InProgress)
+                .2
+                .contains("in progress")
+        );
     }
 
     #[test]

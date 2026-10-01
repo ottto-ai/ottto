@@ -52,6 +52,8 @@ struct ProductionUpkeepQueue {
 pub(crate) struct ClaudeUpkeepObservation {
     pub(crate) proceed_with_collection: bool,
     pub(crate) status: ClaudeConfigSlotUpkeepStatusV1,
+    /// A completed local upkeep observation, never a provider quota check.
+    pub(crate) result_observed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,7 +77,13 @@ struct PersistedUpkeepWitnessV1 {
     due_access_expires_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refresh_token_expires_at: Option<String>,
-    attempted_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempted_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_observed_at: Option<String>,
+    /// Registration and strong binding at a preclaim observation; no secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preclaim_descriptor: Option<ClaudeConfigSlotDescriptorV1>,
     next_allowed_attempt_at: String,
     result: ClaudeConfigSlotUpkeepResultV1,
     consecutive_failures: u32,
@@ -87,7 +95,7 @@ impl PersistedUpkeepWitnessV1 {
             result: self.result,
             due_access_expires_at: Some(self.due_access_expires_at.clone()),
             refresh_token_expires_at: self.refresh_token_expires_at.clone(),
-            attempted_at: Some(self.attempted_at.clone()),
+            attempted_at: self.attempted_at.clone(),
             next_allowed_attempt_at: Some(self.next_allowed_attempt_at.clone()),
             consecutive_failures: self.consecutive_failures,
         }
@@ -196,6 +204,17 @@ trait FinalSpawnGate {
     ) -> Result<Option<ClaudeConfigSlotUpkeepStatusV1>, ()> {
         persist_preclaim_needs_login(support_dir, slot_id, status, now).map(Some)
     }
+
+    fn publish_preclaim_failure(
+        &self,
+        descriptor: &ClaudeConfigSlotDescriptorV1,
+        support_dir: &Path,
+        result: ClaudeConfigSlotUpkeepResultV1,
+        started_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<(), ()> {
+        persist_preclaim_failure(support_dir, descriptor, result, started_at, now)
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +226,22 @@ struct FixedFinalSpawnGate<'a> {
 
 #[cfg(test)]
 impl FinalSpawnGate for FixedFinalSpawnGate<'_> {
+    fn publish_preclaim_failure(
+        &self,
+        descriptor: &ClaudeConfigSlotDescriptorV1,
+        support_dir: &Path,
+        result: ClaudeConfigSlotUpkeepResultV1,
+        started_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<(), ()> {
+        if !self.consent
+            || !self.network_enabled
+            || support_dir.join(UPKEEP_DISABLED_FILE).is_file()
+        {
+            return Err(());
+        }
+        persist_preclaim_failure(support_dir, descriptor, result, started_at, now)
+    }
     fn start_if_allowed(
         &self,
         _descriptor: &ClaudeConfigSlotDescriptorV1,
@@ -229,6 +264,43 @@ impl FinalSpawnGate for FixedFinalSpawnGate<'_> {
 struct ProductionFinalSpawnGate;
 
 impl FinalSpawnGate for ProductionFinalSpawnGate {
+    fn publish_preclaim_failure(
+        &self,
+        descriptor: &ClaudeConfigSlotDescriptorV1,
+        support_dir: &Path,
+        result: ClaudeConfigSlotUpkeepResultV1,
+        started_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<(), ()> {
+        if default_support_dir() != support_dir {
+            return Err(());
+        }
+        FileClaudeConfigSlotSettingsStore::default()
+            .with_locked_status(|registry| {
+                if registry.consent != ClaudeAccountUpkeepConsentState::Granted
+                    || !slot_is_still_registered(registry, descriptor)
+                    || crate::claude_browser_auth::collection_suppression(&descriptor.slot_id)
+                        .is_some()
+                    || crate::agent_status::claude_oauth_usage_network_disabled()
+                    || support_dir.join(UPKEEP_DISABLED_FILE).is_file()
+                {
+                    return Err(());
+                }
+                let current =
+                    crate::agent_status::annotate_claude_accounts_status(registry.clone());
+                let current = current
+                    .managed_slots
+                    .iter()
+                    .chain(current.external_slots.iter())
+                    .find(|slot| slot.slot_id == descriptor.slot_id)
+                    .ok_or(())?;
+                if preclaim_descriptor(current) != preclaim_descriptor(descriptor) {
+                    return Err(());
+                }
+                persist_preclaim_failure(support_dir, descriptor, result, started_at, now)
+            })
+            .map_err(|_| ())?
+    }
     fn start_if_allowed(
         &self,
         descriptor: &ClaudeConfigSlotDescriptorV1,
@@ -396,8 +468,17 @@ pub(crate) fn observe_registered_slot_upkeep(
     if let Some(completed) = persisted_production_upkeep_observation(descriptor, now) {
         return completed;
     }
-    enqueue_production_upkeep(descriptor.clone());
-    observation_with_metadata(false, ClaudeConfigSlotUpkeepResultV1::InProgress, &metadata)
+    if let Err(observed_at) = enqueue_production_upkeep(descriptor.clone()) {
+        let mut observation = observation_with_metadata(
+            false,
+            ClaudeConfigSlotUpkeepResultV1::SpawnFailed,
+            &metadata,
+        );
+        observation.result_observed_at = format_timestamp(observed_at).ok();
+        return observation;
+    }
+    // Enqueueing is not a durable claim and does not prove a vendor process started.
+    observation_with_metadata(false, ClaudeConfigSlotUpkeepResultV1::RefreshDue, &metadata)
 }
 
 /// Return the durable result from the current credential-expiry attempt while
@@ -416,6 +497,18 @@ fn persisted_production_upkeep_observation(
     if witness.due_access_expires_at != due_access_expires_at {
         return None;
     }
+    let result_observed_at = if let Some(fence) = &witness.preclaim_descriptor {
+        if preclaim_descriptor(descriptor).as_ref() != Some(fence)
+            || parse_timestamp(witness.result_observed_at.as_deref()).map_or(true, |at| at > now)
+        {
+            return None;
+        }
+        witness.result_observed_at.clone()
+    } else {
+        // Legacy/claimed witnesses keep their status and retry budget, but
+        // cannot certify a result clock for an unrecorded account binding.
+        None
+    };
     let retry_pending =
         parse_timestamp(Some(&witness.next_allowed_attempt_at)).is_some_and(|next| now < next);
     if witness.result != ClaudeConfigSlotUpkeepResultV1::NeedsLogin && !retry_pending {
@@ -424,10 +517,25 @@ fn persisted_production_upkeep_observation(
     Some(ClaudeUpkeepObservation {
         proceed_with_collection: witness.result == ClaudeConfigSlotUpkeepResultV1::Refreshed,
         status: witness.local_status(),
+        result_observed_at,
     })
 }
 
-fn enqueue_production_upkeep(descriptor: ClaudeConfigSlotDescriptorV1) {
+fn enqueue_production_upkeep(
+    descriptor: ClaudeConfigSlotDescriptorV1,
+) -> Result<(), OffsetDateTime> {
+    enqueue_production_upkeep_with(descriptor, || {
+        thread::Builder::new()
+            .name("ottto-claude-upkeep".to_string())
+            .spawn(run_production_upkeep_queue)
+    })
+}
+
+fn enqueue_production_upkeep_with(
+    descriptor: ClaudeConfigSlotDescriptorV1,
+    spawn: impl FnOnce() -> std::io::Result<thread::JoinHandle<()>>,
+) -> Result<(), OffsetDateTime> {
+    let started_at = OffsetDateTime::now_utc();
     let queue =
         PRODUCTION_UPKEEP_QUEUE.get_or_init(|| Mutex::new(ProductionUpkeepQueue::default()));
     let should_spawn = {
@@ -445,19 +553,30 @@ fn enqueue_production_upkeep(descriptor: ClaudeConfigSlotDescriptorV1) {
         }
     };
     if !should_spawn {
-        return;
+        return Ok(());
     }
-    let spawn = thread::Builder::new()
-        .name("ottto-claude-upkeep".to_string())
-        .spawn(run_production_upkeep_queue);
-    if spawn.is_err() {
-        let mut queue = queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue.running = false;
-        queue.queued_slot_ids.clear();
-        queue.descriptors.clear();
+    if spawn().is_err() {
+        let failed = {
+            let mut queue = queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue.running = false;
+            queue.queued_slot_ids.clear();
+            queue.descriptors.drain(..).collect::<Vec<_>>()
+        };
+        let now = OffsetDateTime::now_utc();
+        for descriptor in failed {
+            let _ = ProductionFinalSpawnGate.publish_preclaim_failure(
+                &descriptor,
+                &default_support_dir(),
+                ClaudeConfigSlotUpkeepResultV1::SpawnFailed,
+                started_at,
+                now,
+            );
+        }
+        return Err(now);
     }
+    Ok(())
 }
 
 fn run_production_upkeep_queue() {
@@ -522,6 +641,7 @@ fn observe_and_publish_registered_slot_upkeep_with_gate(
     process: &dyn DoctorProcessRunner,
     final_gate: &dyn FinalSpawnGate,
 ) -> ClaudeUpkeepObservation {
+    let started_at = clock.now();
     let mut observation = observe_registered_slot_upkeep_with_gate(
         descriptor,
         consent,
@@ -548,6 +668,23 @@ fn observe_and_publish_registered_slot_upkeep_with_gate(
             clock.now(),
         ) {
             observation.status = status;
+        }
+    }
+    if observation.status.attempted_at.is_none()
+        && preclaim_failure_result(observation.status.result)
+    {
+        let now = clock.now();
+        if final_gate
+            .publish_preclaim_failure(
+                descriptor,
+                support_dir,
+                observation.status.result,
+                started_at,
+                now,
+            )
+            .is_ok()
+        {
+            observation.result_observed_at = format_timestamp(now).ok();
         }
     }
     observation
@@ -706,6 +843,7 @@ fn observe_registered_slot_upkeep_with_gate(
             return ClaudeUpkeepObservation {
                 proceed_with_collection: false,
                 status: ClaudeConfigSlotUpkeepStatusV1 { result, ..status },
+                result_observed_at: None,
             };
         }
         ClaimOutcome::Claimed(token, status) => (token, status),
@@ -729,6 +867,7 @@ fn observe_registered_slot_upkeep_with_gate(
             return ClaudeUpkeepObservation {
                 proceed_with_collection: false,
                 status: completed,
+                result_observed_at: format_timestamp(clock.now()).ok(),
             };
         }
     };
@@ -762,6 +901,7 @@ fn observe_registered_slot_upkeep_with_gate(
     ClaudeUpkeepObservation {
         proceed_with_collection: proceed,
         status: completed,
+        result_observed_at: format_timestamp(clock.now()).ok(),
     }
 }
 
@@ -772,6 +912,7 @@ fn observation(
 ) -> ClaudeUpkeepObservation {
     ClaudeUpkeepObservation {
         proceed_with_collection,
+        result_observed_at: witness.and_then(|witness| witness.result_observed_at.clone()),
         status: witness.map_or(
             ClaudeConfigSlotUpkeepStatusV1 {
                 result,
@@ -793,6 +934,7 @@ fn observation_with_metadata(
 ) -> ClaudeUpkeepObservation {
     ClaudeUpkeepObservation {
         proceed_with_collection,
+        result_observed_at: None,
         status: ClaudeConfigSlotUpkeepStatusV1 {
             result,
             due_access_expires_at: metadata.access_expires_at.clone(),
@@ -841,7 +983,9 @@ fn claim_attempt(
     let witness = PersistedUpkeepWitnessV1 {
         due_access_expires_at: due_access_expires_at.to_string(),
         refresh_token_expires_at,
-        attempted_at: now_text.clone(),
+        attempted_at: Some(now_text.clone()),
+        result_observed_at: None,
+        preclaim_descriptor: None,
         next_allowed_attempt_at: format_timestamp(next_allowed)?,
         result: ClaudeConfigSlotUpkeepResultV1::InProgress,
         consecutive_failures: previous_failures,
@@ -870,7 +1014,7 @@ fn complete_attempt(
     let mut state = load_state(support_dir)?;
     let witness = state.slots.get_mut(&token.slot_id).ok_or(())?;
     if witness.due_access_expires_at != token.due_access_expires_at
-        || witness.attempted_at != token.attempted_at
+        || witness.attempted_at.as_deref() != Some(token.attempted_at.as_str())
         || witness.result != ClaudeConfigSlotUpkeepResultV1::InProgress
     {
         return Err(());
@@ -884,6 +1028,7 @@ fn complete_attempt(
             | ClaudeConfigSlotUpkeepResultV1::NeedsLogin
     );
     witness.result = result;
+    witness.result_observed_at = Some(format_timestamp(now)?);
     witness.consecutive_failures = if success {
         0
     } else if neutral {
@@ -925,7 +1070,9 @@ fn persist_preclaim_needs_login(
     let witness = PersistedUpkeepWitnessV1 {
         due_access_expires_at: due_access_expires_at.to_string(),
         refresh_token_expires_at: status.refresh_token_expires_at.clone(),
-        attempted_at: now_text.clone(),
+        attempted_at: Some(now_text.clone()),
+        result_observed_at: Some(now_text.clone()),
+        preclaim_descriptor: None,
         next_allowed_attempt_at: now_text,
         result: ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
         consecutive_failures: 0,
@@ -946,6 +1093,92 @@ fn backoff_duration(failures: u32) -> TimeDuration {
     )
 }
 
+fn preclaim_failure_result(result: ClaudeConfigSlotUpkeepResultV1) -> bool {
+    matches!(
+        result,
+        ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable
+            | ClaudeConfigSlotUpkeepResultV1::ProbeFailed
+            | ClaudeConfigSlotUpkeepResultV1::SpawnFailed
+    )
+}
+
+fn preclaim_descriptor(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+) -> Option<ClaudeConfigSlotDescriptorV1> {
+    let account = descriptor
+        .collection
+        .account_identifier_hash
+        .as_deref()
+        .filter(|value| !value.is_empty())?;
+    let organization = descriptor
+        .collection
+        .organization_identifier_hash
+        .as_deref()
+        .filter(|value| !value.is_empty())?;
+    parse_timestamp(descriptor.collection.access_expires_at.as_deref())?;
+    let mut fence = descriptor.clone();
+    fence.collection = Default::default();
+    fence.collection.account_identifier_hash = Some(account.to_string());
+    fence.collection.organization_identifier_hash = Some(organization.to_string());
+    fence.collection.access_expires_at = descriptor.collection.access_expires_at.clone();
+    fence.collection.relogin_required_at = descriptor.collection.relogin_required_at.clone();
+    Some(fence)
+}
+
+fn persist_preclaim_failure(
+    support_dir: &Path,
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    result: ClaudeConfigSlotUpkeepResultV1,
+    started_at: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Result<(), ()> {
+    if !preclaim_failure_result(result) || started_at > now {
+        return Err(());
+    }
+    let fence = preclaim_descriptor(descriptor).ok_or(())?;
+    let due = fence.collection.access_expires_at.as_deref().ok_or(())?;
+    if parse_timestamp(Some(due)).map_or(true, |at| at > now) {
+        return Err(());
+    }
+    let _guard = upkeep_state_guard(support_dir).map_err(|_| ())?;
+    let mut state = load_state(support_dir)?;
+    if let Some(existing) = state.slots.get(&descriptor.slot_id) {
+        if existing.result == ClaudeConfigSlotUpkeepResultV1::InProgress
+            || parse_timestamp(Some(&existing.due_access_expires_at))
+                .is_some_and(|at| at > parse_timestamp(Some(due)).expect("validated"))
+            || parse_timestamp(existing.result_observed_at.as_deref())
+                .is_some_and(|at| at > started_at)
+        {
+            return Err(());
+        }
+    }
+    let previous = state
+        .slots
+        .get(&descriptor.slot_id)
+        .filter(|witness| witness.due_access_expires_at == due);
+    let consecutive_failures = previous.map_or(0, |witness| witness.consecutive_failures);
+    let next_allowed = (now + backoff_duration(consecutive_failures.max(1))).max(
+        previous
+            .and_then(|witness| parse_timestamp(Some(&witness.next_allowed_attempt_at)))
+            .unwrap_or(now),
+    );
+    state.slots.insert(
+        descriptor.slot_id.clone(),
+        PersistedUpkeepWitnessV1 {
+            due_access_expires_at: due.to_string(),
+            refresh_token_expires_at: descriptor.collection.relogin_required_at.clone(),
+            attempted_at: None,
+            result_observed_at: Some(format_timestamp(now)?),
+            preclaim_descriptor: Some(fence),
+            // Publishing an unclaimed observation never resets claimed retry history.
+            next_allowed_attempt_at: format_timestamp(next_allowed)?,
+            result,
+            consecutive_failures,
+        },
+    );
+    write_state(support_dir, &state)
+}
+
 fn load_state(support_dir: &Path) -> Result<PersistedUpkeepStateV1, ()> {
     let path = support_dir.join(UPKEEP_STATE_FILE);
     if !path.exists() {
@@ -964,7 +1197,17 @@ fn validate_state(state: &PersistedUpkeepStateV1) -> Result<(), ()> {
     for (slot_id, witness) in &state.slots {
         if slot_id.is_empty()
             || parse_timestamp(Some(&witness.due_access_expires_at)).is_none()
-            || parse_timestamp(Some(&witness.attempted_at)).is_none()
+            || witness
+                .attempted_at
+                .as_deref()
+                .is_some_and(|at| parse_timestamp(Some(at)).is_none())
+            || (witness.attempted_at.is_none()
+                && (witness.preclaim_descriptor.is_none()
+                    || !preclaim_failure_result(witness.result)))
+            || witness
+                .result_observed_at
+                .as_deref()
+                .is_some_and(|at| parse_timestamp(Some(at)).is_none())
             || parse_timestamp(Some(&witness.next_allowed_attempt_at)).is_none()
             || witness
                 .refresh_token_expires_at
@@ -1335,7 +1578,7 @@ mod tests {
             assert!(!observation.proceed_with_collection);
             assert_eq!(
                 observation.status.result,
-                ClaudeConfigSlotUpkeepResultV1::InProgress
+                ClaudeConfigSlotUpkeepResultV1::RefreshDue
             );
         }
         assert!(
@@ -1406,6 +1649,430 @@ mod tests {
             ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn bound_preclaim_descriptor() -> ClaudeConfigSlotDescriptorV1 {
+        let mut descriptor = descriptor();
+        descriptor.collection.account_identifier_hash = Some("test-account".to_string());
+        descriptor.collection.organization_identifier_hash = Some("test-org".to_string());
+        descriptor.collection.access_expires_at = Some("2026-08-04T10:00:00Z".to_string());
+        descriptor.collection.relogin_required_at = Some("2026-09-01T00:00:00Z".to_string());
+        descriptor
+    }
+
+    #[test]
+    #[serial]
+    fn unfenced_claimed_terminal_readback_never_certifies_same_or_rebound_pair_clock() {
+        let root = temp_dir("unfenced-claimed-terminal-clock");
+        let _support_guard = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let descriptor = bound_preclaim_descriptor();
+        let now = at("2026-08-04T10:00:00Z");
+        let ClaimOutcome::Claimed(token, _) = claim_attempt(
+            &root,
+            &descriptor.slot_id,
+            descriptor.collection.access_expires_at.as_deref().unwrap(),
+            descriptor.collection.relogin_required_at.clone(),
+            now,
+        )
+        .unwrap() else {
+            panic!("claim");
+        };
+        complete_attempt(
+            &root,
+            &token,
+            ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
+            now + TimeDuration::seconds(1),
+        )
+        .unwrap();
+        let witness = load_state(&root).unwrap().slots[&descriptor.slot_id].clone();
+        assert_eq!(witness.preclaim_descriptor, None);
+        assert!(witness.result_observed_at.is_some());
+
+        for rebound in [false, true] {
+            let mut current = descriptor.clone();
+            if rebound {
+                current.collection.account_identifier_hash = Some("rebound-account".to_string());
+                current.collection.organization_identifier_hash = Some("rebound-org".to_string());
+            }
+            let receipt =
+                persisted_production_upkeep_observation(&current, now + TimeDuration::seconds(2))
+                    .expect("legacy status/backoff remains visible without a certified pair clock");
+            assert_eq!(receipt.status, witness.local_status());
+            assert_eq!(receipt.result_observed_at, None, "rebound={rebound}");
+            assert!(!receipt.proceed_with_collection);
+        }
+        assert_eq!(
+            load_state(&root).unwrap().slots[&descriptor.slot_id],
+            witness
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn preclaim_terminal_readback_survives_worker_without_vendor_attempt() {
+        let root = temp_dir("preclaim-terminal-readback");
+        let _support_guard = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let descriptor = bound_preclaim_descriptor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observation = observe_and_publish_registered_slot_upkeep_with_gate(
+            &descriptor,
+            true,
+            true,
+            &root,
+            &FixedClock(at("2026-08-04T10:00:01Z")),
+            &SequenceCredentials::new(vec![None]),
+            &CountingProcess {
+                result: DoctorProcessResult::ExitZero,
+                calls: calls.clone(),
+            },
+            &FixedFinalSpawnGate {
+                consent: true,
+                network_enabled: true,
+                support_dir: &root,
+            },
+        );
+        assert_eq!(
+            observation.status.result,
+            ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let next = persisted_production_upkeep_observation(&descriptor, at("2026-08-04T10:00:02Z"))
+            .expect("terminal result cannot disappear into perpetual queued presentation");
+        assert_eq!(
+            next.status.result,
+            ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable
+        );
+        assert_eq!(next.status.attempted_at, None);
+        assert_eq!(
+            next.result_observed_at.as_deref(),
+            Some("2026-08-04T10:00:01Z")
+        );
+        assert!(!next.proceed_with_collection);
+        for (index, result) in [
+            ClaudeConfigSlotUpkeepResultV1::ProbeFailed,
+            ClaudeConfigSlotUpkeepResultV1::SpawnFailed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let start = at("2026-08-04T10:00:03Z") + TimeDuration::seconds(index as i64 * 2);
+            persist_preclaim_failure(
+                &root,
+                &descriptor,
+                result,
+                start,
+                start + TimeDuration::seconds(1),
+            )
+            .expect("typed failure");
+            assert_eq!(
+                persisted_production_upkeep_observation(
+                    &descriptor,
+                    start + TimeDuration::seconds(2)
+                )
+                .unwrap()
+                .status
+                .result,
+                result
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn preclaim_terminal_readback_fences_binding_clock_and_active_claim() {
+        let root = temp_dir("preclaim-terminal-fences");
+        let _support_guard = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let descriptor = bound_preclaim_descriptor();
+        let now = at("2026-08-04T10:00:01Z");
+        persist_preclaim_failure(
+            &root,
+            &descriptor,
+            ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
+            now,
+            now,
+        )
+        .unwrap();
+        assert!(
+            persisted_production_upkeep_observation(&descriptor, now - TimeDuration::seconds(1))
+                .is_none(),
+            "future result is not replayable"
+        );
+        assert!(
+            persisted_production_upkeep_observation(&descriptor, now + TimeDuration::minutes(5))
+                .is_none(),
+            "expired result is not replayable"
+        );
+        for mutate in [0, 1, 2, 3, 4] {
+            let mut other = descriptor.clone();
+            match mutate {
+                0 => other.collection.organization_identifier_hash = Some("other-org".to_string()),
+                1 => other.collection.account_identifier_hash = Some("other-account".to_string()),
+                2 => other.config_dir = Some("/tmp/other-registration".to_string()),
+                3 => other.collection.access_expires_at = Some("2026-08-04T11:00:00Z".to_string()),
+                _ => {
+                    other.collection.relogin_required_at = Some("2026-10-01T00:00:00Z".to_string())
+                }
+            }
+            assert!(persisted_production_upkeep_observation(&other, now).is_none());
+        }
+        assert!(
+            persist_preclaim_failure(
+                &root,
+                &descriptor,
+                ClaudeConfigSlotUpkeepResultV1::ProbeFailed,
+                now + TimeDuration::seconds(1),
+                now
+            )
+            .is_err(),
+            "backward clock must refuse publication"
+        );
+        assert!(
+            persist_preclaim_failure(
+                &root,
+                &descriptor,
+                ClaudeConfigSlotUpkeepResultV1::ProbeFailed,
+                now - TimeDuration::seconds(1),
+                now
+            )
+            .is_err(),
+            "newer terminal result wins"
+        );
+        claim_attempt(
+            &root,
+            &descriptor.slot_id,
+            "2026-08-04T10:00:00Z",
+            None,
+            now + TimeDuration::minutes(6),
+        )
+        .unwrap();
+        assert!(
+            persist_preclaim_failure(
+                &root,
+                &descriptor,
+                ClaudeConfigSlotUpkeepResultV1::ProbeFailed,
+                now + TimeDuration::minutes(6),
+                now + TimeDuration::minutes(6)
+            )
+            .is_err(),
+            "active claim wins"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preclaim_terminal_backward_decode_and_consent_refusal() {
+        let legacy: PersistedUpkeepWitnessV1 = serde_json::from_value(serde_json::json!({
+            "due_access_expires_at":"2026-08-04T10:00:00Z", "attempted_at":"2026-08-04T10:00:01Z",
+            "next_allowed_attempt_at":"2026-08-04T10:05:01Z", "result":"in_progress", "consecutive_failures":0
+        })).unwrap();
+        assert_eq!(
+            legacy.local_status().attempted_at.as_deref(),
+            Some("2026-08-04T10:00:01Z")
+        );
+        assert_eq!(legacy.result_observed_at, None);
+        let root = temp_dir("preclaim-consent-off");
+        let descriptor = bound_preclaim_descriptor();
+        let gate = FixedFinalSpawnGate {
+            consent: false,
+            network_enabled: true,
+            support_dir: &root,
+        };
+        assert!(gate
+            .publish_preclaim_failure(
+                &descriptor,
+                &root,
+                ClaudeConfigSlotUpkeepResultV1::ProbeFailed,
+                at("2026-08-04T10:00:01Z"),
+                at("2026-08-04T10:00:01Z")
+            )
+            .is_err());
+        assert!(load_state(&root).unwrap().slots.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn preclaim_terminal_preserves_completed_claim_retry_budget() {
+        let root = temp_dir("preclaim-existing-retry-budget");
+        let _support_guard = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let descriptor = bound_preclaim_descriptor();
+        let ClaimOutcome::Claimed(token, _) = claim_attempt(
+            &root,
+            &descriptor.slot_id,
+            "2026-08-04T10:00:00Z",
+            None,
+            at("2026-08-04T10:00:00Z"),
+        )
+        .unwrap() else {
+            panic!("claim");
+        };
+        complete_attempt(
+            &root,
+            &token,
+            ClaudeConfigSlotUpkeepResultV1::NonzeroExit,
+            at("2026-08-04T10:00:01Z"),
+        )
+        .unwrap();
+        let mut state = load_state(&root).unwrap();
+        state
+            .slots
+            .get_mut(&descriptor.slot_id)
+            .unwrap()
+            .consecutive_failures = 6;
+        write_state(&root, &state).unwrap();
+        let now = at("2026-08-04T10:10:00Z");
+        persist_preclaim_failure(
+            &root,
+            &descriptor,
+            ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
+            now,
+            now,
+        )
+        .unwrap();
+        let witness = load_state(&root)
+            .unwrap()
+            .slots
+            .remove(&descriptor.slot_id)
+            .unwrap();
+        assert_eq!(witness.consecutive_failures, 6);
+        assert_eq!(
+            parse_timestamp(Some(&witness.next_allowed_attempt_at)),
+            Some(now + backoff_duration(6))
+        );
+        assert_eq!(witness.attempted_at, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn preclaim_terminal_production_gate_refuses_removed_rebound_and_suppressed_slots() {
+        let root = temp_dir("preclaim-production-fence");
+        let _support_guard = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let config_dir = root.join("registered");
+        fs::create_dir_all(&config_dir).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let registered = store
+            .register_path(
+                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                config_dir.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+        let mut descriptor = registered.external_slots[0].clone();
+        descriptor.collection = bound_preclaim_descriptor().collection;
+        descriptor.collection.observed_at = Some("2026-08-04T10:00:00Z".to_string());
+        crate::agent_status::persist_one_claude_slot_collection_state(
+            &descriptor.slot_id,
+            &descriptor.collection,
+        )
+        .unwrap();
+        let now = at("2026-08-04T10:00:01Z");
+        let publish = || {
+            ProductionFinalSpawnGate.publish_preclaim_failure(
+                &descriptor,
+                &root,
+                ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
+                now,
+                now,
+            )
+        };
+        assert!(publish().is_err(), "consent off");
+        store
+            .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, true)
+            .unwrap();
+        fs::write(root.join("claude-browser-auth-state.json"), b"{corrupt").unwrap();
+        assert!(publish().is_err(), "suppressed state unavailable");
+        fs::remove_file(root.join("claude-browser-auth-state.json")).unwrap();
+        let mut rebound = descriptor.collection.clone();
+        rebound.organization_identifier_hash = Some("other-org".to_string());
+        rebound.observed_at = Some("2026-08-04T10:00:01Z".to_string());
+        crate::agent_status::persist_one_claude_slot_collection_state(
+            &descriptor.slot_id,
+            &rebound,
+        )
+        .unwrap();
+        assert!(publish().is_err(), "rebound collection");
+        store
+            .remove(
+                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                &descriptor.slot_id,
+            )
+            .unwrap();
+        assert!(publish().is_err(), "removed registration");
+        assert!(
+            load_state(&root).unwrap().slots.is_empty(),
+            "no stale authority persisted"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn preclaim_terminal_queue_spawn_failure_has_original_result_clock_without_attempt() {
+        let root = temp_dir("preclaim-queue-spawn-failure");
+        let _support_guard = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let config_dir = root.join("registered");
+        fs::create_dir_all(&config_dir).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let registered = store
+            .register_path(
+                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                config_dir.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+        store
+            .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, true)
+            .unwrap();
+        let mut descriptor = registered.external_slots[0].clone();
+        descriptor.collection = bound_preclaim_descriptor().collection;
+        descriptor.collection.observed_at = Some("2026-08-04T10:00:00Z".to_string());
+        crate::agent_status::persist_one_claude_slot_collection_state(
+            &descriptor.slot_id,
+            &descriptor.collection,
+        )
+        .unwrap();
+        let observed_at = enqueue_production_upkeep_with(descriptor.clone(), || {
+            Err(std::io::Error::other("injected spawn failure"))
+        })
+        .expect_err("mock queue start fails without any worker/vendor spawn");
+        let receipt = persisted_production_upkeep_observation(&descriptor, observed_at)
+            .expect("failed queue has safe durable result");
+        assert_eq!(
+            receipt.status.result,
+            ClaudeConfigSlotUpkeepResultV1::SpawnFailed
+        );
+        assert_eq!(receipt.status.attempted_at, None);
+        assert_eq!(
+            receipt.result_observed_at,
+            format_timestamp(observed_at).ok()
+        );
+        assert!(PRODUCTION_UPKEEP_QUEUE
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .queued_slot_ids
+            .is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
