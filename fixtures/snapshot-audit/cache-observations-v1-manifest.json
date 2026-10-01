@@ -22,11 +22,11 @@
       "scan_identity_revision": "claude_code_jsonl:v29"
     },
     "codex": {
-      "body_witness_digest": "0d37c87d497dc9cb4cba7dea49fbd05a0233d3235fb62f2d7b01cb7761cc0013",
+      "body_witness_digest": "783c6eec9f21352990e06315765b265c7dee9ff82cd136aef995a53baf51ba7e",
       "body_witness_version": 20,
-      "fixture_canonical_sha256": "b1a57be3081ca95045293952c021270c2890172f7f479aebdefd050a0796e631",
+      "fixture_canonical_sha256": "d7233b6de6dfc00a151c354ffe43434e49cfcf28c32490854946dff81b8618fc",
       "fixture_file": "cache_observation_codex_v1.json",
-      "fixture_wire_bytes": 7597,
+      "fixture_wire_bytes": 7613,
       "normalized_public_body_witness_version": 18,
       "parser_revision": "codex_jsonl:v38",
       "scan_identity_revision": "codex_jsonl:v33"

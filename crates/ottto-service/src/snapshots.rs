@@ -7519,6 +7519,9 @@ struct SnapshotAccumulator {
     activity_tool_counts: BTreeMap<String, u64>,
     activity_call_tools: BTreeMap<String, String>,
     activity_mcp_tool_counts: BTreeMap<String, u64>,
+    // Codex MCP calls keyed by the backend's qualified `mcp__<server>__<tool>`
+    // spelling. Fed by the same `mcp_tool_call_end` events as the activity map.
+    activity_mcp_tool_usage_counts: BTreeMap<String, u64>,
     activity_capability_buckets: BTreeMap<(String, String, String), u64>,
     seen_claude_capability_tool_uses: BTreeSet<String>,
     activity_skills: BTreeSet<String>,
@@ -7681,6 +7684,7 @@ impl SnapshotAccumulator {
             activity_tool_counts: BTreeMap::new(),
             activity_call_tools: BTreeMap::new(),
             activity_mcp_tool_counts: BTreeMap::new(),
+            activity_mcp_tool_usage_counts: BTreeMap::new(),
             activity_capability_buckets: BTreeMap::new(),
             seen_claude_capability_tool_uses: BTreeSet::new(),
             activity_skills: BTreeSet::new(),
@@ -9223,13 +9227,25 @@ impl SnapshotAccumulator {
             SnapshotSource::Pi => Some("uncached".to_string()),
         };
         let activity_summary = self.activity_summary();
-        // Claude is the only parser that currently derives this new contract.
-        // Emit an explicit empty list for a counted Claude transcript so a
-        // newer cumulative scan can clear a previously observed aggregate;
-        // omit the field for Codex/Pi, whose parsers do not populate it.
-        let tool_usage = (self.source == SnapshotSource::ClaudeCode)
-            .then(|| bounded_tool_usage_counts(&self.tool_usage_counts));
-        let tool_usage_truncated = self.tool_usage_truncated;
+        // Emit an explicit empty list for a counted Claude/Codex transcript so
+        // a newer cumulative scan can clear a previously observed aggregate.
+        // Codex reuses the activity-summary counts (MCP-reclassified calls are
+        // already removed from the plain map). Pi's parser does not see tool
+        // names, so the field stays omitted there.
+        let (tool_usage, tool_usage_truncated) = match self.source {
+            SnapshotSource::ClaudeCode => (
+                Some(bounded_tool_usage_counts(&self.tool_usage_counts)),
+                self.tool_usage_truncated,
+            ),
+            SnapshotSource::Codex => {
+                let (rows, truncated) = codex_tool_usage_rows(
+                    &self.activity_tool_counts,
+                    &self.activity_mcp_tool_usage_counts,
+                );
+                (Some(rows), truncated)
+            }
+            SnapshotSource::Pi => (None, false),
+        };
         if self.source == SnapshotSource::ClaudeCode {
             bound_claude_attribution_mcp_tool_cardinality(&mut self.usage_buckets);
         }
@@ -12808,6 +12824,28 @@ fn bounded_activity_counts(
     rows
 }
 
+/// Codex `tool_usage`: plain tool names plus `mcp__<server>__<tool>` MCP
+/// names, highest counts kept when more than `MAX_TOOL_USAGE_NAMES` exist.
+fn codex_tool_usage_rows(
+    tool_counts: &BTreeMap<String, u64>,
+    mcp_tool_counts: &BTreeMap<String, u64>,
+) -> (Vec<SnapshotToolUsage>, bool) {
+    let mut merged: BTreeMap<String, u64> = BTreeMap::new();
+    for (name, count) in tool_counts.iter().chain(mcp_tool_counts) {
+        if *count == 0 {
+            continue;
+        }
+        if let Some(name) = bounded_tool_usage_name(name) {
+            let entry = merged.entry(name).or_default();
+            *entry = entry.saturating_add(*count);
+        }
+    }
+    let mut rows = bounded_tool_usage_counts(&merged);
+    let truncated = rows.len() > MAX_TOOL_USAGE_NAMES;
+    rows.truncate(MAX_TOOL_USAGE_NAMES);
+    (rows, truncated)
+}
+
 fn bounded_tool_usage_counts(counts: &BTreeMap<String, u64>) -> Vec<SnapshotToolUsage> {
     let mut rows = counts
         .iter()
@@ -13547,6 +13585,12 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                     if let Some(name) = bounded_activity_label(&format!("{server}.{tool}")) {
                         *accumulator
                             .activity_mcp_tool_counts
+                            .entry(name)
+                            .or_default() += 1;
+                    }
+                    if let Some(name) = bounded_tool_usage_name(&format!("mcp__{server}__{tool}")) {
+                        *accumulator
+                            .activity_mcp_tool_usage_counts
                             .entry(name)
                             .or_default() += 1;
                     }
@@ -20934,6 +20978,30 @@ mod tests {
         assert!(!encoded.contains("src/private.rs"));
         assert!(!encoded.contains("secret command"));
         assert!(!encoded.contains("private patch content"));
+        let tool_usage = |name: &str, count: u64| SnapshotToolUsage {
+            name: name.to_string(),
+            count,
+        };
+        // The reclassified `_get_pr_info` function_call is counted once, as MCP;
+        // the `exec` transport wrapper is replaced by its nested tools.
+        assert_eq!(
+            item.tool_usage.as_deref(),
+            Some(
+                &[
+                    tool_usage("exec_command", 2),
+                    tool_usage("apply_patch", 1),
+                    tool_usage("mcp__GitHub__get_pr_info", 1),
+                    tool_usage("mcp__chrome_devtools__take_snapshot", 1),
+                    tool_usage("write_stdin", 1),
+                ][..]
+            )
+        );
+        assert!(!item.tool_usage_truncated);
+        let wire = serde_json::to_string(&item).expect("serialize snapshot item");
+        assert!(wire.contains("mcp__chrome_devtools__take_snapshot"));
+        assert!(!wire.contains("secret command"));
+        assert!(!wire.contains("private patch content"));
+        assert!(!wire.contains("src/private.rs"));
 
         let original_fingerprint = item.snapshot_fingerprint.clone();
         let mut labels_disabled = item.clone();
@@ -20955,6 +21023,83 @@ mod tests {
             .is_empty());
         assert_ne!(labels_disabled.snapshot_fingerprint, original_fingerprint);
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_tool_usage_caps_distinct_names_and_marks_truncation() {
+        let path = temp_file("codex-tool-usage-cap");
+        let mut lines = vec![
+            json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"codex-tool-cap-session"}}),
+        ];
+        // The most-used name must survive the cap.
+        for _ in 0..3 {
+            lines.push(json!({"timestamp":"2026-08-02T06:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"never-upload\"}"}}));
+        }
+        for index in 0..MAX_TOOL_USAGE_NAMES {
+            lines.push(json!({"timestamp":"2026-08-02T06:00:02Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"fixture","tool":format!("tool_{index}"),"arguments":{"secret":"never-upload"}}}}));
+        }
+        lines.push(json!({"timestamp":"2026-08-02T06:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"request_count":1},"model":"gpt-5.6"}}}));
+        fs::write(
+            &path,
+            lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("write transcript");
+
+        let item = parse_codex_jsonl_file(&path, "2026-08-02T06:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        let tool_usage = item.tool_usage.as_deref().expect("Codex tool contract");
+        assert_eq!(tool_usage.len(), MAX_TOOL_USAGE_NAMES);
+        assert!(item.tool_usage_truncated);
+        assert_eq!(
+            tool_usage[0],
+            SnapshotToolUsage {
+                name: "exec_command".to_string(),
+                count: 3,
+            }
+        );
+        assert!(tool_usage
+            .iter()
+            .all(|row| row.name.chars().count() <= MAX_TOOL_USAGE_NAME_LENGTH));
+        assert!(!serde_json::to_string(&item)
+            .expect("serialize snapshot item")
+            .contains("never-upload"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_tool_usage_emits_explicit_empty_contract() {
+        let path = temp_file("codex-tool-usage-empty");
+        fs::write(
+            &path,
+            [
+                json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"codex-tool-empty-session"}}),
+                json!({"timestamp":"2026-08-02T06:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"request_count":1},"model":"gpt-5.6"}}}),
+            ]
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .expect("write transcript");
+
+        let item = parse_codex_jsonl_file(&path, "2026-08-02T06:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        assert_eq!(item.tool_usage, Some(Vec::new()));
+        assert!(!item.tool_usage_truncated);
+        assert!(serde_json::to_string(&item)
+            .expect("serialize snapshot item")
+            .contains("\"tool_usage\":[]"));
         let _ = fs::remove_file(path);
     }
 

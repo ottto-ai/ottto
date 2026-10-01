@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 406,
-  "content_sha256": "ad46d468ab4c4079e9e3dd054f30717afd9e160f823cff7c5633ee09a0cff938",
+  "content_sha256": "83ab9ad3548db506b4eb088671be34dcedb39e6e4326e82717edf42e1f8b10ec",
   "files": [
     {
       "executable": false,
@@ -902,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "b65987413f44d087afcdd2a94f6d819f0a121600013281ad39a0e891dcab21ca",
-      "size_bytes": 1985828
+      "sha256": "efc97ec634119af9d87995b8868289374fbc254b2451f43c7fbc4b927794b959",
+      "size_bytes": 1992177
     },
     {
       "executable": false,
@@ -2232,14 +2232,14 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/body-witness-ack-normalization-v1.json",
-      "sha256": "5f2fc88252aa89452613dc5d1afc5f45cb07bb9c1b574811517cee02715feaf2",
-      "size_bytes": 16246
+      "sha256": "84e609f774e3863597a8d2f9584fa2d29de2a8b56e6ed88816e04d530fddfcbb",
+      "size_bytes": 16342
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/cache-observations-v1-manifest.json",
-      "sha256": "cbe87b35ec454ac813156ad842152c4adc6fe574d83f61a6e0b791af13007228",
+      "sha256": "0f9d34d3d7d1070621eb8491bf3488bd89f9c1d0d2234780b78406cf3cbce72b",
       "size_bytes": 1623
     },
     {
@@ -2253,8 +2253,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/cache_observation_codex_v1.json",
-      "sha256": "5e77400bb7270fdb0796ae50205c69d99e55f139f4d39d13c33311bee945a426",
-      "size_bytes": 10437
+      "sha256": "34f8f3884693276ba4b847471d2a9b0729f631917192e460fbd7a03b15133597",
+      "size_bytes": 10459
     },
     {
       "executable": false,
