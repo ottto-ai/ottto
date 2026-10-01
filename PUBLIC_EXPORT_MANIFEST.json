@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 413,
-  "content_sha256": "80ce98ad4a07555acb62d1ff001014857015dca53aa0240f47ba4c4910c79fef",
+  "candidate_file_count": 415,
+  "content_sha256": "cfe793a738901375292505ecc5610c27a648142c378e813a2b3bfa77ac801ab2",
   "files": [
     {
       "executable": false,
@@ -902,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "142434cc1424264009cb8146042a7200bca8c6f00405e9db0ff3d67f1ae9e305",
-      "size_bytes": 2028167
+      "sha256": "b48073e6e11a9f441b931562f6deedfee6f7d69d07eeb965cf7928b87d218d3a",
+      "size_bytes": 2066803
     },
     {
       "executable": false,
@@ -1797,6 +1797,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-01-claude-original-session-carrier.md",
+      "sha256": "ca97b119a0870b6048ea4a09898b84e066ca522d29e963b359beda5d97634fd8",
+      "size_bytes": 3024
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-01-claude-upkeep-terminal-readback.md",
       "sha256": "5b7befe5852ddd07158fb7471c6bcf0dbeb39bd1aa57dfeb3868854514196983",
       "size_bytes": 4235
@@ -2311,6 +2318,13 @@
       "path": "fixtures/snapshot-audit/claude-authority-demotion-cohort.v1.json",
       "sha256": "64bc6cf5cd27c76375c7bb7820a1e4f9e17ab0a50c25a5ac25b94f9b6f04c6b3",
       "size_bytes": 2320
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/snapshot-audit/claude-original-source-corpus-v1.json",
+      "sha256": "bdc2ffb8d3e6ee6f7713d891f7fc45693269adf0716675ae5bab7af2f0fd6328",
+      "size_bytes": 179395
     },
     {
       "executable": false,
@@ -2894,9 +2908,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-02T05:57:53+00:00",
+  "generated_at": "2026-10-02T06:12:57+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 414,
+  "output_file_count": 416,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2930,5 +2944,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "6d43ff24be824054e852e485f9e43a4d9057eb49"
+  "source_commit": "52eef5bdd554f5535a274f7b591df587704da72a"
 }
