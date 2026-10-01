@@ -247,7 +247,8 @@ pub(crate) fn detect_bounded(
             .into(),
             previous: previous.map(|p| p.slot.clone()),
             affected: request.slot.clone(),
-            immediate_next: next.map(|n| n.slot.clone()),
+            // `next_unavailable` means no comparable next witness; the wire carries none.
+            immediate_next: next.filter(|_| recovery_comparable).map(|n| n.slot.clone()),
             ordering_confidence: request.ordering.clone(),
             explanation_code: explanation.into(),
             supporting_conditions: conditions,

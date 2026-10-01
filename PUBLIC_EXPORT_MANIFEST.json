@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 410,
-  "content_sha256": "f6fe4e48288216fe0022c336302f7da14996828c7f1aa96868a45516528e68e1",
+  "candidate_file_count": 411,
+  "content_sha256": "4908a889a2c48ccb12a2edb8774acc832824e258255ad6b4b610be14ae906c59",
   "files": [
     {
       "executable": false,
@@ -909,15 +909,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/cache_observations.rs",
-      "sha256": "56b4126452e434601100433fd7b0d6b9645a811e36ae3819b840ef994d6b0287",
-      "size_bytes": 12114
+      "sha256": "d81eb09a68b89959acc9aebc66a8a4fc4b087b8062e38edf16b732c60f99bc58",
+      "size_bytes": 12237
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/cache_observations/tests.rs",
-      "sha256": "620d46db86d32b35f3023fcaf950b79e3f9bf41d686b30cd8ecc3cf3d86b819e",
-      "size_bytes": 6035
+      "sha256": "e87a2e837a80e03b36c4adb127c4274ee171a96582f1461bdd19464b4a3a463c",
+      "size_bytes": 6513
     },
     {
       "executable": false,
@@ -1807,6 +1807,13 @@
       "path": "docs/session-2026-10-01-claude-valid-access-continuity.md",
       "sha256": "816d6011b871edf6f70f9de6aa8af02dd9bbaf2fd662f5b39094fd8ac07cf75f",
       "size_bytes": 1832
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-02-cache-next-unavailable-slot.md",
+      "sha256": "c1a2bc6536f754c7a0c9ee5642b13596ae7fbacfb3d713326eded5aded9d9d96",
+      "size_bytes": 1446
     },
     {
       "executable": false,
@@ -2875,7 +2882,7 @@
   ],
   "generated_at": "2026-10-01T21:50:20+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 411,
+  "output_file_count": 412,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
