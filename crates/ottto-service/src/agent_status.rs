@@ -15026,10 +15026,22 @@ exit 1
             assert_eq!(slot.collection.state, expected);
         }
 
+        let worker_code = "claude_slot_worker_reconciliation_refused";
         let backend_json = serde_json::to_string(
             &snapshots
                 .into_iter()
-                .map(AgentStatusSnapshot::redacted_for_backend)
+                .enumerate()
+                .map(|(index, mut snapshot)| {
+                    if index == 0 {
+                        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                            worker_code,
+                            AgentDiagnosticSeverity::Info,
+                            claude_worker_diagnostic_message(worker_code)
+                                .expect("closed local worker code"),
+                        ));
+                    }
+                    snapshot.redacted_for_backend()
+                })
                 .collect::<Vec<_>>(),
         )
         .expect("serialize backend snapshots");
@@ -15101,7 +15113,8 @@ exit 1
                 Value::String(text) if text.contains("claude_slot_") => {
                     // Only a diagnostic code from a closed enum is public;
                     // the same prefix in any other field still fails privacy.
-                    let safe = text == "claude_slot_upkeep_attempt_started"
+                    let safe = claude_worker_diagnostic_message(text).is_some()
+                        || text == "claude_slot_upkeep_attempt_started"
                         || text
                             .strip_prefix("claude_slot_collection_")
                             .is_some_and(|suffix| {
@@ -15135,6 +15148,14 @@ exit 1
             &serde_json::from_str(&backend_json).expect("backend payload"),
             "",
         );
+        assert!(backend_json.contains(worker_code));
+        for forbidden in [
+            serde_json::json!({"diagnostics": [{"code": "claude_slot_worker_arbitrary_suffix"}]}),
+            serde_json::json!({"diagnostics": [{"message": worker_code}]}),
+            serde_json::json!({"code": worker_code}),
+        ] {
+            assert!(std::panic::catch_unwind(|| assert_public_fields(&forbidden, "")).is_err());
+        }
         let local_state =
             fs::read_to_string(claude_slot_collection_state_path()).expect("read local slot state");
         assert!(!local_state.contains(root.to_string_lossy().as_ref()));
