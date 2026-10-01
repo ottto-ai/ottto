@@ -1842,6 +1842,13 @@ pub struct ScanIndex {
     /// complete census, so a bounded/failed sweep cannot skip untouched files.
     #[serde(skip)]
     active_upload_context_fingerprint: Option<String>,
+    /// Runtime-only revision of the effective additive upload projection.
+    /// Adoption is recorded per complete, settled file rather than per census.
+    #[serde(skip)]
+    active_effective_upload_body_witness_revision: u64,
+    /// Local held/mixed groups must not adopt a projection they did not upload.
+    #[serde(skip)]
+    effective_upload_body_witness_revision_excluded_source_files: BTreeSet<String>,
 }
 
 impl Default for ScanIndex {
@@ -1892,6 +1899,8 @@ impl Default for ScanIndex {
             quarantined_snapshot_fingerprints: BTreeMap::new(),
             active_quarantine_witness: None,
             active_upload_context_fingerprint: None,
+            active_effective_upload_body_witness_revision: 0,
+            effective_upload_body_witness_revision_excluded_source_files: BTreeSet::new(),
         }
     }
 }
@@ -2008,6 +2017,10 @@ pub struct ScanIndexEntry {
     /// curve upload once without changing the server entity fingerprint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_upload_body_witness: Option<String>,
+    /// Local projection revision that produced this file's settled body witness.
+    /// Missing legacy revisions remain zero; zero preserves default scan behavior.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub effective_upload_body_witness_revision: u64,
     /// Marks entries written by the semantic-sync scan derivation. `None`
     /// identifies a pre-cutover entry that can be adopted without reparsing
     /// when transcript size and mtime are unchanged.
@@ -2431,6 +2444,7 @@ struct PendingIndexFinalization {
     previous_upload_body_witness: Option<String>,
     parse_complete: bool,
     parsed_snapshot_count: usize,
+    effective_upload_body_witness_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -2673,6 +2687,14 @@ pub fn finalize_scan_after_policy_with_body_witness(
         if let Some(entry) = index.files.get_mut(&pending.index_key) {
             entry.last_snapshot_fingerprint = final_group_fingerprint.clone();
             entry.last_upload_body_witness = final_upload_body_witness.clone();
+            if pending.effective_upload_body_witness_revision != 0
+                && !index
+                    .effective_upload_body_witness_revision_excluded_source_files
+                    .contains(&pending.source_file_fingerprint)
+            {
+                entry.effective_upload_body_witness_revision =
+                    pending.effective_upload_body_witness_revision;
+            }
         }
         if final_fingerprints.is_empty() {
             index.file_snapshot_fingerprints.remove(&pending.index_key);
@@ -10562,6 +10584,10 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         scanned_file_count += 1;
         let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
         let previous_upload_body_witness = index.last_upload_body_witness(&candidate);
+        let projection_adoption_required = index
+            .effective_upload_body_witness_revision_requires_adoption(&local_index_key(
+                &candidate.path,
+            ));
         let source_file_fingerprint = candidate.source_file_fingerprint.clone();
         let parsed_file = match source {
             SnapshotSource::Codex => parse_opened_jsonl_file(
@@ -10735,14 +10761,18 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         pending_finalization.push(PendingIndexFinalization {
             index_key,
             source_file_fingerprint: source_file_fingerprint.clone(),
-            previous_snapshot_fingerprint: (decision != CandidateDecision::ReconcileLegacy)
+            previous_snapshot_fingerprint: (decision != CandidateDecision::ReconcileLegacy
+                && !projection_adoption_required)
                 .then_some(previous_snapshot_fingerprint)
                 .flatten(),
-            previous_upload_body_witness: (decision != CandidateDecision::ReconcileLegacy)
+            previous_upload_body_witness: (decision != CandidateDecision::ReconcileLegacy
+                && !projection_adoption_required)
                 .then_some(previous_upload_body_witness)
                 .flatten(),
             parse_complete,
             parsed_snapshot_count,
+            effective_upload_body_witness_revision: index
+                .active_effective_upload_body_witness_revision,
         });
         if parse_complete {
             index.record_terminal_jsonl_disposition(&candidate, terminal_loss.clone());
@@ -17920,6 +17950,24 @@ impl ScanIndex {
         self.active_upload_context_fingerprint = Some(fingerprint);
     }
 
+    /// Select before taking the committed baseline and scanning. Nonzero
+    /// revisions adopt each unchanged file once; zero opts out of adoption.
+    pub fn activate_effective_upload_body_witness_revision(&mut self, revision: u64) {
+        self.active_effective_upload_body_witness_revision = revision;
+        self.effective_upload_body_witness_revision_excluded_source_files
+            .clear();
+    }
+
+    /// Exclude every source file containing a locally held item before finalizing.
+    /// A mixed group retains its old revision until all items can use the projection.
+    pub fn exclude_effective_upload_body_witness_revision_for_source_files(
+        &mut self,
+        source_files: &BTreeSet<String>,
+    ) {
+        self.effective_upload_body_witness_revision_excluded_source_files
+            .extend(source_files.iter().cloned());
+    }
+
     pub fn mark_bounded_sweep_unsettled(&mut self) {
         self.bounded_sweep_had_unsettled_upload = true;
     }
@@ -18874,6 +18922,11 @@ impl ScanIndex {
             quarantined_snapshot_fingerprints: retained_quarantine.clone(),
             active_quarantine_witness: self.active_quarantine_witness.clone(),
             active_upload_context_fingerprint: self.active_upload_context_fingerprint.clone(),
+            active_effective_upload_body_witness_revision: self
+                .active_effective_upload_body_witness_revision,
+            effective_upload_body_witness_revision_excluded_source_files: self
+                .effective_upload_body_witness_revision_excluded_source_files
+                .clone(),
         };
         for key in &safe_keys {
             match self.terminal_jsonl_dispositions.get(key) {
@@ -18979,6 +19032,14 @@ impl ScanIndex {
             .retain(|key, _| files.contains_key(key));
     }
 
+    fn effective_upload_body_witness_revision_requires_adoption(&self, key: &str) -> bool {
+        self.active_effective_upload_body_witness_revision != 0
+            && self.files.get(key).map_or(true, |entry| {
+                entry.effective_upload_body_witness_revision
+                    != self.active_effective_upload_body_witness_revision
+            })
+    }
+
     fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
         let key = local_index_key(&candidate.path);
         if self
@@ -19007,6 +19068,12 @@ impl ScanIndex {
                 }
                 return CandidateDecision::Skip;
             }
+        }
+        // A locally held Claude family above keeps its existing bounded retry
+        // gate. Otherwise a projection change selects even an unchanged v2
+        // file under an already admitted context, independently of parser age.
+        if self.effective_upload_body_witness_revision_requires_adoption(&key) {
+            return CandidateDecision::Parse;
         }
         if self.upload_context_fingerprint != self.active_upload_context_fingerprint {
             return CandidateDecision::Parse;
@@ -19124,6 +19191,10 @@ impl ScanIndex {
             .files
             .get(&key)
             .and_then(|entry| entry.last_upload_body_witness.clone());
+        let effective_upload_body_witness_revision = self
+            .files
+            .get(&key)
+            .map_or(0, |entry| entry.effective_upload_body_witness_revision);
         self.files.insert(
             key,
             ScanIndexEntry {
@@ -19133,6 +19204,7 @@ impl ScanIndex {
                 source_file_fingerprint: candidate.source_file_fingerprint,
                 last_snapshot_fingerprint,
                 last_upload_body_witness,
+                effective_upload_body_witness_revision,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
             },
         );
@@ -19149,6 +19221,10 @@ impl ScanIndex {
             .files
             .get(&key)
             .and_then(|entry| entry.last_upload_body_witness.clone());
+        let effective_upload_body_witness_revision = self
+            .files
+            .get(&key)
+            .map_or(0, |entry| entry.effective_upload_body_witness_revision);
         self.files.insert(
             key.clone(),
             ScanIndexEntry {
@@ -19158,6 +19234,7 @@ impl ScanIndex {
                 source_file_fingerprint: candidate.source_file_fingerprint,
                 last_snapshot_fingerprint,
                 last_upload_body_witness,
+                effective_upload_body_witness_revision,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
             },
         );
@@ -21414,6 +21491,7 @@ mod tests {
                     source_file_fingerprint: "sha256:test".to_string(),
                     last_snapshot_fingerprint: Some("sha256:snapshot".to_string()),
                     last_upload_body_witness: None,
+                    effective_upload_body_witness_revision: 0,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 },
             )]),
@@ -22400,6 +22478,7 @@ mod tests {
                     source_file_fingerprint: candidate.source_file_fingerprint.clone(),
                     last_snapshot_fingerprint: Some("group".to_string()),
                     last_upload_body_witness: None,
+                    effective_upload_body_witness_revision: 0,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 },
             )]),
@@ -22491,11 +22570,18 @@ mod tests {
             index.candidate_decision(&candidate),
             CandidateDecision::Skip
         );
+        index.activate_effective_upload_body_witness_revision(1);
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Skip,
+            "held family retry gate takes precedence over projection adoption"
+        );
         let index_path = root.join("scan-index.json");
         index
             .save(&index_path)
             .expect("persist authority quarantine");
         let mut loaded = ScanIndex::load(&index_path).expect("reload authority quarantine");
+        loaded.activate_effective_upload_body_witness_revision(1);
         assert_eq!(
             loaded.candidate_decision(&candidate),
             CandidateDecision::Skip
@@ -22759,6 +22845,7 @@ mod tests {
                     source_file_fingerprint: legacy_source_file_fingerprint,
                     last_snapshot_fingerprint: Some("legacy-snapshot-fingerprint".to_string()),
                     last_upload_body_witness: None,
+                    effective_upload_body_witness_revision: 0,
                     scan_identity_version: None,
                 },
             )]),
@@ -22843,6 +22930,7 @@ mod tests {
                     source_file_fingerprint: legacy_file_fingerprint,
                     last_snapshot_fingerprint: Some("legacy-snapshot".to_string()),
                     last_upload_body_witness: None,
+                    effective_upload_body_witness_revision: 0,
                     scan_identity_version: None,
                 },
             )]),
@@ -22894,6 +22982,7 @@ mod tests {
                     source_file_fingerprint: "old".to_string(),
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
                     last_upload_body_witness: None,
+                    effective_upload_body_witness_revision: 0,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 },
             )]),
@@ -22932,6 +23021,7 @@ mod tests {
                     source_file_fingerprint: "legacy-previous-sidecar".to_string(),
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
                     last_upload_body_witness: None,
+                    effective_upload_body_witness_revision: 0,
                     scan_identity_version: None,
                 },
             )]),
@@ -22967,6 +23057,7 @@ mod tests {
                     source_file_fingerprint: "legacy-matching-sidecar".to_string(),
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
                     last_upload_body_witness: None,
+                    effective_upload_body_witness_revision: 0,
                     scan_identity_version: None,
                 },
             )]),
@@ -28122,6 +28213,7 @@ mod tests {
             source_file_fingerprint: v6_key.clone(),
             last_snapshot_fingerprint: None,
             last_upload_body_witness: None,
+            effective_upload_body_witness_revision: 0,
             scan_identity_version: None,
         };
 
@@ -37743,6 +37835,306 @@ mod tests {
         }
     }
 
+    fn projection_adoption_fixture(name: &str, count: usize) -> (PathBuf, PathBuf, ScanIndex) {
+        let home = temp_dir(name);
+        let root = home.join("transcripts");
+        fs::create_dir_all(&root).unwrap();
+        for slot in 0..count {
+            let session = format!("00000000-0000-7000-8000-{slot:012x}");
+            fs::write(
+                root.join(format!("rollout-{session}.jsonl")),
+                format!(
+                    "{{\"type\":\"session_meta\",\"ordinal\":0,\"timestamp\":\"2026-07-22T08:00:00Z\",\"payload\":{{\"id\":\"{session}\"}}}}\n{}\n",
+                    codex_test_token_line("2026-07-22T08:00:01Z", Some(1), (12, 0, 4, 0), Some((12, 0, 4, 0)))
+                ),
+            ).unwrap();
+        }
+        let mut index = ScanIndex::default();
+        index.activate_upload_context("already-admitted-context".into());
+        let baseline = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .unwrap();
+        assert_eq!(baseline.snapshots.len(), count);
+        index.record_accepted_snapshot_fingerprints(
+            &baseline
+                .snapshots
+                .iter()
+                .map(|item| item.snapshot_fingerprint.clone())
+                .collect(),
+        );
+        index.save(&home.join("scan-index.json")).unwrap();
+        let mut loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
+        loaded.activate_upload_context("already-admitted-context".into());
+        assert_eq!(loaded.accepted_snapshot_fingerprints.len(), count);
+        assert_eq!(
+            loaded.accepted_snapshot_fingerprint_ledger_version,
+            SNAPSHOT_ACCEPTED_LEDGER_VERSION
+        );
+        assert!(loaded.files.values().all(|entry| {
+            entry.scan_identity_version.as_deref() == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+                && entry.effective_upload_body_witness_revision == 0
+                && entry.last_upload_body_witness.is_some()
+        }));
+        (home, root, loaded)
+    }
+
+    fn projection_adoption_scan(
+        root: &Path,
+        index: &mut ScanIndex,
+        limit: usize,
+    ) -> SourceScanResult {
+        scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            &[root.to_path_buf()],
+            index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+            limit,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn projection_adoption_reselects_143_current_files_with_equal_body_once() {
+        let (home, root, mut index) = projection_adoption_fixture("projection-adoption-143", 143);
+        let unchanged = projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(
+            unchanged.scanned_file_count, 0,
+            "released current identities skip"
+        );
+        index.activate_effective_upload_body_witness_revision(1);
+        let previous = index.clone();
+        let mut scan = projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(
+            scan.scanned_file_count, 143,
+            "projection revision selects unchanged files"
+        );
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::Codex,
+            &mut scan,
+            &mut index,
+            snapshot_upload_body_witness,
+        );
+        assert_eq!((scan.snapshots.len(), scan.semantic_noop_count), (143, 0));
+        for (key, entry) in &index.files {
+            assert_eq!(entry.effective_upload_body_witness_revision, 1);
+            assert_eq!(
+                entry.last_snapshot_fingerprint,
+                previous.files[key].last_snapshot_fingerprint
+            );
+            assert_eq!(
+                entry.last_upload_body_witness,
+                previous.files[key].last_upload_body_witness
+            );
+        }
+        let mut unaccepted =
+            index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+        assert!(unaccepted
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 0));
+        unaccepted.mark_bounded_sweep_unsettled();
+        unaccepted.save(&home.join("scan-index.json")).unwrap();
+        let mut retry_index = ScanIndex::load(&home.join("scan-index.json")).unwrap();
+        retry_index.activate_upload_context("already-admitted-context".into());
+        retry_index.activate_effective_upload_body_witness_revision(1);
+        let retry_previous = retry_index.clone();
+        let mut retry =
+            projection_adoption_scan(&root, &mut retry_index, MAX_BACKFILL_FILES_PER_SOURCE);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut retry, &mut retry_index);
+        assert_eq!(
+            (retry.scanned_file_count, retry.snapshots.len()),
+            (143, 143)
+        );
+        let accepted = retry
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let mut settled =
+            retry_index.committable_subset(&retry_previous, &accepted, &BTreeMap::new());
+        settled.save(&home.join("scan-index.json")).unwrap();
+        let mut loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
+        assert_eq!(loaded.active_effective_upload_body_witness_revision, 0);
+        loaded.activate_upload_context("already-admitted-context".into());
+        loaded.activate_effective_upload_body_witness_revision(1);
+        let stable = projection_adoption_scan(&root, &mut loaded, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!((stable.scanned_file_count, stable.snapshots.len()), (0, 0));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn projection_adoption_partial_file_never_stamps_while_sibling_progresses() {
+        let (home, root, mut index) = projection_adoption_fixture("projection-adoption-partial", 2);
+        let partial_key = index.files.keys().next().unwrap().clone();
+        let body = String::from_utf8(fs::read(&partial_key).unwrap()).unwrap();
+        fs::write(&partial_key, format!("{body}not valid json\n")).unwrap();
+        index.activate_effective_upload_body_witness_revision(1);
+        let previous = index.clone();
+        let mut scan = projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert!(!scan.census_complete);
+        assert!(scan
+            .pending_finalization
+            .iter()
+            .any(|pending| { pending.index_key == partial_key && !pending.parse_complete }));
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+        assert_eq!((scan.scanned_file_count, scan.snapshots.len()), (2, 1));
+        assert_eq!(
+            index.files[&partial_key].effective_upload_body_witness_revision,
+            0
+        );
+        assert!(index
+            .files
+            .iter()
+            .filter(|(key, _)| **key != partial_key)
+            .all(|(_, entry)| { entry.effective_upload_body_witness_revision == 1 }));
+        let accepted = scan
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let mut settled = index.committable_subset(&previous, &accepted, &BTreeMap::new());
+        settled.save(&home.join("scan-index.json")).unwrap();
+        let loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
+        assert_eq!(
+            loaded.files[&partial_key].effective_upload_body_witness_revision,
+            0
+        );
+        assert_eq!(
+            loaded.files[&partial_key].last_upload_body_witness,
+            previous.files[&partial_key].last_upload_body_witness
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn projection_adoption_capped_pages_stamp_and_settle_individually() {
+        let (home, root, mut index) = projection_adoption_fixture("projection-adoption-pages", 4);
+        for page in 1..=2 {
+            index.activate_effective_upload_body_witness_revision(1);
+            let previous = index.clone();
+            let mut scan = projection_adoption_scan(&root, &mut index, 2);
+            assert_eq!(scan.scanned_file_count, 2);
+            assert_eq!(scan.census_complete, page == 2);
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+            assert_eq!((scan.snapshots.len(), scan.semantic_noop_count), (2, 0));
+            assert_eq!(
+                index
+                    .files
+                    .values()
+                    .filter(|entry| entry.effective_upload_body_witness_revision == 1)
+                    .count(),
+                page * 2
+            );
+            let accepted = scan
+                .snapshots
+                .iter()
+                .map(|item| item.snapshot_fingerprint.clone())
+                .collect();
+            let mut settled = index.committable_subset(&previous, &accepted, &BTreeMap::new());
+            settled.save(&home.join("scan-index.json")).unwrap();
+            index = ScanIndex::load(&home.join("scan-index.json")).unwrap();
+            index.activate_upload_context("already-admitted-context".into());
+        }
+        index.activate_effective_upload_body_witness_revision(1);
+        let stable = projection_adoption_scan(&root, &mut index, 4);
+        assert_eq!((stable.scanned_file_count, stable.snapshots.len()), (0, 0));
+        assert!(stable.census_complete);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn projection_adoption_held_and_mixed_file_groups_keep_old_revision() {
+        for mixed in [false, true] {
+            let (home, root, mut index) =
+                projection_adoption_fixture("projection-adoption-held", 2);
+            index.activate_effective_upload_body_witness_revision(1);
+            let previous = index.clone();
+            let mut scan =
+                projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+            let held_file = scan.snapshots[0].source_file_fingerprint.clone().unwrap();
+            if mixed {
+                let mut sibling = scan.snapshots[0].clone();
+                sibling.source_session_id = "00000000-0000-7000-8000-000000000002".into();
+                scan.snapshots.push(sibling);
+            }
+            index.exclude_effective_upload_body_witness_revision_for_source_files(&BTreeSet::from(
+                [held_file.clone()],
+            ));
+            finalize_scan_after_policy_with_body_witness(
+                SnapshotSource::Codex,
+                &mut scan,
+                &mut index,
+                snapshot_upload_body_witness,
+            );
+            assert_eq!(scan.snapshots.len(), if mixed { 3 } else { 2 });
+            for entry in index.files.values() {
+                assert_eq!(
+                    entry.effective_upload_body_witness_revision,
+                    u64::from(entry.source_file_fingerprint != held_file)
+                );
+            }
+            let accepted = scan
+                .snapshots
+                .iter()
+                .filter(|item| item.source_file_fingerprint.as_ref() != Some(&held_file))
+                .map(|item| item.snapshot_fingerprint.clone())
+                .collect();
+            let mut settled = index.committable_subset(&previous, &accepted, &BTreeMap::new());
+            settled.save(&home.join("scan-index.json")).unwrap();
+            let loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
+            assert!(loaded
+                .effective_upload_body_witness_revision_excluded_source_files
+                .is_empty());
+            assert_eq!(
+                loaded
+                    .files
+                    .values()
+                    .filter(|entry| entry.effective_upload_body_witness_revision == 0)
+                    .count(),
+                1
+            );
+            let _ = fs::remove_dir_all(home);
+        }
+    }
+
+    #[test]
+    fn projection_adoption_zero_preserves_legacy_and_default_behavior() {
+        let (home, root, mut index) = projection_adoption_fixture("projection-adoption-zero", 1);
+        assert!(!serde_json::to_string(&index)
+            .unwrap()
+            .contains("effective_upload_body_witness_revision"));
+        index.activate_effective_upload_body_witness_revision(0);
+        let unchanged = projection_adoption_scan(&root, &mut index, 1);
+        assert_eq!(unchanged.scanned_file_count, 0);
+        // Callers using the default API do not downgrade an adopted checkpoint.
+        index
+            .files
+            .values_mut()
+            .next()
+            .unwrap()
+            .effective_upload_body_witness_revision = 1;
+        let mut unchanged = projection_adoption_scan(&root, &mut index, 1);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut unchanged, &mut index);
+        assert_eq!(unchanged.scanned_file_count, 0);
+        assert_eq!(
+            index
+                .files
+                .values()
+                .next()
+                .unwrap()
+                .effective_upload_body_witness_revision,
+            1
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
     fn body_witness_finalizer_scan(
         root: &Path,
         index: &mut ScanIndex,
@@ -43276,6 +43668,7 @@ mod tests {
                 source_file_fingerprint: "stale-parent-file".to_string(),
                 last_snapshot_fingerprint: None,
                 last_upload_body_witness: None,
+                effective_upload_body_witness_revision: 0,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
             },
         );
@@ -44236,6 +44629,7 @@ mod tests {
                 source_file_fingerprint: "file-a".to_string(),
                 last_snapshot_fingerprint: None,
                 last_upload_body_witness: None,
+                effective_upload_body_witness_revision: 0,
                 scan_identity_version: None,
             },
         );
@@ -45301,6 +45695,7 @@ mod tests {
             source_file_fingerprint: "source".to_string(),
             last_snapshot_fingerprint: fingerprint.map(str::to_string),
             last_upload_body_witness: None,
+            effective_upload_body_witness_revision: 0,
             scan_identity_version: Some("semantic_sync:v1".to_string()),
         }
     }
@@ -45707,6 +46102,7 @@ mod tests {
                 source_file_fingerprint: "local-mtime-is-not-membership".to_string(),
                 last_snapshot_fingerprint: Some("group".to_string()),
                 last_upload_body_witness: None,
+                effective_upload_body_witness_revision: 0,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
             },
         );
