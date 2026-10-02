@@ -19,7 +19,8 @@ use crate::snapshot_client::{
 };
 use crate::snapshots::{
     apply_upload_policy, collector_version, context_curve_derivation_revision,
-    finalize_scan_after_policy, scan_source_roots_with_attribution_and_claude_effort_and_hints,
+    finalize_scan_after_policy_with_body_witness,
+    scan_source_roots_with_attribution_and_claude_effort_and_hints,
     snapshot_quarantine_deadline_is_bounded, snapshot_quarantine_witness,
     snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
     SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
@@ -146,6 +147,179 @@ fn bootstrap_cache_heads(
     Ok(())
 }
 
+// Local index projection producer revision; independent of semantic/wire identity.
+const EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION: u64 = 1;
+
+fn exclude_held_effective_body_witness_revision(
+    index: &mut ScanIndex,
+    items: &[SnapshotItem],
+    disposition: &crate::snapshots::ClaudeUsageAuthorityDisposition,
+) {
+    let held = disposition.quarantined_fingerprints(items);
+    let source_files = items
+        .iter()
+        .filter(|item| held.contains(&item.snapshot_fingerprint))
+        .filter_map(|item| item.source_file_fingerprint.clone())
+        .collect();
+    index.exclude_effective_upload_body_witness_revision_for_source_files(&source_files);
+}
+
+#[derive(Debug)]
+struct DeferredCacheHeadIdentity {
+    source_file_fingerprint: Option<String>,
+    snapshot_fingerprint: String,
+    session_key: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_deferred_cache_head_identities(
+    source: SnapshotSource,
+    items: &[SnapshotItem],
+    progress: &SnapshotUploadProgress,
+    enabled: bool,
+    head_cas_required: bool,
+    legacy_pending: &BTreeSet<String>,
+    active_legacy: &BTreeSet<String>,
+    disposition: &crate::snapshots::ClaudeUsageAuthorityDisposition,
+) -> Vec<DeferredCacheHeadIdentity> {
+    if !enabled {
+        return Vec::new();
+    }
+    let held = disposition.quarantined_fingerprints(items);
+    items
+        .iter()
+        .filter_map(|item| {
+            if item.cache_observations.is_none() || held.contains(&item.snapshot_fingerprint) {
+                return None;
+            }
+            // Use the same public semantic primitives as finalization after policy.
+            let fingerprint = crate::snapshots::snapshot_fingerprint_from_component_hashes(
+                source,
+                &item.source_session_id,
+                &crate::snapshots::snapshot_semantic_component_hashes(source, item),
+            );
+            let legacy = legacy_pending.contains(&fingerprint);
+            if legacy && !active_legacy.contains(&fingerprint) {
+                return None;
+            }
+            let session_key = cache_session_key(&item.source_session_id);
+            ((head_cas_required || legacy)
+                && !progress.accepted_cache_heads.contains_key(&session_key))
+            .then(|| DeferredCacheHeadIdentity {
+                source_file_fingerprint: item.source_file_fingerprint.clone(),
+                snapshot_fingerprint: fingerprint,
+                session_key,
+            })
+        })
+        .collect()
+}
+
+/// Pure projection shared by no-op/index witnesses and the network boundary.
+/// Local consumers retain the original cache patch and provisional state.
+fn prepare_snapshot_cache_for_upload(
+    snapshot: &mut SnapshotItem,
+    progress: &SnapshotUploadProgress,
+    enabled: bool,
+    head_cas_required: bool,
+    legacy_pending: &BTreeSet<String>,
+) {
+    if !enabled {
+        snapshot.cache_observations = None;
+        snapshot.cache_observations_state = None;
+        snapshot.cache_base_head_etag = None;
+        return;
+    }
+    let key = cache_session_key(&snapshot.source_session_id);
+    snapshot.cache_base_head_etag = progress.accepted_cache_heads.get(&key).cloned();
+    if (head_cas_required || legacy_pending.contains(&snapshot.snapshot_fingerprint))
+        && snapshot.cache_base_head_etag.is_none()
+    {
+        snapshot.cache_observations = None;
+        snapshot.cache_observations_state = None;
+        return;
+    }
+    crate::snapshots::prepare_cache_observations(
+        snapshot,
+        progress.accepted_cache_states.get(&key),
+    );
+}
+
+fn effective_snapshot_upload_body_witness(
+    snapshot: &SnapshotItem,
+    progress: &SnapshotUploadProgress,
+    enabled: bool,
+    head_cas_required: bool,
+    legacy_pending: &BTreeSet<String>,
+    local_authority: &crate::snapshots::ClaudeUsageAuthorityDisposition,
+) -> String {
+    if !local_authority
+        .quarantined_fingerprints(std::slice::from_ref(snapshot))
+        .is_empty()
+    {
+        // A held group retains its prior local-finalization semantics. It does
+        // not acquire a network settlement or a head retry obligation here.
+        return snapshot_upload_body_witness(snapshot);
+    }
+    let mut projected = snapshot.clone();
+    prepare_snapshot_cache_for_upload(
+        &mut projected,
+        progress,
+        enabled,
+        head_cas_required,
+        legacy_pending,
+    );
+    snapshot_upload_body_witness(&projected)
+}
+
+/// One hash-only group per current file. Duplicate source witnesses are not an
+/// exact mapping and are excluded rather than guessed. O(current index files).
+fn cache_head_file_groups(
+    index: &ScanIndex,
+) -> BTreeMap<String, (String, String, &BTreeSet<String>)> {
+    let mut groups = BTreeMap::new();
+    let mut ambiguous = BTreeSet::new();
+    for (index_key, entry) in &index.files {
+        let Some(group) = entry.last_snapshot_fingerprint.as_ref() else {
+            continue;
+        };
+        let Some(entities) = index
+            .file_snapshot_fingerprints
+            .get(index_key)
+            .filter(|set| !set.is_empty())
+        else {
+            continue;
+        };
+        let file = &entry.source_file_fingerprint;
+        if groups
+            .insert(
+                file.clone(),
+                (cache_head_index_key(index_key), group.clone(), entities),
+            )
+            .is_some()
+        {
+            ambiguous.insert(file.clone());
+        }
+    }
+    for file in ambiguous {
+        groups.remove(&file);
+    }
+    groups
+}
+
+fn cache_head_selection_witness(accepted_head: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("cache_head_selection:v1:{accepted_head}"))
+    )
+}
+
+fn cache_head_index_key(index_key: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("cache_head_file:v1:{index_key}"))
+    )
+}
+
 fn cache_session_key(session: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(session.as_bytes()))
@@ -159,6 +333,23 @@ fn cache_session_key(session: &str) -> String {
 /// snapshot fingerprints lets a restart skip already-accepted pages without
 /// retaining titles, paths, or prompts. Numeric cache evidence and opaque accepted
 /// head tokens survive cycle cleanup for later corrections; session keys are hashes.
+/// A subset of the current file/entity incidence table, containing only cache
+/// evidence actually deferred for missing accepted predecessor authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingCacheHeadFile {
+    source_file_fingerprint: String,
+    group_fingerprint: String,
+    /// Semantic entity -> hashed session key; no source body or authority.
+    entities: BTreeMap<String, String>,
+    /// Sessions whose head arrival already reached a saved current file group.
+    /// Failed bodies remain owed, but normal quarantine drives their retry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    reselected_heads: BTreeMap<String, String>,
+    /// Exact cache-bearing settlements recorded only after the index save.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    settled_entities: BTreeSet<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotUploadProgress {
     schema_version: u16,
@@ -182,6 +373,8 @@ struct SnapshotUploadProgress {
     accepted_cache_states: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     accepted_cache_heads: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending_cache_heads: BTreeMap<String, PendingCacheHeadFile>,
     #[serde(default)]
     quarantined_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
     #[serde(skip)]
@@ -207,6 +400,7 @@ impl SnapshotUploadProgress {
             accepted_body_witnesses: BTreeMap::new(),
             accepted_cache_states: BTreeMap::new(),
             accepted_cache_heads: BTreeMap::new(),
+            pending_cache_heads: BTreeMap::new(),
             quarantined_fingerprints: BTreeMap::new(),
             active_quarantine_witness: Some(active_quarantine_witness),
             active_quarantine_retries: BTreeSet::new(),
@@ -253,6 +447,23 @@ impl SnapshotUploadProgress {
                         .all(|value| is_snapshot_fingerprint(value))
                     && progress.accepted_cache_heads.iter().all(|(key, head)| {
                         is_snapshot_fingerprint(key) && is_snapshot_fingerprint(head)
+                    })
+                    && progress.pending_cache_heads.iter().all(|(file, pending)| {
+                        let sessions = pending.entities.values().collect::<BTreeSet<_>>();
+                        is_snapshot_fingerprint(file)
+                            && is_snapshot_fingerprint(&pending.source_file_fingerprint)
+                            && is_snapshot_fingerprint(&pending.group_fingerprint)
+                            && !pending.entities.is_empty()
+                            && pending.reselected_heads.iter().all(|(key, witness)| {
+                                is_snapshot_fingerprint(witness) && sessions.contains(key)
+                            })
+                            && pending
+                                .settled_entities
+                                .iter()
+                                .all(|entity| pending.entities.contains_key(entity))
+                            && pending.entities.iter().all(|(entity, session)| {
+                                is_snapshot_fingerprint(entity) && is_snapshot_fingerprint(session)
+                            })
                     })
                     && progress.accepted_cache_states.iter().all(|(key, state)| {
                         is_snapshot_fingerprint(key)
@@ -367,6 +578,10 @@ impl SnapshotUploadProgress {
         self.accepted_fingerprints.clear();
         self.accepted_body_witnesses.clear();
         self.quarantined_fingerprints.clear();
+        for pending in self.pending_cache_heads.values_mut() {
+            pending.settled_entities.clear();
+            pending.reselected_heads.clear();
+        }
         true
     }
 
@@ -539,8 +754,248 @@ impl SnapshotUploadProgress {
         result
     }
 
+    /// Use only the successfully loaded destination/source index, before any
+    /// working scan changes. Missing entries remain unknown to candidate_decision
+    /// and will Parse/rebind if the source still exists; no settlement is minted.
+    fn prune_pending_cache_head_orphans_from_loaded_index(&mut self, index: &ScanIndex) -> bool {
+        // Invalid-index quarantine and absent-index adoption return generation 0.
+        // Such fallback/default state cannot certify an orphan disposition.
+        if index.generation == 0 || self.pending_cache_heads.is_empty() {
+            return false;
+        }
+        let indexed = index
+            .files
+            .keys()
+            .map(|key| cache_head_index_key(key))
+            .collect::<BTreeSet<_>>();
+        let before = self.pending_cache_heads.len();
+        self.pending_cache_heads
+            .retain(|key, _| indexed.contains(key));
+        before != self.pending_cache_heads.len()
+    }
+
+    fn record_pending_cache_head(
+        &mut self,
+        item: &SnapshotItem,
+        groups: &BTreeMap<String, (String, String, &BTreeSet<String>)>,
+        actually_deferred: bool,
+    ) -> Result<bool> {
+        self.record_pending_cache_head_identity(
+            item.source_file_fingerprint.as_ref(),
+            &item.snapshot_fingerprint,
+            &cache_session_key(&item.source_session_id),
+            groups,
+            actually_deferred,
+        )
+    }
+
+    fn record_pending_cache_head_identity(
+        &mut self,
+        source_file_fingerprint: Option<&String>,
+        fingerprint: &str,
+        session: &str,
+        groups: &BTreeMap<String, (String, String, &BTreeSet<String>)>,
+        actually_deferred: bool,
+    ) -> Result<bool> {
+        let invalid_binding = || {
+            anyhow::Error::new(SnapshotLocalStateRejected {
+                operation: "bind deferred cache head to current file entities",
+            })
+        };
+        let Some(file) = source_file_fingerprint else {
+            return if actually_deferred {
+                Err(invalid_binding())
+            } else {
+                Ok(false)
+            };
+        };
+        let Some((index_key, group, entities)) = groups.get(file) else {
+            return if actually_deferred {
+                Err(invalid_binding())
+            } else {
+                Ok(false)
+            };
+        };
+        if !entities.contains(fingerprint) {
+            return if actually_deferred {
+                Err(invalid_binding())
+            } else {
+                Ok(false)
+            };
+        }
+        if !actually_deferred && !self.pending_cache_heads.contains_key(index_key) {
+            return Ok(false);
+        }
+        let mut changed = false;
+        let pending = self
+            .pending_cache_heads
+            .entry(index_key.clone())
+            .or_insert_with(|| {
+                changed = true;
+                PendingCacheHeadFile {
+                    source_file_fingerprint: file.clone(),
+                    group_fingerprint: group.clone(),
+                    entities: BTreeMap::new(),
+                    reselected_heads: BTreeMap::new(),
+                    settled_entities: BTreeSet::new(),
+                }
+            });
+        // A fully parsed replacement group owns its own obligation. Never
+        // graft the old entity/session incidence onto a new file revision.
+        if pending.group_fingerprint != *group || pending.source_file_fingerprint != *file {
+            changed = true;
+            pending.source_file_fingerprint = file.clone();
+            pending.group_fingerprint = group.clone();
+            pending.entities.clear();
+            pending.reselected_heads.clear();
+            pending.settled_entities.clear();
+        }
+        changed |= pending
+            .entities
+            .insert(fingerprint.to_owned(), session.to_owned())
+            .as_deref()
+            != Some(session);
+        Ok(changed)
+    }
+
+    fn reselect_pending_cache_heads(&mut self, index: &mut ScanIndex, enabled: bool) -> usize {
+        if !enabled || self.pending_cache_heads.is_empty() {
+            return 0;
+        }
+        for pending in self.pending_cache_heads.values_mut() {
+            pending
+                .reselected_heads
+                .retain(|session, _| self.accepted_cache_heads.contains_key(session));
+        }
+        let mut selected = 0;
+        for (index_key, entry) in &mut index.files {
+            let Some(pending) = self
+                .pending_cache_heads
+                .get(&cache_head_index_key(index_key))
+            else {
+                continue;
+            };
+            if entry.source_file_fingerprint == pending.source_file_fingerprint
+                && entry.last_snapshot_fingerprint.as_ref() == Some(&pending.group_fingerprint)
+                && pending.entities.values().any(|session| {
+                    self.accepted_cache_heads.get(session).is_some_and(|head| {
+                        pending.reselected_heads.get(session)
+                            != Some(&cache_head_selection_witness(head))
+                    })
+                })
+            {
+                // Existing candidate_decision treats a nonempty file without a
+                // final group as Parse. Entity membership/ACK state stays intact.
+                entry.last_snapshot_fingerprint = None;
+                entry.last_upload_body_witness = None;
+                selected += 1;
+            }
+        }
+        selected
+    }
+
+    fn pending_cache_head_file_witnesses(
+        &self,
+        index: &ScanIndex,
+    ) -> BTreeMap<String, Option<String>> {
+        index
+            .files
+            .iter()
+            .filter_map(|(key, entry)| {
+                let key = cache_head_index_key(key);
+                self.pending_cache_heads
+                    .contains_key(&key)
+                    .then(|| (key, entry.last_upload_body_witness.clone()))
+            })
+            .collect()
+    }
+
+    /// Call only after the index's settled save. A failed save or failed upload
+    /// cannot retire a head obligation; repeating a reselect after a crash is safe.
+    fn retire_pending_cache_heads(
+        &mut self,
+        index: &ScanIndex,
+        items: &[SnapshotItem],
+        held: &BTreeSet<String>,
+        census_complete: bool,
+        projected_file_witnesses: &BTreeMap<String, Option<String>>,
+    ) {
+        if self.pending_cache_heads.is_empty() {
+            return;
+        }
+        let current_files = index
+            .files
+            .iter()
+            .map(|(key, entry)| (cache_head_index_key(key), (key, entry)))
+            .collect::<BTreeMap<_, _>>();
+        let projected = items
+            .iter()
+            .filter(|item| item.cache_observations.is_some())
+            .filter_map(|item| {
+                item.source_file_fingerprint
+                    .as_ref()
+                    .map(|file| ((file.clone(), item.snapshot_fingerprint.clone()), item))
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.pending_cache_heads.retain(|file, pending| {
+            let Some((index_key, entry)) = current_files.get(file) else {
+                return !census_complete;
+            };
+            // Neither held absence nor a changed aggregate alone certifies
+            // enrichment. Rebinding comes from the current admitted raw item.
+            if entry.source_file_fingerprint != pending.source_file_fingerprint
+                || entry.last_snapshot_fingerprint.as_ref() != Some(&pending.group_fingerprint)
+            {
+                return true;
+            }
+            for (entity, session) in &pending.entities {
+                if held.contains(entity) {
+                    continue;
+                }
+                let Some(item) =
+                    projected.get(&(pending.source_file_fingerprint.clone(), entity.clone()))
+                else {
+                    continue;
+                };
+                if self.accepted_cache_heads.contains_key(session)
+                    && self.accepted_body_witnesses.get(entity)
+                        == Some(&snapshot_upload_body_witness(item))
+                {
+                    pending.settled_entities.insert(entity.clone());
+                }
+                if let Some(head) = item.cache_base_head_etag.as_ref().filter(|_| {
+                    entry.last_upload_body_witness.is_some()
+                        && projected_file_witnesses.get(file)
+                            == Some(&entry.last_upload_body_witness)
+                }) {
+                    pending
+                        .reselected_heads
+                        .insert(session.clone(), cache_head_selection_witness(head));
+                }
+            }
+            let all_siblings_settled = index
+                .file_snapshot_fingerprints
+                .get(*index_key)
+                .is_some_and(|entities| {
+                    entities.iter().all(|entity| {
+                        pending.settled_entities.contains(entity)
+                            || (self.accepted_fingerprints.contains(entity)
+                                && !index.quarantined_snapshot_fingerprints.contains_key(entity))
+                    })
+                });
+            !(all_siblings_settled
+                && pending
+                    .entities
+                    .keys()
+                    .all(|entity| pending.settled_entities.contains(entity)))
+        });
+    }
+
     fn finish_cycle(&mut self, path: &Path) -> Result<()> {
-        if self.accepted_cache_states.is_empty() && self.accepted_cache_heads.is_empty() {
+        if self.accepted_cache_states.is_empty()
+            && self.accepted_cache_heads.is_empty()
+            && self.pending_cache_heads.is_empty()
+        {
             return self.clear(path);
         }
         self.accepted_fingerprints.clear();
@@ -2379,6 +2834,11 @@ fn sync_source(
         snapshot_quarantine_witness(source),
     )?;
     let mut index = ScanIndex::load(&index_path)?;
+    if index_path.exists()
+        && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
+    {
+        upload_progress.save(&upload_progress_path)?;
+    }
     let mut upload_context =
         snapshot_upload_context_fingerprint(upload_policy, checkpoint_namespace.as_deref());
     if cache_observations_enabled {
@@ -2468,7 +2928,9 @@ fn sync_source(
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
+    index.activate_effective_upload_body_witness_revision(EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION);
     let committed_index = index.clone();
+    upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
     let watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     if watcher_hints.overflowed {
         eprintln!(
@@ -2565,7 +3027,36 @@ fn sync_source(
             source.api_slug(),
         );
     }
-    finalize_scan_after_policy(source, &mut scan_result, &mut index);
+    let deferred_cache_head_identities = capture_deferred_cache_head_identities(
+        source,
+        &scan_result.snapshots,
+        &upload_progress,
+        cache_observations_enabled,
+        activity_hint.snapshot_head_cas_required,
+        &legacy_reconciliation_pending,
+        &active_legacy_reconciliation,
+        &claude_authority_disposition,
+    );
+    exclude_held_effective_body_witness_revision(
+        &mut index,
+        &scan_result.snapshots,
+        &claude_authority_disposition,
+    );
+    finalize_scan_after_policy_with_body_witness(
+        source,
+        &mut scan_result,
+        &mut index,
+        |snapshot| {
+            effective_snapshot_upload_body_witness(
+                snapshot,
+                &upload_progress,
+                cache_observations_enabled,
+                activity_hint.snapshot_head_cas_required,
+                &legacy_reconciliation_pending,
+                &claude_authority_disposition,
+            )
+        },
+    );
     // A parsed file can emit several legacy siblings. Only the persisted
     // migration lease may re-enter an ambiguous old identity this cycle; new
     // fingerprints and ordinary changed entities continue through normally.
@@ -2642,29 +3133,51 @@ fn sync_source(
     claude_authority_disposition.retain_uploadable(&mut scan_result.snapshots);
     let deferred_local_authority_count = index.claude_usage_authority_pending_count();
 
+    let cache_head_groups = if cache_observations_enabled
+        && (activity_hint.snapshot_head_cas_required
+            || !legacy_reconciliation_pending.is_empty()
+            || !upload_progress.pending_cache_heads.is_empty())
+    {
+        cache_head_file_groups(&index)
+    } else {
+        BTreeMap::new()
+    };
+    let mut pending_cache_heads_changed = false;
+    for identity in &deferred_cache_head_identities {
+        pending_cache_heads_changed |= upload_progress.record_pending_cache_head_identity(
+            identity.source_file_fingerprint.as_ref(),
+            &identity.snapshot_fingerprint,
+            &identity.session_key,
+            &cache_head_groups,
+            true,
+        )?;
+    }
+
     for snapshot in &mut scan_result.snapshots {
-        if !cache_observations_enabled {
-            snapshot.cache_observations = None;
-            snapshot.cache_observations_state = None;
-            snapshot.cache_base_head_etag = None;
-            continue;
+        if cache_observations_enabled && snapshot.cache_observations.is_some() {
+            let missing_required_head = (activity_hint.snapshot_head_cas_required
+                || legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint))
+                && !upload_progress
+                    .accepted_cache_heads
+                    .contains_key(&cache_session_key(&snapshot.source_session_id));
+            pending_cache_heads_changed |= upload_progress.record_pending_cache_head(
+                snapshot,
+                &cache_head_groups,
+                missing_required_head,
+            )?;
         }
-        let key = cache_session_key(&snapshot.source_session_id);
-        snapshot.cache_base_head_etag = upload_progress.accepted_cache_heads.get(&key).cloned();
-        if (activity_hint.snapshot_head_cas_required
-            || legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint))
-            && snapshot.cache_base_head_etag.is_none()
-        {
-            // Cache enrichment cannot invent predecessor authority. Keep the
-            // pre-feature ordinary upload behavior on a mandatory-CAS route.
-            snapshot.cache_observations = None;
-            snapshot.cache_observations_state = None;
-            continue;
-        }
-        crate::snapshots::prepare_cache_observations(
+        prepare_snapshot_cache_for_upload(
             snapshot,
-            upload_progress.accepted_cache_states.get(&key),
+            &upload_progress,
+            cache_observations_enabled,
+            activity_hint.snapshot_head_cas_required,
+            &legacy_reconciliation_pending,
         );
+    }
+    if pending_cache_heads_changed {
+        // Durable before ordinary delivery can acquire a head or fail. The
+        // obligation survives until both cache settlement and index save.
+        upload_progress.save(&upload_progress_path)?;
     }
     // Existing entities cannot authorize their first cache enrichment without
     // a producer-owned predecessor token. Probe the unchanged semantic body
@@ -2725,6 +3238,8 @@ fn sync_source(
             }
         }
     }
+    let projected_pending_head_file_witnesses =
+        upload_progress.pending_cache_head_file_witnesses(&index);
     let mut accepted = 0;
     let upload_result = upload_resumable_batches_with_body_witness_partitioned(
         &scan_result.snapshots,
@@ -3168,6 +3683,13 @@ fn sync_source(
     // Final scan/backfill markers are durable before page progress is retired.
     // Accepted cache evidence and head tokens remain in this same ACK-owned
     // ledger across successful cycles so later corrections can retract safely.
+    upload_progress.retire_pending_cache_heads(
+        &index,
+        &scan_result.snapshots,
+        &locally_held_fingerprints,
+        scan_result.census_complete,
+        &projected_pending_head_file_witnesses,
+    );
     upload_progress.finish_cycle(&upload_progress_path)?;
 
     if let Some(count) = deferred_entity_conflict_count {
@@ -5181,6 +5703,1815 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshots::finalize_scan_after_policy;
+    fn pending_head_index_item() -> (ScanIndex, SnapshotItem) {
+        let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        item.context_curve = None;
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            "synthetic/deferred.jsonl".into(),
+            crate::snapshots::ScanIndexEntry {
+                size_bytes: 1,
+                modified_unix_seconds: 1,
+                modified_unix_nanos: Some(1),
+                source_file_fingerprint: item.source_file_fingerprint.clone().unwrap(),
+                last_snapshot_fingerprint: Some("a".repeat(64)),
+                last_upload_body_witness: Some("b".repeat(64)),
+                scan_identity_version: None,
+                effective_upload_body_witness_revision: 0,
+            },
+        );
+        index.file_snapshot_fingerprints.insert(
+            "synthetic/deferred.jsonl".into(),
+            BTreeSet::from([item.snapshot_fingerprint.clone()]),
+        );
+        (index, item)
+    }
+
+    #[test]
+    fn cache_pending_head_lifecycle_survives_finish_and_targets_only_accepted_head() {
+        let (mut index, item) = pending_head_index_item();
+        let mut other = index.files.values().next().unwrap().clone();
+        other.source_file_fingerprint = "c".repeat(64);
+        index
+            .files
+            .insert("synthetic/unrelated.jsonl".into(), other.clone());
+        let mut progress = test_upload_progress();
+        let root =
+            std::env::temp_dir().join(format!("ottto-pending-head-{}", unique_poison_scope()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("progress.json");
+        progress
+            .record_pending_cache_head(&item, &cache_head_file_groups(&index), true)
+            .unwrap();
+        progress.save(&path).unwrap();
+        progress.finish_cycle(&path).unwrap();
+        let namespace = progress.destination_namespace_hash.clone();
+        let witness = progress.active_quarantine_witness.clone().unwrap();
+        progress = SnapshotUploadProgress::load(&path, &namespace, witness).unwrap();
+        assert_eq!(
+            progress.pending_cache_heads.len(),
+            1,
+            "no-head obligation survives cycle cleanup/restart"
+        );
+        assert_eq!(progress.reselect_pending_cache_heads(&mut index, true), 0);
+        assert!(progress.accepted_cache_heads.is_empty());
+        let mut probe = item.clone();
+        probe.cache_observations = None;
+        probe.cache_observations_state = None;
+        bootstrap_cache_heads(
+            &[probe.clone()],
+            &unique_poison_scope(),
+            &mut progress,
+            true,
+            |items, enforce| {
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "codex".into(),
+                    machine_id: "a".repeat(64),
+                    collector_version: Some(collector_version()),
+                    snapshots: items,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                let mut response = accepted_batch(1);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                response
+                    .unchanged_entities
+                    .push(crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: item.source_session_id.clone(),
+                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: None,
+                        body_witness_digest: None,
+                        head_etag: enforce.then(|| "e".repeat(64)),
+                        head_challenge: None,
+                    });
+                response.validate_entity_ack_with_head_cas(&request, enforce)?;
+                Ok(response)
+            },
+            |progress| progress.save(&path),
+        )
+        .unwrap();
+        assert_eq!(
+            progress.reselect_pending_cache_heads(&mut index, false),
+            0,
+            "disabled capability never arms a read"
+        );
+        assert_eq!(progress.reselect_pending_cache_heads(&mut index, true), 1);
+        assert!(index.files["synthetic/deferred.jsonl"]
+            .last_snapshot_fingerprint
+            .is_none());
+        assert_eq!(
+            serde_json::to_value(&index.files["synthetic/unrelated.jsonl"]).unwrap(),
+            serde_json::to_value(&other).unwrap()
+        );
+        assert_eq!(
+            progress.pending_cache_heads.len(),
+            1,
+            "head acquisition and reselection cannot retire before enrichment/index save"
+        );
+        assert!(
+            progress.accepted_cache_states.is_empty(),
+            "ordinary head acquisition does not certify provisional cache state"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cache_pending_head_identity_replacements_are_structurally_bounded() {
+        let (mut index, mut item) = pending_head_index_item();
+        let mut progress = test_upload_progress();
+        for revision in 0..200 {
+            let file = format!("{:064x}", revision + 1);
+            let group = format!("{:064x}", revision + 500);
+            let entity = format!("{:064x}", revision + 1000);
+            let entry = index.files.get_mut("synthetic/deferred.jsonl").unwrap();
+            entry.source_file_fingerprint = file.clone();
+            entry.last_snapshot_fingerprint = Some(group.clone());
+            item.source_file_fingerprint = Some(file);
+            item.snapshot_fingerprint = entity;
+            index.file_snapshot_fingerprints.insert(
+                "synthetic/deferred.jsonl".into(),
+                BTreeSet::from([item.snapshot_fingerprint.clone()]),
+            );
+            progress
+                .record_pending_cache_head(&item, &cache_head_file_groups(&index), true)
+                .unwrap();
+            assert_eq!(progress.pending_cache_heads.len(), 1);
+            assert_eq!(
+                progress
+                    .pending_cache_heads
+                    .values()
+                    .next()
+                    .unwrap()
+                    .entities
+                    .len(),
+                1
+            );
+        }
+        progress
+            .accepted_cache_heads
+            .insert(cache_session_key(&item.source_session_id), "e".repeat(64));
+        index
+            .files
+            .get_mut("synthetic/deferred.jsonl")
+            .unwrap()
+            .source_file_fingerprint = "d".repeat(64);
+        assert_eq!(
+            progress.reselect_pending_cache_heads(&mut index, true),
+            0,
+            "head cannot reselect a replaced source witness"
+        );
+        progress.retire_pending_cache_heads(
+            &index,
+            &[],
+            &BTreeSet::new(),
+            false,
+            &progress.pending_cache_head_file_witnesses(&index),
+        );
+        assert_eq!(
+            progress.pending_cache_heads.len(),
+            1,
+            "incomplete census does not certify deletion/replacement"
+        );
+        progress.retire_pending_cache_heads(
+            &index,
+            &[],
+            &BTreeSet::new(),
+            true,
+            &progress.pending_cache_head_file_witnesses(&index),
+        );
+        assert_eq!(
+            progress.pending_cache_heads.len(),
+            1,
+            "changed group/source alone cannot retire unresolved enrichment"
+        );
+        index.files.clear();
+        progress.retire_pending_cache_heads(
+            &index,
+            &[],
+            &BTreeSet::new(),
+            true,
+            &progress.pending_cache_head_file_witnesses(&index),
+        );
+        assert!(progress.pending_cache_heads.is_empty());
+        index = pending_head_index_item().0;
+        item.source_file_fingerprint = Some("d".repeat(64));
+        let duplicate = index.files.values().next().unwrap().clone();
+        index
+            .files
+            .insert("synthetic/ambiguous.jsonl".into(), duplicate);
+        assert!(
+            progress
+                .record_pending_cache_head(&item, &cache_head_file_groups(&index), true)
+                .is_err(),
+            "ambiguous deferred identity explicitly refuses index settlement"
+        );
+        assert!(progress.pending_cache_heads.is_empty());
+    }
+
+    #[test]
+    fn cache_pending_head_retirement_requires_exact_cache_body_not_ordinary_ack() {
+        let (index, item) = pending_head_index_item();
+        let mut progress = test_upload_progress();
+        progress
+            .record_pending_cache_head(&item, &cache_head_file_groups(&index), true)
+            .unwrap();
+        progress
+            .accepted_cache_heads
+            .insert(cache_session_key(&item.source_session_id), "e".repeat(64));
+        let mut ordinary = item.clone();
+        ordinary.cache_observations = None;
+        ordinary.cache_observations_state = None;
+        progress.record_body(
+            &ordinary.snapshot_fingerprint,
+            &snapshot_upload_body_witness(&ordinary),
+        );
+        progress.retire_pending_cache_heads(
+            &index,
+            std::slice::from_ref(&item),
+            &BTreeSet::new(),
+            true,
+            &progress.pending_cache_head_file_witnesses(&index),
+        );
+        assert_eq!(
+            progress.pending_cache_heads.len(),
+            1,
+            "ordinary settlement cannot fulfill cache enrichment"
+        );
+        progress.record_body(
+            &item.snapshot_fingerprint,
+            &snapshot_upload_body_witness(&item),
+        );
+        let mut wrong_file = item.clone();
+        wrong_file.source_file_fingerprint = Some("d".repeat(64));
+        progress.retire_pending_cache_heads(
+            &index,
+            &[wrong_file],
+            &BTreeSet::new(),
+            true,
+            &progress.pending_cache_head_file_witnesses(&index),
+        );
+        assert_eq!(
+            progress.pending_cache_heads.len(),
+            1,
+            "same semantic entity from another file cannot retire this witness"
+        );
+        progress.retire_pending_cache_heads(
+            &index,
+            std::slice::from_ref(&item),
+            &BTreeSet::new(),
+            true,
+            &progress.pending_cache_head_file_witnesses(&index),
+        );
+        assert!(progress.pending_cache_heads.is_empty());
+        progress
+            .record_pending_cache_head(&item, &cache_head_file_groups(&index), true)
+            .unwrap();
+        progress.retire_pending_cache_heads(
+            &index,
+            &[],
+            &BTreeSet::from([item.snapshot_fingerprint.clone()]),
+            false,
+            &progress.pending_cache_head_file_witnesses(&index),
+        );
+        assert_eq!(
+            progress.pending_cache_heads.len(),
+            1,
+            "held absence cannot retire a prior obligation"
+        );
+        let mut old = serde_json::to_value(&progress).unwrap();
+        old.as_object_mut().unwrap().remove("pending_cache_heads");
+        let adopted: SnapshotUploadProgress = serde_json::from_value(old).unwrap();
+        assert!(
+            adopted.pending_cache_heads.is_empty(),
+            "older progress adopts serde-default empty obligations"
+        );
+    }
+
+    #[test]
+    fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement() {
+        let (mut index, mut first) = pending_head_index_item();
+        first.cache_base_head_etag = Some("e".repeat(64));
+        let mut sibling = first.clone();
+        sibling.snapshot_fingerprint = "9".repeat(64);
+        let mut second = first.clone();
+        second.source_file_fingerprint = Some("8".repeat(64));
+        second.snapshot_fingerprint = "7".repeat(64);
+        let mut entry = index.files.values().next().unwrap().clone();
+        entry.source_file_fingerprint = second.source_file_fingerprint.clone().unwrap();
+        entry.last_snapshot_fingerprint = Some("6".repeat(64));
+        index.files.insert("synthetic/second.jsonl".into(), entry);
+        index
+            .file_snapshot_fingerprints
+            .get_mut("synthetic/deferred.jsonl")
+            .unwrap()
+            .insert(sibling.snapshot_fingerprint.clone());
+        index.file_snapshot_fingerprints.insert(
+            "synthetic/second.jsonl".into(),
+            BTreeSet::from([second.snapshot_fingerprint.clone()]),
+        );
+        let mut progress = test_upload_progress();
+        for item in [&first, &sibling, &second] {
+            progress
+                .record_pending_cache_head(item, &cache_head_file_groups(&index), true)
+                .unwrap();
+        }
+        assert_eq!(progress.pending_cache_heads.len(), 2);
+        assert_eq!(
+            progress
+                .pending_cache_heads
+                .values()
+                .map(|pending| pending.entities.len())
+                .sum::<usize>(),
+            3
+        );
+        let root = std::env::temp_dir().join(format!(
+            "ottto-pending-siblings-{}-{}",
+            unique_poison_scope(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let progress_path = root.join("progress.json");
+        let index_path = root.join("index.json");
+        progress.save(&progress_path).unwrap();
+        // Ordinary body settlement followed by index commit may crash before
+        // cycle cleanup. No cache/head authority is inferred from that ACK.
+        let ordinary = [&first, &sibling, &second]
+            .into_iter()
+            .map(|item| {
+                let mut item = item.clone();
+                item.cache_observations = None;
+                item.cache_observations_state = None;
+                item.cache_base_head_etag = None;
+                item
+            })
+            .collect::<Vec<_>>();
+        let scope = unique_poison_scope();
+        let mut accepted = 0;
+        upload_resumable_batches_with_body_witness(
+            &ordinary,
+            &scope,
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| Ok(accepted_batch(items.len())),
+            |progress| progress.save(&progress_path),
+        )
+        .unwrap();
+        index.save(&index_path).unwrap();
+        let namespace = progress.destination_namespace_hash.clone();
+        let witness = progress.active_quarantine_witness.clone().unwrap();
+        progress =
+            SnapshotUploadProgress::load(&progress_path, &namespace, witness.clone()).unwrap();
+        assert!(progress.accepted_cache_heads.is_empty());
+        assert_eq!(progress.pending_cache_heads.len(), 2);
+        // Exact ordinary repeat acquires real ACK-owned head through bootstrap.
+        bootstrap_cache_heads(
+            &ordinary,
+            &scope,
+            &mut progress,
+            true,
+            |items, enforce| {
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "codex".into(),
+                    machine_id: "a".repeat(64),
+                    collector_version: Some(collector_version()),
+                    snapshots: items.clone(),
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                let mut response = accepted_batch(items.len());
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                response.unchanged_entities = items
+                    .iter()
+                    .map(|item| crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: item.source_session_id.clone(),
+                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: None,
+                        body_witness_digest: None,
+                        head_etag: enforce.then(|| "e".repeat(64)),
+                        head_challenge: None,
+                    })
+                    .collect();
+                response.validate_entity_ack_with_head_cas(&request, enforce)?;
+                Ok(response)
+            },
+            |progress| progress.save(&progress_path),
+        )
+        .unwrap();
+        let mut selected = index.clone();
+        assert_eq!(
+            progress.reselect_pending_cache_heads(&mut selected, true),
+            2,
+            "one session selects both exact files"
+        );
+        let items = [first.clone(), sibling.clone(), second.clone()];
+        let outcome = upload_resumable_batches_with_body_witness(
+            &items,
+            &scope,
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |batch| {
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "codex".into(),
+                    machine_id: "a".repeat(64),
+                    collector_version: Some(collector_version()),
+                    snapshots: batch.clone(),
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                let mut response = accepted_batch(2);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                for item in batch {
+                    let reference = crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: item.source_session_id.clone(),
+                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: Some(14),
+                        body_witness_digest: Some(snapshot_upload_body_witness(&item)),
+                        head_etag: (item.snapshot_fingerprint != sibling.snapshot_fingerprint)
+                            .then(|| "e".repeat(64)),
+                        head_challenge: (item.snapshot_fingerprint == sibling.snapshot_fingerprint)
+                            .then(|| "c".repeat(64)),
+                    };
+                    if item.snapshot_fingerprint == sibling.snapshot_fingerprint {
+                        response.conflict_entities.push(reference);
+                    } else {
+                        response.accepted_entities.push(reference);
+                    }
+                }
+                response.validate_entity_ack_with_head_cas(&request, true)?;
+                Ok(response)
+            },
+            |progress| progress.save(&progress_path),
+        )
+        .unwrap();
+        assert_eq!(outcome, ResumableUploadResult::Conflicted { count: 1 });
+        index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        index.save(&index_path).unwrap();
+        progress.retire_pending_cache_heads(
+            &index,
+            &items,
+            &BTreeSet::new(),
+            true,
+            &progress.pending_cache_head_file_witnesses(&index),
+        );
+        assert_eq!(
+            progress.pending_cache_heads.len(),
+            1,
+            "failed sibling keeps its whole file group pending"
+        );
+        let pending = progress.pending_cache_heads.values().next().unwrap();
+        assert_eq!(pending.entities.len(), 2);
+        assert_eq!(
+            pending.settled_entities,
+            BTreeSet::from([first.snapshot_fingerprint.clone()])
+        );
+        progress.finish_cycle(&progress_path).unwrap();
+        progress = SnapshotUploadProgress::load(&progress_path, &namespace, witness).unwrap();
+        assert_eq!(
+            progress.reselect_pending_cache_heads(&mut index.clone(), true),
+            0,
+            "same verified head does not force repeated file reads while quarantine waits"
+        );
+        let pending_bytes = serde_json::to_vec(&progress.pending_cache_heads)
+            .unwrap()
+            .len();
+        println!("pending_head_resource files=1 entity_edges=2 serialized_bytes={pending_bytes}");
+        assert!(
+            pending_bytes <= 384 + 400 * 2,
+            "fixed hash-only storage bound per tracked edge/file"
+        );
+        let mut rebound = progress.clone();
+        rebound
+            .accepted_cache_heads
+            .insert(cache_session_key(&first.source_session_id), "d".repeat(64));
+        assert_eq!(
+            rebound.reselect_pending_cache_heads(&mut index.clone(), true),
+            1,
+            "different verified head targets only its pending file"
+        );
+        rebound.accepted_cache_heads.clear();
+        assert_eq!(
+            rebound.reselect_pending_cache_heads(&mut index.clone(), true),
+            0
+        );
+        rebound.accepted_cache_heads = progress.accepted_cache_heads.clone();
+        assert_eq!(
+            rebound.reselect_pending_cache_heads(&mut index.clone(), true),
+            1,
+            "actual no-head then acquired head rearms exactly affected file"
+        );
+        let mut new_generation = progress.clone();
+        assert!(new_generation.prepare_historical_replay("next-reviewed-generation"));
+        assert!(new_generation
+            .pending_cache_heads
+            .values()
+            .all(|pending| pending.settled_entities.is_empty()
+                && pending.reselected_heads.is_empty()));
+        let different_namespace_path = root.join("different_namespace_progress.json");
+        std::fs::copy(&progress_path, &different_namespace_path).unwrap();
+        let unrelated = SnapshotUploadProgress::load(
+            &different_namespace_path,
+            &"0".repeat(64),
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        )
+        .unwrap();
+        assert!(
+            unrelated.pending_cache_heads.is_empty(),
+            "destination namespace replacement never adopts obligations"
+        );
+        index
+            .quarantined_snapshot_fingerprints
+            .get_mut(&sibling.snapshot_fingerprint)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+        upload_resumable_batches_with_body_witness(
+            &[sibling.clone()],
+            &scope,
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |batch| {
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "codex".into(),
+                    machine_id: "a".repeat(64),
+                    collector_version: Some(collector_version()),
+                    snapshots: batch,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                let mut response = accepted_batch(1);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                response
+                    .accepted_entities
+                    .push(crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: sibling.source_session_id.clone(),
+                        snapshot_fingerprint: sibling.snapshot_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: Some(14),
+                        body_witness_digest: Some(snapshot_upload_body_witness(&sibling)),
+                        head_etag: Some("e".repeat(64)),
+                        head_challenge: None,
+                    });
+                response.validate_entity_ack_with_head_cas(&request, true)?;
+                Ok(response)
+            },
+            |progress| progress.save(&progress_path),
+        )
+        .unwrap();
+        index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        index.save(&index_path).unwrap();
+        progress.retire_pending_cache_heads(
+            &index,
+            &[sibling],
+            &BTreeSet::new(),
+            true,
+            &progress.pending_cache_head_file_witnesses(&index),
+        );
+        assert!(
+            progress.pending_cache_heads.is_empty(),
+            "final exact cache-bearing sibling ACK completes the group"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn cache_effective_wire_fixture_root() -> PathBuf {
+        use serde_json::json;
+        let root = std::env::temp_dir().join(format!(
+            "ottto-cache-effective-wire-{}-{}",
+            unique_poison_scope(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let id = "00000000-0000-7000-8000-000000000001";
+        let path = root.join(format!("rollout-2026-09-30T10-00-00-{id}.jsonl"));
+        let records = [
+            json!({"type":"session_meta","timestamp":"2026-09-30T10:00:00Z","payload":{"id":id,"source":"cli","timestamp":"2026-09-30T10:00:00Z"}}),
+            json!({"type":"turn_context","payload":{"model":"gpt-5.6-sol","effort":"high"}}),
+            json!({"type":"token_usage_record","timestamp":"2026-09-30T10:00:01Z","payload":{"response_id":"resp_effective_wire","usage":{"input_tokens":100000,"cached_input_tokens":90000,"output_tokens":1}}}),
+            json!({"type":"event_msg","timestamp":"2026-09-30T10:00:01Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100000,"cached_input_tokens":90000,"output_tokens":1},"last_token_usage":{"input_tokens":100000,"cached_input_tokens":90000,"output_tokens":1}}}}),
+        ];
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn cache_pending_head_stamp_preserves_actual_quarantine_candidate_retry() {
+        let root = cache_effective_wire_fixture_root();
+        let scan = |index: &mut ScanIndex| {
+            crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                index,
+                "2026-09-30T10:05:00Z",
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap()
+        };
+        let mut index = ScanIndex::default();
+        index.activate_upload_context("cache-on".into());
+        let mut first = scan(&mut index);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut index);
+        let mut item = first.snapshots.remove(0);
+        let mut progress = test_upload_progress();
+        progress
+            .record_pending_cache_head(&item, &cache_head_file_groups(&index), true)
+            .unwrap();
+        let mut probe = item.clone();
+        probe.cache_observations = None;
+        probe.cache_observations_state = None;
+        bootstrap_cache_heads(
+            &[probe],
+            &unique_poison_scope(),
+            &mut progress,
+            true,
+            |items, enforce| {
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "codex".into(),
+                    machine_id: "a".repeat(64),
+                    collector_version: Some(collector_version()),
+                    snapshots: items,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                let mut response = accepted_batch(1);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                response
+                    .unchanged_entities
+                    .push(crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: item.source_session_id.clone(),
+                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: Some(6),
+                        body_witness_digest: Some(snapshot_upload_body_witness(
+                            &request.snapshots[0],
+                        )),
+                        head_etag: enforce.then(|| "e".repeat(64)),
+                        head_challenge: None,
+                    });
+                response.validate_entity_ack_with_head_cas(&request, enforce)?;
+                Ok(response)
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        item.cache_base_head_etag = progress
+            .accepted_cache_heads
+            .get(&cache_session_key(&item.source_session_id))
+            .cloned();
+        crate::snapshots::prepare_cache_observations(&mut item, None);
+        progress.quarantine_body(
+            &item.snapshot_fingerprint,
+            &snapshot_upload_body_witness(&item),
+        );
+        index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        let index_path = root.join("index.json");
+        index.save(&index_path).unwrap();
+        progress.retire_pending_cache_heads(
+            &index,
+            &[item.clone()],
+            &BTreeSet::new(),
+            true,
+            &progress.pending_cache_head_file_witnesses(&index),
+        );
+        assert_eq!(progress.pending_cache_heads.len(), 1);
+        assert_eq!(progress.reselect_pending_cache_heads(&mut index, true), 0);
+        let waiting = scan(&mut index);
+        assert!(
+            waiting.snapshots.is_empty(),
+            "same head waits for normal bounded quarantine without file reparse"
+        );
+        index
+            .quarantined_snapshot_fingerprints
+            .get_mut(&item.snapshot_fingerprint)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        let mut due = scan(&mut index);
+        assert_eq!(
+            due.snapshots.len(),
+            1,
+            "actual candidate predicate reparses when existing quarantine retry is due"
+        );
+        assert_eq!(progress.reselect_pending_cache_heads(&mut index, true), 0);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut due, &mut index);
+        assert_eq!(
+            due.snapshots.len(),
+            1,
+            "due retry also survives actual finalizer no-op selection"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cache_pending_head_orphan_after_saved_prune_still_present_source_reparses() {
+        let root = cache_effective_wire_fixture_root();
+        let scan = |index: &mut ScanIndex| {
+            crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                index,
+                "2026-09-30T10:05:00Z",
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap()
+        };
+        let mut index = ScanIndex::default();
+        index.activate_upload_context("cache-on".into());
+        let mut result = scan(&mut index);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        let item = result.snapshots.remove(0);
+        let mut progress = test_upload_progress();
+        progress
+            .record_pending_cache_head(&item, &cache_head_file_groups(&index), true)
+            .unwrap();
+        assert!(
+            !progress.prune_pending_cache_head_orphans_from_loaded_index(&ScanIndex::default()),
+            "fallback index cannot certify deletion"
+        );
+        let progress_path = root.join("progress.json");
+        let index_path = root.join("index.json");
+        progress.save(&progress_path).unwrap();
+        // Complete authoritative prune/index save, then crash BEFORE obligation
+        // retirement. The source's reappearance must remain an unknown Parse.
+        index.files.clear();
+        index.file_snapshot_fingerprints.clear();
+        index.confirmed_empty_files.clear();
+        index.save(&index_path).unwrap();
+        let namespace = progress.destination_namespace_hash.clone();
+        let witness = progress.active_quarantine_witness.clone().unwrap();
+        progress = SnapshotUploadProgress::load(&progress_path, &namespace, witness).unwrap();
+        let mut loaded = ScanIndex::load(&index_path).unwrap();
+        let accepted_before = (
+            progress.accepted_fingerprints.clone(),
+            progress.accepted_body_witnesses.clone(),
+            progress.accepted_cache_heads.clone(),
+            progress.accepted_cache_states.clone(),
+        );
+        assert!(progress.prune_pending_cache_head_orphans_from_loaded_index(&loaded));
+        assert_eq!(
+            (
+                progress.accepted_fingerprints.clone(),
+                progress.accepted_body_witnesses.clone(),
+                progress.accepted_cache_heads.clone(),
+                progress.accepted_cache_states.clone()
+            ),
+            accepted_before,
+            "orphan cleanup cannot certify evidence or change authority"
+        );
+        assert!(progress.pending_cache_heads.is_empty());
+        progress.save(&progress_path).unwrap();
+        loaded.activate_upload_context("cache-on".into());
+        let mut reparsed = scan(&mut loaded);
+        assert_eq!(reparsed.snapshots.len(), 1, "actual candidate Parse survives marker cleanup for existing source missing from saved index");
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut reparsed, &mut loaded);
+        assert!(progress
+            .record_pending_cache_head(
+                &reparsed.snapshots[0],
+                &cache_head_file_groups(&loaded),
+                true
+            )
+            .unwrap());
+        assert_eq!(
+            progress.pending_cache_heads.len(),
+            1,
+            "current raw acquisition rebinds exactly one tracked edge"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn cache_effective_wire_released143_index(root: &Path) -> (ScanIndex, SnapshotUploadProgress) {
+        let scan = |index: &mut ScanIndex| {
+            crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::Codex,
+                &[root.to_path_buf()],
+                index,
+                "2026-09-30T10:05:00Z",
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap()
+        };
+        let mut index = ScanIndex::default();
+        let mut progress = test_upload_progress();
+        index.activate_upload_context("cache-off".into());
+        let mut off = scan(&mut index);
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut off.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        // Actual released ordering stores the raw cache-bearing witness first.
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut off, &mut index);
+        for item in &mut off.snapshots {
+            prepare_snapshot_cache_for_upload(item, &progress, false, false, &BTreeSet::new());
+        }
+        let mut accepted = 0;
+        upload_resumable_batches_with_body_witness(
+            &off.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "codex".into(),
+                    machine_id: "a".repeat(64),
+                    collector_version: Some(collector_version()),
+                    snapshots: items,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                let item = &request.snapshots[0];
+                let mut response = accepted_batch(1);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                response
+                    .accepted_entities
+                    .push(crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: item.source_session_id.clone(),
+                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: Some(6),
+                        body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                        head_etag: None,
+                        head_challenge: None,
+                    });
+                response.validate_entity_ack(&request)?;
+                Ok(response)
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        index.activate_upload_context("cache-on".into());
+        let mut on = scan(&mut index);
+        assert_eq!(on.snapshots.len(), 1);
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut on.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut on, &mut index);
+        assert!(
+            on.snapshots.is_empty(),
+            "released143 falsely settles unchanged enrichment under admitted context"
+        );
+        assert!(progress.accepted_cache_states.is_empty());
+        assert!(progress.accepted_cache_heads.is_empty());
+        (index, progress)
+    }
+
+    #[test]
+    fn cache_effective_wire_projection_matches_index_retractions_and_held_local_evidence() {
+        let root = cache_effective_wire_fixture_root();
+        let mut baseline = ScanIndex::default();
+        baseline.activate_effective_upload_body_witness_revision(
+            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+        );
+        let raw = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut baseline,
+            "2026-09-30T10:05:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        assert_eq!(raw.snapshots.len(), 1);
+        let mut prior = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        prior.context_curve = None;
+        assert_eq!(prior.source_session_id, raw.snapshots[0].source_session_id);
+        let key = cache_session_key(&prior.source_session_id);
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        upload_resumable_batches_with_body_witness(
+            &[prior.clone()],
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "codex".into(),
+                    machine_id: "a".repeat(64),
+                    collector_version: Some(collector_version()),
+                    snapshots: items,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                let item = &request.snapshots[0];
+                let mut response = accepted_batch(1);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                response
+                    .accepted_entities
+                    .push(crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: item.source_session_id.clone(),
+                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: Some(14),
+                        body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                        head_etag: Some("e".repeat(64)),
+                        head_challenge: None,
+                    });
+                response.validate_entity_ack_with_head_cas(&request, true)?;
+                Ok(response)
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            progress.accepted_cache_states[&key]["observations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let accepted_prior = progress.accepted_cache_states.clone();
+        for (enabled, held) in [(false, false), (true, true), (true, false)] {
+            let mut disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+            if held {
+                disposition.defer_sessions(BTreeSet::from([prior.source_session_id.clone()]));
+            }
+            let mut effective_scan = raw.clone();
+            let mut effective_index = baseline.clone();
+            apply_upload_policy(
+                SnapshotSource::Codex,
+                &mut effective_scan.snapshots,
+                SnapshotUploadPolicy::default(),
+            );
+            let mut wire_scan = effective_scan.clone();
+            let mut wire_index = baseline.clone();
+            if !held {
+                for item in &mut wire_scan.snapshots {
+                    prepare_snapshot_cache_for_upload(
+                        item,
+                        &progress,
+                        enabled,
+                        true,
+                        &BTreeSet::new(),
+                    );
+                }
+            }
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut wire_scan, &mut wire_index);
+            exclude_held_effective_body_witness_revision(
+                &mut effective_index,
+                &effective_scan.snapshots,
+                &disposition,
+            );
+            finalize_scan_after_policy_with_body_witness(
+                SnapshotSource::Codex,
+                &mut effective_scan,
+                &mut effective_index,
+                |item| {
+                    effective_snapshot_upload_body_witness(
+                        item,
+                        &progress,
+                        enabled,
+                        true,
+                        &BTreeSet::new(),
+                        &disposition,
+                    )
+                },
+            );
+            let effective = effective_index.files.values().next().unwrap();
+            assert_eq!(
+                effective.effective_upload_body_witness_revision,
+                if held {
+                    0
+                } else {
+                    EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION
+                },
+                "caller excludes raw held file from effective adoption"
+            );
+            let expected = wire_index.files.values().next().unwrap();
+            assert_eq!(
+                effective.last_snapshot_fingerprint,
+                expected.last_snapshot_fingerprint
+            );
+            assert_eq!(
+                effective.last_upload_body_witness, expected.last_upload_body_witness,
+                "actual prepared network projection and effective index witness fold must agree"
+            );
+            assert!(
+                effective_scan.snapshots[0].cache_observations.is_some(),
+                "local consumers retain authorized raw declaration"
+            );
+            assert!(
+                effective_scan.snapshots[0]
+                    .cache_observations_state
+                    .is_none(),
+                "local provisional source is distinct from ACK-owned accepted state"
+            );
+            assert_eq!(
+                progress.accepted_cache_states, accepted_prior,
+                "pure projection does not certify or change accepted state"
+            );
+            let mut uploadable = effective_scan.snapshots.clone();
+            disposition.retain_uploadable(&mut uploadable);
+            if held {
+                assert!(uploadable.is_empty());
+                let committed = effective_index.committable_subset(
+                    &ScanIndex::default(),
+                    &BTreeSet::new(),
+                    &BTreeMap::new(),
+                );
+                assert!(
+                    committed.files.is_empty(),
+                    "held group cannot enter index settlement from raw local witness"
+                );
+            } else if enabled {
+                let projected = &wire_scan.snapshots[0];
+                assert_eq!(projected.cache_base_head_etag, Some("e".repeat(64)));
+                assert_eq!(
+                    projected.cache_observations_state.as_ref().unwrap()["observations"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    0
+                );
+                assert!(projected.cache_observations.as_ref().unwrap().operations.iter().any(|operation|
+                    matches!(operation, crate::snapshots::cache_observations::Operation::Retract { .. })),
+                    "complete current source retracts prior ACK-owned observations at real preparation boundary");
+            } else {
+                assert!(wire_scan.snapshots[0].cache_observations.is_none());
+            }
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
+        let root = cache_effective_wire_fixture_root();
+        let scan = |index: &mut ScanIndex| {
+            crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                index,
+                "2026-09-30T10:05:00Z",
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap()
+        };
+        let response = |items: Vec<SnapshotItem>, enforce: bool, head: Option<String>| {
+            let request = SnapshotBatchRequest {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                source: "codex".into(),
+                machine_id: "a".repeat(64),
+                collector_version: Some(collector_version()),
+                snapshots: items,
+                upload_policy: SnapshotUploadPolicy::default(),
+                client_report: crate::client_report::ClientReport::empty(),
+            };
+            let item = &request.snapshots[0];
+            let mut ack = accepted_batch(1);
+            ack.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            ack.accepted_entities
+                .push(crate::snapshot_client::SnapshotEntityRef {
+                    source_session_id: item.source_session_id.clone(),
+                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                    occurrence_count: 1,
+                    body_witness_version: Some(if item.cache_observations.is_some() {
+                        18
+                    } else {
+                        6
+                    }),
+                    body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                    head_etag: head,
+                    head_challenge: None,
+                });
+            ack.validate_entity_ack_with_head_cas(&request, enforce)?;
+            Ok(ack)
+        };
+        let mut index = ScanIndex::default();
+        index.activate_effective_upload_body_witness_revision(
+            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+        );
+        index.activate_upload_context("cache-off".into());
+        let mut progress = test_upload_progress();
+        let mut off = scan(&mut index);
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut off.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::Codex,
+            &mut off,
+            &mut index,
+            |item| {
+                effective_snapshot_upload_body_witness(
+                    item,
+                    &progress,
+                    false,
+                    false,
+                    &BTreeSet::new(),
+                    &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+                )
+            },
+        );
+        for item in &mut off.snapshots {
+            prepare_snapshot_cache_for_upload(item, &progress, false, false, &BTreeSet::new());
+        }
+        let mut accepted = 0;
+        upload_resumable_batches_with_body_witness(
+            &off.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| response(items, false, None),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(progress.accepted_cache_heads.is_empty());
+        let index_path = root.join("index.json");
+        let progress_path = root.join("progress.json");
+        index.save(&index_path).unwrap();
+        progress.save(&progress_path).unwrap();
+        progress.finish_cycle(&progress_path).unwrap();
+        progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &progress.destination_namespace_hash,
+            test_quarantine_witness(),
+        )
+        .unwrap();
+        index.activate_upload_context("cache-on-mandatory".into());
+        let mut on = scan(&mut index);
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut on.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+        let identities = capture_deferred_cache_head_identities(
+            SnapshotSource::Codex,
+            &on.snapshots,
+            &progress,
+            true,
+            true,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &disposition,
+        );
+        assert_eq!(identities.len(), 1);
+        assert!(capture_deferred_cache_head_identities(
+            SnapshotSource::Codex,
+            &on.snapshots,
+            &progress,
+            false,
+            true,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &disposition
+        )
+        .is_empty());
+        let mut held = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+        held.defer_sessions(BTreeSet::from([on.snapshots[0].source_session_id.clone()]));
+        assert!(capture_deferred_cache_head_identities(
+            SnapshotSource::Codex,
+            &on.snapshots,
+            &progress,
+            true,
+            true,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &held
+        )
+        .is_empty());
+        let legacy = BTreeSet::from([identities[0].snapshot_fingerprint.clone()]);
+        assert!(capture_deferred_cache_head_identities(
+            SnapshotSource::Codex,
+            &on.snapshots,
+            &progress,
+            true,
+            true,
+            &legacy,
+            &BTreeSet::new(),
+            &disposition
+        )
+        .is_empty());
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::Codex,
+            &mut on,
+            &mut index,
+            |item| {
+                effective_snapshot_upload_body_witness(
+                    item,
+                    &progress,
+                    true,
+                    true,
+                    &BTreeSet::new(),
+                    &disposition,
+                )
+            },
+        );
+        assert!(
+            on.snapshots.is_empty(),
+            "actual effective ordinary-body equality removes candidate"
+        );
+        let groups = cache_head_file_groups(&index);
+        for identity in &identities {
+            assert!(progress
+                .record_pending_cache_head_identity(
+                    identity.source_file_fingerprint.as_ref(),
+                    &identity.snapshot_fingerprint,
+                    &identity.session_key,
+                    &groups,
+                    true
+                )
+                .unwrap());
+        }
+        progress.save(&progress_path).unwrap(); // obligation before no-op index settlement
+        index.save(&index_path).unwrap();
+        progress.finish_cycle(&progress_path).unwrap();
+        let mut loaded = ScanIndex::load(&index_path).unwrap();
+        loaded.activate_upload_context("cache-on-mandatory".into());
+        loaded.activate_effective_upload_body_witness_revision(
+            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+        );
+        let mut progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &progress.destination_namespace_hash,
+            test_quarantine_witness(),
+        )
+        .unwrap();
+        assert_eq!(progress.pending_cache_heads.len(), 1);
+        assert_eq!(progress.reselect_pending_cache_heads(&mut loaded, true), 0);
+        assert!(
+            scan(&mut loaded).snapshots.is_empty(),
+            "missing authority remains explicitly pending"
+        );
+        // Existing exact ordinary CAS transport supplies the actual prerequisite;
+        // the marker itself neither schedules this probe nor invents head authority.
+        bootstrap_cache_heads(
+            &off.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            true,
+            |items, enforce| response(items, enforce, enforce.then(|| "e".repeat(64))),
+            |state| state.save(&progress_path),
+        )
+        .unwrap();
+        assert_eq!(progress.reselect_pending_cache_heads(&mut loaded, true), 1);
+        let mut enriched = scan(&mut loaded);
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut enriched.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::Codex,
+            &mut enriched,
+            &mut loaded,
+            |item| {
+                effective_snapshot_upload_body_witness(
+                    item,
+                    &progress,
+                    true,
+                    true,
+                    &BTreeSet::new(),
+                    &disposition,
+                )
+            },
+        );
+        assert_eq!(enriched.snapshots.len(), 1);
+        let witnesses = progress.pending_cache_head_file_witnesses(&loaded);
+        for item in &mut enriched.snapshots {
+            prepare_snapshot_cache_for_upload(item, &progress, true, true, &BTreeSet::new());
+        }
+        upload_resumable_batches_with_body_witness(
+            &enriched.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| response(items, true, Some("f".repeat(64))),
+            |state| state.save(&progress_path),
+        )
+        .unwrap();
+        assert_eq!(
+            progress.pending_cache_heads.len(),
+            1,
+            "ACK alone never retires index obligation"
+        );
+        loaded.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        loaded.save(&index_path).unwrap();
+        progress.retire_pending_cache_heads(
+            &loaded,
+            &enriched.snapshots,
+            &BTreeSet::new(),
+            true,
+            &witnesses,
+        );
+        assert!(progress.pending_cache_heads.is_empty());
+        progress.finish_cycle(&progress_path).unwrap();
+        assert!(scan(&mut loaded).snapshots.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cache_effective_wire_existing143_admitted_index_requires_adoption() {
+        let root = cache_effective_wire_fixture_root();
+        let (mut index, _) = cache_effective_wire_released143_index(&root);
+        index.activate_effective_upload_body_witness_revision(
+            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+        );
+        let next = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-09-30T10:05:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            next.snapshots.len(),
+            1,
+            "existing143 admitted index must enter projection adoption instead of Skip"
+        );
+        assert!(
+            index
+                .files
+                .values()
+                .all(|entry| entry.effective_upload_body_witness_revision == 0),
+            "parse alone never certifies effective settlement"
+        );
+    }
+
+    #[test]
+    fn cache_effective_wire_existing143_context_parse_equal_body_requires_adoption() {
+        let root = cache_effective_wire_fixture_root();
+        let (mut index, mut progress) = cache_effective_wire_released143_index(&root);
+        index.activate_effective_upload_body_witness_revision(
+            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+        );
+        index.activate_upload_context("cache-on-new-context-same-effective-body".into());
+        let previous = index.clone();
+        let mut next = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-09-30T10:05:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            next.snapshots.len(),
+            1,
+            "normal context invalidation actually Parse"
+        );
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut next.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::Codex,
+            &mut next,
+            &mut index,
+            |item| {
+                effective_snapshot_upload_body_witness(
+                    item,
+                    &progress,
+                    true,
+                    false,
+                    &BTreeSet::new(),
+                    &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+                )
+            },
+        );
+        assert_eq!(
+            next.snapshots.len(),
+            1,
+            "projection adoption must ignore old raw-body equality after context Parse"
+        );
+        let mut accepted = 0;
+        let outcome = upload_resumable_batches_with_body_witness(
+            &next.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |_| {
+                Err(anyhow::Error::new(UploadShed {
+                    status: 503,
+                    retry_after: Some(Duration::from_secs(60)),
+                }))
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(outcome, ResumableUploadResult::Shed { .. }));
+        assert!(
+            progress.accepted_fingerprints.is_empty(),
+            "actual uploader prunes prior ordinary ACK before additive enrichment"
+        );
+        let mut partial = index.committable_subset(
+            &previous,
+            &progress.accepted_fingerprints,
+            &progress.quarantined_fingerprints,
+        );
+        assert!(partial
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 0));
+        let path = root.join("index.json");
+        partial.save(&path).unwrap();
+        let mut retry_index = ScanIndex::load(&path).unwrap();
+        retry_index.activate_upload_context("cache-on-new-context-same-effective-body".into());
+        retry_index.activate_effective_upload_body_witness_revision(
+            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+        );
+        let mut retry = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut retry_index,
+            "2026-09-30T10:05:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut retry.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::Codex,
+            &mut retry,
+            &mut retry_index,
+            |item| {
+                effective_snapshot_upload_body_witness(
+                    item,
+                    &progress,
+                    true,
+                    false,
+                    &BTreeSet::new(),
+                    &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+                )
+            },
+        );
+        assert_eq!(
+            retry.snapshots.len(),
+            1,
+            "restart retains actual old-file acquisition"
+        );
+        upload_resumable_batches_with_body_witness(
+            &retry.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "codex".into(),
+                    machine_id: "a".repeat(64),
+                    collector_version: Some(collector_version()),
+                    snapshots: items,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                let item = &request.snapshots[0];
+                let mut response = accepted_batch(1);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                response
+                    .accepted_entities
+                    .push(crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: item.source_session_id.clone(),
+                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: Some(18),
+                        body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                        head_etag: Some("f".repeat(64)),
+                        head_challenge: None,
+                    });
+                response.validate_entity_ack_with_head_cas(&request, true)?;
+                Ok(response)
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(progress.accepted_cache_states.len(), 1);
+        retry_index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        retry_index.save(&path).unwrap();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert!(loaded
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision
+                == EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION));
+        loaded.activate_upload_context("cache-on-new-context-same-effective-body".into());
+        loaded.activate_effective_upload_body_witness_revision(
+            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+        );
+        let stable = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut loaded,
+            "2026-09-30T10:05:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        assert!(
+            stable.snapshots.is_empty(),
+            "saved exact cache settlement adopts file once"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cache_effective_wire_unchanged_capability_enable_survives_finalization() {
+        let root = cache_effective_wire_fixture_root();
+        let mut index = ScanIndex::default();
+        index.activate_effective_upload_body_witness_revision(
+            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+        );
+        index.activate_upload_context("cache-off".into());
+        let scan = |index: &mut ScanIndex| {
+            crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                index,
+                "2026-09-30T10:05:00Z",
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap()
+        };
+        let mut off = scan(&mut index);
+        assert_eq!(off.snapshots.len(), 1);
+        assert!(off.snapshots[0].cache_observations.is_some());
+        let mut progress = test_upload_progress();
+        let held = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+        let legacy = BTreeSet::new();
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut off.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::Codex,
+            &mut off,
+            &mut index,
+            |item| {
+                effective_snapshot_upload_body_witness(
+                    item, &progress, false, false, &legacy, &held,
+                )
+            },
+        );
+        assert!(
+            off.snapshots[0].cache_observations.is_some(),
+            "local consumers preserve authorized raw evidence"
+        );
+        for item in &mut off.snapshots {
+            prepare_snapshot_cache_for_upload(item, &progress, false, false, &legacy);
+        }
+        let mut accepted = 0;
+        upload_resumable_batches_with_body_witness(
+            &off.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "codex".into(),
+                    machine_id: "a".repeat(64),
+                    collector_version: Some(collector_version()),
+                    snapshots: items,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                let item = &request.snapshots[0];
+                let mut response = accepted_batch(1);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                response
+                    .accepted_entities
+                    .push(crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: item.source_session_id.clone(),
+                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: Some(6),
+                        body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                        head_etag: None,
+                        head_challenge: None,
+                    });
+                response.validate_entity_ack(&request)?;
+                Ok(response)
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(accepted, 1);
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        index.activate_upload_context("cache-on".into());
+        let mut on = scan(&mut index);
+        assert_eq!(
+            on.snapshots.len(),
+            1,
+            "context transition actually reparses unchanged file"
+        );
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut on.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::Codex,
+            &mut on,
+            &mut index,
+            |item| {
+                effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held)
+            },
+        );
+        assert_eq!(
+            on.snapshots.len(),
+            1,
+            "effective cache enrichment must survive no-op selection"
+        );
+        let semantic = on.snapshots[0].snapshot_fingerprint.clone();
+        let mut local_item = on.snapshots[0].clone();
+        assert!(progress.accepted_cache_states.is_empty());
+        prepare_snapshot_cache_for_upload(&mut local_item, &progress, true, false, &legacy);
+        let prepared_body = snapshot_upload_body_witness(&local_item);
+        let mut probe = local_item.clone();
+        probe.cache_observations = None;
+        probe.cache_observations_state = None;
+        let mut stages = Vec::new();
+        bootstrap_cache_heads(
+            &[probe],
+            &unique_poison_scope(),
+            &mut progress,
+            true,
+            |items, enforce| {
+                stages.push(enforce);
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "codex".into(),
+                    machine_id: "a".repeat(64),
+                    collector_version: Some(collector_version()),
+                    snapshots: items,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                let item = &request.snapshots[0];
+                let mut response = accepted_batch(1);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                response
+                    .unchanged_entities
+                    .push(crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: item.source_session_id.clone(),
+                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: Some(6),
+                        body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                        head_etag: enforce.then(|| "e".repeat(64)),
+                        head_challenge: None,
+                    });
+                response.validate_entity_ack_with_head_cas(&request, enforce)?;
+                Ok(response)
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            stages,
+            [true],
+            "already settled ordinary bytes still require their exact CAS repeat"
+        );
+        prepare_snapshot_cache_for_upload(&mut on.snapshots[0], &progress, true, false, &legacy);
+        assert_eq!(
+            snapshot_upload_body_witness(&on.snapshots[0]),
+            prepared_body,
+            "opaque predecessor does not alter body identity"
+        );
+        upload_resumable_batches_with_body_witness(
+            &on.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "codex".into(),
+                    machine_id: "a".repeat(64),
+                    collector_version: Some(collector_version()),
+                    snapshots: items,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                let item = &request.snapshots[0];
+                let mut response = accepted_batch(1);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                response
+                    .accepted_entities
+                    .push(crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: item.source_session_id.clone(),
+                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: Some(18),
+                        body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                        head_etag: Some("f".repeat(64)),
+                        head_challenge: None,
+                    });
+                response.validate_entity_ack_with_head_cas(&request, true)?;
+                Ok(response)
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(progress
+            .accepted_cache_states
+            .contains_key(&cache_session_key(&local_item.source_session_id)));
+        assert_eq!(on.snapshots[0].snapshot_fingerprint, semantic);
+        assert!(
+            scan(&mut index).snapshots.is_empty(),
+            "next unchanged source is settled"
+        );
+        index.activate_upload_context("cache-on-same-effective-projection".into());
+        let mut repeated = scan(&mut index);
+        assert_eq!(repeated.snapshots.len(), 1);
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut repeated.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::Codex,
+            &mut repeated,
+            &mut index,
+            |item| {
+                effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held)
+            },
+        );
+        assert!(
+            repeated.snapshots.is_empty(),
+            "actual finalizer also suppresses equal effective body after current-state preparation"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn cache_bootstrap_grown_existing_usage_settles_before_exact_head_probe() {
         let mut current = crate::snapshots::cache_adapter_tests::cache_fixture_item();

@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 412,
-  "content_sha256": "131652f5a9096265a06702e5ccf5b7dcb34d970eaec0266563c273ca69d1e043",
+  "candidate_file_count": 413,
+  "content_sha256": "b1878680bdb17eca153ae5e0d4fb8d96bf5afdcec190a39a40b44d20ae6f9b9e",
   "files": [
     {
       "executable": false,
@@ -888,8 +888,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "2736df5c34c037196c6f59d43fd4910762d3f15c3516d2e32c7ec8a30b210f2f",
-      "size_bytes": 513756
+      "sha256": "5b7eed19efbb909fd0b3f87352ca4758aa5cb8c95d92c78bfda636fc0cef0cf4",
+      "size_bytes": 609697
     },
     {
       "executable": false,
@@ -1807,6 +1807,13 @@
       "path": "docs/session-2026-10-01-claude-valid-access-continuity.md",
       "sha256": "816d6011b871edf6f70f9de6aa8af02dd9bbaf2fd662f5b39094fd8ac07cf75f",
       "size_bytes": 1832
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-02-cache-effective-upload-witness.md",
+      "sha256": "62a57e66eaa623b8b3e94601ff10dadf5348c64b39178fc4fc2ea373d246fcbd",
+      "size_bytes": 1847
     },
     {
       "executable": false,
@@ -2889,7 +2896,7 @@
   ],
   "generated_at": "2026-10-02T00:27:00+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 413,
+  "output_file_count": 414,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
