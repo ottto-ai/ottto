@@ -1783,7 +1783,7 @@ fn finalize_identity_mode(
             spawn_status_refresh("browser_auth_complete");
             return Ok(());
         }
-        if let Some(canonical) = duplicate_slot_for_binding(
+        if let Some(canonical) = serving_slot_for_binding(
             &status,
             &operation.slot_id,
             &proof.account_identifier_hash,
@@ -1846,7 +1846,7 @@ fn finalize_identity_mode(
             store.load().map_err(|error| error.to_string())?,
         );
         if operation.mode == PersistedMode::Target {
-            if let Some(canonical) = duplicate_slot_for_binding(
+            if let Some(canonical) = serving_slot_for_binding(
                 &status,
                 &operation.slot_id,
                 &proof.account_identifier_hash,
@@ -1995,7 +1995,19 @@ fn identity_mismatch(
     }
 }
 
-fn duplicate_slot_for_binding(
+/// The registered slot whose saved connection already serves this exact
+/// account/organization pair, making a fresh login for that pair redundant.
+///
+/// A matching slot whose saved credential needs a new sign-in (signed out,
+/// blocked on an expired access deadline, unreadable, or without a proven
+/// identity) does not serve the pair. Treating it as "already connected"
+/// quarantined the only working login and left the account on a dead
+/// connection the user could not repair. Such a login is admitted through the
+/// normal registration path instead; canonical selection then prefers the
+/// working slot and the dead one is presented as a removable duplicate.
+/// Duplicate-labelled slots never serve on their own: canonical selection has
+/// already preferred the best slot for the pair.
+fn serving_slot_for_binding(
     status: &ClaudeAccountsStatusV1,
     candidate_slot_id: &str,
     account_identifier_hash: &str,
@@ -2006,12 +2018,29 @@ fn duplicate_slot_for_binding(
         .iter()
         .chain(status.external_slots.iter())
         .filter(|slot| slot.slot_id != candidate_slot_id)
-        .find(|slot| {
+        .filter(|slot| {
             slot.collection.account_identifier_hash.as_deref() == Some(account_identifier_hash)
                 && slot.collection.organization_identifier_hash.as_deref()
                     == Some(organization_identifier_hash)
         })
+        .find(|slot| claude_saved_connection_serves(&slot.collection))
         .map(|slot| slot.slot_id.clone())
+}
+
+fn claude_saved_connection_serves(
+    collection: &ottto_protocol::ClaudeConfigSlotCollectionStatusV1,
+) -> bool {
+    use ottto_protocol::ClaudeConfigSlotCollectionStateV1 as State;
+    !matches!(
+        collection.state,
+        State::NeedsLogin
+            | State::RefreshDue
+            | State::StaleAccessToken
+            | State::CredentialUnavailable
+            | State::IdentityUnknown
+            | State::IdentityMismatch
+            | State::DuplicateAccount
+    )
 }
 
 fn login_command(config_dir: &str) -> Option<std::process::Command> {
@@ -5066,14 +5095,14 @@ mod tests {
         existing.collection.account_identifier_hash = Some("a".repeat(64));
         existing.collection.organization_identifier_hash = Some("b".repeat(64));
         status.managed_slots.push(existing);
-        assert!(duplicate_slot_for_binding(
+        assert!(serving_slot_for_binding(
             &status,
             "claude_slot_50505050505050505050505050505050",
             &"a".repeat(64),
             &"b".repeat(64)
         )
         .is_some());
-        assert!(duplicate_slot_for_binding(
+        assert!(serving_slot_for_binding(
             &status,
             "claude_slot_50505050505050505050505050505050",
             &"a".repeat(64),
@@ -5222,6 +5251,103 @@ mod tests {
             Some(organization.as_str())
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Live M4, 2026-10-02: "Add Claude account" for an account whose only
+    /// saved connection was signed out ended "already connected", quarantined
+    /// the fresh login and left the account on the dead connection. A slot
+    /// that cannot serve the pair must not swallow the login; a healthy one
+    /// still does.
+    #[test]
+    #[serial]
+    fn generic_login_for_pair_whose_saved_connection_is_dead_is_admitted() {
+        use ottto_protocol::ClaudeConfigSlotCollectionStateV1 as State;
+        for (existing_state, admitted) in [
+            (State::NeedsLogin, true),
+            (State::RefreshDue, true),
+            (State::StaleAccessToken, true),
+            (State::CredentialUnavailable, true),
+            (State::Fresh, false),
+            (State::ProviderUnavailable, false),
+        ] {
+            let root = temp_dir("generic-dead-pair");
+            let support = root.join("support");
+            fs::create_dir_all(&support).expect("support");
+            #[cfg(unix)]
+            fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
+            let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+            let store = FileClaudeConfigSlotSettingsStore::default();
+            let existing_root = root.join("existing");
+            fs::create_dir_all(&existing_root).expect("existing root");
+            let existing_slot = store
+                .register_path(1, existing_root.to_string_lossy().into_owned())
+                .expect("existing registration")
+                .external_slots[0]
+                .slot_id
+                .clone();
+            let account = "a".repeat(64);
+            let organization = "b".repeat(64);
+            crate::agent_status::persist_one_claude_slot_collection_state(
+                &existing_slot,
+                &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: existing_state.clone(),
+                    account_identifier_hash: Some(account.clone()),
+                    organization_identifier_hash: Some(organization.clone()),
+                    observed_at: Some("2026-09-24T12:21:06Z".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("existing saved state");
+            let operation_id = "claude_setup_c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
+            prepare_generic(store.load().expect("registry"), operation_id).expect("prepare");
+            let candidate_slot = read_operation(operation_id).expect("operation").slot_id;
+            finalize_identity(
+                operation_id,
+                crate::agent_status::ClaudeLocalIdentityProof {
+                    account_identifier_hash: account.clone(),
+                    organization_identifier_hash: organization.clone(),
+                    collection: ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                        state: State::Fresh,
+                        account_identifier_hash: Some(account.clone()),
+                        organization_identifier_hash: Some(organization.clone()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .expect("finalize");
+            let operation = read_operation(operation_id).expect("finished operation");
+            let registry = store.load().expect("registry after");
+            let candidate_registered = registry
+                .managed_slots
+                .iter()
+                .any(|slot| slot.slot_id == candidate_slot);
+            if admitted {
+                assert_eq!(
+                    operation.outcome,
+                    Some(ClaudeBrowserAuthOutcomeV1::Complete),
+                    "{existing_state:?}"
+                );
+                assert!(candidate_registered, "{existing_state:?}");
+            } else {
+                assert_eq!(
+                    operation.outcome,
+                    Some(ClaudeBrowserAuthOutcomeV1::AlreadyConnected),
+                    "{existing_state:?}"
+                );
+                assert_eq!(
+                    operation.canonical_slot_id.as_deref(),
+                    Some(existing_slot.as_str())
+                );
+                assert!(!candidate_registered, "{existing_state:?}");
+            }
+            // The existing connection is never removed or rewritten here.
+            assert!(registry
+                .external_slots
+                .iter()
+                .any(|slot| slot.slot_id == existing_slot));
+            drop(_support);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]

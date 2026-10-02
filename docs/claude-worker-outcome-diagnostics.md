@@ -57,5 +57,22 @@ include `expiry_unchanged`, `nonzero_exit`, `timed_out`, `backoff`,
 leaves the anchor `temporarily_unavailable`, and a successful pass replaces the
 receipt. Meters and quota clocks are unchanged.
 
+A worker `needs_login` receipt on a blocked saved slot (`refresh_due` or
+`stale_access_token`) now also persists the slot as `needs_login`. Before this,
+the worker's witness was keyed by the signed-out credential's own expiry (often
+the epoch), so the foreground's exact saved-deadline match never adopted it, and
+the companion never offered "Sign in again". The saved upkeep result stays
+`refresh_due`, so collection keeps queuing the worker, and a valid credential
+after sign-in reconciles through the existing worker path. A newer receipt
+returns the next blocked collection to `refresh_due`.
+
+"Add Claude account" no longer ends `already_connected` for a login whose
+account and organization match only saved connections that cannot serve it
+(`needs_login`, `refresh_due`, `stale_access_token`, `credential_unavailable`,
+unknown or mismatched identity, or a duplicate). The fresh login is admitted
+through the normal registration path. Canonical selection then prefers it, and
+the dead connection is shown as a removable duplicate. A healthy saved
+connection still makes the login `already_connected`.
+
 Session: Codex native 01a0f43d. No provider checks, auth mutations, cadence,
 consent, breaker or release changes were performed for this correction.

@@ -4535,18 +4535,8 @@ fn claude_blocked_refresh_worker_escalation(
     status: &ClaudeConfigSlotCollectionStatusV1,
     now: OffsetDateTime,
 ) -> Option<ClaudeQuotaAccessState> {
-    let account = status.account_identifier_hash.as_deref()?;
-    let organization = status.organization_identifier_hash.as_deref()?;
-    let receipt =
-        safe_claude_slot_check_diagnostics(&status.quota_check_diagnostics, account, organization)
-            .into_iter()
-            .filter(|entry| claude_worker_diagnostic_message(&entry.code).is_some())
-            .filter_map(|entry| {
-                bounded_claude_collection_timestamp(entry.observed_at.as_deref(), now)
-                    .map(|clock| (entry.code, clock))
-            })
-            .max_by_key(|(_, clock)| *clock)?;
-    if receipt.0 == "claude_slot_worker_needs_login" {
+    let receipt = latest_exact_claude_worker_receipt_code(status, now)?;
+    if receipt == "claude_slot_worker_needs_login" {
         return Some(ClaudeQuotaAccessState::ReconnectRequired);
     }
     let expired_long_ago = bounded_claude_collection_timestamp(
@@ -4554,8 +4544,62 @@ fn claude_blocked_refresh_worker_escalation(
         now - TimeDuration::seconds(CLAUDE_BLOCKED_REFRESH_ESCALATION_SECONDS),
     )
     .is_some();
-    (expired_long_ago && CLAUDE_BLOCKED_REFRESH_FAILURE_WORKER_CODES.contains(&receipt.0.as_str()))
+    (expired_long_ago && CLAUDE_BLOCKED_REFRESH_FAILURE_WORKER_CODES.contains(&receipt.as_str()))
         .then_some(ClaudeQuotaAccessState::AttentionRequired)
+}
+
+/// Code of the newest exact-binding local worker receipt on one saved slot,
+/// bounded by `now`. Forged, foreign-pair and future receipts are ignored.
+fn latest_exact_claude_worker_receipt_code(
+    status: &ClaudeConfigSlotCollectionStatusV1,
+    now: OffsetDateTime,
+) -> Option<String> {
+    let account = status.account_identifier_hash.as_deref()?;
+    let organization = status.organization_identifier_hash.as_deref()?;
+    safe_claude_slot_check_diagnostics(&status.quota_check_diagnostics, account, organization)
+        .into_iter()
+        .filter(|entry| claude_worker_diagnostic_message(&entry.code).is_some())
+        .filter_map(|entry| {
+            bounded_claude_collection_timestamp(entry.observed_at.as_deref(), now)
+                .map(|clock| (entry.code, clock))
+        })
+        .max_by_key(|(_, clock)| *clock)
+        .map(|(code, _)| code)
+}
+
+/// Saved state for a blocked slot whose newest exact worker pass read a
+/// credential that needs a new sign-in.
+///
+/// The worker's pre-claim `needs_login` describes the slot's actual
+/// credential, but its witness is keyed by that credential's expiry (for a
+/// signed-out credential, often the epoch), so the foreground's exact saved
+/// deadline match never adopts it and the slot stayed `refresh_due`. That
+/// hid both reconnect-required health and the companion's "Sign in again".
+/// The receipt is already fenced to this registration, pair and saved
+/// deadlines with its original clock, and any newer worker pass replaces it.
+/// Only the presented state changes: the saved upkeep result stays
+/// `refresh_due`, so collection keeps queuing the worker and a valid
+/// credential after sign-in reconciles through the existing worker path.
+fn apply_claude_worker_needs_login_state(
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+    now: OffsetDateTime,
+) {
+    if !matches!(
+        status.state,
+        ClaudeConfigSlotCollectionStateV1::RefreshDue
+            | ClaudeConfigSlotCollectionStateV1::StaleAccessToken
+    ) || latest_exact_claude_worker_receipt_code(status, now).as_deref()
+        != Some("claude_slot_worker_needs_login")
+    {
+        return;
+    }
+    let (state, code, message) =
+        upkeep_state_diagnostic(ClaudeConfigSlotUpkeepResultV1::NeedsLogin);
+    status.state = state;
+    status.diagnostics = vec![ClaudeConfigSlotDiagnosticV1 {
+        code,
+        message: message.to_string(),
+    }];
 }
 
 fn claude_slot_status_carries_meters(status: &ClaudeConfigSlotCollectionStatusV1) -> bool {
@@ -5864,7 +5908,10 @@ fn merge_claude_slot_collection_state(
     slot_id: &str,
     candidate: &ClaudeConfigSlotCollectionStatusV1,
 ) {
-    merge_claude_slot_collection_state_at(slots, slot_id, candidate, OffsetDateTime::now_utc());
+    let now = OffsetDateTime::now_utc();
+    let mut candidate = candidate.clone();
+    apply_claude_worker_needs_login_state(&mut candidate, now);
+    merge_claude_slot_collection_state_at(slots, slot_id, &candidate, now);
 }
 
 fn retain_claude_worker_receipt_for_blocked_candidate(
@@ -14871,6 +14918,133 @@ mod tests {
             serde_json::to_value(read_persisted_claude_slot_collection_state()).unwrap(),
             serde_json::to_value(removed).unwrap()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Live M4 Gmail anchor, 2026-10-02: the worker read a signed-out
+    /// credential (expiry epoch) and published `needs_login`, but the saved
+    /// slot stayed `refresh_due`, so the companion never offered "Sign in
+    /// again". Exercise the real worker publication and the real blocked
+    /// collection persistence that the scheduled loop uses.
+    #[test]
+    #[serial]
+    fn claude_worker_needs_login_receipt_presents_saved_needs_login_through_real_paths() {
+        use ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION;
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-worker-needs-login-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).expect("new isolated fixture root");
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let config = root.join("registered");
+        fs::create_dir(&config).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let registered = store
+            .register_path(
+                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                config.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+        store
+            .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, true)
+            .unwrap();
+        let mut slot = registered.external_slots[0].clone();
+        slot.collection = valid_access_reconciliation_fixture().0.collection;
+        slot.collection.quota_check_diagnostics.clear();
+        let blocked_upkeep = ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+            result: ClaudeConfigSlotUpkeepResultV1::RefreshDue,
+            due_access_expires_at: slot.collection.access_expires_at.clone(),
+            refresh_token_expires_at: slot.collection.relogin_required_at.clone(),
+            attempted_at: None,
+            next_allowed_attempt_at: None,
+            consecutive_failures: 0,
+        };
+        slot.collection.upkeep = Some(blocked_upkeep.clone());
+        persist_one_claude_slot_collection_state(&slot.slot_id, &slot.collection).unwrap();
+        let saved = || read_persisted_claude_slot_collection_state().slots[&slot.slot_id].clone();
+        let anchor_health = || {
+            annotate_claude_accounts_status(store.load().unwrap())
+                .anchor_coverage
+                .accounts
+                .iter()
+                .find_map(|account| account.health)
+        };
+        assert_eq!(saved().state, ClaudeConfigSlotCollectionStateV1::RefreshDue);
+        assert_eq!(
+            anchor_health(),
+            Some(ClaudeAccountAnchorHealthV1::TemporarilyUnavailable)
+        );
+
+        // Real worker publication of the pre-claim outcome.
+        record_registered_claude_worker_observation(
+            &slot,
+            ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
+        );
+        let published = saved();
+        assert_eq!(
+            published.state,
+            ClaudeConfigSlotCollectionStateV1::NeedsLogin
+        );
+        assert_eq!(
+            published.diagnostics[0].code,
+            ottto_protocol::ClaudeConfigSlotDiagnosticCodeV1::NeedsLogin
+        );
+        // The saved upkeep stays refresh-due: the foreground keeps queuing the
+        // worker instead of taking the sticky saved-NeedsLogin early return.
+        assert_eq!(
+            published.upkeep.as_ref().map(|upkeep| upkeep.result),
+            Some(ClaudeConfigSlotUpkeepResultV1::RefreshDue)
+        );
+        assert_eq!(
+            published.access_expires_at,
+            slot.collection.access_expires_at
+        );
+        assert_eq!(
+            published.last_full_quota_read_at,
+            slot.collection.last_full_quota_read_at
+        );
+        assert_eq!(
+            anchor_health(),
+            Some(ClaudeAccountAnchorHealthV1::ReconnectRequired)
+        );
+
+        // The next scheduled blocked collection rebuilds `refresh_due` from
+        // the saved deadline; persisting it keeps the sign-in requirement.
+        let mut descriptor = slot.clone();
+        descriptor.collection = published.clone();
+        let blocked = blocked_claude_upkeep_status(
+            &slot.slot_id,
+            &crate::current_rfc3339_timestamp(),
+            blocked_upkeep.clone(),
+        );
+        assert_eq!(blocked.state, ClaudeConfigSlotCollectionStateV1::RefreshDue);
+        persist_claude_slot_collection_states(
+            &BTreeMap::from([(slot.slot_id.clone(), blocked)]),
+            &[],
+            &BTreeMap::from([(slot.slot_id.clone(), descriptor)]),
+        )
+        .unwrap();
+        assert_eq!(saved().state, ClaudeConfigSlotCollectionStateV1::NeedsLogin);
+
+        // A newer worker pass with another outcome replaces the receipt, and
+        // the next blocked collection presents `refresh_due` again.
+        let mut current = slot.clone();
+        current.collection = saved();
+        record_registered_claude_worker_observation(
+            &current,
+            ClaudeConfigSlotUpkeepResultV1::Backoff,
+        );
+        let blocked = blocked_claude_upkeep_status(
+            &slot.slot_id,
+            &crate::current_rfc3339_timestamp(),
+            blocked_upkeep,
+        );
+        persist_one_claude_slot_collection_state(&slot.slot_id, &blocked).unwrap();
+        assert_eq!(saved().state, ClaudeConfigSlotCollectionStateV1::RefreshDue);
         fs::remove_dir_all(root).unwrap();
     }
 
