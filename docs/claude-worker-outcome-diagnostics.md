@@ -34,5 +34,28 @@ consumers may ignore the new closed codes without treating them as provider
 success. Supported JSON consumers must likewise distinguish these local codes
 from `claude_oauth_usage_check_succeeded`.
 
+When the default slot supplies the meters for the same exact account and
+workspace pair, the blocked canonical anchor is neither uploaded nor turned
+into a degraded snapshot. Its single closed worker receipt, with its original
+local clock, now travels on that winning snapshot's diagnostics. Only exact-pair
+`claude_slot_worker_*` codes move; the anchor's provider-check and collection
+codes stay with the anchor, and the anchor uploading itself carries nothing extra.
+
+A pre-claim `needs_login` read from the slot's actual credential is no longer
+masked by an older witness recorded for a later credential expiry. Such a
+witness is history from before the credential was replaced or signed out;
+returning it reported a stale `expiry_unchanged` every pass without running a
+vendor command. Only a running claim, or a newer witness written while this
+read was in progress, keeps precedence.
+
+For a blocked saved anchor (`refresh_due` or `stale_access_token`), the exact
+fenced worker receipt now sets saved-connection health. `needs_login` projects
+`reconnect_required`. A refresh-failure receipt projects `attention_required`
+once the saved access deadline is more than 24 hours past. Failure receipts
+include `expiry_unchanged`, `nonzero_exit`, `timed_out`, `backoff`,
+`reconciliation_refused` and the identity failures. Any other or newer receipt
+leaves the anchor `temporarily_unavailable`, and a successful pass replaces the
+receipt. Meters and quota clocks are unchanged.
+
 Session: Codex native 01a0f43d. No provider checks, auth mutations, cadence,
 consent, breaker or release changes were performed for this correction.

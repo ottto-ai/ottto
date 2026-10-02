@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 413,
-  "content_sha256": "b1878680bdb17eca153ae5e0d4fb8d96bf5afdcec190a39a40b44d20ae6f9b9e",
+  "content_sha256": "88d1a25e37f9747b56779f7f85289c80e9434c45680c15b8afdf1d9c5ea7098d",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "7951f37f7a31b165c2da6cb3adb48af94070fc0b7030070e7c9917e7307cdb3a",
-      "size_bytes": 985359
+      "sha256": "7dee4ae7ab7b4ce3b90e00fa284b448d6224debb68588e6d24688ffe4c627ff2",
+      "size_bytes": 1005481
     },
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_upkeep.rs",
-      "sha256": "172db5d8e7fed4edf86805a91f08fa670cc7301c962a40952f48a68787d510a4",
-      "size_bytes": 110680
+      "sha256": "2caeb78b8cdf55ea0d1c6287f7c5dea0ee71b7baeca2895a68e47d4baf44176b",
+      "size_bytes": 115856
     },
     {
       "executable": false,
@@ -1000,8 +1000,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/claude-worker-outcome-diagnostics.md",
-      "sha256": "6dcf9658f8088a9f8cbe54c3ce63c49a7c7587b849a595a8caebefcc9174800d",
-      "size_bytes": 2399
+      "sha256": "bfcffcbdd0d8100a81c0def9061493de6cab7374b850b61d4c44d587fc80078c",
+      "size_bytes": 3877
     },
     {
       "executable": false,

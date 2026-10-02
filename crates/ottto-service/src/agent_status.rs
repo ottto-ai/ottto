@@ -3131,15 +3131,15 @@ fn collect_claude_status_snapshots(
         }
     }
     let mut snapshots = Vec::with_capacity(selection.winning_by_binding.len());
-    for (index, mut candidate) in candidates.into_iter().enumerate() {
+    for (index, candidate) in candidates.into_iter().enumerate() {
         match dispositions[index] {
             ClaudeSnapshotDisposition::Upload => {
-                let (durability, health) = anchor_health_by_binding
-                    .get(&candidate.binding)
-                    .map(|health| (ClaudeAccountAnchorDurabilityV1::Anchored, *health))
-                    .unwrap_or((ClaudeAccountAnchorDurabilityV1::DefaultOnly, None));
-                apply_claude_anchor_continuity(&mut candidate.snapshot, durability, health);
-                snapshots.push(candidate.snapshot);
+                snapshots.push(claude_uploaded_candidate_snapshot(
+                    candidate,
+                    &anchor_health_by_binding,
+                    &canonical_anchors,
+                    &slot_states,
+                ));
             }
             ClaudeSnapshotDisposition::ShadowDefault => {
                 if let Some(status) = slot_states.get_mut(&candidate.slot_id) {
@@ -3294,6 +3294,87 @@ fn apply_claude_anchor_continuity(
     }
     account.claude_anchor_durability = Some(durability);
     account.claude_anchor_health = health;
+}
+
+/// Final presentation of one uploaded Claude candidate: the canonical saved
+/// anchor's durability and health for the same exact pair, plus that anchor's
+/// closed local worker receipt when another slot supplies the meters.
+fn claude_uploaded_candidate_snapshot(
+    mut candidate: ClaudeSnapshotCandidate,
+    anchor_health_by_binding: &BTreeMap<ClaudeStrongBinding, Option<ClaudeAccountAnchorHealthV1>>,
+    canonical_anchors: &BTreeMap<ClaudeStrongBinding, String>,
+    slot_states: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+) -> AgentStatusSnapshot {
+    let (durability, health) = anchor_health_by_binding
+        .get(&candidate.binding)
+        .map(|health| (ClaudeAccountAnchorDurabilityV1::Anchored, *health))
+        .unwrap_or((ClaudeAccountAnchorDurabilityV1::DefaultOnly, None));
+    apply_claude_anchor_continuity(&mut candidate.snapshot, durability, health);
+    append_canonical_anchor_worker_receipts(
+        &mut candidate.snapshot,
+        &candidate.slot_id,
+        &candidate.binding,
+        canonical_anchors,
+        slot_states,
+    );
+    candidate.snapshot
+}
+
+/// Carry the canonical registered anchor's closed local worker receipt onto
+/// the snapshot that uploads that same exact account/workspace pair.
+///
+/// When the default slot supplies a binding's meters, its anchor has no meters
+/// and is neither uploaded nor turned into a degraded snapshot, so the anchor's
+/// `claude_slot_worker_*` receipt was only ever persisted locally. That hid the
+/// outcome exactly where the anchor is blocked and the default is not (for
+/// example the CLI's current account). Only exact-binding, closed worker codes
+/// with their original local completion clocks travel; provider-check codes,
+/// collection-state codes and every other anchor diagnostic stay with the
+/// anchor. This is presentation of an existing local fact, not a quota check.
+fn append_canonical_anchor_worker_receipts(
+    snapshot: &mut AgentStatusSnapshot,
+    candidate_slot_id: &str,
+    binding: &ClaudeStrongBinding,
+    canonical_anchors: &BTreeMap<ClaudeStrongBinding, String>,
+    slot_states: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+) {
+    let Some(anchor_slot_id) = canonical_anchors.get(binding) else {
+        return;
+    };
+    if anchor_slot_id == candidate_slot_id {
+        return;
+    }
+    let Some(anchor) = slot_states.get(anchor_slot_id) else {
+        return;
+    };
+    let snapshot_matches = snapshot.account.as_ref().is_some_and(|account| {
+        account.account_identifier_hash.as_deref() == Some(binding.account_identifier_hash.as_str())
+            && account.organization_identifier_hash.as_deref()
+                == Some(binding.organization_identifier_hash.as_str())
+    });
+    if !snapshot_matches
+        || anchor.account_identifier_hash.as_deref()
+            != Some(binding.account_identifier_hash.as_str())
+        || anchor.organization_identifier_hash.as_deref()
+            != Some(binding.organization_identifier_hash.as_str())
+    {
+        return;
+    }
+    for receipt in safe_claude_slot_check_diagnostics(
+        &anchor.quota_check_diagnostics,
+        &binding.account_identifier_hash,
+        &binding.organization_identifier_hash,
+    ) {
+        if claude_worker_diagnostic_message(&receipt.code).is_none()
+            || snapshot
+                .diagnostics
+                .iter()
+                .any(|existing| claude_worker_diagnostic_message(&existing.code).is_some())
+        {
+            continue;
+        }
+        snapshot.diagnostics.push(receipt);
+    }
 }
 
 #[cfg(test)]
@@ -4380,11 +4461,14 @@ fn projected_claude_quota_access_state(
                 ClaudeQuotaAccessState::Partial
             })
         }
+        ClaudeConfigSlotCollectionStateV1::RefreshDue
+        | ClaudeConfigSlotCollectionStateV1::StaleAccessToken => Some(
+            claude_blocked_refresh_worker_escalation(status, OffsetDateTime::now_utc())
+                .unwrap_or(ClaudeQuotaAccessState::TemporarilyUnavailable),
+        ),
         ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
         | ClaudeConfigSlotCollectionStateV1::CollectionInProgress
         | ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
-        | ClaudeConfigSlotCollectionStateV1::RefreshDue
-        | ClaudeConfigSlotCollectionStateV1::StaleAccessToken
         | ClaudeConfigSlotCollectionStateV1::ProbeFailed
         | ClaudeConfigSlotCollectionStateV1::ReloginApproaching => {
             Some(ClaudeQuotaAccessState::TemporarilyUnavailable)
@@ -4412,6 +4496,66 @@ fn projected_claude_quota_access_state(
         | ClaudeConfigSlotCollectionStateV1::DuplicateAccount
         | ClaudeConfigSlotCollectionStateV1::CapacityExceeded => None,
     }
+}
+
+/// Worker outcomes that mean the latest refresh pass for a blocked saved
+/// anchor did not take, as opposed to a pending, paused or successful pass.
+/// `backoff` is included because it only follows a failed attempt for the same
+/// credential expiry; omitting it would make the projection flap between runs.
+const CLAUDE_BLOCKED_REFRESH_FAILURE_WORKER_CODES: &[&str] = &[
+    "claude_slot_worker_expiry_unchanged",
+    "claude_slot_worker_nonzero_exit",
+    "claude_slot_worker_timed_out",
+    "claude_slot_worker_spawn_failed",
+    "claude_slot_worker_credential_unreadable",
+    "claude_slot_worker_probe_failed",
+    "claude_slot_worker_backoff",
+    "claude_slot_worker_reconciliation_refused",
+    "claude_slot_worker_identity_unknown",
+    "claude_slot_worker_identity_credential_unavailable",
+    "claude_slot_worker_identity_mismatch",
+];
+
+/// How long a blocked saved anchor's access may stay expired, with an exact
+/// failed worker receipt, before it stops being presented as temporary.
+const CLAUDE_BLOCKED_REFRESH_ESCALATION_SECONDS: i64 = 24 * 60 * 60;
+
+/// Truthful access state for a saved anchor that collection skips because its
+/// saved access deadline has expired.
+///
+/// The fenced local worker receipt is the only current evidence about that
+/// anchor's real credential. A worker that read a signed-out or expired refresh
+/// grant reports `needs_login`: the saved connection needs sign-in again, not
+/// patience. A refresh that keeps failing for a day is an attention state that
+/// names its worker reason instead of an indefinitely "temporary" one. Any
+/// newer worker pass (refresh, reconciliation) replaces the receipt, so this
+/// never sticks after the credential recovers. Meters and quota clocks are
+/// untouched; this classifies saved-connection health only.
+fn claude_blocked_refresh_worker_escalation(
+    status: &ClaudeConfigSlotCollectionStatusV1,
+    now: OffsetDateTime,
+) -> Option<ClaudeQuotaAccessState> {
+    let account = status.account_identifier_hash.as_deref()?;
+    let organization = status.organization_identifier_hash.as_deref()?;
+    let receipt =
+        safe_claude_slot_check_diagnostics(&status.quota_check_diagnostics, account, organization)
+            .into_iter()
+            .filter(|entry| claude_worker_diagnostic_message(&entry.code).is_some())
+            .filter_map(|entry| {
+                bounded_claude_collection_timestamp(entry.observed_at.as_deref(), now)
+                    .map(|clock| (entry.code, clock))
+            })
+            .max_by_key(|(_, clock)| *clock)?;
+    if receipt.0 == "claude_slot_worker_needs_login" {
+        return Some(ClaudeQuotaAccessState::ReconnectRequired);
+    }
+    let expired_long_ago = bounded_claude_collection_timestamp(
+        status.access_expires_at.as_deref(),
+        now - TimeDuration::seconds(CLAUDE_BLOCKED_REFRESH_ESCALATION_SECONDS),
+    )
+    .is_some();
+    (expired_long_ago && CLAUDE_BLOCKED_REFRESH_FAILURE_WORKER_CODES.contains(&receipt.0.as_str()))
+        .then_some(ClaudeQuotaAccessState::AttentionRequired)
 }
 
 fn claude_slot_status_carries_meters(status: &ClaudeConfigSlotCollectionStatusV1) -> bool {
@@ -13945,6 +14089,346 @@ mod tests {
             forged.code = "claude_slot_worker_arbitrary_secret".to_string();
             assert!(safe_claude_slot_check_diagnostics(&[forged], "account-a", "org-a").is_empty());
         }
+    }
+
+    #[test]
+    fn claude_worker_receipt_travels_on_winning_default_snapshot_for_same_exact_binding() {
+        let (slot, _, _, now) = valid_access_reconciliation_fixture();
+        let mut anchor = claude_worker_receipt_status(
+            &slot,
+            &slot,
+            ClaudeWorkerDiagnostic::ReconciliationRefused,
+            "2026-08-05T02:30:00Z",
+            now,
+        )
+        .unwrap();
+        anchor.quota_check_diagnostics.push(
+            claude_quota_check_diagnostic("claude_oauth_usage_cache_reused", "anchor cache", 1)
+                .with_quota_binding(Some("account-a".to_string()), Some("org-a".to_string())),
+        );
+        let binding = ClaudeStrongBinding::new("account-a", "org-a").unwrap();
+        let canonical = BTreeMap::from([(binding.clone(), slot.slot_id.clone())]);
+        let slot_states = BTreeMap::from([(slot.slot_id.clone(), anchor.clone())]);
+        let worker_codes = |snapshot: &AgentStatusSnapshot| {
+            snapshot
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| claude_worker_diagnostic_message(&diagnostic.code).is_some())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let mut default =
+            claude_account_snapshot("a@example.com", "claude_max_20x", "account-a", "org-a");
+        let before = default.diagnostics.len();
+        append_canonical_anchor_worker_receipts(
+            &mut default,
+            "default",
+            &binding,
+            &canonical,
+            &slot_states,
+        );
+        let carried = worker_codes(&default);
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].code, "claude_slot_worker_reconciliation_refused");
+        assert_eq!(
+            carried[0].observed_at.as_deref(),
+            Some("2026-08-05T02:30:00Z")
+        );
+        assert_eq!(
+            carried[0].account_identifier_hash.as_deref(),
+            Some("account-a")
+        );
+        assert_eq!(
+            carried[0].organization_identifier_hash.as_deref(),
+            Some("org-a")
+        );
+        // Only the closed worker receipt travels; the anchor's provider-check
+        // evidence is never re-presented as the default slot's own check.
+        assert_eq!(default.diagnostics.len(), before + 1);
+        assert!(!default
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "anchor cache"));
+
+        // Idempotent: a second pass never duplicates the single receipt.
+        append_canonical_anchor_worker_receipts(
+            &mut default,
+            "default",
+            &binding,
+            &canonical,
+            &slot_states,
+        );
+        assert_eq!(worker_codes(&default).len(), 1);
+
+        // The anchor uploading itself, a foreign snapshot pair, a foreign
+        // anchor pair, and a missing anchor state carry nothing.
+        let mut itself =
+            claude_account_snapshot("a@example.com", "claude_max_20x", "account-a", "org-a");
+        append_canonical_anchor_worker_receipts(
+            &mut itself,
+            &slot.slot_id,
+            &binding,
+            &canonical,
+            &slot_states,
+        );
+        assert!(worker_codes(&itself).is_empty());
+        let mut foreign =
+            claude_account_snapshot("b@example.com", "claude_max_20x", "account-a", "org-b");
+        append_canonical_anchor_worker_receipts(
+            &mut foreign,
+            "default",
+            &binding,
+            &canonical,
+            &slot_states,
+        );
+        assert!(worker_codes(&foreign).is_empty());
+        let mut rebound_anchor = anchor.clone();
+        rebound_anchor.organization_identifier_hash = Some("org-b".to_string());
+        let rebound_states = BTreeMap::from([(slot.slot_id.clone(), rebound_anchor)]);
+        let mut rebound =
+            claude_account_snapshot("a@example.com", "claude_max_20x", "account-a", "org-a");
+        append_canonical_anchor_worker_receipts(
+            &mut rebound,
+            "default",
+            &binding,
+            &canonical,
+            &rebound_states,
+        );
+        assert!(worker_codes(&rebound).is_empty());
+        let mut missing =
+            claude_account_snapshot("a@example.com", "claude_max_20x", "account-a", "org-a");
+        append_canonical_anchor_worker_receipts(
+            &mut missing,
+            "default",
+            &binding,
+            &canonical,
+            &BTreeMap::new(),
+        );
+        assert!(worker_codes(&missing).is_empty());
+
+        // A forged worker-looking code on the anchor stays rejected.
+        let mut forged_anchor = anchor;
+        forged_anchor.quota_check_diagnostics = vec![AgentStatusDiagnostic::source(
+            "claude_slot_worker_arbitrary_secret",
+            AgentDiagnosticSeverity::Info,
+            "forged",
+        )
+        .with_observed_at(Some("2026-08-05T02:30:00Z".to_string()))
+        .with_quota_binding(Some("account-a".to_string()), Some("org-a".to_string()))];
+        let forged_states = BTreeMap::from([(slot.slot_id.clone(), forged_anchor)]);
+        let mut forged =
+            claude_account_snapshot("a@example.com", "claude_max_20x", "account-a", "org-a");
+        append_canonical_anchor_worker_receipts(
+            &mut forged,
+            "default",
+            &binding,
+            &canonical,
+            &forged_states,
+        );
+        assert!(forged
+            .diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.code.starts_with("claude_slot_worker_")));
+    }
+
+    fn blocked_anchor_with_worker_receipt(
+        code: &str,
+        access_expires_at: OffsetDateTime,
+        receipt_at: OffsetDateTime,
+    ) -> ClaudeConfigSlotCollectionStatusV1 {
+        let (slot, _, _, _) = valid_access_reconciliation_fixture();
+        let mut status = slot.collection;
+        status.state = ClaudeConfigSlotCollectionStateV1::RefreshDue;
+        status.observed_at = Some(rfc3339_from_offset(receipt_at - TimeDuration::minutes(1)));
+        status.access_expires_at = Some(rfc3339_from_offset(access_expires_at));
+        status.quota_check_diagnostics = vec![AgentStatusDiagnostic::source(
+            code,
+            AgentDiagnosticSeverity::Info,
+            claude_worker_diagnostic_message(code).unwrap_or("forged"),
+        )
+        .with_observed_at(Some(rfc3339_from_offset(receipt_at)))
+        .with_quota_binding(Some("account-a".to_string()), Some("org-a".to_string()))];
+        status
+    }
+
+    fn rfc3339_from_offset(value: OffsetDateTime) -> String {
+        value.format(&Rfc3339).unwrap()
+    }
+
+    #[test]
+    fn blocked_anchor_worker_receipt_escalates_saved_health_truthfully() {
+        let now = OffsetDateTime::now_utc();
+        let week_ago = now - TimeDuration::days(8);
+        let receipt_at = now - TimeDuration::minutes(5);
+        let project = |status: &ClaudeConfigSlotCollectionStatusV1| {
+            projected_claude_quota_access_state(status).unwrap()
+        };
+
+        // A worker that read a signed-out refresh grant: sign in again.
+        assert_eq!(
+            project(&blocked_anchor_with_worker_receipt(
+                "claude_slot_worker_needs_login",
+                week_ago,
+                receipt_at,
+            )),
+            ClaudeQuotaAccessState::ReconnectRequired
+        );
+        // A refresh that keeps failing for over a day names attention.
+        for code in CLAUDE_BLOCKED_REFRESH_FAILURE_WORKER_CODES {
+            assert_eq!(
+                project(&blocked_anchor_with_worker_receipt(
+                    code, week_ago, receipt_at
+                )),
+                ClaudeQuotaAccessState::AttentionRequired,
+                "{code}"
+            );
+        }
+        // Within the first day, or after a non-failure pass, it stays temporary.
+        assert_eq!(
+            project(&blocked_anchor_with_worker_receipt(
+                "claude_slot_worker_expiry_unchanged",
+                now - TimeDuration::hours(2),
+                receipt_at,
+            )),
+            ClaudeQuotaAccessState::TemporarilyUnavailable
+        );
+        for code in [
+            "claude_slot_worker_refresh_due",
+            "claude_slot_worker_in_progress",
+            "claude_slot_worker_metadata_reconciled",
+            "claude_slot_worker_refreshed",
+        ] {
+            assert_eq!(
+                project(&blocked_anchor_with_worker_receipt(
+                    code, week_ago, receipt_at
+                )),
+                ClaudeQuotaAccessState::TemporarilyUnavailable,
+                "{code}"
+            );
+        }
+        // Forged, foreign-pair and future receipts never escalate.
+        let forged = blocked_anchor_with_worker_receipt(
+            "claude_slot_worker_needs_login_forged",
+            week_ago,
+            receipt_at,
+        );
+        assert_eq!(
+            project(&forged),
+            ClaudeQuotaAccessState::TemporarilyUnavailable
+        );
+        let mut foreign = blocked_anchor_with_worker_receipt(
+            "claude_slot_worker_needs_login",
+            week_ago,
+            receipt_at,
+        );
+        foreign.quota_check_diagnostics[0].organization_identifier_hash = Some("org-b".to_string());
+        assert_eq!(
+            project(&foreign),
+            ClaudeQuotaAccessState::TemporarilyUnavailable
+        );
+        let future = blocked_anchor_with_worker_receipt(
+            "claude_slot_worker_needs_login",
+            week_ago,
+            now + TimeDuration::hours(1),
+        );
+        assert_eq!(
+            project(&future),
+            ClaudeQuotaAccessState::TemporarilyUnavailable
+        );
+        // Collected states never consult the worker receipt.
+        let mut fresh = blocked_anchor_with_worker_receipt(
+            "claude_slot_worker_needs_login",
+            week_ago,
+            receipt_at,
+        );
+        fresh.state = ClaudeConfigSlotCollectionStateV1::Fresh;
+        assert_eq!(project(&fresh), ClaudeQuotaAccessState::Full);
+        let mut provider = blocked_anchor_with_worker_receipt(
+            "claude_slot_worker_needs_login",
+            week_ago,
+            receipt_at,
+        );
+        provider.state = ClaudeConfigSlotCollectionStateV1::ProviderUnavailable;
+        assert_eq!(
+            project(&provider),
+            ClaudeQuotaAccessState::TemporarilyUnavailable
+        );
+    }
+
+    /// The collection loop's real upload step: the CLI default supplies the
+    /// pair's meters while its canonical saved anchor is blocked. The uploaded
+    /// snapshot must carry the anchor's truthful health and its worker reason.
+    #[test]
+    fn uploaded_default_candidate_carries_blocked_anchor_health_and_reason() {
+        let now = OffsetDateTime::now_utc();
+        let binding = ClaudeStrongBinding::new("account-a", "org-a").unwrap();
+        let anchor_slot = "claude_slot_anchor".to_string();
+        let canonical = BTreeMap::from([(binding.clone(), anchor_slot.clone())]);
+        let upload = |anchor: ClaudeConfigSlotCollectionStatusV1| {
+            let slot_states = BTreeMap::from([(anchor_slot.clone(), anchor)]);
+            let health = canonical_anchor_health(&canonical, &slot_states);
+            let snapshot =
+                claude_account_snapshot("a@example.com", "claude_max_20x", "account-a", "org-a");
+            claude_uploaded_candidate_snapshot(
+                ClaudeSnapshotCandidate {
+                    slot_id: "default".to_string(),
+                    slot_class: ClaudeSnapshotSlotClass::Default,
+                    binding: binding.clone(),
+                    quality: ClaudeSnapshotQuality {
+                        tier: 4,
+                        provider_observed_at: String::new(),
+                    },
+                    snapshot,
+                },
+                &health,
+                &canonical,
+                &slot_states,
+            )
+        };
+        let account = |snapshot: &AgentStatusSnapshot| snapshot.account.clone().unwrap();
+
+        let signed_out = upload(blocked_anchor_with_worker_receipt(
+            "claude_slot_worker_needs_login",
+            now - TimeDuration::days(8),
+            now - TimeDuration::minutes(5),
+        ));
+        assert_eq!(
+            account(&signed_out).claude_anchor_durability,
+            Some(ClaudeAccountAnchorDurabilityV1::Anchored)
+        );
+        assert_eq!(
+            account(&signed_out).claude_anchor_health,
+            Some(ClaudeAccountAnchorHealthV1::ReconnectRequired)
+        );
+        assert!(signed_out
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "claude_slot_worker_needs_login"));
+
+        let stuck = upload(blocked_anchor_with_worker_receipt(
+            "claude_slot_worker_expiry_unchanged",
+            now - TimeDuration::days(8),
+            now - TimeDuration::minutes(5),
+        ));
+        assert_eq!(
+            account(&stuck).claude_anchor_health,
+            Some(ClaudeAccountAnchorHealthV1::AttentionRequired)
+        );
+        assert!(stuck
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "claude_slot_worker_expiry_unchanged"));
+
+        let recent = upload(blocked_anchor_with_worker_receipt(
+            "claude_slot_worker_refresh_due",
+            now - TimeDuration::hours(1),
+            now - TimeDuration::minutes(5),
+        ));
+        assert_eq!(
+            account(&recent).claude_anchor_health,
+            Some(ClaudeAccountAnchorHealthV1::TemporarilyUnavailable)
+        );
     }
 
     #[test]
