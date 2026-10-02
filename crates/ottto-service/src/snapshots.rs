@@ -9346,27 +9346,32 @@ impl SnapshotAccumulator {
             && !self.codex_creator_evidence_conflicted
             && self.codex_creator_header_id.as_deref() == Some(source_session_id.as_str())
             && expected_path_id.as_deref() == Some(source_session_id.as_str())
+            // Native ordinal forks have their own creation-time creator pair.
+            // The first physical header/file/time gates prove its origin;
+            // the independently validated boundary still owns usage, not identity.
             && (!self.codex_is_fork
-                || self.codex_ownership_boundary == CodexOwnershipBoundary::NativeCreatedThread))
-            .then(|| self.codex_creator_evidence.clone())
-            .flatten()
-            .filter(|evidence| {
-                let created = evidence
-                    .source_created_at
-                    .as_deref()
-                    .and_then(|timestamp| OffsetDateTime::parse(timestamp, &Rfc3339).ok());
-                created.is_some_and(|created| {
-                    [self.started_at.as_deref(), Some(collected_at)]
-                        .into_iter()
-                        .all(|timestamp| {
-                            timestamp
-                                .and_then(|timestamp| {
-                                    OffsetDateTime::parse(timestamp, &Rfc3339).ok()
-                                })
-                                .is_some_and(|observed| created <= observed)
-                        })
-                })
-            });
+                || matches!(
+                    self.codex_ownership_boundary,
+                    CodexOwnershipBoundary::NativeCreatedThread
+                        | CodexOwnershipBoundary::Ordinal { .. }
+                )))
+        .then(|| self.codex_creator_evidence.clone())
+        .flatten()
+        .filter(|evidence| {
+            let created = evidence
+                .source_created_at
+                .as_deref()
+                .and_then(|timestamp| OffsetDateTime::parse(timestamp, &Rfc3339).ok());
+            created.is_some_and(|created| {
+                [self.started_at.as_deref(), Some(collected_at)]
+                    .into_iter()
+                    .all(|timestamp| {
+                        timestamp
+                            .and_then(|timestamp| OffsetDateTime::parse(timestamp, &Rfc3339).ok())
+                            .is_some_and(|observed| created <= observed)
+                    })
+            })
+        });
         if self.source == SnapshotSource::ClaudeCode {
             let mut evidence = self.claude_desktop_identity.clone().unwrap_or_else(|| {
                 ClaudeTitleMetadata::default().session_account_evidence(&source_session_id)
@@ -45899,6 +45904,196 @@ mod tests {
         header["payload"]["source"] = json!({"subagent":{"thread_spawn":{
             "parent_thread_id":parent}}});
         header
+    }
+
+    fn codex_fork_creator_items(records: &[Value], path_session_id: &str) -> Vec<SnapshotItem> {
+        let root = temp_dir("codex-fork-creator");
+        let path = root.join(format!(
+            "rollout-2026-09-30T10-00-00-{path_session_id}.jsonl"
+        ));
+        fs::write(
+            &path,
+            records
+                .iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let items = parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", "f".repeat(64)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        items
+    }
+
+    #[test]
+    fn codex_fork_creator_own_header_ordinal_wire_corpus() {
+        let mut header = codex_child_creator_header();
+        header["payload"]["forked_from_id"] = header["payload"]["session_id"].clone();
+        header["payload"]["subagent_history_start_ordinal"] = json!(1);
+        let id = header["payload"]["id"].as_str().unwrap();
+        let usage = |ordinal| {
+            json!({"timestamp":"2026-09-30T10:01:00Z","ordinal":ordinal,
+            "type":"event_msg","payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":100,"output_tokens":5},"model":"gpt-5.5"}}})
+        };
+        let mut ordinary = header.clone();
+        ordinary["payload"]["session_id"] = json!(id);
+        ordinary["payload"]["thread_source"] = json!("user");
+        ordinary["payload"]["source"] = json!("cli");
+        let mut different_pair = header.clone();
+        different_pair["payload"]["creator_user_id"] = json!("synthetic-child-creator");
+        different_pair["payload"]["creator_account_id"] = json!("synthetic-child-workspace");
+        let mut missing = header.clone();
+        missing["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("creator_user_id");
+        missing["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("creator_account_id");
+        let mut partial = header.clone();
+        partial["payload"]["creator_account_id"] = Value::Null;
+        let mut alias = header.clone();
+        alias["payload"]["session_id"] = json!("unrelated-session");
+        let mut default_pair = header.clone();
+        default_pair["payload"]["creator_user_id"] = json!("");
+        default_pair["payload"]["creator_account_id"] = json!(" ");
+        let mut conflict = header.clone();
+        conflict["ordinal"] = json!(1);
+        conflict["payload"]["creator_account_id"] = json!("different-workspace");
+        let mut cases = Vec::new();
+        for (name, records, path_id, expected) in [
+            (
+                "native_fork_own_header",
+                vec![header.clone(), usage(1)],
+                id,
+                true,
+            ),
+            (
+                "native_fork_distinct_creator",
+                vec![different_pair, usage(1)],
+                id,
+                true,
+            ),
+            (
+                "ordinary_fork_own_header",
+                vec![ordinary, usage(1)],
+                id,
+                true,
+            ),
+            (
+                "copied_parent_header",
+                vec![header.clone(), usage(1)],
+                "019e253c-5555-7000-9000-eeeeeeeeeeee",
+                false,
+            ),
+            ("legacy_missing_creator", vec![missing, usage(1)], id, false),
+            ("partial_creator", vec![partial, usage(1)], id, false),
+            (
+                "default_empty_creator",
+                vec![default_pair, usage(1)],
+                id,
+                false,
+            ),
+            ("unrelated_alias", vec![alias, usage(1)], id, false),
+            (
+                "later_creator_conflict",
+                vec![header.clone(), conflict, usage(2)],
+                id,
+                false,
+            ),
+            (
+                "nonoriginal_header",
+                vec![json!({"type":"turn_context"}), header.clone(), usage(1)],
+                id,
+                false,
+            ),
+        ] {
+            let mut items = codex_fork_creator_items(&records, path_id);
+            assert_eq!(items.len(), 1, "{name}");
+            let item = &items[0];
+            assert_eq!(item.session_account_evidence.is_some(), expected, "{name}");
+            assert!(item.usage_accounting_contract.is_some(), "{name}");
+            assert_eq!((item.input_tokens, item.output_tokens), (100, 5), "{name}");
+            if expected {
+                assert_eq!(item.source_session_id, id);
+                assert_eq!(
+                    item.session_account_evidence
+                        .as_ref()
+                        .unwrap()
+                        .source_created_at
+                        .as_deref(),
+                    Some("2026-09-30T10:00:00Z")
+                );
+            }
+            let mut legacy_records = records.clone();
+            for record in &mut legacy_records {
+                if let Some(meta) = record.get_mut("payload").and_then(Value::as_object_mut) {
+                    meta.remove("creator_user_id");
+                    meta.remove("creator_account_id");
+                }
+            }
+            let legacy = codex_fork_creator_items(&legacy_records, path_id);
+            let mut body = serde_json::to_value(&items).unwrap();
+            for item in body.as_array_mut().unwrap() {
+                item.as_object_mut()
+                    .unwrap()
+                    .remove("session_account_evidence");
+            }
+            assert_eq!(
+                body,
+                serde_json::to_value(&legacy).unwrap(),
+                "creator leaves alone change {name}"
+            );
+            prepare_cache_observations(&mut items[0], None);
+            let policy = SnapshotUploadPolicy {
+                session_titles_enabled: false,
+                workspace_labels_enabled: false,
+                ..SnapshotUploadPolicy::default()
+            };
+            apply_upload_policy(SnapshotSource::Codex, &mut items, policy);
+            let mut request = valid_v6_batch_request();
+            request.source = "codex".into();
+            request.snapshots = items;
+            request.upload_policy = policy;
+            let item = &request.snapshots[0];
+            let bytes = serde_json::to_vec(&request).unwrap();
+            let wire: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                wire["snapshots"][0]
+                    .get("session_account_evidence")
+                    .is_some(),
+                expected,
+                "{name}"
+            );
+            let version = snapshot_upload_body_witness_version(item);
+            let released = version.map(|version| match version {
+                9 => 3,
+                10 => 4,
+                11 => 5,
+                12 => 6,
+                15 | 23 if item.cache_observations.is_some() => 13,
+                16 | 24 if item.cache_observations.is_some() => 14,
+                19 => 17,
+                20 => 18,
+                23 => 7,
+                24 => 8,
+                _ => panic!("unexpected fork domain {version}"),
+            });
+            cases.push(json!({"name":name, "capability":match (expected, item.cache_observations.is_some()) {
+                (true,true)=>"combined",(true,false)=>"creator",(false,true)=>"cache",(false,false)=>"legacy"},
+                "exclusive":true,"curve":item.context_curve.is_some(),"tools":"omitted",
+                "wire_body_utf8":String::from_utf8(bytes).unwrap(),"wire":wire,
+                "body_projection":snapshot_upload_body_witness_payload(item),
+                "released_ack_version":released,"digest":version.map(|_| snapshot_upload_body_witness(item))}));
+        }
+        if let Ok(path) = std::env::var("OTTTO_FORK_CREATOR_CORPUS_PATH") {
+            fs::write(
+                path,
+                serde_json::to_vec_pretty(&json!({"schema_version":1,"cases":cases})).unwrap(),
+            )
+            .unwrap();
+        }
     }
 
     #[test]
