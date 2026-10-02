@@ -645,7 +645,7 @@ fn claude_slot_projection_quality(
 /// on a signed-out, unreadable or unproven credential is dead however complete
 /// its older limits are. A legacy saved state without an access deadline is
 /// usable only when it was just collected fresh.
-fn claude_slot_connection_usable(
+pub(crate) fn claude_slot_connection_usable(
     status: &ClaudeConfigSlotCollectionStatusV1,
     now: OffsetDateTime,
 ) -> bool {

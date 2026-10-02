@@ -1998,9 +1998,10 @@ fn identity_mismatch(
 /// The registered slot whose saved connection already serves this exact
 /// account/organization pair, making a fresh login for that pair redundant.
 ///
-/// A matching slot whose saved credential needs a new sign-in (signed out,
-/// blocked on an expired access deadline, unreadable, or without a proven
-/// identity) does not serve the pair. Treating it as "already connected"
+/// A matching slot whose saved credential is not usable (signed out, expired
+/// with a pending or failed refresh, unreadable, or without a proven identity,
+/// as decided by `agent_status::claude_slot_connection_usable`, the same rule
+/// canonical selection uses) does not serve the pair. Treating it as "already connected"
 /// quarantined the only working login and left the account on a dead
 /// connection the user could not repair. Such a login is admitted through the
 /// normal registration path instead; canonical selection then prefers the
@@ -2030,17 +2031,12 @@ fn serving_slot_for_binding(
 fn claude_saved_connection_serves(
     collection: &ottto_protocol::ClaudeConfigSlotCollectionStatusV1,
 ) -> bool {
-    use ottto_protocol::ClaudeConfigSlotCollectionStateV1 as State;
-    !matches!(
-        collection.state,
-        State::NeedsLogin
-            | State::RefreshDue
-            | State::StaleAccessToken
-            | State::CredentialUnavailable
-            | State::IdentityUnknown
-            | State::IdentityMismatch
-            | State::DuplicateAccount
-    )
+    // One usability decision for canonical selection and admission alike.
+    collection.state != ottto_protocol::ClaudeConfigSlotCollectionStateV1::DuplicateAccount
+        && crate::agent_status::claude_slot_connection_usable(
+            collection,
+            time::OffsetDateTime::now_utc(),
+        )
 }
 
 fn login_command(config_dir: &str) -> Option<std::process::Command> {
@@ -5094,6 +5090,11 @@ mod tests {
             );
         existing.collection.account_identifier_hash = Some("a".repeat(64));
         existing.collection.organization_identifier_hash = Some("b".repeat(64));
+        existing.collection.access_expires_at = Some(
+            (time::OffsetDateTime::now_utc() + time::Duration::hours(8))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
         status.managed_slots.push(existing);
         assert!(serving_slot_for_binding(
             &status,
@@ -5262,13 +5263,43 @@ mod tests {
     #[serial]
     fn generic_login_for_pair_whose_saved_connection_is_dead_is_admitted() {
         use ottto_protocol::ClaudeConfigSlotCollectionStateV1 as State;
-        for (existing_state, admitted) in [
-            (State::NeedsLogin, true),
-            (State::RefreshDue, true),
-            (State::StaleAccessToken, true),
-            (State::CredentialUnavailable, true),
-            (State::Fresh, false),
-            (State::ProviderUnavailable, false),
+        use ottto_protocol::ClaudeConfigSlotUpkeepResultV1 as Upkeep;
+        let at = |offset: time::Duration| {
+            (time::OffsetDateTime::now_utc() + offset)
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let valid = Some(at(time::Duration::hours(8)));
+        let expired = Some("2026-09-24T12:27:25Z".to_string());
+        for (existing_state, access, upkeep, admitted) in [
+            (State::NeedsLogin, expired.clone(), None, true),
+            (State::RefreshDue, expired.clone(), None, true),
+            (State::StaleAccessToken, expired.clone(), None, true),
+            (State::CredentialUnavailable, None, None, true),
+            // A failed refresh on an expired credential is presented as
+            // `probe_failed`; it is dead and must not swallow the login.
+            (
+                State::ProbeFailed,
+                expired.clone(),
+                Some(Upkeep::TimedOut),
+                true,
+            ),
+            (
+                State::ProbeFailed,
+                expired.clone(),
+                Some(Upkeep::ExpiryUnchanged),
+                true,
+            ),
+            (
+                State::ProbeFailed,
+                expired.clone(),
+                Some(Upkeep::MissingBinary),
+                true,
+            ),
+            (State::ProviderUnavailable, expired.clone(), None, true),
+            (State::Fresh, valid.clone(), None, false),
+            (State::ProviderUnavailable, valid.clone(), None, false),
+            (State::ProbeFailed, valid.clone(), None, false),
         ] {
             let root = temp_dir("generic-dead-pair");
             let support = root.join("support");
@@ -5294,6 +5325,15 @@ mod tests {
                     account_identifier_hash: Some(account.clone()),
                     organization_identifier_hash: Some(organization.clone()),
                     observed_at: Some("2026-09-24T12:21:06Z".to_string()),
+                    access_expires_at: access.clone(),
+                    upkeep: upkeep.map(|result| ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                        result,
+                        due_access_expires_at: access.clone(),
+                        refresh_token_expires_at: None,
+                        attempted_at: None,
+                        next_allowed_attempt_at: None,
+                        consecutive_failures: 3,
+                    }),
                     ..Default::default()
                 },
             )
@@ -5325,20 +5365,26 @@ mod tests {
                 assert_eq!(
                     operation.outcome,
                     Some(ClaudeBrowserAuthOutcomeV1::Complete),
-                    "{existing_state:?}"
+                    "{existing_state:?} {access:?} {upkeep:?}"
                 );
-                assert!(candidate_registered, "{existing_state:?}");
+                assert!(
+                    candidate_registered,
+                    "{existing_state:?} {access:?} {upkeep:?}"
+                );
             } else {
                 assert_eq!(
                     operation.outcome,
                     Some(ClaudeBrowserAuthOutcomeV1::AlreadyConnected),
-                    "{existing_state:?}"
+                    "{existing_state:?} {access:?} {upkeep:?}"
                 );
                 assert_eq!(
                     operation.canonical_slot_id.as_deref(),
                     Some(existing_slot.as_str())
                 );
-                assert!(!candidate_registered, "{existing_state:?}");
+                assert!(
+                    !candidate_registered,
+                    "{existing_state:?} {access:?} {upkeep:?}"
+                );
             }
             // The existing connection is never removed or rewritten here.
             assert!(registry

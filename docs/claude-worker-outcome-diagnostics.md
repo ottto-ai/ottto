@@ -67,9 +67,10 @@ after sign-in reconciles through the existing worker path. A newer receipt
 returns the next blocked collection to `refresh_due`.
 
 "Add Claude account" no longer ends `already_connected` for a login whose
-account and organization match only saved connections that cannot serve it
-(`needs_login`, `refresh_due`, `stale_access_token`, `credential_unavailable`,
-unknown or mismatched identity, or a duplicate). The fresh login is admitted
+account and organization match only saved connections that cannot serve it.
+That is decided by the same credential-usability rule canonical selection uses
+(so it includes an expired credential whose refresh failed, shown as
+`probe_failed`), plus duplicates. The fresh login is admitted
 through the normal registration path. Canonical selection then prefers it, and
 the dead connection is shown as a removable duplicate. A healthy saved
 connection still makes the login `already_connected`.
