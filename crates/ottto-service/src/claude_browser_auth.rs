@@ -5451,17 +5451,65 @@ mod tests {
             ottto_protocol::ClaudeConfigSlotCollectionStateV1::Fresh,
             "first quota read must be unavailable in this fixture"
         );
-        let anchors = status
-            .anchor_coverage
-            .accounts
-            .iter()
-            .filter(|anchor| anchor.account_identifier_hash == account)
-            .collect::<Vec<_>>();
-        assert_eq!(anchors.len(), 1);
-        assert_ne!(
-            anchors[0].health,
-            Some(ottto_protocol::ClaudeAccountAnchorHealthV1::ReconnectRequired),
-            "the dead slot must not remain the canonical anchor"
+        let anchor_health = |status: &ClaudeAccountsStatusV1| {
+            let anchors = status
+                .anchor_coverage
+                .accounts
+                .iter()
+                .filter(|anchor| anchor.account_identifier_hash == account)
+                .collect::<Vec<_>>();
+            assert_eq!(anchors.len(), 1);
+            anchors[0].health
+        };
+        // The admitted login owns the anchor (its own paused state), not the
+        // dead slot's reconnect requirement.
+        assert_eq!(
+            anchor_health(&status),
+            Some(ottto_protocol::ClaudeAccountAnchorHealthV1::Paused)
+        );
+
+        // A later collection: the old slot's refresh fails on its expired
+        // credential, which is presented as `probe_failed` with complete
+        // historical limits. It must stay below the working login.
+        crate::agent_status::persist_one_claude_slot_collection_state(
+            &existing_slot,
+            &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                state: ottto_protocol::ClaudeConfigSlotCollectionStateV1::ProbeFailed,
+                account_identifier_hash: Some(account.clone()),
+                organization_identifier_hash: Some(organization.clone()),
+                observed_at: Some(observed_at()),
+                access_expires_at: Some("2026-09-24T12:27:25Z".to_string()),
+                relogin_required_at: Some("2026-10-09T23:27:42Z".to_string()),
+                last_full_quota_read_at: Some("2026-09-24T12:21:06Z".to_string()),
+                has_account_windows: true,
+                has_scoped_limits: true,
+                upkeep: Some(ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                    result: ottto_protocol::ClaudeConfigSlotUpkeepResultV1::TimedOut,
+                    due_access_expires_at: Some("2026-09-24T12:27:25Z".to_string()),
+                    refresh_token_expires_at: Some("2026-10-09T23:27:42Z".to_string()),
+                    attempted_at: Some(observed_at()),
+                    next_allowed_attempt_at: None,
+                    consecutive_failures: 3,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("old slot refresh failed");
+        let later = crate::agent_status::annotate_claude_accounts_status(
+            store.load().expect("registry later"),
+        );
+        assert_eq!(
+            later
+                .external_slots
+                .iter()
+                .find(|slot| slot.slot_id == existing_slot)
+                .map(|slot| slot.collection.state.clone()),
+            Some(ottto_protocol::ClaudeConfigSlotCollectionStateV1::ProbeFailed)
+        );
+        assert_eq!(
+            anchor_health(&later),
+            Some(ottto_protocol::ClaudeAccountAnchorHealthV1::Paused),
+            "a failed refresh on an expired credential must not reclaim the anchor"
         );
         drop(_support);
         let _ = fs::remove_dir_all(root);

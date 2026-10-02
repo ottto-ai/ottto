@@ -632,12 +632,24 @@ fn claude_slot_projection_quality(
     }
 }
 
-/// Whether a saved slot still holds a usable connection: its credential is
-/// valid or refreshable, even if the provider is temporarily not answering.
-/// A slot blocked on a signed-out, expired-and-unrefreshed, unreadable or
-/// unproven credential is not usable however complete its old meters are.
-fn claude_slot_connection_usable(status: &ClaudeConfigSlotCollectionStatusV1) -> bool {
-    !matches!(
+/// Whether a saved slot still holds a usable connection, decided from the
+/// credential evidence rather than the collection enum alone.
+///
+/// Usable means the saved access deadline is still in the future, the
+/// refresh deadline (when known) has not passed, and the last upkeep outcome
+/// is not a sign-in requirement. Several enums are shared by very different
+/// facts: `probe_failed` is both a transient provider/probe failure on a
+/// valid credential and the presentation of a failed refresh (timed out,
+/// missing binary, expiry unchanged) on an expired one. An expired credential
+/// whose refresh failed is dead whatever enum presents it, and a slot blocked
+/// on a signed-out, unreadable or unproven credential is dead however complete
+/// its older limits are. A legacy saved state without an access deadline is
+/// usable only when it was just collected fresh.
+fn claude_slot_connection_usable(
+    status: &ClaudeConfigSlotCollectionStatusV1,
+    now: OffsetDateTime,
+) -> bool {
+    if matches!(
         status.state,
         ClaudeConfigSlotCollectionStateV1::NeedsLogin
             | ClaudeConfigSlotCollectionStateV1::RefreshDue
@@ -645,7 +657,27 @@ fn claude_slot_connection_usable(status: &ClaudeConfigSlotCollectionStatusV1) ->
             | ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
             | ClaudeConfigSlotCollectionStateV1::IdentityUnknown
             | ClaudeConfigSlotCollectionStateV1::IdentityMismatch
-    )
+    ) || status
+        .upkeep
+        .as_ref()
+        .is_some_and(|upkeep| upkeep.result == ClaudeConfigSlotUpkeepResultV1::NeedsLogin)
+        || status
+            .relogin_required_at
+            .as_deref()
+            .and_then(|deadline| OffsetDateTime::parse(deadline, &Rfc3339).ok())
+            .is_some_and(|deadline| deadline <= now)
+    {
+        return false;
+    }
+    match status
+        .access_expires_at
+        .as_deref()
+        .map(|deadline| OffsetDateTime::parse(deadline, &Rfc3339).ok())
+    {
+        Some(Some(deadline)) => deadline > now,
+        Some(None) => false,
+        None => status.state == ClaudeConfigSlotCollectionStateV1::Fresh,
+    }
 }
 
 /// Canonical-anchor rank: connection health first, then meter quality.
@@ -660,7 +692,7 @@ fn claude_slot_anchor_rank(
 ) -> (u8, ClaudeSnapshotQuality) {
     let health = if status.state == ClaudeConfigSlotCollectionStateV1::DuplicateAccount {
         0
-    } else if claude_slot_connection_usable(status) {
+    } else if claude_slot_connection_usable(status, OffsetDateTime::now_utc()) {
         2
     } else {
         1
@@ -14964,7 +14996,9 @@ mod tests {
     #[test]
     fn usable_connection_outranks_dead_slot_with_complete_history_for_canonical_anchor() {
         use ClaudeConfigSlotCollectionStateV1 as State;
-        let dead = |state: State| {
+        let now = OffsetDateTime::now_utc();
+        let at = |offset: TimeDuration| (now + offset).format(&Rfc3339).unwrap();
+        let complete = |state: State, access: TimeDuration| {
             let mut status = fresh_slot_status(
                 "2026-09-24T12:21:06Z",
                 "account-a",
@@ -14974,13 +15008,16 @@ mod tests {
                 true,
             );
             status.state = state;
+            status.access_expires_at = Some(at(access));
+            status.relogin_required_at = Some(at(TimeDuration::days(7)));
             status.last_full_quota_read_at = Some("2026-09-24T12:21:06Z".to_string());
             status.quota_snapshot = Some(local_meter_fixture("account-a", "org-a"));
             status
         };
+        let dead = |state: State| complete(state, -TimeDuration::days(8));
         let working = |state: State| {
             let mut status = fresh_slot_status(
-                "2026-10-02T05:00:00Z",
+                &at(TimeDuration::ZERO),
                 "account-a",
                 "org-a",
                 false,
@@ -14988,10 +15025,12 @@ mod tests {
                 false,
             );
             status.state = state;
+            status.access_expires_at = Some(at(TimeDuration::hours(8)));
+            status.relogin_required_at = Some(at(TimeDuration::days(30)));
             status
         };
         let binding = ClaudeStrongBinding::new("account-a", "org-a").unwrap();
-        // Slot ids sort the dead slot first so a tie would keep it.
+        // Slot ids sort the old slot first so a tie would keep it.
         let pick = |old: ClaudeConfigSlotCollectionStatusV1,
                     new: ClaudeConfigSlotCollectionStatusV1| {
             let states = BTreeMap::from([
@@ -15008,6 +15047,11 @@ mod tests {
             State::StaleAccessToken,
             State::CredentialUnavailable,
             State::IdentityMismatch,
+            // Failed refreshes on an expired credential are presented with
+            // shared enums; the expired deadline still makes them dead.
+            State::ProbeFailed,
+            State::ProviderUnavailable,
+            State::Fresh,
         ] {
             for working_state in [
                 State::ProviderUnavailable,
@@ -15022,19 +15066,61 @@ mod tests {
                 );
             }
         }
-        // Among usable slots, meter quality still decides; a slot labelled
-        // duplicate by an earlier selection never takes the anchor back.
+        // A failed refresh (timed out / expiry unchanged) mapped to
+        // `probe_failed` on an expired credential stays below the fresh login.
+        for failed in [
+            ClaudeConfigSlotUpkeepResultV1::TimedOut,
+            ClaudeConfigSlotUpkeepResultV1::ExpiryUnchanged,
+            ClaudeConfigSlotUpkeepResultV1::MissingBinary,
+        ] {
+            let mut old = dead(upkeep_state_diagnostic(failed).0);
+            old.upkeep = Some(ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                result: failed,
+                due_access_expires_at: old.access_expires_at.clone(),
+                refresh_token_expires_at: old.relogin_required_at.clone(),
+                attempted_at: Some(at(-TimeDuration::minutes(1))),
+                next_allowed_attempt_at: Some(at(TimeDuration::minutes(19))),
+                consecutive_failures: 3,
+            });
+            assert_eq!(
+                pick(old, working(State::ProviderUnavailable)),
+                "claude_slot_b_new",
+                "{failed:?}"
+            );
+        }
+        // A passed refresh deadline or a sign-in upkeep outcome is dead even
+        // with an unexpired access deadline.
+        let mut relogin_passed = complete(State::ProviderUnavailable, TimeDuration::hours(1));
+        relogin_passed.relogin_required_at = Some(at(-TimeDuration::hours(1)));
         assert_eq!(
-            pick(dead(State::Fresh), working(State::ProviderUnavailable)),
+            pick(relogin_passed, working(State::ProviderUnavailable)),
+            "claude_slot_b_new"
+        );
+        // Among usable slots, meter quality still decides: a valid credential
+        // with a transient probe failure keeps its complete limits.
+        assert_eq!(
+            pick(
+                complete(State::ProbeFailed, TimeDuration::hours(1)),
+                working(State::ProviderUnavailable)
+            ),
             "claude_slot_a_old"
         );
+        assert_eq!(
+            pick(
+                complete(State::Fresh, TimeDuration::hours(1)),
+                working(State::ProviderUnavailable)
+            ),
+            "claude_slot_a_old"
+        );
+        // A slot labelled duplicate by an earlier selection never takes the
+        // anchor back.
         assert_eq!(
             pick(dead(State::RefreshDue), working(State::DuplicateAccount)),
             "claude_slot_a_old"
         );
         assert_eq!(
             pick(
-                dead(State::DuplicateAccount),
+                complete(State::DuplicateAccount, TimeDuration::hours(1)),
                 working(State::ProviderUnavailable)
             ),
             "claude_slot_b_new"

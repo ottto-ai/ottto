@@ -75,11 +75,15 @@ the dead connection is shown as a removable duplicate. A healthy saved
 connection still makes the login `already_connected`.
 
 When several registered slots hold the same account and workspace, choosing
-the canonical anchor now ranks a usable connection first. A credential is
-usable when it is valid or refreshable, even while the provider is briefly
-unavailable or collection is paused. A slot blocked on `needs_login`,
-`refresh_due`, `stale_access_token`, `credential_unavailable` or unproven
-identity never outranks a usable one, however complete its older limits are.
+the canonical anchor now ranks a usable connection first. Usability comes
+from the saved credential evidence, not the collection enum alone. The access
+deadline must be in the future, the refresh deadline must not have passed, and
+the last upkeep outcome must not be a sign-in requirement. This holds even
+while the provider is briefly unavailable or collection is paused. An expired
+credential whose refresh failed is dead, even when a failed refresh is shown as
+`probe_failed`. A slot blocked on `needs_login`, `refresh_due`,
+`stale_access_token`, `credential_unavailable` or unproven identity never
+outranks a usable one, however complete its older limits are.
 A slot already labelled duplicate ranks last, so persisted readers agree with
 the collector. Meter quality still orders slots of equal health.
 
