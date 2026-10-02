@@ -34,5 +34,12 @@ consumers may ignore the new closed codes without treating them as provider
 success. Supported JSON consumers must likewise distinguish these local codes
 from `claude_oauth_usage_check_succeeded`.
 
+When the default slot supplies the meters for the same exact account and
+workspace pair, the blocked canonical anchor is neither uploaded nor turned
+into a degraded snapshot. Its single closed worker receipt, with its original
+local clock, now travels on that winning snapshot's diagnostics. Only exact-pair
+`claude_slot_worker_*` codes move; the anchor's provider-check and collection
+codes stay with the anchor, and the anchor uploading itself carries nothing extra.
+
 Session: Codex native 01a0f43d. No provider checks, auth mutations, cadence,
 consent, breaker or release changes were performed for this correction.

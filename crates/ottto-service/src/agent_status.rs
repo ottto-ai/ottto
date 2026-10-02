@@ -3139,6 +3139,13 @@ fn collect_claude_status_snapshots(
                     .map(|health| (ClaudeAccountAnchorDurabilityV1::Anchored, *health))
                     .unwrap_or((ClaudeAccountAnchorDurabilityV1::DefaultOnly, None));
                 apply_claude_anchor_continuity(&mut candidate.snapshot, durability, health);
+                append_canonical_anchor_worker_receipts(
+                    &mut candidate.snapshot,
+                    &candidate.slot_id,
+                    &candidate.binding,
+                    &canonical_anchors,
+                    &slot_states,
+                );
                 snapshots.push(candidate.snapshot);
             }
             ClaudeSnapshotDisposition::ShadowDefault => {
@@ -3294,6 +3301,63 @@ fn apply_claude_anchor_continuity(
     }
     account.claude_anchor_durability = Some(durability);
     account.claude_anchor_health = health;
+}
+
+/// Carry the canonical registered anchor's closed local worker receipt onto
+/// the snapshot that uploads that same exact account/workspace pair.
+///
+/// When the default slot supplies a binding's meters, its anchor has no meters
+/// and is neither uploaded nor turned into a degraded snapshot, so the anchor's
+/// `claude_slot_worker_*` receipt was only ever persisted locally. That hid the
+/// outcome exactly where the anchor is blocked and the default is not (for
+/// example the CLI's current account). Only exact-binding, closed worker codes
+/// with their original local completion clocks travel; provider-check codes,
+/// collection-state codes and every other anchor diagnostic stay with the
+/// anchor. This is presentation of an existing local fact, not a quota check.
+fn append_canonical_anchor_worker_receipts(
+    snapshot: &mut AgentStatusSnapshot,
+    candidate_slot_id: &str,
+    binding: &ClaudeStrongBinding,
+    canonical_anchors: &BTreeMap<ClaudeStrongBinding, String>,
+    slot_states: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+) {
+    let Some(anchor_slot_id) = canonical_anchors.get(binding) else {
+        return;
+    };
+    if anchor_slot_id == candidate_slot_id {
+        return;
+    }
+    let Some(anchor) = slot_states.get(anchor_slot_id) else {
+        return;
+    };
+    let snapshot_matches = snapshot.account.as_ref().is_some_and(|account| {
+        account.account_identifier_hash.as_deref() == Some(binding.account_identifier_hash.as_str())
+            && account.organization_identifier_hash.as_deref()
+                == Some(binding.organization_identifier_hash.as_str())
+    });
+    if !snapshot_matches
+        || anchor.account_identifier_hash.as_deref()
+            != Some(binding.account_identifier_hash.as_str())
+        || anchor.organization_identifier_hash.as_deref()
+            != Some(binding.organization_identifier_hash.as_str())
+    {
+        return;
+    }
+    for receipt in safe_claude_slot_check_diagnostics(
+        &anchor.quota_check_diagnostics,
+        &binding.account_identifier_hash,
+        &binding.organization_identifier_hash,
+    ) {
+        if claude_worker_diagnostic_message(&receipt.code).is_none()
+            || snapshot
+                .diagnostics
+                .iter()
+                .any(|existing| claude_worker_diagnostic_message(&existing.code).is_some())
+        {
+            continue;
+        }
+        snapshot.diagnostics.push(receipt);
+    }
 }
 
 #[cfg(test)]
@@ -13945,6 +14009,147 @@ mod tests {
             forged.code = "claude_slot_worker_arbitrary_secret".to_string();
             assert!(safe_claude_slot_check_diagnostics(&[forged], "account-a", "org-a").is_empty());
         }
+    }
+
+    #[test]
+    fn claude_worker_receipt_travels_on_winning_default_snapshot_for_same_exact_binding() {
+        let (slot, _, _, now) = valid_access_reconciliation_fixture();
+        let mut anchor = claude_worker_receipt_status(
+            &slot,
+            &slot,
+            ClaudeWorkerDiagnostic::ReconciliationRefused,
+            "2026-08-05T02:30:00Z",
+            now,
+        )
+        .unwrap();
+        anchor.quota_check_diagnostics.push(
+            claude_quota_check_diagnostic("claude_oauth_usage_cache_reused", "anchor cache", 1)
+                .with_quota_binding(Some("account-a".to_string()), Some("org-a".to_string())),
+        );
+        let binding = ClaudeStrongBinding::new("account-a", "org-a").unwrap();
+        let canonical = BTreeMap::from([(binding.clone(), slot.slot_id.clone())]);
+        let slot_states = BTreeMap::from([(slot.slot_id.clone(), anchor.clone())]);
+        let worker_codes = |snapshot: &AgentStatusSnapshot| {
+            snapshot
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| claude_worker_diagnostic_message(&diagnostic.code).is_some())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let mut default =
+            claude_account_snapshot("a@example.com", "claude_max_20x", "account-a", "org-a");
+        let before = default.diagnostics.len();
+        append_canonical_anchor_worker_receipts(
+            &mut default,
+            "default",
+            &binding,
+            &canonical,
+            &slot_states,
+        );
+        let carried = worker_codes(&default);
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].code, "claude_slot_worker_reconciliation_refused");
+        assert_eq!(
+            carried[0].observed_at.as_deref(),
+            Some("2026-08-05T02:30:00Z")
+        );
+        assert_eq!(
+            carried[0].account_identifier_hash.as_deref(),
+            Some("account-a")
+        );
+        assert_eq!(
+            carried[0].organization_identifier_hash.as_deref(),
+            Some("org-a")
+        );
+        // Only the closed worker receipt travels; the anchor's provider-check
+        // evidence is never re-presented as the default slot's own check.
+        assert_eq!(default.diagnostics.len(), before + 1);
+        assert!(!default
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "anchor cache"));
+
+        // Idempotent: a second pass never duplicates the single receipt.
+        append_canonical_anchor_worker_receipts(
+            &mut default,
+            "default",
+            &binding,
+            &canonical,
+            &slot_states,
+        );
+        assert_eq!(worker_codes(&default).len(), 1);
+
+        // The anchor uploading itself, a foreign snapshot pair, a foreign
+        // anchor pair, and a missing anchor state carry nothing.
+        let mut itself =
+            claude_account_snapshot("a@example.com", "claude_max_20x", "account-a", "org-a");
+        append_canonical_anchor_worker_receipts(
+            &mut itself,
+            &slot.slot_id,
+            &binding,
+            &canonical,
+            &slot_states,
+        );
+        assert!(worker_codes(&itself).is_empty());
+        let mut foreign =
+            claude_account_snapshot("b@example.com", "claude_max_20x", "account-a", "org-b");
+        append_canonical_anchor_worker_receipts(
+            &mut foreign,
+            "default",
+            &binding,
+            &canonical,
+            &slot_states,
+        );
+        assert!(worker_codes(&foreign).is_empty());
+        let mut rebound_anchor = anchor.clone();
+        rebound_anchor.organization_identifier_hash = Some("org-b".to_string());
+        let rebound_states = BTreeMap::from([(slot.slot_id.clone(), rebound_anchor)]);
+        let mut rebound =
+            claude_account_snapshot("a@example.com", "claude_max_20x", "account-a", "org-a");
+        append_canonical_anchor_worker_receipts(
+            &mut rebound,
+            "default",
+            &binding,
+            &canonical,
+            &rebound_states,
+        );
+        assert!(worker_codes(&rebound).is_empty());
+        let mut missing =
+            claude_account_snapshot("a@example.com", "claude_max_20x", "account-a", "org-a");
+        append_canonical_anchor_worker_receipts(
+            &mut missing,
+            "default",
+            &binding,
+            &canonical,
+            &BTreeMap::new(),
+        );
+        assert!(worker_codes(&missing).is_empty());
+
+        // A forged worker-looking code on the anchor stays rejected.
+        let mut forged_anchor = anchor;
+        forged_anchor.quota_check_diagnostics = vec![AgentStatusDiagnostic::source(
+            "claude_slot_worker_arbitrary_secret",
+            AgentDiagnosticSeverity::Info,
+            "forged",
+        )
+        .with_observed_at(Some("2026-08-05T02:30:00Z".to_string()))
+        .with_quota_binding(Some("account-a".to_string()), Some("org-a".to_string()))];
+        let forged_states = BTreeMap::from([(slot.slot_id.clone(), forged_anchor)]);
+        let mut forged =
+            claude_account_snapshot("a@example.com", "claude_max_20x", "account-a", "org-a");
+        append_canonical_anchor_worker_receipts(
+            &mut forged,
+            "default",
+            &binding,
+            &canonical,
+            &forged_states,
+        );
+        assert!(forged
+            .diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.code.starts_with("claude_slot_worker_")));
     }
 
     #[test]

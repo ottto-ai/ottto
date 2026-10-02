@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 413,
-  "content_sha256": "b1878680bdb17eca153ae5e0d4fb8d96bf5afdcec190a39a40b44d20ae6f9b9e",
+  "content_sha256": "490c208fb086793b7940b6e877c6bfe891c103a9b1ade36b7818536e04725e9a",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "7951f37f7a31b165c2da6cb3adb48af94070fc0b7030070e7c9917e7307cdb3a",
-      "size_bytes": 985359
+      "sha256": "db467dc92e080c8a3a4f8acd7c6a47d5c7cd81f1133786bf6be4085133d2d160",
+      "size_bytes": 993636
     },
     {
       "executable": false,
@@ -1000,8 +1000,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/claude-worker-outcome-diagnostics.md",
-      "sha256": "6dcf9658f8088a9f8cbe54c3ce63c49a7c7587b849a595a8caebefcc9174800d",
-      "size_bytes": 2399
+      "sha256": "96556382bc76a14620b9abfae7f50b772cf7daca95f4cd79e30e9bfdba47dbca",
+      "size_bytes": 2869
     },
     {
       "executable": false,
