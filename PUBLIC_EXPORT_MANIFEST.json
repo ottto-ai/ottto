@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 415,
-  "content_sha256": "ecd0e53b30c30f06e94e4ae17b752e6e8065b35d3d3bd9229603035e45892a20",
+  "content_sha256": "e7d671c7794ab2a6e99b33ae5a51103665a3b667d53f34dbc0d86ee9258f3efc",
   "files": [
     {
       "executable": false,
@@ -888,8 +888,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "5b7eed19efbb909fd0b3f87352ca4758aa5cb8c95d92c78bfda636fc0cef0cf4",
-      "size_bytes": 609697
+      "sha256": "1bee5418dccf8ae6ad25ea1db6b8cc4931821bec7fa669580dccdb9871835f50",
+      "size_bytes": 613010
     },
     {
       "executable": false,
@@ -1798,8 +1798,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-01-claude-original-session-carrier.md",
-      "sha256": "5196b0654d856cdb1bfe7b88161c366b67468c23e256c8ef889b4c2af2772f75",
-      "size_bytes": 3814
+      "sha256": "37199d47a9263ca053bf365b710aa7f4e62232f0ac8d7797fd3479a7d59b6cec",
+      "size_bytes": 4288
     },
     {
       "executable": false,
@@ -2908,7 +2908,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-02T06:13:23+00:00",
+  "generated_at": "2026-10-02T06:18:25+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 416,
   "public_roots": [
@@ -2944,5 +2944,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "a46eb0960bba59003fedd7c7e8d6cf35db144363"
+  "source_commit": "601eb2eaa54b1c9b2df3ad36c6a100f02ee7516a"
 }

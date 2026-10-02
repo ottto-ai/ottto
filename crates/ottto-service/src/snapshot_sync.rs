@@ -8296,33 +8296,41 @@ mod tests {
                 evidence_revision: "claude_transcript_model:v1".to_string(),
             }],
         });
-        let items = scan.snapshots;
-        let mut progress = test_upload_progress();
-        let mut accepted = 0;
-
-        let first = upload_resumable_batches_with_body_witness(
-            &items,
-            &unique_poison_scope(),
-            &mut progress,
-            &mut accepted,
-            |snapshot| snapshot.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |_| Err(anyhow!("response lost after durable remote write")),
-            |_| Ok(()),
+        // A current scan explicitly evaluates missing original identity. The
+        // released curve-only compatibility case must omit that newer leaf;
+        // neither wire may borrow the other capability's ACK domain.
+        assert_eq!(
+            item.session_account_evidence
+                .as_ref()
+                .unwrap()
+                .identity_disposition,
+            Some("missing")
         );
-        first.expect_err("lost response cannot advance local checkpoint");
-        assert!(progress.accepted_fingerprints.is_empty());
-
-        let mut retry_calls = 0;
-        upload_resumable_batches_with_body_witness(
-            &items,
-            &unique_poison_scope(),
-            &mut progress,
-            &mut accepted,
-            |snapshot| snapshot.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |batch| {
-                retry_calls += 1;
+        assert!(item.cache_observations.is_none());
+        let current_item = item.clone();
+        for (original_evaluation, public_version, wrong_version) in [(false, 5, 7), (true, 7, 5)] {
+            let mut item = current_item.clone();
+            if !original_evaluation {
+                item.session_account_evidence = None;
+            }
+            let wire = serde_json::to_value(&item).unwrap();
+            assert_eq!(
+                wire.get("session_account_evidence").is_some(),
+                original_evaluation
+            );
+            assert!(wire.get("cache_observations").is_none());
+            assert!(wire.get("context_curve").is_some());
+            assert_eq!(
+                (item.input_tokens, item.output_tokens, item.request_count),
+                (42, 1, 1)
+            );
+            assert_eq!(item.model_usage, current_item.model_usage);
+            assert_eq!(item.usage_buckets, current_item.usage_buckets);
+            let items = vec![item];
+            let digest = snapshot_upload_body_witness(&items[0]);
+            let mut progress = test_upload_progress();
+            let mut accepted = 0;
+            let checked_response = |batch: Vec<SnapshotItem>, version, proof, unchanged| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
                     source: "claude_code".to_string(),
@@ -8333,6 +8341,15 @@ mod tests {
                     client_report: crate::client_report::ClientReport::empty(),
                 };
                 let uploaded = &request.snapshots[0];
+                let reference = crate::snapshot_client::SnapshotEntityRef {
+                    source_session_id: uploaded.source_session_id.clone(),
+                    snapshot_fingerprint: uploaded.snapshot_fingerprint.clone(),
+                    occurrence_count: 1,
+                    body_witness_version: version,
+                    body_witness_digest: proof,
+                    head_etag: None,
+                    head_challenge: None,
+                };
                 let response = crate::snapshot_client::SnapshotBatchResponse {
                     accepted: 1,
                     sessions_reconciled: 0,
@@ -8342,47 +8359,94 @@ mod tests {
                     entity_ack_contract: Some(
                         crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string(),
                     ),
-                    accepted_entities: Vec::new(),
-                    unchanged_entities: vec![crate::snapshot_client::SnapshotEntityRef {
-                        source_session_id: uploaded.source_session_id.clone(),
-                        snapshot_fingerprint: uploaded.snapshot_fingerprint.clone(),
-                        occurrence_count: 1,
-                        body_witness_version: Some(5),
-                        body_witness_digest: Some(snapshot_upload_body_witness(uploaded)),
-                        head_etag: None,
-                        head_challenge: None,
-                    }],
+                    accepted_entities: if unchanged {
+                        vec![]
+                    } else {
+                        vec![reference.clone()]
+                    },
+                    unchanged_entities: if unchanged { vec![reference] } else { vec![] },
                     rejected_entities: Vec::new(),
                     conflict_entities: Vec::new(),
                 };
                 response.validate_entity_ack(&request)?;
                 Ok(response)
-            },
-            |_| Ok(()),
-        )
-        .expect("released v5 unchanged ACK settles curve checkpoint");
-        assert_eq!(retry_calls, 1);
-        assert!(progress.contains_body(
-            &items[0].snapshot_fingerprint,
-            &snapshot_upload_body_witness(&items[0])
-        ));
-
-        let mut noop_calls = 0;
-        upload_resumable_batches_with_body_witness(
-            &items,
-            &unique_poison_scope(),
-            &mut progress,
-            &mut accepted,
-            |snapshot| snapshot.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |_| {
-                noop_calls += 1;
-                Ok(accepted_batch(1))
-            },
-            |_| Ok(()),
-        )
-        .expect("settled curve is a durable no-op");
-        assert_eq!(noop_calls, 0);
+            };
+            checked_response(
+                items.clone(),
+                Some(public_version),
+                Some(digest.clone()),
+                false,
+            )
+            .expect("exact first-admission ACK validates in its declared domain");
+            let first = upload_resumable_batches_with_body_witness(
+                &items,
+                &unique_poison_scope(),
+                &mut progress,
+                &mut accepted,
+                |snapshot| snapshot.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |_| Err(anyhow!("response lost after durable remote write")),
+                |_| Ok(()),
+            );
+            first.expect_err("lost response cannot advance local checkpoint");
+            assert!(progress.accepted_fingerprints.is_empty());
+            for unchanged in [false, true] {
+                for (version, proof) in [
+                    (None, None),
+                    (Some(public_version), Some("0".repeat(64))),
+                    (Some(wrong_version), Some(digest.clone())),
+                ] {
+                    upload_resumable_batches_with_body_witness(
+                        &items,
+                        &unique_poison_scope(),
+                        &mut progress,
+                        &mut accepted,
+                        |snapshot| snapshot.snapshot_fingerprint.as_str(),
+                        snapshot_upload_body_witness,
+                        |batch| checked_response(batch, version, proof.clone(), unchanged),
+                        |_| Ok(()),
+                    )
+                    .expect_err("missing/wrong proof or capability domain cannot settle retry");
+                    assert_eq!(accepted, 0);
+                    assert!(progress.accepted_fingerprints.is_empty());
+                    assert!(!progress.contains_body(&items[0].snapshot_fingerprint, &digest));
+                }
+            }
+            let mut retry_calls = 0;
+            upload_resumable_batches_with_body_witness(
+                &items,
+                &unique_poison_scope(),
+                &mut progress,
+                &mut accepted,
+                |snapshot| snapshot.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |batch| {
+                    retry_calls += 1;
+                    checked_response(batch, Some(public_version), Some(digest.clone()), true)
+                },
+                |_| Ok(()),
+            )
+            .expect("exact unchanged ACK settles its declared curve checkpoint");
+            assert_eq!(retry_calls, 1);
+            assert_eq!(accepted, 1);
+            assert!(progress.contains_body(&items[0].snapshot_fingerprint, &digest));
+            let mut noop_calls = 0;
+            upload_resumable_batches_with_body_witness(
+                &items,
+                &unique_poison_scope(),
+                &mut progress,
+                &mut accepted,
+                |snapshot| snapshot.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |_| {
+                    noop_calls += 1;
+                    Ok(accepted_batch(1))
+                },
+                |_| Ok(()),
+            )
+            .expect("settled curve is a durable no-op");
+            assert_eq!(noop_calls, 0);
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
