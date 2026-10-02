@@ -389,11 +389,31 @@ fn claude_candidate_is_better(
             })
 }
 
+/// Choose the uploading snapshot and the preferred registered anchor for each
+/// exact pair.
+///
+/// The preferred registered anchor follows `canonical_registered_anchors`,
+/// which ranks connection health (the shared credential-usability rule) before
+/// meter quality. A registered slot that is not the canonical anchor for its
+/// pair can neither upload nor become the preferred anchor, so one ranking
+/// decides both the canonical label and which slot's limits are used. Without
+/// this, an unusable slot showing complete limits (for example valid access
+/// but a passed refresh deadline) could win on meter quality and label the
+/// working login a duplicate. The default login still competes on meter
+/// quality alone; it never changes which registered slot is canonical.
 fn select_claude_snapshot_candidates(
     candidates: &[ClaudeSnapshotCandidate],
+    canonical_anchors: &BTreeMap<ClaudeStrongBinding, String>,
 ) -> ClaudeSnapshotSelection {
     let mut selection = ClaudeSnapshotSelection::default();
     for (index, candidate) in candidates.iter().enumerate() {
+        if candidate.slot_class == ClaudeSnapshotSlotClass::Registered
+            && canonical_anchors
+                .get(&candidate.binding)
+                .is_some_and(|canonical| canonical != &candidate.slot_id)
+        {
+            continue;
+        }
         let replace_winner = selection
             .winning_by_binding
             .get(&candidate.binding)
@@ -632,6 +652,74 @@ fn claude_slot_projection_quality(
     }
 }
 
+/// Whether a saved slot still holds a usable connection, decided from the
+/// credential evidence rather than the collection enum alone.
+///
+/// Usable means the saved access deadline is still in the future, the
+/// refresh deadline (when known) has not passed, and the last upkeep outcome
+/// is not a sign-in requirement. Several enums are shared by very different
+/// facts: `probe_failed` is both a transient provider/probe failure on a
+/// valid credential and the presentation of a failed refresh (timed out,
+/// missing binary, expiry unchanged) on an expired one. An expired credential
+/// whose refresh failed is dead whatever enum presents it, and a slot blocked
+/// on a signed-out, unreadable or unproven credential is dead however complete
+/// its older limits are. A legacy saved state without an access deadline is
+/// usable only when it was just collected fresh.
+pub(crate) fn claude_slot_connection_usable(
+    status: &ClaudeConfigSlotCollectionStatusV1,
+    now: OffsetDateTime,
+) -> bool {
+    if matches!(
+        status.state,
+        ClaudeConfigSlotCollectionStateV1::NeedsLogin
+            | ClaudeConfigSlotCollectionStateV1::RefreshDue
+            | ClaudeConfigSlotCollectionStateV1::StaleAccessToken
+            | ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
+            | ClaudeConfigSlotCollectionStateV1::IdentityUnknown
+            | ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+    ) || status
+        .upkeep
+        .as_ref()
+        .is_some_and(|upkeep| upkeep.result == ClaudeConfigSlotUpkeepResultV1::NeedsLogin)
+        || status
+            .relogin_required_at
+            .as_deref()
+            .and_then(|deadline| OffsetDateTime::parse(deadline, &Rfc3339).ok())
+            .is_some_and(|deadline| deadline <= now)
+    {
+        return false;
+    }
+    match status
+        .access_expires_at
+        .as_deref()
+        .map(|deadline| OffsetDateTime::parse(deadline, &Rfc3339).ok())
+    {
+        Some(Some(deadline)) => deadline > now,
+        Some(None) => false,
+        None => status.state == ClaudeConfigSlotCollectionStateV1::Fresh,
+    }
+}
+
+/// Canonical-anchor rank: connection health first, then meter quality.
+///
+/// A dead slot's historical complete limits must never keep the canonical
+/// anchor away from a working connection for the same account (for example a
+/// fresh login admitted while the provider is briefly unavailable). A slot
+/// already labelled `DuplicateAccount` by an earlier selection ranks last, so
+/// readers of persisted state agree with the collector's own choice.
+fn claude_slot_anchor_rank(
+    status: &ClaudeConfigSlotCollectionStatusV1,
+) -> (u8, ClaudeSnapshotQuality) {
+    let health = if status.state == ClaudeConfigSlotCollectionStateV1::DuplicateAccount {
+        0
+    } else if claude_slot_connection_usable(status, OffsetDateTime::now_utc()) {
+        2
+    } else {
+        1
+    };
+    (health, claude_slot_projection_quality(status))
+}
+
 fn canonical_registered_anchors(
     registered_slot_ids: impl IntoIterator<Item = String>,
     slot_states: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
@@ -654,10 +742,10 @@ fn canonical_registered_anchors(
             let current = slot_states
                 .get(current_slot_id)
                 .expect("canonical registered slot remains present");
-            claude_slot_projection_quality(status) > claude_slot_projection_quality(current)
-                || (claude_slot_projection_quality(status)
-                    == claude_slot_projection_quality(current)
-                    && slot_id < *current_slot_id)
+            let candidate_rank = claude_slot_anchor_rank(status);
+            let current_rank = claude_slot_anchor_rank(current);
+            candidate_rank > current_rank
+                || (candidate_rank == current_rank && slot_id < *current_slot_id)
         });
         if replace {
             canonical.insert(binding, slot_id);
@@ -3063,19 +3151,6 @@ fn collect_claude_status_snapshots(
         default_state = status.clone();
     }
 
-    let selection = select_claude_snapshot_candidates(&candidates);
-    let winning_accounts = selection
-        .winning_by_binding
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let dispositions = candidates
-        .iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            claude_snapshot_candidate_disposition(index, candidate, &selection)
-        })
-        .collect::<Vec<_>>();
     let mut registered_slot_ids = settings
         .as_ref()
         .map(|status| {
@@ -3090,6 +3165,19 @@ fn collect_claude_status_snapshots(
     registered_slot_ids.sort();
     let canonical_anchors = canonical_registered_anchors(registered_slot_ids.clone(), &slot_states);
     let anchor_health_by_binding = canonical_anchor_health(&canonical_anchors, &slot_states);
+    let selection = select_claude_snapshot_candidates(&candidates, &canonical_anchors);
+    let winning_accounts = selection
+        .winning_by_binding
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let dispositions = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            claude_snapshot_candidate_disposition(index, candidate, &selection)
+        })
+        .collect::<Vec<_>>();
     for (binding, slot_id) in &canonical_anchors {
         if let Some(status) = slot_states.get_mut(slot_id) {
             status.relationship =
@@ -4535,18 +4623,8 @@ fn claude_blocked_refresh_worker_escalation(
     status: &ClaudeConfigSlotCollectionStatusV1,
     now: OffsetDateTime,
 ) -> Option<ClaudeQuotaAccessState> {
-    let account = status.account_identifier_hash.as_deref()?;
-    let organization = status.organization_identifier_hash.as_deref()?;
-    let receipt =
-        safe_claude_slot_check_diagnostics(&status.quota_check_diagnostics, account, organization)
-            .into_iter()
-            .filter(|entry| claude_worker_diagnostic_message(&entry.code).is_some())
-            .filter_map(|entry| {
-                bounded_claude_collection_timestamp(entry.observed_at.as_deref(), now)
-                    .map(|clock| (entry.code, clock))
-            })
-            .max_by_key(|(_, clock)| *clock)?;
-    if receipt.0 == "claude_slot_worker_needs_login" {
+    let receipt = latest_exact_claude_worker_receipt_code(status, now)?;
+    if receipt == "claude_slot_worker_needs_login" {
         return Some(ClaudeQuotaAccessState::ReconnectRequired);
     }
     let expired_long_ago = bounded_claude_collection_timestamp(
@@ -4554,8 +4632,62 @@ fn claude_blocked_refresh_worker_escalation(
         now - TimeDuration::seconds(CLAUDE_BLOCKED_REFRESH_ESCALATION_SECONDS),
     )
     .is_some();
-    (expired_long_ago && CLAUDE_BLOCKED_REFRESH_FAILURE_WORKER_CODES.contains(&receipt.0.as_str()))
+    (expired_long_ago && CLAUDE_BLOCKED_REFRESH_FAILURE_WORKER_CODES.contains(&receipt.as_str()))
         .then_some(ClaudeQuotaAccessState::AttentionRequired)
+}
+
+/// Code of the newest exact-binding local worker receipt on one saved slot,
+/// bounded by `now`. Forged, foreign-pair and future receipts are ignored.
+fn latest_exact_claude_worker_receipt_code(
+    status: &ClaudeConfigSlotCollectionStatusV1,
+    now: OffsetDateTime,
+) -> Option<String> {
+    let account = status.account_identifier_hash.as_deref()?;
+    let organization = status.organization_identifier_hash.as_deref()?;
+    safe_claude_slot_check_diagnostics(&status.quota_check_diagnostics, account, organization)
+        .into_iter()
+        .filter(|entry| claude_worker_diagnostic_message(&entry.code).is_some())
+        .filter_map(|entry| {
+            bounded_claude_collection_timestamp(entry.observed_at.as_deref(), now)
+                .map(|clock| (entry.code, clock))
+        })
+        .max_by_key(|(_, clock)| *clock)
+        .map(|(code, _)| code)
+}
+
+/// Saved state for a blocked slot whose newest exact worker pass read a
+/// credential that needs a new sign-in.
+///
+/// The worker's pre-claim `needs_login` describes the slot's actual
+/// credential, but its witness is keyed by that credential's expiry (for a
+/// signed-out credential, often the epoch), so the foreground's exact saved
+/// deadline match never adopts it and the slot stayed `refresh_due`. That
+/// hid both reconnect-required health and the companion's "Sign in again".
+/// The receipt is already fenced to this registration, pair and saved
+/// deadlines with its original clock, and any newer worker pass replaces it.
+/// Only the presented state changes: the saved upkeep result stays
+/// `refresh_due`, so collection keeps queuing the worker and a valid
+/// credential after sign-in reconciles through the existing worker path.
+fn apply_claude_worker_needs_login_state(
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+    now: OffsetDateTime,
+) {
+    if !matches!(
+        status.state,
+        ClaudeConfigSlotCollectionStateV1::RefreshDue
+            | ClaudeConfigSlotCollectionStateV1::StaleAccessToken
+    ) || latest_exact_claude_worker_receipt_code(status, now).as_deref()
+        != Some("claude_slot_worker_needs_login")
+    {
+        return;
+    }
+    let (state, code, message) =
+        upkeep_state_diagnostic(ClaudeConfigSlotUpkeepResultV1::NeedsLogin);
+    status.state = state;
+    status.diagnostics = vec![ClaudeConfigSlotDiagnosticV1 {
+        code,
+        message: message.to_string(),
+    }];
 }
 
 fn claude_slot_status_carries_meters(status: &ClaudeConfigSlotCollectionStatusV1) -> bool {
@@ -5864,7 +5996,10 @@ fn merge_claude_slot_collection_state(
     slot_id: &str,
     candidate: &ClaudeConfigSlotCollectionStatusV1,
 ) {
-    merge_claude_slot_collection_state_at(slots, slot_id, candidate, OffsetDateTime::now_utc());
+    let now = OffsetDateTime::now_utc();
+    let mut candidate = candidate.clone();
+    apply_claude_worker_needs_login_state(&mut candidate, now);
+    merge_claude_slot_collection_state_at(slots, slot_id, &candidate, now);
 }
 
 fn retain_claude_worker_receipt_for_blocked_candidate(
@@ -14874,6 +15009,360 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// AutoReview P2 on 83657166: an admitted fresh login whose first quota
+    /// read is unavailable must still become the canonical anchor over a dead
+    /// slot that only has older complete limits, in both the collector's
+    /// selection and the persisted anchor coverage readers use.
+    #[test]
+    fn usable_connection_outranks_dead_slot_with_complete_history_for_canonical_anchor() {
+        use ClaudeConfigSlotCollectionStateV1 as State;
+        let now = OffsetDateTime::now_utc();
+        let at = |offset: TimeDuration| (now + offset).format(&Rfc3339).unwrap();
+        let complete = |state: State, access: TimeDuration| {
+            let mut status = fresh_slot_status(
+                "2026-09-24T12:21:06Z",
+                "account-a",
+                "org-a",
+                true,
+                true,
+                true,
+            );
+            status.state = state;
+            status.access_expires_at = Some(at(access));
+            status.relogin_required_at = Some(at(TimeDuration::days(7)));
+            status.last_full_quota_read_at = Some("2026-09-24T12:21:06Z".to_string());
+            status.quota_snapshot = Some(local_meter_fixture("account-a", "org-a"));
+            status
+        };
+        let dead = |state: State| complete(state, -TimeDuration::days(8));
+        let working = |state: State| {
+            let mut status = fresh_slot_status(
+                &at(TimeDuration::ZERO),
+                "account-a",
+                "org-a",
+                false,
+                false,
+                false,
+            );
+            status.state = state;
+            status.access_expires_at = Some(at(TimeDuration::hours(8)));
+            status.relogin_required_at = Some(at(TimeDuration::days(30)));
+            status
+        };
+        let binding = ClaudeStrongBinding::new("account-a", "org-a").unwrap();
+        // Slot ids sort the old slot first so a tie would keep it.
+        let pick = |old: ClaudeConfigSlotCollectionStatusV1,
+                    new: ClaudeConfigSlotCollectionStatusV1| {
+            let states = BTreeMap::from([
+                ("claude_slot_a_old".to_string(), old),
+                ("claude_slot_b_new".to_string(), new),
+            ]);
+            canonical_registered_anchors(states.keys().cloned().collect::<Vec<_>>(), &states)
+                [&binding]
+                .clone()
+        };
+        for dead_state in [
+            State::NeedsLogin,
+            State::RefreshDue,
+            State::StaleAccessToken,
+            State::CredentialUnavailable,
+            State::IdentityMismatch,
+            // Failed refreshes on an expired credential are presented with
+            // shared enums; the expired deadline still makes them dead.
+            State::ProbeFailed,
+            State::ProviderUnavailable,
+            State::Fresh,
+        ] {
+            for working_state in [
+                State::ProviderUnavailable,
+                State::Fresh,
+                State::CollectionPaused,
+                State::ProbeFailed,
+            ] {
+                assert_eq!(
+                    pick(dead(dead_state.clone()), working(working_state.clone())),
+                    "claude_slot_b_new",
+                    "{dead_state:?} vs {working_state:?}"
+                );
+            }
+        }
+        // A failed refresh (timed out / expiry unchanged) mapped to
+        // `probe_failed` on an expired credential stays below the fresh login.
+        for failed in [
+            ClaudeConfigSlotUpkeepResultV1::TimedOut,
+            ClaudeConfigSlotUpkeepResultV1::ExpiryUnchanged,
+            ClaudeConfigSlotUpkeepResultV1::MissingBinary,
+        ] {
+            let mut old = dead(upkeep_state_diagnostic(failed).0);
+            old.upkeep = Some(ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                result: failed,
+                due_access_expires_at: old.access_expires_at.clone(),
+                refresh_token_expires_at: old.relogin_required_at.clone(),
+                attempted_at: Some(at(-TimeDuration::minutes(1))),
+                next_allowed_attempt_at: Some(at(TimeDuration::minutes(19))),
+                consecutive_failures: 3,
+            });
+            assert_eq!(
+                pick(old, working(State::ProviderUnavailable)),
+                "claude_slot_b_new",
+                "{failed:?}"
+            );
+        }
+        // A passed refresh deadline or a sign-in upkeep outcome is dead even
+        // with an unexpired access deadline.
+        let mut relogin_passed = complete(State::ProviderUnavailable, TimeDuration::hours(1));
+        relogin_passed.relogin_required_at = Some(at(-TimeDuration::hours(1)));
+        assert_eq!(
+            pick(relogin_passed, working(State::ProviderUnavailable)),
+            "claude_slot_b_new"
+        );
+        // Among usable slots, meter quality still decides: a valid credential
+        // with a transient probe failure keeps its complete limits.
+        assert_eq!(
+            pick(
+                complete(State::ProbeFailed, TimeDuration::hours(1)),
+                working(State::ProviderUnavailable)
+            ),
+            "claude_slot_a_old"
+        );
+        assert_eq!(
+            pick(
+                complete(State::Fresh, TimeDuration::hours(1)),
+                working(State::ProviderUnavailable)
+            ),
+            "claude_slot_a_old"
+        );
+        // A slot labelled duplicate by an earlier selection never takes the
+        // anchor back.
+        assert_eq!(
+            pick(dead(State::RefreshDue), working(State::DuplicateAccount)),
+            "claude_slot_a_old"
+        );
+        assert_eq!(
+            pick(
+                complete(State::DuplicateAccount, TimeDuration::hours(1)),
+                working(State::ProviderUnavailable)
+            ),
+            "claude_slot_b_new"
+        );
+    }
+
+    /// Opus review F1 on 6d43ff24: the limits/upload choice must follow the
+    /// health-first canonical choice. An old slot with valid access but a
+    /// passed refresh deadline (fresh, complete limits, unusable) and a new
+    /// working login with partial limits: the new login is canonical, preferred
+    /// and uploads; the old slot is the duplicate, never the reverse.
+    #[test]
+    fn snapshot_selection_follows_health_first_canonical_anchor() {
+        let now = OffsetDateTime::now_utc();
+        let at = |offset: TimeDuration| (now + offset).format(&Rfc3339).unwrap();
+        let mut old = fresh_slot_status(
+            &at(-TimeDuration::minutes(2)),
+            "account-a",
+            "org-a",
+            true,
+            true,
+            true,
+        );
+        old.access_expires_at = Some(at(TimeDuration::hours(3)));
+        old.relogin_required_at = Some(at(-TimeDuration::hours(1)));
+        let mut new = fresh_slot_status(
+            &at(-TimeDuration::minutes(1)),
+            "account-a",
+            "org-a",
+            true,
+            false,
+            false,
+        );
+        new.access_expires_at = Some(at(TimeDuration::hours(8)));
+        new.relogin_required_at = Some(at(TimeDuration::days(30)));
+        assert!(!claude_slot_connection_usable(&old, now));
+        assert!(claude_slot_connection_usable(&new, now));
+        assert!(claude_slot_projection_quality(&old) > claude_slot_projection_quality(&new));
+
+        let binding = ClaudeStrongBinding::new("account-a", "org-a").unwrap();
+        let slot_states = BTreeMap::from([
+            ("claude_slot_a_old".to_string(), old.clone()),
+            ("claude_slot_b_new".to_string(), new.clone()),
+        ]);
+        let candidate =
+            |slot_id: &str, status: &ClaudeConfigSlotCollectionStatusV1| ClaudeSnapshotCandidate {
+                slot_id: slot_id.to_string(),
+                slot_class: ClaudeSnapshotSlotClass::Registered,
+                binding: binding.clone(),
+                quality: claude_slot_projection_quality(status),
+                snapshot: claude_account_snapshot(
+                    "a@example.com",
+                    "claude_max_20x",
+                    "account-a",
+                    "org-a",
+                ),
+            };
+        let candidates = vec![
+            candidate("claude_slot_a_old", &old),
+            candidate("claude_slot_b_new", &new),
+        ];
+
+        // The same order the collection loop uses.
+        let canonical = canonical_registered_anchors(
+            [
+                "claude_slot_a_old".to_string(),
+                "claude_slot_b_new".to_string(),
+            ],
+            &slot_states,
+        );
+        assert_eq!(canonical[&binding], "claude_slot_b_new");
+        let selection = select_claude_snapshot_candidates(&candidates, &canonical);
+        assert_eq!(selection.winning_by_binding[&binding], 1);
+        assert_eq!(selection.preferred_anchor_by_binding[&binding], 1);
+        let dispositions = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                claude_snapshot_candidate_disposition(index, candidate, &selection)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dispositions,
+            vec![
+                ClaudeSnapshotDisposition::DuplicateRegistered,
+                ClaudeSnapshotDisposition::Upload,
+            ]
+        );
+
+        // Without a canonical map (no registered anchors) meter quality alone
+        // still orders candidates, as before.
+        let unanchored = select_claude_snapshot_candidates(&candidates, &BTreeMap::new());
+        assert_eq!(unanchored.winning_by_binding[&binding], 0);
+    }
+
+    /// Live M4 Gmail anchor, 2026-10-02: the worker read a signed-out
+    /// credential (expiry epoch) and published `needs_login`, but the saved
+    /// slot stayed `refresh_due`, so the companion never offered "Sign in
+    /// again". Exercise the real worker publication and the real blocked
+    /// collection persistence that the scheduled loop uses.
+    #[test]
+    #[serial]
+    fn claude_worker_needs_login_receipt_presents_saved_needs_login_through_real_paths() {
+        use ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION;
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-worker-needs-login-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).expect("new isolated fixture root");
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let config = root.join("registered");
+        fs::create_dir(&config).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let registered = store
+            .register_path(
+                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                config.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+        store
+            .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, true)
+            .unwrap();
+        let mut slot = registered.external_slots[0].clone();
+        slot.collection = valid_access_reconciliation_fixture().0.collection;
+        slot.collection.quota_check_diagnostics.clear();
+        let blocked_upkeep = ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+            result: ClaudeConfigSlotUpkeepResultV1::RefreshDue,
+            due_access_expires_at: slot.collection.access_expires_at.clone(),
+            refresh_token_expires_at: slot.collection.relogin_required_at.clone(),
+            attempted_at: None,
+            next_allowed_attempt_at: None,
+            consecutive_failures: 0,
+        };
+        slot.collection.upkeep = Some(blocked_upkeep.clone());
+        persist_one_claude_slot_collection_state(&slot.slot_id, &slot.collection).unwrap();
+        let saved = || read_persisted_claude_slot_collection_state().slots[&slot.slot_id].clone();
+        let anchor_health = || {
+            annotate_claude_accounts_status(store.load().unwrap())
+                .anchor_coverage
+                .accounts
+                .iter()
+                .find_map(|account| account.health)
+        };
+        assert_eq!(saved().state, ClaudeConfigSlotCollectionStateV1::RefreshDue);
+        assert_eq!(
+            anchor_health(),
+            Some(ClaudeAccountAnchorHealthV1::TemporarilyUnavailable)
+        );
+
+        // Real worker publication of the pre-claim outcome.
+        record_registered_claude_worker_observation(
+            &slot,
+            ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
+        );
+        let published = saved();
+        assert_eq!(
+            published.state,
+            ClaudeConfigSlotCollectionStateV1::NeedsLogin
+        );
+        assert_eq!(
+            published.diagnostics[0].code,
+            ottto_protocol::ClaudeConfigSlotDiagnosticCodeV1::NeedsLogin
+        );
+        // The saved upkeep stays refresh-due: the foreground keeps queuing the
+        // worker instead of taking the sticky saved-NeedsLogin early return.
+        assert_eq!(
+            published.upkeep.as_ref().map(|upkeep| upkeep.result),
+            Some(ClaudeConfigSlotUpkeepResultV1::RefreshDue)
+        );
+        assert_eq!(
+            published.access_expires_at,
+            slot.collection.access_expires_at
+        );
+        assert_eq!(
+            published.last_full_quota_read_at,
+            slot.collection.last_full_quota_read_at
+        );
+        assert_eq!(
+            anchor_health(),
+            Some(ClaudeAccountAnchorHealthV1::ReconnectRequired)
+        );
+
+        // The next scheduled blocked collection rebuilds `refresh_due` from
+        // the saved deadline; persisting it keeps the sign-in requirement.
+        let mut descriptor = slot.clone();
+        descriptor.collection = published.clone();
+        let blocked = blocked_claude_upkeep_status(
+            &slot.slot_id,
+            &crate::current_rfc3339_timestamp(),
+            blocked_upkeep.clone(),
+        );
+        assert_eq!(blocked.state, ClaudeConfigSlotCollectionStateV1::RefreshDue);
+        persist_claude_slot_collection_states(
+            &BTreeMap::from([(slot.slot_id.clone(), blocked)]),
+            &[],
+            &BTreeMap::from([(slot.slot_id.clone(), descriptor)]),
+        )
+        .unwrap();
+        assert_eq!(saved().state, ClaudeConfigSlotCollectionStateV1::NeedsLogin);
+
+        // A newer worker pass with another outcome replaces the receipt, and
+        // the next blocked collection presents `refresh_due` again.
+        let mut current = slot.clone();
+        current.collection = saved();
+        record_registered_claude_worker_observation(
+            &current,
+            ClaudeConfigSlotUpkeepResultV1::Backoff,
+        );
+        let blocked = blocked_claude_upkeep_status(
+            &slot.slot_id,
+            &crate::current_rfc3339_timestamp(),
+            blocked_upkeep,
+        );
+        persist_one_claude_slot_collection_state(&slot.slot_id, &blocked).unwrap();
+        assert_eq!(saved().state, ClaudeConfigSlotCollectionStateV1::RefreshDue);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn claude_valid_access_reconciliation_refuses_rebound_changed_root_and_newer_expiry() {
         let (slot, upkeep, proof, now) = valid_access_reconciliation_fixture();
@@ -22359,7 +22848,7 @@ exit 1
                 3,
             ),
         ];
-        let selected = select_claude_snapshot_candidates(&equal);
+        let selected = select_claude_snapshot_candidates(&equal, &BTreeMap::new());
         let binding = ClaudeStrongBinding {
             account_identifier_hash: "account-a".to_string(),
             organization_identifier_hash: "organization-a".to_string(),
@@ -22392,7 +22881,7 @@ exit 1
                 2,
             ),
         ];
-        let selected = select_claude_snapshot_candidates(&fresher_default);
+        let selected = select_claude_snapshot_candidates(&fresher_default, &BTreeMap::new());
         assert_eq!(selected.winning_by_binding[&binding], 0);
         assert_eq!(
             selected.preferred_anchor_by_binding[&binding], 1,
@@ -22457,7 +22946,7 @@ exit 1
                 "organization-b",
             ),
         ];
-        let selected = select_claude_snapshot_candidates(&candidates);
+        let selected = select_claude_snapshot_candidates(&candidates, &BTreeMap::new());
         assert_eq!(selected.winning_by_binding.len(), 2);
         assert_eq!(selected.preferred_anchor_by_binding.len(), 2);
     }

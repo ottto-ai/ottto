@@ -57,5 +57,40 @@ include `expiry_unchanged`, `nonzero_exit`, `timed_out`, `backoff`,
 leaves the anchor `temporarily_unavailable`, and a successful pass replaces the
 receipt. Meters and quota clocks are unchanged.
 
+A worker `needs_login` receipt on a blocked saved slot (`refresh_due` or
+`stale_access_token`) now also persists the slot as `needs_login`. Before this,
+the worker's witness was keyed by the signed-out credential's own expiry (often
+the epoch), so the foreground's exact saved-deadline match never adopted it, and
+the companion never offered "Sign in again". The saved upkeep result stays
+`refresh_due`, so collection keeps queuing the worker, and a valid credential
+after sign-in reconciles through the existing worker path. A newer receipt
+returns the next blocked collection to `refresh_due`.
+
+"Add Claude account" no longer ends `already_connected` for a login whose
+account and organization match only saved connections that cannot serve it.
+That is decided by the same credential-usability rule canonical selection uses
+(so it includes an expired credential whose refresh failed, shown as
+`probe_failed`), plus duplicates. The fresh login is admitted
+through the normal registration path. Canonical selection then prefers it, and
+the dead connection is shown as a removable duplicate. A healthy saved
+connection still makes the login `already_connected`.
+
+When several registered slots hold the same account and workspace, choosing
+the canonical anchor now ranks a usable connection first. Usability comes
+from the saved credential evidence, not the collection enum alone. The access
+deadline must be in the future, the refresh deadline must not have passed, and
+the last upkeep outcome must not be a sign-in requirement. This holds even
+while the provider is briefly unavailable or collection is paused. An expired
+credential whose refresh failed is dead, even when a failed refresh is shown as
+`probe_failed`. A slot blocked on `needs_login`, `refresh_due`,
+`stale_access_token`, `credential_unavailable` or unproven identity never
+outranks a usable one, however complete its older limits are.
+A slot already labelled duplicate ranks last, so persisted readers agree with
+the collector. Meter quality still orders slots of equal health. The choice of
+which registered slot's limits are uploaded follows the same canonical choice.
+A registered slot that is not canonical for its pair can neither upload nor
+become the preferred anchor. The default login still competes on meter
+quality.
+
 Session: Codex native 01a0f43d. No provider checks, auth mutations, cadence,
 consent, breaker or release changes were performed for this correction.

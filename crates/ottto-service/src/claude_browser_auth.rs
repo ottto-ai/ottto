@@ -1783,7 +1783,7 @@ fn finalize_identity_mode(
             spawn_status_refresh("browser_auth_complete");
             return Ok(());
         }
-        if let Some(canonical) = duplicate_slot_for_binding(
+        if let Some(canonical) = serving_slot_for_binding(
             &status,
             &operation.slot_id,
             &proof.account_identifier_hash,
@@ -1846,7 +1846,7 @@ fn finalize_identity_mode(
             store.load().map_err(|error| error.to_string())?,
         );
         if operation.mode == PersistedMode::Target {
-            if let Some(canonical) = duplicate_slot_for_binding(
+            if let Some(canonical) = serving_slot_for_binding(
                 &status,
                 &operation.slot_id,
                 &proof.account_identifier_hash,
@@ -1995,7 +1995,20 @@ fn identity_mismatch(
     }
 }
 
-fn duplicate_slot_for_binding(
+/// The registered slot whose saved connection already serves this exact
+/// account/organization pair, making a fresh login for that pair redundant.
+///
+/// A matching slot whose saved credential is not usable (signed out, expired
+/// with a pending or failed refresh, unreadable, or without a proven identity,
+/// as decided by `agent_status::claude_slot_connection_usable`, the same rule
+/// canonical selection uses) does not serve the pair. Treating it as "already connected"
+/// quarantined the only working login and left the account on a dead
+/// connection the user could not repair. Such a login is admitted through the
+/// normal registration path instead; canonical selection then prefers the
+/// working slot and the dead one is presented as a removable duplicate.
+/// Duplicate-labelled slots never serve on their own: canonical selection has
+/// already preferred the best slot for the pair.
+fn serving_slot_for_binding(
     status: &ClaudeAccountsStatusV1,
     candidate_slot_id: &str,
     account_identifier_hash: &str,
@@ -2006,12 +2019,24 @@ fn duplicate_slot_for_binding(
         .iter()
         .chain(status.external_slots.iter())
         .filter(|slot| slot.slot_id != candidate_slot_id)
-        .find(|slot| {
+        .filter(|slot| {
             slot.collection.account_identifier_hash.as_deref() == Some(account_identifier_hash)
                 && slot.collection.organization_identifier_hash.as_deref()
                     == Some(organization_identifier_hash)
         })
+        .find(|slot| claude_saved_connection_serves(&slot.collection))
         .map(|slot| slot.slot_id.clone())
+}
+
+fn claude_saved_connection_serves(
+    collection: &ottto_protocol::ClaudeConfigSlotCollectionStatusV1,
+) -> bool {
+    // One usability decision for canonical selection and admission alike.
+    collection.state != ottto_protocol::ClaudeConfigSlotCollectionStateV1::DuplicateAccount
+        && crate::agent_status::claude_slot_connection_usable(
+            collection,
+            time::OffsetDateTime::now_utc(),
+        )
 }
 
 fn login_command(config_dir: &str) -> Option<std::process::Command> {
@@ -5065,15 +5090,20 @@ mod tests {
             );
         existing.collection.account_identifier_hash = Some("a".repeat(64));
         existing.collection.organization_identifier_hash = Some("b".repeat(64));
+        existing.collection.access_expires_at = Some(
+            (time::OffsetDateTime::now_utc() + time::Duration::hours(8))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
         status.managed_slots.push(existing);
-        assert!(duplicate_slot_for_binding(
+        assert!(serving_slot_for_binding(
             &status,
             "claude_slot_50505050505050505050505050505050",
             &"a".repeat(64),
             &"b".repeat(64)
         )
         .is_some());
-        assert!(duplicate_slot_for_binding(
+        assert!(serving_slot_for_binding(
             &status,
             "claude_slot_50505050505050505050505050505050",
             &"a".repeat(64),
@@ -5221,6 +5251,313 @@ mod tests {
                 .as_deref(),
             Some(organization.as_str())
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Live M4, 2026-10-02: "Add Claude account" for an account whose only
+    /// saved connection was signed out ended "already connected", quarantined
+    /// the fresh login and left the account on the dead connection. A slot
+    /// that cannot serve the pair must not swallow the login; a healthy one
+    /// still does.
+    #[test]
+    #[serial]
+    fn generic_login_for_pair_whose_saved_connection_is_dead_is_admitted() {
+        use ottto_protocol::ClaudeConfigSlotCollectionStateV1 as State;
+        use ottto_protocol::ClaudeConfigSlotUpkeepResultV1 as Upkeep;
+        let at = |offset: time::Duration| {
+            (time::OffsetDateTime::now_utc() + offset)
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let valid = Some(at(time::Duration::hours(8)));
+        let expired = Some("2026-09-24T12:27:25Z".to_string());
+        for (existing_state, access, upkeep, admitted) in [
+            (State::NeedsLogin, expired.clone(), None, true),
+            (State::RefreshDue, expired.clone(), None, true),
+            (State::StaleAccessToken, expired.clone(), None, true),
+            (State::CredentialUnavailable, None, None, true),
+            // A failed refresh on an expired credential is presented as
+            // `probe_failed`; it is dead and must not swallow the login.
+            (
+                State::ProbeFailed,
+                expired.clone(),
+                Some(Upkeep::TimedOut),
+                true,
+            ),
+            (
+                State::ProbeFailed,
+                expired.clone(),
+                Some(Upkeep::ExpiryUnchanged),
+                true,
+            ),
+            (
+                State::ProbeFailed,
+                expired.clone(),
+                Some(Upkeep::MissingBinary),
+                true,
+            ),
+            (State::ProviderUnavailable, expired.clone(), None, true),
+            (State::Fresh, valid.clone(), None, false),
+            (State::ProviderUnavailable, valid.clone(), None, false),
+            (State::ProbeFailed, valid.clone(), None, false),
+        ] {
+            let root = temp_dir("generic-dead-pair");
+            let support = root.join("support");
+            fs::create_dir_all(&support).expect("support");
+            #[cfg(unix)]
+            fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
+            let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+            let store = FileClaudeConfigSlotSettingsStore::default();
+            let existing_root = root.join("existing");
+            fs::create_dir_all(&existing_root).expect("existing root");
+            let existing_slot = store
+                .register_path(1, existing_root.to_string_lossy().into_owned())
+                .expect("existing registration")
+                .external_slots[0]
+                .slot_id
+                .clone();
+            let account = "a".repeat(64);
+            let organization = "b".repeat(64);
+            crate::agent_status::persist_one_claude_slot_collection_state(
+                &existing_slot,
+                &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: existing_state.clone(),
+                    account_identifier_hash: Some(account.clone()),
+                    organization_identifier_hash: Some(organization.clone()),
+                    observed_at: Some("2026-09-24T12:21:06Z".to_string()),
+                    access_expires_at: access.clone(),
+                    upkeep: upkeep.map(|result| ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                        result,
+                        due_access_expires_at: access.clone(),
+                        refresh_token_expires_at: None,
+                        attempted_at: None,
+                        next_allowed_attempt_at: None,
+                        consecutive_failures: 3,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("existing saved state");
+            let operation_id = "claude_setup_c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
+            prepare_generic(store.load().expect("registry"), operation_id).expect("prepare");
+            let candidate_slot = read_operation(operation_id).expect("operation").slot_id;
+            finalize_identity(
+                operation_id,
+                crate::agent_status::ClaudeLocalIdentityProof {
+                    account_identifier_hash: account.clone(),
+                    organization_identifier_hash: organization.clone(),
+                    collection: ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                        state: State::Fresh,
+                        account_identifier_hash: Some(account.clone()),
+                        organization_identifier_hash: Some(organization.clone()),
+                        ..Default::default()
+                    },
+                },
+            )
+            .expect("finalize");
+            let operation = read_operation(operation_id).expect("finished operation");
+            let registry = store.load().expect("registry after");
+            let candidate_registered = registry
+                .managed_slots
+                .iter()
+                .any(|slot| slot.slot_id == candidate_slot);
+            if admitted {
+                assert_eq!(
+                    operation.outcome,
+                    Some(ClaudeBrowserAuthOutcomeV1::Complete),
+                    "{existing_state:?} {access:?} {upkeep:?}"
+                );
+                assert!(
+                    candidate_registered,
+                    "{existing_state:?} {access:?} {upkeep:?}"
+                );
+            } else {
+                assert_eq!(
+                    operation.outcome,
+                    Some(ClaudeBrowserAuthOutcomeV1::AlreadyConnected),
+                    "{existing_state:?} {access:?} {upkeep:?}"
+                );
+                assert_eq!(
+                    operation.canonical_slot_id.as_deref(),
+                    Some(existing_slot.as_str())
+                );
+                assert!(
+                    !candidate_registered,
+                    "{existing_state:?} {access:?} {upkeep:?}"
+                );
+            }
+            // The existing connection is never removed or rewritten here.
+            assert!(registry
+                .external_slots
+                .iter()
+                .any(|slot| slot.slot_id == existing_slot));
+            drop(_support);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    /// AutoReview P2 on 83657166: with upkeep consent granted the admission
+    /// runs the real one-slot quota collection. When that first read is
+    /// unavailable, the admitted login must still own the canonical anchor in
+    /// persisted coverage over a dead slot with complete historical limits.
+    #[test]
+    #[serial]
+    fn admitted_login_with_unavailable_first_quota_read_becomes_canonical() {
+        let root = temp_dir("generic-dead-pair-canonical");
+        let support = root.join("support");
+        fs::create_dir_all(&support).expect("support");
+        #[cfg(unix)]
+        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
+        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        store
+            .set_upkeep_consent(1, true)
+            .expect("grant upkeep consent");
+        // Quota reads are unavailable on this machine for the whole test: no
+        // provider request can be made, and the collector reports that state.
+        fs::write(
+            support.join(crate::agent_status::CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE),
+            b"off",
+        )
+        .expect("quota network off");
+        let existing_root = root.join("existing");
+        fs::create_dir_all(&existing_root).expect("existing root");
+        let existing_slot = store
+            .register_path(1, existing_root.to_string_lossy().into_owned())
+            .expect("existing registration")
+            .external_slots[0]
+            .slot_id
+            .clone();
+        let account =
+            ottto_core::billing_identity_hash("anthropic", "account", "account-uuid-gmail")
+                .expect("account hash");
+        let organization =
+            ottto_core::billing_identity_hash("anthropic", "organization", "org-uuid-gmail")
+                .expect("organization hash");
+        crate::agent_status::persist_one_claude_slot_collection_state(
+            &existing_slot,
+            &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                state: ottto_protocol::ClaudeConfigSlotCollectionStateV1::NeedsLogin,
+                account_identifier_hash: Some(account.clone()),
+                organization_identifier_hash: Some(organization.clone()),
+                observed_at: Some("2026-09-24T12:21:06Z".to_string()),
+                access_expires_at: Some("2026-09-24T12:27:25Z".to_string()),
+                last_full_quota_read_at: Some("2026-09-24T12:21:06Z".to_string()),
+                has_account_windows: true,
+                has_scoped_limits: true,
+                ..Default::default()
+            },
+        )
+        .expect("dead slot with complete history");
+        let operation_id = "claude_setup_c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+        prepare_generic(store.load().expect("registry"), operation_id).expect("prepare");
+        let candidate = read_operation(operation_id).expect("operation");
+        let candidate_slot = candidate.slot_id.clone();
+        // The fresh login's own identity file, as Claude Code writes it.
+        fs::write(
+            Path::new(&operation_config_dir(&candidate)).join(".claude.json"),
+            br#"{"oauthAccount":{"accountUuid":"account-uuid-gmail","organizationUuid":"org-uuid-gmail"}}"#,
+        )
+        .expect("identity file");
+        finalize_identity(
+            operation_id,
+            crate::agent_status::ClaudeLocalIdentityProof {
+                account_identifier_hash: account.clone(),
+                organization_identifier_hash: organization.clone(),
+                collection: ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: ottto_protocol::ClaudeConfigSlotCollectionStateV1::Fresh,
+                    account_identifier_hash: Some(account.clone()),
+                    organization_identifier_hash: Some(organization.clone()),
+                    observed_at: Some(observed_at()),
+                    access_expires_at: Some(
+                        (time::OffsetDateTime::now_utc() + time::Duration::hours(8))
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap(),
+                    ),
+                    ..Default::default()
+                },
+            },
+        )
+        .expect("finalize");
+        assert_eq!(
+            read_operation(operation_id).and_then(|operation| operation.outcome),
+            Some(ClaudeBrowserAuthOutcomeV1::Complete)
+        );
+        let status = crate::agent_status::annotate_claude_accounts_status(
+            store.load().expect("registry after"),
+        );
+        let admitted = status
+            .managed_slots
+            .iter()
+            .find(|slot| slot.slot_id == candidate_slot)
+            .expect("admitted slot");
+        assert!(!admitted.collection.has_account_windows);
+        assert_ne!(
+            admitted.collection.state,
+            ottto_protocol::ClaudeConfigSlotCollectionStateV1::Fresh,
+            "first quota read must be unavailable in this fixture"
+        );
+        let anchor_health = |status: &ClaudeAccountsStatusV1| {
+            let anchors = status
+                .anchor_coverage
+                .accounts
+                .iter()
+                .filter(|anchor| anchor.account_identifier_hash == account)
+                .collect::<Vec<_>>();
+            assert_eq!(anchors.len(), 1);
+            anchors[0].health
+        };
+        // The admitted login owns the anchor (its own paused state), not the
+        // dead slot's reconnect requirement.
+        assert_eq!(
+            anchor_health(&status),
+            Some(ottto_protocol::ClaudeAccountAnchorHealthV1::Paused)
+        );
+
+        // A later collection: the old slot's refresh fails on its expired
+        // credential, which is presented as `probe_failed` with complete
+        // historical limits. It must stay below the working login.
+        crate::agent_status::persist_one_claude_slot_collection_state(
+            &existing_slot,
+            &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                state: ottto_protocol::ClaudeConfigSlotCollectionStateV1::ProbeFailed,
+                account_identifier_hash: Some(account.clone()),
+                organization_identifier_hash: Some(organization.clone()),
+                observed_at: Some(observed_at()),
+                access_expires_at: Some("2026-09-24T12:27:25Z".to_string()),
+                relogin_required_at: Some("2026-10-09T23:27:42Z".to_string()),
+                last_full_quota_read_at: Some("2026-09-24T12:21:06Z".to_string()),
+                has_account_windows: true,
+                has_scoped_limits: true,
+                upkeep: Some(ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                    result: ottto_protocol::ClaudeConfigSlotUpkeepResultV1::TimedOut,
+                    due_access_expires_at: Some("2026-09-24T12:27:25Z".to_string()),
+                    refresh_token_expires_at: Some("2026-10-09T23:27:42Z".to_string()),
+                    attempted_at: Some(observed_at()),
+                    next_allowed_attempt_at: None,
+                    consecutive_failures: 3,
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("old slot refresh failed");
+        let later = crate::agent_status::annotate_claude_accounts_status(
+            store.load().expect("registry later"),
+        );
+        assert_eq!(
+            later
+                .external_slots
+                .iter()
+                .find(|slot| slot.slot_id == existing_slot)
+                .map(|slot| slot.collection.state.clone()),
+            Some(ottto_protocol::ClaudeConfigSlotCollectionStateV1::ProbeFailed)
+        );
+        assert_eq!(
+            anchor_health(&later),
+            Some(ottto_protocol::ClaudeAccountAnchorHealthV1::Paused),
+            "a failed refresh on an expired credential must not reclaim the anchor"
+        );
+        drop(_support);
         let _ = fs::remove_dir_all(root);
     }
 
