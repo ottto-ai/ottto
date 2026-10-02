@@ -2241,6 +2241,14 @@ fn claude_usage_authority_retry_deadline(
         .saturating_add(jitter)
 }
 
+fn claude_usage_authority_preserves_pending(
+    quarantine: &ClaudeUsageAuthorityQuarantineRecord,
+    witness: &ClaudeUsageFamilyWitness,
+) -> bool {
+    claude_usage_authority_deadline_is_bounded(quarantine)
+        && quarantine.proven_witness_fingerprint == claude_usage_family_witness_fingerprint(witness)
+}
+
 fn claude_usage_authority_deadline_is_bounded(
     record: &ClaudeUsageAuthorityQuarantineRecord,
 ) -> bool {
@@ -3276,9 +3284,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
                     .get(root_session_id)
                     .zip(index.claude_usage_family_witnesses.get(root_session_id))
                     .is_some_and(|(quarantine, witness)| {
-                        claude_usage_authority_deadline_is_bounded(quarantine)
-                            && quarantine.proven_witness_fingerprint
-                                == claude_usage_family_witness_fingerprint(witness)
+                        claude_usage_authority_preserves_pending(quarantine, witness)
                     })
             });
     let detected_duplicate_request_owners = if census_complete && !duplicate_census_invalid {
@@ -17112,6 +17118,49 @@ fn ensure_bounded_traversal(
     // new partial settlement stamps the marker again before persistence.
     index.bounded_sweep_had_unsettled_upload = false;
 
+    if source == SnapshotSource::ClaudeCode {
+        // Partial settlement can retain request evidence from an older census
+        // while accepted unchanged files become no-ops. Reparse every indexed
+        // member of those pending families so uniqueness is proved from the
+        // current frozen window, never from a mixture of old/new requests.
+        // Complete-census cleanup retires this obligation; unresolved markers
+        // alone must not cause endless reparsing of stable refused ownership.
+        // This runs only when a traversal starts, never while resuming a page.
+        let stale_pending_roots = index
+            .claude_usage_family_pending
+            .iter()
+            .filter(|(_, pending)| pending.census_window_end != collected_at)
+            .filter(|(root, _)| {
+                !index
+                    .claude_usage_authority_quarantine
+                    .get(*root)
+                    .zip(index.claude_usage_family_witnesses.get(*root))
+                    .is_some_and(|(quarantine, witness)| {
+                        claude_usage_authority_preserves_pending(quarantine, witness)
+                    })
+            })
+            .map(|(root, _)| root.clone())
+            .collect::<BTreeSet<_>>();
+        let mut rearmed_file_count = 0_usize;
+        for (index_key, entry) in &mut index.files {
+            if claude_index_path_family_member(Path::new(index_key))
+                .is_some_and(|(root, _)| stale_pending_roots.contains(&root))
+                && !entry.source_file_fingerprint.is_empty()
+            {
+                entry.source_file_fingerprint.clear();
+                rearmed_file_count += 1;
+            }
+        }
+        if rearmed_file_count > 0 {
+            eprintln!(
+                "local snapshot census re-armed stale Claude request evidence: {} pending \
+                 family/families, {} indexed file(s); bounded scan counters include this work",
+                stale_pending_roots.len(),
+                rearmed_file_count
+            );
+        }
+    }
+
     let mut census = ScanCensus::default();
     let resolved_roots = roots
         .iter()
@@ -22808,6 +22857,16 @@ mod tests {
             },
         );
 
+        index.claude_usage_family_pending.insert(
+            root_session_id.to_string(),
+            ClaudeUsageFamilyPending {
+                census_window_end: "2026-08-01T00:00:00Z".into(),
+                member_request_id_hashes: BTreeMap::new(),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+            },
+        );
+
         assert_eq!(
             index.candidate_decision(&candidate),
             CandidateDecision::Skip
@@ -22827,6 +22886,62 @@ mod tests {
         assert_eq!(
             loaded.candidate_decision(&candidate),
             CandidateDecision::Skip
+        );
+
+        for terminal in [false, true] {
+            let mut held = loaded.clone();
+            if terminal {
+                let record = held
+                    .claude_usage_authority_quarantine
+                    .get_mut(root_session_id)
+                    .unwrap();
+                record.failed_reconstruction_count = MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
+                record.disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
+                record.retry_after_unix_seconds = 0;
+            }
+            let original = held.files[&local_index_key(&transcript)]
+                .source_file_fingerprint
+                .clone();
+            for tick in 0..2 {
+                // Isolate two fresh-generation boundaries; actual census/usage
+                // fixtures below separately exercise queue completion.
+                held.traversal = None;
+                ensure_bounded_traversal(
+                    SnapshotSource::ClaudeCode,
+                    std::slice::from_ref(&root),
+                    &mut held,
+                    &format!("2026-08-20T10:0{tick}:00Z"),
+                    BACKFILL_WINDOW_DAYS,
+                );
+                assert_eq!(
+                    held.files[&local_index_key(&transcript)].source_file_fingerprint,
+                    original
+                );
+                assert_eq!(
+                    held.candidate_decision(&candidate),
+                    CandidateDecision::Skip,
+                    "fresh census must preserve authority quarantine retry/terminal gates"
+                );
+            }
+        }
+        let mut malformed = loaded.clone();
+        malformed
+            .claude_usage_authority_quarantine
+            .get_mut(root_session_id)
+            .unwrap()
+            .proven_witness_fingerprint = "f".repeat(64);
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut malformed,
+            "2026-08-20T10:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        assert!(
+            malformed.files[&local_index_key(&transcript)]
+                .source_file_fingerprint
+                .is_empty(),
+            "unbound stale authority proof must not bypass fresh census reconstruction"
         );
 
         let mut changed = candidate.clone();
@@ -23689,6 +23804,262 @@ mod tests {
         assert!(!clean_followup.scan_cap_hit);
         assert!(!index.bounded_sweep_had_unsettled_upload);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_stable_owned_start_recovers_after_partial_conflict() {
+        exercise_claude_partial_census_recovery(false, false);
+    }
+
+    #[test]
+    fn claude_duplicate_across_pages_stays_refused_without_reparse_loop() {
+        exercise_claude_partial_census_recovery(true, false);
+    }
+
+    #[test]
+    fn claude_pending_census_recovers_without_releasing_future_quarantine() {
+        exercise_claude_partial_census_recovery(false, true);
+    }
+
+    #[test]
+    fn claude_future_quarantine_preserves_cross_page_duplicate_refusal() {
+        exercise_claude_partial_census_recovery(true, true);
+    }
+
+    fn exercise_claude_partial_census_recovery(duplicate: bool, future_quarantine: bool) {
+        let root = temp_dir("claude-stable-owned-start-conflict-census");
+        let stable = root.join("a-stable.jsonl");
+        fs::write(&stable, concat!(
+            "{\"timestamp\":\"2026-08-20T10:00:00Z\",\"sessionId\":\"a-stable\",\"type\":\"assistant\",\"forkedFrom\":{\"sessionId\":\"parent\",\"messageUuid\":\"parent-message\"},\"requestId\":\"req_parent\",\"message\":{\"id\":\"msg_parent\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":900000,\"output_tokens\":2}}}\n",
+            "{\"timestamp\":\"2026-08-20T10:01:00Z\",\"sessionId\":\"a-stable\",\"type\":\"assistant\",\"requestId\":\"req_owned\",\"message\":{\"id\":\"msg_owned\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":90000,\"cache_creation_input_tokens\":0,\"output_tokens\":2}}}\n",
+            "{\"timestamp\":\"2026-08-20T10:01:10Z\",\"sessionId\":\"a-stable\",\"type\":\"assistant\",\"requestId\":\"req_cold\",\"message\":{\"id\":\"msg_cold\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":2}}}\n",
+            "{\"timestamp\":\"2026-08-20T10:01:20Z\",\"sessionId\":\"a-stable\",\"type\":\"assistant\",\"requestId\":\"req_recovered\",\"message\":{\"id\":\"msg_recovered\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10000,\"cache_read_input_tokens\":90000,\"cache_creation_input_tokens\":0,\"output_tokens\":2}}}\n"
+        )).expect("stable fork fixture");
+        for member in ["b-conflict", "c-sibling", "d-sibling"] {
+            fs::write(root.join(format!("{member}.jsonl")), format!(
+                "{{\"timestamp\":\"2026-08-20T10:01:00Z\",\"sessionId\":\"{member}\",\"type\":\"assistant\",\"requestId\":\"req_{member}\",\"message\":{{\"id\":\"msg_{member}\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n"
+            )).expect("unrelated fixture");
+        }
+        if duplicate {
+            let path = root.join("d-sibling.jsonl");
+            let contents = String::from_utf8(fs::read(&path).expect("late duplicate fixture"))
+                .expect("UTF-8 duplicate fixture");
+            fs::write(path, contents.replace("req_d-sibling", "req_owned"))
+                .expect("duplicate request on final page");
+        }
+        let mut index = ScanIndex::default();
+        let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+        let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        // Independent control proves that this exact stable fork fixture can
+        // establish owned-start through an ordinary conflict-free census.
+        let mut control = ScanIndex::default();
+        for tick in 0..2 {
+            let mut page = scan_source_roots_with_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut control,
+                &format!("2026-08-20T10:0{}:00Z", 2 + tick),
+                BACKFILL_WINDOW_DAYS,
+                3,
+                true,
+            )
+            .expect("control page");
+            let held = apply_claude_reported_usage_with_index(
+                &mut page.snapshots,
+                &api,
+                &trace,
+                &mut control,
+                page.census_complete,
+                &page.census_window_end,
+            );
+            assert_eq!(
+                held.quarantined_entity_count(),
+                0,
+                "fixture must not manufacture local authority withholding"
+            );
+            assert!(!control.account_claude_usage_authority_census_health(&mut page));
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut page, &mut control);
+            assert_eq!(page.census_complete, tick == 1);
+        }
+        assert_eq!(
+            control.claude_owned_start_census["a-stable"]
+                .verified_source_file_fingerprint
+                .is_some(),
+            !duplicate,
+            "fresh no-conflict control verifies only globally unique requests"
+        );
+        let checkpoint = root.join("checkpoint.json");
+        let mut held_conflict = None;
+        for generation in 0..5 {
+            if generation == 4 {
+                // Change the file without changing its owned usage. This is the
+                // real source-fingerprint retry route, not a forced index replay.
+                let mut contents = String::from_utf8(fs::read(&stable).expect("stable fixture"))
+                    .expect("UTF-8 stable fixture");
+                contents.push_str("{\"timestamp\":\"2026-08-20T10:09:00Z\",\"sessionId\":\"a-stable\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"synthetic change\"}}\n");
+                fs::write(&stable, contents).expect("changed stable fixture");
+            }
+            let previous = index.clone();
+            let started = format!("2026-08-20T10:{:02}:00Z", 2 + generation * 2);
+            let mut first = scan_source_roots_with_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut index,
+                &started,
+                BACKFILL_WINDOW_DAYS,
+                3,
+                true,
+            )
+            .expect("first bounded page");
+            if generation == 3 {
+                assert!(
+                    first
+                        .snapshots
+                        .iter()
+                        .all(|item| item.source_session_id != "a-stable"),
+                    "stable verified or refused ownership must return to no-op"
+                );
+            }
+            apply_claude_reported_usage_with_index(
+                &mut first.snapshots,
+                &api,
+                &trace,
+                &mut index,
+                first.census_complete,
+                &first.census_window_end,
+            );
+            if generation == 2 {
+                let stable_item = first
+                    .snapshots
+                    .iter()
+                    .find(|item| item.source_session_id == "a-stable")
+                    .expect("corrective stable snapshot");
+                if duplicate {
+                    assert!(stable_item.cache_observations.is_none());
+                } else {
+                    let cache = stable_item
+                        .cache_observations
+                        .as_ref()
+                        .expect("recovered cache evidence");
+                    assert_eq!(cache.coverage, "complete");
+                    assert_eq!(cache.operations.len(), 1);
+                    let cache_observations::Operation::Upsert { observation } =
+                        &cache.operations[0]
+                    else {
+                        panic!("expected recovered warm-cold-warm observation");
+                    };
+                    assert_eq!(observation.affected_request_ref, "req_cold");
+                    let previous = observation.previous.as_ref().expect("warm previous");
+                    let next = observation.immediate_next.as_ref().expect("warm recovery");
+                    assert_eq!(previous.request_ref, "req_owned");
+                    assert_eq!(next.request_ref, "req_recovered");
+                    for slot in [previous, &observation.affected, next] {
+                        assert_eq!(slot.prompt_tokens, Some(100_000));
+                        assert_eq!(slot.cache_creation_tokens, Some(0));
+                        assert_eq!(slot.output_tokens, Some(2));
+                        assert_ne!(slot.request_ref, "req_parent");
+                    }
+                    assert_eq!(previous.cache_read_tokens, Some(90_000));
+                    assert_eq!(observation.affected.cache_read_tokens, Some(0));
+                    assert_eq!(observation.affected.uncached_tokens, Some(100_000));
+                    assert_eq!(next.cache_read_tokens, Some(90_000));
+                    assert_eq!(
+                        stable_item
+                            .context_curve
+                            .as_ref()
+                            .unwrap()
+                            .total_owned_request_count,
+                        3
+                    );
+                }
+            }
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut first, &mut index);
+            assert!(!first.census_complete);
+            if generation == 0 {
+                let conflict = first
+                    .snapshots
+                    .iter()
+                    .find(|item| item.source_session_id == "b-conflict")
+                    .expect("unrelated conflict is on first page")
+                    .snapshot_fingerprint
+                    .clone();
+                let accepted = first
+                    .snapshots
+                    .iter()
+                    .filter(|item| item.source_session_id != "b-conflict")
+                    .map(|item| item.snapshot_fingerprint.clone())
+                    .collect::<BTreeSet<_>>();
+                assert!(first
+                    .snapshots
+                    .iter()
+                    .any(|item| item.source_session_id == "a-stable"
+                        && accepted.contains(&item.snapshot_fingerprint)));
+                let mut record = snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+                // Fixed-clock retry metadata is synthetic and already due. No
+                // body witness or server ACK digest/version is manufactured.
+                if !future_quarantine {
+                    record.retry_after_unix_seconds = 1787227500;
+                }
+                held_conflict = Some((conflict.clone(), record.retry_after_unix_seconds));
+                let quarantine = BTreeMap::from([(conflict.clone(), record)]);
+                index = index.committable_subset(&previous, &accepted, &quarantine);
+                assert!(!index.accepted_snapshot_fingerprints.contains(&conflict));
+                assert!(accepted
+                    .iter()
+                    .all(|fp| index.accepted_snapshot_fingerprints.contains(fp)));
+                index.mark_bounded_sweep_unsettled();
+            }
+            index.save(&checkpoint).expect("persist partial page");
+            index = ScanIndex::load(&checkpoint).expect("reload partial page");
+            let finished = format!("2026-08-20T10:{:02}:00Z", 3 + generation * 2);
+            let mut last = scan_source_roots_with_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut index,
+                &finished,
+                BACKFILL_WINDOW_DAYS,
+                3,
+                true,
+            )
+            .expect("last bounded page");
+            apply_claude_reported_usage_with_index(
+                &mut last.snapshots,
+                &api,
+                &trace,
+                &mut index,
+                last.census_complete,
+                &last.census_window_end,
+            );
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut last, &mut index);
+            assert!(index.traversal.is_none(), "directory census drained");
+            assert_eq!(last.census_complete, generation >= 1);
+            let witness = index
+                .claude_owned_start_census
+                .get("a-stable")
+                .expect("stable owned-start marker retained");
+            assert_eq!(
+                witness.verified_source_file_fingerprint.is_some(),
+                generation >= 1 && !duplicate,
+                "a clean census recovers unique ownership, but never duplicate ownership"
+            );
+            index.save(&checkpoint).expect("persist terminal page");
+            index = ScanIndex::load(&checkpoint).expect("reload terminal page");
+            if future_quarantine {
+                let (fingerprint, deadline) = held_conflict.as_ref().expect("future conflict");
+                let record = &index.quarantined_snapshot_fingerprints[fingerprint];
+                assert_eq!(record.retry_after_unix_seconds, *deadline);
+                assert_eq!(
+                    record.disposition,
+                    SnapshotQuarantineDisposition::RetryPending
+                );
+                assert!(!index.accepted_snapshot_fingerprints.contains(fingerprint));
+                assert!(
+                    !index.quarantine_requires_retry(fingerprint),
+                    "census reconstruction must not release future delivery quarantine"
+                );
+            }
+        }
         let _ = fs::remove_dir_all(root);
     }
 
