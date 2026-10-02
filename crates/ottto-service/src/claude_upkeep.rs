@@ -200,9 +200,10 @@ trait FinalSpawnGate {
         support_dir: &Path,
         slot_id: &str,
         status: &ClaudeConfigSlotUpkeepStatusV1,
+        observed_from: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<Option<ClaudeConfigSlotUpkeepStatusV1>, ()> {
-        persist_preclaim_needs_login(support_dir, slot_id, status, now).map(Some)
+        persist_preclaim_needs_login(support_dir, slot_id, status, observed_from, now).map(Some)
     }
 
     fn publish_preclaim_failure(
@@ -332,6 +333,7 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
         support_dir: &Path,
         slot_id: &str,
         status: &ClaudeConfigSlotUpkeepStatusV1,
+        observed_from: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<Option<ClaudeConfigSlotUpkeepStatusV1>, ()> {
         FileClaudeConfigSlotSettingsStore::default()
@@ -339,7 +341,8 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
                 if !registered_slot_publication_allowed(registry, descriptor, support_dir) {
                     return Ok(None);
                 }
-                persist_preclaim_needs_login(support_dir, slot_id, status, now).map(Some)
+                persist_preclaim_needs_login(support_dir, slot_id, status, observed_from, now)
+                    .map(Some)
             })
             .map_err(|_| ())?
     }
@@ -687,6 +690,7 @@ fn observe_and_publish_registered_slot_upkeep_with_gate(
             support_dir,
             &descriptor.slot_id,
             &observation.status,
+            started_at,
             clock.now(),
         ) {
             observation.status = status;
@@ -1068,10 +1072,20 @@ fn complete_attempt(
     Ok(status)
 }
 
+/// Persist a pre-claim `NeedsLogin` read from the slot's actual credential.
+///
+/// `observed_from` is when this worker pass began reading that credential. A
+/// running claim still owns the slot, and a witness for a newer credential
+/// expiry that was written after this read began is a concurrent, newer fact.
+/// An older witness is only history: when it carries a later expiry than the
+/// credential just read, the credential has since been replaced or signed out,
+/// so returning that witness would present a stale vendor-command result
+/// (for example `expiry_unchanged`) instead of the current sign-in requirement.
 fn persist_preclaim_needs_login(
     support_dir: &Path,
     slot_id: &str,
     status: &ClaudeConfigSlotUpkeepStatusV1,
+    observed_from: OffsetDateTime,
     now: OffsetDateTime,
 ) -> Result<ClaudeConfigSlotUpkeepStatusV1, ()> {
     let due_access_expires_at = status.due_access_expires_at.as_deref().ok_or(())?;
@@ -1080,10 +1094,18 @@ fn persist_preclaim_needs_login(
     if let Some(existing) = state.slots.get(slot_id) {
         let existing_due = parse_timestamp(Some(&existing.due_access_expires_at));
         let observed_due = parse_timestamp(Some(due_access_expires_at));
+        let written_during_this_read = parse_timestamp(
+            existing
+                .result_observed_at
+                .as_deref()
+                .or(existing.attempted_at.as_deref()),
+        )
+        .is_some_and(|written| written >= observed_from);
         if existing.result == ClaudeConfigSlotUpkeepResultV1::InProgress
-            || existing_due
-                .zip(observed_due)
-                .is_some_and(|(left, right)| left > right)
+            || (written_during_this_read
+                && existing_due
+                    .zip(observed_due)
+                    .is_some_and(|(left, right)| left > right))
         {
             return Ok(existing.local_status());
         }
@@ -2096,6 +2118,87 @@ mod tests {
             .queued_slot_ids
             .is_empty());
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Live M4 Gmail anchor, 2026-10-02: an old claimed witness for a later
+    /// credential expiry (`expiry_unchanged`) masked every later pre-claim
+    /// `NeedsLogin`, so the worker reported a stale vendor-command result, never
+    /// spawned `claude doctor`, never wrote a witness, and the anchor stayed
+    /// "temporarily unavailable" for a week. History older than this read must
+    /// not mask it; a newer witness written during this read still wins.
+    #[test]
+    fn preclaim_needs_login_is_not_masked_by_older_witness_for_later_expiry() {
+        let legacy = |result_observed_at: Option<&str>| PersistedUpkeepWitnessV1 {
+            due_access_expires_at: "2026-09-25T20:38:39.757Z".to_string(),
+            refresh_token_expires_at: Some("2026-10-09T23:27:42.757Z".to_string()),
+            attempted_at: Some("2026-09-25T20:46:47.363775Z".to_string()),
+            result_observed_at: result_observed_at.map(ToString::to_string),
+            preclaim_descriptor: None,
+            next_allowed_attempt_at: "2026-09-25T20:56:48.926601Z".to_string(),
+            result: ClaudeConfigSlotUpkeepResultV1::ExpiryUnchanged,
+            consecutive_failures: 2,
+        };
+        let run = |witness: PersistedUpkeepWitnessV1| {
+            let root = temp_dir("preclaim-needs-login-unmasked");
+            let state = PersistedUpkeepStateV1 {
+                schema_version: UPKEEP_STATE_SCHEMA_VERSION,
+                slots: BTreeMap::from([(descriptor().slot_id, witness)]),
+            };
+            write_state(&root, &state).expect("seed witness");
+            let process_calls = Arc::new(AtomicUsize::new(0));
+            let observation = observe_and_publish_registered_slot_upkeep_with_gate(
+                &descriptor(),
+                true,
+                true,
+                &root,
+                &FixedClock(at("2026-10-02T02:07:05Z")),
+                &SequenceCredentials::new(vec![Some(ClaudeOAuthCredentialMetadata {
+                    access_expires_at: Some("2026-09-24T12:27:25.708Z".to_string()),
+                    refresh_token_expires_at: Some("2026-10-09T23:27:42.708Z".to_string()),
+                    has_refresh_token: false,
+                })]),
+                &CountingProcess {
+                    result: DoctorProcessResult::ExitZero,
+                    calls: process_calls.clone(),
+                },
+                &FixedFinalSpawnGate {
+                    consent: true,
+                    network_enabled: true,
+                    support_dir: &root,
+                },
+            );
+            assert_eq!(process_calls.load(Ordering::SeqCst), 0, "no vendor command");
+            let persisted = load_state(&root).expect("state").slots[&descriptor().slot_id].clone();
+            let _ = fs::remove_dir_all(root);
+            (observation, persisted)
+        };
+
+        let (observation, persisted) = run(legacy(None));
+        assert_eq!(
+            observation.status.result,
+            ClaudeConfigSlotUpkeepResultV1::NeedsLogin
+        );
+        assert_eq!(persisted.result, ClaudeConfigSlotUpkeepResultV1::NeedsLogin);
+        assert_eq!(persisted.due_access_expires_at, "2026-09-24T12:27:25.708Z");
+
+        // A witness for the later expiry recorded while this read was running
+        // is a concurrent newer fact and keeps precedence.
+        let (observation, persisted) = run(legacy(Some("2026-10-02T02:07:05Z")));
+        assert_eq!(
+            observation.status.result,
+            ClaudeConfigSlotUpkeepResultV1::ExpiryUnchanged
+        );
+        assert_eq!(persisted.due_access_expires_at, "2026-09-25T20:38:39.757Z");
+
+        // A running claim still owns the slot.
+        let mut running = legacy(None);
+        running.result = ClaudeConfigSlotUpkeepResultV1::InProgress;
+        let (observation, persisted) = run(running);
+        assert_eq!(
+            observation.status.result,
+            ClaudeConfigSlotUpkeepResultV1::InProgress
+        );
+        assert_eq!(persisted.result, ClaudeConfigSlotUpkeepResultV1::InProgress);
     }
 
     #[test]
