@@ -8105,7 +8105,11 @@ impl SnapshotAccumulator {
         let header_session_id =
             resolve_codex_identity_option(codex_identity_at(meta, &["session_id"]));
         let header_identity = match (header_id, header_session_id) {
-            (Some(id), Some(session_id)) if id == session_id => Some(id),
+            (Some(id), Some(session_id))
+                if id == session_id || codex_session_id_is_native_parent(meta, &session_id) =>
+            {
+                Some(id)
+            }
             (Some(id), None) | (None, Some(id)) => Some(id),
             _ => None,
         };
@@ -13327,15 +13331,29 @@ fn codex_legacy_trigger_turn(value: &Value) -> bool {
             == Some(true)
 }
 
+/// A native child can declare session_id as its parent locator rather than an
+/// alias for its own id. Require both provider relationship declarations; do
+/// not infer that role from a differing alias or a filesystem/state fallback.
+fn codex_session_id_is_native_parent(meta: &Value, session_id: &str) -> bool {
+    string_eq_at(meta, &["thread_source"], "subagent")
+        && resolve_codex_identity_option(codex_identity_at(
+            meta,
+            &["source", "subagent", "thread_spawn", "parent_thread_id"],
+        ))
+        .as_deref()
+            == Some(session_id)
+}
+
 /// Capture the first physical header before applying the ownership boundary.
 /// Raw creator fields are accepted only as a complete provider pair/time.
 /// The caller separately proves first physical record and logical-session ownership.
 fn codex_creator_header_evidence(value: &Value, meta: &Value) -> Option<SessionAccountEvidence> {
     let id = resolve_codex_identity_option(codex_identity_at(meta, &["id"]))?;
-    if meta.get("session_id").is_some()
-        && resolve_codex_identity_option(codex_identity_at(meta, &["session_id"])) != Some(id)
-    {
-        return None;
+    if meta.get("session_id").is_some() {
+        let session_id = resolve_codex_identity_option(codex_identity_at(meta, &["session_id"]))?;
+        if session_id != id && !codex_session_id_is_native_parent(meta, &session_id) {
+            return None;
+        }
     }
     // A later physical ordinal cannot prove original logical-session creation.
     if value.get("ordinal").is_some() && u64_at(value, &["ordinal"]) != Some(0) {
@@ -45871,6 +45889,226 @@ mod tests {
             .expect("usage snapshot");
         fs::remove_dir_all(root).expect("remove creator fixture");
         item
+    }
+
+    fn codex_child_creator_header() -> Value {
+        let mut header = codex_creator_header();
+        let parent = "019e253c-2222-7000-9000-bbbbbbbbbbbb";
+        header["payload"]["session_id"] = json!(parent);
+        header["payload"]["thread_source"] = json!("subagent");
+        header["payload"]["source"] = json!({"subagent":{"thread_spawn":{
+            "parent_thread_id":parent}}});
+        header
+    }
+
+    #[test]
+    fn codex_child_creator_source_generated_wire_corpus() {
+        let child = codex_child_creator_header();
+        let id = child["payload"]["id"].as_str().unwrap();
+        let mut missing_parent = child.clone();
+        missing_parent["payload"]["source"]["subagent"]["thread_spawn"]["parent_thread_id"] =
+            Value::Null;
+        let mut contradictory = child.clone();
+        contradictory["payload"]["session_id"] = json!("019e253c-3333-7000-9000-cccccccccccc");
+        let mut fork = child.clone();
+        fork["payload"]["forked_from_id"] = fork["payload"]["session_id"].clone();
+        fork["payload"]["history_base"] = json!({"cursor":"external"});
+        let mut legacy = child.clone();
+        legacy["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("creator_user_id");
+        legacy["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("creator_account_id");
+        let ordinary = codex_creator_header();
+        let mut cases = Vec::new();
+        for (name, header, path_id, expected) in [
+            ("native_parent", child.clone(), id, true),
+            ("missing_parent", missing_parent, id, false),
+            ("contradictory_alias", contradictory, id, false),
+            ("ordinary_fork", fork, id, false),
+            ("legacy_no_witness", legacy, id, false),
+            ("ordinary_original", ordinary, id, true),
+            (
+                "copied_parent_header",
+                child.clone(),
+                "019e253c-4444-7000-9000-dddddddddddd",
+                false,
+            ),
+        ] {
+            let mut request = valid_v6_batch_request();
+            request.source = "codex".into();
+            request.snapshots = vec![codex_creator_item(&[header], path_id)];
+            apply_upload_policy(
+                SnapshotSource::Codex,
+                &mut request.snapshots,
+                request.upload_policy,
+            );
+            let item = &request.snapshots[0];
+            assert_eq!(item.session_account_evidence.is_some(), expected, "{name}");
+            assert_eq!((item.input_tokens, item.output_tokens), (100, 5), "{name}");
+            let bytes = serde_json::to_vec(&request).unwrap();
+            let wire: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                wire["snapshots"][0]
+                    .get("session_account_evidence")
+                    .is_some(),
+                expected
+            );
+            let version = snapshot_upload_body_witness_version(item);
+            let released = version.map(|version| match version {
+                9 => 3,
+                10 => 4,
+                11 => 5,
+                12 => 6,
+                15 | 23 if item.cache_observations.is_some() => 13,
+                16 | 24 if item.cache_observations.is_some() => 14,
+                19 => 17,
+                20 => 18,
+                23 => 7,
+                24 => 8,
+                _ => panic!("unexpected child-parent domain {version}"),
+            });
+            cases.push(json!({"name":name,
+                "capability":if expected {"creator"} else {"legacy"},
+                "exclusive":item.usage_accounting_contract.is_some(),
+                "curve":item.context_curve.is_some(), "tools":"omitted",
+                "wire_body_utf8":String::from_utf8(bytes).unwrap(), "wire":wire,
+                "body_projection":snapshot_upload_body_witness_payload(item),
+                "released_ack_version":released,
+                "digest":version.map(|_| snapshot_upload_body_witness(item))}));
+        }
+        if let Ok(path) = std::env::var("OTTTO_CHILD_PARENT_CORPUS_PATH") {
+            fs::write(
+                path,
+                serde_json::to_vec_pretty(&json!({"schema_version":1,"cases":cases})).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn codex_child_creator_native_parent_locator_keeps_own_original_pair() {
+        for parent in [
+            "019e253c-2222-7000-9000-bbbbbbbbbbbb",
+            "019e253c-3333-7000-9000-cccccccccccc",
+            "019E253C-4444-7000-9000-DDDDDDDDDDDD",
+        ] {
+            let mut header = codex_child_creator_header();
+            header["payload"]["session_id"] = json!(parent.to_ascii_lowercase());
+            header["payload"]["source"]["subagent"]["thread_spawn"]["parent_thread_id"] =
+                json!(parent);
+            let id = header["payload"]["id"].as_str().unwrap();
+            let item = codex_creator_item(std::slice::from_ref(&header), id);
+            let evidence = item
+                .session_account_evidence
+                .as_ref()
+                .unwrap_or_else(|| panic!("child creator {parent}"));
+            assert_eq!(
+                evidence.account_identifier_hash,
+                ottto_core::billing_identity_hash("openai", "account", "synthetic-user")
+            );
+            assert_eq!(
+                evidence.provider_workspace_hash,
+                ottto_core::billing_identity_hash("openai", "workspace", "synthetic-workspace")
+            );
+            assert_eq!(
+                evidence.source_created_at.as_deref(),
+                Some("2026-09-30T10:00:00Z")
+            );
+            assert_eq!(item.source_session_id, id);
+            let mut legacy_header = header.clone();
+            legacy_header["payload"]
+                .as_object_mut()
+                .unwrap()
+                .remove("creator_user_id");
+            legacy_header["payload"]
+                .as_object_mut()
+                .unwrap()
+                .remove("creator_account_id");
+            let legacy = codex_creator_item(&[legacy_header], id);
+            assert_eq!(
+                snapshot_semantic_component_hashes(SnapshotSource::Codex, &item),
+                snapshot_semantic_component_hashes(SnapshotSource::Codex, &legacy)
+            );
+            let mut without_creator = serde_json::to_value(&item).unwrap();
+            without_creator
+                .as_object_mut()
+                .unwrap()
+                .remove("session_account_evidence");
+            assert_eq!(without_creator, serde_json::to_value(&legacy).unwrap());
+        }
+    }
+
+    #[test]
+    fn codex_child_creator_parent_locator_does_not_relax_other_identity_gates() {
+        let header = codex_child_creator_header();
+        let id = header["payload"]["id"].as_str().unwrap();
+        for pointer in [
+            "/payload/thread_source",
+            "/payload/source/subagent/thread_spawn/parent_thread_id",
+        ] {
+            let mut missing = header.clone();
+            *missing.pointer_mut(pointer).unwrap() = Value::Null;
+            assert!(codex_creator_item(&[missing], id)
+                .session_account_evidence
+                .is_none());
+        }
+        for (pointer, value) in [
+            ("/payload/thread_source", json!("user")),
+            ("/payload/session_id", json!("unrelated-session")),
+            ("/payload/session_id", Value::Null),
+            (
+                "/payload/source/subagent/thread_spawn/parent_thread_id",
+                json!(id),
+            ),
+            (
+                "/payload/source/subagent/thread_spawn/parent_thread_id",
+                json!(""),
+            ),
+            (
+                "/payload/source/subagent/thread_spawn/parent_thread_id",
+                json!({"id":"parent"}),
+            ),
+            ("/payload/creator_user_id", Value::Null),
+            ("/payload/creator_account_id", json!(" ")),
+            ("/payload/timestamp", json!("2026-09-30T10:02:00Z")),
+        ] {
+            let mut malformed = header.clone();
+            *malformed.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                codex_creator_item(&[malformed], id)
+                    .session_account_evidence
+                    .is_none(),
+                "{pointer}"
+            );
+        }
+        let mut fork = header.clone();
+        fork["payload"]["forked_from_id"] = fork["payload"]["session_id"].clone();
+        fork["payload"]["history_base"] = json!({"cursor":"external"});
+        assert!(codex_creator_item(&[fork], id)
+            .session_account_evidence
+            .is_none());
+        assert!(codex_creator_item(
+            std::slice::from_ref(&header),
+            "019e253c-5555-7000-9000-eeeeeeeeeeee"
+        )
+        .session_account_evidence
+        .is_none());
+        assert!(
+            codex_creator_item(&[json!({"type":"turn_context"}), header.clone()], id)
+                .session_account_evidence
+                .is_none()
+        );
+        let mut conflicting = header.clone();
+        conflicting["payload"]["session_id"] = json!("unrelated-session");
+        assert!(
+            codex_creator_item(&[header.clone(), conflicting, header.clone()], id)
+                .session_account_evidence
+                .is_none()
+        );
     }
 
     #[test]
