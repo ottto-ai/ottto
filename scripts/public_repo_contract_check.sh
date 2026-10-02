@@ -572,7 +572,8 @@ def check_privacy_docs_contracts() -> None:
         (
             "must not upload raw prompts, raw responses, tool output,\n"
             "command output, browser cookies, OAuth credentials, API keys, passwords,\n"
-            "absolute local paths, or raw provider account ids",
+            "absolute local paths, provider account emails, or account and organization\n"
+            "labels",
             "privacy docs must prohibit uploading raw private local data",
         ),
         ("derived and redacted fields", "privacy docs must require derived/redacted snapshot fields"),

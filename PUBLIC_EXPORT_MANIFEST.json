@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 410,
-  "content_sha256": "f6fe4e48288216fe0022c336302f7da14996828c7f1aa96868a45516528e68e1",
+  "candidate_file_count": 412,
+  "content_sha256": "131652f5a9096265a06702e5ccf5b7dcb34d970eaec0266563c273ca69d1e043",
   "files": [
     {
       "executable": false,
@@ -76,8 +76,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "70ff75b22656dc4d4b3b437ba38dd3ab9e3abaca9f3a7b9d6c3270eed283c8cd",
-      "size_bytes": 54228
+      "sha256": "f750f9e061cc34079577a4ed4e3e7cfd7af73a927e5741705a54bf50acf52358",
+      "size_bytes": 54318
     },
     {
       "executable": false,
@@ -139,8 +139,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/claude-code/POLICY.md",
-      "sha256": "e10df87927e129d656266fd569ec4565b29fccada64d47659a11a40a26abdceb",
-      "size_bytes": 3348
+      "sha256": "9163dcbd01a6dc5e5e6064682284e99b66cbdfcf5604781807b011c43d2c902e",
+      "size_bytes": 3438
     },
     {
       "executable": false,
@@ -223,15 +223,15 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/POLICY.md",
-      "sha256": "e800b720567d50df5cd4405091d5dabd555ce267c85ad94f4643078cc253e8b7",
-      "size_bytes": 10355
+      "sha256": "0ec8a1b54df2d9884c90a5a0f8cc81e48152bcce77b1028cefae57c38510e1ce",
+      "size_bytes": 10438
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/README.md",
-      "sha256": "e411da018177d4bdd19262a379debb41f639765f502a079dbb475f6086583ae4",
-      "size_bytes": 5088
+      "sha256": "e90ad133b8edb65a55fb82c8432187d5d0916546db5645b2093ac1964c397a25",
+      "size_bytes": 5218
     },
     {
       "executable": false,
@@ -580,8 +580,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "84e67444989ce02308575f7c20243067c80fe3e3112ef2b9d09f7581ddb7b991",
-      "size_bytes": 278382
+      "sha256": "835151e4f9a8e08225dbbcea9570353a1b83974d7b468fb0383df33cbd4b8c4d",
+      "size_bytes": 284001
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "aeef9ffaec67fbb644fbf30db76576a10937a3ebff7ccd9f00e770653d5710be",
-      "size_bytes": 979683
+      "sha256": "7951f37f7a31b165c2da6cb3adb48af94070fc0b7030070e7c9917e7307cdb3a",
+      "size_bytes": 985359
     },
     {
       "executable": false,
@@ -1049,8 +1049,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "e69001a3dccaf6255267bae167d35e88a42c335f6d3d49d435a35efbb2788da0",
-      "size_bytes": 19055
+      "sha256": "eb2edb0a1b36f7342ba82d4bdc80bd9240a4781db0f1f9c8470eb618439723f0",
+      "size_bytes": 19757
     },
     {
       "executable": false,
@@ -1825,6 +1825,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-02-upload-raw-provider-ids.md",
+      "sha256": "1d2376d7e05ba54372712b67ac7d74c20495d97daf3db47bcd3438ca76f00eac",
+      "size_bytes": 3876
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -1891,6 +1898,13 @@
       "path": "fixtures/agent-status/quota-check-diagnostics.v1.json",
       "sha256": "86ad6e4867970669e049ace005f35b1a899d53592ea793f74ea7a20ab39b5d8c",
       "size_bytes": 1733
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/raw-provider-ids-backend-wire.v1.json",
+      "sha256": "26a9fde493f2f53893b37cbb10c084680ec5962df700dd0f3266d16b569703ec",
+      "size_bytes": 3770
     },
     {
       "executable": false,
@@ -2624,8 +2638,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_contract_check.sh",
-      "sha256": "7a3cf855e736bf88eda8e63e44acbd97695e7ae974c0d1a5693794205909c568",
-      "size_bytes": 121081
+      "sha256": "940883b53b09956defc2c5198ab7c4d52c9a83b76592aa75c2705c822994bc83",
+      "size_bytes": 121129
     },
     {
       "executable": true,
@@ -2820,8 +2834,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_contract_check.sh",
-      "sha256": "4301a9fd66b74b3863bb1123a6cf6322a9f2299ecb06dc41003da9d8fdf78b32",
-      "size_bytes": 98792
+      "sha256": "15599e3c75ac91b4d70611d15fe149cf6d018baf2201d309ae489f2c201a78b3",
+      "size_bytes": 98832
     },
     {
       "executable": true,
@@ -2873,9 +2887,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-01T21:50:20+00:00",
+  "generated_at": "2026-10-02T00:27:00+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 411,
+  "output_file_count": 413,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2909,5 +2923,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "0b5d1b3771155df31ba5ac9476130b620b718373"
+  "source_commit": "8d1019e99557a28569e57969983172719dadbeb8"
 }
