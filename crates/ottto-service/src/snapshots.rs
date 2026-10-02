@@ -23843,7 +23843,8 @@ mod tests {
         }
         if duplicate {
             let path = root.join("d-sibling.jsonl");
-            let contents = fs::read_to_string(&path).expect("late duplicate fixture");
+            let contents = String::from_utf8(fs::read(&path).expect("late duplicate fixture"))
+                .expect("UTF-8 duplicate fixture");
             fs::write(path, contents.replace("req_d-sibling", "req_owned"))
                 .expect("duplicate request on final page");
         }
@@ -23894,7 +23895,8 @@ mod tests {
             if generation == 4 {
                 // Change the file without changing its owned usage. This is the
                 // real source-fingerprint retry route, not a forced index replay.
-                let mut contents = fs::read_to_string(&stable).expect("stable fixture");
+                let mut contents = String::from_utf8(fs::read(&stable).expect("stable fixture"))
+                    .expect("UTF-8 stable fixture");
                 contents.push_str("{\"timestamp\":\"2026-08-20T10:09:00Z\",\"sessionId\":\"a-stable\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"synthetic change\"}}\n");
                 fs::write(&stable, contents).expect("changed stable fixture");
             }

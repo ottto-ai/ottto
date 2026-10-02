@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 416,
-  "content_sha256": "3e18db5bf05cb98326d30d6491857fd3c30004211102077802c4e1f9ec9cb9fa",
+  "candidate_file_count": 417,
+  "content_sha256": "87f1d9c415dbf52f81e0119b517a21f8beb3b946fec635d86422dcc3faaabeb7",
   "files": [
     {
       "executable": false,
@@ -902,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "5e0b9e706343f2ee1350f0b97e1980b46738d881dc7f91a5a12449203649f606",
-      "size_bytes": 2091354
+      "sha256": "f1d325e42707b6e17e84a6ed9215e8a28f03b2ccec68c398345c484382e4f977",
+      "size_bytes": 2109575
     },
     {
       "executable": false,
@@ -1044,6 +1044,13 @@
       "path": "docs/install.md",
       "sha256": "30e60e68ad825dd6763155e8cdcb8f543473a904fa26d2297467872c966f35bb",
       "size_bytes": 2789
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/notes/2026-10-02-claude-census-ownership-recovery.md",
+      "sha256": "7406cc0b6cf6f1ca87c0e6756adae26b6e9c6b8ab1fd72e19a1de49798382964",
+      "size_bytes": 2777
     },
     {
       "executable": false,
@@ -2915,9 +2922,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-02T10:16:22+00:00",
+  "generated_at": "2026-10-02T15:35:10+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 417,
+  "output_file_count": 418,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2951,5 +2958,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b1ac72b51fb41c5a96f9a08c718b7ed7fe9caff2"
+  "source_commit": "0cb0b3726d234785742f21b7777ab89899f44e22"
 }
