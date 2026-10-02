@@ -389,11 +389,31 @@ fn claude_candidate_is_better(
             })
 }
 
+/// Choose the uploading snapshot and the preferred registered anchor for each
+/// exact pair.
+///
+/// The preferred registered anchor follows `canonical_registered_anchors`,
+/// which ranks connection health (the shared credential-usability rule) before
+/// meter quality. A registered slot that is not the canonical anchor for its
+/// pair can neither upload nor become the preferred anchor, so one ranking
+/// decides both the canonical label and which slot's limits are used. Without
+/// this, an unusable slot showing complete limits (for example valid access
+/// but a passed refresh deadline) could win on meter quality and label the
+/// working login a duplicate. The default login still competes on meter
+/// quality alone; it never changes which registered slot is canonical.
 fn select_claude_snapshot_candidates(
     candidates: &[ClaudeSnapshotCandidate],
+    canonical_anchors: &BTreeMap<ClaudeStrongBinding, String>,
 ) -> ClaudeSnapshotSelection {
     let mut selection = ClaudeSnapshotSelection::default();
     for (index, candidate) in candidates.iter().enumerate() {
+        if candidate.slot_class == ClaudeSnapshotSlotClass::Registered
+            && canonical_anchors
+                .get(&candidate.binding)
+                .is_some_and(|canonical| canonical != &candidate.slot_id)
+        {
+            continue;
+        }
         let replace_winner = selection
             .winning_by_binding
             .get(&candidate.binding)
@@ -3131,19 +3151,6 @@ fn collect_claude_status_snapshots(
         default_state = status.clone();
     }
 
-    let selection = select_claude_snapshot_candidates(&candidates);
-    let winning_accounts = selection
-        .winning_by_binding
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let dispositions = candidates
-        .iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            claude_snapshot_candidate_disposition(index, candidate, &selection)
-        })
-        .collect::<Vec<_>>();
     let mut registered_slot_ids = settings
         .as_ref()
         .map(|status| {
@@ -3158,6 +3165,19 @@ fn collect_claude_status_snapshots(
     registered_slot_ids.sort();
     let canonical_anchors = canonical_registered_anchors(registered_slot_ids.clone(), &slot_states);
     let anchor_health_by_binding = canonical_anchor_health(&canonical_anchors, &slot_states);
+    let selection = select_claude_snapshot_candidates(&candidates, &canonical_anchors);
+    let winning_accounts = selection
+        .winning_by_binding
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let dispositions = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            claude_snapshot_candidate_disposition(index, candidate, &selection)
+        })
+        .collect::<Vec<_>>();
     for (binding, slot_id) in &canonical_anchors {
         if let Some(status) = slot_states.get_mut(slot_id) {
             status.relationship =
@@ -15127,6 +15147,95 @@ mod tests {
         );
     }
 
+    /// Opus review F1 on 6d43ff24: the limits/upload choice must follow the
+    /// health-first canonical choice. An old slot with valid access but a
+    /// passed refresh deadline (fresh, complete limits, unusable) and a new
+    /// working login with partial limits: the new login is canonical, preferred
+    /// and uploads; the old slot is the duplicate, never the reverse.
+    #[test]
+    fn snapshot_selection_follows_health_first_canonical_anchor() {
+        let now = OffsetDateTime::now_utc();
+        let at = |offset: TimeDuration| (now + offset).format(&Rfc3339).unwrap();
+        let mut old = fresh_slot_status(
+            &at(-TimeDuration::minutes(2)),
+            "account-a",
+            "org-a",
+            true,
+            true,
+            true,
+        );
+        old.access_expires_at = Some(at(TimeDuration::hours(3)));
+        old.relogin_required_at = Some(at(-TimeDuration::hours(1)));
+        let mut new = fresh_slot_status(
+            &at(-TimeDuration::minutes(1)),
+            "account-a",
+            "org-a",
+            true,
+            false,
+            false,
+        );
+        new.access_expires_at = Some(at(TimeDuration::hours(8)));
+        new.relogin_required_at = Some(at(TimeDuration::days(30)));
+        assert!(!claude_slot_connection_usable(&old, now));
+        assert!(claude_slot_connection_usable(&new, now));
+        assert!(claude_slot_projection_quality(&old) > claude_slot_projection_quality(&new));
+
+        let binding = ClaudeStrongBinding::new("account-a", "org-a").unwrap();
+        let slot_states = BTreeMap::from([
+            ("claude_slot_a_old".to_string(), old.clone()),
+            ("claude_slot_b_new".to_string(), new.clone()),
+        ]);
+        let candidate =
+            |slot_id: &str, status: &ClaudeConfigSlotCollectionStatusV1| ClaudeSnapshotCandidate {
+                slot_id: slot_id.to_string(),
+                slot_class: ClaudeSnapshotSlotClass::Registered,
+                binding: binding.clone(),
+                quality: claude_slot_projection_quality(status),
+                snapshot: claude_account_snapshot(
+                    "a@example.com",
+                    "claude_max_20x",
+                    "account-a",
+                    "org-a",
+                ),
+            };
+        let candidates = vec![
+            candidate("claude_slot_a_old", &old),
+            candidate("claude_slot_b_new", &new),
+        ];
+
+        // The same order the collection loop uses.
+        let canonical = canonical_registered_anchors(
+            [
+                "claude_slot_a_old".to_string(),
+                "claude_slot_b_new".to_string(),
+            ],
+            &slot_states,
+        );
+        assert_eq!(canonical[&binding], "claude_slot_b_new");
+        let selection = select_claude_snapshot_candidates(&candidates, &canonical);
+        assert_eq!(selection.winning_by_binding[&binding], 1);
+        assert_eq!(selection.preferred_anchor_by_binding[&binding], 1);
+        let dispositions = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                claude_snapshot_candidate_disposition(index, candidate, &selection)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dispositions,
+            vec![
+                ClaudeSnapshotDisposition::DuplicateRegistered,
+                ClaudeSnapshotDisposition::Upload,
+            ]
+        );
+
+        // Without a canonical map (no registered anchors) meter quality alone
+        // still orders candidates, as before.
+        let unanchored = select_claude_snapshot_candidates(&candidates, &BTreeMap::new());
+        assert_eq!(unanchored.winning_by_binding[&binding], 0);
+    }
+
     /// Live M4 Gmail anchor, 2026-10-02: the worker read a signed-out
     /// credential (expiry epoch) and published `needs_login`, but the saved
     /// slot stayed `refresh_due`, so the companion never offered "Sign in
@@ -22739,7 +22848,7 @@ exit 1
                 3,
             ),
         ];
-        let selected = select_claude_snapshot_candidates(&equal);
+        let selected = select_claude_snapshot_candidates(&equal, &BTreeMap::new());
         let binding = ClaudeStrongBinding {
             account_identifier_hash: "account-a".to_string(),
             organization_identifier_hash: "organization-a".to_string(),
@@ -22772,7 +22881,7 @@ exit 1
                 2,
             ),
         ];
-        let selected = select_claude_snapshot_candidates(&fresher_default);
+        let selected = select_claude_snapshot_candidates(&fresher_default, &BTreeMap::new());
         assert_eq!(selected.winning_by_binding[&binding], 0);
         assert_eq!(
             selected.preferred_anchor_by_binding[&binding], 1,
@@ -22837,7 +22946,7 @@ exit 1
                 "organization-b",
             ),
         ];
-        let selected = select_claude_snapshot_candidates(&candidates);
+        let selected = select_claude_snapshot_candidates(&candidates, &BTreeMap::new());
         assert_eq!(selected.winning_by_binding.len(), 2);
         assert_eq!(selected.preferred_anchor_by_binding.len(), 2);
     }

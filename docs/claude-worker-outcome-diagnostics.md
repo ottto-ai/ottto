@@ -86,7 +86,11 @@ credential whose refresh failed is dead, even when a failed refresh is shown as
 `stale_access_token`, `credential_unavailable` or unproven identity never
 outranks a usable one, however complete its older limits are.
 A slot already labelled duplicate ranks last, so persisted readers agree with
-the collector. Meter quality still orders slots of equal health.
+the collector. Meter quality still orders slots of equal health. The choice of
+which registered slot's limits are uploaded follows the same canonical choice.
+A registered slot that is not canonical for its pair can neither upload nor
+become the preferred anchor. The default login still competes on meter
+quality.
 
 Session: Codex native 01a0f43d. No provider checks, auth mutations, cadence,
 consent, breaker or release changes were performed for this correction.
