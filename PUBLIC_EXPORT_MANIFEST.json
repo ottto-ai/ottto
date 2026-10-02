@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 416,
-  "content_sha256": "6c2b248add202c651da40b558b50ef23788c6d7a0a5f2fbaaf81556df00e01fb",
+  "content_sha256": "3e18db5bf05cb98326d30d6491857fd3c30004211102077802c4e1f9ec9cb9fa",
   "files": [
     {
       "executable": false,
@@ -902,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "3e3ea57ff2d24451bd4bc9b5977fa91d6adede8a3fc01f83490cde03600f9240",
-      "size_bytes": 2083099
+      "sha256": "5e0b9e706343f2ee1350f0b97e1980b46738d881dc7f91a5a12449203649f606",
+      "size_bytes": 2091354
     },
     {
       "executable": false,
@@ -1049,8 +1049,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/notes/2026-10-02-codex-child-creator-parent.md",
-      "sha256": "6a8cd29e902c0136aaede884f33ecd249b952c2a1d8840fe5165b5cb08acaa8c",
-      "size_bytes": 1145
+      "sha256": "636bb6375ed9b1a96b6ce1cc37e39a08929e18f5f8494744b956c0c9288ebf4b",
+      "size_bytes": 1854
     },
     {
       "executable": false,
@@ -2915,7 +2915,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-02T09:39:48+00:00",
+  "generated_at": "2026-10-02T10:16:22+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 417,
   "public_roots": [
@@ -2951,5 +2951,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "41588f9ee9e068e38ac0c72e931f064f3a8ebc0e"
+  "source_commit": "b1ac72b51fb41c5a96f9a08c718b7ed7fe9caff2"
 }
