@@ -14,7 +14,7 @@ Review tier: `official`
 - Claude Code project JSONL files may be read locally for aggregate usage snapshots.
 - Managed telemetry environment/settings may be inspected or written only through the live telemetry setup path.
 - The documented status-line `rate_limits` payload may be used for quota evidence when the Ottto wrapper is enabled.
-- The documented `claude auth status --json` CLI may be subprocessed by `identity_probe` to read `apiProvider`, `authMethod`, `subscriptionType`, `email`, and `orgId` fields. Email and orgId are hashed before emit; raw values never leave the machine.
+- The documented `claude auth status --json` CLI may be subprocessed by `identity_probe` to read `apiProvider`, `authMethod`, `subscriptionType`, `email`, and `orgId` fields. Email never leaves the machine. orgId leaves the machine only as the raw `organization_id` of the agent-status account block and plan observations, next to its hash.
 - `~/.claude/settings.json` may be read for `ANTHROPIC_VERTEX_PROJECT_ID`, `CLOUD_ML_REGION`, and similar gateway env values when a Vertex/Bedrock novelty trigger fires. Read-only.
 - Claude Desktop app-managed metadata may be read only from:
   - `~/Library/Application Support/Claude/config.json` for `lastKnownAccountUuid`.

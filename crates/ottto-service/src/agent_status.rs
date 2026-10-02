@@ -14538,6 +14538,115 @@ mod tests {
         );
     }
 
+    /// Synthetic Claude and Codex agent-status snapshots exactly as the
+    /// collector uploads them: the real account-to-plan-observation copy, the
+    /// real hash function, then the protocol backend redaction. The backend
+    /// repository consumes the same JSON as its wire fixture, so a change to
+    /// either side of the raw-id contract fails one of the two test suites.
+    fn raw_provider_id_backend_wire_snapshots() -> Vec<AgentStatusSnapshot> {
+        let cases = [
+            (
+                SourceKind::ClaudeCode,
+                "anthropic",
+                "organization",
+                "00000000-0000-4000-8000-00000000c1a1",
+                "00000000-0000-4000-8000-00000000c1b2",
+                "claude_max_20x",
+                "max_20x",
+            ),
+            (
+                SourceKind::Codex,
+                "openai",
+                "workspace",
+                "user-SyntheticCodexUser01",
+                "00000000-0000-4000-8000-00000000c0d3",
+                "chatgpt_pro",
+                "pro",
+            ),
+        ];
+        cases
+            .into_iter()
+            .map(
+                |(source, provider, workspace_kind, raw_account, raw_workspace, product, plan)| {
+                    let mut snapshot = base_snapshot(
+                        source,
+                        AgentStatusState::Available,
+                        AgentStatusCollectionMethod::CliJson,
+                        "2026-10-02T08:00:00Z".to_string(),
+                        "2026-10-02T08:05:00Z".to_string(),
+                    );
+                    let account_identifier_hash =
+                        billing_identity_hash(provider, "account", raw_account);
+                    let organization_identifier_hash =
+                        billing_identity_hash(provider, workspace_kind, raw_workspace);
+                    snapshot.account = Some(AgentAccountStatus {
+                        login_state: AgentLoginState::SignedIn,
+                        auth_method: Some("oauth".to_string()),
+                        email: Some("synthetic-owner@example.invalid".to_string()),
+                        account_id: Some(raw_account.to_string()),
+                        organization_id: Some(raw_workspace.to_string()),
+                        organization_label: Some("Synthetic Workspace Label".to_string()),
+                        plan_type: Some(plan.to_string()),
+                        subscription_product: Some(product.to_string()),
+                        billing_channel: Some("subscription".to_string()),
+                        billing_identity_evidence: billing_identity_evidence_for(
+                            &account_identifier_hash,
+                            &organization_identifier_hash,
+                            &None,
+                        ),
+                        account_identifier_hash,
+                        organization_identifier_hash,
+                        billing_identity_confidence: AgentStatusConfidence::High,
+                        confidence: AgentStatusConfidence::High,
+                        ..unsupported_account(provider)
+                    });
+                    let observation = plan_observation_from_snapshot_account(&snapshot, true)
+                        .expect("account plan observation");
+                    snapshot.plan_observations.push(observation);
+                    snapshot.redacted_for_backend()
+                },
+            )
+            .collect()
+    }
+
+    #[test]
+    fn raw_provider_id_backend_wire_fixture_matches_collector_upload() {
+        let value = serde_json::to_value(raw_provider_id_backend_wire_snapshots())
+            .expect("serialize backend wire snapshots");
+        let wire = value.to_string();
+        assert!(!wire.contains('@'), "email must not reach the backend");
+        assert!(!wire.contains("Synthetic Workspace Label"));
+        for raw in [
+            "00000000-0000-4000-8000-00000000c1a1",
+            "00000000-0000-4000-8000-00000000c1b2",
+            "user-SyntheticCodexUser01",
+            "00000000-0000-4000-8000-00000000c0d3",
+        ] {
+            assert!(
+                wire.contains(raw),
+                "raw provider id {raw} must reach the backend"
+            );
+        }
+        let fixture = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&value).expect("pretty-print backend wire snapshots")
+        );
+        if std::env::var_os("OTTTO_WRITE_RAW_PROVIDER_ID_FIXTURE").is_some() {
+            std::fs::write(
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../fixtures/agent-status/raw-provider-ids-backend-wire.v1.json"
+                ),
+                &fixture,
+            )
+            .expect("write fixture");
+        }
+        assert_eq!(
+            fixture,
+            include_str!("../../../fixtures/agent-status/raw-provider-ids-backend-wire.v1.json")
+        );
+    }
+
     #[test]
     #[serial]
     fn claude_registered_slots_fan_out_full_usage_without_cross_account_mixing() {
@@ -15045,6 +15154,19 @@ exit 1
                 .collect::<Vec<_>>(),
         )
         .expect("serialize backend snapshots");
+        // Raw provider account and organization ids are uploaded on purpose,
+        // but only in their own `account_id` / `organization_id` fields. Strip
+        // exactly those field values; the ids must not appear anywhere else.
+        let mut residual_json = backend_json.clone();
+        for slot in ["primary", "secondary", "tertiary"] {
+            residual_json = residual_json
+                .replace(&format!("\"account_id\":\"account-{slot}\""), "")
+                .replace(&format!("\"organization_id\":\"organization-{slot}\""), "");
+        }
+        assert!(
+            backend_json.contains("\"account_id\":\"account-secondary\""),
+            "raw provider account id must reach the backend"
+        );
         for forbidden in [
             root.to_string_lossy().as_ref(),
             "account-primary",
@@ -15056,7 +15178,7 @@ exit 1
             "fixture",
         ] {
             assert!(
-                !backend_json.contains(forbidden),
+                !residual_json.contains(forbidden),
                 "backend snapshots leaked forbidden local material"
             );
         }

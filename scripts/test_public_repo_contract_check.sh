@@ -1397,7 +1397,8 @@ replacements = {
     "should not\nduplicate local setup or repair logic": "may duplicate local setup and repair logic",
     "must not upload raw prompts, raw responses, tool output,\n"
     "command output, browser cookies, OAuth credentials, API keys, passwords,\n"
-    "absolute local paths, or raw provider account ids": "may upload raw local content when support needs details",
+    "absolute local paths, provider account emails, or account and organization\n"
+    "labels": "may upload raw local content when support needs details",
     "derived and redacted fields": "raw fields",
     "hashed workspace identity": "workspace path",
     "display-safe account or plan evidence": "raw account evidence",

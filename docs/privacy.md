@@ -32,7 +32,21 @@ ids, or hardware UUID.
 
 The local platform must not upload raw prompts, raw responses, tool output,
 command output, browser cookies, OAuth credentials, API keys, passwords,
-absolute local paths, or raw provider account ids.
+absolute local paths, provider account emails, or account and organization
+labels.
+
+Raw provider account and organization ids are identifiers, not credentials.
+Agent status uploads carry them on the account block and on plan observations,
+next to their domain-separated hashes, so the backend can recompute those
+hashes from the original roles:
+
+- Claude: the provider account UUID and the selected organization UUID.
+- Codex: the ChatGPT user id and the selected ChatGPT workspace (account) id.
+
+Only plain ids (ASCII letters, digits and `-`, at most 128 characters) are
+sent; anything else is dropped. Emails, labels, tokens and credentials stay
+local. Other uploads, such as usage snapshots and diagnostics, still carry only
+hashed account identity.
 
 Local usage snapshots use derived and redacted fields such as session ids,
 timestamps, usage totals, model usage, hashed workspace identity, and
