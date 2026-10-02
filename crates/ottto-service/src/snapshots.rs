@@ -39216,6 +39216,7 @@ mod tests {
             .as_ref()
             .is_some_and(|rows| rows.iter().any(|row| row.name == "Read" && row.count == 1)));
         let mut cases = Vec::new();
+        let mut declared_cases = Vec::new();
         for disposition in ["complete", "missing", "conflict"] {
             for cache in [false, true] {
                 for curve in [false, true] {
@@ -39247,36 +39248,141 @@ mod tests {
                     if !curve {
                         item.context_curve = None;
                     }
-                    let mut request = valid_v6_batch_request();
-                    request.source = "claude_code".into();
-                    request.snapshots = vec![item];
-                    apply_upload_policy(
-                        SnapshotSource::ClaudeCode,
-                        &mut request.snapshots,
-                        request.upload_policy,
-                    );
-                    request.snapshots[0].snapshot_fingerprint =
-                        snapshot_fingerprint(SnapshotSource::ClaudeCode, &request.snapshots[0]);
-                    let item = &request.snapshots[0];
-                    assert_eq!(
-                        item.session_account_evidence
-                            .as_ref()
-                            .unwrap()
-                            .identity_disposition,
-                        Some(disposition)
-                    );
-                    assert_eq!(snapshot_upload_body_witness_version(item), Some(23));
-                    assert_eq!(item.cache_observations.is_some(), cache);
-                    let bytes = serde_json::to_vec(&request).unwrap();
-                    cases.push(json!({"disposition":disposition,"cache":cache,"curve":curve,
+                    let source_item = item;
+                    for tools in [
+                        "omitted",
+                        "empty_default_only",
+                        "nonempty",
+                        "truncated_only",
+                    ] {
+                        let mut item = source_item.clone();
+                        match tools {
+                            "omitted" | "truncated_only" => item.tool_usage = None,
+                            "empty_default_only" => item.tool_usage = Some(vec![]),
+                            _ => {}
+                        }
+                        item.tool_usage_truncated = tools == "truncated_only";
+                        let mut request = valid_v6_batch_request();
+                        request.source = "claude_code".into();
+                        request.snapshots = vec![item];
+                        apply_upload_policy(
+                            SnapshotSource::ClaudeCode,
+                            &mut request.snapshots,
+                            request.upload_policy,
+                        );
+                        request.snapshots[0].snapshot_fingerprint =
+                            snapshot_fingerprint(SnapshotSource::ClaudeCode, &request.snapshots[0]);
+                        let item = &request.snapshots[0];
+                        assert_eq!(
+                            item.session_account_evidence
+                                .as_ref()
+                                .unwrap()
+                                .identity_disposition,
+                            Some(disposition)
+                        );
+                        assert_eq!(snapshot_upload_body_witness_version(item), Some(23));
+                        assert_eq!(item.cache_observations.is_some(), cache);
+                        assert_eq!(
+                            item.session_account_evidence,
+                            source_item.session_account_evidence
+                        );
+                        assert_eq!(
+                            (item.input_tokens, item.output_tokens, item.request_count),
+                            (
+                                source_item.input_tokens,
+                                source_item.output_tokens,
+                                source_item.request_count
+                            )
+                        );
+                        assert_eq!(item.model_usage, source_item.model_usage);
+                        assert_eq!(item.usage_buckets, source_item.usage_buckets);
+                        let bytes = serde_json::to_vec(&request).unwrap();
+                        let wire: Value = serde_json::from_slice(&bytes).unwrap();
+                        let projection = snapshot_upload_body_witness_payload(item);
+                        for field in [
+                            "session_account_evidence",
+                            "context_curve",
+                            "tool_usage",
+                            "tool_usage_truncated",
+                        ] {
+                            assert_eq!(
+                                projection.get(field),
+                                wire["snapshots"][0].get(field),
+                                "original Claude declared presence: {field}/{tools}"
+                            );
+                        }
+                        assert_eq!(
+                            wire["snapshots"][0].get("tool_usage_truncated"),
+                            (tools == "truncated_only").then_some(&Value::Bool(true))
+                        );
+                        let canonical = crate::canonical_json::canonicalize(&projection).unwrap();
+                        let digest = snapshot_upload_body_witness(item);
+                        assert_eq!(digest, format!("{:x}", Sha256::digest(&canonical)));
+                        let public = if cache { 13 } else { 7 };
+                        let response = |version, proof, unchanged| {
+                            let reference = crate::snapshot_client::SnapshotEntityRef {
+                                source_session_id: item.source_session_id.clone(),
+                                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                                occurrence_count: 1,
+                                body_witness_version: version,
+                                body_witness_digest: proof,
+                                head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
+                                head_challenge: None,
+                            };
+                            crate::snapshot_client::SnapshotBatchResponse {
+                                accepted: 1,
+                                sessions_reconciled: 0,
+                                session_ids: vec![],
+                                disabled: false,
+                                disabled_reason: None,
+                                entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+                                accepted_entities: if unchanged {
+                                    vec![]
+                                } else {
+                                    vec![reference.clone()]
+                                },
+                                unchanged_entities: if unchanged {
+                                    vec![reference]
+                                } else {
+                                    vec![]
+                                },
+                                rejected_entities: vec![],
+                                conflict_entities: vec![],
+                            }
+                        };
+                        for unchanged in [false, true] {
+                            response(Some(public), Some(digest.clone()), unchanged)
+                                .validate_entity_ack(&request)
+                                .unwrap();
+                            for (version, proof) in [
+                                (Some(public), Some("0".repeat(64))),
+                                (None, None),
+                                (Some(23), Some(digest.clone())),
+                                (Some(if cache { 7 } else { 13 }), Some(digest.clone())),
+                            ] {
+                                assert!(response(version, proof, unchanged)
+                                    .validate_entity_ack(&request)
+                                    .is_err());
+                            }
+                        }
+                        let case = json!({"disposition":disposition,"cache":cache,"curve":curve,
                         "provenance":"actual Claude transcript parser, original Desktop index and normal HTTP serializer",
-                        "wire":serde_json::from_slice::<Value>(&bytes).unwrap(),
+                        "wire":wire,
                         "wire_body_utf8":String::from_utf8(bytes).unwrap(),
                         "internal_version":snapshot_upload_body_witness_version(item),
-                        "released_ack_version":if cache {13} else {7},
-                        "digest":snapshot_upload_body_witness(item),
-                        "body_projection":snapshot_upload_body_witness_payload(item),
-                        "cache_observations_state":item.cache_observations_state}));
+                        "released_ack_version":public,
+                        "digest":digest,
+                        "body_projection":projection,
+                        "cache_observations_state":item.cache_observations_state});
+                        if tools == "nonempty" {
+                            cases.push(case.clone());
+                        }
+                        let mut declared_case = case;
+                        declared_case["tools"] = json!(tools);
+                        declared_case["body_projection_canonical_utf8"] =
+                            json!(String::from_utf8(canonical).unwrap());
+                        declared_cases.push(declared_case);
+                    }
                 }
             }
         }
@@ -39294,6 +39400,12 @@ mod tests {
             "regenerate only from the actual Claude source/index/HTTP path with UPDATE_CLAUDE_ORIGINAL_CORPUS=1");
         if let Ok(output) = std::env::var("OTTTO_CLAUDE_ORIGINAL_CORPUS_OUT") {
             fs::write(output, &bytes).unwrap();
+        }
+        assert_eq!(declared_cases.len(), 48);
+        if let Ok(output) = std::env::var("OTTTO_CLAUDE_ORIGINAL_DECLARED_CORPUS_OUT") {
+            fs::write(output, serde_json::to_vec_pretty(
+                &json!({"contract_version":"claude_original_declared_wire_corpus:v1", "cases":declared_cases})
+            ).unwrap()).unwrap();
         }
     }
 
