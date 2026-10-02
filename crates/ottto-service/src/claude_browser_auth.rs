@@ -5350,6 +5350,123 @@ mod tests {
         }
     }
 
+    /// AutoReview P2 on 83657166: with upkeep consent granted the admission
+    /// runs the real one-slot quota collection. When that first read is
+    /// unavailable, the admitted login must still own the canonical anchor in
+    /// persisted coverage over a dead slot with complete historical limits.
+    #[test]
+    #[serial]
+    fn admitted_login_with_unavailable_first_quota_read_becomes_canonical() {
+        let root = temp_dir("generic-dead-pair-canonical");
+        let support = root.join("support");
+        fs::create_dir_all(&support).expect("support");
+        #[cfg(unix)]
+        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
+        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        store
+            .set_upkeep_consent(1, true)
+            .expect("grant upkeep consent");
+        // Quota reads are unavailable on this machine for the whole test: no
+        // provider request can be made, and the collector reports that state.
+        fs::write(
+            support.join(crate::agent_status::CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE),
+            b"off",
+        )
+        .expect("quota network off");
+        let existing_root = root.join("existing");
+        fs::create_dir_all(&existing_root).expect("existing root");
+        let existing_slot = store
+            .register_path(1, existing_root.to_string_lossy().into_owned())
+            .expect("existing registration")
+            .external_slots[0]
+            .slot_id
+            .clone();
+        let account =
+            ottto_core::billing_identity_hash("anthropic", "account", "account-uuid-gmail")
+                .expect("account hash");
+        let organization =
+            ottto_core::billing_identity_hash("anthropic", "organization", "org-uuid-gmail")
+                .expect("organization hash");
+        crate::agent_status::persist_one_claude_slot_collection_state(
+            &existing_slot,
+            &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                state: ottto_protocol::ClaudeConfigSlotCollectionStateV1::NeedsLogin,
+                account_identifier_hash: Some(account.clone()),
+                organization_identifier_hash: Some(organization.clone()),
+                observed_at: Some("2026-09-24T12:21:06Z".to_string()),
+                access_expires_at: Some("2026-09-24T12:27:25Z".to_string()),
+                last_full_quota_read_at: Some("2026-09-24T12:21:06Z".to_string()),
+                has_account_windows: true,
+                has_scoped_limits: true,
+                ..Default::default()
+            },
+        )
+        .expect("dead slot with complete history");
+        let operation_id = "claude_setup_c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+        prepare_generic(store.load().expect("registry"), operation_id).expect("prepare");
+        let candidate = read_operation(operation_id).expect("operation");
+        let candidate_slot = candidate.slot_id.clone();
+        // The fresh login's own identity file, as Claude Code writes it.
+        fs::write(
+            Path::new(&operation_config_dir(&candidate)).join(".claude.json"),
+            br#"{"oauthAccount":{"accountUuid":"account-uuid-gmail","organizationUuid":"org-uuid-gmail"}}"#,
+        )
+        .expect("identity file");
+        finalize_identity(
+            operation_id,
+            crate::agent_status::ClaudeLocalIdentityProof {
+                account_identifier_hash: account.clone(),
+                organization_identifier_hash: organization.clone(),
+                collection: ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: ottto_protocol::ClaudeConfigSlotCollectionStateV1::Fresh,
+                    account_identifier_hash: Some(account.clone()),
+                    organization_identifier_hash: Some(organization.clone()),
+                    observed_at: Some(observed_at()),
+                    access_expires_at: Some(
+                        (time::OffsetDateTime::now_utc() + time::Duration::hours(8))
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap(),
+                    ),
+                    ..Default::default()
+                },
+            },
+        )
+        .expect("finalize");
+        assert_eq!(
+            read_operation(operation_id).and_then(|operation| operation.outcome),
+            Some(ClaudeBrowserAuthOutcomeV1::Complete)
+        );
+        let status = crate::agent_status::annotate_claude_accounts_status(
+            store.load().expect("registry after"),
+        );
+        let admitted = status
+            .managed_slots
+            .iter()
+            .find(|slot| slot.slot_id == candidate_slot)
+            .expect("admitted slot");
+        assert!(!admitted.collection.has_account_windows);
+        assert_ne!(
+            admitted.collection.state,
+            ottto_protocol::ClaudeConfigSlotCollectionStateV1::Fresh,
+            "first quota read must be unavailable in this fixture"
+        );
+        let anchors = status
+            .anchor_coverage
+            .accounts
+            .iter()
+            .filter(|anchor| anchor.account_identifier_hash == account)
+            .collect::<Vec<_>>();
+        assert_eq!(anchors.len(), 1);
+        assert_ne!(
+            anchors[0].health,
+            Some(ottto_protocol::ClaudeAccountAnchorHealthV1::ReconnectRequired),
+            "the dead slot must not remain the canonical anchor"
+        );
+        drop(_support);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn mismatch_type_distinguishes_account_organization_and_both() {
         assert_eq!(

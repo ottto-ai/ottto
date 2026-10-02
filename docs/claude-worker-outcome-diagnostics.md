@@ -74,5 +74,14 @@ through the normal registration path. Canonical selection then prefers it, and
 the dead connection is shown as a removable duplicate. A healthy saved
 connection still makes the login `already_connected`.
 
+When several registered slots hold the same account and workspace, choosing
+the canonical anchor now ranks a usable connection first. A credential is
+usable when it is valid or refreshable, even while the provider is briefly
+unavailable or collection is paused. A slot blocked on `needs_login`,
+`refresh_due`, `stale_access_token`, `credential_unavailable` or unproven
+identity never outranks a usable one, however complete its older limits are.
+A slot already labelled duplicate ranks last, so persisted readers agree with
+the collector. Meter quality still orders slots of equal health.
+
 Session: Codex native 01a0f43d. No provider checks, auth mutations, cadence,
 consent, breaker or release changes were performed for this correction.

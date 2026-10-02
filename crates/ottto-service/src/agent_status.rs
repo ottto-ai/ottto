@@ -632,6 +632,42 @@ fn claude_slot_projection_quality(
     }
 }
 
+/// Whether a saved slot still holds a usable connection: its credential is
+/// valid or refreshable, even if the provider is temporarily not answering.
+/// A slot blocked on a signed-out, expired-and-unrefreshed, unreadable or
+/// unproven credential is not usable however complete its old meters are.
+fn claude_slot_connection_usable(status: &ClaudeConfigSlotCollectionStatusV1) -> bool {
+    !matches!(
+        status.state,
+        ClaudeConfigSlotCollectionStateV1::NeedsLogin
+            | ClaudeConfigSlotCollectionStateV1::RefreshDue
+            | ClaudeConfigSlotCollectionStateV1::StaleAccessToken
+            | ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
+            | ClaudeConfigSlotCollectionStateV1::IdentityUnknown
+            | ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+    )
+}
+
+/// Canonical-anchor rank: connection health first, then meter quality.
+///
+/// A dead slot's historical complete limits must never keep the canonical
+/// anchor away from a working connection for the same account (for example a
+/// fresh login admitted while the provider is briefly unavailable). A slot
+/// already labelled `DuplicateAccount` by an earlier selection ranks last, so
+/// readers of persisted state agree with the collector's own choice.
+fn claude_slot_anchor_rank(
+    status: &ClaudeConfigSlotCollectionStatusV1,
+) -> (u8, ClaudeSnapshotQuality) {
+    let health = if status.state == ClaudeConfigSlotCollectionStateV1::DuplicateAccount {
+        0
+    } else if claude_slot_connection_usable(status) {
+        2
+    } else {
+        1
+    };
+    (health, claude_slot_projection_quality(status))
+}
+
 fn canonical_registered_anchors(
     registered_slot_ids: impl IntoIterator<Item = String>,
     slot_states: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
@@ -654,10 +690,10 @@ fn canonical_registered_anchors(
             let current = slot_states
                 .get(current_slot_id)
                 .expect("canonical registered slot remains present");
-            claude_slot_projection_quality(status) > claude_slot_projection_quality(current)
-                || (claude_slot_projection_quality(status)
-                    == claude_slot_projection_quality(current)
-                    && slot_id < *current_slot_id)
+            let candidate_rank = claude_slot_anchor_rank(status);
+            let current_rank = claude_slot_anchor_rank(current);
+            candidate_rank > current_rank
+                || (candidate_rank == current_rank && slot_id < *current_slot_id)
         });
         if replace {
             canonical.insert(binding, slot_id);
@@ -14919,6 +14955,90 @@ mod tests {
             serde_json::to_value(removed).unwrap()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// AutoReview P2 on 83657166: an admitted fresh login whose first quota
+    /// read is unavailable must still become the canonical anchor over a dead
+    /// slot that only has older complete limits, in both the collector's
+    /// selection and the persisted anchor coverage readers use.
+    #[test]
+    fn usable_connection_outranks_dead_slot_with_complete_history_for_canonical_anchor() {
+        use ClaudeConfigSlotCollectionStateV1 as State;
+        let dead = |state: State| {
+            let mut status = fresh_slot_status(
+                "2026-09-24T12:21:06Z",
+                "account-a",
+                "org-a",
+                true,
+                true,
+                true,
+            );
+            status.state = state;
+            status.last_full_quota_read_at = Some("2026-09-24T12:21:06Z".to_string());
+            status.quota_snapshot = Some(local_meter_fixture("account-a", "org-a"));
+            status
+        };
+        let working = |state: State| {
+            let mut status = fresh_slot_status(
+                "2026-10-02T05:00:00Z",
+                "account-a",
+                "org-a",
+                false,
+                false,
+                false,
+            );
+            status.state = state;
+            status
+        };
+        let binding = ClaudeStrongBinding::new("account-a", "org-a").unwrap();
+        // Slot ids sort the dead slot first so a tie would keep it.
+        let pick = |old: ClaudeConfigSlotCollectionStatusV1,
+                    new: ClaudeConfigSlotCollectionStatusV1| {
+            let states = BTreeMap::from([
+                ("claude_slot_a_old".to_string(), old),
+                ("claude_slot_b_new".to_string(), new),
+            ]);
+            canonical_registered_anchors(states.keys().cloned().collect::<Vec<_>>(), &states)
+                [&binding]
+                .clone()
+        };
+        for dead_state in [
+            State::NeedsLogin,
+            State::RefreshDue,
+            State::StaleAccessToken,
+            State::CredentialUnavailable,
+            State::IdentityMismatch,
+        ] {
+            for working_state in [
+                State::ProviderUnavailable,
+                State::Fresh,
+                State::CollectionPaused,
+                State::ProbeFailed,
+            ] {
+                assert_eq!(
+                    pick(dead(dead_state.clone()), working(working_state.clone())),
+                    "claude_slot_b_new",
+                    "{dead_state:?} vs {working_state:?}"
+                );
+            }
+        }
+        // Among usable slots, meter quality still decides; a slot labelled
+        // duplicate by an earlier selection never takes the anchor back.
+        assert_eq!(
+            pick(dead(State::Fresh), working(State::ProviderUnavailable)),
+            "claude_slot_a_old"
+        );
+        assert_eq!(
+            pick(dead(State::RefreshDue), working(State::DuplicateAccount)),
+            "claude_slot_a_old"
+        );
+        assert_eq!(
+            pick(
+                dead(State::DuplicateAccount),
+                working(State::ProviderUnavailable)
+            ),
+            "claude_slot_b_new"
+        );
     }
 
     /// Live M4 Gmail anchor, 2026-10-02: the worker read a signed-out

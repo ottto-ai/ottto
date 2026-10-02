@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 413,
-  "content_sha256": "9296151f4f72b811a770631bdcf358c54e7624f26d39ba1a23db8a9744e4d9df",
+  "content_sha256": "760643c4a61ddda22c2ecab9f037855763339fa38d49f28e01bf6c599822e183",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "8e4002ef1ad1e84623c1e3de811d8437f966839a3013e8d1462915a473614ffd",
-      "size_bytes": 1013023
+      "sha256": "1a56cd10bc97a6e08b0aba8ad5e7149a3a17806e0025bd1b5835ee2fa9f28dad",
+      "size_bytes": 1017828
     },
     {
       "executable": false,
@@ -671,8 +671,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_browser_auth.rs",
-      "sha256": "a5ff07572921efcddcd631bb065828f4eade003b8e8e899a308fbfeb74866f76",
-      "size_bytes": 318448
+      "sha256": "2867e0231c8388d0eddca421eedbcad8f94e36444144ca8425fa597d3f97db96",
+      "size_bytes": 324091
     },
     {
       "executable": false,
@@ -1000,8 +1000,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/claude-worker-outcome-diagnostics.md",
-      "sha256": "0ea500183aed2f5d0362928c7eb0231b49d6cc35888bfe404e2862fa9e6232b4",
-      "size_bytes": 4984
+      "sha256": "7fcc01444712e4a87840254f9e37452af79c1b6f2a0811b22aa524199ce74607",
+      "size_bytes": 5574
     },
     {
       "executable": false,
@@ -2894,7 +2894,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-02T05:06:33+00:00",
+  "generated_at": "2026-10-02T05:22:49+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 414,
   "public_roots": [
@@ -2930,5 +2930,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "694dcbbdea2f5998cc644374215711c68c0fe966"
+  "source_commit": "83657166cfdfa1612fbeb5e9b1d44ce8bdb23692"
 }
