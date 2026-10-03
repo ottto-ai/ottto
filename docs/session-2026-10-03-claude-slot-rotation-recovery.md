@@ -31,7 +31,8 @@ exited 1 under the daemon's sanitized environment.
 - A non-zero `auth status` when the slot's credential, read after the
   command, has an access token and an unexpired deadline is the new transient
   `ProbeFailed` (collection state `probe_failed`, retried next pass). It does
-  not raise the needs-attention warning. A missing CLI, a signed-out status or
+  not raise the needs-attention warning. A missing CLI, an explicit
+  signed-out answer (`loggedIn: false`, which the CLI prints with exit 1) or
   an expired credential still reports `CredentialUnavailable`. Usage breaker,
   auth holds and Retry-After are untouched.
 
@@ -67,6 +68,7 @@ No lock change was needed.
 - `production_worker_queue_admits_one_refresher_per_slot`
 - `failed_auth_status_with_valid_credential_is_a_transient_probe_failure`
 - `failed_auth_status_with_expired_credential_stays_credential_unavailable`
+- `failed_auth_status_reporting_signed_out_stays_credential_unavailable`
 - `registered_failure_status_keeps_last_known_unexpired_deadlines`
 
-Four of these fail with the fixes reverted.
+Five of these fail with the fixes reverted.

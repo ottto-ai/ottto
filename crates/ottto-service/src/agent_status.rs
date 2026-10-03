@@ -4696,9 +4696,15 @@ fn resolve_registered_claude_slot(
     let auth = run_claude_slot_command(&slot, &["auth", "status", "--json"], COMMAND_TIMEOUT);
     let final_oauth_account = read_claude_cli_oauth_account(&slot.identity_path(&home_dir()));
     if !auth.command_found || !auth.success {
-        // The CLI may have rotated the token inside this very call, so judge
-        // the credential by a read taken after it, never the pre-call copy.
+        // An explicit signed-out answer is authoritative even when stale
+        // credential material is still readable. Otherwise the CLI may have
+        // rotated the token inside this very call, so judge the credential by
+        // a read taken after it, never the pre-call copy.
+        let explicitly_signed_out = serde_json::from_str::<Value>(&auth.stdout).is_ok_and(|json| {
+            parse_claude_auth_json(&json).login_state == AgentLoginState::SignedOut
+        });
         if auth.command_found
+            && !explicitly_signed_out
             && claude_credential_present_and_unexpired(
                 read_claude_oauth_credential_for_slot(&slot).as_ref(),
                 OffsetDateTime::now_utc(),
@@ -20988,6 +20994,7 @@ exit 1
     fn registered_slot_with_failing_auth_status(
         label: &str,
         expires_at_ms: i64,
+        auth_stdout: &str,
     ) -> (
         PathBuf,
         ClaudeConfigSlotDescriptorV1,
@@ -21008,7 +21015,9 @@ exit 1
         let claude = bin.join("claude");
         fs::write(
             &claude,
-            "#!/bin/sh\necho 'status unavailable' >&2\nexit 1\n",
+            format!(
+                "#!/bin/sh\necho 'status unavailable' >&2\nprintf '%s' '{auth_stdout}'\nexit 1\n"
+            ),
         )
         .expect("write fake claude");
         let security = bin.join("security");
@@ -21060,7 +21069,7 @@ exit 1
         let expires_at_ms =
             (OffsetDateTime::now_utc() + TimeDuration::hours(7)).unix_timestamp() * 1_000;
         let (root, descriptor, _home, _command) =
-            registered_slot_with_failing_auth_status("auth-exit-valid", expires_at_ms);
+            registered_slot_with_failing_auth_status("auth-exit-valid", expires_at_ms, "");
 
         let failure = resolve_registered_claude_slot(descriptor)
             .err()
@@ -21086,7 +21095,27 @@ exit 1
         let expires_at_ms =
             (OffsetDateTime::now_utc() - TimeDuration::minutes(5)).unix_timestamp() * 1_000;
         let (root, descriptor, _home, _command) =
-            registered_slot_with_failing_auth_status("auth-exit-expired", expires_at_ms);
+            registered_slot_with_failing_auth_status("auth-exit-expired", expires_at_ms, "");
+
+        assert_eq!(
+            resolve_registered_claude_slot(descriptor).err(),
+            Some(ClaudeSlotProbeFailure::CredentialUnavailable)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn failed_auth_status_reporting_signed_out_stays_credential_unavailable() {
+        // Claude Code prints `loggedIn: false` and exits 1 when signed out.
+        // Stale readable token material must not turn that into a transient.
+        let expires_at_ms =
+            (OffsetDateTime::now_utc() + TimeDuration::hours(7)).unix_timestamp() * 1_000;
+        let (root, descriptor, _home, _command) = registered_slot_with_failing_auth_status(
+            "auth-exit-signed-out",
+            expires_at_ms,
+            r#"{"loggedIn": false, "authMethod": "none"}"#,
+        );
 
         assert_eq!(
             resolve_registered_claude_slot(descriptor).err(),

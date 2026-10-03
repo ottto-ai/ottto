@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 422,
-  "content_sha256": "cc1de6d30abee845409ae722ee0c297f78fa05ce7519b58276baa6709f80b57b",
+  "content_sha256": "2018c977372a5a29780a8ac2a1968a1b06c9ed32d3256e6dbc651c6020aba055",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "355fa15996dbe597539a9dbb285093c9cbe29815a8405d71455c7ec99c55a003",
-      "size_bytes": 1142221
+      "sha256": "cb35aaf34f25dc25077472fbd8e5332b7e5484a11bcde4a5d77ff478031e6f0a",
+      "size_bytes": 1143504
     },
     {
       "executable": false,
@@ -1868,8 +1868,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-03-claude-slot-rotation-recovery.md",
-      "sha256": "89e5a4fa66b3b4080fe1ba99fd20c3a16aecf772fd1f57b1fd91d5a8cd628836",
-      "size_bytes": 3681
+      "sha256": "67605e8baa494d1ec4c9f2f0e6b8636e6ebbd8d34ac5cc714ad4d7a1ca91cc9f",
+      "size_bytes": 3820
     },
     {
       "executable": false,
