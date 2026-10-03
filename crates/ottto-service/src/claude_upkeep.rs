@@ -618,7 +618,11 @@ fn run_production_upkeep_queue() {
                     .organization_identifier_hash
                     .as_deref(),
             ) {
-                crate::agent_status::clear_claude_oauth_usage_auth_breaker(account, organization);
+                crate::agent_status::clear_claude_oauth_usage_auth_breaker(
+                    account,
+                    organization,
+                    &descriptor.slot_id,
+                );
             }
         }
         // Record an actual completed local worker observation, not queue

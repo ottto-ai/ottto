@@ -95,7 +95,13 @@ wins only an exact quality-and-time tie. Therefore a freshly switched default
 slot may temporarily supply the displayed meters while the registered slot
 remains the durable anchor and still reports its own reconnect or paused health.
 The default slot is then locally marked `shadowed_by_anchor`; its truthful
-collection state is not rewritten. A second registered directory for the same
+collection state is not rewritten. When a managed slot has proved on its last
+pass that it reads the same account and organization as the default login, the
+slot's credential is the only one that asks Anthropic for that account's
+limits; the default login reuses the shared local reading instead of sending
+its own token. A rejected credential (HTTP 401 or 403) backs off on its own,
+starting at 15 minutes, and does not pause a different credential for the same
+account. A second registered directory for the same
 binding remains an actionable duplicate instead of being silently treated as
 another account.
 
