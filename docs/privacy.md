@@ -99,6 +99,19 @@ daemon prunes accepted hashes that are no longer present in the current scan, so
 a permanently invalid session cannot make the checkpoint grow with every
 historical revision.
 
+Snapshot upload receipts share a bounded, owner-only atomic local ring: at
+most 500 receipts and 4 MiB. A request-specific validated ACK may retain a
+private content-free annotation with full semantic fingerprints, body-witness
+versions and hashes, one-way session and destination identifiers, hashed
+accepted-head or conflict-challenge references, occurrence counts, uploaded
+cache-patch presence, two numeric usage scalars and coverage. At most 50 entity
+records are retained per receipt. This diagnostic
+annotation survives ordinary checkpoint retirement; it never becomes ACK,
+retry, checkpoint or publication authority. Raw session/account/device ids,
+head tokens, request bodies, local paths and credentials are not retained.
+Public receipt responses keep their existing abbreviated identifiers, and
+private annotations are excluded from diagnostics and uploaded payloads.
+
 The optional Codex Cloud Sessions collector is experimental and disabled by
 default. It uses an officially documented, upstream-experimental Codex CLI
 surface. Its single daemon supervisor starts normally but remains inert until

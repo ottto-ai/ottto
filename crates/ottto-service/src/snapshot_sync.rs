@@ -2781,6 +2781,10 @@ fn sync_source(
             && activity_hint.session_attribution_labels_enabled,
     };
     let upload_destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
+    let receipt_client = client
+        .clone()
+        .with_receipt_destination_namespace(upload_destination_namespace.clone());
+    let client = &receipt_client;
     let checkpoint_namespace = attribution_context
         .as_ref()
         .map(SessionAttributionContext::checkpoint_namespace);
