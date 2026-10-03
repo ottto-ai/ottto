@@ -437,6 +437,7 @@ fn observe_registered_slot_upkeep_reading(
         // Persisted local status intentionally records deadlines, not grant
         // contents. The background worker performs the authoritative read.
         has_refresh_token: true,
+        cleared_by_cli: false,
     };
     if !network_enabled {
         return observation_with_metadata(
@@ -446,15 +447,33 @@ fn observe_registered_slot_upkeep_reading(
         );
     }
     // Persisted deadlines are a cache of the last observation, not proof the
-    // credential is gone. Re-read the slot's own metadata before latching.
+    // credential is gone. Re-read the slot's own metadata (one keychain read,
+    // never a CLI spawn) when the deadline is missing, and while the slot is
+    // waiting for login so a reconnect or official login resumes it.
     let mut witness_descriptor = None;
-    if parse_timestamp(metadata.access_expires_at.as_deref()).is_none() {
-        if let Some(live) = descriptor
+    let waiting_for_login = descriptor
+        .collection
+        .upkeep
+        .as_ref()
+        .is_some_and(|status| status.result == ClaudeConfigSlotUpkeepResultV1::NeedsLogin);
+    if waiting_for_login || parse_timestamp(metadata.access_expires_at.as_deref()).is_none() {
+        let live = descriptor
             .config_dir
             .as_deref()
             .and_then(|config_dir| ClaudeConfigDirSlot::registered(config_dir.to_string()).ok())
-            .and_then(|slot| credentials.read(&slot))
-            .filter(|live| parse_timestamp(live.access_expires_at.as_deref()).is_some())
+            .and_then(|slot| credentials.read(&slot));
+        if let Some(cleared) = live.as_ref().filter(|live| live.cleared_by_cli) {
+            // Claude Code signed this slot out after a rejected refresh. No
+            // `auth status` or `doctor` can restore it; wait for the stored
+            // item to carry tokens again.
+            return observation_with_metadata(
+                false,
+                ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
+                cleared,
+            );
+        }
+        if let Some(live) =
+            live.filter(|live| parse_timestamp(live.access_expires_at.as_deref()).is_some())
         {
             let mut current = descriptor.clone();
             current.collection.access_expires_at = live.access_expires_at.clone();
@@ -1546,6 +1565,7 @@ mod tests {
             access_expires_at: Some(access.to_string()),
             refresh_token_expires_at: Some(refresh.to_string()),
             has_refresh_token: true,
+            cleared_by_cli: false,
         }
     }
 
@@ -2209,6 +2229,7 @@ mod tests {
                     access_expires_at: Some("2026-09-24T12:27:25.708Z".to_string()),
                     refresh_token_expires_at: Some("2026-10-09T23:27:42.708Z".to_string()),
                     has_refresh_token: false,
+                    cleared_by_cli: false,
                 })]),
                 &CountingProcess {
                     result: DoctorProcessResult::ExitZero,
@@ -2270,6 +2291,7 @@ mod tests {
             access_expires_at: descriptor.collection.access_expires_at.clone(),
             refresh_token_expires_at: descriptor.collection.relogin_required_at.clone(),
             has_refresh_token: false,
+            cleared_by_cli: false,
         })]);
         let process = CountingProcess {
             result: DoctorProcessResult::ExitZero,
@@ -2357,6 +2379,7 @@ mod tests {
                 access_expires_at: Some("2026-08-04T10:00:00Z".to_string()),
                 refresh_token_expires_at: Some("2026-09-01T00:00:00Z".to_string()),
                 has_refresh_token: false,
+                cleared_by_cli: false,
             })]),
             &FixedProcess(DoctorProcessResult::ExitZero),
             &ProductionFinalSpawnGate,
@@ -2393,6 +2416,7 @@ mod tests {
                 // grant, so it must not make the credential look refreshable.
                 refresh_token_expires_at: Some("2026-09-15T04:52:51Z".to_string()),
                 has_refresh_token: false,
+                cleared_by_cli: false,
             })]),
             &CountingProcess {
                 result: DoctorProcessResult::ExitZero,
@@ -3337,5 +3361,100 @@ mod tests {
             .descriptors
             .retain(|queued| queued.slot_id != descriptor.slot_id);
         queue.running = false;
+    }
+
+    fn cli_cleared_metadata() -> ClaudeOAuthCredentialMetadata {
+        ClaudeOAuthCredentialMetadata {
+            access_expires_at: Some("1970-01-01T00:00:00Z".to_string()),
+            refresh_token_expires_at: Some(rfc3339_from_now(TimeDuration::days(25))),
+            has_refresh_token: false,
+            cleared_by_cli: true,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn cli_cleared_credential_needs_login_without_worker_or_collection() {
+        let root = temp_dir("cli-cleared-needs-login");
+        let _support_guard = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+
+        let observation = observe_registered_slot_upkeep_reading(
+            &descriptor_without_persisted_deadline(),
+            true,
+            true,
+            &SequenceCredentials::new(vec![Some(cli_cleared_metadata())]),
+            &mut |_| panic!("a CLI-cleared credential must not queue `claude doctor`"),
+        );
+
+        assert!(
+            !observation.proceed_with_collection,
+            "no `claude auth status` for a CLI-cleared credential"
+        );
+        assert_eq!(
+            observation.status.result,
+            ClaudeConfigSlotUpkeepResultV1::NeedsLogin
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn needs_login_slot_resumes_once_the_stored_item_carries_tokens_again() {
+        let root = temp_dir("needs-login-resumes");
+        let _support_guard = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let mut waiting = descriptor();
+        waiting.collection.access_expires_at = Some("1970-01-01T00:00:00Z".to_string());
+        waiting.collection.upkeep = Some(ClaudeConfigSlotUpkeepStatusV1 {
+            result: ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
+            due_access_expires_at: Some("1970-01-01T00:00:00Z".to_string()),
+            refresh_token_expires_at: None,
+            attempted_at: None,
+            next_allowed_attempt_at: None,
+            consecutive_failures: 0,
+        });
+
+        let still_cleared = observe_registered_slot_upkeep_reading(
+            &waiting,
+            true,
+            true,
+            &SequenceCredentials::new(vec![Some(cli_cleared_metadata())]),
+            &mut |_| panic!("still cleared: no worker"),
+        );
+        assert!(!still_cleared.proceed_with_collection);
+        assert_eq!(
+            still_cleared.status.result,
+            ClaudeConfigSlotUpkeepResultV1::NeedsLogin
+        );
+
+        let access = rfc3339_from_now(TimeDuration::hours(8));
+        let reconnected = observe_registered_slot_upkeep_reading(
+            &waiting,
+            true,
+            true,
+            &SequenceCredentials::new(vec![Some(metadata(
+                &access,
+                &rfc3339_from_now(TimeDuration::days(30)),
+            ))]),
+            &mut |_| panic!("valid access needs no worker"),
+        );
+        assert!(
+            reconnected.proceed_with_collection,
+            "a reconnect resumes collection without a manual state reset"
+        );
+        assert_eq!(
+            reconnected.status.result,
+            ClaudeConfigSlotUpkeepResultV1::NotRequired
+        );
+        assert_eq!(
+            reconnected.status.due_access_expires_at.as_deref(),
+            Some(access.as_str())
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }
