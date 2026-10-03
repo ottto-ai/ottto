@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::snapshot_client::{SnapshotBatchResponse, SnapshotEntityRef, SnapshotEntityRejection};
+use crate::snapshots::SnapshotBatchRequest;
 
 pub const UPLOAD_RECEIPT_RING_CAPACITY: usize = 500;
 const UPLOAD_RECEIPTS_FILENAME: &str = "snapshot_upload_receipts.json";
@@ -28,7 +29,269 @@ static CORRUPTION_LOGGED: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PersistedReceiptRing {
     schema_version: u16,
-    receipts: Vec<UploadReceiptV1>,
+    receipts: Vec<PersistedReceipt>,
+}
+
+// Internal disk fields never enter the public protocol DTO or diagnostics reader.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedReceipt {
+    #[serde(flatten)]
+    public: UploadReceiptV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validated_evidence: Option<ValidatedReceiptEvidence>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ValidatedReceiptEvidence {
+    schema_version: u16,
+    destination_namespace_hash: String,
+    api_destination_hash: String,
+    producer_version: Option<String>,
+    attempt_identity: String,
+    head_cas: bool,
+    entity_ack_contract: String,
+    requested_occurrences: u64,
+    requested_distinct_entities: usize,
+    retained_entities: usize,
+    total_entities: usize,
+    outcome_occurrences: std::collections::BTreeMap<String, u64>,
+    coverage: String,
+    entities: Vec<ValidatedReceiptEntity>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ValidatedReceiptEntity {
+    session_hash: String,
+    snapshot_fingerprint: String,
+    request_occurrences: u64,
+    uploaded_cache_patch_present: bool,
+    uploaded_request_count: u64,
+    uploaded_output_tokens: u64,
+    outcome: String,
+    outcome_occurrences: u64,
+    request_body_witness_version: Option<u64>,
+    request_body_witness_digest: String,
+    acknowledged_body_witness_version: Option<u64>,
+    acknowledged_body_witness_digest: Option<String>,
+    accepted_head_hash: Option<String>,
+    conflict_challenge_hash: Option<String>,
+}
+
+pub(crate) fn full_hash(domain: &[u8], value: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update([0]);
+    digest.update(value.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn validated_evidence(
+    request: &SnapshotBatchRequest,
+    response: &SnapshotBatchResponse,
+    destination: &str,
+    api_destination: &str,
+    head_cas: bool,
+    attempt_time: &str,
+    server_request_id: Option<&str>,
+) -> Option<ValidatedReceiptEvidence> {
+    let head_cas = head_cas
+        || request
+            .snapshots
+            .iter()
+            .any(|item| item.cache_observations.is_some());
+    if !valid_digest(destination)
+        || !valid_digest(api_destination)
+        || response.disabled
+        || response.entity_ack_contract.as_deref()
+            != Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT)
+        || response
+            .validate_entity_ack_with_head_cas(request, head_cas)
+            .is_err()
+    {
+        return None;
+    }
+    let mut requested = std::collections::BTreeMap::new();
+    for item in &request.snapshots {
+        if !valid_digest(&item.snapshot_fingerprint) {
+            return None;
+        }
+        let entry = requested
+            .entry((
+                item.source_session_id.as_str(),
+                item.snapshot_fingerprint.as_str(),
+            ))
+            .or_insert((0u64, item));
+        entry.0 += 1;
+    }
+    let mut entities = Vec::new();
+    for (outcome, refs) in [
+        ("accepted", &response.accepted_entities),
+        ("unchanged", &response.unchanged_entities),
+        ("conflict", &response.conflict_entities),
+    ] {
+        for reference in refs {
+            let (count, item) = requested.get(&(
+                reference.source_session_id.as_str(),
+                reference.snapshot_fingerprint.as_str(),
+            ))?;
+            if reference
+                .head_etag
+                .as_ref()
+                .is_some_and(|v| !valid_digest(v))
+                || reference
+                    .head_challenge
+                    .as_ref()
+                    .is_some_and(|v| !valid_digest(v))
+            {
+                return None;
+            }
+            if reference
+                .body_witness_digest
+                .as_ref()
+                .is_some_and(|v| !valid_digest(v))
+            {
+                return None;
+            }
+            if entities.len() >= 50 {
+                continue;
+            }
+            entities.push(ValidatedReceiptEntity {
+                session_hash: full_hash(
+                    b"ottto.validated_receipt.session:v1",
+                    &reference.source_session_id,
+                ),
+                snapshot_fingerprint: reference.snapshot_fingerprint.clone(),
+                request_occurrences: *count,
+                uploaded_cache_patch_present: item.cache_observations.is_some(),
+                uploaded_request_count: item.request_count,
+                uploaded_output_tokens: item.output_tokens,
+                outcome: outcome.into(),
+                outcome_occurrences: reference.occurrence_count,
+                request_body_witness_version:
+                    crate::snapshots::snapshot_upload_body_witness_version(item),
+                request_body_witness_digest: crate::snapshots::snapshot_upload_body_witness(item),
+                acknowledged_body_witness_version: reference.body_witness_version,
+                acknowledged_body_witness_digest: reference.body_witness_digest.clone(),
+                accepted_head_hash: reference
+                    .head_etag
+                    .as_deref()
+                    .map(|h| full_hash(b"ottto.validated_receipt.head:v1", h)),
+                conflict_challenge_hash: reference
+                    .head_challenge
+                    .as_deref()
+                    .map(|h| full_hash(b"ottto.validated_receipt.challenge:v1", h)),
+            });
+        }
+    }
+    for reference in &response.rejected_entities {
+        let (count, item) = requested.get(&(
+            reference.source_session_id.as_str(),
+            reference.snapshot_fingerprint.as_str(),
+        ))?;
+        if entities.len() >= 50 {
+            continue;
+        }
+        entities.push(ValidatedReceiptEntity {
+            session_hash: full_hash(
+                b"ottto.validated_receipt.session:v1",
+                &reference.source_session_id,
+            ),
+            snapshot_fingerprint: reference.snapshot_fingerprint.clone(),
+            request_occurrences: *count,
+            uploaded_cache_patch_present: item.cache_observations.is_some(),
+            uploaded_request_count: item.request_count,
+            uploaded_output_tokens: item.output_tokens,
+            outcome: "rejected".into(),
+            outcome_occurrences: reference.occurrence_count,
+            request_body_witness_version: crate::snapshots::snapshot_upload_body_witness_version(
+                item,
+            ),
+            request_body_witness_digest: crate::snapshots::snapshot_upload_body_witness(item),
+            acknowledged_body_witness_version: None,
+            acknowledged_body_witness_digest: None,
+            accepted_head_hash: None,
+            conflict_challenge_hash: None,
+        });
+    }
+    let total_entities = response.accepted_entities.len()
+        + response.unchanged_entities.len()
+        + response.conflict_entities.len()
+        + response.rejected_entities.len();
+    entities.truncate(50);
+    Some(ValidatedReceiptEvidence {
+        schema_version: 1,
+        destination_namespace_hash: destination.into(),
+        api_destination_hash: api_destination.into(),
+        producer_version: request
+            .collector_version
+            .as_ref()
+            .filter(|v| {
+                v.len() <= 64
+                    && v.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
+            })
+            .cloned(),
+        attempt_identity: full_hash(
+            b"ottto.validated_receipt.attempt:v1",
+            &format!(
+                "{destination}:{attempt_time}:{}",
+                server_request_id.unwrap_or("")
+            ),
+        ),
+        head_cas,
+        entity_ack_contract: response.entity_ack_contract.clone()?,
+        requested_occurrences: request.snapshots.len() as u64,
+        requested_distinct_entities: requested.len(),
+        retained_entities: entities.len(),
+        total_entities,
+        outcome_occurrences: [
+            (
+                "accepted",
+                response
+                    .accepted_entities
+                    .iter()
+                    .map(|e| e.occurrence_count)
+                    .sum(),
+            ),
+            (
+                "unchanged",
+                response
+                    .unchanged_entities
+                    .iter()
+                    .map(|e| e.occurrence_count)
+                    .sum(),
+            ),
+            (
+                "conflict",
+                response
+                    .conflict_entities
+                    .iter()
+                    .map(|e| e.occurrence_count)
+                    .sum(),
+            ),
+            (
+                "rejected",
+                response
+                    .rejected_entities
+                    .iter()
+                    .map(|e| e.occurrence_count)
+                    .sum(),
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect(),
+        coverage: if total_entities <= 50 {
+            "complete"
+        } else {
+            "truncated"
+        }
+        .into(),
+        entities,
+    })
 }
 
 /// Status-safe labels captured with a receipt. Neither value contains a raw
@@ -93,6 +356,29 @@ pub fn append_success_with_context(
     response: &SnapshotBatchResponse,
     context: &UploadReceiptContext,
 ) -> Result<()> {
+    append_success_with_evidence_context(
+        state_dir,
+        source,
+        batch_item_count,
+        http_status,
+        server_request_id,
+        response,
+        context,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_success_with_evidence_context(
+    state_dir: &Path,
+    source: SourceKind,
+    batch_item_count: usize,
+    http_status: u16,
+    server_request_id: Option<&str>,
+    response: &SnapshotBatchResponse,
+    context: &UploadReceiptContext,
+    evidence_request: Option<(&SnapshotBatchRequest, &str, &str, bool)>,
+) -> Result<()> {
     let outcome = if response.disabled {
         UploadReceiptOutcomeV1::Rejected
     } else if response.rejected_entities.is_empty() && response.conflict_entities.is_empty() {
@@ -133,10 +419,22 @@ pub fn append_success_with_context(
         .take(remaining)
         .map(sanitize_entity_rejection)
         .collect();
-    append(
+    let uploaded_at = now_rfc3339();
+    let evidence = evidence_request.and_then(|(request, namespace, api_destination, cas)| {
+        validated_evidence(
+            request,
+            response,
+            namespace,
+            api_destination,
+            cas,
+            &uploaded_at,
+            server_request_id,
+        )
+    });
+    append_with_evidence(
         state_dir,
         UploadReceiptV1 {
-            uploaded_at: now_rfc3339(),
+            uploaded_at,
             outcome,
             http_status: Some(http_status),
             server_request_id: sanitize_server_request_id(server_request_id),
@@ -151,6 +449,7 @@ pub fn append_success_with_context(
             conflict_entities,
             rejected_entities,
         },
+        evidence,
     )
 }
 
@@ -255,6 +554,7 @@ pub fn read(
         .receipts
         .into_iter()
         .rev()
+        .map(|receipt| receipt.public)
         .filter(|receipt| {
             source
                 .as_ref()
@@ -304,19 +604,49 @@ fn empty_receipt(
 }
 
 fn append(state_dir: &Path, receipt: UploadReceiptV1) -> Result<()> {
+    append_with_evidence(state_dir, receipt, None)
+}
+
+fn append_with_evidence(
+    state_dir: &Path,
+    receipt: UploadReceiptV1,
+    evidence: Option<ValidatedReceiptEvidence>,
+) -> Result<()> {
     let _guard = RECEIPT_FILE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = upload_receipts_path(state_dir);
     let mut ring = load_locked(&path)?;
-    ring.receipts.push(receipt);
+    ring.receipts.push(PersistedReceipt {
+        public: receipt,
+        validated_evidence: evidence,
+    });
     if ring.receipts.len() > UPLOAD_RECEIPT_RING_CAPACITY {
         let overflow = ring.receipts.len() - UPLOAD_RECEIPT_RING_CAPACITY;
         ring.receipts.drain(..overflow);
     }
-    let payload = serde_json::to_vec(&ring).context("serialize upload receipt ring")?;
+    let mut payload = serde_json::to_vec(&ring).context("serialize upload receipt ring")?;
     if payload.len() as u64 > MAX_RECEIPT_FILE_BYTES {
-        anyhow::bail!("upload receipt ring exceeds its private state size bound");
+        let mut remaining_bytes = payload.len();
+        let mut evict = 0;
+        // Each removed row also removes one comma while at least one row remains.
+        // Measure once instead of repeatedly serializing the whole ring per eviction.
+        for row in ring
+            .receipts
+            .iter()
+            .take(ring.receipts.len().saturating_sub(1))
+        {
+            remaining_bytes -= serde_json::to_vec(row)?.len() + 1;
+            evict += 1;
+            if remaining_bytes as u64 <= MAX_RECEIPT_FILE_BYTES {
+                break;
+            }
+        }
+        if remaining_bytes as u64 > MAX_RECEIPT_FILE_BYTES {
+            anyhow::bail!("single upload receipt exceeds private state bound");
+        }
+        ring.receipts.drain(..evict);
+        payload = serde_json::to_vec(&ring).context("serialize bounded upload receipt ring")?;
     }
     write_owner_only_file_atomic(&path, &payload).context("persist upload receipt ring")
 }
@@ -486,6 +816,302 @@ mod tests {
             rejected_entities: Vec::new(),
             conflict_entities: Vec::new(),
         }
+    }
+
+    fn proof_request(source: &str, cache: bool) -> SnapshotBatchRequest {
+        let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        item.context_curve = None;
+        if !cache {
+            item.cache_observations = None;
+            item.cache_observations_state = None;
+        }
+        SnapshotBatchRequest {
+            schema_version: crate::snapshots::SNAPSHOT_SCHEMA_VERSION,
+            source: source.into(),
+            machine_id: "a".repeat(64),
+            collector_version: Some("0.1.synthetic".into()),
+            snapshots: vec![item],
+            upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        }
+    }
+    fn proof_response(request: &SnapshotBatchRequest, cas: bool) -> SnapshotBatchResponse {
+        let mut ack = response(&request.snapshots[0].source_session_id);
+        ack.accepted_entities[0].snapshot_fingerprint =
+            request.snapshots[0].snapshot_fingerprint.clone();
+        if request.snapshots[0].cache_observations.is_some() {
+            ack.accepted_entities[0].body_witness_version = Some(14);
+            ack.accepted_entities[0].body_witness_digest = Some(
+                crate::snapshots::snapshot_upload_body_witness(&request.snapshots[0]),
+            );
+        }
+        ack.accepted_entities[0].head_etag = cas.then(|| "e".repeat(64));
+        ack
+    }
+    fn evidence(
+        request: &SnapshotBatchRequest,
+        ack: &SnapshotBatchResponse,
+        cas: bool,
+    ) -> Option<ValidatedReceiptEvidence> {
+        validated_evidence(
+            request,
+            ack,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            cas,
+            "2026-10-03T00:00:00Z",
+            Some("safe-request"),
+        )
+    }
+
+    #[test]
+    fn private_proof_refuses_unvalidated_legacy_disabled_and_foreign_acks() {
+        let request = proof_request("codex", true);
+        let good = proof_response(&request, true);
+        assert!(evidence(&request, &good, true).is_some());
+        assert!(validated_evidence(
+            &request,
+            &good,
+            &"a".repeat(64),
+            "short",
+            true,
+            "synthetic",
+            None
+        )
+        .is_none());
+        for kind in [
+            "foreign",
+            "missing_body",
+            "bad_body",
+            "missing_head",
+            "short_head",
+            "duplicate",
+            "short_fp",
+            "short_partition",
+            "legacy",
+            "disabled",
+        ] {
+            let mut req = request.clone();
+            let mut ack = good.clone();
+            match kind {
+                "foreign" => ack.accepted_entities[0].source_session_id = "unrequested".into(),
+                "missing_body" => {
+                    ack.accepted_entities[0].body_witness_version = None;
+                    ack.accepted_entities[0].body_witness_digest = None;
+                }
+                "bad_body" => ack.accepted_entities[0].body_witness_digest = Some("f".repeat(64)),
+                "missing_head" => ack.accepted_entities[0].head_etag = None,
+                "short_head" => ack.accepted_entities[0].head_etag = Some("e".repeat(12)),
+                "duplicate" => ack.accepted_entities.push(ack.accepted_entities[0].clone()),
+                "short_fp" => {
+                    req.snapshots[0].snapshot_fingerprint = "123456789abc".into();
+                    ack.accepted_entities[0].snapshot_fingerprint = "123456789abc".into();
+                }
+                "short_partition" => ack.accepted_entities.clear(),
+                "legacy" => {
+                    ack.entity_ack_contract = None;
+                    ack.accepted_entities.clear();
+                }
+                "disabled" => {
+                    ack.disabled = true;
+                    ack.accepted = 0;
+                    ack.accepted_entities.clear();
+                }
+                _ => unreachable!(),
+            }
+            assert!(evidence(&req, &ack, true).is_none(), "{kind}");
+        }
+        let ordinary = proof_request("codex", false);
+        let mut legacy = proof_response(&ordinary, false);
+        legacy.entity_ack_contract = None;
+        legacy.accepted_entities.clear();
+        assert!(legacy
+            .validate_entity_ack_with_head_cas(&ordinary, false)
+            .is_ok());
+        assert!(evidence(&ordinary, &legacy, false).is_none());
+    }
+
+    #[test]
+    fn private_proof_retains_mixed_multiplicity_without_content_and_projects_v1() {
+        let dir = temp_dir();
+        let mut request = proof_request("claude_code", true);
+        let first = request.snapshots[0].clone();
+        request.snapshots.push(first.clone());
+        for n in 2..5 {
+            let mut item = first.clone();
+            item.snapshot_fingerprint = format!("{n:064x}");
+            request.snapshots.push(item);
+        }
+        let mut ack = proof_response(&request, true);
+        ack.accepted = 3;
+        ack.accepted_entities[0].occurrence_count = 2;
+        let mut unchanged = ack.accepted_entities[0].clone();
+        unchanged.snapshot_fingerprint = request.snapshots[2].snapshot_fingerprint.clone();
+        unchanged.occurrence_count = 1;
+        ack.unchanged_entities.push(unchanged.clone());
+        let mut conflict = unchanged;
+        conflict.snapshot_fingerprint = request.snapshots[3].snapshot_fingerprint.clone();
+        conflict.head_etag = None;
+        conflict.head_challenge = Some("c".repeat(64));
+        ack.conflict_entities.push(conflict);
+        ack.rejected_entities.push(SnapshotEntityRejection {
+            source_session_id: first.source_session_id.clone(),
+            snapshot_fingerprint: request.snapshots[4].snapshot_fingerprint.clone(),
+            occurrence_count: 1,
+            reason: "synthetic".into(),
+            detail: "must-not-persist".into(),
+            permanent: true,
+        });
+        let proof = evidence(&request, &ack, true).unwrap();
+        assert_eq!(proof.requested_occurrences, 5);
+        assert_eq!(proof.requested_distinct_entities, 4);
+        assert_eq!(proof.outcome_occurrences["accepted"], 2);
+        assert_eq!(proof.outcome_occurrences.values().sum::<u64>(), 5);
+        assert_eq!(proof.entities.len(), 4);
+        assert_eq!(proof.entities[0].request_occurrences, 2);
+        assert!(proof.entities[0].uploaded_cache_patch_present);
+        assert_eq!(
+            proof.entities[0].uploaded_request_count,
+            first.request_count
+        );
+        assert_eq!(
+            proof.entities[0].uploaded_output_tokens,
+            first.output_tokens
+        );
+        assert_eq!(proof.entities[0].outcome_occurrences, 2);
+        assert_eq!(
+            proof
+                .entities
+                .iter()
+                .map(|e| e.outcome.as_str())
+                .collect::<Vec<_>>(),
+            ["accepted", "unchanged", "conflict", "rejected"]
+        );
+        assert!(proof.entities[2].accepted_head_hash.is_none());
+        assert!(proof.entities[2].conflict_challenge_hash.is_some());
+        append_success_with_evidence_context(
+            &dir,
+            SourceKind::ClaudeCode,
+            5,
+            200,
+            Some("safe-request"),
+            &ack,
+            &UploadReceiptContext::default(),
+            Some((&request, &"a".repeat(64), &"b".repeat(64), true)),
+        )
+        .unwrap();
+        let private = load_locked(&upload_receipts_path(&dir)).unwrap();
+        assert!(private.receipts[0].validated_evidence.is_some());
+        let public = read(&dir, 500, None, None).unwrap();
+        let public_json = serde_json::to_string(&public).unwrap();
+        assert!(!public_json.contains("validated_evidence"));
+        assert!(!public_json.contains(&first.snapshot_fingerprint));
+        let bytes = std::fs::read(upload_receipts_path(&dir)).unwrap();
+        let disk = String::from_utf8(bytes).unwrap();
+        assert!(!disk.contains(&first.source_session_id));
+        assert!(!disk.contains(&"e".repeat(64)));
+        assert!(!disk.contains("must-not-persist"));
+        assert_eq!(
+            std::fs::metadata(upload_receipts_path(&dir))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        // Namespace/API changes identify different destinations; attempts are distinct.
+        let other = validated_evidence(
+            &request,
+            &ack,
+            &"d".repeat(64),
+            &"f".repeat(64),
+            true,
+            "2026-10-03T00:00:01Z",
+            Some("safe-request"),
+        )
+        .unwrap();
+        assert_ne!(
+            proof.destination_namespace_hash,
+            other.destination_namespace_hash
+        );
+        assert_ne!(proof.api_destination_hash, other.api_destination_hash);
+        assert_ne!(proof.attempt_identity, other.attempt_identity);
+    }
+
+    #[test]
+    fn private_proof_old_rows_byte_eviction_and_truncation_remain_readable() {
+        let dir = temp_dir();
+        let mut request = proof_request("codex", false);
+        let first = request.snapshots[0].clone();
+        request.snapshots.clear();
+        for n in 1..=51 {
+            let mut item = first.clone();
+            item.snapshot_fingerprint = format!("{n:064x}");
+            request.snapshots.push(item);
+        }
+        let mut ack = proof_response(&request, false);
+        ack.accepted = 51;
+        ack.accepted_entities = (0..51)
+            .map(|n| {
+                let mut e = ack.accepted_entities[0].clone();
+                e.snapshot_fingerprint = request.snapshots[n].snapshot_fingerprint.clone();
+                e
+            })
+            .collect();
+        let proof = evidence(&request, &ack, false).unwrap();
+        assert_eq!(proof.total_entities, 51);
+        assert_eq!(proof.retained_entities, 50);
+        assert_eq!(proof.coverage, "truncated");
+        assert!(!proof.entities[0].uploaded_cache_patch_present);
+        {
+            append_success_with_evidence_context(
+                &dir,
+                SourceKind::Codex,
+                51,
+                200,
+                None,
+                &ack,
+                &UploadReceiptContext::default(),
+                Some((&request, &"a".repeat(64), &"b".repeat(64), false)),
+            )
+            .unwrap();
+        }
+        let path = upload_receipts_path(&dir);
+        let row = serde_json::to_value(load_locked(&path).unwrap().receipts.remove(0)).unwrap();
+        let row_bytes = serde_json::to_vec(&row).unwrap().len();
+        let count = ((MAX_RECEIPT_FILE_BYTES as usize - 128) / (row_bytes + 1)).min(500);
+        let seeded = serde_json::json!({"schema_version":1,"receipts":vec![row; count]});
+        std::fs::write(&path, serde_json::to_vec(&seeded).unwrap()).unwrap();
+        append_success_with_evidence_context(
+            &dir,
+            SourceKind::Codex,
+            51,
+            200,
+            None,
+            &ack,
+            &UploadReceiptContext::default(),
+            Some((&request, &"a".repeat(64), &"b".repeat(64), false)),
+        )
+        .unwrap();
+        let ring = load_locked(&upload_receipts_path(&dir)).unwrap();
+        assert!(ring.receipts.len() < 500);
+        assert!(ring.receipts.len() < count + 1);
+        assert!(ring.receipts.last().unwrap().validated_evidence.is_some());
+        assert!(!ring.receipts.is_empty());
+        assert!(
+            std::fs::metadata(upload_receipts_path(&dir)).unwrap().len() <= MAX_RECEIPT_FILE_BYTES
+        );
+        let old = read(&dir, 1, None, None).unwrap().receipts.remove(0);
+        std::fs::write(
+            upload_receipts_path(&dir),
+            serde_json::to_vec(&serde_json::json!({"schema_version":1,"receipts":[old]})).unwrap(),
+        )
+        .unwrap();
+        let migrated = load_locked(&upload_receipts_path(&dir)).unwrap();
+        assert!(migrated.receipts[0].validated_evidence.is_none());
+        assert_eq!(read(&dir, 1, None, None).unwrap().receipts.len(), 1);
+        clear(&dir).unwrap();
+        assert!(!upload_receipts_path(&dir).exists());
     }
 
     #[test]
