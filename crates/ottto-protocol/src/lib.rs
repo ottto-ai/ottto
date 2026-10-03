@@ -2842,6 +2842,12 @@ pub struct ClaudeConfigSlotCollectionStatusV1 {
     pub quota_check_diagnostics: Vec<AgentStatusDiagnostic>,
     #[serde(default)]
     pub diagnostics: Vec<ClaudeConfigSlotDiagnosticV1>,
+    /// Machine-local notice that this registered connection's approved
+    /// account was taken from the login observed on it (trust on first use)
+    /// rather than a verified setup or reconnect. Names a plan, never an
+    /// email, and is never uploaded. Older clients ignore this additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

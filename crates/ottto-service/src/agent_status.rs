@@ -3434,8 +3434,12 @@ fn collect_claude_status_snapshots(
             }
         }
     }
+    let approvals = claude_slot_approvals();
     for (slot_id, status) in &mut slot_states {
         inherit_claude_slot_account_profile(status, previous_states.slots.get(slot_id));
+        if slot_id != "default" {
+            apply_claude_slot_approval_notice(status, approvals.get(slot_id));
+        }
     }
     let mut quarantined_slots = claude_cross_binding_meter_collisions(&candidates);
     for slot_id in &quarantined_slots {
@@ -4250,7 +4254,11 @@ pub(crate) fn collect_registered_claude_slot_status(
     let expected_binding =
         match claude_slot_pre_collection_gate(&descriptor, previous, &captured_at) {
             Ok(expected) => expected,
-            Err(status) => {
+            Err(mut status) => {
+                apply_claude_slot_approval_notice(
+                    &mut status,
+                    claude_slot_approvals().get(slot_id),
+                );
                 let _ = persist_one_claude_slot_collection_state(slot_id, &status);
                 return status;
             }
@@ -4317,6 +4325,7 @@ pub(crate) fn collect_registered_claude_slot_status(
     };
     apply_claude_upkeep_observation(&mut status, upkeep.status);
     inherit_claude_slot_account_profile(&mut status, previous);
+    apply_claude_slot_approval_notice(&mut status, claude_slot_approvals().get(slot_id));
     let _ = persist_one_claude_slot_collection_state(slot_id, &status);
     status
 }
@@ -5707,20 +5716,19 @@ fn claude_slot_local_login(
     Some((binding, claude_oauth_plan_type_for_label(&oauth)))
 }
 
-/// Whether this registered slot's current Claude login contradicts the
-/// account it is approved for. Read-only; used by the upkeep worker's final
-/// spawn and publication fences so a refresh never runs for another login.
-pub(crate) fn claude_slot_login_contradicts_approval(
-    descriptor: &ClaudeConfigSlotDescriptorV1,
-) -> bool {
-    let Some(expected) = FileClaudeConfigSlotSettingsStore::default()
-        .expected_slot_binding(&descriptor.slot_id)
-        .ok()
-        .flatten()
-    else {
-        return false;
-    };
-    claude_slot_local_login(descriptor).is_some_and(|(current, _)| current != expected)
+/// Whether this registered slot's current Claude login is not provably the
+/// account it is approved for: another account, or an account file that is
+/// missing, unreadable or without strong ids. Read-only; used by the upkeep
+/// worker's final spawn and publication fences so a refresh never runs for
+/// another or an unknown login. An unreadable approval also refuses.
+pub(crate) fn claude_slot_login_unapproved(descriptor: &ClaudeConfigSlotDescriptorV1) -> bool {
+    match FileClaudeConfigSlotSettingsStore::default().expected_slot_binding(&descriptor.slot_id) {
+        Ok(None) => false,
+        Ok(Some(expected)) => {
+            claude_slot_local_login(descriptor).map_or(true, |(current, _)| current != expected)
+        }
+        Err(_) => true,
+    }
 }
 
 /// Plan type for local wording only, from `.claude.json` alone. Mirrors the
@@ -5812,6 +5820,36 @@ fn claude_slot_binding_mismatch_status(
     previous: Option<&ClaudeConfigSlotCollectionStatusV1>,
     captured_at: &str,
 ) -> ClaudeConfigSlotCollectionStatusV1 {
+    claude_slot_approval_blocked_status(
+        expected,
+        ClaudeSlotProbeFailure::IdentityMismatch,
+        |approved_plan| claude_slot_binding_mismatch_message(approved_plan, signed_in_plan),
+        previous,
+        captured_at,
+    )
+}
+
+/// Local message when a bound slot's Claude account file cannot be read.
+fn claude_slot_unknown_login_message(approved_plan: Option<&str>) -> String {
+    let approved = claude_plan_label(approved_plan)
+        .map(|label| format!("the {label} account"))
+        .unwrap_or_else(|| "the account it was set up with".to_string());
+    format!(
+        "Claude Code's account file for this connection is missing or unreadable, so Ottto cannot confirm it is still signed in to {approved}. Ottto paused limit reading, uploads and token refresh here. Sign in again with {approved} to resume."
+    )
+}
+
+/// Status for a bound slot that must not be collected or refreshed this
+/// pass. It keeps the approved pair, profile and that account's own last
+/// complete reading (stale), so local and degraded projections stay on the
+/// approved account; nothing from any other login is kept.
+fn claude_slot_approval_blocked_status(
+    expected: &ClaudeSlotAccountBinding,
+    failure: ClaudeSlotProbeFailure,
+    message: impl FnOnce(Option<&str>) -> String,
+    previous: Option<&ClaudeConfigSlotCollectionStatusV1>,
+    captured_at: &str,
+) -> ClaudeConfigSlotCollectionStatusV1 {
     let previous = previous
         .filter(|previous| claude_slot_status_binding(previous).as_ref() == Some(expected))
         .cloned();
@@ -5819,15 +5857,10 @@ fn claude_slot_binding_mismatch_status(
         .as_ref()
         .and_then(exact_claude_slot_account_profile)
         .and_then(|profile| profile.plan_type.clone());
-    let mut status = ClaudeConfigSlotCollectionStatusV1 {
-        state: ClaudeConfigSlotCollectionStateV1::IdentityMismatch,
-        observed_at: Some(captured_at.to_string()),
-        diagnostics: vec![ClaudeConfigSlotDiagnosticV1 {
-            code: ClaudeConfigSlotDiagnosticCodeV1::IdentityMismatch,
-            message: claude_slot_binding_mismatch_message(approved_plan.as_deref(), signed_in_plan),
-        }],
-        ..Default::default()
-    };
+    let mut status = failure.status(captured_at);
+    if let Some(diagnostic) = status.diagnostics.first_mut() {
+        diagnostic.message = message(approved_plan.as_deref());
+    }
     retain_exact_claude_slot_binding(
         &mut status,
         &expected.account_identifier_hash,
@@ -5857,16 +5890,59 @@ fn claude_slot_pre_collection_gate(
         return Ok(None);
     };
     match claude_slot_local_login(descriptor) {
-        Some((current, signed_in_plan)) if current != expected => {
-            Err(claude_slot_binding_mismatch_status(
-                &expected,
-                signed_in_plan.as_deref(),
-                previous,
-                captured_at,
-            ))
-        }
-        _ => Ok(Some(expected)),
+        Some((current, _)) if current == expected => Ok(Some(expected)),
+        Some((_, signed_in_plan)) => Err(claude_slot_binding_mismatch_status(
+            &expected,
+            signed_in_plan.as_deref(),
+            previous,
+            captured_at,
+        )),
+        // Fail closed: never refresh or probe a login that cannot be shown to
+        // be the approved account.
+        None => Err(claude_slot_approval_blocked_status(
+            &expected,
+            ClaudeSlotProbeFailure::IdentityUnknown,
+            claude_slot_unknown_login_message,
+            previous,
+            captured_at,
+        )),
     }
+}
+
+/// Local wording for a slot whose approval was observed, not verified.
+fn claude_slot_observed_approval_notice(approved_plan: Option<&str>) -> String {
+    match claude_plan_label(approved_plan) {
+        Some(label) => format!(
+            "Approved from the current Claude login ({label}). If this is the wrong account, sign in again with the right one."
+        ),
+        None => "Approved from the current Claude login. If this is the wrong account, sign in again with the right one.".to_string(),
+    }
+}
+
+/// Mark registered slots whose approval was back-filled from an observed
+/// login (trust on first use). The notice is local-only and clears as soon
+/// as a verified setup or reconnect approves the slot.
+fn apply_claude_slot_approval_notice(
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+    approval: Option<&ottto_core::ClaudeSlotApproval>,
+) {
+    status.approval_notice = approval
+        .filter(|approval| {
+            approval.source == ottto_core::ClaudeSlotApprovalSource::Observed
+                && claude_slot_status_binding(status).as_ref() == Some(&approval.binding)
+        })
+        .map(|_| {
+            claude_slot_observed_approval_notice(
+                exact_claude_slot_account_profile(status)
+                    .and_then(|profile| profile.plan_type.as_deref()),
+            )
+        });
+}
+
+fn claude_slot_approvals() -> BTreeMap<String, ottto_core::ClaudeSlotApproval> {
+    FileClaudeConfigSlotSettingsStore::default()
+        .slot_approvals()
+        .unwrap_or_default()
 }
 
 /// Gate after the exact slot resolved, before its usage call. A slot without
@@ -28493,6 +28569,33 @@ exit 0
             |snapshot| snapshot_binding(snapshot).as_ref() == Some(&team)
                 && !snapshot.quota_windows.is_empty()
         ));
+        assert_eq!(
+            FileClaudeConfigSlotSettingsStore::default()
+                .slot_approvals()
+                .expect("approvals")
+                .get(&slot_id)
+                .map(|approval| approval.source),
+            Some(ottto_core::ClaudeSlotApprovalSource::Observed)
+        );
+        assert_eq!(
+            slot.collection.approval_notice.as_deref(),
+            Some(
+                "Approved from the current Claude login (Claude Team Premium). If this is the wrong account, sign in again with the right one."
+            ),
+            "an observed approval is surfaced locally"
+        );
+        let first_wire = serde_json::to_string(
+            &first
+                .iter()
+                .cloned()
+                .map(|snapshot| snapshot.redacted_for_backend())
+                .collect::<Vec<_>>(),
+        )
+        .expect("serialize upload");
+        assert!(
+            !first_wire.contains("Approved from"),
+            "the notice is never uploaded"
+        );
 
         // `CLAUDE_CONFIG_DIR=<slot> claude` + `/login` with the Max account.
         fixture.sign_in(MAX_20X);
@@ -28578,7 +28681,7 @@ exit 0
         );
         assert!(!wire.contains("fixture-secret"), "no token in uploads");
         assert!(
-            crate::agent_status::claude_slot_login_contradicts_approval(&slot),
+            crate::agent_status::claude_slot_login_unapproved(&slot),
             "the upkeep worker's spawn and publication fences refuse this slot"
         );
         let persisted = fixture.support_files_text();
@@ -28596,7 +28699,7 @@ exit 0
             slot.collection.state,
             ClaudeConfigSlotCollectionStateV1::Fresh
         );
-        assert!(!crate::agent_status::claude_slot_login_contradicts_approval(&slot));
+        assert!(!crate::agent_status::claude_slot_login_unapproved(&slot));
         let approved = recovered
             .iter()
             .find(|snapshot| snapshot_binding(snapshot).as_ref() == Some(&team))
@@ -28750,6 +28853,63 @@ exit 0
             binding_test_time(15),
         );
         assert_eq!(recovered.state, ClaudeConfigSlotCollectionStateV1::Fresh);
+    }
+
+    #[test]
+    #[serial]
+    fn bound_slot_with_unreadable_account_file_fails_closed_without_refresh() {
+        let fixture = ClaudeBindingFixture::new("unknown-login");
+        let team = ClaudeBindingFixture::hashes(TEAM_PREMIUM);
+        fixture.sign_in(TEAM_PREMIUM);
+        let slot_id = fixture.register();
+        fixture.collect();
+        assert!(FileClaudeConfigSlotSettingsStore::default()
+            .expected_slot_binding(&slot_id)
+            .expect("read")
+            .is_some());
+
+        for broken in [None, Some("{not json"), Some(r#"{"oauthAccount":{}}"#)] {
+            match broken {
+                None => fs::remove_file(fixture.slot_dir.join(".claude.json"))
+                    .expect("remove account file"),
+                Some(body) => fs::write(fixture.slot_dir.join(".claude.json"), body)
+                    .expect("write broken account file"),
+            }
+            fixture.clear_spawns();
+            let snapshots = fixture.collect();
+            let slot = fixture.slot(&slot_id);
+            assert_eq!(
+                slot.collection.state,
+                ClaudeConfigSlotCollectionStateV1::IdentityUnknown,
+                "{broken:?}"
+            );
+            assert_eq!(
+                slot.collection.account_identifier_hash.as_deref(),
+                Some(team.0.as_str())
+            );
+            assert!(slot.collection.diagnostics[0]
+                .message
+                .contains("missing or unreadable"));
+            assert!(
+                fixture.slot_spawns().is_empty(),
+                "no auth status or refresh for an unknown login: {:?}",
+                fixture.slot_spawns()
+            );
+            assert!(
+                crate::agent_status::claude_slot_login_unapproved(&slot),
+                "the upkeep worker fences refuse an unknown login"
+            );
+            assert!(snapshots
+                .iter()
+                .filter(|snapshot| snapshot_binding(snapshot).as_ref() == Some(&team))
+                .all(|snapshot| snapshot.status == AgentStatusState::Degraded));
+        }
+        fixture.sign_in(TEAM_PREMIUM);
+        fixture.collect();
+        assert_eq!(
+            fixture.slot(&slot_id).collection.state,
+            ClaudeConfigSlotCollectionStateV1::Fresh
+        );
     }
 
     #[test]

@@ -50,10 +50,30 @@ login in that directory.
   directory), the binding it would have recorded is still enforced for that
   pass; if the approval cannot be read at all, the slot is skipped for that
   pass (`concurrent_mutation`) instead of collecting ungated.
+- **Provenance and notice (review F1).** The approval also stores
+  `approved_from` (`setup`, `reconnect` or `observed`, no hashes). Back-fill
+  steps 2 and 3 are trust on first use: they approve whatever login was there,
+  including one that drifted before this version. Such a slot gets a local-only
+  `approval_notice` on its collection status (an additive optional field,
+  ignored by older clients, never uploaded): "Approved from the current Claude
+  login (<plan>). If this is the wrong account, sign in again with the right
+  one." A browser reconnect on an observed-approval slot that proves another
+  account adopts that account
+  (`adopt_reconnect_identity_for_observed_approval`), completes, and records a
+  `reconnect` approval; verified approvals still refuse another account. Any
+  completed verified reconnect re-records its pair, so one started without an
+  expected organization re-approves a same-account organization change
+  (review F2; the app's "Sign in again" for `identity_mismatch` is the
+  follow-up).
 - **Gate.** Before upkeep, before any CLI spawn and before the usage call, the
   collector compares the slot's `.claude.json` identity with the approval. It
   checks again against the identity `claude auth status` resolves. The
   scheduled loop and the direct slot check both use it.
+
+  When `.claude.json` is missing, unreadable or lacks strong ids on a bound
+  slot, the gate fails closed (review F3): `identity_unknown` with a local
+  message, approved pair and stale reading kept, no CLI spawn or refresh; the
+  worker fences refuse it too.
 
   On a difference the slot reports the existing `identity_mismatch` state and
   diagnostic. Its status keeps the approved hashes, the approved account's
@@ -98,6 +118,13 @@ login in that directory.
   - message wording.
 
   With the gates disabled, the three behaviour tests fail with `Fresh`.
+- Review fixes (each red with its fix disabled): observed provenance and
+  adoption by a verified reconnect, verified approvals refusing another
+  account, re-approval of a new organization by a reconnect without expected
+  organization (core); the local notice and that it is never uploaded; the
+  fail-closed unknown-login path for a missing, corrupt or id-less
+  `.claude.json`; a browser reconnect that replaces an observed approval and is
+  refused once the approval is verified.
 - Browser auth: an approved slot's mismatched reconnect has truthful detail,
   lifts suppression to the gate and recovers. The existing unapproved-slot
   test still preserves suppression. Generic admission records the approval.
