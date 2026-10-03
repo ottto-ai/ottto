@@ -22,6 +22,14 @@ the app and the web disagreed.
   default login) or `provider_unavailable` with stale readings. Slot states
   that already raise the registered-slot attention path (for example
   `needs_login`) are left to that path, so an account is not reported twice.
+- Review follow-up (AutoReview 01a10090): `fresh` alone is not proof that an
+  account is served. The default login marks account-attributed status-line
+  fallback readings `fresh`, and a held slot can look `fresh` while the shared
+  cache is young. A slot now serves its account only when it is `fresh`
+  through an eligible provider caller: no live hold for that caller, no open
+  account-wide auth breaker, and no sign-in-rejection or breaker-suppression
+  evidence on the slot. An eligible caller reusing its own young cache still
+  serves, because it asks the provider on its normal cadence.
 - The next automatic check comes from the account's breaker: the account-wide
   auth cool-down when it is open, otherwise the earliest live per-caller hold
   from #475. The breaker is read only, never written or reset.
@@ -69,7 +77,11 @@ the app and the web disagreed.
   `provider_unavailable` with stale readings counts without auth evidence (and
   not before the readings are stale); per-caller holds give the earliest next
   check; a default-login auth pause is attributed to its account, a
-  response-shape circuit is not; several accounts are counted.
+  response-shape circuit is not; several accounts are counted. Review follow-up tests: fallback-only `fresh`
+  default with an open auth breaker is paused; a young shared cache on a held
+  slot is paused (and serves again once the hold expires); a genuinely serving
+  second credential keeps the account unpaused. The first two fail on
+  ec93133f; the third passes there too and guards against over-reporting.
 - New tests in `lib.rs`: a paused account gives the Claude Code source
   `healthy` + `warning` + one `unknown`-coded problem, canonical
   `blocking_reason=usage_checks_paused`, and no extra machine blocker; without

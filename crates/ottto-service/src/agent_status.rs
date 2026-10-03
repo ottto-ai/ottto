@@ -3680,18 +3680,34 @@ fn claude_breaker_auth_pause_until(breaker: &ClaudeOAuthUsageBreaker, now: u64) 
 
 /// Connected Claude accounts whose usage checks are paused.
 ///
-/// An account counts only when no slot for it is `Fresh` (a healthy caller
-/// still serves it), and some non-duplicate slot for it is either held back
-/// after a sign-in rejection (slot diagnostics or a live breaker hold) or
-/// `provider_unavailable` with only stale readings. Slots whose state already
-/// raises the registered-slot attention path are left to that path, so the
-/// same account is never reported twice.
+/// An account is served, and so not paused, only while some slot for it is
+/// `Fresh` through an ELIGIBLE provider caller: that caller has no live auth
+/// hold, the account has no open auth breaker, and the slot carries no
+/// sign-in-rejection or breaker-suppression evidence. `Fresh` alone is not
+/// proof: the default login marks account-attributed status-line fallback
+/// readings `Fresh`, and a held slot can look `Fresh` while the shared cache
+/// is young. An eligible caller reusing its own young cache still counts as
+/// serving, because it will ask the provider on its normal cadence.
+///
+/// An unserved account counts when some non-duplicate slot for it is held
+/// back after a sign-in rejection (slot diagnostics, the default login's own
+/// diagnostics, or a live breaker hold) or is `provider_unavailable` with only
+/// stale readings. Slots whose state already raises the registered-slot
+/// attention path are left to that path, so the same account is never
+/// reported twice.
 fn claude_paused_usage_accounts(
     slot_states: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
     default_snapshot: &AgentStatusSnapshot,
     breaker_for: impl Fn(&str, &str) -> Option<ClaudeOAuthUsageBreaker>,
     now: u64,
 ) -> Vec<ClaudePausedUsageAccount> {
+    #[derive(Default)]
+    struct AccountEvidence {
+        breaker: Option<ClaudeOAuthUsageBreaker>,
+        served: bool,
+        auth_paused: bool,
+        provider_stale: bool,
+    }
     let default_binding = default_snapshot.account.as_ref().and_then(|account| {
         Some((
             account.account_identifier_hash.clone()?,
@@ -3702,7 +3718,7 @@ fn claude_paused_usage_accounts(
         .diagnostics
         .iter()
         .any(claude_diagnostic_is_auth_pause);
-    let mut accounts: BTreeMap<(String, String), (bool, bool, bool)> = BTreeMap::new();
+    let mut accounts: BTreeMap<(String, String), AccountEvidence> = BTreeMap::new();
     for (slot_id, status) in slot_states {
         let (Some(account), Some(organization)) = (
             status
@@ -3717,9 +3733,46 @@ fn claude_paused_usage_accounts(
             continue;
         };
         let key = (account.to_string(), organization.to_string());
-        let entry = accounts.entry(key.clone()).or_insert((false, false, false));
+        let is_default = slot_id == "default";
+        let entry = accounts
+            .entry(key.clone())
+            .or_insert_with(|| AccountEvidence {
+                breaker: breaker_for(account, organization),
+                ..Default::default()
+            });
+        let caller_key = if is_default {
+            CLAUDE_OAUTH_USAGE_DEFAULT_CALLER_KEY.to_string()
+        } else {
+            claude_oauth_usage_slot_caller_key(slot_id)
+        };
+        let (account_auth_open, caller_held) =
+            entry.breaker.as_ref().map_or((false, false), |breaker| {
+                (
+                    breaker.opened_by == "auth_rejected"
+                        && now < breaker.reopen_after_epoch_seconds,
+                    breaker
+                        .auth_callers
+                        .get(&caller_key)
+                        .is_some_and(|state| now < state.backoff_until_epoch_seconds),
+                )
+            });
+        let slot_auth_evidence = status
+            .quota_check_diagnostics
+            .iter()
+            .any(claude_diagnostic_is_auth_pause)
+            || (is_default && default_auth_paused && default_binding.as_ref() == Some(&key));
+        let slot_suppressed = status
+            .quota_check_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "claude_oauth_usage_check_suppressed");
         if status.state == ClaudeConfigSlotCollectionStateV1::Fresh {
-            entry.0 = true;
+            if !account_auth_open && !caller_held && !slot_auth_evidence && !slot_suppressed {
+                entry.served = true;
+            } else if account_auth_open || caller_held || slot_auth_evidence {
+                // Fresh-looking readings from a held caller (status-line
+                // fallback or a young shared cache) are not service.
+                entry.auth_paused = true;
+            }
             continue;
         }
         if status.state == ClaudeConfigSlotCollectionStateV1::DuplicateAccount
@@ -3729,30 +3782,23 @@ fn claude_paused_usage_accounts(
         {
             continue;
         }
-        let auth_paused = status
-            .quota_check_diagnostics
-            .iter()
-            .any(claude_diagnostic_is_auth_pause)
-            || (slot_id == "default"
-                && default_auth_paused
-                && default_binding.as_ref() == Some(&key));
-        let provider_stale = status.state == ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
+        entry.auth_paused |= slot_auth_evidence || caller_held || account_auth_open;
+        entry.provider_stale |= status.state
+            == ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
             && status.quota_snapshot.as_ref().is_some_and(|snapshot| {
                 snapshot.state == ClaudeConfigSlotQuotaSnapshotStateV1::Stale
             });
-        entry.1 |= auth_paused;
-        entry.2 |= provider_stale;
     }
     accounts
-        .into_iter()
-        .filter(|(_, (fresh, auth_paused, provider_stale))| {
-            !fresh && (*auth_paused || *provider_stale)
-        })
-        .map(|((account, organization), (_, auth_paused, _))| {
-            let held_until = breaker_for(&account, &organization)
-                .and_then(|breaker| claude_breaker_auth_pause_until(&breaker, now));
+        .into_values()
+        .filter(|evidence| !evidence.served && (evidence.auth_paused || evidence.provider_stale))
+        .map(|evidence| {
+            let held_until = evidence
+                .breaker
+                .as_ref()
+                .and_then(|breaker| claude_breaker_auth_pause_until(breaker, now));
             ClaudePausedUsageAccount {
-                after_sign_in_rejection: auth_paused || held_until.is_some(),
+                after_sign_in_rejection: evidence.auth_paused || held_until.is_some(),
                 next_check_epoch_seconds: held_until,
             }
         })
@@ -27454,8 +27500,27 @@ mod usage_checks_paused_tests {
         assert!(claude_usage_checks_paused_diagnostic(&paused).is_none());
     }
 
+    fn held(backoff_until: u64) -> ClaudeOAuthUsageCallerAuthState {
+        ClaudeOAuthUsageCallerAuthState {
+            consecutive_failures: 1,
+            last_status: 401,
+            last_failure_at_epoch_seconds: NOW - 60,
+            backoff_until_epoch_seconds: backoff_until,
+            credential_expires_at: None,
+        }
+    }
+
+    fn caller_hold_breaker(caller_key: String, backoff_until: u64) -> ClaudeOAuthUsageBreaker {
+        let mut breaker = auth_breaker(0);
+        breaker.opened_by = String::new();
+        breaker.auth_callers.insert(caller_key, held(backoff_until));
+        breaker
+    }
+
     #[test]
-    fn account_still_served_by_a_fresh_slot_is_not_paused() {
+    fn account_genuinely_served_by_a_second_credential_is_not_paused() {
+        // The held slot's own caller is backing off, but a different, eligible
+        // credential for the same account is reading it.
         let slots = BTreeMap::from([
             ("slot-held".to_string(), paused_slot(ACCOUNT_A)),
             ("slot-fresh".to_string(), healthy_slot(ACCOUNT_A)),
@@ -27463,7 +27528,74 @@ mod usage_checks_paused_tests {
         let paused = claude_paused_usage_accounts(
             &slots,
             &current_login(),
-            |_, _| Some(auth_breaker(NOW + 60)),
+            |_, _| {
+                Some(caller_hold_breaker(
+                    claude_oauth_usage_slot_caller_key("slot-held"),
+                    NOW + 900,
+                ))
+            },
+            NOW,
+        );
+        assert!(paused.is_empty());
+    }
+
+    #[test]
+    fn fallback_only_fresh_default_with_open_auth_breaker_is_paused() {
+        // The default login marks account-attributed status-line fallback
+        // readings Fresh; with the account-wide auth breaker open no provider
+        // caller is eligible, so the account is paused.
+        let mut default_slot = healthy_slot(ACCOUNT_A);
+        default_slot.quota_check_diagnostics.clear();
+        let slots = BTreeMap::from([("default".to_string(), default_slot)]);
+        let reopen = NOW + 3_600;
+        let paused = claude_paused_usage_accounts(
+            &slots,
+            &current_login(),
+            |_, _| Some(auth_breaker(reopen)),
+            NOW,
+        );
+        assert_eq!(
+            paused,
+            vec![ClaudePausedUsageAccount {
+                after_sign_in_rejection: true,
+                next_check_epoch_seconds: Some(reopen),
+            }]
+        );
+    }
+
+    #[test]
+    fn young_shared_cache_on_a_held_slot_is_paused() {
+        // A held slot can look Fresh while the shared per-account cache is
+        // young; its caller cannot refresh it, so it does not serve the account.
+        let slots = BTreeMap::from([("slot-held".to_string(), healthy_slot(ACCOUNT_A))]);
+        let paused = claude_paused_usage_accounts(
+            &slots,
+            &current_login(),
+            |_, _| {
+                Some(caller_hold_breaker(
+                    claude_oauth_usage_slot_caller_key("slot-held"),
+                    NOW + 900,
+                ))
+            },
+            NOW,
+        );
+        assert_eq!(
+            paused,
+            vec![ClaudePausedUsageAccount {
+                after_sign_in_rejection: true,
+                next_check_epoch_seconds: Some(NOW + 900),
+            }]
+        );
+        // Once the hold has expired the same slot serves the account again.
+        let paused = claude_paused_usage_accounts(
+            &slots,
+            &current_login(),
+            |_, _| {
+                Some(caller_hold_breaker(
+                    claude_oauth_usage_slot_caller_key("slot-held"),
+                    NOW - 1,
+                ))
+            },
             NOW,
         );
         assert!(paused.is_empty());
