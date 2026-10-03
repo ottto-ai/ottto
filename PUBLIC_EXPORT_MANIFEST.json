@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 420,
-  "content_sha256": "84597f68f6c1d2d808ff72a869fe401d2deffda23f1f7f8eb12ee4fd64857f30",
+  "candidate_file_count": 421,
+  "content_sha256": "62631c68b2a7020f43b03bc123bf9550bb322a6a19b22ccd9f500b886fc1cc79",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "fbad8d2b78d5fb9e775a4959f8b78948dbd5210f0fc52854c6bbd5a2823068f4",
-      "size_bytes": 1126572
+      "sha256": "c73edf14d97782668406060cd03fdbb5b8990ee1d149f24b0202ac9c5ad5e1da",
+      "size_bytes": 1131441
     },
     {
       "executable": false,
@@ -1874,6 +1874,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-03-statusline-reset-tolerance.md",
+      "sha256": "d18a2ad08983f74d25502e9b483cc8f78f4eda2688fa5be7b67b68c6b8ace77e",
+      "size_bytes": 1488
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-03-validated-upload-receipt-evidence.md",
       "sha256": "681a3414e9ae8852aa34889d6bce90f661261293c70c1dd79b26d1ff704886ee",
       "size_bytes": 3325
@@ -2945,7 +2952,7 @@
   ],
   "generated_at": "2026-10-03T07:12:26+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 421,
+  "output_file_count": 422,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

@@ -10000,6 +10000,15 @@ fn claude_statusline_quota_windows_from_cache(
     windows
 }
 
+/// OAuth usage resets carry microseconds; statusLine resets are whole epoch
+/// seconds from response headers. Two resets within this tolerance name the
+/// same window; distinct Claude windows are hours apart.
+const CLAUDE_STATUSLINE_RESET_MATCH_TOLERANCE_SECONDS: i64 = 1;
+
+fn claude_statusline_same_instant(left: OffsetDateTime, right: OffsetDateTime) -> bool {
+    (left - right).abs() <= TimeDuration::seconds(CLAUDE_STATUSLINE_RESET_MATCH_TOLERANCE_SECONDS)
+}
+
 /// Replace only a percentage-only meter whose clocks, exact binding and reset
 /// prove the statusLine reading newer. Money-bearing readings remain intact;
 /// unreported OAuth meters remain in the original vector.
@@ -10073,17 +10082,24 @@ fn prefer_newer_exact_claude_statusline_windows(
             else {
                 continue;
             };
-            if old_reset != new_reset {
+            // Same window only: whole-second statusLine vs microsecond OAuth.
+            // A reading taken at or after its own reset describes a finished
+            // window and never wins.
+            if !claude_statusline_same_instant(old_reset, new_reset) || new_reset <= new_time {
                 continue;
             }
             // A start is a period boundary, not a reading clock. It can survive
             // only when the same verified reset/duration derives that boundary.
             if let Some(start) = older.started_at.as_deref() {
-                let derived = newer.window_seconds.and_then(|seconds| {
-                    rfc3339_minus_seconds(newer.resets_at.as_deref().unwrap_or_default(), seconds)
-                });
-                if start != derived.as_deref().unwrap_or_default() {
-                    continue;
+                let start = OffsetDateTime::parse(start, &Rfc3339).ok();
+                let derived = newer
+                    .window_seconds
+                    .and_then(|seconds| i64::try_from(seconds).ok())
+                    .map(|seconds| new_reset - TimeDuration::seconds(seconds));
+                match (start, derived) {
+                    (Some(start), Some(derived))
+                        if claude_statusline_same_instant(start, derived) => {}
+                    _ => continue,
                 }
             }
             let Some(old_time) = older
@@ -24531,6 +24547,89 @@ exit 1
             local()
         ));
         assert_eq!(conflicting_start.windows, before);
+    }
+
+    #[test]
+    fn prefer_newer_statusline_matches_whole_second_reset_against_microsecond_oauth_reset() {
+        // OAuth carries microsecond resets; statusLine carries whole epoch
+        // seconds. The same window must still match, and only that window.
+        let reset_epoch: u64 = 1_790_961_600; // 2026-10-02T17:20:00Z
+        let oauth_observed: u64 = reset_epoch - 8_400; // T = 15:00:00Z
+        let oauth = || {
+            let response = serde_json::json!({
+                "five_hour": {"utilization": 40, "resets_at": "2026-10-02T17:20:00.123456Z"},
+                "seven_day": {"utilization": 70, "resets_at": "2026-10-08T00:00:00.654321Z"}
+            });
+            let mut usage = ClaudeOAuthUsage {
+                windows: claude_oauth_quota_windows(&response),
+                credit_balances: claude_oauth_credit_balances(&response),
+            };
+            claude_oauth_stamp_account_identity(&mut usage, "account-a", Some("org-a"));
+            for window in &mut usage.windows {
+                window.observed_at = rfc3339_from_unix_seconds(oauth_observed);
+            }
+            usage
+        };
+        let statusline = |account: &str, observed: u64, reset: u64| {
+            claude_statusline_quota_windows_from_cache(
+                ClaudeStatusLineRateLimitCache {
+                    schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
+                    observed_under_account_identifier_hash: account.to_string(),
+                    observed_under_organization_identifier_hash: Some("org-a".to_string()),
+                    observed_under_account_method: "session_store".to_string(),
+                    observed_at_epoch_seconds: observed,
+                    windows: vec![ClaudeStatusLineRateLimitWindow {
+                        name: "five_hour".to_string(),
+                        used_percent: 55,
+                        resets_at_epoch_seconds: reset,
+                    }],
+                },
+                observed,
+            )
+        };
+        let newer = oauth_observed + 20 * 60;
+
+        let original = oauth();
+        let mut usage = original.clone();
+        assert!(prefer_newer_exact_claude_statusline_windows(
+            &mut usage.windows,
+            statusline("account-a", newer, reset_epoch)
+        ));
+        assert_eq!(usage.windows[0].used_percent, Some(55));
+        assert_eq!(
+            usage.windows[0].observed_at,
+            rfc3339_from_unix_seconds(newer)
+        );
+        assert_eq!(usage.windows[0].started_at, original.windows[0].started_at);
+        assert_eq!(usage.windows[1], original.windows[1]);
+
+        // Counterexamples leave the OAuth reading untouched.
+        let refused: Vec<Vec<AgentQuotaWindow>> = vec![
+            // A different window: reset one minute (or two seconds) apart.
+            statusline("account-a", newer, reset_epoch + 60),
+            statusline("account-a", newer, reset_epoch + 2),
+            // An older statusLine reading.
+            statusline("account-a", oauth_observed - 20 * 60, reset_epoch),
+            // A different account.
+            statusline("account-b", newer, reset_epoch),
+            // A statusLine reading taken after its own reset passed.
+            {
+                let mut past = statusline("account-a", newer, reset_epoch);
+                past[0].observed_at = rfc3339_from_unix_seconds(reset_epoch + 600);
+                past
+            },
+        ];
+        for candidate in refused {
+            let mut usage = original.clone();
+            assert!(!prefer_newer_exact_claude_statusline_windows(
+                &mut usage.windows,
+                candidate
+            ));
+            assert_eq!(usage.windows, original.windows);
+        }
+        // A statusLine window already past its reset at serve time is dropped
+        // before it can compete.
+        assert!(statusline("account-a", reset_epoch + 1, reset_epoch).is_empty());
     }
 
     #[test]
