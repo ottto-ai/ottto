@@ -105,6 +105,14 @@ account. A second registered directory for the same
 binding remains an actionable duplicate instead of being silently treated as
 another account.
 
+When usage checks for a connected account are paused (its credential is held
+back after the provider rejected sign-in, or the provider stopped answering and
+only older readings remain) and no other credential still serves that account,
+`ottto apps` grades the Claude Code source `warning` with one problem titled
+"Claude usage checks paused" that names how many accounts are affected and the
+next automatic check. The source stays `healthy`, the problem asks for no
+sign-in, and Ottto keeps its own schedule; nothing forces an earlier check.
+
 The `claude_quota_access_state_v1` capability marks daemon versions that know
 this contract. On an older daemon, or for a desktop/status-line observation
 that is not an exact strongly bound slot, an absent state means unknown; it

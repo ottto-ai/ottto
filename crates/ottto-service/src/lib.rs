@@ -2389,6 +2389,9 @@ fn local_health_problem_code_slug(problem: &HealthProblem) -> &'static str {
     {
         return "smoke_quota_limited";
     }
+    if is_usage_checks_paused_problem(problem) {
+        return USAGE_CHECKS_PAUSED_REASON;
+    }
     stable_problem_code_slug(&problem.code)
 }
 
@@ -3823,6 +3826,34 @@ fn verification_attention_is_current(existing: &SourceHealth, refreshed: &Source
     age <= MAX_AGE_SECONDS
 }
 
+/// Canonical-health slug for the paused-usage-checks problem. The problem
+/// itself uses the existing `Unknown` code so older CLIs and Companions, which
+/// decode `StableProblemCode` strictly, keep decoding the status; the
+/// canonical `blocking_reason` is a free string, so it names the cause.
+const USAGE_CHECKS_PAUSED_REASON: &str = "usage_checks_paused";
+const USAGE_CHECKS_PAUSED_TITLE: &str = "Claude usage checks paused";
+
+fn usage_checks_paused_problem(snapshot: &AgentStatusSnapshot) -> Option<HealthProblem> {
+    if snapshot.source != SourceKind::ClaudeCode {
+        return None;
+    }
+    let diagnostic = snapshot.diagnostics.iter().find(|diagnostic| {
+        diagnostic.code == agent_status::CLAUDE_USAGE_CHECKS_PAUSED_DIAGNOSTIC_CODE
+    })?;
+    Some(HealthProblem {
+        code: StableProblemCode::Unknown,
+        title: USAGE_CHECKS_PAUSED_TITLE.to_string(),
+        detail: diagnostic.message.clone(),
+        // Clears on Ottto's own schedule; a manual retry must not force a
+        // provider check.
+        retryable: false,
+    })
+}
+
+fn is_usage_checks_paused_problem(problem: &HealthProblem) -> bool {
+    problem.code == StableProblemCode::Unknown && problem.title == USAGE_CHECKS_PAUSED_TITLE
+}
+
 fn source_health_from_agent_status(
     state: &DaemonState,
     snapshot: AgentStatusSnapshot,
@@ -3833,7 +3864,13 @@ fn source_health_from_agent_status(
         .and_then(|account| account.account_id.clone().or_else(|| account.email.clone()));
     let expected_account_id = state.account.user.as_ref().map(|user| user.id.clone());
     let (source_state, grade, problems) = match snapshot.status {
-        AgentStatusState::Available => (SourceState::Healthy, HealthGrade::Ok, Vec::new()),
+        AgentStatusState::Available => match usage_checks_paused_problem(&snapshot) {
+            // The current login works, so the source stays healthy; paused
+            // usage checks for an account are an attention grade with a
+            // plain-words problem, never a repair or sign-in request.
+            Some(problem) => (SourceState::Healthy, HealthGrade::Warning, vec![problem]),
+            None => (SourceState::Healthy, HealthGrade::Ok, Vec::new()),
+        },
         AgentStatusState::NotInstalled => (
             SourceState::NotFound,
             HealthGrade::Unknown,
@@ -7738,6 +7775,83 @@ mod tests {
         assert!(!health.problems[0]
             .detail
             .contains("current login remains available"));
+    }
+
+    fn paused_usage_checks_status(paused: bool) -> DaemonStatus {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut snapshot = available_agent_status(SourceKind::ClaudeCode, "2026-10-03T06:46:07Z");
+        if paused {
+            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                agent_status::CLAUDE_USAGE_CHECKS_PAUSED_DIAGNOSTIC_CODE,
+                AgentDiagnosticSeverity::Warning,
+                "Claude usage checks paused for one account after the provider rejected sign-in; next automatic check 2026-10-04T05:00:00Z. Last readings stay shown until then.",
+            ));
+        }
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(&mut state, snapshot);
+        }
+        daemon.status(TOKEN).expect("status")
+    }
+
+    #[test]
+    fn paused_usage_checks_give_claude_source_an_attention_grade() {
+        let status = paused_usage_checks_status(true);
+        let source = &status.sources[0];
+        assert_eq!(source.state, SourceState::Healthy);
+        assert_eq!(source.grade, HealthGrade::Warning);
+        assert_eq!(source.problems.len(), 1);
+        let problem = &source.problems[0];
+        assert_eq!(problem.code, StableProblemCode::Unknown);
+        assert_eq!(problem.title, "Claude usage checks paused");
+        assert!(problem
+            .detail
+            .starts_with("Claude usage checks paused for one account after the provider rejected sign-in; next automatic check 2026-10-04T05:00:00Z."));
+        assert!(!problem.retryable);
+        assert!(source.recommended_actions.is_empty());
+        // Existing problem code on the wire, so strict older decoders keep working.
+        let wire = serde_json::to_value(problem).expect("problem json");
+        assert_eq!(wire["code"], "unknown");
+
+        let canonical = status.canonical_health.as_ref().expect("canonical health");
+        let canonical_source = &canonical.sources[0];
+        assert_eq!(canonical_source.state, LocalHealthSourceState::Healthy);
+        assert_eq!(
+            canonical_source.blocking_reason.as_deref(),
+            Some("usage_checks_paused")
+        );
+        assert!(canonical_source.next_action.is_none());
+        // Not a machine blocker: overall health matches the unpaused machine.
+        let healthy = paused_usage_checks_status(false);
+        let healthy_canonical = healthy.canonical_health.as_ref().expect("canonical");
+        assert_eq!(canonical.overall.state, healthy_canonical.overall.state);
+        assert_eq!(canonical.blockers.len(), healthy_canonical.blockers.len());
+    }
+
+    #[test]
+    fn healthy_claude_source_without_paused_usage_checks_stays_ok() {
+        let status = paused_usage_checks_status(false);
+        let source = &status.sources[0];
+        assert_eq!(source.state, SourceState::Healthy);
+        assert_eq!(source.grade, HealthGrade::Ok);
+        assert!(source.problems.is_empty());
+        let canonical = status.canonical_health.as_ref().expect("canonical health");
+        assert!(canonical.sources[0].blocking_reason.is_none());
+    }
+
+    #[test]
+    fn paused_usage_checks_diagnostic_is_ignored_for_other_sources() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut snapshot = available_agent_status(SourceKind::Codex, "2026-10-03T06:46:07Z");
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            agent_status::CLAUDE_USAGE_CHECKS_PAUSED_DIAGNOSTIC_CODE,
+            AgentDiagnosticSeverity::Warning,
+            "Claude usage checks paused for one account.",
+        ));
+        let state = daemon.inner.lock().expect("state");
+        let health = source_health_from_agent_status(&state, snapshot);
+        assert_eq!(health.grade, HealthGrade::Ok);
+        assert!(health.problems.is_empty());
     }
 
     #[test]
