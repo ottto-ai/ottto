@@ -64,9 +64,10 @@ ottto receipts --limit 20
 ottto receipts --json --since 2026-09-10T00:00:00Z --source codex
 ```
 
-The daemon keeps at most 500 receipts. Source session ids are never stored:
-each is replaced with a 12-hex SHA-256 prefix, and snapshot fingerprints are
-limited to 12 hex characters. Request bodies, authorization headers, tokens,
+The daemon keeps at most 500 receipts. Public receipt output replaces source
+session ids with a 12-hex SHA-256 prefix and limits snapshot fingerprints to
+12 hex characters. Raw source session ids are never stored in receipts.
+Request bodies, authorization headers, tokens,
 and raw backend rejection details are not included. `device_label` and
 `account_binding` use only the user-facing label and binding state already
 shown by `ottto status`; raw device, account, user, and organization ids are
@@ -105,6 +106,22 @@ omit the optional `X-Request-ID` header, in which case the field is `null`.
   "state_path_present": true
 }
 ```
+
+The private, owner-only receipt file may additionally retain content-free
+request-specific ACK evidence after the existing validator succeeds. This
+annotation contains full semantic fingerprints and body-witness hashes,
+one-way session/destination identifiers, hashed head references, occurrence
+counts, uploaded cache-patch presence, two numeric usage scalars and explicit
+retained-coverage limits. It shares the existing ring's 500-receipt and 4 MiB limits and retains at most 50 entity records per receipt.
+It is excluded from public receipt output, local-control responses and
+diagnostics bundles. Raw head tokens, session ids, request bodies and
+credentials are not retained.
+
+An HTTP success receipt alone does not prove that a request-specific ACK
+validated. Even a validated ACK does not prove that local checkpoint saving,
+backend publication or customer-page freshness completed. Legacy count-only
+responses and missing or truncated proof remain explicitly unproved; private
+evidence is diagnostic and never authorizes delivery or a retry.
 
 ## Common Diagnostics Flow
 

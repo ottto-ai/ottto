@@ -1426,6 +1426,7 @@ pub struct SnapshotApiClient {
     agent: ureq::Agent,
     batch_agent: ureq::Agent,
     receipt_state_dir: Option<PathBuf>,
+    receipt_destination_namespace: Option<String>,
     receipt_context: crate::upload_receipts::UploadReceiptContext,
 }
 
@@ -1449,6 +1450,7 @@ impl SnapshotApiClient {
             agent,
             batch_agent,
             receipt_state_dir: None,
+            receipt_destination_namespace: None,
             receipt_context: crate::upload_receipts::UploadReceiptContext::default(),
         }
     }
@@ -1456,6 +1458,12 @@ impl SnapshotApiClient {
     /// Enable privacy-safe local receipts for snapshot batch attempts.
     pub fn with_receipt_state_dir(mut self, state_dir: impl Into<PathBuf>) -> Self {
         self.receipt_state_dir = Some(state_dir.into());
+        self
+    }
+
+    /// Explicit one-way destination binding for internal diagnostic ACK proof.
+    pub(crate) fn with_receipt_destination_namespace(mut self, namespace: String) -> Self {
+        self.receipt_destination_namespace = Some(namespace);
         self
     }
 
@@ -1624,6 +1632,7 @@ impl SnapshotApiClient {
                             status,
                             server_request_id.as_deref(),
                             &response,
+                            enforce_head_cas,
                         );
                         Ok(response)
                     }
@@ -1717,11 +1726,16 @@ impl SnapshotApiClient {
         status: u16,
         server_request_id: Option<&str>,
         response: &SnapshotBatchResponse,
+        enforce_head_cas: bool,
     ) {
         let Some(state_dir) = self.receipt_state_dir.as_deref() else {
             return;
         };
-        if crate::upload_receipts::append_success_with_context(
+        let api_destination_hash = crate::upload_receipts::full_hash(
+            b"ottto.validated_receipt.api_destination:v1",
+            &self.api_base_url,
+        );
+        if crate::upload_receipts::append_success_with_evidence_context(
             state_dir,
             receipt_source(&request.source),
             request.snapshots.len(),
@@ -1729,6 +1743,16 @@ impl SnapshotApiClient {
             server_request_id,
             response,
             &self.receipt_context,
+            self.receipt_destination_namespace
+                .as_deref()
+                .map(|namespace| {
+                    (
+                        request,
+                        namespace,
+                        api_destination_hash.as_str(),
+                        enforce_head_cas,
+                    )
+                }),
         )
         .is_err()
         {
@@ -3550,6 +3574,103 @@ mod tests {
             rejected_entities: Vec::new(),
             conflict_entities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn validated_receipt_transport_is_private_destination_scoped_and_io_noninterfering() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        let dir =
+            std::env::temp_dir().join(format!("ottto-validated-receipts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        item.context_curve = None;
+        let ack = entity_ack(
+            1,
+            vec![SnapshotEntityRef {
+                source_session_id: item.source_session_id.clone(),
+                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                occurrence_count: 1,
+                body_witness_version: Some(14),
+                body_witness_digest: Some(crate::snapshots::snapshot_upload_body_witness(&item)),
+                head_etag: Some("e".repeat(64)),
+                head_challenge: None,
+            }],
+        );
+        let reference = &ack.accepted_entities[0];
+        let body = serde_json::json!({
+            "accepted": 1, "sessions_reconciled": 0, "session_ids": [], "disabled": false,
+            "entity_ack_contract": SNAPSHOT_ENTITY_ACK_CONTRACT,
+            "accepted_entities": [{"source_session_id": reference.source_session_id,
+                "snapshot_fingerprint": reference.snapshot_fingerprint, "occurrence_count": 1,
+                "body_witness_version": reference.body_witness_version,
+                "body_witness_digest": reference.body_witness_digest, "head_etag": reference.head_etag}],
+            "unchanged_entities": [], "rejected_entities": [], "conflict_entities": []
+        }).to_string();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_complete_http_request(&mut stream);
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Request-ID: synthetic-request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let mut request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "a".repeat(64),
+            collector_version: Some("0.1.synthetic".into()),
+            snapshots: vec![item],
+            upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        for (source, namespace) in [("codex", "a"), ("claude_code", "b")] {
+            request.source = source.into();
+            let client = SnapshotApiClient::new(format!("http://{address}"))
+                .with_receipt_state_dir(&dir)
+                .with_receipt_destination_namespace(namespace.repeat(64));
+            let response = client
+                .upload_batch("synthetic-relay", &request, false)
+                .unwrap();
+            response
+                .validate_entity_ack_with_head_cas(&request, true)
+                .unwrap();
+        }
+        let disk: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(crate::upload_receipts::upload_receipts_path(&dir)).unwrap(),
+        )
+        .unwrap();
+        let rows = disk["receipts"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(
+            rows[0]["validated_evidence"]["destination_namespace_hash"],
+            rows[1]["validated_evidence"]["destination_namespace_hash"]
+        );
+        assert_eq!(
+            rows[0]["validated_evidence"]["api_destination_hash"],
+            rows[1]["validated_evidence"]["api_destination_hash"]
+        );
+        assert_eq!(rows[0]["server_request_id"], "synthetic-request");
+        let public =
+            serde_json::to_value(crate::upload_receipts::read(&dir, 50, None, None).unwrap())
+                .unwrap();
+        assert!(!public.to_string().contains("validated_evidence"));
+        let blocked = dir.join("not-a-directory");
+        std::fs::write(&blocked, b"synthetic").unwrap();
+        let client = SnapshotApiClient::new(format!("http://{address}"))
+            .with_receipt_state_dir(&blocked)
+            .with_receipt_destination_namespace("c".repeat(64));
+        let response = client
+            .upload_batch("synthetic-relay", &request, false)
+            .unwrap();
+        response
+            .validate_entity_ack_with_head_cas(&request, true)
+            .unwrap();
+        assert_eq!(response.accepted, 1);
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
