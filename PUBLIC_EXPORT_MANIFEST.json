@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 420,
-  "content_sha256": "10f0044c1848ad2a831097a531a2282b7b5dd39f6d86f9f4ba0a1ff514726cd2",
+  "content_sha256": "4f5b7705e7b6845332e0f201647c3a160c192e5f84000c79280a16692991fb48",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "dbdafdcc3ae98d46908a4bb5d3b90163321f7448f32c20aed6fbfd20b30ced61",
-      "size_bytes": 1119621
+      "sha256": "46559d1bc18be27c34a25d88044bbde13588bde20b1535f9062976f9066d9986",
+      "size_bytes": 1124906
     },
     {
       "executable": false,
@@ -1861,8 +1861,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-03-apps-health-reflects-paused-usage-checks.md",
-      "sha256": "69bfa240db078779e173be4a1fd7ccc416ce3680120f97497a9e5727c3b43c15",
-      "size_bytes": 4467
+      "sha256": "e002d9322e22ebc2cadc6f428461c9cea7d46986b7c390d3ab0c59db28f88260",
+      "size_bytes": 5411
     },
     {
       "executable": false,
@@ -2943,7 +2943,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-03T06:57:44+00:00",
+  "generated_at": "2026-10-03T07:06:01+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 421,
   "public_roots": [
@@ -2979,5 +2979,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "98a15c9000d5e5aa17542f3d96a9b09c773c7744"
+  "source_commit": "828725f55642aa900d1c14dda2c3a39cd08888ec"
 }
