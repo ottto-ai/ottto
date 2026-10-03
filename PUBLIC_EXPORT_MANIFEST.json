@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 418,
-  "content_sha256": "b242879111f69b13ac2e0ab0739c8b014a1b2a16a2d949b7184cd22eb5f6e503",
+  "candidate_file_count": 419,
+  "content_sha256": "fcfea776a087e4dcc9aaca4052b132bdf47bddef159807dff8c1cd3e025aa496",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "09f0966612201cecb22c5cfd0cf80f873ed76f1ba6fa7a2ffbbd7cce24c2ed98",
-      "size_bytes": 1026733
+      "sha256": "481e4e35cfbb75356db05efb04cbae6c30a20fc14b91aeb4e98f4c29aa365563",
+      "size_bytes": 1100711
     },
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_upkeep.rs",
-      "sha256": "2caeb78b8cdf55ea0d1c6287f7c5dea0ee71b7baeca2895a68e47d4baf44176b",
-      "size_bytes": 115856
+      "sha256": "7b95a6eb83eebdbff387a871e3a24f5435eccf0b26d174b0f26da49271867072",
+      "size_bytes": 115956
     },
     {
       "executable": false,
@@ -993,8 +993,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/claude-accounts.md",
-      "sha256": "762cd2f2e3b296986c37172caab17162d4a9081cdea261b7dca344553a51bcde",
-      "size_bytes": 17331
+      "sha256": "91dbe8711daaaec5ecc0c3e04c9bb00783c671618535499bb8d6bb8d83bd1179",
+      "size_bytes": 17768
     },
     {
       "executable": false,
@@ -1856,6 +1856,13 @@
       "path": "docs/session-2026-10-02-upload-raw-provider-ids.md",
       "sha256": "1d2376d7e05ba54372712b67ac7d74c20495d97daf3db47bcd3438ca76f00eac",
       "size_bytes": 3876
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-03-claude-usage-single-caller-auth-backoff.md",
+      "sha256": "05d0a9ad63f67a3f648916cf1a08d428c57ec00a39ca3c15b8c2a98719df78ec",
+      "size_bytes": 6287
     },
     {
       "executable": false,
@@ -2929,9 +2936,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-03T00:38:19+00:00",
+  "generated_at": "2026-10-03T02:18:07+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 419,
+  "output_file_count": 420,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2965,5 +2972,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "2f1ea51b06b99eabe5283e7bd52222d4118bcc47"
+  "source_commit": "a5c51c4d32421c130a5d5d1df86363db811f75f7"
 }
