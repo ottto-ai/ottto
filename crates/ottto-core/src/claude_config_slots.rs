@@ -1160,6 +1160,23 @@ impl FileClaudeConfigSlotSettingsStore {
         Ok(effective_slot_binding(&persisted, slot_id).map(|(binding, _)| binding))
     }
 
+    /// The binding `ensure_approved_slot_binding` would return, without
+    /// writing. Callers use it to keep enforcing the approval for one pass
+    /// when persisting a back-fill fails.
+    pub fn prospective_approved_slot_binding(
+        &self,
+        slot_id: &str,
+        observed: Option<&ClaudeSlotAccountBinding>,
+    ) -> Result<Option<ClaudeSlotAccountBinding>, ClaudeConfigSlotSettingsError> {
+        let persisted = self.load_persisted()?;
+        Ok(match effective_slot_binding(&persisted, slot_id) {
+            Some((binding, _)) => Some(binding),
+            None => observed
+                .filter(|_| slot_allows_first_use_binding(&persisted, slot_id))
+                .cloned(),
+        })
+    }
+
     /// Expected binding for collection, back-filling the persisted approval
     /// once for a slot registered before bindings existed:
     ///

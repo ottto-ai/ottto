@@ -5655,23 +5655,44 @@ fn claude_slot_status_binding(
 
 /// The account+organization this registered slot is approved to collect for,
 /// back-filling the approval once for slots registered before approvals were
-/// persisted (see `ensure_approved_slot_binding`). `None` leaves the slot
-/// ungated, which is exactly the behaviour before approvals existed.
+/// persisted (see `ensure_approved_slot_binding`). `Ok(None)` leaves the slot
+/// ungated, which is exactly the behaviour before approvals existed. When the
+/// back-fill cannot be persisted, the binding it would have recorded is still
+/// enforced for this pass; `Err` means the approval could not be determined
+/// at all, and callers then refuse to collect rather than run ungated.
 fn claude_slot_expected_binding(
     slot_id: &str,
     observed: Option<&ClaudeSlotAccountBinding>,
-) -> Option<ClaudeSlotAccountBinding> {
+) -> Result<Option<ClaudeSlotAccountBinding>, ()> {
     if slot_id == "default" {
-        return None;
+        return Ok(None);
     }
-    FileClaudeConfigSlotSettingsStore::default()
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    store
         .ensure_approved_slot_binding(
             ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
             slot_id,
             observed,
         )
-        .ok()
-        .flatten()
+        .or_else(|_| store.prospective_approved_slot_binding(slot_id, observed))
+        .map_err(|_| ())
+}
+
+/// Collection is refused for one pass when the approval is undeterminable.
+/// The slot keeps its last verified pair so its card stays on that account.
+fn claude_slot_approval_unavailable_status(
+    previous: Option<&ClaudeConfigSlotCollectionStatusV1>,
+    captured_at: &str,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    let mut status = ClaudeSlotProbeFailure::ConcurrentMutation.status(captured_at);
+    if let Some(binding) = previous.and_then(claude_slot_status_binding) {
+        retain_exact_claude_slot_binding(
+            &mut status,
+            &binding.account_identifier_hash,
+            &binding.organization_identifier_hash,
+        );
+    }
+    status
 }
 
 /// The strong identity Claude Code's local account file names for this slot,
@@ -5831,6 +5852,7 @@ fn claude_slot_pre_collection_gate(
 ) -> Result<Option<ClaudeSlotAccountBinding>, ClaudeConfigSlotCollectionStatusV1> {
     let observed = previous.and_then(claude_slot_status_binding);
     let Some(expected) = claude_slot_expected_binding(&descriptor.slot_id, observed.as_ref())
+        .map_err(|()| claude_slot_approval_unavailable_status(previous, captured_at))?
     else {
         return Ok(None);
     };
@@ -5861,8 +5883,11 @@ fn claude_slot_post_resolution_gate(
         &resolved.account_identifier_hash,
         &resolved.organization_identifier_hash,
     );
-    let expected =
-        expected.or_else(|| claude_slot_expected_binding(&descriptor.slot_id, current.as_ref()));
+    let expected = match expected {
+        Some(expected) => Some(expected),
+        None => claude_slot_expected_binding(&descriptor.slot_id, current.as_ref())
+            .map_err(|()| claude_slot_approval_unavailable_status(previous, captured_at))?,
+    };
     match (expected, current) {
         (Some(expected), Some(current)) if expected != current => {
             Err(claude_slot_binding_mismatch_status(
@@ -28623,6 +28648,61 @@ exit 0
         assert!(snapshots
             .iter()
             .all(|snapshot| snapshot_binding(snapshot).as_ref() != Some(&max)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial]
+    fn approval_back_fill_that_cannot_be_persisted_is_still_enforced() {
+        let fixture = ClaudeBindingFixture::new("backfill-unwritable");
+        let team = ClaudeBindingFixture::hashes(TEAM_PREMIUM);
+        fixture.sign_in(TEAM_PREMIUM);
+        let slot_id = fixture.register();
+        persist_one_claude_slot_collection_state(
+            &slot_id,
+            &fresh_slot_status(&binding_test_time(0), &team.0, &team.1, true, true, false),
+        )
+        .expect("legacy collection state");
+        fixture.sign_in(MAX_20X);
+        fixture.clear_spawns();
+        // An immutable settings file stays readable, but the atomic rename
+        // that would persist the back-fill fails.
+        let settings = fixture
+            .root
+            .join("support")
+            .join(ottto_core::CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME);
+        let chflags = |flag: &str| {
+            assert!(std::process::Command::new("/usr/bin/chflags")
+                .arg(flag)
+                .arg(&settings)
+                .status()
+                .expect("chflags")
+                .success());
+        };
+        chflags("uchg");
+        let status = collect_registered_claude_slot_status(
+            &slot_id,
+            binding_test_time(0),
+            binding_test_time(15),
+        );
+        let spawns = fixture.slot_spawns();
+        chflags("nouchg");
+        assert_eq!(
+            FileClaudeConfigSlotSettingsStore::default()
+                .expected_slot_binding(&slot_id)
+                .expect("read"),
+            None,
+            "the back-fill really was not persisted"
+        );
+        assert_eq!(
+            status.state,
+            ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        );
+        assert_eq!(
+            status.account_identifier_hash.as_deref(),
+            Some(team.0.as_str())
+        );
+        assert!(spawns.is_empty(), "{spawns:?}");
     }
 
     #[test]

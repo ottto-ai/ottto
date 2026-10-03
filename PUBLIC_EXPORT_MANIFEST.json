@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 423,
-  "content_sha256": "914760d9ede8d2e3a6de04483e7a11cd9a43945119cf6e4591e5bc94a10bbac9",
+  "content_sha256": "1f2213051ba4bc18590db6ee9afb9ba933c49401edfa9a02cf34898683308ec0",
   "files": [
     {
       "executable": false,
@@ -503,8 +503,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/claude_config_slots.rs",
-      "sha256": "a37940fc363f8a9b0fd540baed40ff08dda9b2216c8bb3046b735bb442ef52e2",
-      "size_bytes": 165058
+      "sha256": "57de78e0ef0bb581a5c8e3ebed99907a000e190f1314b6ec0224d4bfbd0e0f01",
+      "size_bytes": 165784
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "c69a0aa0cc0e49951f7276942db49f70abbf308eb728d9ac4b2ebf81f18f2165",
-      "size_bytes": 1180717
+      "sha256": "9ee3de9a76ebc40d9fbf13f42d505eb14fe1fad261d17a01968259cae543a41d",
+      "size_bytes": 1183944
     },
     {
       "executable": false,
@@ -1868,8 +1868,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-03-claude-slot-account-binding.md",
-      "sha256": "e4f4900644fdc139e3c2b5f607b8efb44c0edb84d681670dde1f9f97290f40ad",
-      "size_bytes": 5538
+      "sha256": "4e9c35efa37e95729a09eb3fc9299ad578d8664c0f4dda010b9522f59375e379",
+      "size_bytes": 5917
     },
     {
       "executable": false,

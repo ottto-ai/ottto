@@ -46,7 +46,10 @@ login in that directory.
   Steps 2 and 3 run only when no setup or reconnect for the slot is pending or
   ended unverified, so a wrong-account sign-in during setup can never become
   the approval. While a setup or reconnect is pending, its own expected pair is
-  the gate.
+  the gate. If the back-fill cannot be written (for example a read-only support
+  directory), the binding it would have recorded is still enforced for that
+  pass; if the approval cannot be read at all, the slot is skipped for that
+  pass (`concurrent_mutation`) instead of collecting ungated.
 - **Gate.** Before upkeep, before any CLI spawn and before the usage call, the
   collector compares the slot's `.claude.json` identity with the approval. It
   checks again against the identity `claude auth status` resolves. The
@@ -89,6 +92,8 @@ login in that directory.
     refuses, and no email or token appears in uploads or persisted state;
   - signing back in recovers to `fresh`;
   - back-fill from the last verified identity;
+  - a back-fill that cannot be persisted is still enforced (macOS, immutable
+    settings file);
   - the direct slot check;
   - message wording.
 
