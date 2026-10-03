@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 418,
-  "content_sha256": "60b5e08bb61b99372bba529ad6ec6b25902d6e6845b16b733322c57a00574cb6",
+  "content_sha256": "e61b73a2c9925b324f9ab3842e929b26f70828f1a40df0cbdb183b339563b269",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "2c9bd21691b8b9dece1671a5d911d938910037b84fa9c8529a19f465a1da1606",
-      "size_bytes": 1076704
+      "sha256": "8e7f7944e9ff07e41a5ece1ba4611115c01ee219d9921347020d162a3f896118",
+      "size_bytes": 1096215
     },
     {
       "executable": false,
@@ -1861,8 +1861,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-03-claude-usage-single-caller-auth-backoff.md",
-      "sha256": "02115f4dda7bdf618412171436de97e0a37f752733fe46a66d27970195b7f9c9",
-      "size_bytes": 4937
+      "sha256": "05d0a9ad63f67a3f648916cf1a08d428c57ec00a39ca3c15b8c2a98719df78ec",
+      "size_bytes": 6287
     },
     {
       "executable": false,

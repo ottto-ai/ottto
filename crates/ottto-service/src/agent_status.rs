@@ -963,6 +963,12 @@ struct ClaudeOAuthUsageCallerAuthState {
     /// This caller is not sent to the provider while `now` is before this.
     #[serde(default)]
     backoff_until_epoch_seconds: u64,
+    /// Access-token expiry metadata of the credential that was rejected (never
+    /// the token). When the caller's current credential reports a different
+    /// expiry, the credential was rotated: the hold is released and the streak
+    /// starts over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -973,6 +979,109 @@ struct ClaudeOAuthUsageAuthFailureRecord {
     status: u16,
     #[serde(default)]
     at_epoch_seconds: u64,
+}
+
+const CLAUDE_OAUTH_USAGE_DEFAULT_CALLER_KEY: &str = "default";
+const CLAUDE_OAUTH_USAGE_SLOT_CALLER_KEY_PREFIX: &str = "slot-sha256:";
+/// Raw-slot-id key form written only by an unreleased build; migrated on read.
+const CLAUDE_OAUTH_USAGE_RAW_SLOT_CALLER_KEY_PREFIX: &str = "slot:";
+
+fn claude_oauth_usage_slot_caller_key(slot_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ottto:claude-oauth-usage-caller:v1\0");
+    hasher.update(slot_id.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!(
+        "{CLAUDE_OAUTH_USAGE_SLOT_CALLER_KEY_PREFIX}{}",
+        &digest[..32]
+    )
+}
+
+/// The opaque form of a persisted caller key; raw `slot:<id>` keys are hashed.
+fn claude_oauth_usage_opaque_caller_key(key: &str) -> String {
+    match key.strip_prefix(CLAUDE_OAUTH_USAGE_RAW_SLOT_CALLER_KEY_PREFIX) {
+        Some(slot_id) => claude_oauth_usage_slot_caller_key(slot_id),
+        None => key.to_string(),
+    }
+}
+
+/// Whether the caller's current credential is provably not the one whose
+/// rejection this state records (its access expiry changed).
+fn claude_oauth_usage_caller_credential_rotated(
+    state: &ClaudeOAuthUsageCallerAuthState,
+    credential_expires_at: Option<&str>,
+) -> bool {
+    matches!(
+        (state.credential_expires_at.as_deref(), credential_expires_at),
+        (Some(recorded), Some(current)) if recorded != current
+    )
+}
+
+/// Whether a caller's streak is older than the cool-down and so no longer
+/// counts toward that caller's threshold.
+fn claude_oauth_usage_caller_streak_is_stale(
+    state: &ClaudeOAuthUsageCallerAuthState,
+    now: u64,
+) -> bool {
+    state.last_failure_at_epoch_seconds > 0
+        && now
+            >= state
+                .last_failure_at_epoch_seconds
+                .saturating_add(CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS)
+}
+
+impl ClaudeOAuthUsageBreaker {
+    /// Rewrite any raw slot-id caller keys into their opaque form. Returns
+    /// whether anything changed, so the caller can persist the migration.
+    fn migrate_raw_caller_keys(&mut self) -> bool {
+        let raw = |key: &str| key.starts_with(CLAUDE_OAUTH_USAGE_RAW_SLOT_CALLER_KEY_PREFIX);
+        let mut changed = false;
+        if self.auth_callers.keys().any(|key| raw(key)) {
+            let callers = std::mem::take(&mut self.auth_callers);
+            for (key, state) in callers {
+                let key = claude_oauth_usage_opaque_caller_key(&key);
+                match self.auth_callers.get(&key) {
+                    Some(existing)
+                        if existing.last_failure_at_epoch_seconds
+                            >= state.last_failure_at_epoch_seconds => {}
+                    _ => {
+                        self.auth_callers.insert(key, state);
+                    }
+                }
+            }
+            changed = true;
+        }
+        if let Some(record) = self.last_auth_failure.as_mut() {
+            if raw(&record.caller) {
+                record.caller = claude_oauth_usage_opaque_caller_key(&record.caller);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Nothing left but identity and history: the file can be removed.
+    fn holds_no_state(&self) -> bool {
+        self.auth_failures == 0
+            && self.shape_failures == 0
+            && self.rate_limit_failures == 0
+            && self.opened_at_epoch_seconds == 0
+            && self.reopen_after_epoch_seconds == 0
+            && self.opened_by.is_empty()
+            && self.auth_callers.is_empty()
+    }
+}
+
+/// Parse a breaker file, migrating raw slot-id caller keys in place.
+fn read_claude_oauth_usage_breaker_file_migrating(path: &Path) -> Option<ClaudeOAuthUsageBreaker> {
+    let body = fs::read_to_string(path).ok()?;
+    let mut breaker: ClaudeOAuthUsageBreaker = serde_json::from_str(&body).ok()?;
+    if breaker.migrate_raw_caller_keys() {
+        if let Ok(body) = serde_json::to_vec_pretty(&breaker) {
+            let _ = write_owner_only_file_atomic(path, &body);
+        }
+    }
+    Some(breaker)
 }
 
 /// Which local credential is asking the Claude OAuth usage endpoint.
@@ -1002,10 +1111,14 @@ impl ClaudeOAuthUsageCaller {
         !matches!(self, Self::DefaultDeferredToSlot)
     }
 
+    /// Persisted key. The slot id stays in memory only: on disk a slot is a
+    /// domain-separated opaque hash of its id.
     fn breaker_key(&self) -> String {
         match self {
-            Self::Default | Self::DefaultDeferredToSlot => "default".to_string(),
-            Self::RegisteredSlot(slot_id) => format!("slot:{slot_id}"),
+            Self::Default | Self::DefaultDeferredToSlot => {
+                CLAUDE_OAUTH_USAGE_DEFAULT_CALLER_KEY.to_string()
+            }
+            Self::RegisteredSlot(slot_id) => claude_oauth_usage_slot_caller_key(slot_id),
         }
     }
 
@@ -2894,10 +3007,11 @@ fn collect_claude_status(
             } else {
                 ClaudeOAuthUsageCaller::Default
             };
-            collect_claude_oauth_usage_with_access_token(
+            collect_claude_oauth_usage_with_credential(
                 account_hash,
                 organization_hash,
                 stable.credential.access_token.clone(),
+                stable.credential.access_expires_at.clone(),
                 &caller,
             )
         }
@@ -3078,6 +3192,23 @@ fn collect_claude_status_snapshots(
                     ClaudeStrongBinding::new(&account, &organization)
                 },
                 |slot_id| crate::claude_browser_auth::collection_suppression(slot_id).is_some(),
+                |binding, slot_id| {
+                    read_claude_oauth_usage_breaker_with_legacy_migration(
+                        &binding.account_identifier_hash,
+                        &binding.organization_identifier_hash,
+                        &claude_oauth_usage_config_fingerprint(),
+                        false,
+                    )
+                    .is_some_and(|breaker| {
+                        claude_oauth_usage_caller_auth_hold(
+                            &breaker,
+                            &ClaudeOAuthUsageCaller::RegisteredSlot(slot_id.to_string()),
+                            current_unix_seconds(),
+                            None,
+                        )
+                        .is_some()
+                    })
+                },
             )
         })
         .unwrap_or_default();
@@ -3201,10 +3332,11 @@ fn collect_claude_status_snapshots(
         let organization_hash = resolved.organization_identifier_hash.clone();
         let access_token = resolved.credential.access_token.take();
         let credential_available = access_token.is_some();
-        let outcome = collect_claude_oauth_usage_with_access_token(
+        let outcome = collect_claude_oauth_usage_with_credential(
             &account_hash,
             &organization_hash,
             access_token,
+            resolved.credential.access_expires_at.clone(),
             &ClaudeOAuthUsageCaller::RegisteredSlot(slot_id.clone()),
         );
         match custom_claude_snapshot_from_usage(
@@ -3713,11 +3845,15 @@ fn bounded_claude_custom_descriptors(
 /// - its last pass was the binding's canonical anchor and ended `Fresh` or
 ///   `ReloginApproaching`, i.e. its own credential read this account;
 /// - its config directory's identity file still names that same account and
-///   organization right now.
+///   organization right now;
+/// - its own credential is not in a live auth hold. A held slot can still
+///   look `Fresh` while the shared cache is young, but it would not refresh
+///   the account, so the default login keeps calling.
 fn claude_slot_owned_usage_bindings(
     status: &ClaudeAccountsStatusV1,
     current_binding: impl Fn(&ClaudeConfigSlotDescriptorV1) -> Option<ClaudeStrongBinding>,
     suppressed: impl Fn(&str) -> bool,
+    slot_auth_held: impl Fn(&ClaudeStrongBinding, &str) -> bool,
 ) -> BTreeSet<ClaudeStrongBinding> {
     let mut custom = ordered_claude_slot_descriptors(status)
         .into_iter()
@@ -3752,7 +3888,9 @@ fn claude_slot_owned_usage_bindings(
                     .organization_identifier_hash
                     .as_deref()?,
             )?;
-            (current_binding(descriptor)? == persisted).then_some(persisted)
+            (current_binding(descriptor)? == persisted
+                && !slot_auth_held(&persisted, &descriptor.slot_id))
+            .then_some(persisted)
         })
         .collect()
 }
@@ -3841,10 +3979,11 @@ pub(crate) fn collect_registered_claude_slot_status(
     let organization_hash = resolved.organization_identifier_hash.clone();
     let access_token = resolved.credential.access_token.take();
     let credential_available = access_token.is_some();
-    let outcome = collect_claude_oauth_usage_with_access_token(
+    let outcome = collect_claude_oauth_usage_with_credential(
         &account_hash,
         &organization_hash,
         access_token,
+        resolved.credential.access_expires_at.clone(),
         &ClaudeOAuthUsageCaller::RegisteredSlot(slot_id.to_string()),
     );
     let mut status = match custom_claude_snapshot_from_usage(
@@ -7496,16 +7635,36 @@ fn collect_claude_statusline_context_status() -> Result<AgentContextStatus, Stri
     Ok(claude_statusline_context_from_cache(cache, history))
 }
 
+#[cfg(test)]
 fn collect_claude_oauth_usage_with_access_token(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
     access_token: Option<String>,
     caller: &ClaudeOAuthUsageCaller,
 ) -> ClaudeOAuthUsageOutcome {
+    collect_claude_oauth_usage_with_credential(
+        account_identifier_hash,
+        organization_identifier_hash,
+        access_token,
+        None,
+        caller,
+    )
+}
+
+/// `credential_expires_at` is the access-token expiry metadata of the same
+/// credential, used only to notice rotation; it is never the token.
+fn collect_claude_oauth_usage_with_credential(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    access_token: Option<String>,
+    credential_expires_at: Option<String>,
+    caller: &ClaudeOAuthUsageCaller,
+) -> ClaudeOAuthUsageOutcome {
     let mut outcome = collect_claude_oauth_usage_unstamped(
         account_identifier_hash,
         organization_identifier_hash,
         access_token,
+        credential_expires_at.as_deref(),
         caller,
     );
     if let Ok(usage) = &mut outcome.result {
@@ -7546,6 +7705,7 @@ fn collect_claude_oauth_usage_unstamped(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
     access_token: Option<String>,
+    credential_expires_at: Option<&str>,
     caller: &ClaudeOAuthUsageCaller,
 ) -> ClaudeOAuthUsageOutcome {
     let now = current_unix_seconds();
@@ -7650,7 +7810,9 @@ fn collect_claude_oauth_usage_unstamped(
     }
     let caller_auth_hold = breaker
         .as_ref()
-        .and_then(|breaker| claude_oauth_usage_caller_auth_hold(breaker, caller, now))
+        .and_then(|breaker| {
+            claude_oauth_usage_caller_auth_hold(breaker, caller, now, credential_expires_at)
+        })
         .cloned();
     let open_breaker = breaker.filter(|breaker| claude_oauth_usage_breaker_is_open(breaker, now));
 
@@ -7832,6 +7994,7 @@ fn collect_claude_oauth_usage_unstamped(
                         organization_identifier_hash,
                         &config_fingerprint,
                         now,
+                        credential_expires_at,
                     )
                 }
                 Some(failure) => record_claude_oauth_usage_failure_with_legacy(
@@ -7936,7 +8099,7 @@ fn collect_claude_oauth_usage_unstamped(
     }
     // One clean answer clears the accumulated failure counters: the thresholds
     // below are about *consecutive* failures. Another caller's own auth
-    // backoff survives: this answer says nothing about that credential.
+    // streak survives: this answer says nothing about that credential.
     clear_claude_oauth_usage_breaker_after_success(
         caller,
         account_identifier_hash,
@@ -8204,12 +8367,14 @@ fn read_claude_oauth_usage_breaker_locked(
             config_fingerprint,
         );
     }
-    let body = fs::read_to_string(claude_oauth_usage_breaker_path(
-        account_identifier_hash,
-        organization_identifier_hash,
-    ))
-    .ok()?;
-    let breaker: ClaudeOAuthUsageBreaker = serde_json::from_str(&body).ok()?;
+    if allow_legacy_migration {
+        let _ = read_claude_oauth_usage_breaker_file_migrating(
+            &claude_oauth_usage_legacy_breaker_path(),
+        );
+    }
+    let breaker = read_claude_oauth_usage_breaker_file_migrating(
+        &claude_oauth_usage_breaker_path(account_identifier_hash, organization_identifier_hash),
+    )?;
     if breaker.schema_version != CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION
         || breaker.account_identifier_hash != account_identifier_hash
         || breaker.organization_identifier_hash != organization_identifier_hash
@@ -8284,7 +8449,7 @@ fn clear_claude_oauth_usage_breaker_with_legacy(
 /// Auth state is per caller, so only the refreshed slot's own streak and
 /// backoff are retired; the default login's rejections, if any, were earned by
 /// a different credential and stay. An account-wide auth verdict written by a
-/// daemon from before caller attribution is cleared as before.
+/// daemon from before caller attribution has only its auth fields cleared.
 pub(crate) fn clear_claude_oauth_usage_auth_breaker(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
@@ -8292,33 +8457,29 @@ pub(crate) fn clear_claude_oauth_usage_auth_breaker(
 ) {
     let caller_key = ClaudeOAuthUsageCaller::RegisteredSlot(slot_id.to_string()).breaker_key();
     let retire = |path: &Path| {
-        let Some(mut breaker) = fs::read_to_string(path)
-            .ok()
-            .and_then(|body| serde_json::from_str::<ClaudeOAuthUsageBreaker>(&body).ok())
-            .filter(|breaker| {
+        let Some(mut breaker) =
+            read_claude_oauth_usage_breaker_file_migrating(path).filter(|breaker| {
                 breaker.account_identifier_hash == account_identifier_hash
                     && breaker.organization_identifier_hash == organization_identifier_hash
             })
         else {
             return;
         };
+        let mut changed = breaker.auth_callers.remove(&caller_key).is_some();
+        // A pre-attribution account-wide auth verdict: clear only its auth
+        // fields. Other callers' attributed holds were earned by credentials
+        // this refresh did not touch, and stay.
         if breaker.opened_by == ClaudeOAuthUsageFailure::AuthRejected.code() {
-            let _ = fs::remove_file(path);
+            breaker.auth_failures = 0;
+            breaker.opened_by.clear();
+            breaker.opened_at_epoch_seconds = 0;
+            breaker.reopen_after_epoch_seconds = 0;
+            changed = true;
+        }
+        if !changed {
             return;
         }
-        if breaker.auth_callers.remove(&caller_key).is_none() {
-            return;
-        }
-        if breaker
-            == (ClaudeOAuthUsageBreaker {
-                schema_version: breaker.schema_version,
-                account_identifier_hash: breaker.account_identifier_hash.clone(),
-                organization_identifier_hash: breaker.organization_identifier_hash.clone(),
-                config_fingerprint: breaker.config_fingerprint.clone(),
-                last_auth_failure: breaker.last_auth_failure.clone(),
-                ..Default::default()
-            })
-        {
+        if breaker.holds_no_state() {
             let _ = fs::remove_file(path);
             return;
         }
@@ -8356,7 +8517,7 @@ fn migrate_legacy_claude_oauth_usage_breaker_locked(
         return;
     }
     let legacy = claude_oauth_usage_legacy_breaker_path();
-    let Some(breaker) = fs::read_to_string(&legacy)
+    let Some(mut breaker) = fs::read_to_string(&legacy)
         .ok()
         .and_then(|body| serde_json::from_str::<ClaudeOAuthUsageBreaker>(&body).ok())
         .filter(|breaker| {
@@ -8368,6 +8529,7 @@ fn migrate_legacy_claude_oauth_usage_breaker_locked(
     else {
         return;
     };
+    breaker.migrate_raw_caller_keys();
     if write_claude_oauth_usage_breaker_locked(&breaker).is_ok() {
         let _ = fs::remove_file(legacy);
     }
@@ -8479,16 +8641,20 @@ fn claude_oauth_usage_auth_backoff_seconds(consecutive_failures: u32) -> u64 {
         .min(CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS)
 }
 
-/// This caller's auth state while it is held back, if it is.
+/// This caller's auth state while it is held back, if it is. A rotated
+/// credential (different access expiry) is not held by its predecessor's
+/// rejections. `None` for the current expiry means unknown: the hold stands.
 fn claude_oauth_usage_caller_auth_hold<'a>(
     breaker: &'a ClaudeOAuthUsageBreaker,
     caller: &ClaudeOAuthUsageCaller,
     now: u64,
+    credential_expires_at: Option<&str>,
 ) -> Option<&'a ClaudeOAuthUsageCallerAuthState> {
     breaker
         .auth_callers
         .get(&caller.breaker_key())
         .filter(|state| now < state.backoff_until_epoch_seconds)
+        .filter(|state| !claude_oauth_usage_caller_credential_rotated(state, credential_expires_at))
 }
 
 /// Fold one 401/403 from one caller into the persisted breaker. Pure so the
@@ -8497,6 +8663,7 @@ fn claude_oauth_usage_caller_auth_hold<'a>(
 /// The account-wide counters and open verdict are untouched: one credential's
 /// rejection must not stop a different credential for the same account. A
 /// caller whose streak is older than the cool-down starts a new streak.
+#[allow(clippy::too_many_arguments)]
 fn claude_oauth_usage_breaker_after_auth_failure(
     previous: Option<ClaudeOAuthUsageBreaker>,
     caller: &ClaudeOAuthUsageCaller,
@@ -8505,6 +8672,7 @@ fn claude_oauth_usage_breaker_after_auth_failure(
     organization_identifier_hash: &str,
     config_fingerprint: &str,
     now: u64,
+    credential_expires_at: Option<&str>,
 ) -> ClaudeOAuthUsageBreaker {
     let mut breaker = previous.unwrap_or_default();
     breaker.schema_version = CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION;
@@ -8513,14 +8681,12 @@ fn claude_oauth_usage_breaker_after_auth_failure(
     breaker.config_fingerprint = config_fingerprint.to_string();
     let key = caller.breaker_key();
     let state = breaker.auth_callers.entry(key.clone()).or_default();
-    if state.last_failure_at_epoch_seconds > 0
-        && now
-            >= state
-                .last_failure_at_epoch_seconds
-                .saturating_add(CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS)
+    if claude_oauth_usage_caller_streak_is_stale(state, now)
+        || claude_oauth_usage_caller_credential_rotated(state, credential_expires_at)
     {
         *state = ClaudeOAuthUsageCallerAuthState::default();
     }
+    state.credential_expires_at = credential_expires_at.map(ToString::to_string);
     state.consecutive_failures = state.consecutive_failures.saturating_add(1);
     state.last_status = status;
     state.last_failure_at_epoch_seconds = now;
@@ -8542,6 +8708,7 @@ fn record_claude_oauth_usage_auth_failure(
     organization_identifier_hash: &str,
     config_fingerprint: &str,
     now: u64,
+    credential_expires_at: Option<&str>,
 ) -> Vec<AgentStatusDiagnostic> {
     let mirror_legacy_default = caller.mirrors_legacy_default();
     let lock =
@@ -8557,10 +8724,11 @@ fn record_claude_oauth_usage_auth_failure(
     );
     let was_open = previous
         .as_ref()
-        .and_then(|breaker| breaker.auth_callers.get(&caller.breaker_key()))
+        .and_then(|breaker| {
+            claude_oauth_usage_caller_auth_hold(breaker, caller, now, credential_expires_at)
+        })
         .is_some_and(|state| {
-            now < state.backoff_until_epoch_seconds
-                && state.consecutive_failures >= CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD
+            state.consecutive_failures >= CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD
         });
     let breaker = claude_oauth_usage_breaker_after_auth_failure(
         previous,
@@ -8570,6 +8738,7 @@ fn record_claude_oauth_usage_auth_failure(
         organization_identifier_hash,
         config_fingerprint,
         now,
+        credential_expires_at,
     );
     let _ = write_claude_oauth_usage_breaker_locked(&breaker);
     if mirror_legacy_default {
@@ -8631,8 +8800,8 @@ fn claude_oauth_usage_caller_auth_hold_diagnostic(
 }
 
 /// A clean answer from `caller`: reset the account-wide counters and this
-/// caller's auth streak. Other callers' live auth holds are kept, because this
-/// answer was earned by a different credential. With nothing left to keep, the
+/// caller's auth streak. Other callers' non-stale streaks are kept, held or
+/// not, because this answer was earned by a different credential. With nothing left to keep, the
 /// files are removed exactly as before caller attribution.
 fn clear_claude_oauth_usage_breaker_after_success(
     caller: &ClaudeOAuthUsageCaller,
@@ -8654,6 +8823,8 @@ fn clear_claude_oauth_usage_breaker_after_success(
         mirror_legacy_default,
     );
     let caller_key = caller.breaker_key();
+    // Another caller's streak survives this success, held or not: it ends only
+    // on that caller's own success, its credential refresh, or staleness.
     let held_others = previous
         .as_ref()
         .map(|breaker| {
@@ -8661,7 +8832,7 @@ fn clear_claude_oauth_usage_breaker_after_success(
                 .auth_callers
                 .iter()
                 .filter(|(key, state)| {
-                    **key != caller_key && now < state.backoff_until_epoch_seconds
+                    **key != caller_key && !claude_oauth_usage_caller_streak_is_stale(state, now)
                 })
                 .map(|(key, state)| (key.clone(), state.clone()))
                 .collect::<BTreeMap<_, _>>()
@@ -22525,6 +22696,7 @@ exit 1
                 "organization-a",
                 "fingerprint-a",
                 now,
+                None,
             ));
         }
         let breaker = breaker.expect("breaker");
@@ -22541,7 +22713,7 @@ exit 1
             default_state.backoff_until_epoch_seconds,
             2_000 + 2 * CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS
         );
-        let slot_state = &breaker.auth_callers["slot:slot-a"];
+        let slot_state = &breaker.auth_callers[&claude_oauth_usage_slot_caller_key("slot-a")];
         assert_eq!(slot_state.consecutive_failures, 1);
         assert_eq!(slot_state.last_status, 403);
         assert_eq!(
@@ -22557,20 +22729,22 @@ exit 1
             })
         );
         // Each caller is held only by its own state.
-        assert!(claude_oauth_usage_caller_auth_hold(&breaker, &default, 2_001).is_some());
+        assert!(claude_oauth_usage_caller_auth_hold(&breaker, &default, 2_001, None).is_some());
         assert!(claude_oauth_usage_caller_auth_hold(
             &breaker,
             &slot,
-            1_100 + CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS
+            1_100 + CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS,
+            None
         )
         .is_none());
         let other_slot = ClaudeOAuthUsageCaller::RegisteredSlot("slot-b".to_string());
-        assert!(claude_oauth_usage_caller_auth_hold(&breaker, &other_slot, 2_001).is_none());
+        assert!(claude_oauth_usage_caller_auth_hold(&breaker, &other_slot, 2_001, None).is_none());
         // The deferred default shares the default login's key: same credential.
         assert!(claude_oauth_usage_caller_auth_hold(
             &breaker,
             &ClaudeOAuthUsageCaller::DefaultDeferredToSlot,
-            2_001
+            2_001,
+            None
         )
         .is_some());
     }
@@ -22599,14 +22773,14 @@ exit 1
         let mut breaker = None;
         for _ in 0..CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD {
             breaker = Some(claude_oauth_usage_breaker_after_auth_failure(
-                breaker, &caller, 401, "a", "o", "f", 1_000,
+                breaker, &caller, 401, "a", "o", "f", 1_000, None,
             ));
         }
         let later = 1_000 + CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS;
         let breaker = claude_oauth_usage_breaker_after_auth_failure(
-            breaker, &caller, 401, "a", "o", "f", later,
+            breaker, &caller, 401, "a", "o", "f", later, None,
         );
-        let state = &breaker.auth_callers["slot:slot-a"];
+        let state = &breaker.auth_callers[&claude_oauth_usage_slot_caller_key("slot-a")];
         assert_eq!(state.consecutive_failures, 1);
         assert_eq!(
             state.backoff_until_epoch_seconds,
@@ -22636,6 +22810,7 @@ exit 1
             organization,
             &fingerprint,
             now,
+            None,
         );
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].code, "claude_oauth_usage_auth_rejected");
@@ -22703,6 +22878,7 @@ exit 1
                     "organization-threshold",
                     "fingerprint-threshold",
                     1_000 + u64::from(attempt),
+                    None,
                 )
                 .into_iter()
                 .filter(|diagnostic| diagnostic.code == "claude_oauth_usage_circuit_open"),
@@ -22753,7 +22929,15 @@ exit 1
         let (account, organization, fingerprint) = ("account-s", "organization-s", "fingerprint-s");
         let slot = ClaudeOAuthUsageCaller::RegisteredSlot("slot-s".to_string());
         let now = 10_000;
-        record_claude_oauth_usage_auth_failure(&slot, 401, account, organization, fingerprint, now);
+        record_claude_oauth_usage_auth_failure(
+            &slot,
+            401,
+            account,
+            organization,
+            fingerprint,
+            now,
+            None,
+        );
         record_claude_oauth_usage_failure(
             ClaudeOAuthUsageFailure::ResponseShape,
             account,
@@ -22772,7 +22956,7 @@ exit 1
         let kept = read_claude_oauth_usage_breaker(account, organization, fingerprint)
             .expect("the rejected slot's hold survives another credential's success");
         assert_eq!(kept.shape_failures, 0, "endpoint-level counters reset");
-        assert!(claude_oauth_usage_caller_auth_hold(&kept, &slot, now + 1).is_some());
+        assert!(claude_oauth_usage_caller_auth_hold(&kept, &slot, now + 1, None).is_some());
         assert_eq!(kept.last_auth_failure.expect("history").status, 401);
 
         clear_claude_oauth_usage_breaker_after_success(
@@ -22807,6 +22991,7 @@ exit 1
             organization,
             fingerprint,
             1_000,
+            None,
         );
         record_claude_oauth_usage_auth_failure(
             &default,
@@ -22815,17 +23000,26 @@ exit 1
             organization,
             fingerprint,
             1_000,
+            None,
         );
 
         clear_claude_oauth_usage_auth_breaker(account, organization, "slot-u");
         let kept = read_claude_oauth_usage_breaker(account, organization, fingerprint)
             .expect("the default login's own rejection stays");
-        assert!(claude_oauth_usage_caller_auth_hold(&kept, &slot, 1_001).is_none());
-        assert!(claude_oauth_usage_caller_auth_hold(&kept, &default, 1_001).is_some());
+        assert!(claude_oauth_usage_caller_auth_hold(&kept, &slot, 1_001, None).is_none());
+        assert!(claude_oauth_usage_caller_auth_hold(&kept, &default, 1_001, None).is_some());
 
         // With only the refreshed slot's state present, the file goes away.
         let other = ("account-v", "organization-v");
-        record_claude_oauth_usage_auth_failure(&slot, 403, other.0, other.1, fingerprint, 1_000);
+        record_claude_oauth_usage_auth_failure(
+            &slot,
+            403,
+            other.0,
+            other.1,
+            fingerprint,
+            1_000,
+            None,
+        );
         clear_claude_oauth_usage_auth_breaker(other.0, other.1, "slot-u");
         assert!(!claude_oauth_usage_breaker_path(other.0, other.1).exists());
         let _ = fs::remove_dir_all(support_dir);
@@ -22962,6 +23156,7 @@ exit 1
             &single_caller_accounts_status(vec![anchor.clone()], Vec::new()),
             same,
             never_suppressed,
+            |_, _| false,
         );
         assert_eq!(owned, BTreeSet::from([binding.clone()]));
 
@@ -22979,6 +23174,7 @@ exit 1
                 &single_caller_accounts_status(vec![managed], Vec::new()),
                 same,
                 never_suppressed,
+                |_, _| false
             )
             .is_empty());
         }
@@ -22993,6 +23189,7 @@ exit 1
             &single_caller_accounts_status(Vec::new(), vec![external]),
             same,
             never_suppressed,
+            |_, _| false
         )
         .is_empty());
         // The slot's identity file now names another account, or cannot be read.
@@ -23002,6 +23199,7 @@ exit 1
                 &single_caller_accounts_status(vec![anchor.clone()], Vec::new()),
                 |_| current.clone(),
                 never_suppressed,
+                |_, _| false
             )
             .is_empty());
         }
@@ -23010,6 +23208,7 @@ exit 1
             &single_caller_accounts_status(vec![anchor], Vec::new()),
             same,
             |_| true,
+            |_, _| false
         )
         .is_empty());
     }
@@ -23064,6 +23263,7 @@ exit 1
             "o",
             "f",
             1_000,
+            None,
         );
         let body = serde_json::to_string(&new).expect("serialize attributed breaker");
         let read_by_old: PreAttributionBreaker =
@@ -23077,6 +23277,305 @@ exit 1
     }
 
     #[test]
+    #[serial]
+    fn another_callers_success_keeps_an_expired_hold_streak_until_it_goes_stale() {
+        let support_dir = single_caller_test_support_dir("streak-kept");
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let (account, organization, fingerprint) = ("account-k", "organization-k", "fingerprint-k");
+        let slot_a = ClaudeOAuthUsageCaller::RegisteredSlot("slot-a".to_string());
+        let slot_b = ClaudeOAuthUsageCaller::RegisteredSlot("slot-b".to_string());
+        record_claude_oauth_usage_auth_failure(
+            &slot_a,
+            401,
+            account,
+            organization,
+            fingerprint,
+            1_000,
+            None,
+        );
+        // A's 15-minute hold has expired when B succeeds.
+        let after_hold = 1_000 + CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS + 60;
+        clear_claude_oauth_usage_breaker_after_success(
+            &slot_b,
+            account,
+            organization,
+            fingerprint,
+            after_hold,
+        );
+        let kept = read_claude_oauth_usage_breaker(account, organization, fingerprint)
+            .expect("A's streak survives B's success");
+        assert_eq!(
+            kept.auth_callers[&slot_a.breaker_key()].consecutive_failures,
+            1
+        );
+        // A's next two rejections therefore reach the threshold.
+        for offset in [1, 2] {
+            record_claude_oauth_usage_auth_failure(
+                &slot_a,
+                401,
+                account,
+                organization,
+                fingerprint,
+                after_hold + offset,
+                None,
+            );
+        }
+        let opened =
+            read_claude_oauth_usage_breaker(account, organization, fingerprint).expect("breaker");
+        assert_eq!(
+            opened.auth_callers[&slot_a.breaker_key()].consecutive_failures,
+            CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD
+        );
+        // Once the streak is stale, B's success drops it.
+        clear_claude_oauth_usage_breaker_after_success(
+            &slot_b,
+            account,
+            organization,
+            fingerprint,
+            after_hold + 2 + CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS,
+        );
+        assert!(!claude_oauth_usage_breaker_path(account, organization).exists());
+        let _ = fs::remove_dir_all(support_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn clearing_a_legacy_auth_verdict_keeps_other_callers_holds() {
+        let support_dir = single_caller_test_support_dir("legacy-verdict");
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let (account, organization, fingerprint) = ("account-l", "organization-l", "fingerprint-l");
+        let now = current_unix_seconds();
+        // A pre-attribution account-wide auth verdict...
+        for _ in 0..CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD {
+            record_claude_oauth_usage_failure(
+                ClaudeOAuthUsageFailure::AuthRejected,
+                account,
+                organization,
+                fingerprint,
+                now,
+            );
+        }
+        // ...plus the default login's own attributed hold and the slot's.
+        let default = ClaudeOAuthUsageCaller::Default;
+        let slot = ClaudeOAuthUsageCaller::RegisteredSlot("slot-l".to_string());
+        record_claude_oauth_usage_auth_failure(
+            &default,
+            401,
+            account,
+            organization,
+            fingerprint,
+            now,
+            None,
+        );
+        record_claude_oauth_usage_auth_failure(
+            &slot,
+            403,
+            account,
+            organization,
+            fingerprint,
+            now,
+            None,
+        );
+
+        clear_claude_oauth_usage_auth_breaker(account, organization, "slot-l");
+
+        let kept = read_claude_oauth_usage_breaker(account, organization, fingerprint)
+            .expect("unrelated callers' holds survive the refresh");
+        assert!(!claude_oauth_usage_breaker_is_open(&kept, now));
+        assert_eq!(kept.auth_failures, 0);
+        assert!(kept.opened_by.is_empty());
+        assert!(claude_oauth_usage_caller_auth_hold(&kept, &default, now, None).is_some());
+        assert!(claude_oauth_usage_caller_auth_hold(&kept, &slot, now, None).is_none());
+        let _ = fs::remove_dir_all(support_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn breaker_files_never_persist_the_raw_slot_id_and_migrate_raw_keys() {
+        let support_dir = single_caller_test_support_dir("opaque-key");
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let raw_slot_id = "claude_slot_0123456789abcdef0123456789abcdef";
+        let slot = ClaudeOAuthUsageCaller::RegisteredSlot(raw_slot_id.to_string());
+        let (account, organization, fingerprint) = ("account-o", "organization-o", "fingerprint-o");
+        // The default login mirrors into the legacy file; the slot writes the
+        // per-account file. Neither may carry the raw id.
+        record_claude_oauth_usage_auth_failure(
+            &slot,
+            401,
+            account,
+            organization,
+            fingerprint,
+            1_000,
+            None,
+        );
+        record_claude_oauth_usage_auth_failure(
+            &ClaudeOAuthUsageCaller::Default,
+            401,
+            account,
+            organization,
+            fingerprint,
+            1_001,
+            None,
+        );
+        for path in [
+            claude_oauth_usage_breaker_path(account, organization),
+            claude_oauth_usage_legacy_breaker_path(),
+        ] {
+            let body = fs::read_to_string(&path).expect("breaker body");
+            assert!(
+                !body.contains(raw_slot_id),
+                "raw slot id persisted in {path:?}"
+            );
+            assert!(body.contains(&claude_oauth_usage_slot_caller_key(raw_slot_id)));
+        }
+        assert_ne!(
+            claude_oauth_usage_slot_caller_key(raw_slot_id),
+            claude_oauth_usage_slot_caller_key("claude_slot_other")
+        );
+
+        // A file already written with raw `slot:<id>` keys is migrated on read.
+        let (account, organization) = ("account-raw", "organization-raw");
+        let path = claude_oauth_usage_breaker_path(account, organization);
+        fs::create_dir_all(path.parent().expect("parent")).expect("state dir");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION,
+                "account_identifier_hash": account,
+                "organization_identifier_hash": organization,
+                "config_fingerprint": fingerprint,
+                "auth_callers": {
+                    format!("slot:{raw_slot_id}"): {
+                        "consecutive_failures": 2,
+                        "last_status": 403,
+                        "last_failure_at_epoch_seconds": 1_000,
+                        "backoff_until_epoch_seconds": 2_800
+                    }
+                },
+                "last_auth_failure": {
+                    "caller": format!("slot:{raw_slot_id}"),
+                    "status": 403,
+                    "at_epoch_seconds": 1_000
+                }
+            }))
+            .expect("raw fixture"),
+        )
+        .expect("write raw-key breaker");
+        let migrated = read_claude_oauth_usage_breaker(account, organization, fingerprint)
+            .expect("migrated breaker");
+        assert_eq!(
+            migrated.auth_callers[&slot.breaker_key()].consecutive_failures,
+            2
+        );
+        assert_eq!(
+            migrated.last_auth_failure.expect("history").caller,
+            slot.breaker_key()
+        );
+        assert!(
+            !fs::read_to_string(&path)
+                .expect("rewritten")
+                .contains(raw_slot_id),
+            "the migration is persisted"
+        );
+        let _ = fs::remove_dir_all(support_dir);
+    }
+
+    #[test]
+    fn default_does_not_defer_to_a_slot_whose_own_credential_is_held() {
+        use ottto_protocol::ClaudeConfigSlotRelationshipV1 as Relationship;
+        let binding = ClaudeStrongBinding::new("account-g", "organization-g").expect("binding");
+        let anchor = single_caller_slot(
+            "claude_slot_held",
+            ClaudeConfigSlotOwnership::Managed,
+            ClaudeConfigSlotCollectionStateV1::Fresh,
+            Some(Relationship::CanonicalAnchor),
+        );
+        let status = single_caller_accounts_status(vec![anchor], Vec::new());
+        let held = claude_slot_owned_usage_bindings(
+            &status,
+            |_| Some(binding.clone()),
+            |_| false,
+            |held_binding, slot_id| {
+                assert_eq!(held_binding, &binding);
+                assert_eq!(slot_id, "claude_slot_held");
+                true
+            },
+        );
+        assert!(
+            held.is_empty(),
+            "a Fresh-looking slot in its own auth hold would not refresh the account"
+        );
+        let not_held = claude_slot_owned_usage_bindings(
+            &status,
+            |_| Some(binding.clone()),
+            |_| false,
+            |_, _| false,
+        );
+        assert_eq!(not_held, BTreeSet::from([binding]));
+    }
+
+    #[test]
+    fn rotated_default_credential_is_released_from_its_predecessors_hold() {
+        let default = ClaudeOAuthUsageCaller::Default;
+        let rejected_expiry = Some("2026-10-03T01:00:00Z");
+        let rotated_expiry = Some("2026-10-03T09:00:00Z");
+        let mut breaker = None;
+        for offset in 0..2 {
+            breaker = Some(claude_oauth_usage_breaker_after_auth_failure(
+                breaker,
+                &default,
+                401,
+                "a",
+                "o",
+                "f",
+                1_000 + offset,
+                rejected_expiry,
+            ));
+        }
+        let breaker = breaker.expect("breaker");
+        let state = &breaker.auth_callers["default"];
+        assert_eq!(state.credential_expires_at.as_deref(), rejected_expiry);
+        // Same credential, or unknown current expiry: still held.
+        assert!(
+            claude_oauth_usage_caller_auth_hold(&breaker, &default, 1_002, rejected_expiry)
+                .is_some()
+        );
+        assert!(claude_oauth_usage_caller_auth_hold(&breaker, &default, 1_002, None).is_some());
+        // Claude Code rotated the token: released at once.
+        assert!(
+            claude_oauth_usage_caller_auth_hold(&breaker, &default, 1_002, rotated_expiry)
+                .is_none()
+        );
+        // A rejection of the rotated credential starts a new streak.
+        let next = claude_oauth_usage_breaker_after_auth_failure(
+            Some(breaker),
+            &default,
+            401,
+            "a",
+            "o",
+            "f",
+            1_003,
+            rotated_expiry,
+        );
+        let state = &next.auth_callers["default"];
+        assert_eq!(state.consecutive_failures, 1);
+        assert_eq!(state.credential_expires_at.as_deref(), rotated_expiry);
+        assert_eq!(
+            state.backoff_until_epoch_seconds,
+            1_003 + CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS
+        );
+    }
+
+    #[test]
     fn caller_attribution_diagnostics_survive_the_backend_upload_redaction() {
         let caller = ClaudeOAuthUsageCaller::RegisteredSlot("claude_slot_private".to_string());
         let state = ClaudeOAuthUsageCallerAuthState {
@@ -23085,6 +23584,7 @@ exit 1
             last_failure_at_epoch_seconds: 1_790_000_000,
             backoff_until_epoch_seconds: 1_790_000_000
                 + CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS,
+            credential_expires_at: None,
         };
         let mut snapshot = base_snapshot(
             SourceKind::ClaudeCode,
