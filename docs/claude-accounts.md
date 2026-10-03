@@ -213,6 +213,49 @@ and daemon restart retain the same operation/slot binding. After completion,
 another reconnect may start for the same slot; prior operation ids remain
 retired in bounded fail-closed state and can never be rebound.
 
+Each registered connection remembers the account it is approved for: the
+strong account and organization hashes only, never an email or credential,
+stored with its registration together with how it was approved
+(`approved_from`: `setup`, `reconnect` or `observed`). A setup or reconnect
+that completes with verified identity records that approval. A connection saved
+before approvals existed is back-filled once: from its latest completed,
+verified setup or reconnect; else from the last verified identity in local
+collection state; else from its first verified identity. A connection whose
+setup or reconnect is still pending, or ended without verified identity, is
+never back-filled from an observation.
+
+The last two back-fills are trust on first use (`observed`). They approve
+whatever account was signed in, including one that drifted there before this
+version, so local status shows a notice on that connection: "Approved from the
+current Claude login (<plan>). If this is the wrong account, sign in again with
+the right one." The next completed verified reconnect replaces an observed
+approval, even when it proves a different account, because signing in through
+a reconnect is the user's explicit choice; the notice then disappears. An
+approval from a verified setup or reconnect is never replaced by another
+account that way. Any completed verified reconnect re-records its own verified
+pair; one started without an expected organization (a same-account
+organization change) therefore re-approves the new organization. Otherwise,
+switching a verified connection to another account or organization means
+removing and re-adding it.
+
+Running `CLAUDE_CONFIG_DIR=<that directory> claude` and `/login` with another
+account replaces the Claude login inside that connection. Ottto then reports
+`identity_mismatch` for it, with a local message that names both plans (for
+example a Claude Max 20x login in a Claude Team Premium connection). Until the
+approved account signs in again, Ottto starts no Claude command, credential
+refresh or usage request for that connection and uploads nothing for the other
+account; the approved account keeps its own profile and its last full reading,
+marked stale, so its card shows that it needs attention. Accounts are never
+merged. Signing in again with the approved account, from Terminal or the app,
+resumes collection on the next pass. If the connection's Claude account file
+(`.claude.json`) is missing, unreadable or lacks strong ids, Ottto fails closed
+the same way and reports `identity_unknown`: no command, refresh or usage
+request runs for a login it cannot identify. A browser reconnect of a verified
+connection that returns another account leaves the mismatch state: Claude's own sign-in ran in that directory, so
+the saved Claude login there was replaced even though Ottto kept the
+connection's approval. The default `~/.claude` login is unchanged: it follows
+whichever account is signed in there.
+
 Ottto does not assign special “Team” or “Personal” directories. Every distinct
 account-and-organization binding can receive its own daemon-managed anchor,
 whether a Mac has two personal accounts, several organizations, or a mixture.

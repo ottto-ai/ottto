@@ -311,7 +311,9 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
                     return Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin);
                 }
                 if crate::claude_browser_auth::collection_suppression(&descriptor.slot_id).is_some()
+                    || crate::agent_status::claude_slot_login_unapproved(descriptor)
                 {
+                    // Never refresh another or an unknown login on a bound slot.
                     return Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin);
                 }
                 if crate::agent_status::claude_oauth_usage_network_disabled() {
@@ -386,6 +388,7 @@ pub(crate) fn registered_slot_publication_allowed(
     registry.consent == ClaudeAccountUpkeepConsentState::Granted
         && slot_is_still_registered(registry, descriptor)
         && crate::claude_browser_auth::collection_suppression(&descriptor.slot_id).is_none()
+        && !crate::agent_status::claude_slot_login_unapproved(descriptor)
         && !crate::agent_status::claude_oauth_usage_network_disabled()
         && !support_dir.join(UPKEEP_DISABLED_FILE).is_file()
 }

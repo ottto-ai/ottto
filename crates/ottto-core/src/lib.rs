@@ -29,6 +29,7 @@ pub use claude_account::{
 pub use claude_config_slots::{
     claude_legacy_launch_command, prepare_managed_claude_provisional_root,
     validate_managed_claude_auth_root, ClaudeConfigDirSlot, ClaudeConfigSlotSettingsError,
+    ClaudeSlotAccountBinding, ClaudeSlotApproval, ClaudeSlotApprovalSource,
     FileClaudeConfigSlotSettingsStore, CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME,
     CLAUDE_MANAGED_ACCOUNTS_DIR_NAME, CLAUDE_OAUTH_KEYCHAIN_SERVICE, MAX_CLAUDE_ACCOUNT_SLOTS,
     MAX_CLAUDE_CONFIG_DIR_BYTES, MAX_REGISTERED_CLAUDE_CONFIG_SLOTS,

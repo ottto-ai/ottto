@@ -178,6 +178,116 @@ struct PersistedClaudeConfigSlotV1 {
     slot_id: String,
     ownership: ClaudeConfigSlotOwnership,
     config_dir: String,
+    /// Strong account+organization hashes this registration is approved for.
+    /// Set when a setup or reconnect completes with verified identity, or
+    /// back-filled once for a slot registered before bindings existed. Only
+    /// hashes are stored, never emails or credentials. An older daemon
+    /// ignores these fields; a downgrade rewrite drops them and the next
+    /// collection back-fills again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approved_account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approved_organization_identifier_hash: Option<String>,
+    /// How the approval was obtained (no hashes). Absent on an approval
+    /// written by an earlier build of this change; read as `observed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approved_from: Option<ClaudeSlotApprovalSource>,
+}
+
+impl PersistedClaudeConfigSlotV1 {
+    fn new(slot_id: String, ownership: ClaudeConfigSlotOwnership, config_dir: String) -> Self {
+        Self {
+            slot_id,
+            ownership,
+            config_dir,
+            approved_account_identifier_hash: None,
+            approved_organization_identifier_hash: None,
+            approved_from: None,
+        }
+    }
+
+    fn approved_binding(&self) -> Option<ClaudeSlotAccountBinding> {
+        Some(ClaudeSlotAccountBinding {
+            account_identifier_hash: self.approved_account_identifier_hash.clone()?,
+            organization_identifier_hash: self.approved_organization_identifier_hash.clone()?,
+        })
+    }
+
+    fn approval(&self) -> Option<ClaudeSlotApproval> {
+        Some(ClaudeSlotApproval {
+            binding: self.approved_binding()?,
+            source: self
+                .approved_from
+                .unwrap_or(ClaudeSlotApprovalSource::Observed),
+        })
+    }
+
+    fn approve(&mut self, binding: &ClaudeSlotAccountBinding, source: ClaudeSlotApprovalSource) {
+        self.approved_account_identifier_hash = Some(binding.account_identifier_hash.clone());
+        self.approved_organization_identifier_hash =
+            Some(binding.organization_identifier_hash.clone());
+        self.approved_from = Some(source);
+    }
+}
+
+/// How a slot's approval was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeSlotApprovalSource {
+    /// A setup (or browser admission) completed with verified identity.
+    Setup,
+    /// A reconnect completed with verified identity.
+    Reconnect,
+    /// Back-filled from an observed login (the last verified collection
+    /// identity or the first resolved one): trust on first use. The next
+    /// completed verified reconnect replaces it, even with another account.
+    Observed,
+}
+
+impl ClaudeSlotApprovalSource {
+    fn of_operation(kind: ClaudeAccountSetupOperationKind) -> Self {
+        match kind {
+            ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot => Self::Reconnect,
+            _ => Self::Setup,
+        }
+    }
+}
+
+/// A slot's persisted approval and its provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeSlotApproval {
+    pub binding: ClaudeSlotAccountBinding,
+    pub source: ClaudeSlotApprovalSource,
+}
+
+/// The strong Claude account+organization pair one registered slot is
+/// approved to collect for. Hashes only.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClaudeSlotAccountBinding {
+    pub account_identifier_hash: String,
+    pub organization_identifier_hash: String,
+}
+
+impl ClaudeSlotAccountBinding {
+    pub fn new(account_identifier_hash: &str, organization_identifier_hash: &str) -> Option<Self> {
+        validate_binding_hashes(account_identifier_hash, organization_identifier_hash).ok()?;
+        Some(Self {
+            account_identifier_hash: account_identifier_hash.to_string(),
+            organization_identifier_hash: organization_identifier_hash.to_string(),
+        })
+    }
+}
+
+/// Where a slot's expected binding came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveSlotBindingSource {
+    /// A setup or reconnect for this slot is still in progress and names its
+    /// own expected pair; that operation's check owns the slot meanwhile.
+    PendingOperation,
+    /// The persisted approved binding.
+    Approved,
+    /// Not persisted yet: the latest completed, verified operation.
+    CompletedOperation(ClaudeSlotApprovalSource),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,27 +410,57 @@ impl FileClaudeConfigSlotSettingsStore {
         slot_id: String,
         config_dir: String,
     ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
+        self.register_managed_path_with_slot_id_and_binding(
+            schema_version,
+            slot_id,
+            config_dir,
+            None,
+        )
+    }
+
+    /// Same admission, also recording the verified account+organization the
+    /// new slot is approved for in the same registry transaction.
+    pub fn register_managed_path_with_slot_id_and_binding(
+        &self,
+        schema_version: u16,
+        slot_id: String,
+        config_dir: String,
+        binding: Option<ClaudeSlotAccountBinding>,
+    ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
         validate_opaque_slot_id(&slot_id)?;
         validate_managed_claude_auth_root(&config_dir)?;
+        if let Some(binding) = binding.as_ref() {
+            validate_binding_hashes(
+                &binding.account_identifier_hash,
+                &binding.organization_identifier_hash,
+            )?;
+        }
         self.transact(schema_version, move |settings| {
-            if let Some(existing) = settings.registered_slots.iter().find(|candidate| {
+            if let Some(existing) = settings.registered_slots.iter_mut().find(|candidate| {
                 candidate.slot_id == slot_id || candidate.config_dir == config_dir
             }) {
                 if existing.slot_id == slot_id
                     && existing.config_dir == config_dir
                     && existing.ownership == ClaudeConfigSlotOwnership::Managed
                 {
+                    if let Some(binding) = binding.as_ref() {
+                        existing.approve(binding, ClaudeSlotApprovalSource::Setup);
+                    }
                     return Ok(());
                 }
                 return Err(ClaudeConfigSlotSettingsError::Invalid(
                     "provisional Claude admission conflicts with an existing slot".to_string(),
                 ));
             }
-            settings.registered_slots.push(PersistedClaudeConfigSlotV1 {
+            let mut registered = PersistedClaudeConfigSlotV1::new(
                 slot_id,
-                ownership: ClaudeConfigSlotOwnership::Managed,
+                ClaudeConfigSlotOwnership::Managed,
                 config_dir,
-            });
+            );
+            if let Some(binding) = binding {
+                registered.approve(&binding, ClaudeSlotApprovalSource::Setup);
+            }
+            settings.registered_slots.push(registered);
             Ok(())
         })
     }
@@ -1052,6 +1192,169 @@ impl FileClaudeConfigSlotSettingsStore {
         Ok(status_contract_for_operation(&persisted, operation_id))
     }
 
+    /// The account+organization this registered slot must currently be
+    /// signed in to, without writing anything. A pending setup/reconnect's own
+    /// expected pair wins while it runs; otherwise the approved binding, or the
+    /// latest completed verified operation when it has not been persisted yet.
+    /// `None` means the slot is not gated (unknown slot or nothing verified).
+    pub fn expected_slot_binding(
+        &self,
+        slot_id: &str,
+    ) -> Result<Option<ClaudeSlotAccountBinding>, ClaudeConfigSlotSettingsError> {
+        let persisted = self.load_persisted()?;
+        Ok(effective_slot_binding(&persisted, slot_id).map(|(binding, _)| binding))
+    }
+
+    /// The binding `ensure_approved_slot_binding` would return, without
+    /// writing. Callers use it to keep enforcing the approval for one pass
+    /// when persisting a back-fill fails.
+    pub fn prospective_approved_slot_binding(
+        &self,
+        slot_id: &str,
+        observed: Option<&ClaudeSlotAccountBinding>,
+    ) -> Result<Option<ClaudeSlotAccountBinding>, ClaudeConfigSlotSettingsError> {
+        let persisted = self.load_persisted()?;
+        Ok(match effective_slot_binding(&persisted, slot_id) {
+            Some((binding, _)) => Some(binding),
+            None => observed
+                .filter(|_| slot_allows_first_use_binding(&persisted, slot_id))
+                .cloned(),
+        })
+    }
+
+    /// Expected binding for collection, back-filling the persisted approval
+    /// once for a slot registered before bindings existed:
+    ///
+    /// 1. an approved binding (or a pending operation's pair) is returned as is;
+    /// 2. otherwise the latest completed, identity-verified setup/reconnect for
+    ///    this exact slot is persisted as the approval;
+    /// 3. otherwise, only when no setup/reconnect for the slot is pending or
+    ///    ended unverified, `observed` (the last or current verified local
+    ///    identity) is persisted as the approval: trust on first use.
+    pub fn ensure_approved_slot_binding(
+        &self,
+        schema_version: u16,
+        slot_id: &str,
+        observed: Option<&ClaudeSlotAccountBinding>,
+    ) -> Result<Option<ClaudeSlotAccountBinding>, ClaudeConfigSlotSettingsError> {
+        if let Some(observed) = observed {
+            validate_binding_hashes(
+                &observed.account_identifier_hash,
+                &observed.organization_identifier_hash,
+            )?;
+        }
+        let persisted = self.load_persisted()?;
+        match effective_slot_binding(&persisted, slot_id) {
+            Some((binding, EffectiveSlotBindingSource::Approved))
+            | Some((binding, EffectiveSlotBindingSource::PendingOperation)) => {
+                return Ok(Some(binding))
+            }
+            Some((_, EffectiveSlotBindingSource::CompletedOperation(_))) => {}
+            None if observed.is_none() || !slot_allows_first_use_binding(&persisted, slot_id) => {
+                return Ok(None)
+            }
+            None => {}
+        }
+        let _transaction = self.settings_transaction_lock()?;
+        validate_schema_version(schema_version)?;
+        let mut persisted = self.load_persisted()?;
+        let (binding, source) = match effective_slot_binding(&persisted, slot_id) {
+            Some((binding, EffectiveSlotBindingSource::Approved))
+            | Some((binding, EffectiveSlotBindingSource::PendingOperation)) => {
+                return Ok(Some(binding))
+            }
+            Some((binding, EffectiveSlotBindingSource::CompletedOperation(source))) => {
+                (binding, source)
+            }
+            None => match observed {
+                Some(observed) if slot_allows_first_use_binding(&persisted, slot_id) => {
+                    (observed.clone(), ClaudeSlotApprovalSource::Observed)
+                }
+                _ => return Ok(None),
+            },
+        };
+        let Some(slot) = persisted
+            .registered_slots
+            .iter_mut()
+            .find(|slot| slot.slot_id == slot_id)
+        else {
+            return Ok(None);
+        };
+        slot.approve(&binding, source);
+        validate_persisted(&persisted)?;
+        self.write_persisted(&persisted)?;
+        Ok(Some(binding))
+    }
+
+    /// Every registered slot's persisted approval with its provenance.
+    pub fn slot_approvals(
+        &self,
+    ) -> Result<BTreeMap<String, ClaudeSlotApproval>, ClaudeConfigSlotSettingsError> {
+        Ok(self
+            .load_persisted()?
+            .registered_slots
+            .iter()
+            .filter_map(|slot| Some((slot.slot_id.clone(), slot.approval()?)))
+            .collect())
+    }
+
+    /// A browser reconnect proved `proven` for a slot whose approval was only
+    /// observed (trust on first use). Signing in through a reconnect is the
+    /// user's explicit choice, so the still-pending operation adopts the
+    /// proven pair as its expected binding and its completion replaces the
+    /// approval. Returns `false`, changing nothing, for any slot approved by
+    /// a verified setup or reconnect, or when the operation is not a pending
+    /// reconnect of a registered slot. The immutable requested pair is kept
+    /// for idempotent replay.
+    pub fn adopt_reconnect_identity_for_observed_approval(
+        &self,
+        schema_version: u16,
+        operation_id: &str,
+        proven: &ClaudeSlotAccountBinding,
+    ) -> Result<bool, ClaudeConfigSlotSettingsError> {
+        validate_setup_operation_id(operation_id)?;
+        validate_binding_hashes(
+            &proven.account_identifier_hash,
+            &proven.organization_identifier_hash,
+        )?;
+        let _transaction = self.settings_transaction_lock()?;
+        validate_schema_version(schema_version)?;
+        let mut persisted = self.load_persisted()?;
+        let Some(operation) = persisted
+            .reconnect_operations
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .filter(|operation| operation_is_nonterminal(operation))
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let observed_only = persisted
+            .registered_slots
+            .iter()
+            .find(|slot| {
+                slot.slot_id == operation.slot_id && slot.config_dir == operation.config_dir
+            })
+            .and_then(PersistedClaudeConfigSlotV1::approval)
+            .is_some_and(|approval| approval.source == ClaudeSlotApprovalSource::Observed);
+        if !observed_only {
+            return Ok(false);
+        }
+        let operation = persisted
+            .reconnect_operations
+            .iter_mut()
+            .find(|candidate| candidate.operation_id == operation_id)
+            .expect("pending reconnect remains present");
+        operation.expected_account_identifier_hash = Some(proven.account_identifier_hash.clone());
+        operation.expected_organization_identifier_hash =
+            Some(proven.organization_identifier_hash.clone());
+        operation.account_identifier_hash = Some(proven.account_identifier_hash.clone());
+        operation.organization_identifier_hash = Some(proven.organization_identifier_hash.clone());
+        validate_persisted(&persisted)?;
+        self.write_persisted(&persisted)?;
+        Ok(true)
+    }
+
     fn register_path_with_ownership(
         &self,
         schema_version: u16,
@@ -1061,11 +1364,11 @@ impl FileClaudeConfigSlotSettingsStore {
         validate_registered_config_dir(&config_dir)?;
         let slot_id = generate_opaque_slot_id()?;
         self.transact(schema_version, move |settings| {
-            settings.registered_slots.push(PersistedClaudeConfigSlotV1 {
-                slot_id,
-                ownership,
-                config_dir,
-            });
+            settings
+                .registered_slots
+                .push(PersistedClaudeConfigSlotV1::new(
+                    slot_id, ownership, config_dir,
+                ));
             Ok(())
         })
     }
@@ -1176,7 +1479,7 @@ impl FileClaudeConfigSlotSettingsStore {
         let _transaction = self.settings_transaction_lock()?;
         validate_schema_version(schema_version)?;
         let mut persisted = self.load_persisted()?;
-        let retire_terminal_reconnect = {
+        let (retire_terminal_reconnect, approved) = {
             let operation = persisted
                 .setup_operations
                 .iter_mut()
@@ -1191,10 +1494,31 @@ impl FileClaudeConfigSlotSettingsStore {
                 == ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
                 && operation_allows_reconnect_successor(operation);
             mutation(operation)?;
-            !was_terminal_reconnect
-                && operation.kind == ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
-                && operation_allows_reconnect_successor(operation)
+            (
+                !was_terminal_reconnect
+                    && operation.kind == ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
+                    && operation_allows_reconnect_successor(operation),
+                completed_operation_binding(operation).map(|binding| {
+                    (
+                        operation.slot_id.clone(),
+                        operation.config_dir.clone(),
+                        binding,
+                        ClaudeSlotApprovalSource::of_operation(operation.kind),
+                    )
+                }),
+            )
         };
+        if let Some((slot_id, config_dir, binding, source)) = approved {
+            // A setup or reconnect that completed with verified identity is
+            // the approval of record for its exact registered slot.
+            if let Some(slot) = persisted
+                .registered_slots
+                .iter_mut()
+                .find(|slot| slot.slot_id == slot_id && slot.config_dir == config_dir)
+            {
+                slot.approve(&binding, source);
+            }
+        }
         if retire_terminal_reconnect {
             // Keep the live row so exact same-binding status/replay remains
             // available, but retire the id before persisting the terminal
@@ -1274,11 +1598,11 @@ impl FileClaudeConfigSlotSettingsStore {
         let created = create_managed_slot_directory(&config_dir_path)?;
         persisted
             .registered_slots
-            .push(PersistedClaudeConfigSlotV1 {
-                slot_id: operation.slot_id.clone(),
-                ownership: ClaudeConfigSlotOwnership::Managed,
-                config_dir: operation.config_dir.clone(),
-            });
+            .push(PersistedClaudeConfigSlotV1::new(
+                operation.slot_id.clone(),
+                ClaudeConfigSlotOwnership::Managed,
+                operation.config_dir.clone(),
+            ));
         let mutable = persisted
             .setup_operations
             .iter_mut()
@@ -1406,6 +1730,19 @@ fn validate_persisted(
     for registered in &settings.registered_slots {
         validate_opaque_slot_id(&registered.slot_id)?;
         validate_registered_config_dir(&registered.config_dir)?;
+        match (
+            registered.approved_account_identifier_hash.as_deref(),
+            registered.approved_organization_identifier_hash.as_deref(),
+        ) {
+            (None, None) if registered.approved_from.is_none() => {}
+            (Some(account), Some(organization)) => validate_binding_hashes(account, organization)?,
+            _ => {
+                return Err(ClaudeConfigSlotSettingsError::Invalid(
+                    "an approved Claude slot binding needs both account and organization hashes"
+                        .to_string(),
+                ))
+            }
+        }
         let slot = ClaudeConfigDirSlot::registered(registered.config_dir.clone())?;
         if !slot_ids.insert(registered.slot_id.as_str()) {
             return Err(ClaudeConfigSlotSettingsError::Invalid(
@@ -1903,6 +2240,111 @@ fn operation_is_nonterminal(operation: &PersistedClaudeAccountSetupOperationV1) 
             | ClaudeAccountSetupOperationState::Validating
             | ClaudeAccountSetupOperationState::Reading
     )
+}
+
+fn validate_binding_hashes(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> Result<(), ClaudeConfigSlotSettingsError> {
+    validate_expected_account_hash(Some(account_identifier_hash))?;
+    validate_expected_account_hash(Some(organization_identifier_hash))
+}
+
+/// The verified pair a completed operation proved, if any.
+fn completed_operation_binding(
+    operation: &PersistedClaudeAccountSetupOperationV1,
+) -> Option<ClaudeSlotAccountBinding> {
+    if operation.state != ClaudeAccountSetupOperationState::Complete {
+        return None;
+    }
+    ClaudeSlotAccountBinding::new(
+        operation.account_identifier_hash.as_deref()?,
+        operation.organization_identifier_hash.as_deref()?,
+    )
+}
+
+fn slot_operations<'a>(
+    settings: &'a PersistedClaudeConfigSlotSettingsV1,
+    slot: &'a PersistedClaudeConfigSlotV1,
+) -> impl Iterator<Item = &'a PersistedClaudeAccountSetupOperationV1> + 'a {
+    settings
+        .setup_operations
+        .iter()
+        .chain(settings.reconnect_operations.iter())
+        .filter(move |operation| {
+            operation.slot_id == slot.slot_id && operation.config_dir == slot.config_dir
+        })
+}
+
+fn effective_slot_binding(
+    settings: &PersistedClaudeConfigSlotSettingsV1,
+    slot_id: &str,
+) -> Option<(ClaudeSlotAccountBinding, EffectiveSlotBindingSource)> {
+    let slot = settings
+        .registered_slots
+        .iter()
+        .find(|slot| slot.slot_id == slot_id)?;
+    let approved = slot.approved_binding();
+    if let Some(pending) = slot_operations(settings, slot)
+        .filter(|operation| operation_is_nonterminal(operation))
+        .max_by_key(|operation| operation.created_sequence)
+    {
+        let expected_account = pending.expected_account_identifier_hash.as_deref();
+        let expected_organization = pending.expected_organization_identifier_hash.as_deref();
+        if let Some(binding) =
+            expected_account
+                .zip(expected_organization)
+                .and_then(|(account, organization)| {
+                    ClaudeSlotAccountBinding::new(account, organization)
+                })
+        {
+            return Some((binding, EffectiveSlotBindingSource::PendingOperation));
+        }
+        // A pending operation without a full expected pair only keeps an
+        // approval it does not contradict; its own check owns the slot.
+        return approved
+            .filter(|approved| {
+                expected_account.map_or(true, |account| approved.account_identifier_hash == account)
+            })
+            .map(|binding| (binding, EffectiveSlotBindingSource::PendingOperation));
+    }
+    if let Some(approved) = approved {
+        return Some((approved, EffectiveSlotBindingSource::Approved));
+    }
+    slot_operations(settings, slot)
+        .filter_map(|operation| {
+            completed_operation_binding(operation).map(|binding| {
+                (
+                    operation.created_sequence,
+                    binding,
+                    ClaudeSlotApprovalSource::of_operation(operation.kind),
+                )
+            })
+        })
+        .max_by_key(|(sequence, _, _)| *sequence)
+        .map(|(_, binding, source)| {
+            (
+                binding,
+                EffectiveSlotBindingSource::CompletedOperation(source),
+            )
+        })
+}
+
+/// Trust on first use is allowed only when nothing for this slot is pending
+/// or ended without verified identity, so a wrong-account sign-in during
+/// setup or reconnect can never become the slot's approval.
+fn slot_allows_first_use_binding(
+    settings: &PersistedClaudeConfigSlotSettingsV1,
+    slot_id: &str,
+) -> bool {
+    settings
+        .registered_slots
+        .iter()
+        .find(|slot| slot.slot_id == slot_id)
+        .is_some_and(|slot| {
+            slot_operations(settings, slot)
+                .all(|operation| operation.state == ClaudeAccountSetupOperationState::Complete)
+        })
 }
 
 fn reject_other_nonterminal_operation(
@@ -3504,6 +3946,432 @@ mod tests {
             .expect("target readable")
             .next()
             .is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn binding(account: char, organization: char) -> ClaudeSlotAccountBinding {
+        ClaudeSlotAccountBinding::new(
+            &account.to_string().repeat(64),
+            &organization.to_string().repeat(64),
+        )
+        .expect("strong test binding")
+    }
+
+    #[test]
+    fn verified_completion_records_the_approved_binding_and_a_mismatch_never_changes_it() {
+        let path = temp_path("approved-binding-completion");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let config_dir = format!("{}/external slot", root.display());
+        let slot_id = store
+            .register_path(1, config_dir)
+            .expect("register external slot")
+            .external_slots[0]
+            .slot_id
+            .clone();
+        assert_eq!(store.expected_slot_binding(&slot_id).expect("read"), None);
+
+        let approved = binding('a', 'b');
+        let first = "claude_setup_61111111111111111111111111111111";
+        store
+            .begin_registered_slot_reconnect_target(
+                1,
+                first.to_string(),
+                &slot_id,
+                None,
+                approved.account_identifier_hash.clone(),
+                Some(approved.organization_identifier_hash.clone()),
+            )
+            .expect("begin reconnect");
+        assert_eq!(
+            store.expected_slot_binding(&slot_id).expect("read"),
+            Some(approved.clone()),
+            "a pending reconnect gates on its own expected pair"
+        );
+        store
+            .transition_setup_operation_with_binding(
+                1,
+                first,
+                Some(&approved.account_identifier_hash),
+                Some(&approved.organization_identifier_hash),
+                ClaudeAccountSetupOperationState::Complete,
+                Some(&approved.account_identifier_hash),
+                Some(&approved.organization_identifier_hash),
+                Some("verified"),
+            )
+            .expect("complete reconnect");
+        let persisted = store.load_persisted().expect("persisted");
+        assert_eq!(
+            persisted.registered_slots[0].approved_binding(),
+            Some(approved.clone()),
+            "verified completion persists the approval"
+        );
+
+        let second = "claude_setup_62222222222222222222222222222222";
+        store
+            .begin_registered_slot_reconnect_target(
+                1,
+                second.to_string(),
+                &slot_id,
+                None,
+                approved.account_identifier_hash.clone(),
+                Some(approved.organization_identifier_hash.clone()),
+            )
+            .expect("begin second reconnect");
+        store
+            .transition_setup_operation_with_binding(
+                1,
+                second,
+                Some(&approved.account_identifier_hash),
+                Some(&approved.organization_identifier_hash),
+                ClaudeAccountSetupOperationState::IdentityMismatch,
+                None,
+                None,
+                Some("mismatch"),
+            )
+            .expect("terminal mismatch");
+        assert_eq!(
+            store.expected_slot_binding(&slot_id).expect("read"),
+            Some(approved.clone())
+        );
+        assert_eq!(
+            store
+                .ensure_approved_slot_binding(1, &slot_id, Some(&binding('c', 'd')))
+                .expect("ensure"),
+            Some(approved),
+            "an observation never replaces an approval"
+        );
+        let body = fs::read_to_string(&path).expect("settings body");
+        assert!(!body.contains('@'), "approvals are hashes only");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_slots_back_fill_from_completed_operation_then_first_verified_identity_only() {
+        let path = temp_path("approved-binding-backfill");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        fs::create_dir_all(root).expect("root");
+        let completed = binding('1', '2');
+        let legacy = serde_json::json!({
+            "schema_version": 2,
+            "background_upkeep_consent": true,
+            "registered_slots": [
+                {"slot_id": "claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ownership": "external", "config_dir": format!("{}/with-complete", root.display())},
+                {"slot_id": "claude_slot_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "ownership": "external", "config_dir": format!("{}/no-operations", root.display())},
+                {"slot_id": "claude_slot_cccccccccccccccccccccccccccccccc", "ownership": "external", "config_dir": format!("{}/unverified", root.display())}
+            ],
+            "reconnect_operations": [
+                {
+                    "kind": "reconnect_registered_slot",
+                    "created_sequence": 1,
+                    "operation_id": "claude_setup_71111111111111111111111111111111",
+                    "slot_id": "claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "config_dir": format!("{}/with-complete", root.display()),
+                    "state": "complete",
+                    "requested_expected_account_identifier_hash": completed.account_identifier_hash,
+                    "expected_account_identifier_hash": completed.account_identifier_hash,
+                    "expected_organization_identifier_hash": completed.organization_identifier_hash,
+                    "account_identifier_hash": completed.account_identifier_hash,
+                    "organization_identifier_hash": completed.organization_identifier_hash
+                },
+                {
+                    "kind": "reconnect_registered_slot",
+                    "created_sequence": 2,
+                    "operation_id": "claude_setup_72222222222222222222222222222222",
+                    "slot_id": "claude_slot_cccccccccccccccccccccccccccccccc",
+                    "config_dir": format!("{}/unverified", root.display()),
+                    "state": "identity_mismatch",
+                    "requested_expected_account_identifier_hash": "3".repeat(64),
+                    "expected_account_identifier_hash": "3".repeat(64),
+                    "expected_organization_identifier_hash": "4".repeat(64)
+                }
+            ]
+        });
+        fs::write(&path, serde_json::to_vec(&legacy).expect("legacy json")).expect("write legacy");
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let observed = binding('8', '9');
+
+        // 1. The latest completed, verified operation wins over observation.
+        assert_eq!(
+            store
+                .expected_slot_binding("claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .expect("read"),
+            Some(completed.clone()),
+            "read-only view derives the approval without writing"
+        );
+        assert_eq!(
+            store
+                .ensure_approved_slot_binding(
+                    1,
+                    "claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    Some(&observed)
+                )
+                .expect("ensure"),
+            Some(completed.clone())
+        );
+        // 2. No operation: trust the first verified identity, once.
+        assert_eq!(
+            store
+                .ensure_approved_slot_binding(
+                    1,
+                    "claude_slot_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    None
+                )
+                .expect("ensure without observation"),
+            None
+        );
+        assert_eq!(
+            store
+                .ensure_approved_slot_binding(
+                    1,
+                    "claude_slot_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    Some(&observed)
+                )
+                .expect("ensure"),
+            Some(observed.clone())
+        );
+        assert_eq!(
+            store
+                .ensure_approved_slot_binding(
+                    1,
+                    "claude_slot_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    Some(&completed)
+                )
+                .expect("ensure again"),
+            Some(observed.clone()),
+            "first use is recorded once"
+        );
+        // 3. An operation that ended unverified forbids trust on first use.
+        assert_eq!(
+            store
+                .ensure_approved_slot_binding(
+                    1,
+                    "claude_slot_cccccccccccccccccccccccccccccccc",
+                    Some(&observed)
+                )
+                .expect("ensure"),
+            None
+        );
+        let persisted = store.load_persisted().expect("persisted");
+        let approvals = persisted
+            .registered_slots
+            .iter()
+            .map(|slot| (slot.slot_id.as_str(), slot.approved_binding()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            approvals["claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+            Some(completed)
+        );
+        assert_eq!(
+            approvals["claude_slot_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+            Some(observed)
+        );
+        assert_eq!(
+            approvals["claude_slot_cccccccccccccccccccccccccccccccc"],
+            None
+        );
+
+        // Removing the slot removes its approval with the registration.
+        store
+            .remove(1, "claude_slot_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .expect("remove");
+        assert_eq!(
+            store
+                .expected_slot_binding("claude_slot_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .expect("read"),
+            None
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approved_binding_requires_both_strong_hashes() {
+        let path = temp_path("approved-binding-validation");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        fs::create_dir_all(root).expect("root");
+        for slot in [
+            serde_json::json!({"slot_id": "claude_slot_dddddddddddddddddddddddddddddddd", "ownership": "external", "config_dir": format!("{}/half", root.display()), "approved_account_identifier_hash": "a".repeat(64)}),
+            serde_json::json!({"slot_id": "claude_slot_dddddddddddddddddddddddddddddddd", "ownership": "external", "config_dir": format!("{}/weak", root.display()), "approved_account_identifier_hash": "user@example.invalid", "approved_organization_identifier_hash": "b".repeat(64)}),
+        ] {
+            fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 2,
+                    "background_upkeep_consent": false,
+                    "registered_slots": [slot]
+                }))
+                .expect("json"),
+            )
+            .expect("write");
+            assert!(FileClaudeConfigSlotSettingsStore::new(&path)
+                .load()
+                .is_err());
+        }
+        assert!(ClaudeSlotAccountBinding::new("user@example.invalid", &"b".repeat(64)).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approval_records_provenance_and_only_an_observed_one_yields_to_a_reconnect() {
+        let path = temp_path("approval-provenance");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let slot_id = store
+            .register_path(1, format!("{}/external", root.display()))
+            .expect("register")
+            .external_slots[0]
+            .slot_id
+            .clone();
+        let observed = binding('a', 'b');
+        let chosen = binding('c', 'd');
+        assert_eq!(
+            store
+                .ensure_approved_slot_binding(1, &slot_id, Some(&observed))
+                .expect("first use"),
+            Some(observed.clone())
+        );
+        let approval = |store: &FileClaudeConfigSlotSettingsStore| {
+            store.slot_approvals().expect("approvals").remove(&slot_id)
+        };
+        assert_eq!(
+            approval(&store),
+            Some(ClaudeSlotApproval {
+                binding: observed.clone(),
+                source: ClaudeSlotApprovalSource::Observed
+            })
+        );
+        let body = fs::read_to_string(&path).expect("settings");
+        assert!(body.contains("\"approved_from\": \"observed\""), "{body}");
+
+        // The user explicitly signs in to another account through a reconnect
+        // started for the observed one: the pending op adopts the proven pair
+        // and its verified completion replaces the observed approval.
+        let operation = "claude_setup_91111111111111111111111111111111";
+        store
+            .begin_registered_slot_reconnect_target(
+                1,
+                operation.to_string(),
+                &slot_id,
+                None,
+                observed.account_identifier_hash.clone(),
+                Some(observed.organization_identifier_hash.clone()),
+            )
+            .expect("begin");
+        assert!(store
+            .adopt_reconnect_identity_for_observed_approval(1, operation, &chosen)
+            .expect("adopt"));
+        store
+            .transition_setup_operation_with_binding(
+                1,
+                operation,
+                Some(&chosen.account_identifier_hash),
+                Some(&chosen.organization_identifier_hash),
+                ClaudeAccountSetupOperationState::Complete,
+                Some(&chosen.account_identifier_hash),
+                Some(&chosen.organization_identifier_hash),
+                Some("verified"),
+            )
+            .expect("complete with the proven account");
+        assert_eq!(
+            approval(&store),
+            Some(ClaudeSlotApproval {
+                binding: chosen.clone(),
+                source: ClaudeSlotApprovalSource::Reconnect
+            })
+        );
+        // Replay keeps the original immutable request.
+        assert!(store
+            .begin_registered_slot_reconnect_target(
+                1,
+                operation.to_string(),
+                &slot_id,
+                None,
+                observed.account_identifier_hash.clone(),
+                Some(observed.organization_identifier_hash.clone()),
+            )
+            .is_ok());
+
+        // A verified approval never yields to another account.
+        let second = "claude_setup_92222222222222222222222222222222";
+        store
+            .begin_registered_slot_reconnect_target(
+                1,
+                second.to_string(),
+                &slot_id,
+                None,
+                chosen.account_identifier_hash.clone(),
+                Some(chosen.organization_identifier_hash.clone()),
+            )
+            .expect("begin second");
+        assert!(!store
+            .adopt_reconnect_identity_for_observed_approval(1, second, &observed)
+            .expect("refused"));
+        assert_eq!(
+            store.expected_slot_binding(&slot_id).expect("read"),
+            Some(chosen)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconnect_without_expected_organization_re_approves_the_verified_organization() {
+        let path = temp_path("approval-org-switch");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let slot_id = store
+            .register_path(1, format!("{}/external", root.display()))
+            .expect("register")
+            .external_slots[0]
+            .slot_id
+            .clone();
+        let first = binding('a', 'b');
+        let moved = binding('a', 'e');
+        let complete = |operation: &str, pair: &ClaudeSlotAccountBinding, org: Option<String>| {
+            store
+                .begin_registered_slot_reconnect_target(
+                    1,
+                    operation.to_string(),
+                    &slot_id,
+                    None,
+                    pair.account_identifier_hash.clone(),
+                    org,
+                )
+                .expect("begin");
+            store
+                .transition_setup_operation_with_binding(
+                    1,
+                    operation,
+                    Some(&pair.account_identifier_hash),
+                    None,
+                    ClaudeAccountSetupOperationState::Complete,
+                    Some(&pair.account_identifier_hash),
+                    Some(&pair.organization_identifier_hash),
+                    Some("verified"),
+                )
+                .expect("complete");
+        };
+        complete(
+            "claude_setup_93333333333333333333333333333333",
+            &first,
+            Some(first.organization_identifier_hash.clone()),
+        );
+        complete(
+            "claude_setup_94444444444444444444444444444444",
+            &moved,
+            None,
+        );
+        assert_eq!(
+            store.slot_approvals().expect("approvals").remove(&slot_id),
+            Some(ClaudeSlotApproval {
+                binding: moved,
+                source: ClaudeSlotApprovalSource::Reconnect
+            })
+        );
         let _ = fs::remove_dir_all(root);
     }
 }
