@@ -8838,6 +8838,14 @@ fn clear_claude_oauth_usage_breaker_after_success(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    if !mirror_legacy_default {
+        retire_success_from_legacy_breaker_locked(
+            &caller_key,
+            account_identifier_hash,
+            organization_identifier_hash,
+            now,
+        );
+    }
     if held_others.is_empty() {
         let _ = fs::remove_file(claude_oauth_usage_breaker_path(
             account_identifier_hash,
@@ -8861,6 +8869,52 @@ fn clear_claude_oauth_usage_breaker_after_success(
     if mirror_legacy_default {
         let _ = write_legacy_claude_oauth_usage_breaker(&retained);
     }
+}
+
+/// Apply a non-default caller's success to the legacy root breaker too.
+///
+/// The default collection mirrors the whole account breaker, other callers'
+/// streaks included, into the legacy file, and later migrates that file back
+/// whenever the account file is absent. Without this, a slot's success that
+/// deleted the account file would be undone by that migration. Only a legacy
+/// file for this exact account and organization is touched: the success
+/// resets its account-wide counters and this caller's entry, drops stale
+/// streaks, and keeps unrelated callers' state. Runs under the account lock,
+/// which is the lock the default path holds when it writes this legacy file.
+fn retire_success_from_legacy_breaker_locked(
+    caller_key: &str,
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: u64,
+) {
+    let path = claude_oauth_usage_legacy_breaker_path();
+    let Some(previous) = read_claude_oauth_usage_breaker_file_migrating(&path).filter(|breaker| {
+        breaker.account_identifier_hash == account_identifier_hash
+            && breaker.organization_identifier_hash == organization_identifier_hash
+    }) else {
+        return;
+    };
+    let mut retired = ClaudeOAuthUsageBreaker {
+        schema_version: previous.schema_version,
+        account_identifier_hash: previous.account_identifier_hash.clone(),
+        organization_identifier_hash: previous.organization_identifier_hash.clone(),
+        config_fingerprint: previous.config_fingerprint.clone(),
+        auth_callers: previous.auth_callers.clone(),
+        last_auth_failure: previous.last_auth_failure.clone(),
+        ..Default::default()
+    };
+    retired.auth_callers.remove(caller_key);
+    retired
+        .auth_callers
+        .retain(|_, state| !claude_oauth_usage_caller_streak_is_stale(state, now));
+    if retired == previous {
+        return;
+    }
+    if retired.holds_no_state() {
+        let _ = fs::remove_file(&path);
+        return;
+    }
+    let _ = write_legacy_claude_oauth_usage_breaker(&retired);
 }
 
 /// The alert itself. Snapshot diagnostics are uploaded with the agent-status
@@ -23573,6 +23627,60 @@ exit 1
             state.backoff_until_epoch_seconds,
             1_003 + CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS
         );
+    }
+
+    #[test]
+    #[serial]
+    fn slot_success_is_not_resurrected_from_the_legacy_mirror() {
+        let support_dir = single_caller_test_support_dir("legacy-resurrect");
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let (account, organization, fingerprint) = ("account-r", "organization-r", "fingerprint-r");
+        let slot_a = ClaudeOAuthUsageCaller::RegisteredSlot("slot-a".to_string());
+        let default = ClaudeOAuthUsageCaller::Default;
+        record_claude_oauth_usage_auth_failure(
+            &slot_a,
+            401,
+            account,
+            organization,
+            fingerprint,
+            1_000,
+            None,
+        );
+        // The default login succeeds after A's hold expired: A's streak is
+        // kept and the default path mirrors it into the legacy file.
+        let after_hold = 1_000 + CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS + 60;
+        clear_claude_oauth_usage_breaker_after_success(
+            &default,
+            account,
+            organization,
+            fingerprint,
+            after_hold,
+        );
+        assert!(fs::read_to_string(claude_oauth_usage_legacy_breaker_path())
+            .expect("legacy mirror")
+            .contains(&slot_a.breaker_key()));
+        // A's own success retires its streak and deletes the account file.
+        clear_claude_oauth_usage_breaker_after_success(
+            &slot_a,
+            account,
+            organization,
+            fingerprint,
+            after_hold + 1,
+        );
+        assert!(!claude_oauth_usage_breaker_path(account, organization).exists());
+        // The next default read migrates the legacy file if present; A's
+        // retired streak must not come back.
+        let resurrected = read_claude_oauth_usage_breaker(account, organization, fingerprint);
+        assert!(
+            resurrected
+                .as_ref()
+                .is_none_or(|breaker| !breaker.auth_callers.contains_key(&slot_a.breaker_key())),
+            "a caller's success must permanently retire its streak: {resurrected:?}"
+        );
+        let _ = fs::remove_dir_all(support_dir);
     }
 
     #[test]
