@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 421,
-  "content_sha256": "62631c68b2a7020f43b03bc123bf9550bb322a6a19b22ccd9f500b886fc1cc79",
+  "candidate_file_count": 422,
+  "content_sha256": "cc1de6d30abee845409ae722ee0c297f78fa05ce7519b58276baa6709f80b57b",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "c73edf14d97782668406060cd03fdbb5b8990ee1d149f24b0202ac9c5ad5e1da",
-      "size_bytes": 1131441
+      "sha256": "355fa15996dbe597539a9dbb285093c9cbe29815a8405d71455c7ec99c55a003",
+      "size_bytes": 1142221
     },
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_upkeep.rs",
-      "sha256": "7b95a6eb83eebdbff387a871e3a24f5435eccf0b26d174b0f26da49271867072",
-      "size_bytes": 115956
+      "sha256": "e9d11ae5a5cff9d00151d017c67b66f3eae802048aae32e46bfb15e069eb9880",
+      "size_bytes": 126171
     },
     {
       "executable": false,
@@ -1867,6 +1867,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-03-claude-slot-rotation-recovery.md",
+      "sha256": "89e5a4fa66b3b4080fe1ba99fd20c3a16aecf772fd1f57b1fd91d5a8cd628836",
+      "size_bytes": 3681
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-03-claude-usage-single-caller-auth-backoff.md",
       "sha256": "05d0a9ad63f67a3f648916cf1a08d428c57ec00a39ca3c15b8c2a98719df78ec",
       "size_bytes": 6287
@@ -2952,7 +2959,7 @@
   ],
   "generated_at": "2026-10-03T07:12:26+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 422,
+  "output_file_count": 423,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

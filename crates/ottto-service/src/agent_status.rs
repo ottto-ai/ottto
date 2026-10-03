@@ -780,6 +780,10 @@ enum ClaudeSlotProbeFailure {
     CredentialUnavailable,
     IdentityMismatch,
     ConcurrentMutation,
+    /// `claude auth status` failed while the slot's own credential was still
+    /// present and unexpired. Transient and retried on the next pass; it is
+    /// not evidence that the login is gone.
+    ProbeFailed,
 }
 
 impl ClaudeSlotProbeFailure {
@@ -789,6 +793,7 @@ impl ClaudeSlotProbeFailure {
             Self::CredentialUnavailable => "claude_slot_credential_unavailable",
             Self::IdentityMismatch => "claude_slot_identity_mismatch",
             Self::ConcurrentMutation => "claude_slot_concurrent_mutation",
+            Self::ProbeFailed => "claude_slot_probe_failed",
         }
     }
 
@@ -813,6 +818,11 @@ impl ClaudeSlotProbeFailure {
                 ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
                 ClaudeConfigSlotDiagnosticCodeV1::ConcurrentMutation,
                 "This registered Claude slot changed during verification; collection will retry from a stable state.",
+            ),
+            Self::ProbeFailed => (
+                ClaudeConfigSlotCollectionStateV1::ProbeFailed,
+                ClaudeConfigSlotDiagnosticCodeV1::ProbeFailed,
+                "Claude Code's local status check failed while this slot's saved login is still valid; collection will retry.",
             ),
         };
         ClaudeConfigSlotCollectionStatusV1 {
@@ -4314,6 +4324,9 @@ pub(crate) fn verify_claude_local_identity(
         ClaudeSlotProbeFailure::ConcurrentMutation => {
             ClaudeLocalIdentityFailure::ConcurrentMutation
         }
+        // Identity proof needs a successful status read; keep the connect
+        // flow's existing answer for a failed one.
+        ClaudeSlotProbeFailure::ProbeFailed => ClaudeLocalIdentityFailure::CredentialUnavailable,
     })?;
     let mut collection = fresh_slot_status(
         observed_at,
@@ -4683,6 +4696,16 @@ fn resolve_registered_claude_slot(
     let auth = run_claude_slot_command(&slot, &["auth", "status", "--json"], COMMAND_TIMEOUT);
     let final_oauth_account = read_claude_cli_oauth_account(&slot.identity_path(&home_dir()));
     if !auth.command_found || !auth.success {
+        // The CLI may have rotated the token inside this very call, so judge
+        // the credential by a read taken after it, never the pre-call copy.
+        if auth.command_found
+            && claude_credential_present_and_unexpired(
+                read_claude_oauth_credential_for_slot(&slot).as_ref(),
+                OffsetDateTime::now_utc(),
+            )
+        {
+            return Err(ClaudeSlotProbeFailure::ProbeFailed);
+        }
         return Err(ClaudeSlotProbeFailure::CredentialUnavailable);
     }
     let stable = stable_claude_slot_credential(
@@ -4717,6 +4740,22 @@ fn resolve_registered_claude_slot(
         account_identifier_hash,
         organization_identifier_hash,
         credential: stable.credential,
+    })
+}
+
+/// Whether a slot credential is still usable without any refresh: an access
+/// token is present and its vendor deadline is in the future.
+fn claude_credential_present_and_unexpired(
+    credential: Option<&ClaudeOAuthCredential>,
+    now: OffsetDateTime,
+) -> bool {
+    credential.is_some_and(|credential| {
+        credential.access_token.is_some()
+            && credential
+                .access_expires_at
+                .as_deref()
+                .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+                .is_some_and(|expiry| expiry > now)
     })
 }
 
@@ -6038,8 +6077,42 @@ fn registered_claude_failure_status(
     } else {
         clear_claude_slot_binding(&mut status);
     }
+    retain_last_known_claude_deadlines(&mut status, descriptor, &upkeep);
     apply_claude_upkeep_observation(&mut status, upkeep);
     status
+}
+
+/// Keep the last-known, still-unexpired access deadline (and its paired
+/// refresh deadline) on a failed probe. Persisting the failure without them
+/// made the next upkeep pass read "no deadline" as "credential unreadable"
+/// and stop there. An already-past deadline is not carried: upkeep then
+/// re-reads the slot's own metadata and routes a truly expired login to the
+/// refresh worker.
+fn retain_last_known_claude_deadlines(
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    upkeep: &ottto_protocol::ClaudeConfigSlotUpkeepStatusV1,
+) {
+    let now = OffsetDateTime::now_utc();
+    let unexpired = |at: Option<&str>| {
+        at.and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+            .is_some_and(|expiry| expiry > now)
+    };
+    let (access, relogin) = if unexpired(upkeep.due_access_expires_at.as_deref()) {
+        (
+            upkeep.due_access_expires_at.clone(),
+            upkeep.refresh_token_expires_at.clone(),
+        )
+    } else if unexpired(descriptor.collection.access_expires_at.as_deref()) {
+        (
+            descriptor.collection.access_expires_at.clone(),
+            descriptor.collection.relogin_required_at.clone(),
+        )
+    } else {
+        return;
+    };
+    status.access_expires_at = access;
+    status.relogin_required_at = relogin;
 }
 
 fn upkeep_state_diagnostic(
@@ -20907,6 +20980,192 @@ exit 1
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Fake `claude` whose `auth status --json` exits 1 with no JSON, as the
+    /// daemon observed from Claude Code 2.1.288 right after the CLI rotated a
+    /// slot token, plus a slot whose own credential file holds `expires_at_ms`.
+    fn registered_slot_with_failing_auth_status(
+        label: &str,
+        expires_at_ms: i64,
+    ) -> (
+        PathBuf,
+        ClaudeConfigSlotDescriptorV1,
+        EnvVarGuard,
+        EnvVarGuard,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-slot-{label}-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let home = root.join("home");
+        let bin = root.join("bin");
+        let slot_dir = root.join("slot");
+        for dir in [&home, &bin, &slot_dir] {
+            fs::create_dir_all(dir).expect("create fixture dir");
+        }
+        let claude = bin.join("claude");
+        fs::write(
+            &claude,
+            "#!/bin/sh\necho 'status unavailable' >&2\nexit 1\n",
+        )
+        .expect("write fake claude");
+        let security = bin.join("security");
+        fs::write(&security, "#!/bin/sh\nexit 1\n").expect("write fake security");
+        for executable in [&claude, &security] {
+            let mut permissions = fs::metadata(executable).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(executable, permissions).expect("chmod executable");
+        }
+        fs::write(
+            slot_dir.join(".claude.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "oauthAccount": {
+                    "accountUuid": "account-rotated",
+                    "organizationUuid": "organization-rotated",
+                    "emailAddress": "rotated@example.invalid"
+                }
+            }))
+            .expect("serialize identity"),
+        )
+        .expect("write slot identity");
+        fs::write(
+            slot_dir.join(".credentials.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "fixture-access",
+                    "refreshToken": "fixture-refresh",
+                    "expiresAt": expires_at_ms
+                }
+            }))
+            .expect("serialize credential"),
+        )
+        .expect("write slot credential");
+        let home_guard = EnvVarGuard::set_os("HOME", home.as_os_str().to_os_string());
+        let command_guard =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", bin.as_os_str().to_os_string());
+        let descriptor = ClaudeConfigDirSlot::registered(slot_dir.to_string_lossy().to_string())
+            .expect("registered slot")
+            .descriptor(
+                format!("claude_slot_{label}"),
+                ClaudeConfigSlotOwnership::Managed,
+            );
+        (root, descriptor, home_guard, command_guard)
+    }
+
+    #[test]
+    #[serial]
+    fn failed_auth_status_with_valid_credential_is_a_transient_probe_failure() {
+        let expires_at_ms =
+            (OffsetDateTime::now_utc() + TimeDuration::hours(7)).unix_timestamp() * 1_000;
+        let (root, descriptor, _home, _command) =
+            registered_slot_with_failing_auth_status("auth-exit-valid", expires_at_ms);
+
+        let failure = resolve_registered_claude_slot(descriptor)
+            .err()
+            .expect("auth status exit 1 must not resolve");
+
+        assert_eq!(
+            failure,
+            ClaudeSlotProbeFailure::ProbeFailed,
+            "a present, unexpired credential makes a non-zero auth status transient"
+        );
+        let status = failure.status("2026-10-03T13:30:00Z");
+        assert_eq!(status.state, ClaudeConfigSlotCollectionStateV1::ProbeFailed);
+        assert!(
+            !claude_custom_slot_needs_attention(&status.state),
+            "a transient probe failure must not raise the needs-attention warning"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn failed_auth_status_with_expired_credential_stays_credential_unavailable() {
+        let expires_at_ms =
+            (OffsetDateTime::now_utc() - TimeDuration::minutes(5)).unix_timestamp() * 1_000;
+        let (root, descriptor, _home, _command) =
+            registered_slot_with_failing_auth_status("auth-exit-expired", expires_at_ms);
+
+        assert_eq!(
+            resolve_registered_claude_slot(descriptor).err(),
+            Some(ClaudeSlotProbeFailure::CredentialUnavailable)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registered_failure_status_keeps_last_known_unexpired_deadlines() {
+        let access = (OffsetDateTime::now_utc() + TimeDuration::hours(6))
+            .format(&Rfc3339)
+            .expect("format");
+        let relogin = (OffsetDateTime::now_utc() + TimeDuration::days(25))
+            .format(&Rfc3339)
+            .expect("format");
+        let upkeep = ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+            result: ClaudeConfigSlotUpkeepResultV1::NotRequired,
+            due_access_expires_at: Some(access.clone()),
+            refresh_token_expires_at: Some(relogin.clone()),
+            attempted_at: None,
+            next_allowed_attempt_at: None,
+            consecutive_failures: 0,
+        };
+        let descriptor = ClaudeConfigSlotDescriptorV1 {
+            slot_id: "claude_slot_deadline_fixture".to_string(),
+            ownership: ClaudeConfigSlotOwnership::Managed,
+            config_dir: None,
+            service_name: String::new(),
+            collection: Default::default(),
+        };
+
+        for failure in [
+            ClaudeSlotProbeFailure::ProbeFailed,
+            ClaudeSlotProbeFailure::CredentialUnavailable,
+        ] {
+            let status = registered_claude_failure_status(
+                &descriptor,
+                failure,
+                "2026-10-03T13:30:00Z",
+                upkeep.clone(),
+            );
+            assert_eq!(status.access_expires_at.as_deref(), Some(access.as_str()));
+            assert_eq!(
+                status.relogin_required_at.as_deref(),
+                Some(relogin.as_str())
+            );
+        }
+
+        // Fallback: the previously persisted collection deadline.
+        let mut persisted = descriptor.clone();
+        persisted.collection.access_expires_at = Some(access.clone());
+        persisted.collection.relogin_required_at = Some(relogin.clone());
+        let status = registered_claude_failure_status(
+            &persisted,
+            ClaudeSlotProbeFailure::ProbeFailed,
+            "2026-10-03T13:30:00Z",
+            ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                due_access_expires_at: None,
+                refresh_token_expires_at: None,
+                ..upkeep.clone()
+            },
+        );
+        assert_eq!(status.access_expires_at.as_deref(), Some(access.as_str()));
+
+        // An already-past deadline is not carried; upkeep re-reads instead.
+        let past = (OffsetDateTime::now_utc() - TimeDuration::minutes(1))
+            .format(&Rfc3339)
+            .expect("format");
+        let status = registered_claude_failure_status(
+            &descriptor,
+            ClaudeSlotProbeFailure::CredentialUnavailable,
+            "2026-10-03T13:30:00Z",
+            ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                due_access_expires_at: Some(past),
+                ..upkeep
+            },
+        );
+        assert_eq!(status.access_expires_at, None);
     }
 
     #[test]
