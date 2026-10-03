@@ -5,9 +5,10 @@ use ottto_core::{
     billing_identity_hash, compiled_release_version, default_support_dir,
     read_claude_statusline_cache, read_claude_statusline_context_cache,
     read_claude_statusline_context_history, write_owner_only_file_atomic, ClaudeConfigDirSlot,
-    ClaudeStatusLineContextWindowCache, ClaudeStatusLineContextWindowHistory,
-    ClaudeStatusLineContextWindowSample, ClaudeStatusLineRateLimitCache, CodexHomeTrust,
-    FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore, MAX_CLAUDE_ACCOUNT_SLOTS,
+    ClaudeSlotAccountBinding, ClaudeStatusLineContextWindowCache,
+    ClaudeStatusLineContextWindowHistory, ClaudeStatusLineContextWindowSample,
+    ClaudeStatusLineRateLimitCache, CodexHomeTrust, FileClaudeConfigSlotSettingsStore,
+    FileCodexAccountSlotSettingsStore, MAX_CLAUDE_ACCOUNT_SLOTS,
 };
 use ottto_protocol::{
     AgentAccountStatus, AgentAvailableModelStatus, AgentCapabilityGap, AgentCapabilityStatus,
@@ -3316,6 +3317,7 @@ fn collect_claude_status_snapshots(
     for descriptor in overflow_descriptors {
         slot_states.insert(descriptor.slot_id, capacity_exceeded_status(&captured_at));
     }
+    let previous_states = read_persisted_claude_slot_collection_state();
     for descriptor in custom_descriptors {
         match crate::claude_browser_auth::collection_suppression(&descriptor.slot_id) {
             Some(
@@ -3330,6 +3332,17 @@ fn collect_claude_status_snapshots(
             }
             None => {}
         }
+        let previous = previous_states.slots.get(&descriptor.slot_id);
+        // Another account signed in to this slot: no upkeep, CLI, usage call,
+        // candidate or refresh for it until the approved account is back.
+        let expected_binding =
+            match claude_slot_pre_collection_gate(&descriptor, previous, &captured_at) {
+                Ok(expected) => expected,
+                Err(status) => {
+                    slot_states.insert(descriptor.slot_id, status);
+                    continue;
+                }
+            };
         let upkeep = crate::claude_upkeep::observe_registered_slot_upkeep(
             &descriptor,
             upkeep_consent,
@@ -3366,6 +3379,16 @@ fn collect_claude_status_snapshots(
             }
         };
         let slot_id = resolved.descriptor.slot_id.clone();
+        if let Err(status) = claude_slot_post_resolution_gate(
+            &descriptor,
+            expected_binding,
+            &resolved,
+            previous,
+            &captured_at,
+        ) {
+            slot_states.insert(slot_id, status);
+            continue;
+        }
         let account_hash = resolved.account_identifier_hash.clone();
         let organization_hash = resolved.organization_identifier_hash.clone();
         let access_token = resolved.credential.access_token.take();
@@ -3411,7 +3434,6 @@ fn collect_claude_status_snapshots(
             }
         }
     }
-    let previous_states = read_persisted_claude_slot_collection_state();
     for (slot_id, status) in &mut slot_states {
         inherit_claude_slot_account_profile(status, previous_states.slots.get(slot_id));
     }
@@ -4223,6 +4245,16 @@ pub(crate) fn collect_registered_claude_slot_status(
         ) => return descriptor.collection,
         None => {}
     }
+    let previous_states = read_persisted_claude_slot_collection_state();
+    let previous = previous_states.slots.get(slot_id);
+    let expected_binding =
+        match claude_slot_pre_collection_gate(&descriptor, previous, &captured_at) {
+            Ok(expected) => expected,
+            Err(status) => {
+                let _ = persist_one_claude_slot_collection_state(slot_id, &status);
+                return status;
+            }
+        };
     let upkeep = crate::claude_upkeep::observe_registered_slot_upkeep(
         &descriptor,
         upkeep_consent,
@@ -4249,6 +4281,16 @@ pub(crate) fn collect_registered_claude_slot_status(
             return status;
         }
     };
+    if let Err(status) = claude_slot_post_resolution_gate(
+        &descriptor,
+        expected_binding,
+        &resolved,
+        previous,
+        &captured_at,
+    ) {
+        let _ = persist_one_claude_slot_collection_state(slot_id, &status);
+        return status;
+    }
     let account_hash = resolved.account_identifier_hash.clone();
     let organization_hash = resolved.organization_identifier_hash.clone();
     let access_token = resolved.credential.access_token.take();
@@ -4274,8 +4316,7 @@ pub(crate) fn collect_registered_claude_slot_status(
         }
     };
     apply_claude_upkeep_observation(&mut status, upkeep.status);
-    let previous_states = read_persisted_claude_slot_collection_state();
-    inherit_claude_slot_account_profile(&mut status, previous_states.slots.get(slot_id));
+    inherit_claude_slot_account_profile(&mut status, previous);
     let _ = persist_one_claude_slot_collection_state(slot_id, &status);
     status
 }
@@ -5572,6 +5613,15 @@ fn retain_verified_claude_slot_binding(
     }
     retain_exact_claude_slot_binding(status, &current_account, &current_organization);
     inherit_claude_slot_account_profile(status, Some(&previous));
+    retain_previous_complete_claude_read(status, previous);
+}
+
+/// Keep the same account's last complete reading, marked stale, when the
+/// current pass produced none. Callers prove `previous` is the same binding.
+fn retain_previous_complete_claude_read(
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+    previous: ClaudeConfigSlotCollectionStatusV1,
+) {
     let current_has_complete_read = status.last_full_quota_read_at.is_some()
         && status.has_account_windows
         && status.has_scoped_limits;
@@ -5590,6 +5640,239 @@ fn retain_verified_claude_slot_binding(
                 local_claude_quota_snapshot_within_retention(snapshot, OffsetDateTime::now_utc())
             })
             .map(|snapshot| stale_local_claude_quota_snapshot(&snapshot));
+    }
+}
+
+/// A registered slot's strong local identity as last recorded by collection.
+fn claude_slot_status_binding(
+    status: &ClaudeConfigSlotCollectionStatusV1,
+) -> Option<ClaudeSlotAccountBinding> {
+    ClaudeSlotAccountBinding::new(
+        status.account_identifier_hash.as_deref()?,
+        status.organization_identifier_hash.as_deref()?,
+    )
+}
+
+/// The account+organization this registered slot is approved to collect for,
+/// back-filling the approval once for slots registered before approvals were
+/// persisted (see `ensure_approved_slot_binding`). `None` leaves the slot
+/// ungated, which is exactly the behaviour before approvals existed.
+fn claude_slot_expected_binding(
+    slot_id: &str,
+    observed: Option<&ClaudeSlotAccountBinding>,
+) -> Option<ClaudeSlotAccountBinding> {
+    if slot_id == "default" {
+        return None;
+    }
+    FileClaudeConfigSlotSettingsStore::default()
+        .ensure_approved_slot_binding(
+            ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+            slot_id,
+            observed,
+        )
+        .ok()
+        .flatten()
+}
+
+/// The strong identity Claude Code's local account file names for this slot,
+/// plus its plan for local wording. A cheap file read: no CLI, no keychain.
+fn claude_slot_local_login(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+) -> Option<(ClaudeSlotAccountBinding, Option<String>)> {
+    let slot = claude_config_slot_for_descriptor(descriptor)?;
+    let oauth = read_claude_cli_oauth_account(&slot.identity_path(&home_dir()))?;
+    let (account, organization) = claude_strong_oauth_identity_hashes(&oauth)?;
+    let binding = ClaudeSlotAccountBinding::new(&account, &organization)?;
+    Some((binding, claude_oauth_plan_type_for_label(&oauth)))
+}
+
+/// Whether this registered slot's current Claude login contradicts the
+/// account it is approved for. Read-only; used by the upkeep worker's final
+/// spawn and publication fences so a refresh never runs for another login.
+pub(crate) fn claude_slot_login_contradicts_approval(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+) -> bool {
+    let Some(expected) = FileClaudeConfigSlotSettingsStore::default()
+        .expected_slot_binding(&descriptor.slot_id)
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    claude_slot_local_login(descriptor).is_some_and(|(current, _)| current != expected)
+}
+
+/// Plan type for local wording only, from `.claude.json` alone. Mirrors the
+/// collector's Max 5x/20x and Team seat refinements without an auth status.
+fn claude_oauth_plan_type_for_label(oauth: &ClaudeCliOauthAccount) -> Option<String> {
+    let organization_type = normalize_plan_type(oauth.organization_type.clone()?);
+    let base = organization_type
+        .strip_prefix("claude_")
+        .unwrap_or(&organization_type)
+        .to_string();
+    let tier = |value: &Option<String>| value.clone().map(normalize_plan_type).unwrap_or_default();
+    let organization_tier = tier(&oauth.organization_rate_limit_tier);
+    let user_tier = tier(&oauth.user_rate_limit_tier);
+    let refined = match base.as_str() {
+        "max" => [&organization_tier, &user_tier]
+            .into_iter()
+            .find_map(|tier| {
+                if tier.ends_with("max_5x") {
+                    Some("max_5x")
+                } else if tier.ends_with("max_20x") {
+                    Some("max_20x")
+                } else {
+                    None
+                }
+            })
+            .map(str::to_string),
+        "team" => {
+            let seat = tier(&oauth.seat_tier);
+            if seat.contains("premium") || user_tier.ends_with("max_5x") {
+                Some("team_premium".to_string())
+            } else if seat.contains("standard") {
+                Some("team_standard".to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    Some(refined.unwrap_or(base)).filter(|plan| !plan.is_empty())
+}
+
+/// "Claude Max 20x", "Claude Team Premium", ... for a local message.
+fn claude_plan_label(plan_type: Option<&str>) -> Option<String> {
+    let plan = normalize_plan_type(plan_type?.to_string());
+    let plan = plan.strip_prefix("claude_").unwrap_or(&plan);
+    let label = match plan {
+        "" => return None,
+        "max_20x" => "Max 20x".to_string(),
+        "max_5x" => "Max 5x".to_string(),
+        other => other
+            .split('_')
+            .filter(|word| !word.is_empty())
+            .map(|word| {
+                let mut chars = word.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + chars.as_str()
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    Some(format!("Claude {label}"))
+}
+
+/// Local-only explanation naming the plans of both logins. It never names an
+/// email and is never uploaded: degraded projections carry codes only.
+fn claude_slot_binding_mismatch_message(
+    approved_plan: Option<&str>,
+    signed_in_plan: Option<&str>,
+) -> String {
+    let approved = claude_plan_label(approved_plan)
+        .map(|label| format!("the {label} account"))
+        .unwrap_or_else(|| "the account it was set up with".to_string());
+    let signed_in = claude_plan_label(signed_in_plan)
+        .map(|label| format!("a different {label} account"))
+        .unwrap_or_else(|| "a different Claude account".to_string());
+    format!(
+        "Claude Code in this connection is now signed in to {signed_in}. This connection is for {approved}, so Ottto paused limit reading, uploads and token refresh here and assigned nothing to the other account. Sign in again with {approved} to resume."
+    )
+}
+
+/// Collection status for a slot whose current login is not the account it is
+/// approved for. It keeps the approved pair, profile and that account's own
+/// last complete reading (stale), so local and degraded projections stay on
+/// the approved account; nothing from the other login is kept.
+fn claude_slot_binding_mismatch_status(
+    expected: &ClaudeSlotAccountBinding,
+    signed_in_plan: Option<&str>,
+    previous: Option<&ClaudeConfigSlotCollectionStatusV1>,
+    captured_at: &str,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    let previous = previous
+        .filter(|previous| claude_slot_status_binding(previous).as_ref() == Some(expected))
+        .cloned();
+    let approved_plan = previous
+        .as_ref()
+        .and_then(exact_claude_slot_account_profile)
+        .and_then(|profile| profile.plan_type.clone());
+    let mut status = ClaudeConfigSlotCollectionStatusV1 {
+        state: ClaudeConfigSlotCollectionStateV1::IdentityMismatch,
+        observed_at: Some(captured_at.to_string()),
+        diagnostics: vec![ClaudeConfigSlotDiagnosticV1 {
+            code: ClaudeConfigSlotDiagnosticCodeV1::IdentityMismatch,
+            message: claude_slot_binding_mismatch_message(approved_plan.as_deref(), signed_in_plan),
+        }],
+        ..Default::default()
+    };
+    retain_exact_claude_slot_binding(
+        &mut status,
+        &expected.account_identifier_hash,
+        &expected.organization_identifier_hash,
+    );
+    if let Some(previous) = previous {
+        inherit_claude_slot_account_profile(&mut status, Some(&previous));
+        retain_previous_complete_claude_read(&mut status, previous);
+    }
+    status
+}
+
+/// Gate before upkeep, any CLI spawn or usage call: when the slot's local
+/// Claude account file names another account than the approved one, return
+/// the identity-mismatch status instead. `Ok` carries the expected binding
+/// (when the slot has one) for the post-resolution check.
+#[allow(clippy::result_large_err)]
+fn claude_slot_pre_collection_gate(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    previous: Option<&ClaudeConfigSlotCollectionStatusV1>,
+    captured_at: &str,
+) -> Result<Option<ClaudeSlotAccountBinding>, ClaudeConfigSlotCollectionStatusV1> {
+    let observed = previous.and_then(claude_slot_status_binding);
+    let Some(expected) = claude_slot_expected_binding(&descriptor.slot_id, observed.as_ref())
+    else {
+        return Ok(None);
+    };
+    match claude_slot_local_login(descriptor) {
+        Some((current, signed_in_plan)) if current != expected => {
+            Err(claude_slot_binding_mismatch_status(
+                &expected,
+                signed_in_plan.as_deref(),
+                previous,
+                captured_at,
+            ))
+        }
+        _ => Ok(Some(expected)),
+    }
+}
+
+/// Gate after the exact slot resolved, before its usage call. A slot without
+/// any approval records this first verified identity (trust on first use).
+#[allow(clippy::result_large_err)]
+fn claude_slot_post_resolution_gate(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    expected: Option<ClaudeSlotAccountBinding>,
+    resolved: &ResolvedClaudeSlot,
+    previous: Option<&ClaudeConfigSlotCollectionStatusV1>,
+    captured_at: &str,
+) -> Result<(), ClaudeConfigSlotCollectionStatusV1> {
+    let current = ClaudeSlotAccountBinding::new(
+        &resolved.account_identifier_hash,
+        &resolved.organization_identifier_hash,
+    );
+    let expected =
+        expected.or_else(|| claude_slot_expected_binding(&descriptor.slot_id, current.as_ref()));
+    match (expected, current) {
+        (Some(expected), Some(current)) if expected != current => {
+            Err(claude_slot_binding_mismatch_status(
+                &expected,
+                resolved.account.plan_type.as_deref(),
+                previous,
+                captured_at,
+            ))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -27907,6 +28190,509 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         scheduled.join().expect("join scheduled");
         assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// One registered slot on throwaway HOME/support dirs with a fake `claude`
+    /// that logs every spawn (`<config dir>|<args>`) and a file credential.
+    struct ClaudeBindingFixture {
+        root: PathBuf,
+        slot_dir: PathBuf,
+        spawn_log: PathBuf,
+        _guards: Vec<EnvVarGuard>,
+    }
+
+    const TEAM_PREMIUM: (&str, &str) = ("account-team-premium", "organization-team");
+    const MAX_20X: (&str, &str) = ("account-max-20x", "organization-max");
+
+    impl ClaudeBindingFixture {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "ottto-claude-binding-{label}-{}-{}",
+                std::process::id(),
+                OffsetDateTime::now_utc().unix_timestamp_nanos()
+            ));
+            let home = root.join("home");
+            let support = root.join("support");
+            let bin = root.join("bin");
+            let slot_dir = root.join("slot");
+            for dir in [&home, &support, &bin, &slot_dir] {
+                fs::create_dir_all(dir).expect("create fixture dir");
+            }
+            let spawn_log = root.join("claude-spawns.log");
+            let claude = bin.join("claude");
+            fs::write(
+                &claude,
+                format!(
+                    r#"#!/bin/sh
+echo "$CLAUDE_CONFIG_DIR|$*" >> '{log}'
+if [ "$1" = "--version" ]; then
+  echo "fixture-version"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then
+  [ -n "$CLAUDE_CONFIG_DIR" ] || exit 1
+  exec /usr/bin/python3 - "$CLAUDE_CONFIG_DIR/.claude.json" <<'FAKE'
+import json, sys
+account = json.load(open(sys.argv[1]))["oauthAccount"]
+print(json.dumps({{
+  "status": "authenticated",
+  "email": account["emailAddress"],
+  "organizationId": account["organizationUuid"],
+  "subscriptionType": account["organizationType"].replace("claude_", ""),
+}}))
+FAKE
+fi
+exit 0
+"#,
+                    log = spawn_log.display()
+                ),
+            )
+            .expect("write fake claude");
+            let security = bin.join("security");
+            fs::write(&security, "#!/bin/sh\nexit 1\n").expect("write fake security");
+            for executable in [&claude, &security] {
+                let mut permissions = fs::metadata(executable).expect("metadata").permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(executable, permissions).expect("chmod executable");
+            }
+            let guards = vec![
+                EnvVarGuard::set_os("HOME", home.as_os_str().to_os_string()),
+                EnvVarGuard::set_os(
+                    "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+                    support.as_os_str().to_os_string(),
+                ),
+                EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", bin.as_os_str().to_os_string()),
+            ];
+            let fixture = Self {
+                root,
+                slot_dir,
+                spawn_log,
+                _guards: guards,
+            };
+            let now = current_unix_seconds();
+            for ((account, organization), percent) in [(TEAM_PREMIUM, 41), (MAX_20X, 92)] {
+                let (account_hash, organization_hash) = Self::hashes((account, organization));
+                let mut usage = ClaudeOAuthUsage {
+                    windows: ["session", "weekly"]
+                        .into_iter()
+                        .map(|name| AgentQuotaWindow {
+                            name: name.to_string(),
+                            scope: AgentQuotaWindowScope::Account,
+                            status: AgentQuotaWindowStatus::Ok,
+                            freshness: AgentQuotaWindowFreshness::Fresh,
+                            used_percent: Some(percent),
+                            ..Default::default()
+                        })
+                        .chain(std::iter::once(AgentQuotaWindow {
+                            name: "weekly_sonnet".to_string(),
+                            scope: AgentQuotaWindowScope::Model,
+                            status: AgentQuotaWindowStatus::Ok,
+                            freshness: AgentQuotaWindowFreshness::Fresh,
+                            model: Some("claude-sonnet".to_string()),
+                            used_percent: Some(percent),
+                            ..Default::default()
+                        }))
+                        .collect(),
+                    credit_balances: Vec::new(),
+                };
+                claude_oauth_stamp_account_identity(
+                    &mut usage,
+                    &account_hash,
+                    Some(&organization_hash),
+                );
+                write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
+                    schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+                    account_identifier_hash: account_hash,
+                    organization_identifier_hash: organization_hash,
+                    observed_at_epoch_seconds: now,
+                    next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
+                    windows: usage.windows,
+                    credit_balances: usage.credit_balances,
+                })
+                .expect("write usage cache");
+            }
+            fixture
+        }
+
+        fn hashes((account, organization): (&str, &str)) -> (String, String) {
+            (
+                billing_identity_hash("anthropic", "account", account).expect("account hash"),
+                billing_identity_hash("anthropic", "organization", organization)
+                    .expect("organization hash"),
+            )
+        }
+
+        /// What `CLAUDE_CONFIG_DIR=<slot> claude` then `/login` leaves behind.
+        fn sign_in(&self, which: (&str, &str)) {
+            let team = which == TEAM_PREMIUM;
+            let mut account = serde_json::json!({
+                "accountUuid": which.0,
+                "organizationUuid": which.1,
+                "emailAddress": if team { "team.person@example.invalid" } else { "max.person@example.invalid" },
+                "organizationType": if team { "claude_team" } else { "claude_max" },
+            });
+            if team {
+                account["seatTier"] = serde_json::json!("premium");
+            } else {
+                account["organizationRateLimitTier"] = serde_json::json!("default_claude_max_20x");
+            }
+            fs::write(
+                self.slot_dir.join(".claude.json"),
+                serde_json::to_vec(&serde_json::json!({ "oauthAccount": account }))
+                    .expect("serialize identity"),
+            )
+            .expect("write identity");
+            let expires_at_ms =
+                (OffsetDateTime::now_utc() + TimeDuration::hours(6)).unix_timestamp() * 1_000;
+            fs::write(
+                self.slot_dir.join(".credentials.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "claudeAiOauth": {
+                        "accessToken": format!("fixture-secret-token-{}", which.0),
+                        "refreshToken": "fixture-secret-refresh",
+                        "expiresAt": expires_at_ms
+                    }
+                }))
+                .expect("serialize credential"),
+            )
+            .expect("write credential");
+        }
+
+        fn register(&self) -> String {
+            FileClaudeConfigSlotSettingsStore::default()
+                .register_path(
+                    ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                    self.slot_dir.to_string_lossy().to_string(),
+                )
+                .expect("register slot")
+                .external_slots[0]
+                .slot_id
+                .clone()
+        }
+
+        fn collect(&self) -> Vec<AgentStatusSnapshot> {
+            collect_agent_status_collection(
+                &SourceKind::ClaudeCode,
+                binding_test_time(0),
+                binding_test_time(15),
+            )
+            .snapshots
+        }
+
+        fn slot(&self, slot_id: &str) -> ClaudeConfigSlotDescriptorV1 {
+            let status = annotate_claude_accounts_status(
+                FileClaudeConfigSlotSettingsStore::default()
+                    .load()
+                    .expect("load slots"),
+            );
+            status
+                .external_slots
+                .into_iter()
+                .find(|slot| slot.slot_id == slot_id)
+                .expect("registered slot")
+        }
+
+        fn slot_spawns(&self) -> Vec<String> {
+            let marker = format!("{}|", self.slot_dir.display());
+            fs::read_to_string(&self.spawn_log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.starts_with(&marker))
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn clear_spawns(&self) {
+            let _ = fs::remove_file(&self.spawn_log);
+        }
+
+        fn support_files_text(&self) -> String {
+            [
+                ottto_core::CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME,
+                "claude-config-slot-collection-state.json",
+            ]
+            .into_iter()
+            .map(|name| {
+                fs::read_to_string(self.root.join("support").join(name)).unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+        }
+    }
+
+    impl Drop for ClaudeBindingFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn binding_test_time(minutes_ahead: i64) -> String {
+        (OffsetDateTime::now_utc() + TimeDuration::minutes(minutes_ahead))
+            .format(&Rfc3339)
+            .expect("format time")
+    }
+
+    fn snapshot_binding(snapshot: &AgentStatusSnapshot) -> Option<(String, String)> {
+        let account = snapshot.account.as_ref()?;
+        Some((
+            account.account_identifier_hash.clone()?,
+            account.organization_identifier_hash.clone()?,
+        ))
+    }
+
+    #[test]
+    #[serial]
+    fn terminal_login_with_another_account_is_identity_mismatch_without_collection_upload_or_refresh(
+    ) {
+        let fixture = ClaudeBindingFixture::new("terminal-mismatch");
+        let team = ClaudeBindingFixture::hashes(TEAM_PREMIUM);
+        let max = ClaudeBindingFixture::hashes(MAX_20X);
+        fixture.sign_in(TEAM_PREMIUM);
+        let slot_id = fixture.register();
+
+        // Legacy slot without an approval: the first verified identity is
+        // back-filled as the approval and collection is unchanged.
+        let first = fixture.collect();
+        let slot = fixture.slot(&slot_id);
+        assert_eq!(
+            slot.collection.state,
+            ClaudeConfigSlotCollectionStateV1::Fresh
+        );
+        assert_eq!(
+            FileClaudeConfigSlotSettingsStore::default()
+                .expected_slot_binding(&slot_id)
+                .expect("read approval"),
+            ClaudeSlotAccountBinding::new(&team.0, &team.1),
+        );
+        assert!(first.iter().any(
+            |snapshot| snapshot_binding(snapshot).as_ref() == Some(&team)
+                && !snapshot.quota_windows.is_empty()
+        ));
+
+        // `CLAUDE_CONFIG_DIR=<slot> claude` + `/login` with the Max account.
+        fixture.sign_in(MAX_20X);
+        fixture.clear_spawns();
+        let provider_calls_before =
+            CLAUDE_OAUTH_PROVIDER_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let snapshots = fixture.collect();
+        let slot = fixture.slot(&slot_id);
+
+        assert_eq!(
+            slot.collection.state,
+            ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        );
+        assert_eq!(
+            slot.collection.account_identifier_hash.as_deref(),
+            Some(team.0.as_str()),
+            "the slot stays on its approved account"
+        );
+        assert_eq!(
+            slot.collection.organization_identifier_hash.as_deref(),
+            Some(team.1.as_str())
+        );
+        assert_eq!(
+            slot.collection
+                .account_profile
+                .as_ref()
+                .and_then(|profile| profile.plan_type.as_deref()),
+            Some("team_premium"),
+            "the approved account's own profile is kept"
+        );
+        let message = &slot.collection.diagnostics[0].message;
+        assert_eq!(
+            slot.collection.diagnostics[0].code,
+            ClaudeConfigSlotDiagnosticCodeV1::IdentityMismatch
+        );
+        assert!(message.contains("Claude Max 20x"), "{message}");
+        assert!(message.contains("Claude Team Premium"), "{message}");
+        assert!(!message.contains('@'), "{message}");
+        assert!(
+            fixture.slot_spawns().is_empty(),
+            "no auth status, doctor or other CLI spawn for a mismatched slot: {:?}",
+            fixture.slot_spawns()
+        );
+        assert_eq!(
+            CLAUDE_OAUTH_PROVIDER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            provider_calls_before,
+            "no usage call"
+        );
+        assert!(
+            snapshots
+                .iter()
+                .all(|snapshot| snapshot_binding(snapshot).as_ref() != Some(&max)),
+            "nothing is uploaded under the other account"
+        );
+        assert!(snapshots.iter().all(|snapshot| snapshot
+            .quota_windows
+            .iter()
+            .all(|window| window.used_percent != Some(92))));
+        let approved = snapshots
+            .iter()
+            .find(|snapshot| snapshot_binding(snapshot).as_ref() == Some(&team))
+            .expect("approved account health projection");
+        assert_eq!(approved.status, AgentStatusState::Degraded);
+        assert_eq!(
+            approved
+                .account
+                .as_ref()
+                .and_then(|account| account.claude_quota_access_state),
+            Some(ClaudeQuotaAccessState::AttentionRequired)
+        );
+        let wire = serde_json::to_string(
+            &snapshots
+                .iter()
+                .cloned()
+                .map(|snapshot| snapshot.redacted_for_backend())
+                .collect::<Vec<_>>(),
+        )
+        .expect("serialize upload");
+        assert!(!wire.contains('@'), "no email in uploads");
+        assert!(
+            !wire.contains("Claude Max 20x"),
+            "the local message is not uploaded"
+        );
+        assert!(!wire.contains("fixture-secret"), "no token in uploads");
+        assert!(
+            crate::agent_status::claude_slot_login_contradicts_approval(&slot),
+            "the upkeep worker's spawn and publication fences refuse this slot"
+        );
+        let persisted = fixture.support_files_text();
+        assert!(!persisted.contains("fixture-secret"), "no token persisted");
+        assert!(
+            !persisted.contains("max.person@"),
+            "the other login's email is never persisted"
+        );
+
+        // The approved account signs in again from Terminal: collection resumes.
+        fixture.sign_in(TEAM_PREMIUM);
+        let recovered = fixture.collect();
+        let slot = fixture.slot(&slot_id);
+        assert_eq!(
+            slot.collection.state,
+            ClaudeConfigSlotCollectionStateV1::Fresh
+        );
+        assert!(!crate::agent_status::claude_slot_login_contradicts_approval(&slot));
+        let approved = recovered
+            .iter()
+            .find(|snapshot| snapshot_binding(snapshot).as_ref() == Some(&team))
+            .expect("approved account snapshot");
+        assert_eq!(
+            approved
+                .account
+                .as_ref()
+                .and_then(|account| account.claude_quota_access_state),
+            Some(ClaudeQuotaAccessState::Full)
+        );
+        assert!(approved
+            .quota_windows
+            .iter()
+            .all(|window| window.used_percent == Some(41)));
+    }
+
+    #[test]
+    #[serial]
+    fn back_fill_prefers_the_last_verified_identity_over_a_new_login() {
+        let fixture = ClaudeBindingFixture::new("backfill-last-verified");
+        let team = ClaudeBindingFixture::hashes(TEAM_PREMIUM);
+        let max = ClaudeBindingFixture::hashes(MAX_20X);
+        fixture.sign_in(TEAM_PREMIUM);
+        let slot_id = fixture.register();
+        // A collection-state file written before approvals existed records
+        // this slot's last verified identity.
+        persist_one_claude_slot_collection_state(
+            &slot_id,
+            &fresh_slot_status(&binding_test_time(0), &team.0, &team.1, true, true, false),
+        )
+        .expect("legacy collection state");
+        // The other account signed in before this daemon version ran.
+        fixture.sign_in(MAX_20X);
+        fixture.clear_spawns();
+        let snapshots = fixture.collect();
+        let slot = fixture.slot(&slot_id);
+        assert_eq!(
+            FileClaudeConfigSlotSettingsStore::default()
+                .expected_slot_binding(&slot_id)
+                .expect("read approval"),
+            ClaudeSlotAccountBinding::new(&team.0, &team.1),
+        );
+        assert_eq!(
+            slot.collection.state,
+            ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        );
+        assert!(fixture.slot_spawns().is_empty());
+        assert!(snapshots
+            .iter()
+            .all(|snapshot| snapshot_binding(snapshot).as_ref() != Some(&max)));
+    }
+
+    #[test]
+    #[serial]
+    fn direct_slot_check_refuses_another_account_and_resumes_for_the_approved_one() {
+        let fixture = ClaudeBindingFixture::new("direct-check");
+        let team = ClaudeBindingFixture::hashes(TEAM_PREMIUM);
+        fixture.sign_in(TEAM_PREMIUM);
+        let slot_id = fixture.register();
+        let first = collect_registered_claude_slot_status(
+            &slot_id,
+            binding_test_time(0),
+            binding_test_time(15),
+        );
+        assert_eq!(first.state, ClaudeConfigSlotCollectionStateV1::Fresh);
+
+        fixture.sign_in(MAX_20X);
+        fixture.clear_spawns();
+        let mismatched = collect_registered_claude_slot_status(
+            &slot_id,
+            binding_test_time(0),
+            binding_test_time(15),
+        );
+        assert_eq!(
+            mismatched.state,
+            ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        );
+        assert_eq!(
+            mismatched.account_identifier_hash.as_deref(),
+            Some(team.0.as_str())
+        );
+        assert!(mismatched
+            .quota_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot
+                .quota_windows
+                .iter()
+                .all(|window| window.used_percent == Some(41))));
+        assert!(fixture.slot_spawns().is_empty());
+
+        fixture.sign_in(TEAM_PREMIUM);
+        let recovered = collect_registered_claude_slot_status(
+            &slot_id,
+            binding_test_time(0),
+            binding_test_time(15),
+        );
+        assert_eq!(recovered.state, ClaudeConfigSlotCollectionStateV1::Fresh);
+    }
+
+    #[test]
+    fn binding_mismatch_message_names_plans_only() {
+        assert_eq!(
+            claude_plan_label(Some("max_20x")).as_deref(),
+            Some("Claude Max 20x")
+        );
+        assert_eq!(
+            claude_plan_label(Some("claude_team_premium")).as_deref(),
+            Some("Claude Team Premium")
+        );
+        assert_eq!(
+            claude_plan_label(Some("pro")).as_deref(),
+            Some("Claude Pro")
+        );
+        assert_eq!(claude_plan_label(None), None);
+        let message = claude_slot_binding_mismatch_message(Some("team_premium"), Some("max_20x"));
+        assert!(message.contains("a different Claude Max 20x account"));
+        assert!(message.contains("the Claude Team Premium account"));
+        let unknown = claude_slot_binding_mismatch_message(None, None);
+        assert!(unknown.contains("a different Claude account"));
+        assert!(unknown.contains("the account it was set up with"));
     }
 }
 

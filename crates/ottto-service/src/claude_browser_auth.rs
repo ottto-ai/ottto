@@ -447,6 +447,19 @@ pub(crate) fn collection_suppression(slot_id: &str) -> Option<ClaudeCollectionSu
     if admitted {
         return None;
     }
+    if operation.mode == PersistedMode::Reconnect
+        && operation.outcome == Some(ClaudeBrowserAuthOutcomeV1::IdentityMismatch)
+        && FileClaudeConfigSlotSettingsStore::default()
+            .expected_slot_binding(slot_id)
+            .is_ok_and(|binding| binding.is_some())
+    {
+        // The reconnect replaced the slot's Claude login with another
+        // account. The approved-binding gate now owns the slot: it reports
+        // the mismatch and blocks collection, upload and refresh while the
+        // other account stays signed in, and resumes as soon as the approved
+        // account signs in again by any path (Terminal or a later reconnect).
+        return None;
+    }
     Some(match operation.mode {
         PersistedMode::Target => ClaudeCollectionSuppression::HideProvisionalTarget,
         PersistedMode::Reconnect => ClaudeCollectionSuppression::PreserveCanonicalReconnect,
@@ -1819,10 +1832,14 @@ fn finalize_identity_mode(
             clear_admission_slot(operation_id);
             return Ok(());
         }
-        if let Err(error) = store.register_managed_path_with_slot_id(
+        if let Err(error) = store.register_managed_path_with_slot_id_and_binding(
             CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
             canonical.clone(),
             operation_config_dir(&operation),
+            ottto_core::ClaudeSlotAccountBinding::new(
+                &proof.account_identifier_hash,
+                &proof.organization_identifier_hash,
+            ),
         ) {
             let _ = crate::agent_status::prune_claude_slot_collection_state(&canonical);
             clear_admission_slot(operation_id);
@@ -3127,10 +3144,18 @@ fn finish_mismatch(
         if !eligible {
             return Ok(());
         }
+        let message = if operation.mode == PersistedMode::Reconnect {
+            // Claude's own login ran in this slot's directory, so the Claude
+            // login saved there now belongs to the other account.
+            "Claude signed in to a different account, which replaced the Claude login saved in this connection. Ottto kept this connection set up for its original account and assigned no usage to the other account. Sign in again with the original account to resume."
+        } else {
+            "Claude signed in to a different account than the one requested. Ottto did not save that login or assign it any usage."
+        };
         if operation.mode != PersistedMode::Generic
-            && transition_registry_terminal(
+            && transition_registry_terminal_with_message(
                 &operation,
                 ClaudeBrowserAuthOutcomeV1::IdentityMismatch,
+                message,
             )
             .is_err()
         {
@@ -5251,6 +5276,13 @@ mod tests {
                 .as_deref(),
             Some(organization.as_str())
         );
+        assert_eq!(
+            store
+                .expected_slot_binding(&exposed.managed_slots[0].slot_id)
+                .expect("approval"),
+            ottto_core::ClaudeSlotAccountBinding::new(&account, &organization),
+            "admission records the verified pair as the slot's approval atomically"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6540,6 +6572,172 @@ mod tests {
             .find(|slot| slot.slot_id == slot_id)
             .expect("canonical reconnect slot");
         assert_eq!(durable.collection, prior);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn mismatched_reconnect_of_an_approved_slot_reports_truthfully_and_recovers_by_any_path() {
+        let root = temp_dir("reconnect-mismatch-approved");
+        let support = root.join("support");
+        let empty_bin = root.join("empty-bin");
+        let managed_parent = support.join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME);
+        let managed = managed_parent.join("claude_slot_d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1");
+        fs::create_dir_all(&managed).expect("managed root");
+        fs::create_dir_all(&empty_bin).expect("empty command dir");
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("support mode");
+            fs::set_permissions(&managed_parent, fs::Permissions::from_mode(0o700))
+                .expect("managed parent mode");
+            fs::set_permissions(&managed, fs::Permissions::from_mode(0o700))
+                .expect("managed root mode");
+        }
+        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        // No CLI or keychain tool is reachable: nothing real is ever spawned.
+        let _commands = EnvGuard::set("OTTTO_COMMAND_SEARCH_PATH", &empty_bin);
+        let hash = |kind: &str, value: &str| {
+            ottto_core::billing_identity_hash("anthropic", kind, value).expect("hash")
+        };
+        let account = hash("account", "account-approved");
+        let organization = hash("organization", "organization-approved");
+        let sign_in = |account_uuid: &str, organization_uuid: &str| {
+            fs::write(
+                managed.join(".claude.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "oauthAccount": {
+                        "accountUuid": account_uuid,
+                        "organizationUuid": organization_uuid,
+                        "emailAddress": "someone@example.invalid",
+                        "organizationType": "claude_max",
+                        "organizationRateLimitTier": "default_claude_max_20x"
+                    }
+                }))
+                .expect("identity json"),
+            )
+            .expect("write identity");
+        };
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let registered = store
+            .register_managed_path(1, managed.to_string_lossy().into_owned())
+            .expect("register");
+        let slot_id = registered.managed_slots[0].slot_id.clone();
+        let approved =
+            ottto_core::ClaudeSlotAccountBinding::new(&account, &organization).expect("binding");
+        assert_eq!(
+            store
+                .ensure_approved_slot_binding(1, &slot_id, Some(&approved))
+                .expect("approve"),
+            Some(approved.clone())
+        );
+        let prior = ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+            account_identifier_hash: Some(account.clone()),
+            organization_identifier_hash: Some(organization.clone()),
+            ..Default::default()
+        };
+        crate::agent_status::persist_one_claude_slot_collection_state(&slot_id, &prior)
+            .expect("prior canonical evidence");
+
+        let operation_id = "claude_setup_d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2";
+        store
+            .begin_registered_slot_reconnect_target(
+                1,
+                operation_id.to_string(),
+                &slot_id,
+                None,
+                account.clone(),
+                Some(organization.clone()),
+            )
+            .expect("core reconnect");
+        transact(|state| {
+            state.operations.push(PersistedOperation {
+                operation_id: operation_id.to_string(),
+                slot_id: slot_id.clone(),
+                config_dir: managed.to_string_lossy().into_owned(),
+                ceremony_baseline: None,
+                mode: PersistedMode::Reconnect,
+                target_id: None,
+                expected_account_identifier_hash: Some(account.clone()),
+                expected_organization_identifier_hash: Some(organization.clone()),
+                phase: ClaudeBrowserAuthPhaseV1::WaitingForProvider,
+                outcome: None,
+                canonical_slot_id: None,
+                admission_slot_id: None,
+                identity_mismatch: None,
+                cancel_requested: false,
+                started_unix_seconds: 1,
+                deadline_unix_seconds: u64::MAX,
+                completed_unix_seconds: None,
+                fallback_completed: false,
+            });
+        })
+        .expect("sidecar reconnect");
+        assert_eq!(
+            collection_suppression(&slot_id),
+            Some(ClaudeCollectionSuppression::PreserveCanonicalReconnect),
+            "an active reconnect still preserves the slot"
+        );
+
+        // Claude's sign-in ran in the slot directory with another account.
+        sign_in("account-other", "organization-other");
+        finish_mismatch(
+            operation_id,
+            ClaudeBrowserAuthIdentityMismatchV1::Account,
+            false,
+        )
+        .expect("terminal mismatch");
+        let operation = store
+            .setup_operation(operation_id)
+            .expect("terminal core op")
+            .setup_operation;
+        assert_eq!(
+            operation.state,
+            ClaudeAccountSetupOperationState::IdentityMismatch
+        );
+        let message = operation.message.expect("mismatch detail");
+        assert!(
+            message.contains("replaced the Claude login saved in this connection"),
+            "{message}"
+        );
+        assert!(!message.contains("not changed"), "{message}");
+        assert_eq!(
+            store.expected_slot_binding(&slot_id).expect("approval"),
+            Some(approved),
+            "a mismatch never changes the approval"
+        );
+        assert_eq!(
+            collection_suppression(&slot_id),
+            None,
+            "the approved-binding gate owns the slot after a mismatched reconnect"
+        );
+        let mismatched = crate::agent_status::collect_registered_claude_slot_status(
+            &slot_id,
+            "2026-10-03T20:00:00Z".to_string(),
+            "2026-10-03T20:15:00Z".to_string(),
+        );
+        assert_eq!(
+            mismatched.state,
+            ottto_protocol::ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        );
+        assert_eq!(mismatched.account_identifier_hash, Some(account.clone()));
+        assert_eq!(
+            mismatched.organization_identifier_hash,
+            Some(organization.clone())
+        );
+
+        // The approved account signs in again from Terminal: the gate passes
+        // and ordinary collection resumes (no CLI here, so it stops at the
+        // credential check instead of reporting a mismatch).
+        sign_in("account-approved", "organization-approved");
+        let resumed = crate::agent_status::collect_registered_claude_slot_status(
+            &slot_id,
+            "2026-10-03T20:05:00Z".to_string(),
+            "2026-10-03T20:20:00Z".to_string(),
+        );
+        assert_ne!(
+            resumed.state,
+            ottto_protocol::ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        );
         let _ = fs::remove_dir_all(root);
     }
 

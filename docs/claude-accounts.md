@@ -213,6 +213,30 @@ and daemon restart retain the same operation/slot binding. After completion,
 another reconnect may start for the same slot; prior operation ids remain
 retired in bounded fail-closed state and can never be rebound.
 
+Each registered connection remembers the account it is approved for: the
+strong account and organization hashes only, never an email or credential,
+stored with its registration. A setup or reconnect that completes with verified
+identity records that approval. A connection saved before approvals existed is
+back-filled once: from its latest completed, verified setup or reconnect; else
+from the last verified identity in local collection state; else from its first
+verified identity. A connection whose setup or reconnect is still pending, or
+ended without verified identity, is never back-filled from an observation.
+
+Running `CLAUDE_CONFIG_DIR=<that directory> claude` and `/login` with another
+account replaces the Claude login inside that connection. Ottto then reports
+`identity_mismatch` for it, with a local message that names both plans (for
+example a Claude Max 20x login in a Claude Team Premium connection). Until the
+approved account signs in again, Ottto starts no Claude command, credential
+refresh or usage request for that connection and uploads nothing for the other
+account; the approved account keeps its own profile and its last full reading,
+marked stale, so its card shows that it needs attention. Accounts are never
+merged. Signing in again with the approved account, from Terminal or the app,
+resumes collection on the next pass. A browser reconnect that returns another
+account leaves the same state: Claude's own sign-in ran in that directory, so
+the saved Claude login there was replaced even though Ottto kept the
+connection's approval. The default `~/.claude` login is unchanged: it follows
+whichever account is signed in there.
+
 Ottto does not assign special “Team” or “Personal” directories. Every distinct
 account-and-organization binding can receive its own daemon-managed anchor,
 whether a Mac has two personal accounts, several organizations, or a mixture.
