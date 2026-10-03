@@ -29,7 +29,10 @@ the app and the web disagreed.
   through an eligible provider caller: no live hold for that caller, no open
   account-wide auth breaker, and no sign-in-rejection or breaker-suppression
   evidence on the slot. An eligible caller reusing its own young cache still
-  serves, because it asks the provider on its normal cadence.
+  serves, because it asks the provider on its normal cadence. The caller hold
+  is checked with the collector's own rotation-aware
+  `claude_oauth_usage_caller_auth_hold` and the slot's current access expiry,
+  so a rotated credential is not reported as paused (AutoReview 01a10097).
 - The next automatic check comes from the account's breaker: the account-wide
   auth cool-down when it is open, otherwise the earliest live per-caller hold
   from #475. The breaker is read only, never written or reset.
@@ -82,6 +85,8 @@ the app and the web disagreed.
   slot is paused (and serves again once the hold expires); a genuinely serving
   second credential keeps the account unpaused. The first two fail on
   ec93133f; the third passes there too and guards against over-reporting.
+  A rotated credential with a stale predecessor hold is not paused (fails on
+  9fd00542).
 - New tests in `lib.rs`: a paused account gives the Claude Code source
   `healthy` + `warning` + one `unknown`-coded problem, canonical
   `blocking_reason=usage_checks_paused`, and no extra machine blocker; without

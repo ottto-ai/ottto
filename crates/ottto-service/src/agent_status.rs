@@ -3740,20 +3740,25 @@ fn claude_paused_usage_accounts(
                 breaker: breaker_for(account, organization),
                 ..Default::default()
             });
-        let caller_key = if is_default {
-            CLAUDE_OAUTH_USAGE_DEFAULT_CALLER_KEY.to_string()
+        let caller = if is_default {
+            ClaudeOAuthUsageCaller::Default
         } else {
-            claude_oauth_usage_slot_caller_key(slot_id)
+            ClaudeOAuthUsageCaller::RegisteredSlot(slot_id.clone())
         };
+        // The same rotation-aware hold the collector applies: a credential
+        // whose access expiry differs from the rejected one is not held.
         let (account_auth_open, caller_held) =
             entry.breaker.as_ref().map_or((false, false), |breaker| {
                 (
                     breaker.opened_by == "auth_rejected"
                         && now < breaker.reopen_after_epoch_seconds,
-                    breaker
-                        .auth_callers
-                        .get(&caller_key)
-                        .is_some_and(|state| now < state.backoff_until_epoch_seconds),
+                    claude_oauth_usage_caller_auth_hold(
+                        breaker,
+                        &caller,
+                        now,
+                        status.access_expires_at.as_deref(),
+                    )
+                    .is_some(),
                 )
             });
         let slot_auth_evidence = status
@@ -27599,6 +27604,37 @@ mod usage_checks_paused_tests {
             NOW,
         );
         assert!(paused.is_empty());
+    }
+
+    #[test]
+    fn rotated_credential_with_a_stale_predecessor_hold_is_not_paused() {
+        // The rejected credential expired at T1; the slot now reads with a
+        // rotated credential (T2). The collector releases such a hold, so the
+        // slot serving its own young cache is not paused.
+        let mut slot = healthy_slot(ACCOUNT_A);
+        slot.access_expires_at = Some("2026-10-03T12:00:00Z".to_string());
+        let slots = BTreeMap::from([("slot-rotated".to_string(), slot)]);
+        let breaker = || {
+            let mut breaker = caller_hold_breaker(
+                claude_oauth_usage_slot_caller_key("slot-rotated"),
+                NOW + 900,
+            );
+            for state in breaker.auth_callers.values_mut() {
+                state.credential_expires_at = Some("2026-10-03T04:00:00Z".to_string());
+            }
+            breaker
+        };
+        let paused =
+            claude_paused_usage_accounts(&slots, &current_login(), |_, _| Some(breaker()), NOW);
+        assert!(paused.is_empty());
+
+        // The same credential that was rejected stays held.
+        let mut same = healthy_slot(ACCOUNT_A);
+        same.access_expires_at = Some("2026-10-03T04:00:00Z".to_string());
+        let slots = BTreeMap::from([("slot-rotated".to_string(), same)]);
+        let paused =
+            claude_paused_usage_accounts(&slots, &current_login(), |_, _| Some(breaker()), NOW);
+        assert_eq!(paused.len(), 1);
     }
 
     #[test]
