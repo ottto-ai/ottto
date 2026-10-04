@@ -424,6 +424,9 @@ pub(crate) fn backdate_failure_for_test(slot_id: &str, by: Duration) {
 /// Forget a removed slot's refresh history.
 pub(crate) fn prune_slot(slot_id: &str) {
     let support_dir = default_support_dir();
+    let _guard = state_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut state = load_state(&support_dir);
     if state.failed.remove(slot_id).is_some() {
         let _ = write_state(&support_dir, &state);

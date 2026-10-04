@@ -10616,26 +10616,40 @@ pub(crate) fn claude_credential_modified_marker(slot: &ClaudeConfigDirSlot) -> O
 pub(crate) fn read_claude_spawn_gate_credential(
     slot: &ClaudeConfigDirSlot,
 ) -> crate::claude_spawn_gate::ClaudeGateCredential {
+    claude_gate_credential(
+        &read_claude_oauth_credential_state_for_slot(slot),
+        OffsetDateTime::now_utc(),
+    )
+}
+
+/// The spawn gate's view, derived from the one login classifier
+/// ([`claude_local_login_state`]) so the status, the gate and the refresher
+/// always agree. A missing or unparseable access deadline, a missing access
+/// token or inference scope, or a failed read is `Unreadable` there and
+/// `ReadFailed` here: no spawn, no refresh.
+fn claude_gate_credential(
+    read: &ClaudeCredentialRead,
+    now: OffsetDateTime,
+) -> crate::claude_spawn_gate::ClaudeGateCredential {
     use crate::claude_spawn_gate::ClaudeGateCredential;
-    match read_claude_oauth_credential_state_for_slot(slot) {
-        ClaudeCredentialRead::Absent => ClaudeGateCredential::Absent,
-        ClaudeCredentialRead::Unreadable => ClaudeGateCredential::ReadFailed,
-        // A refreshable item without an access token or without the inference
-        // scope is malformed (Claude Code always writes both): fail closed.
-        ClaudeCredentialRead::Present(credential)
-            if credential.has_refresh_token
-                && (credential.access_token.is_none()
-                    || credential.has_inference_scope != Some(true)) =>
-        {
-            ClaudeGateCredential::ReadFailed
+    match claude_local_login_state(read, now) {
+        ClaudeLocalLoginState::NotSignedIn => ClaudeGateCredential::Absent,
+        ClaudeLocalLoginState::Unreadable => ClaudeGateCredential::ReadFailed,
+        // Nothing left to refresh, so nothing a short run could lose.
+        ClaudeLocalLoginState::SignedOutByCli | ClaudeLocalLoginState::NeedsLogin => {
+            ClaudeGateCredential::Present {
+                has_refresh_token: false,
+                access_expires_at: None,
+            }
         }
-        ClaudeCredentialRead::Present(credential) => ClaudeGateCredential::Present {
-            has_refresh_token: credential.has_refresh_token,
-            access_expires_at: credential
-                .access_expires_at
-                .as_deref()
-                .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok()),
-        },
+        ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending => {
+            ClaudeGateCredential::Present {
+                has_refresh_token: true,
+                access_expires_at: read.metadata().and_then(|metadata| {
+                    OffsetDateTime::parse(metadata.access_expires_at.as_deref()?, &Rfc3339).ok()
+                }),
+            }
+        }
     }
 }
 
@@ -31599,5 +31613,74 @@ exit 44
             "an approved key comes first"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// One classifier: the status, the spawn gate and the refresher agree on
+    /// absent, malformed, expired and valid access deadlines. An absent or
+    /// malformed deadline fails closed everywhere.
+    #[test]
+    fn status_gate_and_refresher_agree_on_the_access_deadline() {
+        use crate::claude_refresher::{decide_refresh, RefreshDecision};
+        use crate::claude_spawn_gate::{evaluate_short_run, ClaudeSpawnRefusal};
+        let now = OffsetDateTime::now_utc();
+        let at = |offset: TimeDuration| Some((now + offset).format(&Rfc3339).expect("format"));
+        let read = |access_expires_at: Option<String>| {
+            ClaudeCredentialRead::Present(ClaudeOAuthCredential {
+                access_token: Some("fixture-access".to_string()),
+                has_refresh_token: true,
+                access_expires_at,
+                relogin_required_at: at(TimeDuration::days(20)),
+                has_inference_scope: Some(true),
+                has_profile_scope: true,
+                subscription_type: None,
+            })
+        };
+        for (label, deadline, state, spawn, refresh) in [
+            (
+                "absent",
+                None,
+                ClaudeLocalLoginState::Unreadable,
+                Err(ClaudeSpawnRefusal::CredentialReadFailed),
+                RefreshDecision::NotNeeded,
+            ),
+            (
+                "malformed",
+                Some("not-a-time".to_string()),
+                ClaudeLocalLoginState::Unreadable,
+                Err(ClaudeSpawnRefusal::CredentialReadFailed),
+                RefreshDecision::NotNeeded,
+            ),
+            (
+                "expired",
+                at(-TimeDuration::minutes(10)),
+                ClaudeLocalLoginState::RefreshPending,
+                Err(ClaudeSpawnRefusal::QuietWindow),
+                RefreshDecision::Started,
+            ),
+            (
+                "valid",
+                at(TimeDuration::hours(3)),
+                ClaudeLocalLoginState::AccessValid,
+                Ok(()),
+                RefreshDecision::NotNeeded,
+            ),
+        ] {
+            let read = read(deadline);
+            assert_eq!(claude_local_login_state(&read, now), state, "{label}");
+            assert_eq!(
+                evaluate_short_run(claude_gate_credential(&read, now), None, now),
+                spawn,
+                "{label}"
+            );
+            let live = ClaudeLiveLogin {
+                state: claude_local_login_state(&read, now),
+                metadata: read.metadata(),
+            };
+            assert_eq!(
+                decide_refresh(&live, true, false, None, now),
+                refresh,
+                "{label}"
+            );
+        }
     }
 }
