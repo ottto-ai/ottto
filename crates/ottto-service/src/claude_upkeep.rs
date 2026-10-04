@@ -463,6 +463,7 @@ fn observe_registered_slot_upkeep_reading(
             refresh_token_expires_at: descriptor.collection.relogin_required_at.clone(),
             has_refresh_token: true,
             cleared_by_cli: false,
+            has_profile_scope: false,
         };
         return observation_with_metadata(
             false,
@@ -478,6 +479,7 @@ fn observe_registered_slot_upkeep_reading(
             refresh_token_expires_at: None,
             has_refresh_token: false,
             cleared_by_cli: false,
+            has_profile_scope: false,
         });
     match live.state {
         // Claude Code signed this slot out, or its refresh grant is gone. No
@@ -515,8 +517,8 @@ fn observe_registered_slot_upkeep_reading(
         }
         ClaudeLocalLoginState::RefreshPending => {
             let result = match refresh {
-                // The background refresh of this exact credential did not
-                // advance its expiry: sign in again; no retry until a new
+                // The background refresh of this exact credential signed it
+                // out or failed twice: sign in again; no retry until a new
                 // credential appears.
                 RefreshDecision::FailedWaitingForSignIn => {
                     return observation_with_metadata(
@@ -525,10 +527,11 @@ fn observe_registered_slot_upkeep_reading(
                         &metadata,
                     )
                 }
-                // A background refresh is running for this login.
-                RefreshDecision::Started | RefreshDecision::Running => {
-                    ClaudeConfigSlotUpkeepResultV1::InProgress
-                }
+                // A background refresh is running for this login, or its one
+                // retry after an intact failure is due on a later pass.
+                RefreshDecision::Started
+                | RefreshDecision::Running
+                | RefreshDecision::RetryWaiting => ClaudeConfigSlotUpkeepResultV1::InProgress,
                 RefreshDecision::Disabled | RefreshDecision::NotNeeded => {
                     if PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
                         ClaudeConfigSlotUpkeepResultV1::RefreshDue
@@ -1527,6 +1530,7 @@ mod tests {
             refresh_token_expires_at: Some(refresh.to_string()),
             has_refresh_token: true,
             cleared_by_cli: false,
+            has_profile_scope: false,
         }
     }
 
@@ -2121,6 +2125,7 @@ mod tests {
                     refresh_token_expires_at: Some("2026-10-09T23:27:42.708Z".to_string()),
                     has_refresh_token: false,
                     cleared_by_cli: false,
+                    has_profile_scope: false,
                 })]),
                 &CountingProcess {
                     result: DoctorProcessResult::ExitZero,
@@ -2183,6 +2188,7 @@ mod tests {
             refresh_token_expires_at: descriptor.collection.relogin_required_at.clone(),
             has_refresh_token: false,
             cleared_by_cli: false,
+            has_profile_scope: false,
         })]);
         let process = CountingProcess {
             result: DoctorProcessResult::ExitZero,
@@ -2271,6 +2277,7 @@ mod tests {
                 refresh_token_expires_at: Some("2026-09-01T00:00:00Z".to_string()),
                 has_refresh_token: false,
                 cleared_by_cli: false,
+                has_profile_scope: false,
             })]),
             &FixedProcess(DoctorProcessResult::ExitZero),
             &ProductionFinalSpawnGate,
@@ -2308,6 +2315,7 @@ mod tests {
                 refresh_token_expires_at: Some("2026-09-15T04:52:51Z".to_string()),
                 has_refresh_token: false,
                 cleared_by_cli: false,
+                has_profile_scope: false,
             })]),
             &CountingProcess {
                 result: DoctorProcessResult::ExitZero,
@@ -3281,6 +3289,7 @@ mod tests {
             refresh_token_expires_at: Some(rfc3339_from_now(TimeDuration::days(25))),
             has_refresh_token: false,
             cleared_by_cli: true,
+            has_profile_scope: false,
         }
     }
 

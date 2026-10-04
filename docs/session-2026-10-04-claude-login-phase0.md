@@ -37,8 +37,16 @@ Verify smoke.
   access token is within 5 minutes of expiry or expired; empty cwd, own process
   group, Mac kept awake (`caffeinate -i -w`), never killed (reported after
   120 s), success only when `expiresAt` advances (keychain `mdat` logged).
-  Failure or blanking: no retry for that credential, the slot asks to sign in
-  again; a new credential clears it.
+  Only for logins whose `/usage` refreshes (`user:profile` scope, not
+  `usage_based`, no other credential first via the shared alternative-auth
+  helper; a usage snapshot under 60 s postpones it). A first failure with the
+  login intact gets one retry at least 5 minutes later; a second failure or a
+  blanking stops retries and the slot asks to sign in again; a new credential
+  clears it. `caffeinate` is reaped by the waiter.
+- **MCP probes** (`mcp_inventory.rs`): a server that is Claude Code itself
+  (`claude mcp serve`, or the npm package) is not started inside its login's
+  quiet window (same gate); the cycle keeps the last fresh inventory. It is
+  never killed while its login's refresh lock is fresh.
 - **Lifetime warnings** 3 days and 1 day before `refreshTokenExpiresAt`, on
   the existing `relogin_approaching` diagnostic.
 - **No expired-token usage requests.**
@@ -51,4 +59,5 @@ Code 2.1.288's source; the real CLI was not run.
 
 MCP credential isolation, hook disabling, process-group kills of short runs,
 the opaque-executable structure and the strict-MCP `/context`. MCP probes and
-`/context` are back to master behaviour apart from the quiet window.
+`/context` are back to master behaviour apart from the quiet window (and, for
+Claude Code MCP servers, no kill mid-refresh).

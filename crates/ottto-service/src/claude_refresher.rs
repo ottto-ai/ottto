@@ -16,9 +16,14 @@
 //!   left to finish;
 //! - leaves concurrency to Claude Code's own `.oauth_refresh.lock`;
 //! - afterwards proves success only by a new, later `expiresAt`. If the
-//!   expiry did not advance or the login was blanked, that login is not
-//!   refreshed again (it asks to sign in again) until a new credential
-//!   appears.
+//!   login was blanked, or the expiry did not advance twice, that login is
+//!   not refreshed again (it asks to sign in again) until a new credential
+//!   appears. A first failure that leaves the login intact (refresh token
+//!   present, not blanked; typically a refresh right after a wake, before the
+//!   network is back) gets exactly one retry, at least 5 minutes later;
+//! - runs only for logins whose `/usage` actually refreshes: `user:profile`
+//!   scope, not usage-billed, no other credential taking precedence
+//!   (`agent_status::claude_refresher_skip_reason`).
 //!
 //! `-p /usage` is a local command (`supportsNonInteractive`) that reads plan
 //! usage with the account's token, so it uses no model quota; Claude Code
@@ -42,6 +47,8 @@ pub(crate) const REFRESH_TRIGGER: Duration = Duration::from_secs(5 * 60);
 /// After this the refresher is reported as still running and left alone.
 pub(crate) const REFRESH_REPORT_AFTER: Duration = Duration::from_secs(120);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// The single retry after an intact failure waits at least this long.
+pub(crate) const RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 pub(crate) const REFRESH_ARGV: [&str; 4] = [
     "-p",
     "/usage",
@@ -67,8 +74,11 @@ pub(crate) enum RefreshDecision {
     Running,
     /// "Keep my Claude accounts signed in" is off, or usage reads are off.
     Disabled,
-    /// The last refresh of this exact credential did not advance its
-    /// expiry: wait for the user to sign in again.
+    /// The first refresh of this exact credential failed but left it
+    /// intact; its one retry starts on a later pass.
+    RetryWaiting,
+    /// The refresh of this exact credential signed it out, or failed twice:
+    /// wait for the user to sign in again.
     FailedWaitingForSignIn,
 }
 
@@ -90,10 +100,13 @@ struct RefreshState {
 /// A failed refresh of one exact credential (identified by its access
 /// deadline). Holds no token, account or path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct FailedRefresh {
+pub(crate) struct FailedRefresh {
     access_expires_at: String,
     failed_at: String,
     outcome: String,
+    /// The first failure left the login intact: one retry is allowed.
+    #[serde(default)]
+    retry_allowed: bool,
 }
 
 /// Pure decision: should this login be refreshed now?
@@ -101,7 +114,7 @@ pub(crate) fn decide_refresh(
     live: &ClaudeLiveLogin,
     enabled: bool,
     already_running: bool,
-    failed_for_expiry: Option<&str>,
+    failed: Option<&FailedRefresh>,
     now: OffsetDateTime,
 ) -> RefreshDecision {
     if !matches!(
@@ -117,8 +130,15 @@ pub(crate) fn decide_refresh(
     else {
         return RefreshDecision::NotNeeded;
     };
-    if failed_for_expiry == Some(expires_at) {
-        return RefreshDecision::FailedWaitingForSignIn;
+    if let Some(failed) = failed.filter(|failed| failed.access_expires_at == expires_at) {
+        if !failed.retry_allowed {
+            return RefreshDecision::FailedWaitingForSignIn;
+        }
+        let retry_at = OffsetDateTime::parse(&failed.failed_at, &Rfc3339)
+            .map(|at| at + TimeDuration::try_from(RETRY_AFTER).expect("retry"));
+        if !already_running && retry_at.map_or(true, |retry_at| now < retry_at) {
+            return RefreshDecision::RetryWaiting;
+        }
     }
     let Ok(expiry) = OffsetDateTime::parse(expires_at, &Rfc3339) else {
         return RefreshDecision::NotNeeded;
@@ -177,6 +197,9 @@ pub(crate) fn maybe_refresh(
         enabled,
         &default_support_dir(),
         &ProductionLauncher,
+        &|| {
+            crate::agent_status::claude_refresher_skip_reason(slot, live, OffsetDateTime::now_utc())
+        },
     )
 }
 
@@ -217,24 +240,27 @@ fn maybe_refresh_with(
     enabled: bool,
     support_dir: &Path,
     launcher: &dyn RefreshLauncher,
+    skip_reason: &dyn Fn() -> Option<&'static str>,
 ) -> RefreshDecision {
     let now = OffsetDateTime::now_utc();
-    let mut state = load_state(support_dir);
     let current_expiry = live
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.access_expires_at.clone());
-    // A new credential (a different access deadline) clears an old failure.
-    if let Some(failed) = state.failed.get(slot_id) {
-        if current_expiry.as_deref() != Some(failed.access_expires_at.as_str()) {
-            state.failed.remove(slot_id);
-            let _ = write_state(support_dir, &state);
+    let failed = {
+        let _guard = state_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = load_state(support_dir);
+        // A new credential (a different access deadline) clears an old failure.
+        if let Some(failed) = state.failed.get(slot_id) {
+            if current_expiry.as_deref() != Some(failed.access_expires_at.as_str()) {
+                state.failed.remove(slot_id);
+                let _ = write_state(support_dir, &state);
+            }
         }
-    }
-    let failed_for = state
-        .failed
-        .get(slot_id)
-        .map(|failed| failed.access_expires_at.clone());
+        state.failed.get(slot_id).cloned()
+    };
     let network_enabled = !crate::agent_status::claude_oauth_usage_network_disabled();
     // Check and reserve the slot in one critical section, so two overlapping
     // collection passes can never both start a refresher for it.
@@ -246,7 +272,7 @@ fn maybe_refresh_with(
             live,
             enabled && network_enabled,
             reserved.contains_key(slot_id),
-            failed_for.as_deref(),
+            failed.as_ref(),
             now,
         );
         if decision != RefreshDecision::Started || current_expiry.is_none() {
@@ -255,6 +281,10 @@ fn maybe_refresh_with(
             } else {
                 decision
             };
+        }
+        if let Some(reason) = skip_reason() {
+            eprintln!("claude_refresher result=skipped reason={reason} target={slot_id}");
+            return RefreshDecision::NotNeeded;
         }
         reserved.insert(slot_id.to_string(), ());
     }
@@ -279,7 +309,7 @@ fn maybe_refresh_with(
             return RefreshDecision::NotNeeded;
         }
     };
-    keep_awake_while(&child);
+    let mut keep_awake = keep_awake_while(&child);
     eprintln!("claude_refresher result=started target={slot_id}");
     let caller_slot_id = slot_id;
     let slot_id = slot_id.to_string();
@@ -307,8 +337,15 @@ fn maybe_refresh_with(
                 }
             }
             drop(cwd);
+            // `caffeinate -w` exits with the refresher; reap it.
+            if let Some(caffeinate) = keep_awake.as_mut() {
+                let _ = caffeinate.wait();
+            }
             let after = crate::agent_status::read_claude_live_login_for_slot(&slot);
             let outcome = judge_refresh(&before_expires_at, &after, OffsetDateTime::now_utc());
+            let intact = after.metadata.as_ref().is_some_and(|metadata| {
+                metadata.has_refresh_token && !metadata.cleared_by_cli
+            });
             let mdat_changed = credential_modified_marker(&slot) != before_mdat;
             eprintln!(
                 "claude_refresher result={} target={slot_id} keychain_modified={mdat_changed} seconds={}",
@@ -316,7 +353,7 @@ fn maybe_refresh_with(
                 started.elapsed().as_secs()
             );
             if outcome != RefreshOutcome::Refreshed {
-                record_failure(&support_dir, &slot_id, &before_expires_at, outcome);
+                record_failure(&support_dir, &slot_id, &before_expires_at, outcome, intact);
             }
             running()
                 .lock()
@@ -360,6 +397,22 @@ pub(crate) fn wait_until_idle(slot_id: &str) {
     }
 }
 
+/// Move a recorded failure `by` into the past (tests only).
+#[cfg(test)]
+pub(crate) fn backdate_failure_for_test(slot_id: &str, by: Duration) {
+    let support_dir = default_support_dir();
+    let _guard = state_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = load_state(&support_dir);
+    if let Some(failed) = state.failed.get_mut(slot_id) {
+        let at = OffsetDateTime::parse(&failed.failed_at, &Rfc3339).expect("failed_at")
+            - TimeDuration::try_from(by).expect("duration");
+        failed.failed_at = at.format(&Rfc3339).expect("format");
+        write_state(&support_dir, &state).expect("state");
+    }
+}
+
 /// Forget a removed slot's refresh history.
 pub(crate) fn prune_slot(slot_id: &str) {
     let support_dir = default_support_dir();
@@ -369,11 +422,24 @@ pub(crate) fn prune_slot(slot_id: &str) {
     }
 }
 
-fn record_failure(support_dir: &Path, slot_id: &str, expires_at: &str, outcome: RefreshOutcome) {
+/// Record a failed refresh. The first failure of a credential that left it
+/// intact allows one retry; a second failure, or a sign-out, does not.
+fn record_failure(
+    support_dir: &Path,
+    slot_id: &str,
+    expires_at: &str,
+    outcome: RefreshOutcome,
+    intact: bool,
+) {
     let _guard = state_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut state = load_state(support_dir);
+    let first_failure = state
+        .failed
+        .get(slot_id)
+        .map_or(true, |failed| failed.access_expires_at != expires_at);
+    let retry_allowed = first_failure && intact && outcome == RefreshOutcome::ExpiryUnchanged;
     state.failed.insert(
         slot_id.to_string(),
         FailedRefresh {
@@ -382,6 +448,7 @@ fn record_failure(support_dir: &Path, slot_id: &str, expires_at: &str, outcome: 
                 .format(&Rfc3339)
                 .unwrap_or_default(),
             outcome: outcome_code(outcome).to_string(),
+            retry_allowed,
         },
     );
     let _ = write_state(support_dir, &state);
@@ -406,20 +473,22 @@ fn write_state(support_dir: &Path, state: &RefreshState) -> std::io::Result<()> 
 }
 
 /// Keep the Mac awake while the refresher runs (`caffeinate -i -w <pid>` exits
-/// on its own when the refresher does). Best effort.
-fn keep_awake_while(child: &Child) {
+/// on its own when the refresher does; the waiter reaps it). Best effort.
+fn keep_awake_while(child: &Child) -> Option<Child> {
     if cfg!(test) {
-        return;
+        return None;
     }
     let caffeinate = Path::new("/usr/bin/caffeinate");
-    if caffeinate.is_file() {
-        let _ = std::process::Command::new(caffeinate)
-            .args(["-i", "-w", &child.id().to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+    if !caffeinate.is_file() {
+        return None;
     }
+    std::process::Command::new(caffeinate)
+        .args(["-i", "-w", &child.id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
 }
 
 /// The stored credential's modification marker, for the log only: the
@@ -451,6 +520,7 @@ mod tests {
                 refresh_token_expires_at: Some(rfc(expires_at + TimeDuration::days(20))),
                 has_refresh_token: true,
                 cleared_by_cli: false,
+                has_profile_scope: false,
             }),
         }
     }
@@ -487,13 +557,51 @@ mod tests {
             decide_refresh(&due, false, false, None, at(0)),
             RefreshDecision::Disabled
         );
+        let failed = |expiry: OffsetDateTime, failed_at: OffsetDateTime, retry_allowed: bool| {
+            FailedRefresh {
+                access_expires_at: rfc(expiry),
+                failed_at: rfc(failed_at),
+                outcome: "expiry_unchanged".to_string(),
+                retry_allowed,
+            }
+        };
         assert_eq!(
-            decide_refresh(&due, true, false, Some(&rfc(at(-60))), at(0)),
+            decide_refresh(
+                &due,
+                true,
+                false,
+                Some(&failed(at(-60), at(-30), false)),
+                at(0)
+            ),
             RefreshDecision::FailedWaitingForSignIn
+        );
+        // One retry after an intact failure: not before 5 minutes, then once.
+        let intact = failed(at(-60), at(-30), true);
+        assert_eq!(
+            decide_refresh(&due, true, false, Some(&intact), at(0)),
+            RefreshDecision::RetryWaiting
+        );
+        assert_eq!(
+            decide_refresh(&due, true, false, Some(&intact), at(5 * 60 - 31)),
+            RefreshDecision::RetryWaiting
+        );
+        assert_eq!(
+            decide_refresh(&due, true, false, Some(&intact), at(5 * 60 - 30)),
+            RefreshDecision::Started
+        );
+        assert_eq!(
+            decide_refresh(&due, true, true, Some(&intact), at(5 * 60)),
+            RefreshDecision::Running
         );
         // A different (new) credential is not held back by an old failure.
         assert_eq!(
-            decide_refresh(&due, true, false, Some(&rfc(at(-7_200))), at(0)),
+            decide_refresh(
+                &due,
+                true,
+                false,
+                Some(&failed(at(-7_200), at(-30), false)),
+                at(0)
+            ),
             RefreshDecision::Started
         );
         for state in [
@@ -550,7 +658,15 @@ mod tests {
                 let slot = slot.clone();
                 let support = support.clone();
                 std::thread::spawn(move || {
-                    maybe_refresh_with("race-slot", &slot, &due, true, &support, launcher.as_ref())
+                    maybe_refresh_with(
+                        "race-slot",
+                        &slot,
+                        &due,
+                        true,
+                        &support,
+                        launcher.as_ref(),
+                        &|| None,
+                    )
                 })
             })
             .collect::<Vec<_>>()
@@ -574,6 +690,88 @@ mod tests {
             Some(value) => std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", value),
             None => std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH"),
         }
+        let _ = std::fs::remove_dir_all(support);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn only_a_first_intact_failure_gets_one_retry() {
+        let support = std::env::temp_dir().join(format!(
+            "ottto-claude-refresher-retry-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let expiry = rfc(at(0));
+        let retry = |slot_id: &str| load_state(&support).failed[slot_id].retry_allowed;
+        record_failure(
+            &support,
+            "a",
+            &expiry,
+            RefreshOutcome::ExpiryUnchanged,
+            true,
+        );
+        assert!(retry("a"), "first failure, login intact");
+        record_failure(
+            &support,
+            "a",
+            &expiry,
+            RefreshOutcome::ExpiryUnchanged,
+            true,
+        );
+        assert!(!retry("a"), "the retry failed too");
+        record_failure(&support, "b", &expiry, RefreshOutcome::SignedOut, false);
+        assert!(!retry("b"), "signed out");
+        record_failure(
+            &support,
+            "c",
+            &expiry,
+            RefreshOutcome::ExpiryUnchanged,
+            false,
+        );
+        assert!(!retry("c"), "refresh token gone or blanked");
+        let _ = std::fs::remove_dir_all(support);
+    }
+
+    /// A login whose `/usage` would not refresh (no `user:profile`,
+    /// usage-billed, another credential first) never gets a refresher.
+    #[test]
+    #[serial_test::serial]
+    fn an_ineligible_login_never_starts_a_refresher() {
+        struct CountingLauncher(std::sync::atomic::AtomicUsize);
+        impl RefreshLauncher for CountingLauncher {
+            fn launch(&self, _slot: &ClaudeConfigDirSlot, _cwd: &Path) -> std::io::Result<Child> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::process::Command::new("/usr/bin/true").spawn()
+            }
+        }
+        let support = std::env::temp_dir().join(format!(
+            "ottto-claude-refresher-skip-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let launcher = CountingLauncher(std::sync::atomic::AtomicUsize::new(0));
+        let due = live(
+            ClaudeLocalLoginState::RefreshPending,
+            OffsetDateTime::now_utc() - TimeDuration::minutes(1),
+        );
+        let slot = ClaudeConfigDirSlot::registered("/tmp/ottto-refresher-skip-slot".to_string())
+            .expect("slot");
+        for reason in [
+            "no_profile_scope",
+            "usage_billing",
+            "other_auth",
+            "usage_cached",
+        ] {
+            assert_eq!(
+                maybe_refresh_with("skip-slot", &slot, &due, true, &support, &launcher, &|| {
+                    Some(reason)
+                }),
+                RefreshDecision::NotNeeded,
+                "{reason}"
+            );
+        }
+        assert_eq!(launcher.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!running().lock().unwrap().contains_key("skip-slot"));
         let _ = std::fs::remove_dir_all(support);
     }
 
@@ -695,7 +893,15 @@ mod tests {
         .expect("credential");
         let due = crate::agent_status::read_claude_live_login_for_slot(&slot);
         assert_eq!(
-            maybe_refresh_with("slot-a", &slot, &due, true, &support, &ProductionLauncher),
+            maybe_refresh_with(
+                "slot-a",
+                &slot,
+                &due,
+                true,
+                &support,
+                &ProductionLauncher,
+                &|| None
+            ),
             RefreshDecision::Started
         );
         wait("slot-a");
@@ -718,21 +924,69 @@ mod tests {
         std::fs::write(slot_dir.join(".credentials.json"), credential(expired)).expect("cred");
         let due = crate::agent_status::read_claude_live_login_for_slot(&slot);
         assert_eq!(
-            maybe_refresh_with("slot-a", &slot, &due, true, &support, &ProductionLauncher),
+            maybe_refresh_with(
+                "slot-a",
+                &slot,
+                &due,
+                true,
+                &support,
+                &ProductionLauncher,
+                &|| None
+            ),
             RefreshDecision::Started
         );
         wait("slot-a");
-        assert_eq!(
-            load_state(&support).failed["slot-a"].outcome,
-            "expiry_unchanged"
-        );
+        let first = load_state(&support).failed["slot-a"].clone();
+        assert_eq!(first.outcome, "expiry_unchanged");
+        assert!(first.retry_allowed, "the login is intact: one retry");
         let again = crate::agent_status::read_claude_live_login_for_slot(&slot);
         assert_eq!(
-            maybe_refresh_with("slot-a", &slot, &again, true, &support, &ProductionLauncher),
-            RefreshDecision::FailedWaitingForSignIn,
-            "no retry for the same credential"
+            maybe_refresh_with(
+                "slot-a",
+                &slot,
+                &again,
+                true,
+                &support,
+                &ProductionLauncher,
+                &|| None
+            ),
+            RefreshDecision::RetryWaiting,
+            "the retry waits for a later pass"
         );
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+        // Five minutes later the one retry runs; it fails too.
+        let mut state = load_state(&support);
+        state.failed.get_mut("slot-a").unwrap().failed_at =
+            rfc(OffsetDateTime::now_utc() - TimeDuration::minutes(6));
+        write_state(&support, &state).expect("state");
+        assert_eq!(
+            maybe_refresh_with(
+                "slot-a",
+                &slot,
+                &again,
+                true,
+                &support,
+                &ProductionLauncher,
+                &|| None
+            ),
+            RefreshDecision::Started
+        );
+        wait("slot-a");
+        assert!(!load_state(&support).failed["slot-a"].retry_allowed);
+        assert_eq!(
+            maybe_refresh_with(
+                "slot-a",
+                &slot,
+                &again,
+                true,
+                &support,
+                &ProductionLauncher,
+                &|| None
+            ),
+            RefreshDecision::FailedWaitingForSignIn,
+            "no loop: sign in again after the one retry"
+        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3);
 
         // A new credential (the user signed in again) clears the failure.
         std::fs::write(
@@ -748,7 +1002,8 @@ mod tests {
                 &signed_in,
                 true,
                 &support,
-                &ProductionLauncher
+                &ProductionLauncher,
+                &|| None
             ),
             RefreshDecision::NotNeeded
         );

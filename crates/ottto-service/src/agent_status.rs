@@ -334,6 +334,10 @@ struct ClaudeOAuthCredential {
     /// Claude Code itself reports `loggedIn` only for an inference-scoped
     /// token, so this is the same local evidence `claude auth status` used.
     has_inference_scope: Option<bool>,
+    /// The stored `scopes` list carries `user:profile`. Claude Code's
+    /// `/usage` reads plan usage (and so refreshes the login first) only for
+    /// such a login.
+    has_profile_scope: bool,
     /// The plan Claude Code stored with the login (`subscriptionType`), the
     /// same field `claude auth status` printed. Display metadata, not a secret.
     subscription_type: Option<String>,
@@ -370,6 +374,7 @@ impl ClaudeCredentialRead {
                 access_expires_at: credential.access_expires_at.clone(),
                 refresh_token_expires_at: credential.relogin_required_at.clone(),
                 has_refresh_token: credential.has_refresh_token,
+                has_profile_scope: credential.has_profile_scope,
             }),
             Self::Absent | Self::Unreadable => None,
         }
@@ -472,6 +477,8 @@ pub(crate) struct ClaudeOAuthCredentialMetadata {
     /// shape when the token endpoint rejects a refresh with `invalid_grant`.
     /// Only an official login or reconnect can restore it.
     pub(crate) cleared_by_cli: bool,
+    /// The stored scopes include `user:profile` (no secret).
+    pub(crate) has_profile_scope: bool,
 }
 
 struct ClaudeSnapshotCandidate {
@@ -2998,7 +3005,7 @@ impl ClaudeAlternativeAuth {
     }
 }
 
-/// Whether the default login authenticates without OAuth, following Claude
+/// Whether a Claude login authenticates without OAuth, following Claude
 /// Code 2.1.288's own rules (read statically from its source):
 ///
 /// - Settings layers are applied low to high (`user`, `project`, `local`,
@@ -3015,7 +3022,7 @@ impl ClaudeAlternativeAuth {
 ///
 /// Only presence (and, for the API key, the approval suffix compared in
 /// memory) is read; no value is kept.
-fn claude_default_alternative_auth(
+fn claude_alternative_auth(
     paths: &[(String, PathBuf)],
     ambient: &dyn Fn(&str) -> Option<String>,
     oauth_usable: bool,
@@ -3094,11 +3101,12 @@ fn claude_default_alternative_auth(
         .then_some(ClaudeAlternativeAuth::ApiKey)
 }
 
-/// Whether a Console API key saved by `/login` is present for the default
-/// login: the `Claude Code` keychain item (presence only, read without `-w`)
-/// or `.claude.json` `primaryApiKey`. No key value is kept.
-fn claude_default_stored_console_key_present() -> bool {
-    let in_config = fs::read_to_string(claude_cli_config_path())
+/// Whether a Console API key saved by `/login` is present for this login:
+/// its `Claude Code` keychain item (`Claude Code-<hash>` for a registered
+/// config dir, the same suffix as the OAuth item; presence only, read
+/// without `-w`) or `.claude.json` `primaryApiKey`. No key value is kept.
+fn claude_stored_console_key_present(slot: &ClaudeConfigDirSlot) -> bool {
+    let in_config = fs::read_to_string(slot.identity_path(&home_dir()))
         .ok()
         .and_then(|body| serde_json::from_str::<Value>(&body).ok())
         .and_then(|value| {
@@ -3119,7 +3127,15 @@ fn claude_default_stored_console_key_present() -> bool {
     };
     run_command_capture(
         "security",
-        &["find-generic-password", "-a", &account, "-s", "Claude Code"],
+        &[
+            "find-generic-password",
+            "-a",
+            &account,
+            "-s",
+            &slot
+                .service_name()
+                .replacen("Claude Code-credentials", "Claude Code", 1),
+        ],
         COMMAND_TIMEOUT,
     )
     .success
@@ -3148,13 +3164,105 @@ fn claude_approved_api_key_suffixes(path: &Path) -> Vec<String> {
 }
 
 fn claude_default_alternative_auth_now(oauth_usable: bool) -> Option<ClaudeAlternativeAuth> {
-    claude_default_alternative_auth(
-        &claude_settings_paths(),
+    claude_alternative_auth_for_slot(
+        &ClaudeConfigDirSlot::Default,
         &|key| std::env::var(key).ok(),
         oauth_usable,
-        &claude_approved_api_key_suffixes(&claude_cli_config_path()),
-        !oauth_usable && claude_default_stored_console_key_present(),
     )
+}
+
+/// [`claude_alternative_auth`] for one login, read from that login's own
+/// settings, `.claude.json` approvals and stored Console key. `ambient` is the
+/// environment the Claude Code process for this login runs with.
+fn claude_alternative_auth_for_slot(
+    slot: &ClaudeConfigDirSlot,
+    ambient: &dyn Fn(&str) -> Option<String>,
+    oauth_usable: bool,
+) -> Option<ClaudeAlternativeAuth> {
+    claude_alternative_auth(
+        &claude_settings_paths_for_slot(slot),
+        ambient,
+        oauth_usable,
+        &claude_approved_api_key_suffixes(&slot.identity_path(&home_dir())),
+        !oauth_usable && claude_stored_console_key_present(slot),
+    )
+}
+
+/// Claude Code's settings files for one login, lowest precedence first.
+fn claude_settings_paths_for_slot(slot: &ClaudeConfigDirSlot) -> Vec<(String, PathBuf)> {
+    match slot.config_dir() {
+        None => claude_settings_paths(),
+        Some(config_dir) => vec![
+            (
+                "claude_code.settings".to_string(),
+                PathBuf::from(config_dir).join("settings.json"),
+            ),
+            (
+                "claude_code.settings_local".to_string(),
+                PathBuf::from(config_dir).join("settings.local.json"),
+            ),
+            (
+                "claude_code.managed_settings".to_string(),
+                PathBuf::from(CLAUDE_MANAGED_SETTINGS_PATH),
+            ),
+        ],
+    }
+}
+
+/// A plan-usage snapshot younger than this is reused by `/usage`, which then
+/// refreshes nothing.
+const CLAUDE_USAGE_CACHE_REUSE_MS: i64 = 60_000;
+
+/// Why the background refresher must not run `claude -p /usage` for this
+/// login now. Claude Code 2.1.288's `/usage` returns without awaiting a token
+/// refresh when:
+///
+/// - the stored scopes lack `user:profile`;
+/// - `.claude.json` `oauthAccount.billingType` is `usage_based`;
+/// - another credential takes precedence over the OAuth login (Bedrock,
+///   Vertex, an auth token, `apiKeyHelper`, or an approved API key). Judged by
+///   the same helper the status uses, with the refresher's own environment
+///   (it starts Claude Code with a cleared environment, so only the login's
+///   settings files count);
+/// - its plan-usage snapshot is under 60 seconds old (a later pass runs).
+pub(crate) fn claude_refresher_skip_reason(
+    slot: &ClaudeConfigDirSlot,
+    live: &ClaudeLiveLogin,
+    now: OffsetDateTime,
+) -> Option<&'static str> {
+    if !live
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.has_profile_scope)
+    {
+        return Some("no_profile_scope");
+    }
+    let config = fs::read_to_string(slot.identity_path(&home_dir()))
+        .ok()
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok());
+    let config = config.as_ref();
+    if config.and_then(|value| value.get("oauthAccount")?.get("billingType")?.as_str())
+        == Some("usage_based")
+    {
+        return Some("usage_billing");
+    }
+    if claude_alternative_auth_for_slot(slot, &|_| None, true).is_some() {
+        return Some("other_auth");
+    }
+    let fetched_at_ms = config.and_then(|value| {
+        let fetched = value.get("cachedUsageUtilization")?.get("fetchedAtMs")?;
+        fetched
+            .as_i64()
+            .or_else(|| fetched.as_f64().map(|ms| ms as i64))
+    });
+    let now_ms = i64::try_from(now.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX);
+    if fetched_at_ms.is_some_and(|fetched| {
+        let age = now_ms - fetched;
+        (0..CLAUDE_USAGE_CACHE_REUSE_MS).contains(&age)
+    }) {
+        return Some("usage_cached");
+    }
+    None
 }
 
 /// `slot_owned_bindings` names exact account+organization bindings that a
@@ -10725,6 +10833,15 @@ fn parse_claude_oauth_credential_value(oauth: &Value) -> Option<ClaudeOAuthCrede
             .filter_map(Value::as_str)
             .any(|scope| scope.trim() == CLAUDE_INFERENCE_SCOPE)
     });
+    let has_profile_scope = oauth
+        .get("scopes")
+        .and_then(Value::as_array)
+        .is_some_and(|scopes| {
+            scopes
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|scope| scope.trim() == CLAUDE_PROFILE_SCOPE)
+        });
     let subscription_type = oauth
         .get("subscriptionType")
         .and_then(Value::as_str)
@@ -10737,12 +10854,15 @@ fn parse_claude_oauth_credential_value(oauth: &Value) -> Option<ClaudeOAuthCrede
         access_expires_at: timestamp("expiresAt"),
         relogin_required_at: timestamp("refreshTokenExpiresAt"),
         has_inference_scope,
+        has_profile_scope,
         subscription_type,
     })
 }
 
 /// The OAuth scope Claude Code requires before it reports a login as signed in.
 const CLAUDE_INFERENCE_SCOPE: &str = "user:inference";
+/// The OAuth scope Claude Code's `/usage` needs before it reads plan usage.
+const CLAUDE_PROFILE_SCOPE: &str = "user:profile";
 
 fn rfc3339_from_epoch_millis(epoch_millis: i64) -> Option<String> {
     let seconds = epoch_millis.div_euclid(1_000);
@@ -10843,6 +10963,7 @@ fn stable_claude_slot_credential(
             access_expires_at: None,
             relogin_required_at: None,
             has_inference_scope: None,
+            has_profile_scope: false,
             subscription_type: None,
         }),
     })
@@ -28342,6 +28463,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
                 access_expires_at: None,
                 relogin_required_at: None,
                 has_inference_scope: None,
+                has_profile_scope: false,
                 subscription_type: None,
             },
         };
@@ -30864,8 +30986,10 @@ exit 44
     /// "Keep my Claude accounts signed in" on: an expiring slot gets exactly
     /// one background refresher (`-p /usage --no-session-persistence
     /// --strict-mcp-config`, in the slot's own config dir) and shows a refresh
-    /// in progress. This fake refresher does not advance the expiry, so the
-    /// next pass asks to sign in again and no second refresher starts.
+    /// in progress. This fake refresher does not advance the expiry but
+    /// leaves the login intact, so one retry follows on a pass at least five
+    /// minutes later; after it fails too the slot asks to sign in again and
+    /// no third refresher starts.
     #[test]
     #[serial]
     fn expiring_slot_gets_one_background_refresher_then_sign_in_again_on_failure() {
@@ -30909,6 +31033,41 @@ exit 44
             "exactly one refresher, for the expiring slot only"
         );
 
+        // First failure, login intact: the retry waits for a later pass.
+        fixture.collect();
+        assert_eq!(
+            fixture
+                .slot_collection(0)
+                .upkeep
+                .as_ref()
+                .map(|upkeep| upkeep.result),
+            Some(ClaudeConfigSlotUpkeepResultV1::InProgress)
+        );
+        assert_eq!(
+            fixture
+                .spawns()
+                .into_iter()
+                .filter(|line| line != "|--version")
+                .count(),
+            1,
+            "the retry is not immediate"
+        );
+        crate::claude_refresher::backdate_failure_for_test(
+            &fixture.slot_ids[0],
+            crate::claude_refresher::RETRY_AFTER,
+        );
+        fixture.collect();
+        crate::claude_refresher::wait_until_idle(&fixture.slot_ids[0]);
+        assert_eq!(
+            fixture
+                .spawns()
+                .into_iter()
+                .filter(|line| line != "|--version")
+                .count(),
+            2,
+            "exactly one retry"
+        );
+
         fixture.collect();
         let after = fixture.slot_collection(0);
         assert_eq!(after.state, ClaudeConfigSlotCollectionStateV1::NeedsLogin);
@@ -30923,8 +31082,8 @@ exit 44
                 .into_iter()
                 .filter(|line| line != "|--version")
                 .count(),
-            1,
-            "no retry until a new credential appears"
+            2,
+            "no further retry until a new credential appears"
         );
         // The user signs in again: a new credential clears it.
         fixture.item(&fixture.slot(0), TimeDuration::hours(8));
@@ -31283,8 +31442,7 @@ exit 44
         fs::write(&env_key, r#"{"env":{"ANTHROPIC_API_KEY":"x"}}"#).expect("env");
         let paths = |path: &Path| vec![("settings".to_string(), path.to_path_buf())];
         let none = |_: &str| None;
-        let detect =
-            |path: &Path| claude_default_alternative_auth(&paths(path), &none, true, &[], false);
+        let detect = |path: &Path| claude_alternative_auth(&paths(path), &none, true, &[], false);
         assert_eq!(detect(&plain), None);
         assert_eq!(detect(&helper), Some(ClaudeAlternativeAuth::ApiKey));
         assert_eq!(detect(&root.join("missing.json")), None);
@@ -31304,7 +31462,7 @@ exit 44
             ("managed".to_string(), managed_off.clone()),
         ];
         assert_eq!(
-            claude_default_alternative_auth(&layered, &none, false, &[], false),
+            claude_alternative_auth(&layered, &none, false, &[], false),
             None
         );
         let reversed = vec![
@@ -31312,20 +31470,14 @@ exit 44
             ("managed".to_string(), bedrock.clone()),
         ];
         assert_eq!(
-            claude_default_alternative_auth(&reversed, &none, false, &[], false),
+            claude_alternative_auth(&reversed, &none, false, &[], false),
             Some(ClaudeAlternativeAuth::Bedrock)
         );
         // Settings env outranks the ambient environment.
         let ambient_bedrock =
             |key: &str| (key == "CLAUDE_CODE_USE_BEDROCK").then(|| "1".to_string());
         assert_eq!(
-            claude_default_alternative_auth(
-                &paths(&managed_off),
-                &ambient_bedrock,
-                false,
-                &[],
-                false
-            ),
+            claude_alternative_auth(&paths(&managed_off), &ambient_bedrock, false, &[], false),
             None
         );
 
@@ -31335,32 +31487,117 @@ exit 44
         let suffix = key[key.len() - 20..].to_string();
         let ambient_key = |name: &str| (name == "ANTHROPIC_API_KEY").then(|| key.to_string());
         assert_eq!(
-            claude_default_alternative_auth(&paths(&plain), &ambient_key, true, &[], false),
+            claude_alternative_auth(&paths(&plain), &ambient_key, true, &[], false),
             None,
             "a declined or unapproved key leaves the subscription login in charge"
         );
         assert_eq!(
-            claude_default_alternative_auth(&paths(&plain), &ambient_key, true, &[suffix], false),
+            claude_alternative_auth(&paths(&plain), &ambient_key, true, &[suffix], false),
             Some(ClaudeAlternativeAuth::ApiKey)
         );
         assert_eq!(
-            claude_default_alternative_auth(&paths(&plain), &ambient_key, false, &[], false),
+            claude_alternative_auth(&paths(&plain), &ambient_key, false, &[], false),
             Some(ClaudeAlternativeAuth::ApiKey)
         );
         // A Console API key saved by `/login` counts only without OAuth.
         assert_eq!(
-            claude_default_alternative_auth(&paths(&plain), &none, false, &[], true),
+            claude_alternative_auth(&paths(&plain), &none, false, &[], true),
             Some(ClaudeAlternativeAuth::ApiKey)
         );
         assert_eq!(
-            claude_default_alternative_auth(&paths(&plain), &none, true, &[], true),
+            claude_alternative_auth(&paths(&plain), &none, true, &[], true),
             None
         );
         assert_eq!(
-            claude_default_alternative_auth(&paths(&env_key), &none, true, &[], false),
+            claude_alternative_auth(&paths(&env_key), &none, true, &[], false),
             None,
             "settings env ANTHROPIC_API_KEY follows the same approval rule"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// The refresher runs only where Claude Code's `/usage` refreshes: a
+    /// `user:profile` login, not usage-billed, no other credential first,
+    /// no plan-usage snapshot under 60 seconds old. Fixture files only.
+    #[test]
+    fn refresher_runs_only_for_logins_whose_usage_refreshes() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-claude-refresher-eligibility-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("dir");
+        let slot =
+            ClaudeConfigDirSlot::registered(dir.to_string_lossy().to_string()).expect("slot");
+        let now = OffsetDateTime::now_utc();
+        let now_ms = i64::try_from(now.unix_timestamp_nanos() / 1_000_000).expect("ms");
+        let login = |has_profile_scope: bool| ClaudeLiveLogin {
+            state: ClaudeLocalLoginState::RefreshPending,
+            metadata: Some(ClaudeOAuthCredentialMetadata {
+                access_expires_at: Some(
+                    (now - time::Duration::minutes(1))
+                        .format(&Rfc3339)
+                        .expect("format"),
+                ),
+                refresh_token_expires_at: None,
+                has_refresh_token: true,
+                cleared_by_cli: false,
+                has_profile_scope,
+            }),
+        };
+        let skip = |has_profile_scope: bool| {
+            claude_refresher_skip_reason(&slot, &login(has_profile_scope), now)
+        };
+        let write = |name: &str, body: Value| {
+            fs::write(dir.join(name), body.to_string()).expect("write");
+        };
+        assert_eq!(skip(false), Some("no_profile_scope"));
+        assert_eq!(skip(true), None);
+        write(
+            ".claude.json",
+            serde_json::json!({"oauthAccount": {"billingType": "usage_based"}}),
+        );
+        assert_eq!(skip(true), Some("usage_billing"));
+        write(
+            ".claude.json",
+            serde_json::json!({
+                "oauthAccount": {"billingType": "stripe_subscription"},
+                "cachedUsageUtilization": {"fetchedAtMs": now_ms - 10_000}
+            }),
+        );
+        assert_eq!(skip(true), Some("usage_cached"));
+        write(
+            ".claude.json",
+            serde_json::json!({"cachedUsageUtilization": {"fetchedAtMs": now_ms - 120_000}}),
+        );
+        assert_eq!(skip(true), None);
+        write(
+            "settings.json",
+            serde_json::json!({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}),
+        );
+        assert_eq!(skip(true), Some("other_auth"));
+        write(
+            "settings.json",
+            serde_json::json!({"apiKeyHelper": "/bin/echo"}),
+        );
+        assert_eq!(skip(true), Some("other_auth"));
+        let key = "sk-ant-fixture-key-0123456789abcdefghij";
+        write(
+            "settings.json",
+            serde_json::json!({"env": {"ANTHROPIC_API_KEY": key}}),
+        );
+        assert_eq!(skip(true), None, "a key the user did not approve");
+        write(
+            ".claude.json",
+            serde_json::json!({
+                "customApiKeyResponses": {"approved": [&key[key.len() - 20..]]}
+            }),
+        );
+        assert_eq!(
+            skip(true),
+            Some("other_auth"),
+            "an approved key comes first"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }

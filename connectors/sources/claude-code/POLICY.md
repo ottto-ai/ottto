@@ -20,8 +20,8 @@ Review tier: `official`
 
 - The daemon never runs `claude auth status` or `claude doctor`. A short Claude Code command that starts near or after access expiry can begin a token refresh and exit before the rotated token is saved, which signs the login out (anthropics/claude-code#95822).
 - Login state comes from `.claude.json`, then the stored credential (the `Claude Code-credentials[-<hash>]` Keychain item read with `security find-generic-password -w`, or `<config>/.credentials.json`), then `.claude.json` again. The credential passes into daemon memory only: the access token is used solely for the documented subscription usage request and is never sent once it is locally expired; the refresh token is checked for presence and never used. Nothing from the item is stored, logged or uploaded. A failed or unavailable Keychain read fails closed.
-- With "Keep my Claude accounts signed in" on, the daemon runs one `claude -p /usage --no-session-persistence --strict-mcp-config` per login when its access token is within 5 minutes of expiry or expired, never kills it, and accepts the refresh only when `expiresAt` advances.
-- The `-p /context` read and the Verify smoke do not start from 15 minutes before a login's access expiry until it is refreshed.
+- With "Keep my Claude accounts signed in" on, the daemon runs one `claude -p /usage --no-session-persistence --strict-mcp-config` per login when its access token is within 5 minutes of expiry or expired, never kills it, and accepts the refresh only when `expiresAt` advances. It runs only for `user:profile` logins that are not usage-billed and have no other credential taking precedence. A first failure that leaves the login intact gets one retry at least 5 minutes later; then the login asks to sign in again.
+- The `-p /context` read, the Verify smoke and the MCP probe of a Claude Code server (`claude mcp serve`) do not start from 15 minutes before a login's access expiry until it is refreshed. A Claude Code MCP server is never stopped while its login's refresh lock is fresh.
 
 ## Undocumented Surfaces
 

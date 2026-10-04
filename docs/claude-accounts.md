@@ -342,15 +342,29 @@ off), Ottto keeps each registered slot and the default login signed in:
 - The refresher is never killed. After 120 seconds it is reported as still
   running and left to finish. Concurrency is left to Claude Code's own refresh
   lock.
-- Success is proved only by a new, later `expiresAt`. If the expiry did not
-  advance, or the login was blanked, that login is not refreshed again and
-  asks to sign in again until a new credential appears.
+- It runs only for logins whose `/usage` refreshes: the stored scopes include
+  `user:profile`, `.claude.json` `oauthAccount.billingType` is not
+  `usage_based`, and no other credential takes precedence (Bedrock, Vertex, an
+  auth token, `apiKeyHelper`, or an approved API key in that login's settings;
+  the same rules the status uses). A plan-usage snapshot under 60 seconds old
+  postpones it to a later pass.
+- Success is proved only by a new, later `expiresAt`. A first failure that
+  leaves the login intact (refresh token present, not blanked; typically a
+  refresh right after the Mac wakes, before the network is back) gets exactly
+  one retry on a pass at least 5 minutes later. If that fails too, or the login
+  was blanked, it is not refreshed again and asks to sign in again until a new
+  credential appears.
 
-The daemon's other short Claude runs (the `-p /context` footprint read and the
-Verify smoke) do not start from 15 minutes before a login's access expiry until
+The daemon's other short Claude runs (the `-p /context` footprint read, the
+Verify smoke, and the MCP inventory probe of a server that is Claude Code
+itself, such as `claude mcp serve`) do not start from 15 minutes before a login's access expiry until
 the refresh has advanced it, nor while it is expired or Claude Code holds its
 refresh lock. A skipped `/context` read retries in 30 minutes; a skipped Verify
-returns a warning asking to open Claude Code once (or wait), then Verify.
+returns a warning asking to open Claude Code once (or wait), then Verify. A
+deferred MCP probe keeps the last uploaded inventory (or, without a fresh one,
+reports that server unreachable). A Claude Code MCP server whose login Claude
+Code is refreshing is never stopped mid-refresh; it is stopped once the refresh
+lock goes quiet.
 
 `refreshTokenExpiresAt` (about 28 days after a browser sign-in) is an absolute
 login horizon. Three days and one day before it, the slot (and the default

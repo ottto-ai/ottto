@@ -6,8 +6,9 @@
 //! refresh token spent, and Claude Code then signs the login out
 //! (anthropics/claude-code#95822).
 //!
-//! The daemon's own short Claude runs (the `-p /context` footprint read and the
-//! Verify smoke) therefore never start from 15 minutes before the access
+//! The daemon's own short Claude runs (the `-p /context` footprint read, the
+//! Verify smoke, and an MCP inventory probe of a server that is Claude Code
+//! itself) therefore never start from 15 minutes before the access
 //! token's expiry until the background refresher (`claude_refresher`) has
 //! confirmed a new expiry, nor while the token is expired. `claude auth
 //! status` and `claude doctor` are not run at all.
@@ -108,9 +109,8 @@ pub(crate) fn evaluate_short_run(
 /// credentials file) and of Claude Code's refresh lock.
 pub(crate) fn check_short_claude_run(slot: &ClaudeConfigDirSlot) -> Result<(), ClaudeSpawnRefusal> {
     let credential = crate::agent_status::read_claude_spawn_gate_credential(slot);
-    let lock_modified = slot
-        .credentials_path(&crate::agent_status::home_dir())
-        .parent()
+    let lock_modified = refresh_lock_dir(slot)
+        .as_deref()
         .and_then(refresh_lock_modified);
     let decision = evaluate_short_run(credential, lock_modified, OffsetDateTime::now_utc());
     if let Err(refusal) = decision {
@@ -125,6 +125,25 @@ pub(crate) fn check_short_claude_run(slot: &ClaudeConfigDirSlot) -> Result<(), C
         );
     }
     decision
+}
+
+/// The directory holding this login's refresh lock (its config dir;
+/// `~/.claude` for the default login).
+pub(crate) fn refresh_lock_dir(slot: &ClaudeConfigDirSlot) -> Option<std::path::PathBuf> {
+    slot.credentials_path(&crate::agent_status::home_dir())
+        .parent()
+        .map(Path::to_path_buf)
+}
+
+/// A Claude Code process is refreshing this login right now: its refresh
+/// lock was touched within [`REFRESH_LOCK_FRESHNESS`] (a lock stamped in the
+/// future counts as fresh).
+pub(crate) fn refresh_in_progress(config_dir: &Path) -> bool {
+    refresh_lock_modified(config_dir).is_some_and(|modified| {
+        SystemTime::now()
+            .duration_since(modified)
+            .map_or(true, |age| age < REFRESH_LOCK_FRESHNESS)
+    })
 }
 
 /// Modification time of Claude Code's refresh lock. Read-only: the lock
