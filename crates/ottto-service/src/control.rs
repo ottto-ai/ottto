@@ -1,7 +1,7 @@
+#[cfg(test)]
+use crate::agent_configs::codex_toml;
 use crate::{
-    agent_configs::{
-        claude_env, codex_toml, detection::detect_agent_installation, fence::AgentConfigError,
-    },
+    agent_configs::{claude_env, detection::detect_agent_installation, fence::AgentConfigError},
     agent_status::{
         pi_identity_hints_for_route, read_pi_agent_auth, read_pi_smoke_routes,
         BillingIdentityHints, PiModelRoute,
@@ -72,7 +72,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use toml_edit::{DocumentMut, Item, Table};
+use toml_edit::{DocumentMut, Item};
 
 #[cfg(test)]
 use ottto_core::LocalMachineBinding;
@@ -3340,6 +3340,12 @@ fn telemetry_control_with_detector(
     detector: &dyn Fn(&SourceKind) -> AgentInstallationDetection,
 ) -> Result<ControlResult, LocalApiError> {
     let mut key_id = key_id;
+    if source == SourceKind::Codex && matches!(action, TelemetryControlAction::EnableTelemetry) {
+        return Err(LocalApiError::InvalidRequest(
+            "Ottto Codex live telemetry is disabled; local session import remains available"
+                .to_string(),
+        ));
+    }
     if !matches!(source, SourceKind::Codex | SourceKind::ClaudeCode) {
         return Err(LocalApiError::InvalidRequest(
             "telemetry control supports codex and claude_code only".to_string(),
@@ -3484,7 +3490,9 @@ fn telemetry_control_with_detector(
             })?;
     }
 
-    let requires_restart = matches!(action, TelemetryControlAction::EnableTelemetry);
+    let requires_restart = matches!(action, TelemetryControlAction::EnableTelemetry)
+        || (source == SourceKind::Codex
+            && matches!(action, TelemetryControlAction::DisableTelemetry));
     Ok(ControlResult {
         requires_restart,
         key_id,
@@ -3513,7 +3521,7 @@ fn apply_telemetry_config(
     }
     let relay_base_url = local_relay_base_url_for_daemon(daemon);
     match source {
-        SourceKind::Codex => patch_codex_config_with_relay_base(&relay_base_url),
+        SourceKind::Codex => reconcile_codex_source_off(),
         SourceKind::ClaudeCode => {
             let machine = daemon.status_for_trusted_client()?.machine;
             patch_claude_code_env_with_relay_base(&machine, &relay_base_url)
@@ -3529,7 +3537,7 @@ fn remove_telemetry_config(
     source: &SourceKind,
 ) -> Result<ConfigPatchResult, LocalApiError> {
     match source {
-        SourceKind::Codex => remove_codex_config(),
+        SourceKind::Codex => reconcile_codex_source_off(),
         SourceKind::ClaudeCode => {
             let _ = daemon.status_for_trusted_client()?;
             remove_claude_code_env()
@@ -3613,7 +3621,7 @@ fn repair_source(
                 )
             } else {
                 format!(
-                    "{} telemetry config already matched the active local relay.",
+                    "{} local source config already matched its collection policy.",
                     source_display_name(&source)
                 )
             }
@@ -3711,7 +3719,7 @@ fn repair_source_config(
 ) -> Result<ConfigPatchResult, LocalApiError> {
     let relay_base_url = local_relay_base_url_for_daemon(daemon);
     match source {
-        SourceKind::Codex => patch_codex_config_with_relay_base(&relay_base_url),
+        SourceKind::Codex => reconcile_codex_source_off(),
         SourceKind::ClaudeCode => {
             let machine = daemon.status_for_trusted_client()?.machine;
             patch_claude_code_settings_with_relay_base(&machine, &relay_base_url)
@@ -7660,6 +7668,10 @@ struct SetupRunSourceApiResponse {
     state: String,
     #[serde(default)]
     missing_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_import_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live_telemetry_required: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -7695,6 +7707,10 @@ struct SetupScanSource {
     /// configured on this machine instead of a canned template.
     #[serde(skip_serializing_if = "Option::is_none")]
     managed_config: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_import_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_telemetry_required: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -7740,12 +7756,19 @@ fn setup_result_from_detail(
         .iter()
         .filter(|source| source.detected)
         .map(|source| {
-            json!({
+            let mut summary = json!({
                 "source": source.source,
                 "state": source.state,
                 "readiness_percent": source.readiness_percent,
                 "missing_fields": source.missing_fields,
-            })
+            });
+            if let Some(ready) = source.local_import_ready {
+                summary["local_import_ready"] = json!(ready);
+            }
+            if let Some(required) = source.live_telemetry_required {
+                summary["live_telemetry_required"] = json!(required);
+            }
+            summary
         })
         .collect::<Vec<_>>();
 
@@ -8377,17 +8400,18 @@ fn setup_action_execution_error_result(
     error: &LocalApiError,
 ) -> (String, String, serde_json::Value) {
     let (error_code, error_message) = setup_action_execution_error_detail(error);
-    (
-        "failed".to_string(),
-        error_message.clone(),
-        json!({
-            "action_type": action.action_type.as_str(),
-            "source": action.source.as_deref().or_else(|| source.map(source_slug)),
-            "verified": false,
-            "error_code": error_code,
-            "error_message": error_message,
-        }),
-    )
+    let mut result = json!({
+        "action_type": action.action_type.as_str(),
+        "source": action.source.as_deref().or_else(|| source.map(source_slug)),
+        "verified": false,
+        "error_code": error_code,
+        "error_message": error_message,
+    });
+    if source == Some(&SourceKind::Codex) {
+        result["live_telemetry_required"] = json!(false);
+        result["local_import_ready"] = json!(false);
+    }
+    ("failed".to_string(), error_message, result)
 }
 
 fn setup_action_execution_error_detail(error: &LocalApiError) -> (&'static str, String) {
@@ -8750,7 +8774,12 @@ fn run_install_source_action(
         },
     )?;
 
-    if !source_requires_config_patch(&source_kind) {
+    let codex_cleanup = if source_kind == SourceKind::Codex {
+        Some(reconcile_codex_source_off()?)
+    } else {
+        None
+    };
+    if source_kind == SourceKind::Codex || !source_requires_config_patch(&source_kind) {
         record_install_session_event(
             api_base_url,
             &install_session.install_session_id,
@@ -8773,16 +8802,36 @@ fn run_install_source_action(
             "{} local session import prepared",
             source_display_name(&source_kind)
         );
-        return Ok((
-            "succeeded".to_string(),
-            message.clone(),
-            install_source_registration_result(
-                &install_session.install_session_id,
-                &device_id,
-                source,
-                &message,
-            ),
-        ));
+        let mut result = install_source_registration_result(
+            &install_session.install_session_id,
+            &device_id,
+            source,
+            &message,
+        );
+        if let Some(cleanup) = codex_cleanup {
+            result["live_telemetry_required"] = json!(false);
+            result["local_import_ready"] = json!(
+                snapshot_device_credentials_include_source("codex")
+                    && codex_config_state_at(
+                        &home_path(".codex/config.toml"),
+                        "~/.codex/config.toml",
+                        "",
+                        false
+                    )
+                    .drift
+                    .is_empty()
+                    && !source_patch_disabled(&source_kind)
+            );
+            result["managed_telemetry_disabled"] = json!(!source_patch_disabled(&source_kind));
+            result["config_updated"] = json!(cleanup.changed);
+            result["requires_restart"] = json!(cleanup.changed);
+            result["message"] = json!(if cleanup.changed {
+                "Codex local import prepared; restart existing Codex processes to stop managed telemetry"
+            } else {
+                &message
+            });
+        }
+        return Ok(("succeeded".to_string(), message, result));
     }
 
     if source_patch_disabled(&source_kind) {
@@ -8823,7 +8872,7 @@ fn run_install_source_action(
     let relay_base_url = local_relay_base_url_for_daemon(daemon);
     let relay_port = local_relay_port_for_daemon(daemon);
     let patch = match source_kind {
-        SourceKind::Codex => patch_codex_config_with_relay_base(&relay_base_url)?,
+        SourceKind::Codex => reconcile_codex_source_off()?,
         SourceKind::ClaudeCode => {
             patch_claude_code_settings_with_relay_base(machine, &relay_base_url)?
         }
@@ -9075,172 +9124,42 @@ fn empty_source_config(source: &SourceKind) -> SourceConfigState {
 fn codex_config_state_at(
     path: &Path,
     path_hint: &str,
-    relay_base_url: &str,
+    _relay_base_url: &str,
     patch_disabled: bool,
 ) -> SourceConfigState {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return SourceConfigState {
-                discovered: false,
-                path_hint: Some(path_hint.to_string()),
-                fingerprint: None,
-                drift: if patch_disabled {
-                    Vec::new()
-                } else {
-                    vec![config_drift("codex.config_file", "present", "missing")]
-                },
+    let bytes = fs::read(path);
+    let (discovered, fingerprint, drift) = match bytes {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (false, None, Vec::new()),
+        Err(_) => (
+            false,
+            None,
+            vec![config_drift("codex.config_file", "readable", "unreadable")],
+        ),
+        Ok(bytes) => {
+            let drift = match std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|body| codex_source_off_body(body).ok().map(|next| (body, next)))
+            {
+                Some((body, next)) if body == next => Vec::new(),
+                Some(_) => vec![config_drift(
+                    "codex.ottto_exporters",
+                    "disabled",
+                    "configured",
+                )],
+                None => vec![config_drift(
+                    "codex.config_toml",
+                    "valid_unambiguous",
+                    "needs_review",
+                )],
             };
-        }
-        Err(_) => {
-            return SourceConfigState {
-                discovered: false,
-                path_hint: Some(path_hint.to_string()),
-                fingerprint: None,
-                drift: if patch_disabled {
-                    Vec::new()
-                } else {
-                    vec![config_drift("codex.config_file", "readable", "unreadable")]
-                },
-            };
-        }
-    };
-    let fingerprint = Some(config_fingerprint(&bytes));
-    if patch_disabled {
-        return SourceConfigState {
-            discovered: true,
-            path_hint: Some(path_hint.to_string()),
-            fingerprint,
-            drift: Vec::new(),
-        };
-    }
-    let mut drift = Vec::new();
-    let body = match std::str::from_utf8(&bytes) {
-        Ok(body) => body,
-        Err(_) => {
-            drift.push(config_drift("codex.config_toml", "valid", "invalid_utf8"));
-            return SourceConfigState {
-                discovered: true,
-                path_hint: Some(path_hint.to_string()),
-                fingerprint,
-                drift,
-            };
+            (true, Some(config_fingerprint(&bytes)), drift)
         }
     };
-    let document = match body.parse::<DocumentMut>() {
-        Ok(document) => document,
-        Err(_) => {
-            drift.push(config_drift("codex.config_toml", "valid", "invalid"));
-            return SourceConfigState {
-                discovered: true,
-                path_hint: Some(path_hint.to_string()),
-                fingerprint,
-                drift,
-            };
-        }
-    };
-    let Some(otel) = document.get("otel").and_then(Item::as_table) else {
-        drift.push(config_drift("otel", "present", "missing"));
-        return SourceConfigState {
-            discovered: true,
-            path_hint: Some(path_hint.to_string()),
-            fingerprint,
-            drift,
-        };
-    };
-    let prompt_logging_disabled = otel
-        .get("log_user_prompt")
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_bool());
-    if prompt_logging_disabled != Some(false) {
-        drift.push(config_drift(
-            "otel.log_user_prompt",
-            "false",
-            prompt_logging_disabled
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "missing".to_string()),
-        ));
-    }
-    codex_exporter_config_drift(
-        &mut drift,
-        otel,
-        "otel.exporter.otlp-http",
-        "exporter",
-        "logs",
-        relay_base_url,
-    );
-    codex_exporter_config_drift(
-        &mut drift,
-        otel,
-        "otel.trace_exporter.otlp-http",
-        "trace_exporter",
-        "traces",
-        relay_base_url,
-    );
-    codex_exporter_config_drift(
-        &mut drift,
-        otel,
-        "otel.metrics_exporter.otlp-http",
-        "metrics_exporter",
-        "metrics",
-        relay_base_url,
-    );
     SourceConfigState {
-        discovered: true,
+        discovered,
         path_hint: Some(path_hint.to_string()),
         fingerprint,
-        drift,
-    }
-}
-
-fn codex_exporter_config_drift(
-    drift: &mut Vec<ConfigDrift>,
-    otel: &Table,
-    drift_prefix: &str,
-    exporter_key: &str,
-    signal: &str,
-    relay_base_url: &str,
-) {
-    let otlp_http = otel
-        .get(exporter_key)
-        .and_then(Item::as_table_like)
-        .and_then(|table| table.get("otlp-http"))
-        .and_then(Item::as_table_like);
-    let expected_endpoint = expected_relay_endpoint(relay_base_url, signal);
-    let observed_endpoint = otlp_http
-        .and_then(|table| table.get("endpoint"))
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_str());
-    if observed_endpoint != Some(expected_endpoint.as_str()) {
-        drift.push(config_drift(
-            format!("{drift_prefix}.endpoint"),
-            expected_endpoint,
-            observed_endpoint.unwrap_or("missing"),
-        ));
-    }
-    let observed_protocol = otlp_http
-        .and_then(|table| table.get("protocol"))
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_str());
-    if observed_protocol != Some("binary") {
-        drift.push(config_drift(
-            format!("{drift_prefix}.protocol"),
-            "binary",
-            observed_protocol.unwrap_or("missing"),
-        ));
-    }
-    let observed_header = otlp_http
-        .and_then(|table| table.get("headers"))
-        .and_then(Item::as_table_like)
-        .and_then(|headers| headers.get(crate::otlp_relay::LOCAL_RELAY_HEADER))
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_str());
-    if observed_header != Some(crate::otlp_relay::CODEX_RELAY_SOURCE) {
-        drift.push(config_drift(
-            format!("{drift_prefix}.headers.X-Ottto-Local-Relay"),
-            crate::otlp_relay::CODEX_RELAY_SOURCE,
-            observed_header.unwrap_or("missing"),
-        ));
+        drift: if patch_disabled { Vec::new() } else { drift },
     }
 }
 
@@ -9355,10 +9274,6 @@ fn claude_code_settings_config_state_at(
         fingerprint,
         drift,
     }
-}
-
-fn expected_relay_endpoint(relay_base_url: &str, signal: &str) -> String {
-    format!("{}/v1/{signal}", relay_base_url.trim_end_matches('/'))
 }
 
 fn config_fingerprint(bytes: &[u8]) -> String {
@@ -10082,15 +9997,192 @@ fn local_relay_port_for_daemon(daemon: &LocalDaemon) -> u16 {
         .unwrap_or(crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT)
 }
 
-fn patch_codex_config_with_relay_base(
-    relay_base_url: &str,
+/// Upgrade reconciliation is local and never reads credentials or contacts a provider.
+pub fn reconcile_codex_source_off_at_startup() -> Result<bool, LocalApiError> {
+    reconcile_codex_source_off().map(|result| result.changed)
+}
+
+fn reconcile_codex_source_off() -> Result<ConfigPatchResult, LocalApiError> {
+    if source_patch_disabled(&SourceKind::Codex) {
+        return Ok(ConfigPatchResult {
+            changed: false,
+            created: false,
+            backup_created: false,
+        });
+    }
+    reconcile_codex_source_off_at(&home_path(".codex/config.toml"), &default_support_dir())
+}
+
+static CODEX_CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static CODEX_CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn reconcile_codex_source_off_at(
+    path: &Path,
+    backup_root: &Path,
 ) -> Result<ConfigPatchResult, LocalApiError> {
-    let backup_root = default_support_dir();
-    patch_codex_config_at_with_relay_base(
-        &home_path(".codex/config.toml"),
-        &backup_root,
-        relay_base_url,
-    )
+    let _write_guard = CODEX_CONFIG_WRITE_LOCK
+        .lock()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let existing = match fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ConfigPatchResult {
+                changed: false,
+                created: false,
+                backup_created: false,
+            })
+        }
+        Err(_) => return Err(LocalApiError::StatePoisoned),
+    };
+    let next = codex_source_off_body(&existing)?;
+    if next == existing {
+        return Ok(ConfigPatchResult {
+            changed: false,
+            created: false,
+            backup_created: false,
+        });
+    }
+    let backup_created = backup_existing_config(SourceKind::Codex, path, backup_root)?.is_some();
+    if fs::read_to_string(path).map_err(|_| LocalApiError::StatePoisoned)? != existing {
+        return Err(LocalApiError::InvalidRequest(
+            "Codex config changed during telemetry cleanup; retry after the edit finishes"
+                .to_string(),
+        ));
+    }
+    write_codex_source_off_body(path, &existing, &next)?;
+    Ok(ConfigPatchResult {
+        changed: true,
+        created: false,
+        backup_created,
+    })
+}
+
+fn write_codex_source_off_body(
+    path: &Path,
+    expected: &str,
+    next: &str,
+) -> Result<(), LocalApiError> {
+    use std::io::Write;
+    let sequence = CODEX_CONFIG_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("tmp.codex-off.{}.{sequence}", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let result = (|| {
+        let mut file = options
+            .open(&temp)
+            .map_err(|_| LocalApiError::StatePoisoned)?;
+        let permissions = fs::metadata(path)
+            .map_err(|_| LocalApiError::StatePoisoned)?
+            .permissions();
+        fs::set_permissions(&temp, permissions).map_err(|_| LocalApiError::StatePoisoned)?;
+        file.write_all(next.as_bytes())
+            .map_err(|_| LocalApiError::StatePoisoned)?;
+        file.sync_all().map_err(|_| LocalApiError::StatePoisoned)?;
+        if fs::read_to_string(path).map_err(|_| LocalApiError::StatePoisoned)? != expected {
+            return Err(LocalApiError::InvalidRequest(
+                "Codex config changed during cleanup; retry after the edit finishes".into(),
+            ));
+        }
+        fs::rename(&temp, path).map_err(|_| LocalApiError::StatePoisoned)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Only an Ottto header AND a loopback signal destination establish ownership.
+/// External exporters and unrelated table fields survive, including inside a fence.
+fn codex_source_off_body(existing: &str) -> Result<String, LocalApiError> {
+    let has_marker = existing
+        .lines()
+        .any(|line| matches!(line.trim(), "# ottto:start" | "# ottto:end"));
+    if has_marker && crate::agent_configs::fence::extract_fence_lines(existing).is_none() {
+        return Err(LocalApiError::ManualFenceReviewRequired);
+    }
+    let mut document = existing
+        .parse::<DocumentMut>()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let Some(otel) = document.get_mut("otel").and_then(Item::as_table_like_mut) else {
+        return Ok(existing.to_string());
+    };
+    let changed = remove_owned_codex_exporters(otel);
+    if !changed {
+        return Ok(existing.to_string());
+    }
+    // A legacy fence containing only the generated telemetry fields can go away
+    // entirely. Mixed/user-edited fences keep their remaining contents.
+    if let Some(lines) = crate::agent_configs::fence::extract_fence_lines(existing) {
+        let fenced_body = lines[1..lines.len() - 1].join("\n");
+        if let Ok(mut fenced) = fenced_body.parse::<DocumentMut>() {
+            if let Some(table) = fenced.get_mut("otel").and_then(Item::as_table_like_mut) {
+                remove_owned_codex_exporters(table);
+                let generated_only = table.iter().all(|(key, value)| match key {
+                    "environment" => value.as_str() == Some("prod"),
+                    "log_user_prompt" => value.as_bool() == Some(false),
+                    _ => false,
+                }) && fenced.iter().count() == 1;
+                let full_table_generated_only =
+                    document["otel"].as_table_like().is_some_and(|table| {
+                        table.iter().all(|(key, value)| match key {
+                            "environment" => value.as_str() == Some("prod"),
+                            "log_user_prompt" => value.as_bool() == Some(false),
+                            _ => false,
+                        })
+                    });
+                if generated_only && full_table_generated_only {
+                    let mut offset = 0;
+                    let mut start = None;
+                    for line in existing.split_inclusive('\n') {
+                        if line.trim() == "# ottto:start" {
+                            start = Some(offset);
+                        }
+                        offset += line.len();
+                        if line.trim() == "# ottto:end" {
+                            let mut next = existing.to_string();
+                            next.replace_range(start.expect("validated fence")..offset, "");
+                            let mut remaining = next
+                                .parse::<DocumentMut>()
+                                .map_err(|_| LocalApiError::StatePoisoned)?;
+                            if let Some(otel) =
+                                remaining.get_mut("otel").and_then(Item::as_table_like_mut)
+                            {
+                                if remove_owned_codex_exporters(otel) {
+                                    return Ok(remaining.to_string());
+                                }
+                            }
+                            return Ok(next);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(document.to_string())
+}
+
+fn remove_owned_codex_exporters(otel: &mut dyn toml_edit::TableLike) -> bool {
+    let mut changed = false;
+    for (key, signal) in [
+        ("exporter", "logs"),
+        ("trace_exporter", "traces"),
+        ("metrics_exporter", "metrics"),
+    ] {
+        if codex_exporter_relay_port(otel, key, signal).is_some() {
+            let exporter = otel
+                .get_mut(key)
+                .and_then(Item::as_table_like_mut)
+                .expect("owned exporter table");
+            exporter.remove("otlp-http");
+            if exporter.is_empty() {
+                otel.remove(key);
+            }
+            changed = true;
+        }
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -10105,39 +10197,14 @@ fn patch_codex_config_at(
     )
 }
 
+// Historical enabled configuration is a fixture, never a production policy.
+#[cfg(test)]
 fn patch_codex_config_at_with_relay_base(
     path: &Path,
     backup_root: &Path,
     relay_base_url: &str,
 ) -> Result<ConfigPatchResult, LocalApiError> {
-    let existing_body = if path.exists() {
-        fs::read_to_string(path).ok()
-    } else {
-        None
-    };
-    if existing_body
-        .as_deref()
-        .is_some_and(|body| codex_config_has_relay_otel_for_base(body, relay_base_url))
-    {
-        return Ok(ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        });
-    }
-    if let Some(result) =
-        patch_existing_codex_otel_table(path, backup_root, relay_base_url, existing_body.as_deref())
-    {
-        return result;
-    }
     let body = render_codex_relay_toml_block_for_base(relay_base_url);
-    if !codex_toml::upsert_would_change(path, &body).map_err(agent_config_error)? {
-        return Ok(ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        });
-    }
     let backup_created = backup_existing_config(SourceKind::Codex, path, backup_root)?.is_some();
     let write = codex_toml::upsert_fence(path, &body).map_err(agent_config_error)?;
     Ok(ConfigPatchResult {
@@ -10147,71 +10214,7 @@ fn patch_codex_config_at_with_relay_base(
     })
 }
 
-fn patch_existing_codex_otel_table(
-    path: &Path,
-    backup_root: &Path,
-    relay_base_url: &str,
-    existing_body: Option<&str>,
-) -> Option<Result<ConfigPatchResult, LocalApiError>> {
-    let existing_body = existing_body?;
-    let mut document = match existing_body.parse::<DocumentMut>() {
-        Ok(document) => document,
-        Err(_) => return None,
-    };
-    document.get("otel")?;
-    let replacement =
-        match render_codex_relay_toml_block_for_base(relay_base_url).parse::<DocumentMut>() {
-            Ok(replacement) => replacement,
-            Err(error) => {
-                return Some(Err(LocalApiError::LocalOperationFailed(format!(
-                    "generated Codex telemetry config is invalid: {error}"
-                ))));
-            }
-        };
-    document["otel"] = replacement["otel"].clone();
-    let next_body = document.to_string();
-    if next_body == existing_body {
-        return Some(Ok(ConfigPatchResult {
-            changed: false,
-            created: false,
-            backup_created: false,
-        }));
-    }
-    let backup_created = match backup_existing_config(SourceKind::Codex, path, backup_root) {
-        Ok(value) => value.is_some(),
-        Err(error) => return Some(Err(error)),
-    };
-    Some(
-        write_config_body(path, next_body.as_bytes()).map(|()| ConfigPatchResult {
-            changed: true,
-            created: false,
-            backup_created,
-        }),
-    )
-}
-
-fn write_config_body(path: &Path, body: &[u8]) -> Result<(), LocalApiError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|_| LocalApiError::StatePoisoned)?;
-    }
-    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&tmp_path, body).map_err(|_| LocalApiError::StatePoisoned)?;
-    fs::rename(tmp_path, path).map_err(|_| LocalApiError::StatePoisoned)
-}
-
-fn remove_codex_config() -> Result<ConfigPatchResult, LocalApiError> {
-    remove_codex_config_at(&home_path(".codex/config.toml"))
-}
-
-fn remove_codex_config_at(path: &Path) -> Result<ConfigPatchResult, LocalApiError> {
-    let write = codex_toml::remove_fence(path).map_err(agent_config_error)?;
-    Ok(ConfigPatchResult {
-        changed: write.changed,
-        created: false,
-        backup_created: false,
-    })
-}
-
+#[cfg(test)]
 fn render_codex_relay_toml_block_for_base(relay_base_url: &str) -> String {
     let relay_header = crate::otlp_relay::LOCAL_RELAY_HEADER;
     let relay_source = crate::otlp_relay::CODEX_RELAY_SOURCE;
@@ -10871,6 +10874,29 @@ fn run_verify_source_action(
     if source == SourceKind::Pi {
         return run_pi_verify_source_action(daemon, api_base_url, credentials, action);
     }
+    if source == SourceKind::Codex {
+        reconcile_codex_source_off()?;
+        let result = verify_source(
+            daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            source,
+            false,
+        )?;
+        let ready = result.message.code == "codex_local_import" && result.config.drift.is_empty();
+        return Ok((
+            if ready { "succeeded" } else { "failed" }.to_string(),
+            result.message.text.clone(),
+            json!({
+                "status": verification_status_slug(&result.status), "verified": false, "records_seen": 0,
+                "last_record_id": null, "last_received_at": null, "smoke_after": null,
+                "local_import_ready": ready, "live_telemetry_required": false,
+                "message_code": result.message.code,
+                "error_code": if ready { serde_json::Value::Null } else { json!(result.message.code) },
+                "error_message": if ready { serde_json::Value::Null } else { json!(result.message.text) }
+            }),
+        ));
+    }
+
     if !source_binary_present(&source) {
         let result =
             not_installed_verification_result(source.clone(), empty_source_config(&source));
@@ -12689,17 +12715,22 @@ fn scan_source(source: &SourceKind) -> SetupScanSource {
             let command_found = executable_exists("codex");
             let config = home_path(".codex/config.toml");
             let config_body = read_optional_to_string(&config);
-            let telemetry_installed = config_body
-                .as_deref()
-                .is_some_and(telemetry_config_installed);
+            let telemetry_installed = false;
+            let local_import_ready =
+                (command_found || config.exists() || home_path(".codex/sessions").exists())
+                    && snapshot_device_credentials_include_source("codex")
+                    && codex_config_state_at(&config, "~/.codex/config.toml", "", false)
+                        .drift
+                        .is_empty();
             let managed_config = codex_managed_config_preview(config_body.as_deref());
+            let local_import_ready = local_import_ready && !source_patch_disabled(source);
             let mut scan_entry = setup_scan_source(
                 source,
                 "codex",
-                command_found || config.exists(),
+                command_found || config.exists() || home_path(".codex/sessions").exists(),
                 command_found,
                 telemetry_installed,
-                if telemetry_installed {
+                if local_import_ready {
                     "healthy"
                 } else {
                     "needs_repair"
@@ -12712,6 +12743,8 @@ fn scan_source(source: &SourceKind) -> SetupScanSource {
                 ]),
             );
             scan_entry.managed_config = managed_config;
+            scan_entry.local_import_ready = Some(local_import_ready);
+            scan_entry.live_telemetry_required = Some(false);
             scan_entry
         }
         SourceKind::ClaudeCode => {
@@ -12785,6 +12818,8 @@ fn setup_scan_source(
         attribution_guess,
         agent_status: Some(local_agent_status(source_kind).redacted_for_backend()),
         managed_config: None,
+        local_import_ready: None,
+        live_telemetry_required: None,
     }
 }
 
@@ -12982,25 +13017,12 @@ fn read_optional_to_string(path: &PathBuf) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
-fn telemetry_config_installed(body: &str) -> bool {
-    let relay_port = codex_config_relay_port(body);
-    relay_port.is_some()
-        && relay_port.is_some_and(loopback_listener_available)
-        && snapshot_device_credentials_include_source(crate::otlp_relay::CODEX_RELAY_SOURCE)
-}
-
 #[cfg(test)]
 fn codex_config_has_relay_otel(body: &str) -> bool {
     codex_config_relay_port(body).is_some()
 }
 
-fn codex_config_has_relay_otel_for_base(body: &str, relay_base_url: &str) -> bool {
-    codex_config_relay_port(body).is_some_and(|port| {
-        crate::otlp_relay::local_relay_base_url_for_port(port)
-            == relay_base_url.trim_end_matches('/')
-    })
-}
-
+#[cfg(test)]
 fn codex_config_relay_port(body: &str) -> Option<u16> {
     let Ok(document) = body.parse::<DocumentMut>() else {
         return None;
@@ -13024,13 +13046,11 @@ fn codex_config_relay_port(body: &str) -> Option<u16> {
     }
 }
 
-#[cfg(test)]
-fn codex_exporter_has_relay(otel: &Table, exporter_key: &str, signal: &str) -> bool {
-    let expected_port = crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT;
-    codex_exporter_relay_port(otel, exporter_key, signal) == Some(expected_port)
-}
-
-fn codex_exporter_relay_port(otel: &Table, exporter_key: &str, signal: &str) -> Option<u16> {
+fn codex_exporter_relay_port(
+    otel: &dyn toml_edit::TableLike,
+    exporter_key: &str,
+    signal: &str,
+) -> Option<u16> {
     let otlp_http = otel
         .get(exporter_key)
         .and_then(Item::as_table_like)
@@ -13046,14 +13066,6 @@ fn codex_exporter_relay_port(otel: &Table, exporter_key: &str, signal: &str) -> 
     }
     let relay_base_url = endpoint.strip_suffix(&suffix)?;
     let relay_port = crate::otlp_relay::local_relay_port_from_endpoint(relay_base_url)?;
-    if otlp_http
-        .get("protocol")
-        .and_then(Item::as_value)
-        .and_then(|value| value.as_str())
-        != Some("binary")
-    {
-        return None;
-    }
     let headers = otlp_http.get("headers").and_then(Item::as_table_like)?;
     if headers
         .get(crate::otlp_relay::LOCAL_RELAY_HEADER)
@@ -13079,7 +13091,11 @@ fn claude_code_telemetry_config_installed(body: &str) -> bool {
 fn snapshot_device_credentials_include_source(source: &str) -> bool {
     crate::snapshot_client::load_snapshot_device_credentials()
         .ok()
-        .is_some_and(|(device, _secret)| {
+        .is_some_and(|(device, secret)| {
+            if source == "codex" && (device.device_id.trim().is_empty() || secret.trim().is_empty())
+            {
+                return false;
+            }
             device
                 .sources
                 .iter()
@@ -13379,6 +13395,11 @@ fn rfc3339_after_minutes(minutes: u64) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn codex_local_import_verification(config: SourceConfigState) -> SourceVerificationResult {
+    verification_result_with_config(SourceKind::Codex, config, SourceVerificationStatus::Warning, false, 0, None, None, None,
+        "codex_local_import", "Codex uses local session import. Live telemetry is disabled; this check does not prove an upload. Restart existing Codex processes after configuration cleanup and check collector status for import progress.")
+}
+
 fn verify_source(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
@@ -13419,7 +13440,9 @@ fn verify_source(
     let status = status_for(daemon, authorization)?;
     let recoverable_pending_account =
         status.account.state == LocalAccountState::ClaimPending && status.account.user.is_some();
-    if status.account.state != LocalAccountState::Connected && !recoverable_pending_account {
+    if status.account.state != LocalAccountState::Connected
+        && (source == SourceKind::Codex || !recoverable_pending_account)
+    {
         let result = verification_result_with_config(
             source,
             config,
@@ -13452,6 +13475,20 @@ fn verify_source(
         daemon.record_verification_result(&result)?;
         return Ok(result);
     };
+
+    if source == SourceKind::Codex {
+        let result = if !snapshot_device_credentials_include_source("codex") {
+            verification_result_with_config(source, config, SourceVerificationStatus::Warning, false,
+                0, None, None, None, "relay_device_not_provisioned",
+                "Codex local import needs this Mac's source registration. Finish setup in Ottto, then check again.")
+        } else if source_binary_present(&source) {
+            codex_local_import_verification(config)
+        } else {
+            not_installed_verification_result(source, config)
+        };
+        daemon.record_verification_result(&result)?;
+        return Ok(result);
+    }
 
     let mut setup_credentials = match setup_run_token_for_connection(
         &connection.api_base_url,
@@ -21928,11 +21965,11 @@ mod tests {
         let store_root = telemetry_key_store_root("enable");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let install_root = telemetry_key_store_root("enable-install");
-        let fake_codex = fake_binary_path(&install_root, "codex");
+        let fake_claude = fake_binary_path(&install_root, "claude");
         let _home_guard = EnvVarGuard::set_path("HOME", &install_root);
         let _path_guard = EnvVarGuard::set_os(
             "OTTTO_COMMAND_SEARCH_PATH",
-            fake_codex
+            fake_claude
                 .parent()
                 .expect("fake binary parent")
                 .as_os_str()
@@ -21955,8 +21992,8 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::TelemetryControl {
                     action: TelemetryControlAction::EnableTelemetry,
-                    source: SourceKind::Codex,
-                    control_token: test_control_token("enable_telemetry", "codex", 300),
+                    source: SourceKind::ClaudeCode,
+                    control_token: test_control_token("enable_telemetry", "claude_code", 300),
                     api_base_url: Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
                     key_id: Some("key_123".to_string()),
                     organization_id: Some("org_123".to_string()),
@@ -21988,16 +22025,16 @@ mod tests {
         );
         assert_eq!(
             TelemetryKeyStore::file_only(&store_root)
-                .load(&SourceKind::Codex, "key_123")
+                .load(&SourceKind::ClaudeCode, "key_123")
                 .expect("stored key"),
             "transit_secret_for_tests"
         );
-        let config =
-            fs::read_to_string(install_root.join(".codex/config.toml")).expect("codex config");
+        let config = fs::read_to_string(install_root.join(".ottto/claude-telemetry.env"))
+            .expect("Claude env");
         assert!(config.contains("# ottto:start"));
         assert!(config.contains("# ottto:end"));
-        assert!(config.contains("otel.environment"));
-        assert!(codex_config_has_relay_otel(&config));
+        assert!(config.contains("CLAUDE_CODE_ENABLE_TELEMETRY"));
+        assert!(config.contains("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"));
         assert!(!config.contains("transit_secret_for_tests"));
     }
 
@@ -24013,7 +24050,7 @@ mod tests {
             payload
                 .get("requires_restart")
                 .and_then(|value| value.as_bool()),
-            Some(false)
+            Some(true)
         );
         assert!(matches!(
             store.load(&SourceKind::Codex, "key_disable"),
@@ -24216,7 +24253,7 @@ mod tests {
         let store_root = telemetry_key_store_root("missing-agent");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let missing = AgentInstallationDetection {
-            source: SourceKind::Codex,
+            source: SourceKind::ClaudeCode,
             installed: false,
             version: None,
             config_path: None,
@@ -24229,8 +24266,8 @@ mod tests {
         let response = telemetry_control_with_detector(
             &daemon(),
             TelemetryControlAction::EnableTelemetry,
-            SourceKind::Codex,
-            test_control_token("enable_telemetry", "codex", 300),
+            SourceKind::ClaudeCode,
+            test_control_token("enable_telemetry", "claude_code", 300),
             // Ignored for token validation (resolved via OTTTO_API_BASE_URL).
             Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
             Some("key_missing".to_string()),
@@ -24246,7 +24283,7 @@ mod tests {
         assert_eq!(response.message.code, "agent_not_installed");
         assert_eq!(response.installation, Some(missing));
         assert!(matches!(
-            TelemetryKeyStore::file_only(&store_root).load(&SourceKind::Codex, "key_missing"),
+            TelemetryKeyStore::file_only(&store_root).load(&SourceKind::ClaudeCode, "key_missing"),
             Err(TelemetryKeychainError::Missing)
         ));
     }
@@ -25637,134 +25674,129 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    fn patch_codex_config_writes_loopback_relay_without_dropping_user_config() {
-        let root =
-            std::env::temp_dir().join(format!("ottto-codex-config-test-{}", std::process::id()));
+    fn codex_source_off_removes_all_owned_exporters_and_preserves_user_fields() {
+        let root = control_test_root("codex-source-off");
+        fs::create_dir_all(&root).unwrap();
         let path = root.join("config.toml");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("create temp dir");
-        let original = "model = \"gpt-5.4\"\n[profile]\nname = \"work\"\n";
-        fs::write(&path, original).expect("write config");
-
-        let backup_root = root.join("backups");
-        let result = patch_codex_config_at(&path, &backup_root).expect("patch config");
-        let body = fs::read_to_string(&path).expect("read config");
-        let document = body.parse::<DocumentMut>().expect("toml config");
-        let otel = document
-            .get("otel")
-            .and_then(Item::as_table)
-            .expect("otel table");
-
+        let original = "model = \"test-model\"\n";
+        fs::write(&path, original).unwrap();
+        patch_codex_config_at(&path, &root.join("backups")).unwrap();
+        let result = reconcile_codex_source_off_at(&path, &root.join("backups")).unwrap();
         assert!(result.changed);
-        assert!(!result.created);
         assert!(result.backup_created);
-        let backup_dir = backup_root.join("config-backups/codex");
-        assert!(backup_dir.exists());
-        assert_eq!(count_backup_files(&backup_dir), 1);
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("/v1/logs"));
+        assert!(!body.contains("/v1/traces"));
+        assert!(!body.contains("/v1/metrics"));
         assert_eq!(
-            document
-                .get("model")
-                .and_then(Item::as_value)
-                .and_then(|value| value.as_str()),
-            Some("gpt-5.4")
+            body.parse::<DocumentMut>().unwrap()["model"].as_str(),
+            Some("test-model")
         );
-        assert!(body.contains("# ottto:start\notel.environment"));
-        assert!(body.contains("# ottto:end\nmodel = \"gpt-5.4\""));
-        assert!(codex_config_has_relay_otel(&body));
-        assert!(codex_exporter_has_relay(otel, "exporter", "logs"));
-        assert!(codex_exporter_has_relay(otel, "trace_exporter", "traces"));
-        assert!(codex_exporter_has_relay(
-            otel,
-            "metrics_exporter",
-            "metrics"
-        ));
-        let second = patch_codex_config_at(&path, &backup_root).expect("patch config again");
-        assert!(!second.changed);
-        assert!(!second.created);
-        assert!(!second.backup_created);
-        assert_eq!(fs::read_to_string(&path).expect("read second config"), body);
-        assert_eq!(count_backup_files(&backup_dir), 1);
-        remove_codex_config_at(&path).expect("remove managed block");
-        assert_eq!(
-            fs::read_to_string(&path).expect("read restored config"),
-            original
+        assert!(
+            !reconcile_codex_source_off_at(&path, &root.join("backups"))
+                .unwrap()
+                .changed
         );
-        let _ = fs::remove_dir_all(&root);
+        assert!(codex_config_state_at(&path, "config", "", false)
+            .drift
+            .is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn patch_codex_config_accepts_existing_unfenced_relay_otel_table() {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-codex-config-inline-test-{}",
-            std::process::id()
-        ));
-        let path = root.join("config.toml");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("create temp dir");
-        fs::write(
-            &path,
-            r#"model = "gpt-5.4"
-
-[otel]
-environment = "prod"
-log_user_prompt = false
-exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/logs", protocol = "binary", headers = { "X-Ottto-Local-Relay" = "codex" } } }
-trace_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/traces", protocol = "binary", headers = { "X-Ottto-Local-Relay" = "codex" } } }
-metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics", protocol = "binary", headers = { "X-Ottto-Local-Relay" = "codex" } } }
-"#,
-        )
-        .expect("write config");
-        let original = fs::read_to_string(&path).expect("read original config");
-
-        let backup_root = root.join("backups");
-        let result = patch_codex_config_at(&path, &backup_root).expect("compatible relay config");
-        let body = fs::read_to_string(&path).expect("read config");
-
-        assert!(!result.changed);
-        assert!(!result.created);
-        assert!(!result.backup_created);
-        assert_eq!(body, original);
-        assert!(!backup_root.exists());
-        let _ = fs::remove_dir_all(&root);
+    fn codex_source_off_preserves_external_exporters_and_cleans_legacy_unfenced_owned_ones() {
+        let owned = render_codex_relay_toml_block_for_base("http://127.0.0.1:44621");
+        let body = owned.replace(
+            "http://127.0.0.1:44621/v1/traces",
+            "https://collector.example/v1/traces",
+        );
+        let next = codex_source_off_body(&body).unwrap();
+        assert!(!next.contains("/v1/logs"));
+        assert!(!next.contains("/v1/metrics"));
+        assert!(next.contains("https://collector.example/v1/traces"));
+        assert_eq!(codex_source_off_body(&next).unwrap(), next);
+        let no_header = owned.replace("X-Ottto-Local-Relay", "External-Header");
+        assert_eq!(codex_source_off_body(&no_header).unwrap(), no_header);
     }
 
     #[test]
-    fn patch_codex_config_rewrites_managed_relay_to_active_fallback_endpoint() {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-codex-config-fallback-test-{}",
-            std::process::id()
-        ));
+    fn codex_source_off_removes_owned_exporters_outside_fence_and_preserves_custom_fields() {
+        let outside = format!("# ottto:start\notel.environment = \"prod\"\notel.log_user_prompt = false\n# ottto:end\n{}\n", render_codex_relay_toml_block_for_base("http://127.0.0.1:44621").lines().skip(2).collect::<Vec<_>>().join("\n"));
+        let next = codex_source_off_body(&outside).unwrap();
+        assert!(!next.contains("/v1/logs"));
+        assert!(!next.contains("/v1/traces"));
+        assert!(!next.contains("/v1/metrics"));
+        let custom = format!(
+            "# ottto:start\n{}\n# ottto:end\n",
+            render_codex_relay_toml_block_for_base("http://127.0.0.1:44621")
+                .replace("\"prod\"", "\"custom\"")
+                .replace("log_user_prompt = false", "log_user_prompt = true")
+        );
+        let next = codex_source_off_body(&custom).unwrap();
+        let doc = next.parse::<DocumentMut>().unwrap();
+        assert_eq!(doc["otel"]["environment"].as_str(), Some("custom"));
+        assert_eq!(doc["otel"]["log_user_prompt"].as_bool(), Some(true));
+        assert!(!next.contains("/v1/logs"));
+    }
+
+    #[test]
+    fn codex_source_off_preserves_table_scope_after_legacy_fence() {
+        let body = "# ottto:start\n[otel]\nenvironment = \"prod\"\nlog_user_prompt = false\nexporter = { otlp-http = { endpoint = \"http://127.0.0.1:44621/v1/logs\", headers = { X-Ottto-Local-Relay = \"codex\" } } }\n# ottto:end\ncustom_setting = true\n";
+        let next = codex_source_off_body(body).unwrap();
+        let doc = next.parse::<DocumentMut>().unwrap();
+        assert_eq!(doc["otel"]["custom_setting"].as_bool(), Some(true));
+        assert!(doc.get("custom_setting").is_none());
+        assert!(!next.contains("/v1/logs"));
+        assert_eq!(codex_source_off_body(&next).unwrap(), next);
+    }
+
+    #[test]
+    fn codex_source_off_handles_inline_otel_without_false_clean() {
+        let body = "otel = { exporter = { otlp-http = { endpoint = \"http://127.0.0.1:44621/v1/logs\", headers = { X-Ottto-Local-Relay = \"codex\" } } }, environment = \"custom\" }\n";
+        let next = codex_source_off_body(body).unwrap();
+        assert!(!next.contains("/v1/logs"));
+        assert!(next.contains("custom"));
+        assert_eq!(codex_source_off_body(&next).unwrap(), next);
+    }
+
+    #[test]
+    fn codex_source_off_compare_before_replace_refuses_concurrent_edits() {
+        let root = control_test_root("codex-source-off-edit-conflict");
+        fs::create_dir_all(&root).unwrap();
         let path = root.join("config.toml");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("create temp dir");
-        fs::write(
-            &path,
-            format!(
-                "# ottto:start\n{}\n# ottto:end\nmodel = \"gpt-5.4\"\n",
-                render_codex_relay_toml_block_for_base(
-                    &crate::otlp_relay::default_local_relay_base_url()
-                )
-            ),
-        )
-        .expect("write config");
+        fs::write(&path, "model = \"new\"\n").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(write_codex_source_off_body(&path, "model = \"old\"\n", "").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "model = \"new\"\n");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        write_codex_source_off_body(&path, "model = \"new\"\n", "model = \"kept\"\n").unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 
-        let backup_root = root.join("backups");
-        let fallback = "http://127.0.0.1:44621";
-        let result = patch_codex_config_at_with_relay_base(&path, &backup_root, fallback)
-            .expect("patch fallback config");
-        let body = fs::read_to_string(&path).expect("read config");
-
-        assert!(!result.created);
-        assert!(result.backup_created);
-        assert!(body.contains("http://127.0.0.1:44621/v1/logs"));
-        assert!(!body.contains("http://127.0.0.1:43119/v1/logs"));
-        assert!(codex_config_has_relay_otel(&body));
-        assert!(codex_config_has_relay_otel_for_base(&body, fallback));
-        assert!(!codex_config_has_relay_otel_for_base(
-            &body,
-            &crate::otlp_relay::default_local_relay_base_url()
-        ));
-        let _ = fs::remove_dir_all(&root);
+    #[test]
+    fn codex_source_off_refuses_ambiguous_or_invalid_config_without_writes() {
+        let root = control_test_root("codex-source-off-invalid");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        for body in ["# ottto:start\n[otel]\n", "[otel\n"] {
+            fs::write(&path, body).unwrap();
+            assert!(reconcile_codex_source_off_at(&path, &root.join("backups")).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), body);
+        }
+        let missing = root.join("missing.toml");
+        assert!(
+            !reconcile_codex_source_off_at(&missing, &root.join("backups"))
+                .unwrap()
+                .changed
+        );
+        assert!(!missing.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -26159,89 +26191,181 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
     }
 
     #[test]
-    fn codex_config_state_detects_clean_missing_wrong_and_invalid_without_writes() {
-        let root = control_test_root("codex-config-state");
-        fs::create_dir_all(&root).expect("create root");
-        let missing = root.join("missing.toml");
-        let default_base = crate::otlp_relay::default_local_relay_base_url();
-
-        let missing_state =
-            codex_config_state_at(&missing, "~/.codex/config.toml", &default_base, false);
-        assert!(!missing_state.discovered);
-        assert!(missing_state
-            .drift
-            .iter()
-            .any(|drift| drift.key == "codex.config_file"));
-
-        let invalid = root.join("invalid.toml");
-        fs::write(&invalid, "[otel\n").expect("write invalid config");
-        let invalid_body = fs::read_to_string(&invalid).expect("read invalid config");
-        let invalid_state =
-            codex_config_state_at(&invalid, "~/.codex/config.toml", &default_base, false);
-        assert!(invalid_state.discovered);
-        assert!(invalid_state
-            .fingerprint
-            .as_deref()
-            .unwrap_or("")
-            .starts_with("sha256:"));
-        assert!(invalid_state
-            .drift
-            .iter()
-            .any(|drift| drift.key == "codex.config_toml"));
-        assert_eq!(
-            fs::read_to_string(&invalid).expect("read invalid again"),
-            invalid_body
-        );
-
-        let clean = root.join("clean.toml");
-        patch_codex_config_at_with_relay_base(&clean, &root.join("backups"), &default_base)
-            .expect("seed clean config");
-        let clean_body = fs::read_to_string(&clean).expect("read clean config");
-        let clean_state =
-            codex_config_state_at(&clean, "~/.codex/config.toml", &default_base, false);
-        assert!(clean_state.discovered);
-        assert!(clean_state.drift.is_empty());
-        assert_eq!(
-            fs::read_to_string(&clean).expect("read clean again"),
-            clean_body
-        );
-
-        let fallback_base = "http://127.0.0.1:44621";
-        let wrong_relay_state =
-            codex_config_state_at(&clean, "~/.codex/config.toml", fallback_base, false);
-        assert!(wrong_relay_state
-            .drift
-            .iter()
-            .any(|drift| drift.key.ends_with(".endpoint")));
-
-        fs::write(
-            &clean,
-            clean_body.replace("protocol = \"binary\"", "protocol = \"grpc\""),
+    #[serial]
+    fn codex_source_off_setup_and_manual_verification_do_not_probe_provider_or_backend() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("codex-source-off-verify");
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::write(root.join(".codex/config.toml"), "model = \"test-model\"\n").unwrap();
+        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("empty-bin"));
+        let _home = EnvVarGuard::set_path("HOME", &root);
+        let _support =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let secret_root = root.join("secrets");
+        fs::create_dir_all(&secret_root).unwrap();
+        let _secret = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".into(),
+                machine_id: None,
+                sources: vec!["codex".into()],
+            })
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .unwrap();
+        let connection = LocalConnectionBinding {
+            setup_run_id: "test".into(),
+            setup_run_token_expires_at: "2000-01-01T00:00:00Z".into(),
+            machine_id: None,
+            claim_code: None,
+            api_base_url: "http://127.0.0.1:1".into(),
+        };
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection.clone()));
+        let registered = scan_source(&SourceKind::Codex);
+        assert_eq!(registered.live_telemetry_required, Some(false));
+        assert_eq!(registered.local_import_ready, Some(true));
+        assert!(!registered.telemetry_installed);
+        let result = verify_source(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            SourceKind::Codex,
+            false,
         )
-        .expect("write wrong protocol");
-        let wrong_protocol_state =
-            codex_config_state_at(&clean, "~/.codex/config.toml", &default_base, false);
-        assert!(wrong_protocol_state
-            .drift
-            .iter()
-            .any(|drift| drift.key.ends_with(".protocol")));
-
-        fs::write(
-            &clean,
-            clean_body.replace(
-                "\"X-Ottto-Local-Relay\" = \"codex\"",
-                "\"X-Ottto-Local-Relay\" = \"wrong\"",
-            ),
+        .unwrap();
+        assert_eq!(result.message.code, "codex_local_import");
+        assert!(!result.verified);
+        assert_eq!(result.records_seen, 0);
+        assert!(!verification_result_should_refresh_agent_status(&result));
+        let mut credentials = SetupRunCredentials {
+            connection,
+            setup_run_token: "test".into(),
+        };
+        let action = SetupRunActionApiResponse {
+            id: "test".into(),
+            action_type: "verify_source".into(),
+            source: Some("codex".into()),
+        };
+        let (status, _, payload) = run_verify_source_action(
+            &daemon,
+            "http://127.0.0.1:1",
+            &mut credentials,
+            &action,
+            SourceKind::Codex,
         )
-        .expect("write wrong header");
-        let wrong_header_state =
-            codex_config_state_at(&clean, "~/.codex/config.toml", &default_base, false);
-        assert!(wrong_header_state
-            .drift
-            .iter()
-            .any(|drift| drift.key.ends_with(".headers.X-Ottto-Local-Relay")));
+        .unwrap();
+        assert_eq!(status, "succeeded");
+        assert_eq!(payload["verified"], false);
+        assert_eq!(payload["records_seen"], 0);
+        assert_eq!(payload["live_telemetry_required"], false);
+        assert!(payload["smoke_after"].is_null());
+        let disconnected = self::daemon().with_connection(Some(credentials.connection.clone()));
+        let (status, _, payload) = run_verify_source_action(
+            &disconnected,
+            "http://127.0.0.1:1",
+            &mut credentials,
+            &action,
+            SourceKind::Codex,
+        )
+        .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(payload["local_import_ready"], false);
+        assert_eq!(payload["error_code"], "account_not_connected");
+        {
+            let _disabled = EnvVarGuard::set_str("OTTTO_PATCH_CODEX_DISABLED", "1");
+            let (status, _, payload) = run_verify_source_action(
+                &daemon,
+                "http://127.0.0.1:1",
+                &mut credentials,
+                &action,
+                SourceKind::Codex,
+            )
+            .unwrap();
+            assert_eq!(status, "failed");
+            assert_eq!(payload["local_import_ready"], false);
+            assert_eq!(payload["error_code"], "patch_disabled");
+        }
+        FileDeviceStore::default().reset().unwrap();
+        assert_eq!(
+            scan_source(&SourceKind::Codex).local_import_ready,
+            Some(false)
+        );
+        let result = verify_source(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            SourceKind::Codex,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.message.code, "relay_device_not_provisioned");
+        assert!(!result.verified);
+        let _ = fs::remove_dir_all(root);
+    }
 
-        let _ = fs::remove_dir_all(&root);
+    #[test]
+    #[serial]
+    fn codex_source_off_respects_no_touch_override_at_startup() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("codex-source-off-no-touch");
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        let _home = EnvVarGuard::set_path("HOME", &root);
+        let _support =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let _disabled = EnvVarGuard::set_str("OTTTO_PATCH_CODEX_DISABLED", "1");
+        let path = root.join(".codex/config.toml");
+        let body = render_codex_relay_toml_block_for_base("http://127.0.0.1:44621");
+        fs::write(&path, &body).unwrap();
+        assert!(!reconcile_codex_source_off_at_startup().unwrap());
+        assert_eq!(fs::read_to_string(path).unwrap(), body);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_source_off_rejects_enable_without_touching_control_token_or_key_store() {
+        let result = telemetry_control(
+            &daemon(),
+            TelemetryControlAction::EnableTelemetry,
+            SourceKind::Codex,
+            "not-a-token".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(result, Err(LocalApiError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn codex_source_off_config_state_requires_only_removal_of_owned_exporters() {
+        let root = control_test_root("codex-source-off-state");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        assert!(codex_config_state_at(&path, "config", "", false)
+            .drift
+            .is_empty());
+        let external = "otel.exporter = \"none\"\n";
+        fs::write(&path, external).unwrap();
+        assert!(codex_config_state_at(&path, "config", "", false)
+            .drift
+            .is_empty());
+        patch_codex_config_at(&path, &root.join("backups")).unwrap_err();
+        fs::write(
+            &path,
+            render_codex_relay_toml_block_for_base("http://127.0.0.1:44621"),
+        )
+        .unwrap();
+        assert!(!codex_config_state_at(&path, "config", "", false)
+            .drift
+            .is_empty());
+        fs::write(&path, "[otel\n").unwrap();
+        assert!(!codex_config_state_at(&path, "config", "", false)
+            .drift
+            .is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[otel\n");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -26432,11 +26556,9 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
         let config_path = root.join(".codex/config.toml");
         fs::write(
             &config_path,
-            r#"[otel]
-log_user_prompt = true
-"#,
+            render_codex_relay_toml_block_for_base("http://127.0.0.1:44621"),
         )
-        .expect("write drifted config");
+        .expect("legacy config");
 
         let response = handle_request(
             &daemon(),
@@ -26460,9 +26582,9 @@ log_user_prompt = true
         assert_eq!(result.message.code, "account_not_connected");
         assert!(result.config.drift.is_empty());
         let body = fs::read_to_string(&config_path).expect("read repaired config");
-        assert!(body.contains("http://127.0.0.1:43119/v1/logs"));
-        assert!(body.contains("protocol = \"binary\""));
-        assert!(body.contains("otel.log_user_prompt = false"));
+        assert!(!body.contains("/v1/logs"));
+        assert!(!body.contains("/v1/traces"));
+        assert!(!body.contains("/v1/metrics"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -26517,11 +26639,9 @@ log_user_prompt = true
         let config_path = root.join(".codex/config.toml");
         fs::write(
             &config_path,
-            r#"[otel]
-log_user_prompt = true
-"#,
+            render_codex_relay_toml_block_for_base("http://127.0.0.1:44621"),
         )
-        .expect("write drifted config");
+        .expect("legacy config");
 
         let response = handle_request(
             &daemon().with_account(connected_account()),
@@ -27368,12 +27488,8 @@ log_user_prompt = true
         let root = control_test_root("verify-no-account");
         create_control_test_dir(&root.join(".codex"));
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        patch_codex_config_at_with_relay_base(
-            &root.join(".codex/config.toml"),
-            &root.join("support"),
-            &crate::otlp_relay::default_local_relay_base_url(),
-        )
-        .expect("seed clean config");
+        fs::write(root.join(".codex/config.toml"), "model = \"gpt-6.1-sol\"\n")
+            .expect("seed clean config");
         let daemon = daemon().with_connection(Some(LocalConnectionBinding {
             setup_run_id: "setup_stale".to_string(),
             setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
@@ -27394,257 +27510,6 @@ log_user_prompt = true
         assert!(!result.verified);
         assert_eq!(result.message.code, "account_not_connected");
         assert!(result.message.text.contains("Use Sign in in the Ottto app"));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    #[serial]
-    fn verify_refreshes_recoverable_pending_account_before_requiring_sign_in() {
-        let _lock = lock_backend_test_env();
-        let root = control_test_root("verify-pending-account-refresh");
-        let support_root = root.join("support");
-        let secret_root = telemetry_key_store_root("verify-pending-account-refresh-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        create_control_test_dir(&root.join(".codex"));
-        let fake_codex = fake_binary_path(&root, "codex");
-        fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex smoke");
-        #[cfg(unix)]
-        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
-            .expect("mark fake codex executable");
-        let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let _path_guard = EnvVarGuard::set_os(
-            "OTTTO_COMMAND_SEARCH_PATH",
-            fake_codex
-                .parent()
-                .expect("fake binary parent")
-                .as_os_str()
-                .to_os_string(),
-        );
-        patch_codex_config_at_with_relay_base(
-            &root.join(".codex/config.toml"),
-            &support_root,
-            &crate::otlp_relay::default_local_relay_base_url(),
-        )
-        .expect("seed clean config");
-        FileDeviceStore::default()
-            .save(&LocalDeviceBinding {
-                device_id: "device_test".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            })
-            .expect("persist relay device binding");
-        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-            .save("device_secret_test")
-            .expect("persist relay device secret");
-        let api_base_url = verify_refresh_backend();
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_verify_refresh".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: Some("claim_existing".to_string()),
-            api_base_url: api_base_url.clone(),
-        };
-        let mut stale_overlay = connected_account();
-        stale_overlay.state = LocalAccountState::ClaimPending;
-        let daemon = daemon()
-            .with_account(stale_overlay)
-            .with_connection(Some(connection));
-        daemon
-            .begin_auth_with_claim(PendingAuthClaim {
-                claim_code: "claim_refresh".to_string(),
-                claim_token: "token_refresh".to_string(),
-                nonce: "nonce_refresh".to_string(),
-                claim_url: "https://ottto.net/apps/setup?code=claim_refresh".to_string(),
-                expires_at: "2026-05-05T10:05:00Z".to_string(),
-            })
-            .expect("start recoverable pending auth");
-
-        let result = verify_source(
-            &daemon,
-            &RequestAuthorization::TrustedCompanionApp,
-            SourceKind::Codex,
-            false,
-        )
-        .expect("verification should refresh setup token");
-
-        assert_eq!(result.status, SourceVerificationStatus::Verified);
-        assert!(result.verified);
-        assert_eq!(result.message.code, "verified");
-        assert_eq!(
-            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-                .load()
-                .expect("load refreshed setup token"),
-            "otsr_verify_fresh"
-        );
-        assert_eq!(
-            daemon
-                .status_for_trusted_client()
-                .expect("status")
-                .account
-                .state,
-            LocalAccountState::Connected
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    #[serial]
-    fn verify_refreshes_invalid_stored_setup_token_before_requiring_sign_in() {
-        let _lock = lock_backend_test_env();
-        let root = control_test_root("verify-invalid-token-refresh");
-        let support_root = root.join("support");
-        let secret_root = telemetry_key_store_root("verify-invalid-token-refresh-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        create_control_test_dir(&root.join(".codex"));
-        let fake_codex = fake_binary_path(&root, "codex");
-        fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex smoke");
-        #[cfg(unix)]
-        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
-            .expect("mark fake codex executable");
-        let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let _path_guard = EnvVarGuard::set_os(
-            "OTTTO_COMMAND_SEARCH_PATH",
-            fake_codex
-                .parent()
-                .expect("fake binary parent")
-                .as_os_str()
-                .to_os_string(),
-        );
-        patch_codex_config_at_with_relay_base(
-            &root.join(".codex/config.toml"),
-            &support_root,
-            &crate::otlp_relay::default_local_relay_base_url(),
-        )
-        .expect("seed clean config");
-        FileDeviceStore::default()
-            .save(&LocalDeviceBinding {
-                device_id: "device_test".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            })
-            .expect("persist relay device binding");
-        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-            .save("device_secret_test")
-            .expect("persist relay device secret");
-        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-            .save("otsr_stale_verify")
-            .expect("persist stale setup token");
-        let api_base_url = verify_invalid_token_refresh_backend();
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_verify_refresh".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: api_base_url.clone(),
-        };
-        let mut stale_overlay = connected_account();
-        stale_overlay.state = LocalAccountState::ClaimPending;
-        let daemon = daemon()
-            .with_account(stale_overlay)
-            .with_connection(Some(connection));
-
-        let result = verify_source(
-            &daemon,
-            &RequestAuthorization::TrustedCompanionApp,
-            SourceKind::Codex,
-            false,
-        )
-        .expect("verification should refresh invalid stored setup token");
-
-        assert_eq!(result.status, SourceVerificationStatus::Verified);
-        assert!(result.verified);
-        assert_eq!(result.message.code, "verified");
-        assert_eq!(
-            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-                .load()
-                .expect("load refreshed setup token"),
-            "otsr_verify_fresh"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    #[serial]
-    fn verify_uses_rebound_setup_run_after_token_refresh() {
-        let _lock = lock_backend_test_env();
-        let root = control_test_root("verify-rebound-token-refresh");
-        let support_root = root.join("support");
-        let secret_root = telemetry_key_store_root("verify-rebound-token-refresh-secret");
-        fs::create_dir_all(&secret_root).expect("secret root");
-        create_control_test_dir(&root.join(".codex"));
-        let fake_codex = fake_binary_path(&root, "codex");
-        fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex smoke");
-        #[cfg(unix)]
-        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
-            .expect("mark fake codex executable");
-        let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        let _support_guard =
-            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
-        let _path_guard = EnvVarGuard::set_os(
-            "OTTTO_COMMAND_SEARCH_PATH",
-            fake_codex
-                .parent()
-                .expect("fake binary parent")
-                .as_os_str()
-                .to_os_string(),
-        );
-        patch_codex_config_at_with_relay_base(
-            &root.join(".codex/config.toml"),
-            &support_root,
-            &crate::otlp_relay::default_local_relay_base_url(),
-        )
-        .expect("seed clean config");
-        FileDeviceStore::default()
-            .save(&LocalDeviceBinding {
-                device_id: "device_test".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            })
-            .expect("persist relay device binding");
-        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-            .save("device_secret_test")
-            .expect("persist relay device secret");
-        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-            .save("otsr_stale_verify")
-            .expect("persist stale setup token");
-        let api_base_url = verify_rebound_token_refresh_backend();
-        let connection = LocalConnectionBinding {
-            setup_run_id: "setup_verify_stale".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_test".to_string()),
-            claim_code: None,
-            api_base_url: api_base_url.clone(),
-        };
-        let daemon = daemon()
-            .with_account(connected_account())
-            .with_connection(Some(connection));
-
-        let result = verify_source(
-            &daemon,
-            &RequestAuthorization::TrustedCompanionApp,
-            SourceKind::Codex,
-            false,
-        )
-        .expect("verification should retry against rebound setup run");
-
-        assert_eq!(result.status, SourceVerificationStatus::Verified);
-        assert!(result.verified);
-        assert_eq!(result.message.code, "verified");
-        assert_eq!(
-            FileConnectionStore::default()
-                .load()
-                .expect("load rebound connection")
-                .expect("connection saved")
-                .setup_run_id,
-            "setup_verify_rebound"
-        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -27968,18 +27833,18 @@ log_user_prompt = true
         let support_root = root.join("support");
         let secret_root = telemetry_key_store_root("setup-action-token-refresh-secret");
         fs::create_dir_all(&secret_root).expect("secret root");
-        let fake_codex = fake_binary_path(&root, "codex");
-        fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex smoke");
+        let fake_claude = fake_binary_path(&root, "claude");
+        fs::write(&fake_claude, "#!/bin/sh\nexit 0\n").expect("write fake claude smoke");
         #[cfg(unix)]
-        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
-            .expect("mark fake codex executable");
+        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755))
+            .expect("mark fake claude executable");
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
         let _support_guard =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
         let _path_guard = EnvVarGuard::set_os(
             "OTTTO_COMMAND_SEARCH_PATH",
-            fake_codex
+            fake_claude
                 .parent()
                 .expect("fake binary parent")
                 .as_os_str()
@@ -27989,7 +27854,7 @@ log_user_prompt = true
             .save(&LocalDeviceBinding {
                 device_id: "device_test".to_string(),
                 machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
+                sources: vec!["claude_code".to_string()],
             })
             .expect("persist relay device binding");
         KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
@@ -28017,7 +27882,7 @@ log_user_prompt = true
         let response = setup_action(
             &daemon,
             &RequestAuthorization::Token("token".to_string()),
-            SourceKind::Codex,
+            SourceKind::ClaudeCode,
             "verify_source".to_string(),
             Some(api_base_url.clone()),
         )
@@ -28037,7 +27902,7 @@ log_user_prompt = true
             response
                 .pointer("/actions/0/source")
                 .and_then(serde_json::Value::as_str),
-            Some("codex")
+            Some("claude_code")
         );
         assert_eq!(
             response
@@ -28070,15 +27935,15 @@ log_user_prompt = true
     fn setup_verify_action_backend_error_completes_failed_action() {
         let _guard = lock_backend_test_env();
         let root = control_test_root("setup-action-error-complete");
-        let fake_codex = fake_binary_path(&root, "codex");
-        fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex smoke");
+        let fake_claude = fake_binary_path(&root, "claude");
+        fs::write(&fake_claude, "#!/bin/sh\nexit 0\n").expect("write fake Claude smoke");
         #[cfg(unix)]
-        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
-            .expect("mark fake codex executable");
+        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755))
+            .expect("mark fake Claude executable");
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
         let _path_guard = EnvVarGuard::set_os(
             "OTTTO_COMMAND_SEARCH_PATH",
-            fake_codex
+            fake_claude
                 .parent()
                 .expect("fake binary parent")
                 .as_os_str()
@@ -28107,7 +27972,7 @@ log_user_prompt = true
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].action_type, "verify_source");
-        assert_eq!(results[0].source.as_deref(), Some("codex"));
+        assert_eq!(results[0].source.as_deref(), Some("claude_code"));
         assert_eq!(results[0].status, "failed");
         let body_guard = completed_body.lock().expect("completed body lock");
         let body = body_guard.as_ref().expect("complete body observed");
@@ -28542,7 +28407,7 @@ log_user_prompt = true
                             &mut stream,
                             200,
                             "OK",
-                            r#"{"id":"action_verify_codex","action_type":"verify_source","source":"codex"}"#,
+                            r#"{"id":"action_verify_claude","action_type":"verify_source","source":"claude_code"}"#,
                         );
                     } else {
                         write_json_response(
@@ -28578,7 +28443,7 @@ log_user_prompt = true
                         continue;
                     }
                     let body = if next_action_calls == 0 {
-                        r#"{"action":{"id":"action_verify_codex","action_type":"verify_source","source":"codex"}}"#
+                        r#"{"action":{"id":"action_verify_claude","action_type":"verify_source","source":"claude_code"}}"#
                     } else {
                         r#"{"action":null}"#
                     };
@@ -28587,7 +28452,7 @@ log_user_prompt = true
                     if next_action_calls > 1 {
                         break;
                     }
-                } else if request.contains("/actions/action_verify_codex/events") {
+                } else if request.contains("/actions/action_verify_claude/events") {
                     if event_calls == 0 {
                         event_calls += 1;
                         write_json_response(
@@ -28624,7 +28489,7 @@ log_user_prompt = true
                             &mut stream,
                             200,
                             "OK",
-                            r#"{"source":"codex","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
+                            r#"{"source":"claude_code","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
                         );
                     } else {
                         write_json_response(
@@ -28665,7 +28530,7 @@ log_user_prompt = true
                         r#"{{"setup_run_token":"{token}","expires_at":"2026-06-11T18:30:00Z"}}"#
                     );
                     write_json_response(&mut stream, 200, "OK", &body);
-                } else if request.contains("/actions/action_verify_codex/complete") {
+                } else if request.contains("/actions/action_verify_claude/complete") {
                     if complete_calls == 0 {
                         complete_calls += 1;
                         write_json_response(
@@ -28684,7 +28549,7 @@ log_user_prompt = true
                             &mut stream,
                             200,
                             "OK",
-                            r#"{"run":{"id":"setup_token_refresh","status":"complete","machine_id":"machine_test"},"sources":[{"source":"codex","detected":true,"readiness_percent":100,"state":"verified","missing_fields":[]}],"next_action":null,"next_question":null}"#,
+                            r#"{"run":{"id":"setup_token_refresh","status":"complete","machine_id":"machine_test"},"sources":[{"source":"claude_code","detected":true,"readiness_percent":100,"state":"verified","missing_fields":[]}],"next_action":null,"next_question":null}"#,
                         );
                     } else {
                         write_json_response(
@@ -28707,195 +28572,6 @@ log_user_prompt = true
         format!("http://{address}")
     }
 
-    fn verify_refresh_backend() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind verify refresh backend");
-        let address = listener.local_addr().expect("local address");
-        thread::spawn(move || {
-            let mut marker_seen = false;
-            for _ in 0..4 {
-                let (mut stream, _) = listener.accept().expect("accept verify request");
-                let request = read_complete_http_request(&mut stream);
-                if request.contains("/local-client/refresh") {
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"setup_run_token":"otsr_verify_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
-                    );
-                } else if request.contains("/local-client/verification-marker")
-                    && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
-                {
-                    marker_seen = true;
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"source":"codex","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
-                    );
-                } else if request.contains("/local-client/verification")
-                    && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
-                    && marker_seen
-                {
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"verified":true,"records_seen":1,"last_record_id":"rec_test","last_received_at":"2026-06-11T18:00:00Z","smoke_after":"2026-06-11T17:59:00Z"}"#,
-                    );
-                    break;
-                } else {
-                    write_json_response(
-                        &mut stream,
-                        400,
-                        "Bad Request",
-                        r#"{"detail":"unexpected verify refresh request"}"#,
-                    );
-                }
-            }
-        });
-        format!("http://{address}")
-    }
-
-    fn verify_invalid_token_refresh_backend() -> String {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").expect("bind invalid verify refresh backend");
-        let address = listener.local_addr().expect("local address");
-        thread::spawn(move || {
-            let mut marker_seen = false;
-            for _ in 0..4 {
-                let (mut stream, _) = listener.accept().expect("accept verify request");
-                let request = read_complete_http_request(&mut stream);
-                if request.contains("/local-client/refresh") {
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"setup_run_token":"otsr_verify_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
-                    );
-                } else if request.contains("/local-client/verification-marker")
-                    && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
-                {
-                    marker_seen = true;
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"source":"codex","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
-                    );
-                } else if request.contains("/local-client/verification-marker")
-                    && request.contains("X-Ottto-Setup-Run-Token: otsr_stale_verify")
-                {
-                    write_json_response(
-                        &mut stream,
-                        400,
-                        "Bad Request",
-                        r#"{"detail":"Setup run companion token is invalid"}"#,
-                    );
-                } else if request.contains("/local-client/verification")
-                    && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
-                    && marker_seen
-                {
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"verified":true,"records_seen":1,"last_record_id":"rec_test","last_received_at":"2026-06-11T18:00:00Z","smoke_after":"2026-06-11T17:59:00Z"}"#,
-                    );
-                    break;
-                } else if request.contains("/local-client/verification")
-                    && request.contains("X-Ottto-Setup-Run-Token: otsr_stale_verify")
-                {
-                    write_json_response(
-                        &mut stream,
-                        400,
-                        "Bad Request",
-                        r#"{"detail":"Setup run companion token is invalid"}"#,
-                    );
-                } else {
-                    write_json_response(
-                        &mut stream,
-                        400,
-                        "Bad Request",
-                        r#"{"detail":"unexpected invalid-token refresh request"}"#,
-                    );
-                }
-            }
-        });
-        format!("http://{address}")
-    }
-
-    fn verify_rebound_token_refresh_backend() -> String {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").expect("bind rebound verify refresh backend");
-        let address = listener.local_addr().expect("local address");
-        thread::spawn(move || {
-            let mut marker_seen = false;
-            for _ in 0..4 {
-                let (mut stream, _) = listener.accept().expect("accept verify request");
-                let request = read_complete_http_request(&mut stream);
-                if request.contains("/local-client/refresh") {
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"setup_run_id":"setup_verify_rebound","setup_run_token":"otsr_verify_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
-                    );
-                } else if request.contains(
-                    "/api/v1/setup-runs/setup_verify_rebound/local-client/verification-marker",
-                ) && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
-                {
-                    marker_seen = true;
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"source":"codex","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
-                    );
-                } else if request.contains(
-                    "/api/v1/setup-runs/setup_verify_stale/local-client/verification-marker",
-                ) && request.contains("X-Ottto-Setup-Run-Token: otsr_stale_verify")
-                {
-                    write_json_response(
-                        &mut stream,
-                        400,
-                        "Bad Request",
-                        r#"{"detail":"Setup run companion token is invalid"}"#,
-                    );
-                } else if request
-                    .contains("/api/v1/setup-runs/setup_verify_rebound/local-client/verification")
-                    && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
-                    && marker_seen
-                {
-                    write_json_response(
-                        &mut stream,
-                        200,
-                        "OK",
-                        r#"{"verified":true,"records_seen":1,"last_record_id":"rec_test","last_received_at":"2026-06-11T18:00:00Z","smoke_after":"2026-06-11T17:59:00Z"}"#,
-                    );
-                    break;
-                } else if request
-                    .contains("/api/v1/setup-runs/setup_verify_stale/local-client/verification")
-                    && request.contains("X-Ottto-Setup-Run-Token: otsr_stale_verify")
-                {
-                    write_json_response(
-                        &mut stream,
-                        400,
-                        "Bad Request",
-                        r#"{"detail":"Setup run companion token is invalid"}"#,
-                    );
-                } else {
-                    write_json_response(
-                        &mut stream,
-                        400,
-                        "Bad Request",
-                        r#"{"detail":"unexpected rebound-token refresh request"}"#,
-                    );
-                }
-            }
-        });
-        format!("http://{address}")
-    }
-
     fn setup_verify_action_backend_error_server(
         completed_body: Arc<Mutex<Option<serde_json::Value>>>,
     ) -> String {
@@ -28910,7 +28586,7 @@ log_user_prompt = true
                     write_json_response(&mut stream, 200, "OK", "{}");
                 } else if request.contains("/local-client/next-action") {
                     let body = if next_action_calls == 0 {
-                        r#"{"action":{"id":"action_verify_codex","action_type":"verify_source","source":"codex"}}"#
+                        r#"{"action":{"id":"action_verify_claude_code","action_type":"verify_source","source":"claude_code"}}"#
                     } else {
                         r#"{"action":null}"#
                     };
@@ -28919,14 +28595,14 @@ log_user_prompt = true
                     if next_action_calls > 1 {
                         break;
                     }
-                } else if request.contains("/actions/action_verify_codex/events") {
+                } else if request.contains("/actions/action_verify_claude_code/events") {
                     write_json_response(&mut stream, 200, "OK", "{}");
                 } else if request.contains("/local-client/verification-marker") {
                     write_json_response(
                         &mut stream,
                         200,
                         "OK",
-                        r#"{"source":"codex","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
+                        r#"{"source":"claude_code","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
                     );
                 } else if request.contains("/local-client/verification") {
                     write_json_response(
@@ -28935,7 +28611,7 @@ log_user_prompt = true
                         "Service Unavailable",
                         r#"{"detail":"warehouse timeout request_id=req_hidden"}"#,
                     );
-                } else if request.contains("/actions/action_verify_codex/complete") {
+                } else if request.contains("/actions/action_verify_claude_code/complete") {
                     let body: serde_json::Value =
                         serde_json::from_str(http_request_body(&request)).expect("complete json");
                     *completed_body.lock().expect("completed body lock") = Some(body);
@@ -28943,7 +28619,7 @@ log_user_prompt = true
                         &mut stream,
                         200,
                         "OK",
-                        r#"{"run":{"id":"setup_error_complete","status":"waiting_for_user","machine_id":"machine_test"},"sources":[{"source":"codex","detected":true,"readiness_percent":70,"state":"failed","missing_fields":[]}],"next_action":null,"next_question":null}"#,
+                        r#"{"run":{"id":"setup_error_complete","status":"waiting_for_user","machine_id":"machine_test"},"sources":[{"source":"claude_code","detected":true,"readiness_percent":70,"state":"failed","missing_fields":[]}],"next_action":null,"next_question":null}"#,
                     );
                 } else {
                     write_json_response(

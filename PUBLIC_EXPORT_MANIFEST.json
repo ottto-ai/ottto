@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 428,
-  "content_sha256": "0a7d5fc53389ddc7bae4f8a37444d93a171f4fad6b60df19bfdb6d9eb8c9ec6e",
+  "candidate_file_count": 429,
+  "content_sha256": "d09ac93177be49aaf0c02cc4836ad6c96b7df1fff291cb7dd38202a07263dd68",
   "files": [
     {
       "executable": false,
@@ -762,8 +762,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "6b3a2f9164aca81ca5f6deefcbbb15b918293a5b28686efadbd46fecaf2d21b2",
-      "size_bytes": 1179153
+      "sha256": "adaa5bde1e15f37f3b152b2a688c7c976d777f906e93fa057ffccefe5e8df596",
+      "size_bytes": 1168550
     },
     {
       "executable": false,
@@ -825,8 +825,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "3fee39f6921ebd9145da8db1ccd27aab2def7c3d1bf70d188611bc34ecf46e21",
-      "size_bytes": 332986
+      "sha256": "815dba6865169e33fb66157b4d33cc0fcc9508ec3d32340b90c6eafabcc3cb05",
+      "size_bytes": 340682
     },
     {
       "executable": false,
@@ -839,8 +839,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/main.rs",
-      "sha256": "b5461b607a1d1d7d87b6d5fbc3e7427a7fab58ade8e5e1b688dd885be781295c",
-      "size_bytes": 38664
+      "sha256": "0429a317875d1b61b2c69d1e510bfd36cbfcecfd066d473da6aef6ca72bb4924",
+      "size_bytes": 38996
     },
     {
       "executable": false,
@@ -1077,8 +1077,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "bf7e9f2f3cb5276085a30991a0177aeeb0507753c7896bf35a48a2f2ae5ea8bf",
-      "size_bytes": 20637
+      "sha256": "cdb827d5419d456ba91064b47687b973811feb3436b4b69dfcb905279b664213",
+      "size_bytes": 21578
     },
     {
       "executable": false,
@@ -1919,6 +1919,13 @@
       "path": "docs/session-2026-10-04-claude-login-phase0.md",
       "sha256": "ef0df8633404bfef0329720fa71f47d89d34ade7a99cd276e61b09cfaed6aea5",
       "size_bytes": 3573
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-04-codex-managed-telemetry-source-off.md",
+      "sha256": "65ba2701707c8164f34c06f4af9600714f639c1c8c9a5f7db9e0eaeb5ff10cb5",
+      "size_bytes": 3005
     },
     {
       "executable": false,
@@ -2999,9 +3006,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-04T20:19:15+00:00",
+  "generated_at": "2026-10-04T21:06:33+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 429,
+  "output_file_count": 430,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3035,5 +3042,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "9936d31d34f211a60c8aca6e668b2a6bf7f8829a"
+  "source_commit": "0dca0669d67e883b7613dc6009383201a1e2605f"
 }

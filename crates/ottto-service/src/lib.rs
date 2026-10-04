@@ -1009,7 +1009,48 @@ impl LocalDaemon {
         let mut state = self.state()?;
         let observed_at = current_rfc3339_timestamp();
         state.stamp_first_seen(&result.source, result.last_received_at.as_deref());
-        let health = source_health_from_verification(&state, result, &observed_at);
+        let mut health = source_health_from_verification(&state, result, &observed_at);
+        if result.source == SourceKind::Codex && result.message.code == "codex_local_import" {
+            if let Some(existing) = state
+                .sources
+                .iter()
+                .find(|source| source.source == SourceKind::Codex)
+            {
+                health.collector = existing.collector.clone();
+                // Preserve historical evidence without stamping a new upload check.
+                health.last_seen_at = existing.last_seen_at.clone();
+                health.last_verified_at = existing.last_verified_at.clone();
+                // The same generic problem code also represents auth/upload failures.
+                // Only retired transport-specific witnesses may be cleared by readiness.
+                let retired_transport = state
+                    .command_ledger
+                    .iter()
+                    .rev()
+                    .find(|command| command.action_id == "verify_codex")
+                    .and_then(|command| command.error_code.as_deref())
+                    .is_some_and(|code| {
+                        matches!(code, "no_fresh_telemetry" | "relay_device_not_provisioned")
+                    });
+                let retained = existing
+                    .problems
+                    .iter()
+                    .filter(|problem| match problem.code {
+                        StableProblemCode::ConfigDrift
+                        | StableProblemCode::ConfigMissing
+                        | StableProblemCode::SourceNotInstalled => false,
+                        StableProblemCode::TelemetryNotVerified => !retired_transport,
+                        _ => true,
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !retained.is_empty() {
+                    health.state = existing.state.clone();
+                    health.grade = existing.grade.clone();
+                    health.problems.extend(retained);
+                    health.recommended_actions = existing.recommended_actions.clone();
+                }
+            }
+        }
         if let Some(existing) = state
             .sources
             .iter_mut()
@@ -1020,6 +1061,11 @@ impl LocalDaemon {
             state.sources.push(health);
         }
         state.persist_source_state(&result.source);
+        // Configuration readiness is not an end-to-end verification witness.
+        // Do not append VerifyPassed/VerifyFailed for an intentionally absent transport.
+        if result.source == SourceKind::Codex && result.message.code == "codex_local_import" {
+            return Ok(());
+        }
         let sequence = next_local_health_sequence(&state);
         let machine_id = state.machine.machine_id.clone();
         let source_slug = source_slug(&result.source);
@@ -3177,7 +3223,8 @@ fn normalize_persisted_source_health(state: &DaemonState, health: &mut SourceHea
 /// latter is what Companion install actions provision on this Mac.
 fn telemetry_configured_for_source(source: &SourceKind) -> Option<bool> {
     match source {
-        SourceKind::Codex | SourceKind::ClaudeCode => Some(
+        SourceKind::Codex => Some(false),
+        SourceKind::ClaudeCode => Some(
             keychain::TelemetryKeyStore::production()
                 .latest_key_id(source)
                 .is_ok_and(|key| key.is_some())
@@ -3364,7 +3411,11 @@ fn source_health_from_verification(
                 retryable: false,
             }],
         )
-    } else if patch_disabled || usage_limited || pi_local_only {
+    } else if patch_disabled
+        || usage_limited
+        || pi_local_only
+        || (result.source == SourceKind::Codex && result.message.code == "codex_local_import")
+    {
         (
             SourceState::Healthy,
             if usage_limited || pi_local_only {
@@ -3450,7 +3501,12 @@ fn source_health_from_verification(
                 result.config.fingerprint.clone(),
             )),
         }]
-    } else if result.verified || patch_disabled || usage_limited || telemetry_disabled_by_admin {
+    } else if result.verified
+        || patch_disabled
+        || usage_limited
+        || telemetry_disabled_by_admin
+        || (result.source == SourceKind::Codex && result.message.code == "codex_local_import")
+    {
         Vec::new()
     } else {
         vec![RepairAction {
@@ -3486,7 +3542,11 @@ fn source_health_from_verification(
         detected_uses,
         active_session_reconciliation: None,
         last_seen_at: result.last_received_at.clone(),
-        last_verified_at: if result.verified {
+        last_verified_at: if result.source == SourceKind::Codex
+            && result.message.code == "codex_local_import"
+        {
+            None
+        } else if result.verified {
             result
                 .last_received_at
                 .clone()
@@ -6234,6 +6294,115 @@ mod tests {
     }
 
     #[test]
+    fn codex_source_off_mode_is_not_a_verification_witness_or_retry_loop() {
+        let daemon = daemon().with_account(account("user_1", "test@example.com"));
+        let mut result = verified_codex("2026-05-05T10:20:00Z");
+        result.status = SourceVerificationStatus::Warning;
+        result.verified = false;
+        result.message.code = "codex_local_import".to_string();
+        result.records_seen = 0;
+        result.last_record_id = None;
+        result.last_received_at = None;
+        result.smoke_after = None;
+        assert!(!verification_result_records_success(&result));
+        daemon.record_verification_result(&result).unwrap();
+        let status = daemon.status(TOKEN).unwrap();
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert!(status.sources[0].last_verified_at.is_none());
+        assert!(status.sources[0].last_seen_at.is_none());
+        assert!(status.sources[0].recommended_actions.is_empty());
+        assert!(status
+            .local_health_events
+            .iter()
+            .all(|event| !matches!(event.event_type.as_str(), "VerifyPassed" | "VerifyFailed")));
+        assert!(daemon
+            .sources_with_blocking_verification_failure()
+            .unwrap()
+            .is_empty());
+        result.config.drift.push(ottto_protocol::ConfigDrift {
+            key: "codex.config_toml".into(),
+            expected: RedactedValue::String("valid".into()),
+            observed: RedactedValue::String("invalid".into()),
+        });
+        daemon.record_verification_result(&result).unwrap();
+        assert_eq!(
+            daemon.status(TOKEN).unwrap().sources[0].state,
+            SourceState::NeedsRepair
+        );
+        result.config.drift.clear();
+        {
+            let mut state = daemon.inner.lock().unwrap();
+            state.sources[0].state = SourceState::Failed;
+            state.sources[0].grade = HealthGrade::Critical;
+            state.sources[0].last_seen_at = Some("2026-05-05T10:00:00Z".into());
+            state.sources[0].last_verified_at = Some("2026-05-05T10:01:00Z".into());
+            state.sources[0].problems = vec![ottto_protocol::HealthProblem {
+                code: StableProblemCode::Unknown,
+                title: "Collector parse failure".into(),
+                detail: "parse_error".into(),
+                retryable: false,
+            }];
+        }
+        daemon.record_verification_result(&result).unwrap();
+        let status = daemon.status(TOKEN).unwrap();
+        assert_eq!(status.sources[0].state, SourceState::Failed);
+        assert_eq!(status.sources[0].problems[0].detail, "parse_error");
+        assert_eq!(
+            status.sources[0].last_seen_at.as_deref(),
+            Some("2026-05-05T10:00:00Z")
+        );
+        assert_eq!(
+            status.sources[0].last_verified_at.as_deref(),
+            Some("2026-05-05T10:01:00Z")
+        );
+        result.message.code = "setup_run_token_expired".into();
+        result.status = SourceVerificationStatus::ReconnectRequired;
+        daemon.record_verification_result(&result).unwrap();
+        assert_eq!(
+            daemon.status(TOKEN).unwrap().sources[0].state,
+            SourceState::Failed
+        );
+        result.status = SourceVerificationStatus::Warning;
+        result.message.code = "codex_local_import".into();
+        daemon.record_verification_result(&result).unwrap();
+        let status = daemon.status(TOKEN).unwrap();
+        assert_eq!(
+            status.sources[0].state,
+            SourceState::Failed,
+            "readiness cannot erase prior backend auth failure"
+        );
+        assert!(status.sources[0]
+            .problems
+            .iter()
+            .any(|problem| problem.code == StableProblemCode::TelemetryNotVerified));
+    }
+
+    #[test]
+    fn codex_source_off_readiness_clears_resolved_source_absence() {
+        let daemon = daemon().with_account(account("user_1", "test@example.com"));
+        let mut result = verified_codex("2026-05-05T10:20:00Z");
+        result.status = SourceVerificationStatus::Failed;
+        result.verified = false;
+        result.message.code = "source_not_installed".into();
+        result.records_seen = 0;
+        result.last_record_id = None;
+        result.last_received_at = None;
+        result.smoke_after = None;
+        daemon.record_verification_result(&result).unwrap();
+        assert_eq!(
+            daemon.status(TOKEN).unwrap().sources[0].state,
+            SourceState::NotFound
+        );
+        result.status = SourceVerificationStatus::Warning;
+        result.message.code = "codex_local_import".into();
+        daemon.record_verification_result(&result).unwrap();
+        let status = daemon.status(TOKEN).unwrap();
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert!(status.sources[0].problems.is_empty());
+        assert!(status.sources[0].recommended_actions.is_empty());
+    }
+
+    #[test]
     fn warning_verification_without_success_never_projects_healthy() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let result = SourceVerificationResult {
@@ -8040,13 +8209,13 @@ mod tests {
             Some(true)
         );
 
-        // After a legacy Codex key is stored, Codex also reports configured.
+        // A legacy key cannot re-enable Codex managed telemetry.
         keychain::TelemetryKeyStore::production()
             .save(&SourceKind::Codex, "key_test", "secret")
             .expect("save telemetry key");
         assert_eq!(
             telemetry_configured_for_source(&SourceKind::Codex),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             telemetry_configured_for_source(&SourceKind::ClaudeCode),
