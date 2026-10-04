@@ -896,7 +896,22 @@ pub(crate) fn resolve_mcp_program(command: &str, spawn_dir: Option<&Path>) -> Mc
             McpProgram::Resolved(base.join(path))
         });
     }
-    crate::command_env::executable_path(command).map_or(McpProgram::NotFound, McpProgram::Resolved)
+    match crate::command_env::executable_path(command) {
+        None => McpProgram::NotFound,
+        Some(found) => pin_search_result(found, std::env::current_dir().ok().as_deref()),
+    }
+}
+
+/// A relative search-path entry would resolve against the server's own cwd at
+/// spawn time; pin it to the daemon's directory, where it was found, so the
+/// inspected and spawned programs are the same file.
+fn pin_search_result(found: PathBuf, daemon_dir: Option<&Path>) -> McpProgram {
+    if found.is_absolute() {
+        return McpProgram::Resolved(found);
+    }
+    daemon_dir.map_or(McpProgram::Unresolvable, |dir| {
+        McpProgram::Resolved(dir.join(found))
+    })
 }
 
 /// A whole word `claude` (a path segment or word; `.claude` config dirs and
@@ -1611,6 +1626,28 @@ mod tests {
         // The read happened 2 s ago (for example logging blocked): expired.
         old.evidence_read_at = Instant::now() - Duration::from_secs(2);
         assert!(matches!(old.spawn(), Err(ClaudeSpawnFailure::Expired)));
+    }
+
+    /// Review round 1: a bare MCP command found through a relative search-path
+    /// entry is pinned to an absolute path, so the spawn (which sets the
+    /// server's cwd) runs the same file the check inspected.
+    #[test]
+    fn bare_mcp_command_from_a_relative_search_path_entry_is_pinned() {
+        let daemon_dir = Path::new("/var/daemon-cwd");
+        match pin_search_result(PathBuf::from("rel-bin/runner"), Some(daemon_dir)) {
+            McpProgram::Resolved(path) => {
+                assert_eq!(path, daemon_dir.join("rel-bin/runner"));
+            }
+            _ => panic!("must resolve"),
+        }
+        assert!(matches!(
+            pin_search_result(PathBuf::from("rel-bin/runner"), None),
+            McpProgram::Unresolvable
+        ));
+        assert!(matches!(
+            pin_search_result(PathBuf::from("/opt/bin/runner"), None),
+            McpProgram::Resolved(path) if path == Path::new("/opt/bin/runner")
+        ));
     }
 
     /// Review round 1: every credential-using argv runs with no user MCP
