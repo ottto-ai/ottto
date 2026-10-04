@@ -3127,6 +3127,23 @@ fn collect_claude_status(
                 ));
         }
         ClaudeLocalLoginState::NotSignedIn
+            if claude_default_settings_select_api_key(&claude_settings_paths()) =>
+        {
+            // No OAuth login, but the settings authenticate Claude Code with an
+            // API key: signed in, with no subscription identity or usage.
+            let mut auth = serde_json::Map::new();
+            auth.insert("loggedIn".to_string(), Value::Bool(true));
+            auth.insert("authMethod".to_string(), Value::from("api_key"));
+            auth.insert("apiProvider".to_string(), Value::from("anthropic"));
+            snapshot.account = Some(parse_claude_auth_json(&Value::Object(auth)));
+            snapshot.status = AgentStatusState::Available;
+            snapshot
+                .diagnostics
+                .push(default_claude_identity_diagnostic(
+                    ClaudeSlotProbeFailure::IdentityUnknown,
+                ));
+        }
+        ClaudeLocalLoginState::NotSignedIn
         | ClaudeLocalLoginState::NeedsLogin
         | ClaudeLocalLoginState::SignedOutByCli => {
             snapshot.account = Some(unsupported_account("anthropic"));
@@ -30555,6 +30572,36 @@ exit 44
         );
         assert_eq!(provider_calls(), before + 1, "the default login asks once");
         assert_only_version_probes(&fixture.spawns(), "takeover");
+    }
+
+    /// An API-key-only installation (settings `apiKeyHelper`, no OAuth login)
+    /// is still reported as signed in with the API-key method, not as a
+    /// missing login.
+    #[test]
+    #[serial]
+    fn api_key_only_default_install_is_signed_in_without_subscription_identity() {
+        let fixture = Phase0Fixture::new("api-key-only", false);
+        let home = fixture.root.join("home");
+        fs::write(
+            home.join(".claude").join("settings.json"),
+            r#"{"apiKeyHelper":"/usr/local/bin/print-key"}"#,
+        )
+        .expect("settings");
+        let collection = fixture.collect();
+        let account = collection
+            .source_health_snapshot
+            .account
+            .clone()
+            .expect("default account");
+        assert_eq!(account.login_state, AgentLoginState::SignedIn);
+        assert_eq!(account.auth_method.as_deref(), Some("api_key"));
+        assert_eq!(account.billing_channel.as_deref(), Some("direct_api"));
+        assert_eq!(account.account_identifier_hash, None);
+        assert_ne!(
+            fixture.status().default_slot.collection.state,
+            ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
+        );
+        assert_only_version_probes(&fixture.spawns(), "api-key");
     }
 
     #[test]

@@ -312,6 +312,9 @@ pub(crate) struct ClaudeSpawnPermit {
     command: Command,
     class: ClaudeSpawnClass,
     admitted_at: Instant,
+    /// Wall-clock admission time: `Instant` does not advance while the Mac
+    /// sleeps, so a permit held across sleep must still expire.
+    admitted_wall: SystemTime,
 }
 
 impl std::fmt::Debug for ClaudeSpawnPermit {
@@ -376,7 +379,10 @@ impl ClaudeSpawnPermit {
     /// and a wall clock, so a Mac that sleeps while the child runs still kills
     /// it once the real time budget is gone.
     pub(crate) fn spawn(mut self) -> std::io::Result<ClaudeChild> {
-        if self.admitted_at.elapsed() > PERMIT_SPAWN_WINDOW {
+        let wall_elapsed_ok = SystemTime::now()
+            .duration_since(self.admitted_wall)
+            .is_ok_and(|elapsed| elapsed <= PERMIT_SPAWN_WINDOW);
+        if self.admitted_at.elapsed() > PERMIT_SPAWN_WINDOW || !wall_elapsed_ok {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "Claude spawn permit expired before spawn",
@@ -518,6 +524,7 @@ fn admit_with(
         command,
         class,
         admitted_at: Instant::now(),
+        admitted_wall: SystemTime::now(),
     })
 }
 
@@ -1242,6 +1249,48 @@ mod tests {
         assert_eq!(env_value(command, "CLAUDE_CONFIG_DIR"), Some(None));
         assert_eq!(env_value(command, "CLAUDE_CODE_OAUTH_TOKEN"), Some(None));
         assert_eq!(evidence.reads.get(), 2);
+    }
+
+    /// A permit held across sleep (wall clock moved, monotonic clock did not)
+    /// or past the spawn window can no longer spawn.
+    #[test]
+    #[serial_test::serial]
+    fn stale_permits_cannot_spawn_even_across_sleep() {
+        let _fixture = GateFixture::new("stale-permit");
+        let evidence = fresh_evidence();
+        let version = ClaudeSpawnClass::VersionProbe {
+            max_runtime: Duration::from_secs(3),
+        };
+        let mut slept = admit_with(
+            ClaudeSpawnTarget::Default,
+            version,
+            &["--version"],
+            &evidence,
+        )
+        .expect("admitted");
+        slept.admitted_wall = SystemTime::now() - Duration::from_secs(3 * 60 * 60);
+        assert!(slept.spawn().is_err(), "wall clock advanced during sleep");
+        let mut future = admit_with(
+            ClaudeSpawnTarget::Default,
+            version,
+            &["--version"],
+            &evidence,
+        )
+        .expect("admitted");
+        future.admitted_wall = SystemTime::now() + Duration::from_secs(60);
+        assert!(
+            future.spawn().is_err(),
+            "a backward clock jump fails closed"
+        );
+        let fresh = admit_with(
+            ClaudeSpawnTarget::Default,
+            version,
+            &["--version"],
+            &evidence,
+        )
+        .expect("admitted");
+        let (mut child, _) = fresh.spawn().expect("prompt spawn").into_parts();
+        assert!(child.wait().expect("wait").success());
     }
 
     #[test]
