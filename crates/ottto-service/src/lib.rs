@@ -1017,6 +1017,9 @@ impl LocalDaemon {
                 .find(|source| source.source == SourceKind::Codex)
             {
                 health.collector = existing.collector.clone();
+                // Preserve historical evidence without stamping a new upload check.
+                health.last_seen_at = existing.last_seen_at.clone();
+                health.last_verified_at = existing.last_verified_at.clone();
                 // The same generic problem code also represents auth/upload failures.
                 // Only retired transport-specific witnesses may be cleared by readiness.
                 let retired_transport = state
@@ -3537,7 +3540,11 @@ fn source_health_from_verification(
         detected_uses,
         active_session_reconciliation: None,
         last_seen_at: result.last_received_at.clone(),
-        last_verified_at: if result.verified {
+        last_verified_at: if result.source == SourceKind::Codex
+            && result.message.code == "codex_local_import"
+        {
+            None
+        } else if result.verified {
             result
                 .last_received_at
                 .clone()
@@ -6299,6 +6306,8 @@ mod tests {
         daemon.record_verification_result(&result).unwrap();
         let status = daemon.status(TOKEN).unwrap();
         assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert!(status.sources[0].last_verified_at.is_none());
+        assert!(status.sources[0].last_seen_at.is_none());
         assert!(status.sources[0].recommended_actions.is_empty());
         assert!(status
             .local_health_events
@@ -6323,6 +6332,8 @@ mod tests {
             let mut state = daemon.inner.lock().unwrap();
             state.sources[0].state = SourceState::Failed;
             state.sources[0].grade = HealthGrade::Critical;
+            state.sources[0].last_seen_at = Some("2026-05-05T10:00:00Z".into());
+            state.sources[0].last_verified_at = Some("2026-05-05T10:01:00Z".into());
             state.sources[0].problems = vec![ottto_protocol::HealthProblem {
                 code: StableProblemCode::Unknown,
                 title: "Collector parse failure".into(),
@@ -6334,6 +6345,14 @@ mod tests {
         let status = daemon.status(TOKEN).unwrap();
         assert_eq!(status.sources[0].state, SourceState::Failed);
         assert_eq!(status.sources[0].problems[0].detail, "parse_error");
+        assert_eq!(
+            status.sources[0].last_seen_at.as_deref(),
+            Some("2026-05-05T10:00:00Z")
+        );
+        assert_eq!(
+            status.sources[0].last_verified_at.as_deref(),
+            Some("2026-05-05T10:01:00Z")
+        );
         result.message.code = "setup_run_token_expired".into();
         result.status = SourceVerificationStatus::ReconnectRequired;
         daemon.record_verification_result(&result).unwrap();
@@ -8163,13 +8182,13 @@ mod tests {
             Some(true)
         );
 
-        // After a legacy Codex key is stored, Codex also reports configured.
+        // A legacy key cannot re-enable Codex managed telemetry.
         keychain::TelemetryKeyStore::production()
             .save(&SourceKind::Codex, "key_test", "secret")
             .expect("save telemetry key");
         assert_eq!(
             telemetry_configured_for_source(&SourceKind::Codex),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             telemetry_configured_for_source(&SourceKind::ClaudeCode),

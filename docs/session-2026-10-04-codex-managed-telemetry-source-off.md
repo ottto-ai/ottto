@@ -24,3 +24,18 @@ actual configuration, account and collection failures remain visible.
 No implemented local Codex OTLP consumer is removed. This does not claim all
 provider calls have rollout records: background calls without local session
 representation remain outside currently supported usage capture.
+
+Local-import readiness requires this Mac's Codex device registration and usable
+source credentials, detected Codex local files or executable, clean configuration,
+and no no-touch override. Missing registration follows the existing install path.
+Setup summaries carry optional `local_import_ready` and
+`live_telemetry_required` flags; older summaries remain decodable. Configuration
+checks report no record identifiers or receive/smoke timestamps, and cannot mint
+an upload verification witness. Actual setup execution failures retain their
+error codes and report local-import readiness false.
+
+The containing release requires compatible setup admission and companion UI.
+Companion checks must say **Local import configured** and **Upload not checked**;
+first-data onboarding still requires accepted data. Source tests are separate from
+installed acceptance: a signed containing release and ordinary client restart
+are needed before claiming the managed exporter has stopped in live processes.

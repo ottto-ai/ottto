@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 427,
-  "content_sha256": "ef1aed368af9555fa6102909035f048497bdacc5ec8925bf57092bc0f6b0fe47",
+  "content_sha256": "632b4b5eda28b31cad5e8b5f3f533a742690cf8aef767d6ea47a0bd202b7416c",
   "files": [
     {
       "executable": false,
@@ -762,8 +762,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "84eb9a7c419c7c4ca3b8ea7213eb9c765245f2fa27206435d354b57eda6a7080",
-      "size_bytes": 1164080
+      "sha256": "0e2db84029f65b4958e6702d5b9ac4eb3c6779a9ccd9418924bfa0208b666f0d",
+      "size_bytes": 1167197
     },
     {
       "executable": false,
@@ -825,8 +825,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "034fbb1db1024e894767442a4ddd3baa6d257ba9dbb65234f9b099148426d7ab",
-      "size_bytes": 338548
+      "sha256": "ef744b4e758f06315598906228c98cbe97f0c0f38a14704e057ccdf024557cf6",
+      "size_bytes": 339453
     },
     {
       "executable": false,
@@ -1924,8 +1924,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-04-codex-managed-telemetry-source-off.md",
-      "sha256": "644b82a07a145a4a3fa864ae74d8cc03aa42c350c314160fd4ae29b1cdce61f0",
-      "size_bytes": 1546
+      "sha256": "05980b81b280075ee9b6c35edfadef81cbcdad5909ca4b1a8b40d9d156d10238",
+      "size_bytes": 2540
     },
     {
       "executable": false,
@@ -2992,7 +2992,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-04T19:16:54+00:00",
+  "generated_at": "2026-10-04T20:14:23+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 428,
   "public_roots": [
@@ -3028,5 +3028,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "9936d31d34f211a60c8aca6e668b2a6bf7f8829a"
+  "source_commit": "3e10da501c9f21db979d0378b3e844bd6a0d9948"
 }

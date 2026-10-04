@@ -7668,6 +7668,10 @@ struct SetupRunSourceApiResponse {
     state: String,
     #[serde(default)]
     missing_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_import_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live_telemetry_required: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -7752,12 +7756,19 @@ fn setup_result_from_detail(
         .iter()
         .filter(|source| source.detected)
         .map(|source| {
-            json!({
+            let mut summary = json!({
                 "source": source.source,
                 "state": source.state,
                 "readiness_percent": source.readiness_percent,
                 "missing_fields": source.missing_fields,
-            })
+            });
+            if let Some(ready) = source.local_import_ready {
+                summary["local_import_ready"] = json!(ready);
+            }
+            if let Some(required) = source.live_telemetry_required {
+                summary["live_telemetry_required"] = json!(required);
+            }
+            summary
         })
         .collect::<Vec<_>>();
 
@@ -8389,17 +8400,18 @@ fn setup_action_execution_error_result(
     error: &LocalApiError,
 ) -> (String, String, serde_json::Value) {
     let (error_code, error_message) = setup_action_execution_error_detail(error);
-    (
-        "failed".to_string(),
-        error_message.clone(),
-        json!({
-            "action_type": action.action_type.as_str(),
-            "source": action.source.as_deref().or_else(|| source.map(source_slug)),
-            "verified": false,
-            "error_code": error_code,
-            "error_message": error_message,
-        }),
-    )
+    let mut result = json!({
+        "action_type": action.action_type.as_str(),
+        "source": action.source.as_deref().or_else(|| source.map(source_slug)),
+        "verified": false,
+        "error_code": error_code,
+        "error_message": error_message,
+    });
+    if source == Some(&SourceKind::Codex) {
+        result["live_telemetry_required"] = json!(false);
+        result["local_import_ready"] = json!(false);
+    }
+    ("failed".to_string(), error_message, result)
 }
 
 fn setup_action_execution_error_detail(error: &LocalApiError) -> (&'static str, String) {
@@ -8797,6 +8809,19 @@ fn run_install_source_action(
             &message,
         );
         if let Some(cleanup) = codex_cleanup {
+            result["live_telemetry_required"] = json!(false);
+            result["local_import_ready"] = json!(
+                snapshot_device_credentials_include_source("codex")
+                    && codex_config_state_at(
+                        &home_path(".codex/config.toml"),
+                        "~/.codex/config.toml",
+                        "",
+                        false
+                    )
+                    .drift
+                    .is_empty()
+                    && !source_patch_disabled(&source_kind)
+            );
             result["managed_telemetry_disabled"] = json!(!source_patch_disabled(&source_kind));
             result["config_updated"] = json!(cleanup.changed);
             result["requires_restart"] = json!(cleanup.changed);
@@ -10857,7 +10882,7 @@ fn run_verify_source_action(
                 "status": verification_status_slug(&result.status), "verified": false, "records_seen": 0,
                 "last_record_id": null, "last_received_at": null, "smoke_after": null,
                 "local_import_ready": ready, "live_telemetry_required": false,
-                "message_code": result.message.code, "requires_restart": ready,
+                "message_code": result.message.code,
                 "error_code": if ready { serde_json::Value::Null } else { json!(result.message.code) },
                 "error_message": if ready { serde_json::Value::Null } else { json!(result.message.text) }
             }),
@@ -12685,14 +12710,16 @@ fn scan_source(source: &SourceKind) -> SetupScanSource {
             let telemetry_installed = false;
             let local_import_ready =
                 (command_found || config.exists() || home_path(".codex/sessions").exists())
+                    && snapshot_device_credentials_include_source("codex")
                     && codex_config_state_at(&config, "~/.codex/config.toml", "", false)
                         .drift
                         .is_empty();
             let managed_config = codex_managed_config_preview(config_body.as_deref());
+            let local_import_ready = local_import_ready && !source_patch_disabled(source);
             let mut scan_entry = setup_scan_source(
                 source,
                 "codex",
-                command_found || config.exists(),
+                command_found || config.exists() || home_path(".codex/sessions").exists(),
                 command_found,
                 telemetry_installed,
                 if local_import_ready {
@@ -13056,7 +13083,11 @@ fn claude_code_telemetry_config_installed(body: &str) -> bool {
 fn snapshot_device_credentials_include_source(source: &str) -> bool {
     crate::snapshot_client::load_snapshot_device_credentials()
         .ok()
-        .is_some_and(|(device, _secret)| {
+        .is_some_and(|(device, secret)| {
+            if source == "codex" && (device.device_id.trim().is_empty() || secret.trim().is_empty())
+            {
+                return false;
+            }
             device
                 .sources
                 .iter()
@@ -13438,7 +13469,11 @@ fn verify_source(
     };
 
     if source == SourceKind::Codex {
-        let result = if source_binary_present(&source) {
+        let result = if !snapshot_device_credentials_include_source("codex") {
+            verification_result_with_config(source, config, SourceVerificationStatus::Warning, false,
+                0, None, None, None, "relay_device_not_provisioned",
+                "Codex local import needs this Mac's source registration. Finish setup in Ottto, then check again.")
+        } else if source_binary_present(&source) {
             codex_local_import_verification(config)
         } else {
             not_installed_verification_result(source, config)
@@ -26145,6 +26180,19 @@ X-API-Key = "otel_redacted"
         let _home = EnvVarGuard::set_path("HOME", &root);
         let _support =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let secret_root = root.join("secrets");
+        fs::create_dir_all(&secret_root).unwrap();
+        let _secret = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".into(),
+                machine_id: None,
+                sources: vec!["codex".into()],
+            })
+            .unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .unwrap();
         let connection = LocalConnectionBinding {
             setup_run_id: "test".into(),
             setup_run_token_expires_at: "2000-01-01T00:00:00Z".into(),
@@ -26155,6 +26203,10 @@ X-API-Key = "otel_redacted"
         let daemon = daemon()
             .with_account(connected_account())
             .with_connection(Some(connection.clone()));
+        let registered = scan_source(&SourceKind::Codex);
+        assert_eq!(registered.live_telemetry_required, Some(false));
+        assert_eq!(registered.local_import_ready, Some(true));
+        assert!(!registered.telemetry_installed);
         let result = verify_source(
             &daemon,
             &RequestAuthorization::TrustedCompanionApp,
@@ -26214,6 +26266,20 @@ X-API-Key = "otel_redacted"
             assert_eq!(payload["local_import_ready"], false);
             assert_eq!(payload["error_code"], "patch_disabled");
         }
+        FileDeviceStore::default().reset().unwrap();
+        assert_eq!(
+            scan_source(&SourceKind::Codex).local_import_ready,
+            Some(false)
+        );
+        let result = verify_source(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            SourceKind::Codex,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.message.code, "relay_device_not_provisioned");
+        assert!(!result.verified);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -27401,12 +27467,8 @@ X-API-Key = "otel_redacted"
         let root = control_test_root("verify-no-account");
         create_control_test_dir(&root.join(".codex"));
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
-        patch_codex_config_at_with_relay_base(
-            &root.join(".codex/config.toml"),
-            &root.join("support"),
-            &crate::otlp_relay::default_local_relay_base_url(),
-        )
-        .expect("seed clean config");
+        fs::write(root.join(".codex/config.toml"), "model = \"gpt-6.1-sol\"\n")
+            .expect("seed clean config");
         let daemon = daemon().with_connection(Some(LocalConnectionBinding {
             setup_run_id: "setup_stale".to_string(),
             setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
@@ -27750,18 +27812,18 @@ X-API-Key = "otel_redacted"
         let support_root = root.join("support");
         let secret_root = telemetry_key_store_root("setup-action-token-refresh-secret");
         fs::create_dir_all(&secret_root).expect("secret root");
-        let fake_codex = fake_binary_path(&root, "codex");
-        fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex smoke");
+        let fake_claude = fake_binary_path(&root, "claude");
+        fs::write(&fake_claude, "#!/bin/sh\nexit 0\n").expect("write fake claude smoke");
         #[cfg(unix)]
-        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
-            .expect("mark fake codex executable");
+        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755))
+            .expect("mark fake claude executable");
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
         let _support_guard =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
         let _path_guard = EnvVarGuard::set_os(
             "OTTTO_COMMAND_SEARCH_PATH",
-            fake_codex
+            fake_claude
                 .parent()
                 .expect("fake binary parent")
                 .as_os_str()
@@ -27771,7 +27833,7 @@ X-API-Key = "otel_redacted"
             .save(&LocalDeviceBinding {
                 device_id: "device_test".to_string(),
                 machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
+                sources: vec!["claude_code".to_string()],
             })
             .expect("persist relay device binding");
         KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
@@ -27799,7 +27861,7 @@ X-API-Key = "otel_redacted"
         let response = setup_action(
             &daemon,
             &RequestAuthorization::Token("token".to_string()),
-            SourceKind::Codex,
+            SourceKind::ClaudeCode,
             "verify_source".to_string(),
             Some(api_base_url.clone()),
         )
@@ -27819,7 +27881,7 @@ X-API-Key = "otel_redacted"
             response
                 .pointer("/actions/0/source")
                 .and_then(serde_json::Value::as_str),
-            Some("codex")
+            Some("claude_code")
         );
         assert_eq!(
             response
@@ -28324,7 +28386,7 @@ X-API-Key = "otel_redacted"
                             &mut stream,
                             200,
                             "OK",
-                            r#"{"id":"action_verify_codex","action_type":"verify_source","source":"codex"}"#,
+                            r#"{"id":"action_verify_claude","action_type":"verify_source","source":"claude_code"}"#,
                         );
                     } else {
                         write_json_response(
@@ -28360,7 +28422,7 @@ X-API-Key = "otel_redacted"
                         continue;
                     }
                     let body = if next_action_calls == 0 {
-                        r#"{"action":{"id":"action_verify_codex","action_type":"verify_source","source":"codex"}}"#
+                        r#"{"action":{"id":"action_verify_claude","action_type":"verify_source","source":"claude_code"}}"#
                     } else {
                         r#"{"action":null}"#
                     };
@@ -28369,7 +28431,7 @@ X-API-Key = "otel_redacted"
                     if next_action_calls > 1 {
                         break;
                     }
-                } else if request.contains("/actions/action_verify_codex/events") {
+                } else if request.contains("/actions/action_verify_claude/events") {
                     if event_calls == 0 {
                         event_calls += 1;
                         write_json_response(
@@ -28406,7 +28468,7 @@ X-API-Key = "otel_redacted"
                             &mut stream,
                             200,
                             "OK",
-                            r#"{"source":"codex","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
+                            r#"{"source":"claude_code","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
                         );
                     } else {
                         write_json_response(
@@ -28447,7 +28509,7 @@ X-API-Key = "otel_redacted"
                         r#"{{"setup_run_token":"{token}","expires_at":"2026-06-11T18:30:00Z"}}"#
                     );
                     write_json_response(&mut stream, 200, "OK", &body);
-                } else if request.contains("/actions/action_verify_codex/complete") {
+                } else if request.contains("/actions/action_verify_claude/complete") {
                     if complete_calls == 0 {
                         complete_calls += 1;
                         write_json_response(
@@ -28466,7 +28528,7 @@ X-API-Key = "otel_redacted"
                             &mut stream,
                             200,
                             "OK",
-                            r#"{"run":{"id":"setup_token_refresh","status":"complete","machine_id":"machine_test"},"sources":[{"source":"codex","detected":true,"readiness_percent":100,"state":"verified","missing_fields":[]}],"next_action":null,"next_question":null}"#,
+                            r#"{"run":{"id":"setup_token_refresh","status":"complete","machine_id":"machine_test"},"sources":[{"source":"claude_code","detected":true,"readiness_percent":100,"state":"verified","missing_fields":[]}],"next_action":null,"next_question":null}"#,
                         );
                     } else {
                         write_json_response(
