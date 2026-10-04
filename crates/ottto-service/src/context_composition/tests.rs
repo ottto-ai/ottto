@@ -101,7 +101,12 @@ fn measure_synthetic_workspace() {
     };
     let source_label = agent_source_label(source);
     let start = Instant::now();
-    let scans = discover_workspaces(&root.join("transcripts"), SystemTime::now());
+    let scans = discover_workspaces(
+        &root.join("transcripts"),
+        SystemTime::now(),
+        Instant::now() + Duration::from_secs(300),
+    )
+    .unwrap();
     let discovery_us = start.elapsed().as_micros();
     assert!(scans.len() <= 1, "fixture cache expects one workspace");
     let mut reports = Vec::new();
@@ -128,7 +133,8 @@ fn measure_synthetic_workspace() {
             }
         }
         let deadline = Instant::now() + Duration::from_secs(300);
-        let report = build_report_for_scan(scan, source, wide_window(), deadline);
+        let report = build_report_for_scan(scan, source, wide_window(), deadline)
+            .expect("measurement report deadline expired");
         // The stat-derived counters assume the bounded loop reached every file.
         // Fail the sample instead of publishing those counters after a timeout.
         assert!(
@@ -814,4 +820,61 @@ fn config_hash_is_stable_and_source_specific() {
     assert_eq!(a, b);
     assert_ne!(a, c);
     assert_eq!(a.len(), 64);
+}
+
+#[test]
+fn discovery_incomplete_transcript_refuses_partial_workspace_set() {
+    let root = crate::test_scratch::private_dir("composition-discovery-coverage");
+    let workspace = root.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let transcripts = root.join("transcripts");
+    fs::create_dir(&transcripts).unwrap();
+    fs::write(
+        transcripts.join("usable.jsonl"),
+        json!({"cwd":workspace}).to_string(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let scans = discover_workspaces(&transcripts, SystemTime::now(), deadline).unwrap();
+    assert_eq!(scans.len(), 1);
+    assert_eq!(scans[0].workspace, workspace);
+    fs::write(transcripts.join("unresolved.jsonl"), b"\xff\n").unwrap();
+    assert!(discover_workspaces(&transcripts, SystemTime::now(), deadline).is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn discovery_expired_budget_is_not_complete_empty_coverage() {
+    let root = crate::test_scratch::private_dir("composition-discovery-expired");
+    assert!(discover_workspaces(&root, SystemTime::now(), Instant::now()).is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn report_expired_budget_does_not_return_empty_or_partial_replacement() {
+    let path = write_jsonl(
+        "expired-report",
+        &[json!({"type":"user","message":{"content":"text"}})],
+    );
+    let scan = WorkspaceScan {
+        workspace: PathBuf::from("."),
+        files: vec![(path.clone(), SystemTime::now())],
+        last_seen: SystemTime::now(),
+    };
+    assert!(build_report_for_scan(
+        &scan,
+        SnapshotSource::ClaudeCode,
+        wide_window(),
+        Instant::now()
+    )
+    .is_none());
+    let empty = WorkspaceScan {
+        files: Vec::new(),
+        ..scan
+    };
+    assert!(
+        build_report_for_scan(&empty, SnapshotSource::Codex, wide_window(), Instant::now())
+            .is_none()
+    );
+    fs::remove_file(path).unwrap();
 }

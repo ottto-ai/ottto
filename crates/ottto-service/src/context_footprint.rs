@@ -1059,6 +1059,127 @@ pub(crate) fn cwd_values_from_jsonl(path: &Path) -> Vec<String> {
     out
 }
 
+/// Composition needs only the first cwd that still names a directory. Keep
+/// `cwd_values_from_jsonl` for footprint, which needs every candidate. Errors
+/// mean discovery is incomplete, never a proven absence of workspaces.
+pub(crate) fn first_existing_cwd_from_jsonl(
+    path: &Path,
+    deadline: Instant,
+) -> std::io::Result<Option<String>> {
+    let file = File::open(path)?;
+    let before = file.metadata()?;
+    let mut reader = BufReader::new(file);
+    let cwd = first_existing_cwd_in_reader(
+        &mut reader,
+        deadline,
+        crate::snapshots::MAX_JSONL_LINE_BYTES,
+    )?;
+    if !same_discovery_file(&before, &reader.get_ref().metadata()?)
+        || !same_discovery_file(&before, &fs::metadata(path)?)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "workspace discovery source changed",
+        ));
+    }
+    discovery_before_deadline(deadline)?;
+    Ok(cwd)
+}
+
+fn discovery_before_deadline(deadline: Instant) -> std::io::Result<()> {
+    if Instant::now() >= deadline {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "workspace discovery budget expired",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn same_discovery_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    if before.len() != after.len()
+        || before
+            .modified()
+            .ok()
+            .zip(after.modified().ok())
+            .map(|(a, b)| a == b)
+            != Some(true)
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn first_existing_cwd_in_reader(
+    reader: &mut impl BufRead,
+    deadline: Instant,
+    max_line_bytes: usize,
+) -> std::io::Result<Option<String>> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        loop {
+            discovery_before_deadline(deadline)?;
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                break;
+            }
+            let count = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            if count > max_line_bytes.saturating_sub(line.len()) {
+                // Skipping this record could skip the first usable cwd.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "workspace discovery record exceeds JSONL bound",
+                ));
+            }
+            line.extend_from_slice(&available[..count]);
+            reader.consume(count);
+            if line.last() == Some(&b'\n') {
+                break;
+            }
+        }
+        discovery_before_deadline(deadline)?;
+        if line.is_empty() {
+            return Ok(None);
+        }
+        // `lines()` in the all-cwd oracle stops at invalid UTF-8. Do not
+        // continue past it and select a cwd the original caller cannot see.
+        let text = std::str::from_utf8(&line).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "workspace discovery UTF-8 error",
+            )
+        })?;
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        if let Some(cwd) = string_at(&value, &["cwd"])
+            .or_else(|| string_at(&value, &["payload", "cwd"]))
+            .or_else(|| string_at(&value, &["turn_context", "payload", "cwd"]))
+        {
+            if Path::new(cwd).is_dir() {
+                discovery_before_deadline(deadline)?;
+                return Ok(Some(cwd.to_string()));
+            }
+        }
+    }
+}
+
 fn string_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     let mut current = value;
     for key in path {
@@ -1265,6 +1386,265 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         test_scratch::private_dir(&format!("ottto-context-footprint-{name}"))
+    }
+
+    fn discovery_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    #[test]
+    fn first_existing_cwd_matches_all_cwd_oracle_and_field_precedence() {
+        let root = temp_dir("cwd-parity");
+        let workspace = root.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let vanished = root.join("vanished");
+        let regular_file = root.join("regular-file");
+        fs::write(&regular_file, "file").unwrap();
+        let variants = [
+            json!({"cwd": workspace}),
+            json!({"payload": {"cwd": workspace}}),
+            json!({"turn_context": {"payload": {"cwd": workspace}}}),
+            json!({"cwd": null, "payload": {"cwd": workspace}}),
+        ];
+        for variant in variants {
+            let path = root.join("session.jsonl");
+            let records = [
+                json!({"cwd":vanished, "payload":{"cwd":workspace}}),
+                json!({"cwd":regular_file}),
+                json!({"cwd":17}),
+                json!({"other":"no cwd"}),
+                variant,
+                json!({"cwd":root}),
+            ];
+            let text = records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\r\n");
+            fs::write(&path, format!("not json\n{text}")).unwrap();
+            let all = cwd_values_from_jsonl(&path);
+            let expected = all.iter().find(|cwd| Path::new(cwd).is_dir()).cloned();
+            assert_eq!(
+                first_existing_cwd_from_jsonl(&path, discovery_deadline()).unwrap(),
+                expected
+            );
+            assert_eq!(expected, Some(workspace.to_string_lossy().into_owned()));
+            // The footprint caller still receives later candidates.
+            assert_eq!(all.last().unwrap(), &root.to_string_lossy());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn first_existing_cwd_absent_malformed_and_valid_unterminated_records() {
+        let root = temp_dir("cwd-trailing");
+        let path = root.join("session.jsonl");
+        for text in [
+            "",
+            "not json\n{}\n",
+            "{\"cwd\":null}\n{\"cwd\":",
+            "{\"cwd\":\"\"}",
+        ] {
+            fs::write(&path, text).unwrap();
+            assert_eq!(
+                first_existing_cwd_from_jsonl(&path, discovery_deadline()).unwrap(),
+                None
+            );
+        }
+        fs::write(&path, json!({"payload":{"cwd":root}}).to_string()).unwrap();
+        assert_eq!(
+            first_existing_cwd_from_jsonl(&path, discovery_deadline()).unwrap(),
+            Some(root.to_string_lossy().into_owned())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn first_existing_cwd_bounds_and_read_errors_are_incomplete() {
+        let deadline = discovery_deadline();
+        assert!(first_existing_cwd_in_reader(
+            &mut std::io::Cursor::new(b"{}\n"),
+            Instant::now(),
+            64
+        )
+        .is_err());
+        // A giant record cannot be skipped: it could contain the first cwd.
+        assert!(first_existing_cwd_in_reader(
+            &mut std::io::Cursor::new(b"{\"cwd\":\"long\"}\n{}\n"),
+            deadline,
+            8
+        )
+        .is_err());
+        assert!(
+            first_existing_cwd_in_reader(&mut std::io::Cursor::new(b"\xff\n"), deadline, 64)
+                .is_err()
+        );
+        struct ReadError;
+        impl std::io::Read for ReadError {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("synthetic read error"))
+            }
+        }
+        assert!(
+            first_existing_cwd_in_reader(&mut BufReader::new(ReadError), deadline, 64).is_err()
+        );
+    }
+
+    #[test]
+    fn first_existing_cwd_checks_deadline_after_read_and_record_boundaries() {
+        struct SlowRead;
+        impl std::io::Read for SlowRead {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(10));
+                buffer[..3].copy_from_slice(b"{}\n");
+                Ok(3)
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let error =
+            first_existing_cwd_in_reader(&mut BufReader::new(SlowRead), deadline, 64).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            first_existing_cwd_in_reader(
+                &mut std::io::Cursor::new(b"{}\n"),
+                discovery_deadline(),
+                3
+            )
+            .unwrap(),
+            None
+        );
+        assert!(first_existing_cwd_in_reader(
+            &mut std::io::Cursor::new(b"{}\r\n"),
+            discovery_deadline(),
+            3
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn first_existing_cwd_stops_before_unneeded_tail() {
+        let root = temp_dir("cwd-short-circuit");
+        let prefix = format!("{}\n", json!({"cwd":root}));
+        struct PrefixOnly(std::io::Cursor<Vec<u8>>);
+        impl std::io::Read for PrefixOnly {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.position() == self.0.get_ref().len() as u64 {
+                    panic!("reader reached tail after first usable cwd");
+                }
+                std::io::Read::read(&mut self.0, bytes)
+            }
+        }
+        let mut reader = BufReader::new(PrefixOnly(std::io::Cursor::new(prefix.into_bytes())));
+        assert_eq!(
+            first_existing_cwd_in_reader(&mut reader, discovery_deadline(), 1024).unwrap(),
+            Some(root.to_string_lossy().into_owned())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_file_witness_refuses_append_shrink_rewrite_and_replace() {
+        let root = temp_dir("cwd-mutation");
+        let path = root.join("session.jsonl");
+        let replacement = root.join("replacement.jsonl");
+        fs::write(&path, "original").unwrap();
+        let file = File::open(&path).unwrap();
+        let before = file.metadata().unwrap();
+        assert!(same_discovery_file(&before, &fs::metadata(&path).unwrap()));
+        for text in ["mutated!", "original plus append", "short"] {
+            fs::write(&path, text).unwrap();
+            assert!(!same_discovery_file(&before, &file.metadata().unwrap()));
+        }
+        let current = file.metadata().unwrap();
+        fs::write(&replacement, "rewritten").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert!(!same_discovery_file(
+            &current,
+            &fs::metadata(&path).unwrap()
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Bounded, opt-in offline discovery measurement. Emits no source content
+    /// or cwd. Each mode must run in a fresh process for comparable peak RSS.
+    #[test]
+    #[ignore]
+    fn measure_first_existing_cwd() {
+        use std::io::Read;
+        let path = PathBuf::from(std::env::var("OTTTO_DISCOVERY_SPECIMEN").unwrap());
+        let mode = std::env::var("OTTTO_DISCOVERY_MODE").unwrap();
+        let before = fs::metadata(&path).unwrap();
+        assert!(before.is_file() && before.len() <= 128 * 1024 * 1024);
+        fn usage() -> libc::rusage {
+            let mut out = std::mem::MaybeUninit::uninit();
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, out.as_mut_ptr()) },
+                0
+            );
+            unsafe { out.assume_init() }
+        }
+        fn cpu_us(u: &libc::rusage) -> i128 {
+            (i128::from(u.ru_utime.tv_sec) + i128::from(u.ru_stime.tv_sec)) * 1_000_000
+                + i128::from(u.ru_utime.tv_usec)
+                + i128::from(u.ru_stime.tv_usec)
+        }
+        if mode == "parity" {
+            struct CountedRead {
+                file: File,
+                bytes: u64,
+            }
+            impl Read for CountedRead {
+                fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                    let n = self.file.read(buffer)?;
+                    self.bytes += n as u64;
+                    Ok(n)
+                }
+            }
+            let expected = cwd_values_from_jsonl(&path)
+                .into_iter()
+                .find(|cwd| Path::new(cwd).is_dir());
+            let mut reader = BufReader::new(CountedRead {
+                file: File::open(&path).unwrap(),
+                bytes: 0,
+            });
+            let actual = first_existing_cwd_in_reader(
+                &mut reader,
+                discovery_deadline(),
+                crate::snapshots::MAX_JSONL_LINE_BYTES,
+            )
+            .unwrap();
+            assert!(actual == expected, "discovery parity mismatch");
+            assert!(
+                first_existing_cwd_from_jsonl(&path, discovery_deadline()).unwrap() == expected,
+                "opened-file discovery parity mismatch"
+            );
+            assert!(same_discovery_file(&before, &fs::metadata(&path).unwrap()));
+            println!(
+                "DISCOVERY {}",
+                json!({"mode":mode, "source_bytes":before.len(), "reader_bytes":reader.get_ref().bytes, "record_bytes":reader.get_ref().bytes - reader.buffer().len() as u64, "same":true, "found":actual.is_some()})
+            );
+            return;
+        }
+        let cpu_before = usage();
+        let start = Instant::now();
+        let cwd = match mode.as_str() {
+            "full" => cwd_values_from_jsonl(&path)
+                .into_iter()
+                .find(|cwd| Path::new(cwd).is_dir()),
+            "early" => first_existing_cwd_from_jsonl(&path, discovery_deadline()).unwrap(),
+            _ => panic!("unsupported measurement mode"),
+        };
+        let elapsed_us = start.elapsed().as_micros();
+        let after = usage();
+        assert!(same_discovery_file(&before, &fs::metadata(&path).unwrap()));
+        #[cfg(target_os = "macos")]
+        let peak_rss_bytes = after.ru_maxrss;
+        #[cfg(not(target_os = "macos"))]
+        let peak_rss_bytes = after.ru_maxrss * 1024;
+        println!(
+            "DISCOVERY {}",
+            json!({"mode":mode, "source_bytes":before.len(), "elapsed_us":elapsed_us, "cpu_us":cpu_us(&after)-cpu_us(&cpu_before), "peak_rss_bytes":peak_rss_bytes, "found":cwd.is_some()})
+        );
     }
 
     fn run_git(repo: &Path, args: &[&str]) {
