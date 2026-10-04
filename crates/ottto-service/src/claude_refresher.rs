@@ -247,27 +247,31 @@ fn maybe_refresh_with(
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.access_expires_at.clone());
-    let failed = {
-        let _guard = state_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut state = load_state(support_dir);
-        // A new credential (a different access deadline) clears an old failure.
-        if let Some(failed) = state.failed.get(slot_id) {
-            if current_expiry.as_deref() != Some(failed.access_expires_at.as_str()) {
-                state.failed.remove(slot_id);
-                let _ = write_state(support_dir, &state);
-            }
-        }
-        state.failed.get(slot_id).cloned()
-    };
     let network_enabled = !crate::agent_status::claude_oauth_usage_network_disabled();
-    // Check and reserve the slot in one critical section, so two overlapping
-    // collection passes can never both start a refresher for it.
+    // Read the failure history, check and reserve the slot in one critical
+    // section (`running`, then the state lock; the waiter records its
+    // outcome and releases the slot under the same `running` lock), so two
+    // overlapping passes can never both start a refresher, and no pass
+    // decides from a failure history older than the last finished attempt.
     {
         let mut reserved = running()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failed = {
+            let _guard = state_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = load_state(support_dir);
+            // A new credential (a different access deadline) clears an old
+            // failure.
+            if let Some(failed) = state.failed.get(slot_id) {
+                if current_expiry.as_deref() != Some(failed.access_expires_at.as_str()) {
+                    state.failed.remove(slot_id);
+                    let _ = write_state(support_dir, &state);
+                }
+            }
+            state.failed.get(slot_id).cloned()
+        };
         let decision = decide_refresh(
             live,
             enabled && network_enabled,
@@ -352,13 +356,17 @@ fn maybe_refresh_with(
                 outcome_code(outcome),
                 started.elapsed().as_secs()
             );
-            if outcome != RefreshOutcome::Refreshed {
-                record_failure(&support_dir, &slot_id, &before_expires_at, outcome, intact);
+            {
+                // Record and release together, under the lock passes decide
+                // in.
+                let mut reserved = running()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if outcome != RefreshOutcome::Refreshed {
+                    record_failure(&support_dir, &slot_id, &before_expires_at, outcome, intact);
+                }
+                reserved.remove(&slot_id);
             }
-            running()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&slot_id);
             // Collect again right away. (Not in unit tests: a detached status
             // pass must never outlive a test's throwaway environment.)
             #[cfg(not(test))]

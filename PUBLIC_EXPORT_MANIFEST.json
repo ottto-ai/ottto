@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 426,
-  "content_sha256": "cf7edcc837310e3f7462fa77eed982bd2d86f20b906947921067bd11dec5b316",
+  "content_sha256": "0598f7df9e407a575a435b476238690e31cfd2c3ddccab26ad8c91c652d0b5a6",
   "files": [
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_refresher.rs",
-      "sha256": "f40e8912220f7e6308f1c4e0a47879a7bd61044de966a0024e008e640f709eaf",
-      "size_bytes": 38792
+      "sha256": "3a258114d0749e17c3308f000e6d8b58607f07c4daf283b1d44ee84fd9f6290a",
+      "size_bytes": 39270
     },
     {
       "executable": false,
@@ -2985,7 +2985,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-04T12:04:37+00:00",
+  "generated_at": "2026-10-04T12:06:27+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 427,
   "public_roots": [
@@ -3021,5 +3021,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c0e2d0796fe6d3b195375f9405a5db323c124ae1"
+  "source_commit": "d0a55faea34393b1f1022aebda03b5030b541851"
 }
