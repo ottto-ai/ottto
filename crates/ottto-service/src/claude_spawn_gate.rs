@@ -127,23 +127,122 @@ pub(crate) fn check_short_claude_run(slot: &ClaudeConfigDirSlot) -> Result<(), C
     decision
 }
 
+/// Claude Code's own refresh window: it refreshes when the access token
+/// expires within 5 minutes.
+pub(crate) const CLI_REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// How often a Claude process left running near a refresh is re-checked.
+const LEFT_RUNNING_POLL: Duration = Duration::from_millis(500);
+
+/// Whether killing a Claude Code process of this login could cut a token
+/// refresh short: the access token is within the CLI's 5-minute window or
+/// expired (or its expiry is unknown, or the read failed), or the CLI's
+/// refresh lock exists at any age. Pure.
+pub(crate) fn kill_could_cut_a_refresh(
+    credential: ClaudeGateCredential,
+    refresh_lock_exists: bool,
+    now: OffsetDateTime,
+) -> bool {
+    if refresh_lock_exists {
+        return true;
+    }
+    match credential {
+        ClaudeGateCredential::Absent
+        | ClaudeGateCredential::Present {
+            has_refresh_token: false,
+            ..
+        } => false,
+        ClaudeGateCredential::ReadFailed
+        | ClaudeGateCredential::Present {
+            access_expires_at: None,
+            ..
+        } => true,
+        ClaudeGateCredential::Present {
+            access_expires_at: Some(expires_at),
+            ..
+        } => expires_at - now <= TimeDuration::try_from(CLI_REFRESH_WINDOW).expect("window"),
+    }
+}
+
+fn kill_could_cut_a_refresh_now(slot: &ClaudeConfigDirSlot) -> bool {
+    kill_could_cut_a_refresh(
+        crate::agent_status::read_claude_spawn_gate_credential(slot),
+        refresh_lock_dir(slot).is_some_and(|dir| dir.join(REFRESH_LOCK_FILE).exists()),
+        OffsetDateTime::now_utc(),
+    )
+}
+
+/// The one way a timed-out Claude Code process of `slot` is stopped. It is
+/// killed only when that cannot cut a token refresh short; otherwise it is
+/// left to finish (its output drained) and killed only once the login is out
+/// of the refresh window and the lock is gone. Returns whether it was left
+/// running.
+pub(crate) fn stop_claude_child(
+    mut child: std::process::Child,
+    slot: &ClaudeConfigDirSlot,
+    label: &'static str,
+) -> bool {
+    if !kill_could_cut_a_refresh_now(slot) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    }
+    eprintln!("claude_short_run decision=left_running reason=refresh_window label={label}");
+    for pipe in [
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let mut pipe = pipe;
+        let _ = std::thread::Builder::new()
+            .name("ottto-claude-left-running-drain".to_string())
+            .spawn(move || {
+                let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+            });
+    }
+    let slot = slot.clone();
+    let _ = std::thread::Builder::new()
+        .name("ottto-claude-left-running".to_string())
+        .spawn(move || loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => {}
+            }
+            if !kill_could_cut_a_refresh_now(&slot) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            std::thread::sleep(LEFT_RUNNING_POLL);
+        });
+    true
+}
+
+/// Pin a short Claude run to the login the gate evaluated: `CLAUDE_CONFIG_DIR`
+/// set to that login's config dir (unset for the default login), and no
+/// `CLAUDE_SECURESTORAGE_CONFIG_DIR`, which would select another keychain
+/// item.
+pub(crate) fn pin_claude_login(command: &mut std::process::Command, slot: &ClaudeConfigDirSlot) {
+    match slot.config_dir() {
+        Some(config_dir) => command.env("CLAUDE_CONFIG_DIR", config_dir),
+        None => command.env_remove("CLAUDE_CONFIG_DIR"),
+    };
+    command.env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR");
+}
+
 /// The directory holding this login's refresh lock (its config dir;
 /// `~/.claude` for the default login).
 pub(crate) fn refresh_lock_dir(slot: &ClaudeConfigDirSlot) -> Option<std::path::PathBuf> {
     slot.credentials_path(&crate::agent_status::home_dir())
         .parent()
         .map(Path::to_path_buf)
-}
-
-/// A Claude Code process is refreshing this login right now: its refresh
-/// lock was touched within [`REFRESH_LOCK_FRESHNESS`] (a lock stamped in the
-/// future counts as fresh).
-pub(crate) fn refresh_in_progress(config_dir: &Path) -> bool {
-    refresh_lock_modified(config_dir).is_some_and(|modified| {
-        SystemTime::now()
-            .duration_since(modified)
-            .map_or(true, |age| age < REFRESH_LOCK_FRESHNESS)
-    })
 }
 
 /// Modification time of Claude Code's refresh lock. Read-only: the lock
@@ -330,6 +429,68 @@ mod tests {
             has_refresh_token: true,
             access_expires_at: Some(at(0) + expires_in),
         }
+    }
+
+    #[test]
+    fn a_kill_never_lands_near_a_refresh() {
+        let now = at(0);
+        // Inside the CLI's 5-minute window, expired, unknown or unreadable:
+        // never killed. Outside it with no lock: killed.
+        for (credential, lock, expected) in [
+            (present(TimeDuration::minutes(5)), false, true),
+            (present(-TimeDuration::hours(2)), false, true),
+            (
+                ClaudeGateCredential::Present {
+                    has_refresh_token: true,
+                    access_expires_at: None,
+                },
+                false,
+                true,
+            ),
+            (ClaudeGateCredential::ReadFailed, false, true),
+            (present(TimeDuration::hours(3)), true, true),
+            (ClaudeGateCredential::Absent, true, true),
+            (present(TimeDuration::minutes(6)), false, false),
+            (ClaudeGateCredential::Absent, false, false),
+            (
+                ClaudeGateCredential::Present {
+                    has_refresh_token: false,
+                    access_expires_at: None,
+                },
+                false,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                kill_could_cut_a_refresh(credential, lock, now),
+                expected,
+                "{credential:?} lock={lock}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_runs_are_pinned_to_the_evaluated_login() {
+        let run = |slot: &ClaudeConfigDirSlot| {
+            let mut command = std::process::Command::new("/usr/bin/env");
+            command
+                .env("CLAUDE_CONFIG_DIR", "/tmp/ottto-ambient-slot")
+                .env(
+                    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+                    "/tmp/ottto-ambient-store",
+                );
+            pin_claude_login(&mut command, slot);
+            String::from_utf8(command.output().expect("env").stdout).expect("utf8")
+        };
+        let default = run(&ClaudeConfigDirSlot::Default);
+        assert!(!default.contains("CLAUDE_CONFIG_DIR="), "{default}");
+        assert!(!default.contains("CLAUDE_SECURESTORAGE_CONFIG_DIR="));
+        let slot = ClaudeConfigDirSlot::registered("/tmp/ottto-evaluated-slot").expect("slot");
+        let registered = run(&slot);
+        assert!(registered
+            .lines()
+            .any(|line| line == "CLAUDE_CONFIG_DIR=/tmp/ottto-evaluated-slot"));
+        assert!(!registered.contains("CLAUDE_SECURESTORAGE_CONFIG_DIR="));
     }
 
     #[test]

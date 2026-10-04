@@ -11232,6 +11232,11 @@ fn run_bounded_command(
     if program == "pi" {
         command.envs(crate::command_env::provider_env());
     }
+    // The Claude smoke runs on the default login, the one its gate checked.
+    let claude_login = (program == "claude").then_some(ottto_core::ClaudeConfigDirSlot::Default);
+    if let Some(login) = claude_login.as_ref() {
+        crate::claude_spawn_gate::pin_claude_login(&mut command, login);
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
@@ -11283,10 +11288,22 @@ fn run_bounded_command(
                 };
             }
             Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let (diagnostic, usage_limited) =
-                    read_command_diagnostic_with_flags(stdout_reader, stderr_reader);
+                let left_running = match claude_login.as_ref() {
+                    Some(login) => {
+                        crate::claude_spawn_gate::stop_claude_child(child, login, "smoke")
+                    }
+                    None => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        false
+                    }
+                };
+                // A run left to finish keeps its pipes open: do not wait on them.
+                let (diagnostic, usage_limited) = if left_running {
+                    (None, false)
+                } else {
+                    read_command_diagnostic_with_flags(stdout_reader, stderr_reader)
+                };
                 return SmokeResult {
                     command_found: true,
                     succeeded: false,

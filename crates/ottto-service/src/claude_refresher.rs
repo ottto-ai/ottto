@@ -198,6 +198,11 @@ pub(crate) fn maybe_refresh(
         &default_support_dir(),
         &ProductionLauncher,
         &|| {
+            // Re-read "Keep my Claude accounts signed in" right before the
+            // spawn: the pass's copy may be older than the user's switch-off.
+            if !crate::agent_status::claude_keep_signed_in_now() {
+                return Some("consent_off");
+            }
             crate::agent_status::claude_refresher_skip_reason(slot, live, OffsetDateTime::now_utc())
         },
     )
@@ -217,6 +222,7 @@ impl RefreshLauncher for ProductionLauncher {
             .ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "Claude Code CLI not found")
             })?;
+        crate::claude_spawn_gate::pin_claude_login(&mut command, slot);
         command
             .current_dir(cwd)
             .stdin(Stdio::null())

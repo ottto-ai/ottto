@@ -345,8 +345,9 @@ off), Ottto keeps each registered slot and the default login signed in:
 - It runs only for logins whose `/usage` refreshes: the stored scopes include
   `user:profile`, `.claude.json` `oauthAccount.billingType` is not
   `usage_based`, and no other credential takes precedence (Bedrock, Vertex, an
-  auth token, `apiKeyHelper`, or an approved API key in that login's settings;
-  the same rules the status uses). A plan-usage snapshot under 60 seconds old
+  auth token, `apiKeyHelper`, or any `ANTHROPIC_API_KEY` in that login's
+  settings, approved or not, because `claude -p` uses it either way).
+  "Keep my Claude accounts signed in" is re-read right before each start. A plan-usage snapshot under 60 seconds old
   postpones it to a later pass.
 - Success is proved only by a new, later `expiresAt`. A first failure that
   leaves the login intact (refresh token present, not blanked; typically a
@@ -362,9 +363,13 @@ the refresh has advanced it, nor while it is expired or Claude Code holds its
 refresh lock. A skipped `/context` read retries in 30 minutes; a skipped Verify
 returns a warning asking to open Claude Code once (or wait), then Verify. A
 deferred MCP probe keeps the last uploaded inventory (or, without a fresh one,
-reports that server unreachable). A Claude Code MCP server whose login Claude
-Code is refreshing is never stopped mid-refresh; it is stopped once the refresh
-lock goes quiet.
+reports that server unreachable). Each of these runs is pinned to the login
+its gate checked (`CLAUDE_CONFIG_DIR` set to it, or unset for the default;
+no `CLAUDE_SECURESTORAGE_CONFIG_DIR`). A timed-out run is never killed while
+its login is inside Claude Code's 5-minute refresh window, expired, or has a
+refresh lock (any age); it is left to finish. If the registered-slot settings
+cannot be read, the saved slot states are kept for at most 6 passes or 1 hour,
+then marked stale.
 
 `refreshTokenExpiresAt` (about 28 days after a browser sign-in) is an absolute
 login horizon. Three days and one day before it, the slot (and the default

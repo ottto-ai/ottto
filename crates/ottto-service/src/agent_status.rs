@@ -3168,21 +3168,29 @@ fn claude_default_alternative_auth_now(oauth_usable: bool) -> Option<ClaudeAlter
         &ClaudeConfigDirSlot::Default,
         &|key| std::env::var(key).ok(),
         oauth_usable,
+        false,
     )
 }
 
 /// [`claude_alternative_auth`] for one login, read from that login's own
 /// settings, `.claude.json` approvals and stored Console key. `ambient` is the
 /// environment the Claude Code process for this login runs with.
+///
+/// `print_mode`: a `claude -p` run. Claude Code 2.1.288 (`Rb`: when the
+/// session is non-interactive, `ANTHROPIC_API_KEY` is returned before the
+/// `customApiKeyResponses` approval check) then uses any `ANTHROPIC_API_KEY`,
+/// approved or not.
 fn claude_alternative_auth_for_slot(
     slot: &ClaudeConfigDirSlot,
     ambient: &dyn Fn(&str) -> Option<String>,
     oauth_usable: bool,
+    print_mode: bool,
 ) -> Option<ClaudeAlternativeAuth> {
     claude_alternative_auth(
         &claude_settings_paths_for_slot(slot),
         ambient,
-        oauth_usable,
+        // The approval rule applies only while an OAuth login is usable.
+        oauth_usable && !print_mode,
         &claude_approved_api_key_suffixes(&slot.identity_path(&home_dir())),
         !oauth_usable && claude_stored_console_key_present(slot),
     )
@@ -3209,6 +3217,15 @@ fn claude_settings_paths_for_slot(slot: &ClaudeConfigDirSlot) -> Vec<(String, Pa
     }
 }
 
+/// "Keep my Claude accounts signed in", read now. A failed read counts as off.
+pub(crate) fn claude_keep_signed_in_now() -> bool {
+    FileClaudeConfigSlotSettingsStore::default()
+        .load()
+        .is_ok_and(|status| {
+            status.consent == ottto_protocol::ClaudeAccountUpkeepConsentState::Granted
+        })
+}
+
 /// A plan-usage snapshot younger than this is reused by `/usage`, which then
 /// refreshes nothing.
 const CLAUDE_USAGE_CACHE_REUSE_MS: i64 = 60_000;
@@ -3223,7 +3240,8 @@ const CLAUDE_USAGE_CACHE_REUSE_MS: i64 = 60_000;
 ///   Vertex, an auth token, `apiKeyHelper`, or an approved API key). Judged by
 ///   the same helper the status uses, with the refresher's own environment
 ///   (it starts Claude Code with a cleared environment, so only the login's
-///   settings files count);
+///   settings files count) and print-mode precedence: any `ANTHROPIC_API_KEY`
+///   in those settings counts, approved or not;
 /// - its plan-usage snapshot is under 60 seconds old (a later pass runs).
 pub(crate) fn claude_refresher_skip_reason(
     slot: &ClaudeConfigDirSlot,
@@ -3246,7 +3264,7 @@ pub(crate) fn claude_refresher_skip_reason(
     {
         return Some("usage_billing");
     }
-    if claude_alternative_auth_for_slot(slot, &|_| None, true).is_some() {
+    if claude_alternative_auth_for_slot(slot, &|_| None, true, true).is_some() {
         return Some("other_auth");
     }
     let fetched_at_ms = config.and_then(|value| {
@@ -3771,11 +3789,45 @@ fn load_claude_slot_settings_for_pass(
         .inspect_err(|_| eprintln!("claude_status registered_slots=unavailable"))
 }
 
+/// A failing registered-slot settings read keeps the last saved slot states
+/// and withholds default uploads for slot-owned accounts for at most this
+/// long, or this many consecutive passes.
+const CLAUDE_SETTINGS_FAILURE_BOUND: Duration = Duration::from_secs(60 * 60);
+const CLAUDE_SETTINGS_FAILURE_BOUND_PASSES: u32 = 6;
+
+/// Whether a run of failed settings reads (first failure at `since`, `passes`
+/// consecutive failed passes) has outlasted the bound. Pure.
+fn claude_settings_failure_outlasted(since: Instant, passes: u32, now: Instant) -> bool {
+    now.saturating_duration_since(since) >= CLAUDE_SETTINGS_FAILURE_BOUND
+        || passes >= CLAUDE_SETTINGS_FAILURE_BOUND_PASSES
+}
+
+/// Record this pass's settings read and say whether the failure run has
+/// outlasted the bound. A successful read resets it.
+fn claude_settings_failure_bound_exceeded(failed: bool) -> bool {
+    static RUN: OnceLock<Mutex<Option<(Instant, u32)>>> = OnceLock::new();
+    let mut run = RUN
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !failed {
+        *run = None;
+        return false;
+    }
+    let (since, passes) = run.get_or_insert((Instant::now(), 0));
+    *passes += 1;
+    claude_settings_failure_outlasted(*since, *passes, Instant::now())
+}
+
 fn collect_claude_status_snapshots(
     captured_at: String,
     expires_at: String,
 ) -> AgentStatusCollection {
     let settings = load_claude_slot_settings_for_pass().map(annotate_claude_accounts_status);
+    let settings_failure_outlasted = claude_settings_failure_bound_exceeded(settings.is_err());
+    if settings_failure_outlasted {
+        eprintln!("claude_status registered_slots=unavailable_past_bound saved_slot_states=stale");
+    }
     let slot_owned_bindings = settings
         .as_ref()
         .map(|status| {
@@ -4077,12 +4129,17 @@ fn collect_claude_status_snapshots(
     registered_slot_ids.sort();
     let canonical_anchors = canonical_registered_anchors(registered_slot_ids.clone(), &slot_states);
     let anchor_health_by_binding = canonical_anchor_health(&canonical_anchors, &slot_states);
-    let mut registered_owned = claude_registered_owned_bindings(
-        settings.is_ok(),
-        &registered_slot_ids,
-        &slot_states,
-        &previous_states.slots,
-    );
+    // Past the bound, saved ownership no longer withholds the default upload.
+    let mut registered_owned = if settings_failure_outlasted {
+        BTreeSet::new()
+    } else {
+        claude_registered_owned_bindings(
+            settings.is_ok(),
+            &registered_slot_ids,
+            &slot_states,
+            &previous_states.slots,
+        )
+    };
     registered_owned.extend(slot_owned_bindings.iter().cloned());
     let selection = select_claude_snapshot_candidates(&candidates, &canonical_anchors);
     let winning_accounts = selection
@@ -4200,6 +4257,14 @@ fn collect_claude_status_snapshots(
             &slot_states,
             &unresolved_accounts,
             &blocked_worker_receipt_descriptors,
+        );
+    } else if settings_failure_outlasted {
+        // Past the bound the saved registered-slot states are stale: a fresh
+        // one becomes a transient read failure (no repair asked).
+        let _ = persist_claude_slot_collection_states(
+            &claude_stale_saved_slot_states(&previous_states.slots),
+            &unresolved_accounts,
+            &BTreeMap::new(),
         );
     }
 
@@ -4619,6 +4684,24 @@ fn claude_registered_owned_bindings(
             ]
         })
         .flatten()
+        .collect()
+}
+
+/// The saved registered-slot states, with every fresh one marked a transient
+/// read failure.
+fn claude_stale_saved_slot_states(
+    previous: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+) -> BTreeMap<String, ClaudeConfigSlotCollectionStatusV1> {
+    previous
+        .iter()
+        .filter(|(slot_id, _)| slot_id.as_str() != "default")
+        .map(|(slot_id, status)| {
+            let mut status = status.clone();
+            if status.state == ClaudeConfigSlotCollectionStateV1::Fresh {
+                status.state = ClaudeConfigSlotCollectionStateV1::ProbeFailed;
+            }
+            (slot_id.clone(), status)
+        })
         .collect()
 }
 
@@ -31291,6 +31374,88 @@ exit 44
         );
     }
 
+    /// A settings-read failure keeps the saved slot states and withholds the
+    /// default upload only for a bounded run (6 passes or 1 hour): then the
+    /// default uploads again and the saved fresh slot states turn into a
+    /// transient read failure.
+    #[test]
+    #[serial]
+    fn a_settings_read_failure_stops_suppressing_after_the_bound() {
+        let since = Instant::now();
+        assert!(!claude_settings_failure_outlasted(since, 5, since));
+        assert!(claude_settings_failure_outlasted(since, 6, since));
+        assert!(claude_settings_failure_outlasted(
+            since,
+            1,
+            since + CLAUDE_SETTINGS_FAILURE_BOUND
+        ));
+
+        let fixture = Phase0Fixture::new("dropout-bound", true);
+        fixture.write_identity(&fixture.root.join("home"), SLOT_ACCOUNTS[0]);
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        let (owned_account, _) = Phase0Fixture::hashes(SLOT_ACCOUNTS[0]);
+        fixture.collect();
+        let uploads_owned = |collection: &AgentStatusCollection| {
+            collection.snapshots.iter().any(|snapshot| {
+                snapshot
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.account_identifier_hash.as_deref())
+                    == Some(owned_account.as_str())
+            })
+        };
+        let settings_path = FileClaudeConfigSlotSettingsStore::default()
+            .path()
+            .to_path_buf();
+        let original = fs::read(&settings_path).expect("settings");
+        fs::write(&settings_path, b"{").expect("unreadable settings");
+        for pass in 1..CLAUDE_SETTINGS_FAILURE_BOUND_PASSES {
+            assert!(!uploads_owned(&fixture.collect()), "pass {pass} withholds");
+        }
+        assert!(
+            uploads_owned(&fixture.collect()),
+            "past the bound the default uploads"
+        );
+        let saved = read_persisted_claude_slot_collection_state();
+        assert_eq!(
+            saved.slots[&fixture.slot_ids[0]].state,
+            ClaudeConfigSlotCollectionStateV1::ProbeFailed,
+            "saved fresh slot states are marked stale"
+        );
+        fs::write(&settings_path, original).expect("restore settings");
+        fixture.collect();
+    }
+
+    /// "Keep my Claude accounts signed in" is re-read right before a
+    /// refresher spawn: a pass holding an older "on" starts nothing once the
+    /// user turned it off.
+    #[test]
+    #[serial]
+    fn a_refresher_never_starts_after_keep_signed_in_is_turned_off() {
+        let fixture = Phase0Fixture::new("consent-race", false);
+        fixture.item(&fixture.slot(0), -TimeDuration::minutes(2));
+        let live = read_claude_live_login_for_slot(&fixture.slot(0));
+        // The pass read "on"; the user has turned it off since (the fixture
+        // stores off).
+        assert_eq!(
+            crate::claude_refresher::maybe_refresh(
+                &fixture.slot_ids[0],
+                &fixture.slot(0),
+                &live,
+                true
+            ),
+            crate::claude_refresher::RefreshDecision::NotNeeded
+        );
+        crate::claude_refresher::wait_until_idle(&fixture.slot_ids[0]);
+        assert!(
+            fixture
+                .spawns()
+                .into_iter()
+                .all(|line| line == "|--version"),
+            "no refresher started"
+        );
+    }
+
     /// The default login's upload drops plan observations (for example a
     /// Claude Desktop session bucket marked current) for accounts registered
     /// slots own, and keeps its own and unowned ones. A default candidate for
@@ -31856,7 +32021,11 @@ exit 44
             "settings.json",
             serde_json::json!({"env": {"ANTHROPIC_API_KEY": key}}),
         );
-        assert_eq!(skip(true), None, "a key the user did not approve");
+        assert_eq!(
+            skip(true),
+            Some("other_auth"),
+            "`-p` uses an ANTHROPIC_API_KEY even when the user did not approve it"
+        );
         write(
             ".claude.json",
             serde_json::json!({

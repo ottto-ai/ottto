@@ -656,10 +656,13 @@ fn harvest_stdio(
     cwd: Option<&str>,
     config_dir: Option<&Path>,
     server_env: &BTreeMap<String, String>,
-    claude_refresh_lock_dir: Option<&Path>,
+    claude_login: Option<&ottto_core::ClaudeConfigDirSlot>,
 ) -> Result<Vec<McpToolInput>> {
-    let mut child = env
-        .command_in(command, args, cwd, config_dir, server_env)
+    let mut command = env.command_in(command, args, cwd, config_dir, server_env);
+    if let Some(login) = claude_login {
+        crate::claude_spawn_gate::pin_claude_login(&mut command, login);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -688,17 +691,17 @@ fn harvest_stdio(
 
     match rx.recv_timeout(HANDSHAKE_TIMEOUT) {
         Ok(result) => {
-            reap_unless_refreshing(child, claude_refresh_lock_dir);
+            reap_unless_refreshing(child, claude_login);
             result
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             // Kill the child; the detached handshake thread unblocks on the
             // closed pipe and exits, then its send fails silently.
-            reap_unless_refreshing(child, claude_refresh_lock_dir);
+            reap_unless_refreshing(child, claude_login);
             Err(anyhow!("mcp handshake timed out"))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            reap_unless_refreshing(child, claude_refresh_lock_dir);
+            reap_unless_refreshing(child, claude_login);
             Err(anyhow!("mcp handshake thread ended unexpectedly"))
         }
     }
@@ -709,39 +712,20 @@ fn reap_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Stop a probed server, except a Claude Code server whose login Claude Code
-/// is refreshing right now: killing it before the rotated token is saved
-/// would sign the login out (anthropics/claude-code#95822). Such a server is
-/// left to exit on its own (its stdin is closed) and is stopped only once the
-/// refresh lock goes quiet.
-fn reap_unless_refreshing(mut child: Child, claude_refresh_lock_dir: Option<&Path>) {
-    let Some(lock_dir) = claude_refresh_lock_dir else {
-        reap_child(&mut child);
-        return;
-    };
-    if !crate::claude_spawn_gate::refresh_in_progress(lock_dir) {
-        reap_child(&mut child);
-        return;
+/// Stop a probed server. A Claude Code server is stopped through the shared
+/// `claude_spawn_gate::stop_claude_child`, which never kills it while that
+/// could cut its login's token refresh short.
+fn reap_unless_refreshing(
+    mut child: Child,
+    claude_login: Option<&ottto_core::ClaudeConfigDirSlot>,
+) {
+    match claude_login {
+        Some(login) => {
+            crate::claude_spawn_gate::stop_claude_child(child, login, "mcp_inventory");
+        }
+        None => reap_child(&mut child),
     }
-    eprintln!("mcp_harvest claude_server=left_running reason=refresh_in_progress");
-    let lock_dir = lock_dir.to_path_buf();
-    let _ = std::thread::Builder::new()
-        .name("ottto-mcp-claude-refresh-wait".to_string())
-        .spawn(move || loop {
-            match child.try_wait() {
-                Ok(Some(_)) | Err(_) => return,
-                Ok(None) => {}
-            }
-            if !crate::claude_spawn_gate::refresh_in_progress(&lock_dir) {
-                reap_child(&mut child);
-                return;
-            }
-            std::thread::sleep(CLAUDE_REFRESH_POLL);
-        });
 }
-
-/// How often a Claude Code server left running mid-refresh is re-checked.
-const CLAUDE_REFRESH_POLL: Duration = Duration::from_millis(500);
 
 /// The Claude login a stdio MCP server uses when the server is Claude Code
 /// itself (`claude mcp serve`, or the `@anthropic-ai/claude-code` package
@@ -934,7 +918,7 @@ fn harvest_server(
             cwd,
             env: server_env,
         } => {
-            let refresh_lock_dir =
+            let claude_login =
                 match claude_login_of_server(command, args, server_env, &env.provider) {
                     None => None,
                     Some(Err(())) => {
@@ -946,7 +930,7 @@ fn harvest_server(
                             eprintln!("mcp_harvest claude_server=deferred reason=quiet_window");
                             return (unreachable_server(server, loading_mode), true);
                         }
-                        crate::claude_spawn_gate::refresh_lock_dir(&slot)
+                        Some(slot)
                     }
                 };
             harvest_stdio(
@@ -956,7 +940,7 @@ fn harvest_server(
                 cwd.as_deref(),
                 server.config_dir.as_deref(),
                 server_env,
-                refresh_lock_dir.as_deref(),
+                claude_login.as_ref(),
             )
             .ok()
         }
@@ -2902,10 +2886,12 @@ done
     }
 
     /// A Claude Code server is never killed while its login's refresh lock
-    /// is fresh; it is stopped once the lock goes quiet. Other servers are
-    /// stopped at once.
+    /// exists (any age); it is stopped once the lock is gone. Other servers
+    /// are stopped at once. Fake keychain only.
     #[test]
+    #[serial_test::serial]
     fn a_claude_code_server_is_never_killed_mid_refresh() {
+        let _fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("mcp-kill");
         let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
         let dir = std::env::temp_dir().join(format!(
             "ottto-mcp-refresh-lock-{}-{}",
@@ -2913,20 +2899,29 @@ done
             OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir_all(&dir).expect("dir");
+        let login = ottto_core::ClaudeConfigDirSlot::registered(dir.to_string_lossy().to_string())
+            .expect("slot");
         let lock = dir.join(crate::claude_spawn_gate::REFRESH_LOCK_FILE);
         fs::write(&lock, "").expect("lock");
+        // An old lock still counts.
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .and_then(|file| file.set_modified(old))
+            .expect("age the lock");
 
         let child = Command::new("/bin/sleep").arg("30").spawn().expect("sleep");
         let pid = i32::try_from(child.id()).expect("pid");
-        reap_unless_refreshing(child, Some(&dir));
+        reap_unless_refreshing(child, Some(&login));
         std::thread::sleep(Duration::from_millis(300));
-        assert!(alive(pid), "left running while the login refreshes");
+        assert!(alive(pid), "left running while the refresh lock exists");
         fs::remove_file(&lock).expect("unlock");
         let deadline = Instant::now() + Duration::from_secs(5);
         while alive(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(!alive(pid), "stopped once the refresh lock is quiet");
+        assert!(!alive(pid), "stopped once the refresh lock is gone");
 
         let other = Command::new("/bin/sleep").arg("30").spawn().expect("sleep");
         let other_pid = i32::try_from(other.id()).expect("pid");

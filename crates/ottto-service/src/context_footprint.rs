@@ -447,9 +447,11 @@ fn run_claude_context(
 ) -> Result<String> {
     // Quiet window: never start Claude Code from 15 minutes before the
     // default login's access expiry until the refresher confirmed a new one.
-    crate::claude_spawn_gate::check_short_claude_run(&ottto_core::ClaudeConfigDirSlot::Default)
+    let login = ottto_core::ClaudeConfigDirSlot::Default;
+    crate::claude_spawn_gate::check_short_claude_run(&login)
         .map_err(|refusal| anyhow::Error::new(ClaudeContextRefused(refusal)))?;
     let mut command = env.claude_command()?;
+    crate::claude_spawn_gate::pin_claude_login(&mut command, &login);
     command
         .current_dir(workspace)
         .stdout(Stdio::piped())
@@ -472,8 +474,7 @@ fn run_claude_context(
                     .map_err(|_| anyhow!("Claude Code /context stdout was not UTF-8"));
             }
             Ok(None) if started.elapsed() >= command_timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::claude_spawn_gate::stop_claude_child(child, &login, "context");
                 return Err(anyhow!("Claude Code /context timed out"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
