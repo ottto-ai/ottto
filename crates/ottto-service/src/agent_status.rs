@@ -3475,23 +3475,16 @@ fn collect_claude_status(
                     ClaudeSlotProbeFailure::IdentityUnknown,
                 ));
         }
-        ClaudeLocalLoginState::Unreadable => {
-            // Fail closed: a failed or malformed read is not "signed out".
-            snapshot.account = Some(unsupported_account("anthropic"));
-            snapshot
-                .diagnostics
-                .push(default_claude_identity_diagnostic(
-                    ClaudeSlotProbeFailure::ProbeFailed,
-                ));
-        }
-        ClaudeLocalLoginState::NotSignedIn
+        ClaudeLocalLoginState::Unreadable
+        | ClaudeLocalLoginState::NotSignedIn
         | ClaudeLocalLoginState::NeedsLogin
         | ClaudeLocalLoginState::SignedOutByCli => {
             snapshot.account = Some(unsupported_account("anthropic"));
             snapshot
                 .diagnostics
-                .push(default_claude_identity_diagnostic(
-                    ClaudeSlotProbeFailure::CredentialUnavailable,
+                .extend(default_claude_unusable_login_diagnostic(
+                    login_state,
+                    crate::command_env::executable_path("claude").is_some(),
                 ));
         }
     }
@@ -7594,6 +7587,29 @@ fn upkeep_state_diagnostic(
             "Claude Code background upkeep did not prove that this expired credential advanced; cached readings remain honestly stale.",
         ),
     }
+}
+
+/// The warning for a default login that cannot be used, or none.
+///
+/// Without a `claude` CLI on this Mac nothing uses the default login: Claude
+/// Desktop authenticates its own Code sessions, and a keychain item a removed
+/// CLI left behind (often already cleared by that CLI) is not actionable. The
+/// slot itself still reports `credential_unavailable`; only the user-visible
+/// warning is withheld, as it was while status ran `claude auth status`, which
+/// added no diagnostic when the command was not found.
+fn default_claude_unusable_login_diagnostic(
+    state: ClaudeLocalLoginState,
+    claude_cli_installed: bool,
+) -> Option<AgentStatusDiagnostic> {
+    let failure = match state {
+        // Fail closed: a failed or malformed read is not "signed out".
+        ClaudeLocalLoginState::Unreadable => ClaudeSlotProbeFailure::ProbeFailed,
+        ClaudeLocalLoginState::NotSignedIn
+        | ClaudeLocalLoginState::NeedsLogin
+        | ClaudeLocalLoginState::SignedOutByCli => ClaudeSlotProbeFailure::CredentialUnavailable,
+        ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending => return None,
+    };
+    claude_cli_installed.then(|| default_claude_identity_diagnostic(failure))
 }
 
 fn default_claude_identity_diagnostic(failure: ClaudeSlotProbeFailure) -> AgentStatusDiagnostic {
@@ -23097,6 +23113,31 @@ for line in sys.stdin:
             Some("future_plan"),
             Some("claude_team")
         ));
+    }
+
+    #[test]
+    fn default_unusable_login_warns_only_when_the_claude_cli_is_installed() {
+        use ClaudeLocalLoginState as State;
+        for (state, code) in [
+            (State::SignedOutByCli, "claude_slot_credential_unavailable"),
+            (State::NeedsLogin, "claude_slot_credential_unavailable"),
+            (State::NotSignedIn, "claude_slot_credential_unavailable"),
+            (State::Unreadable, "claude_slot_probe_failed"),
+        ] {
+            let warning = default_claude_unusable_login_diagnostic(state, true)
+                .unwrap_or_else(|| panic!("{state:?} warns with the CLI installed"));
+            assert_eq!(warning.code, code, "{state:?}");
+            assert_eq!(warning.severity, AgentDiagnosticSeverity::Warning);
+            // Desktop-only Mac: a leftover default login nothing uses.
+            assert!(
+                default_claude_unusable_login_diagnostic(state, false).is_none(),
+                "{state:?} stays quiet without the CLI"
+            );
+        }
+        for state in [State::AccessValid, State::RefreshPending] {
+            assert!(default_claude_unusable_login_diagnostic(state, true).is_none());
+            assert!(default_claude_unusable_login_diagnostic(state, false).is_none());
+        }
     }
 
     #[test]
