@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 428,
-  "content_sha256": "17ba7d96c24f39fe51f6ed3cbc1d00db7e230a60812963cbcff23b9e9f5ae87f",
+  "candidate_file_count": 429,
+  "content_sha256": "d09ac93177be49aaf0c02cc4836ad6c96b7df1fff291cb7dd38202a07263dd68",
   "files": [
     {
       "executable": false,
@@ -580,8 +580,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "3841b3dfa20e2420571e2da408009af0e2ef7377cb487780c215fc70fa2f9b02",
-      "size_bytes": 284408
+      "sha256": "cc34008c43ad3cf3e0062a3614564c86c50af40a6e0424cf4b85a3cbe4582803",
+      "size_bytes": 284586
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "941150912ed391c10c9e2cfa7a8441da24bae7b40cf21be943ca75317abfb597",
-      "size_bytes": 1305885
+      "sha256": "e117ab0de55f36daa8354f8c69fe0389f07f2404d082dbcb8563e9042130f5c1",
+      "size_bytes": 1318385
     },
     {
       "executable": false,
@@ -1937,6 +1937,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-04-quota-window-truth.md",
+      "sha256": "033194ac030cdda042e97035fdede075ab4228a798ada2d642a6f58d60841472",
+      "size_bytes": 2752
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -2999,9 +3006,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-04T21:03:22+00:00",
+  "generated_at": "2026-10-04T21:06:33+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 429,
+  "output_file_count": 430,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3035,5 +3042,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "18ec5a35cbd2fc1df63e4def1231738a9bb89823"
+  "source_commit": "0dca0669d67e883b7613dc6009383201a1e2605f"
 }
