@@ -198,13 +198,9 @@ pub(crate) fn maybe_refresh(
         &default_support_dir(),
         &ProductionLauncher,
         &|| {
-            // Re-read "Keep my Claude accounts signed in" right before the
-            // spawn: the pass's copy may be older than the user's switch-off.
-            if !crate::agent_status::claude_keep_signed_in_now() {
-                return Some("consent_off");
-            }
             crate::agent_status::claude_refresher_skip_reason(slot, live, OffsetDateTime::now_utc())
         },
+        &crate::agent_status::claude_keep_signed_in_now,
     )
 }
 
@@ -239,6 +235,7 @@ impl RefreshLauncher for ProductionLauncher {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maybe_refresh_with(
     slot_id: &str,
     slot: &ClaudeConfigDirSlot,
@@ -247,6 +244,7 @@ fn maybe_refresh_with(
     support_dir: &Path,
     launcher: &dyn RefreshLauncher,
     skip_reason: &dyn Fn() -> Option<&'static str>,
+    still_enabled: &dyn Fn() -> bool,
 ) -> RefreshDecision {
     let now = OffsetDateTime::now_utc();
     let current_expiry = live
@@ -311,6 +309,14 @@ fn maybe_refresh_with(
         return RefreshDecision::NotNeeded;
     };
     let before_mdat = credential_modified_marker(slot);
+    // Re-read "Keep my Claude accounts signed in" immediately before the
+    // spawn, after every blocking read: the pass's copy may predate the
+    // user's switch-off.
+    if !still_enabled() {
+        release();
+        eprintln!("claude_refresher result=not_started reason=consent_off target={slot_id}");
+        return RefreshDecision::NotNeeded;
+    }
     let mut child = match launcher.launch(slot, cwd.path()) {
         Ok(child) => child,
         Err(_) => {
@@ -683,6 +689,7 @@ mod tests {
                         &support,
                         launcher.as_ref(),
                         &|| None,
+                        &|| true,
                     )
                 })
             })
@@ -780,15 +787,77 @@ mod tests {
             "usage_cached",
         ] {
             assert_eq!(
-                maybe_refresh_with("skip-slot", &slot, &due, true, &support, &launcher, &|| {
-                    Some(reason)
-                }),
+                maybe_refresh_with(
+                    "skip-slot",
+                    &slot,
+                    &due,
+                    true,
+                    &support,
+                    &launcher,
+                    &|| Some(reason),
+                    &|| true
+                ),
                 RefreshDecision::NotNeeded,
                 "{reason}"
             );
         }
         assert_eq!(launcher.0.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!running().lock().unwrap().contains_key("skip-slot"));
+        let _ = std::fs::remove_dir_all(support);
+    }
+
+    /// "Keep my Claude accounts signed in" turned off while the pass was
+    /// reading (after the decision and the credential marker read): nothing
+    /// starts and the slot is released.
+    #[test]
+    #[serial_test::serial]
+    fn consent_turned_off_during_the_reads_starts_nothing() {
+        struct CountingLauncher(std::sync::atomic::AtomicUsize);
+        impl RefreshLauncher for CountingLauncher {
+            fn launch(&self, _slot: &ClaudeConfigDirSlot, _cwd: &Path) -> std::io::Result<Child> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::process::Command::new("/usr/bin/true").spawn()
+            }
+        }
+        let support = std::env::temp_dir().join(format!(
+            "ottto-claude-refresher-consent-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(support.join("empty-bin")).expect("support");
+        // No `security` on the search path: no keychain is ever queried.
+        let previous_search = std::env::var_os("OTTTO_COMMAND_SEARCH_PATH");
+        std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", support.join("empty-bin"));
+        let launcher = CountingLauncher(std::sync::atomic::AtomicUsize::new(0));
+        let due = live(
+            ClaudeLocalLoginState::RefreshPending,
+            OffsetDateTime::now_utc() - TimeDuration::minutes(1),
+        );
+        let slot = ClaudeConfigDirSlot::registered("/tmp/ottto-refresher-consent-slot".to_string())
+            .expect("slot");
+        // The pass read "on" (`enabled`); the switch-off lands during the
+        // reads, so the re-read right before the spawn sees "off".
+        let switched_off = std::sync::atomic::AtomicBool::new(false);
+        let decision = maybe_refresh_with(
+            "consent-slot",
+            &slot,
+            &due,
+            true,
+            &support,
+            &launcher,
+            &|| {
+                switched_off.store(true, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
+            &|| !switched_off.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        assert_eq!(decision, RefreshDecision::NotNeeded);
+        assert_eq!(launcher.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!running().lock().unwrap().contains_key("consent-slot"));
+        match previous_search {
+            Some(value) => std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", value),
+            None => std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH"),
+        }
         let _ = std::fs::remove_dir_all(support);
     }
 
@@ -917,7 +986,8 @@ mod tests {
                 true,
                 &support,
                 &ProductionLauncher,
-                &|| None
+                &|| None,
+                &|| true
             ),
             RefreshDecision::Started
         );
@@ -948,7 +1018,8 @@ mod tests {
                 true,
                 &support,
                 &ProductionLauncher,
-                &|| None
+                &|| None,
+                &|| true
             ),
             RefreshDecision::Started
         );
@@ -965,7 +1036,8 @@ mod tests {
                 true,
                 &support,
                 &ProductionLauncher,
-                &|| None
+                &|| None,
+                &|| true
             ),
             RefreshDecision::RetryWaiting,
             "the retry waits for a later pass"
@@ -984,7 +1056,8 @@ mod tests {
                 true,
                 &support,
                 &ProductionLauncher,
-                &|| None
+                &|| None,
+                &|| true
             ),
             RefreshDecision::Started
         );
@@ -998,7 +1071,8 @@ mod tests {
                 true,
                 &support,
                 &ProductionLauncher,
-                &|| None
+                &|| None,
+                &|| true
             ),
             RefreshDecision::FailedWaitingForSignIn,
             "no loop: sign in again after the one retry"
@@ -1020,7 +1094,8 @@ mod tests {
                 true,
                 &support,
                 &ProductionLauncher,
-                &|| None
+                &|| None,
+                &|| true
             ),
             RefreshDecision::NotNeeded
         );
