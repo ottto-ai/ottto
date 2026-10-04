@@ -3002,6 +3002,15 @@ impl ClaudeAlternativeAuth {
             Self::ApiKey => "anthropic",
         }
     }
+
+    /// How Claude Code usage is billed on this route.
+    fn billing_channel(self) -> &'static str {
+        match self {
+            Self::Bedrock => "amazon_bedrock",
+            Self::Vertex => "google_vertex",
+            Self::ApiKey => "direct_api",
+        }
+    }
 }
 
 /// Whether the default login authenticates without OAuth, from the settings
@@ -3165,9 +3174,11 @@ fn collect_claude_status(
             };
             let mut account = account;
             if let Some(alternative) = alternative {
-                // The OAuth login still supplies identity and subscription
-                // usage; Claude Code itself authenticates the other way.
+                // The OAuth login still supplies identity, plan and
+                // subscription usage; Claude Code itself authenticates, and
+                // bills its own usage, the other way.
                 account.auth_method = Some(alternative.auth_method().to_string());
+                account.billing_channel = Some(alternative.billing_channel().to_string());
             }
             snapshot.account = Some(account);
             snapshot.status = AgentStatusState::Available;
@@ -30831,6 +30842,18 @@ exit 44
                 "{method}"
             );
         }
+        // With a valid OAuth login next to Bedrock, the account keeps its
+        // OAuth identity but reports the Bedrock route and billing channel.
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        let collection = fixture.collect();
+        let account = collection
+            .source_health_snapshot
+            .account
+            .clone()
+            .expect("default account");
+        assert_eq!(account.auth_method.as_deref(), Some("bedrock"));
+        assert_eq!(account.billing_channel.as_deref(), Some("amazon_bedrock"));
+        assert!(account.account_identifier_hash.is_some());
         assert_only_version_probes(&fixture.spawns(), "api-key-over-cleared");
     }
 

@@ -663,7 +663,13 @@ fn harvest_stdio(
     config_dir: Option<&Path>,
     server_env: &BTreeMap<String, String>,
 ) -> Result<Vec<McpToolInput>> {
-    if crate::claude_spawn_gate::is_claude_cli_mcp_server(command, args, server_env) {
+    let spawn_dir = SpawnEnv::resolve_cwd(cwd, config_dir);
+    if crate::claude_spawn_gate::is_claude_cli_mcp_server(
+        command,
+        args,
+        server_env,
+        spawn_dir.as_deref(),
+    ) {
         // `claude mcp serve` (or the npm Claude Code package) is a
         // credential-using Claude Code process outside the spawn gate: killing
         // it at the handshake timeout could interrupt a token refresh and sign
@@ -865,11 +871,17 @@ fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv)
     if let Transport::Stdio {
         command,
         args,
+        cwd,
         env: server_env,
-        ..
     } = &server.transport
     {
-        if crate::claude_spawn_gate::is_claude_cli_mcp_server(command, args, server_env) {
+        let spawn_dir = SpawnEnv::resolve_cwd(cwd.as_deref(), server.config_dir.as_deref());
+        if crate::claude_spawn_gate::is_claude_cli_mcp_server(
+            command,
+            args,
+            server_env,
+            spawn_dir.as_deref(),
+        ) {
             // Never started: it can reach the Claude Code CLI outside the
             // spawn gate. Reported as skipped (cost zero), not as broken.
             eprintln!(

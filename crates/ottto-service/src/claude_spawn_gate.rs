@@ -815,6 +815,7 @@ pub(crate) fn is_claude_cli_mcp_server(
     command: &str,
     args: &[String],
     env: &std::collections::BTreeMap<String, String>,
+    spawn_dir: Option<&Path>,
 ) -> bool {
     let path = Path::new(command);
     let basename = path
@@ -848,12 +849,23 @@ pub(crate) fn is_claude_cli_mcp_server(
     }
     let resolved = if path.is_absolute() {
         Some(path.to_path_buf())
+    } else if path.components().count() > 1 {
+        // A relative path (`./runner`, `bin/server`) runs from the spawn
+        // directory; resolve it exactly there. Unresolvable: refuse below.
+        let base = match spawn_dir {
+            Some(dir) => Some(dir.to_path_buf()),
+            None => std::env::current_dir().ok(),
+        };
+        match base {
+            Some(base) => Some(base.join(path)),
+            None => return true,
+        }
     } else {
         crate::command_env::executable_path(command)
     };
     let Some(resolved) = resolved else {
-        // Not found on the daemon's search path: it cannot start, so it
-        // cannot reach Claude either (it reports unreachable as before).
+        // A bare name not on the daemon's search path cannot start: the
+        // spawn's `PATH` is that same search path.
         return false;
     };
     let Ok(canonical) = std::fs::canonicalize(&resolved) else {
@@ -1641,13 +1653,18 @@ mod tests {
         ];
         for (command, args) in &refused {
             assert!(
-                is_claude_cli_mcp_server(command, args, &no_env),
+                is_claude_cli_mcp_server(command, args, &no_env, None),
                 "{command} {args:?} must be refused"
             );
         }
         let with_config_dir =
             BTreeMap::from([("CLAUDE_CONFIG_DIR".to_string(), "/tmp/slot".to_string())]);
-        assert!(is_claude_cli_mcp_server("my-server", &[], &with_config_dir));
+        assert!(is_claude_cli_mcp_server(
+            "my-server",
+            &[],
+            &with_config_dir,
+            None
+        ));
 
         // A renamed copy (symlink) of the resolved Claude binary.
         let bin = fixture.root.join("bin");
@@ -1656,7 +1673,8 @@ mod tests {
         assert!(is_claude_cli_mcp_server(
             renamed.to_str().unwrap(),
             &[],
-            &no_env
+            &no_env,
+            None
         ));
         // A wrapper script that names Claude.
         let wrapper = bin.join("wrapper-server");
@@ -1667,9 +1685,24 @@ mod tests {
         assert!(is_claude_cli_mcp_server(
             wrapper.to_str().unwrap(),
             &[],
-            &no_env
+            &no_env,
+            None
         ));
 
+        // A relative command runs from its spawn directory: a script there
+        // that names Claude is refused, and an unresolvable one fails closed.
+        assert!(is_claude_cli_mcp_server(
+            "./wrapper-server",
+            &[],
+            &no_env,
+            Some(bin.as_path())
+        ));
+        assert!(is_claude_cli_mcp_server(
+            "./does-not-exist",
+            &[],
+            &no_env,
+            Some(bin.as_path())
+        ));
         // Ordinary servers still run.
         let plain = bin.join("plain-server");
         std::fs::write(
@@ -1682,17 +1715,20 @@ mod tests {
         assert!(!is_claude_cli_mcp_server(
             plain.to_str().unwrap(),
             &[],
-            &no_env
+            &no_env,
+            None
         ));
         assert!(!is_claude_cli_mcp_server(
             "npx",
             &strings(&["-y", "@modelcontextprotocol/server-filesystem"]),
-            &no_env
+            &no_env,
+            None
         ));
         assert!(!is_claude_cli_mcp_server(
             "uvx",
             &strings(&["claude-design-mcp"]),
-            &no_env
+            &no_env,
+            None
         ));
     }
 
