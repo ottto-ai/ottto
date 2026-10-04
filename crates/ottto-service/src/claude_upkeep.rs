@@ -1,18 +1,21 @@
 //! Claude Code login upkeep decisions for registered custom slots.
 //!
-//! Phase 0 of the durable-login fix: Ottto no longer refreshes any Claude
-//! login. A short `claude doctor` run after access expiry could start a token
-//! refresh and exit before the rotated token was saved, which signs the login
-//! out (anthropics/claude-code#95822). The foreground decision now reads the
-//! slot's stored credential on every pass and either collects, waits for
-//! Claude Code itself to refresh (paused), or asks for sign-in when the
-//! refresh grant is gone. The background worker below is retained but its
-//! production process runner never spawns anything, and nothing enqueues it.
+//! `claude doctor` upkeep is off: a short `doctor` run after access expiry
+//! could start a token refresh and exit before the rotated token was saved,
+//! which signs the login out (anthropics/claude-code#95822). Refreshing is
+//! done by `claude_refresher` (one waiting `claude -p /usage` per login). The
+//! foreground decision here reads the slot's stored credential on every pass
+//! and either collects, waits while the refresher runs, stays paused when
+//! "Keep my Claude accounts signed in" is off, or asks for sign-in when the
+//! refresh grant is gone or the refresher could not advance the expiry. The
+//! background `doctor` worker below is retained but its production process
+//! runner never spawns anything, and nothing enqueues it.
 
 use crate::agent_status::{
     read_claude_oauth_credential_metadata_for_slot, ClaudeLiveLogin, ClaudeLocalLoginState,
     ClaudeOAuthCredentialMetadata,
 };
+use crate::claude_refresher::RefreshDecision;
 use ottto_core::{
     default_support_dir, write_owner_only_file_atomic, ClaudeConfigDirSlot,
     FileClaudeConfigSlotSettingsStore,
@@ -431,12 +434,14 @@ pub(crate) fn observe_registered_slot_upkeep(
     consent: bool,
     network_enabled: bool,
     live: &ClaudeLiveLogin,
+    refresh: RefreshDecision,
 ) -> ClaudeUpkeepObservation {
     observe_registered_slot_upkeep_reading(
         descriptor,
         consent,
         network_enabled,
         live,
+        refresh,
         OffsetDateTime::now_utc(),
     )
 }
@@ -449,6 +454,7 @@ fn observe_registered_slot_upkeep_reading(
     consent: bool,
     network_enabled: bool,
     live: &ClaudeLiveLogin,
+    refresh: RefreshDecision,
     now: OffsetDateTime,
 ) -> ClaudeUpkeepObservation {
     if !network_enabled {
@@ -508,15 +514,30 @@ fn observe_registered_slot_upkeep_reading(
             )
         }
         ClaudeLocalLoginState::RefreshPending => {
-            let mut observation = observation_with_metadata(
-                false,
-                if PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
-                    ClaudeConfigSlotUpkeepResultV1::RefreshDue
-                } else {
-                    ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled
-                },
-                &metadata,
-            );
+            let result = match refresh {
+                // The background refresh of this exact credential did not
+                // advance its expiry: sign in again; no retry until a new
+                // credential appears.
+                RefreshDecision::FailedWaitingForSignIn => {
+                    return observation_with_metadata(
+                        false,
+                        ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
+                        &metadata,
+                    )
+                }
+                // A background refresh is running for this login.
+                RefreshDecision::Started | RefreshDecision::Running => {
+                    ClaudeConfigSlotUpkeepResultV1::InProgress
+                }
+                RefreshDecision::Disabled | RefreshDecision::NotNeeded => {
+                    if PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
+                        ClaudeConfigSlotUpkeepResultV1::RefreshDue
+                    } else {
+                        ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled
+                    }
+                }
+            };
+            let mut observation = observation_with_metadata(false, result, &metadata);
             observation.paused_awaiting_claude_refresh = true;
             observation
         }
@@ -1976,6 +1997,10 @@ mod tests {
                 now,
             )
         };
+        // "Keep my Claude accounts signed in" defaults on; turn it off first.
+        store
+            .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, false)
+            .unwrap();
         assert!(publish().is_err(), "consent off");
         store
             .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, true)
@@ -3005,6 +3030,7 @@ mod tests {
             true,
             true,
             &live(ClaudeLocalLoginState::AccessValid, &access, &refresh),
+            RefreshDecision::Disabled,
             OffsetDateTime::now_utc(),
         );
 
@@ -3052,6 +3078,7 @@ mod tests {
                 &access,
                 &rfc3339_from_now(TimeDuration::days(25)),
             ),
+            RefreshDecision::Disabled,
             OffsetDateTime::now_utc(),
         );
 
@@ -3073,6 +3100,7 @@ mod tests {
             true,
             true,
             &live(ClaudeLocalLoginState::RefreshPending, &access, &refresh),
+            RefreshDecision::Disabled,
             OffsetDateTime::now_utc(),
         );
 
@@ -3102,6 +3130,7 @@ mod tests {
             true,
             true,
             &ClaudeLiveLogin::unreadable(),
+            RefreshDecision::Disabled,
             OffsetDateTime::now_utc(),
         );
         assert!(unreadable.proceed_with_collection);
@@ -3118,6 +3147,7 @@ mod tests {
                 state: ClaudeLocalLoginState::NotSignedIn,
                 metadata: None,
             },
+            RefreshDecision::Disabled,
             OffsetDateTime::now_utc(),
         );
         assert!(absent.proceed_with_collection);
@@ -3136,6 +3166,7 @@ mod tests {
             true,
             false,
             &ClaudeLiveLogin::unreadable(),
+            RefreshDecision::Disabled,
             OffsetDateTime::now_utc(),
         );
         assert!(!observation.proceed_with_collection);
@@ -3188,6 +3219,7 @@ mod tests {
                 true,
                 true,
                 &live(ClaudeLocalLoginState::RefreshPending, &access, &refresh),
+                RefreshDecision::Disabled,
             );
             assert!(!observation.proceed_with_collection);
             assert!(observation.paused_awaiting_claude_refresh);
@@ -3263,6 +3295,7 @@ mod tests {
                 state: ClaudeLocalLoginState::SignedOutByCli,
                 metadata: Some(cli_cleared_metadata()),
             },
+            RefreshDecision::Disabled,
             OffsetDateTime::now_utc(),
         );
 
@@ -3296,6 +3329,7 @@ mod tests {
                 state: ClaudeLocalLoginState::SignedOutByCli,
                 metadata: Some(cli_cleared_metadata()),
             },
+            RefreshDecision::Disabled,
             OffsetDateTime::now_utc(),
         );
         assert!(!still_cleared.proceed_with_collection);
@@ -3314,6 +3348,7 @@ mod tests {
                 &access,
                 &rfc3339_from_now(TimeDuration::days(30)),
             ),
+            RefreshDecision::Disabled,
             OffsetDateTime::now_utc(),
         );
         assert!(

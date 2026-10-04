@@ -2947,21 +2947,6 @@ fn apply_claude_statusline_context_provenance(
     }
 }
 
-/// `claude --version` through the spawn gate. In the supported CLI this exact
-/// argv prints and returns before any login code runs.
-fn claude_cli_version() -> Option<String> {
-    let permit = crate::claude_spawn_gate::admit(
-        crate::claude_spawn_gate::ClaudeSpawnTarget::Default,
-        crate::claude_spawn_gate::ClaudeSpawnClass::VersionProbe {
-            max_runtime: COMMAND_TIMEOUT,
-        },
-        &["--version"],
-    )
-    .ok()?;
-    let output = crate::claude_spawn_gate::run_to_completion(permit);
-    output.success.then_some(output.stdout)
-}
-
 /// A signed-in default login whose `.claude.json` identity could not be
 /// trusted: keep the plan stored with the credential, claim no identity.
 fn claude_signed_in_account_without_identity(
@@ -3035,6 +3020,7 @@ fn claude_default_alternative_auth(
     ambient: &dyn Fn(&str) -> Option<String>,
     oauth_usable: bool,
     approved_api_key_suffixes: &[String],
+    stored_console_key: bool,
 ) -> Option<ClaudeAlternativeAuth> {
     // Highest precedence first.
     let layers = paths
@@ -3101,7 +3087,42 @@ fn claude_default_alternative_auth(
                     .any(|approved| approved == suffix)
             })
     });
-    api_key_active.then_some(ClaudeAlternativeAuth::ApiKey)
+    // A Console API key saved by `/login` ("/login managed key": the
+    // `Claude Code` keychain item or `.claude.json` `primaryApiKey`). Counted
+    // only when no OAuth login is usable, so a subscription stays one.
+    (api_key_active || (stored_console_key && !oauth_usable))
+        .then_some(ClaudeAlternativeAuth::ApiKey)
+}
+
+/// Whether a Console API key saved by `/login` is present for the default
+/// login: the `Claude Code` keychain item (presence only, read without `-w`)
+/// or `.claude.json` `primaryApiKey`. No key value is kept.
+fn claude_default_stored_console_key_present() -> bool {
+    let in_config = fs::read_to_string(claude_cli_config_path())
+        .ok()
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        .and_then(|value| {
+            value
+                .get("primaryApiKey")
+                .and_then(Value::as_str)
+                .map(|key| !key.trim().is_empty())
+        })
+        .unwrap_or(false);
+    if in_config {
+        return true;
+    }
+    if crate::command_env::executable_path("security").is_none() {
+        return false;
+    }
+    let Some(account) = effective_user_account_name() else {
+        return false;
+    };
+    run_command_capture(
+        "security",
+        &["find-generic-password", "-a", &account, "-s", "Claude Code"],
+        COMMAND_TIMEOUT,
+    )
+    .success
 }
 
 /// `.claude.json` `customApiKeyResponses.approved`: suffixes of API keys the
@@ -3132,6 +3153,7 @@ fn claude_default_alternative_auth_now(oauth_usable: bool) -> Option<ClaudeAlter
         &|key| std::env::var(key).ok(),
         oauth_usable,
         &claude_approved_api_key_suffixes(&claude_cli_config_path()),
+        !oauth_usable && claude_default_stored_console_key_present(),
     )
 }
 
@@ -3139,10 +3161,14 @@ fn claude_default_alternative_auth_now(oauth_usable: bool) -> Option<ClaudeAlter
 /// registered managed slot has proved it reads (see
 /// `claude_slot_owned_usage_bindings`). For those, the default login is not a
 /// second provider caller: it serves the shared account cache only.
+/// Snapshot diagnostic for the default login's lifetime warning.
+const CLAUDE_RELOGIN_APPROACHING_CODE: &str = "claude_relogin_approaching";
+
 fn collect_claude_status(
     captured_at: String,
     expires_at: String,
     slot_owned_bindings: &BTreeSet<ClaudeStrongBinding>,
+    keep_signed_in: bool,
 ) -> AgentStatusSnapshot {
     // Presence is decided by the canonical detector, which requires the `claude`
     // binary. A lone `~/.claude/settings.json` — which Ottto's own relay-base
@@ -3167,7 +3193,40 @@ fn collect_claude_status(
     // printed exactly these fields but could refresh, and so sign out, the
     // default login on every pass.
     let local = read_claude_slot_locally(&ClaudeConfigDirSlot::Default);
-    let login_state = local.state;
+    let mut login_state = local.state;
+    let default_live = local.live_login();
+    // "Keep my Claude accounts signed in": the default login gets the same
+    // single waiting background refresh as registered slots.
+    let refresh = if claude_oauth_usage_network_disabled() {
+        crate::claude_refresher::RefreshDecision::NotNeeded
+    } else {
+        crate::claude_refresher::maybe_refresh(
+            "default",
+            &ClaudeConfigDirSlot::Default,
+            &default_live,
+            keep_signed_in,
+        )
+    };
+    if login_state == ClaudeLocalLoginState::RefreshPending
+        && refresh == crate::claude_refresher::RefreshDecision::FailedWaitingForSignIn
+    {
+        // The background refresh could not advance this credential: ask for
+        // sign-in (the app's "Sign in again" gate), no retry until it changes.
+        login_state = ClaudeLocalLoginState::NeedsLogin;
+    }
+    if let Some(warning) = claude_relogin_warning(
+        default_live
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.refresh_token_expires_at.as_deref()),
+        OffsetDateTime::now_utc(),
+    ) {
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            CLAUDE_RELOGIN_APPROACHING_CODE,
+            AgentDiagnosticSeverity::Warning,
+            warning,
+        ));
+    }
     let credential_plan = match &local.credential {
         ClaudeCredentialRead::Present(credential) => credential.subscription_type.clone(),
         ClaudeCredentialRead::Absent | ClaudeCredentialRead::Unreadable => None,
@@ -3306,7 +3365,7 @@ fn collect_claude_status(
                 ));
         }
     }
-    let version = claude_cli_version();
+    let version = run_command_capture("claude", &["--version"], COMMAND_TIMEOUT);
     snapshot.model = Some(AgentModelStatus {
         active_model: None,
         default_model: None,
@@ -3561,7 +3620,7 @@ fn collect_claude_status(
     if let Some(diagnostic) = runtime_defaults.diagnostic {
         snapshot.diagnostics.push(diagnostic);
     }
-    if version.is_some() {
+    if version.command_found && version.success {
         snapshot.diagnostics.push(AgentStatusDiagnostic::source(
             "claude_version_detected",
             AgentDiagnosticSeverity::Info,
@@ -3629,15 +3688,16 @@ fn collect_claude_status_snapshots(
             )
         })
         .unwrap_or_default();
+    let upkeep_consent = settings.as_ref().is_ok_and(|status| {
+        status.consent == ottto_protocol::ClaudeAccountUpkeepConsentState::Granted
+    });
     let mut default_snapshot = collect_claude_status(
         captured_at.clone(),
         expires_at.clone(),
         &slot_owned_bindings,
+        upkeep_consent,
     );
     let mut candidates = Vec::new();
-    let upkeep_consent = settings.as_ref().is_ok_and(|status| {
-        status.consent == ottto_protocol::ClaudeAccountUpkeepConsentState::Granted
-    });
     let mut descriptors = settings
         .as_ref()
         .map(ordered_claude_slot_descriptors)
@@ -3653,6 +3713,18 @@ fn collect_claude_status_snapshots(
 
     let mut slot_states = BTreeMap::new();
     let mut default_state = claude_default_slot_collection_status(&default_snapshot);
+    if let Some(warning) = default_snapshot
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == CLAUDE_RELOGIN_APPROACHING_CODE)
+    {
+        default_state
+            .diagnostics
+            .push(ClaudeConfigSlotDiagnosticV1 {
+                code: ClaudeConfigSlotDiagnosticCodeV1::ReloginApproaching,
+                message: warning.message.clone(),
+            });
+    }
     remember_claude_slot_account_profile(
         &mut default_state,
         default_snapshot.account.as_ref(),
@@ -3731,11 +3803,15 @@ fn collect_claude_status_snapshots(
         let live = local
             .as_ref()
             .map_or_else(ClaudeLiveLogin::unreadable, ClaudeSlotLocalRead::live_login);
+        // "Keep my Claude accounts signed in": start (or follow) the one
+        // background refresh for this login when it is due.
+        let refresh = registered_slot_refresh(&descriptor, &live, upkeep_consent, network_enabled);
         let upkeep = crate::claude_upkeep::observe_registered_slot_upkeep(
             &descriptor,
             upkeep_consent,
             network_enabled,
             &live,
+            refresh,
         );
         if !upkeep.proceed_with_collection {
             let result_observed_at = upkeep.result_observed_at.clone();
@@ -4667,11 +4743,13 @@ pub(crate) fn collect_registered_claude_slot_status(
     let live = local
         .as_ref()
         .map_or_else(ClaudeLiveLogin::unreadable, ClaudeSlotLocalRead::live_login);
+    let refresh = registered_slot_refresh(&descriptor, &live, upkeep_consent, network_enabled);
     let upkeep = crate::claude_upkeep::observe_registered_slot_upkeep(
         &descriptor,
         upkeep_consent,
         network_enabled,
         &live,
+        refresh,
     );
     if !upkeep.proceed_with_collection {
         let result_observed_at = upkeep.result_observed_at.clone();
@@ -5205,6 +5283,20 @@ fn read_claude_slot_locally(slot: &ClaudeConfigDirSlot) -> ClaudeSlotLocalRead {
         credential,
         final_oauth_account,
         state,
+    }
+}
+
+fn registered_slot_refresh(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    live: &ClaudeLiveLogin,
+    consent: bool,
+    network_enabled: bool,
+) -> crate::claude_refresher::RefreshDecision {
+    match claude_config_slot_for_descriptor(descriptor).filter(|slot| slot.config_dir().is_some()) {
+        Some(slot) if network_enabled => {
+            crate::claude_refresher::maybe_refresh(&descriptor.slot_id, &slot, live, consent)
+        }
+        _ => crate::claude_refresher::RefreshDecision::NotNeeded,
     }
 }
 
@@ -6925,10 +7017,22 @@ fn paused_claude_refresh_status(
         .due_access_expires_at
         .clone()
         .unwrap_or_else(|| "an unknown time".to_string());
-    let message = format!(
-        "Claude Code has not refreshed this sign-in since it expired at {expired_at}. Ottto no longer refreshes it in the background, because that can sign the account out. The last reading is shown with its age. Sign in again to resume now."
-    );
-    let (state, code) = if crate::claude_upkeep::PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
+    let refreshing = upkeep.result == ClaudeConfigSlotUpkeepResultV1::InProgress;
+    let message = if refreshing {
+        format!(
+            "This sign-in expired at {expired_at}; Ottto is refreshing it in the background now. The last reading is shown with its age until the refresh finishes."
+        )
+    } else {
+        format!(
+            "Claude Code has not refreshed this sign-in since it expired at {expired_at}. \"Keep my Claude accounts signed in\" is off, so Ottto does not refresh it. The last reading is shown with its age. Sign in again, or turn the setting on, to resume now."
+        )
+    };
+    let (state, code) = if refreshing {
+        (
+            ClaudeConfigSlotCollectionStateV1::RefreshDue,
+            ClaudeConfigSlotDiagnosticCodeV1::RefreshDue,
+        )
+    } else if crate::claude_upkeep::PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
         (
             ClaudeConfigSlotCollectionStateV1::CredentialUnavailable,
             ClaudeConfigSlotDiagnosticCodeV1::CredentialUnavailable,
@@ -6958,19 +7062,18 @@ fn apply_claude_upkeep_observation(
     status: &mut ClaudeConfigSlotCollectionStatusV1,
     upkeep: ottto_protocol::ClaudeConfigSlotUpkeepStatusV1,
 ) {
-    let deadline_approaching = upkeep
-        .refresh_token_expires_at
-        .as_deref()
-        .and_then(|deadline| OffsetDateTime::parse(deadline, &Rfc3339).ok())
-        .is_some_and(|deadline| {
-            let now = OffsetDateTime::now_utc();
-            deadline > now && deadline - now <= TimeDuration::hours(72)
-        });
+    let relogin_warning = claude_relogin_warning(
+        upkeep.refresh_token_expires_at.as_deref(),
+        OffsetDateTime::now_utc(),
+    );
+    let deadline_approaching = relogin_warning.is_some();
     match upkeep.result {
         ClaudeConfigSlotUpkeepResultV1::ReloginApproaching => {
             status.diagnostics.push(ClaudeConfigSlotDiagnosticV1 {
                 code: ClaudeConfigSlotDiagnosticCodeV1::ReloginApproaching,
-                message: "This Claude login reaches its absolute refresh deadline within 72 hours; official login will be required again.".to_string(),
+                message: relogin_warning.clone().unwrap_or_else(|| {
+                    "This Claude login reaches its absolute refresh deadline within 3 days; sign in again before then.".to_string()
+                }),
             });
         }
         ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented => {
@@ -6984,10 +7087,37 @@ fn apply_claude_upkeep_observation(
     if deadline_approaching && upkeep.result != ClaudeConfigSlotUpkeepResultV1::ReloginApproaching {
         status.diagnostics.push(ClaudeConfigSlotDiagnosticV1 {
             code: ClaudeConfigSlotDiagnosticCodeV1::ReloginApproaching,
-            message: "This Claude login reaches its absolute refresh deadline within 72 hours; official login will be required again.".to_string(),
+            message: relogin_warning.unwrap_or_default(),
         });
     }
     status.upkeep = Some(upkeep);
+}
+
+/// The login lifetime warning, from the stored `refreshTokenExpiresAt` (about
+/// 28 days after a browser sign-in): 3 days before, then 1 day before. No new
+/// wire value: the existing `relogin_approaching` diagnostic carries it.
+fn claude_relogin_warning(
+    refresh_token_expires_at: Option<&str>,
+    now: OffsetDateTime,
+) -> Option<String> {
+    let deadline = OffsetDateTime::parse(refresh_token_expires_at?, &Rfc3339).ok()?;
+    if deadline <= now {
+        return None;
+    }
+    let left = deadline - now;
+    if left <= TimeDuration::days(1) {
+        Some(
+            "This Claude login ends within 1 day; sign in again to keep its limits current."
+                .to_string(),
+        )
+    } else if left <= TimeDuration::days(3) {
+        Some(
+            "This Claude login ends within 3 days; sign in again to keep its limits current."
+                .to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 fn append_claude_upkeep_result_receipt(
@@ -7142,7 +7272,7 @@ fn upkeep_state_diagnostic(
         ClaudeConfigSlotUpkeepResultV1::ReloginApproaching => (
             ClaudeConfigSlotCollectionStateV1::ReloginApproaching,
             ClaudeConfigSlotDiagnosticCodeV1::ReloginApproaching,
-            "This Claude login reaches its absolute refresh deadline within 72 hours.",
+            "This Claude login reaches its absolute refresh deadline within 3 days.",
         ),
         _ => (
             ClaudeConfigSlotCollectionStateV1::ProbeFailed,
@@ -10336,6 +10466,43 @@ fn read_claude_oauth_credential_state_for_slot(slot: &ClaudeConfigDirSlot) -> Cl
     }
 }
 
+/// Exact-slot login state from one fresh local read. Never spawns `claude`.
+pub(crate) fn read_claude_live_login_for_slot(slot: &ClaudeConfigDirSlot) -> ClaudeLiveLogin {
+    let read = read_claude_oauth_credential_state_for_slot(slot);
+    ClaudeLiveLogin {
+        state: claude_local_login_state(&read, OffsetDateTime::now_utc()),
+        metadata: read.metadata(),
+    }
+}
+
+/// The stored credential's modification marker, for the refresher's log: the
+/// keychain item's `mdat` attribute (read without `-w`, so no secret is
+/// printed), or the credentials file's mtime. Never the item's contents.
+pub(crate) fn claude_credential_modified_marker(slot: &ClaudeConfigDirSlot) -> Option<String> {
+    if crate::command_env::executable_path("security").is_some() {
+        if let Some(account) = effective_user_account_name() {
+            let service = slot.service_name();
+            let output = run_command_capture(
+                "security",
+                &["find-generic-password", "-a", &account, "-s", &service],
+                COMMAND_TIMEOUT,
+            );
+            if output.success {
+                return output
+                    .stdout
+                    .lines()
+                    .chain(output.stderr.lines())
+                    .find(|line| line.trim_start().starts_with("\"mdat\""))
+                    .map(|line| line.trim().to_string());
+            }
+        }
+    }
+    std::fs::metadata(slot.credentials_path(&home_dir()))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .map(|modified| format!("{modified:?}"))
+}
+
 /// Spawn-gate view of one exact slot's stored credential: token presence and
 /// the raw access deadline only.
 pub(crate) fn read_claude_spawn_gate_credential(
@@ -10403,12 +10570,6 @@ struct EffectiveUserIdentity {
 
 fn effective_user_account_name() -> Option<String> {
     effective_user_identity().map(|identity| identity.account_name)
-}
-
-/// Account name and home directory of the user this daemon runs as, for the
-/// Claude spawn gate's binary resolution and sanitized environment.
-pub(crate) fn claude_spawn_user_identity() -> Option<(String, PathBuf)> {
-    effective_user_identity().map(|identity| (identity.account_name, identity.home_dir))
 }
 
 #[cfg(unix)]
@@ -15312,6 +15473,40 @@ fn resolved_codex_home_command(
     Some(command)
 }
 
+/// Resolve Claude once and apply the single shared sanitized exact-slot
+/// environment used by the browser sign-in and the background refresher. No
+/// provider or token-shaped ambient variables survive `env_clear`.
+pub(crate) fn resolved_claude_slot_command(
+    slot: &ClaudeConfigDirSlot,
+    args: &[&str],
+) -> Option<Command> {
+    let identity = effective_user_identity()?;
+    let program_path = crate::command_env::claude_executable_path(&identity.home_dir)?;
+    let mut command = Command::new(program_path);
+    command
+        .args(args)
+        .env_clear()
+        .env("HOME", &identity.home_dir)
+        .env("USER", identity.account_name);
+    for locale_key in ["LANG", "LC_ALL", "LC_CTYPE"] {
+        if let Some(value) = std::env::var_os(locale_key) {
+            command.env(locale_key, value);
+        }
+    }
+    if let Some(path_env) = crate::command_env::claude_path_env(&identity.home_dir) {
+        command.env("PATH", path_env);
+    }
+    match slot.config_dir() {
+        Some(config_dir) => {
+            command.env("CLAUDE_CONFIG_DIR", config_dir);
+        }
+        None => {
+            command.env_remove("CLAUDE_CONFIG_DIR");
+        }
+    }
+    Some(command)
+}
+
 fn run_command_capture_with_exact_env(
     program: &str,
     args: &[&str],
@@ -17132,6 +17327,10 @@ mod tests {
         let mut slot = registered.external_slots[0].clone();
         slot.collection = valid_access_reconciliation_fixture().0.collection;
         persist_one_claude_slot_collection_state(&slot.slot_id, &slot.collection).unwrap();
+        // "Keep my Claude accounts signed in" defaults on; turn it off first.
+        store
+            .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, false)
+            .unwrap();
         let publish = || {
             record_registered_claude_worker_observation(
                 &slot,
@@ -30347,11 +30546,13 @@ exit 44
                 Guard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
                 Guard::set("OTTTO_COMMAND_SEARCH_PATH", &bin),
             ];
+            // "Keep my Claude accounts signed in" off: these passes must start
+            // no Claude process at all. Refresher tests turn it on.
             let store = FileClaudeConfigSlotSettingsStore::default();
             store
                 .set_upkeep_consent(
                     ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
-                    true,
+                    false,
                 )
                 .expect("consent");
             let mut fixture = Self {
@@ -30658,6 +30859,104 @@ exit 44
         let single = collect_registered_claude_slot_status(&fixture.slot_ids[1], now.clone(), now);
         assert_eq!(single.state, ClaudeConfigSlotCollectionStateV1::Fresh);
         assert!(fixture.spawns().is_empty(), "no `claude` of any kind");
+    }
+
+    /// "Keep my Claude accounts signed in" on: an expiring slot gets exactly
+    /// one background refresher (`-p /usage --no-session-persistence
+    /// --strict-mcp-config`, in the slot's own config dir) and shows a refresh
+    /// in progress. This fake refresher does not advance the expiry, so the
+    /// next pass asks to sign in again and no second refresher starts.
+    #[test]
+    #[serial]
+    fn expiring_slot_gets_one_background_refresher_then_sign_in_again_on_failure() {
+        let fixture = Phase0Fixture::new("refresher", false);
+        FileClaudeConfigSlotSettingsStore::default()
+            .set_upkeep_consent(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                true,
+            )
+            .expect("keep signed in");
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        fixture.collect();
+        assert_eq!(
+            fixture.slot_collection(0).state,
+            ClaudeConfigSlotCollectionStateV1::Fresh
+        );
+        fixture.clear_logs();
+        fixture.item(&fixture.slot(0), -TimeDuration::minutes(2));
+        fixture.collect();
+        let collection = fixture.slot_collection(0);
+        assert_eq!(
+            collection.state,
+            ClaudeConfigSlotCollectionStateV1::RefreshDue
+        );
+        assert_eq!(
+            collection.upkeep.as_ref().map(|upkeep| upkeep.result),
+            Some(ClaudeConfigSlotUpkeepResultV1::InProgress)
+        );
+        crate::claude_refresher::wait_until_idle(&fixture.slot_ids[0]);
+        let slot_dir = fixture.slot_dirs[0].to_string_lossy().to_string();
+        let refreshers = fixture
+            .spawns()
+            .into_iter()
+            .filter(|line| line != "|--version")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            refreshers,
+            vec![format!(
+                "{slot_dir}|-p /usage --no-session-persistence --strict-mcp-config"
+            )],
+            "exactly one refresher, for the expiring slot only"
+        );
+
+        fixture.collect();
+        let after = fixture.slot_collection(0);
+        assert_eq!(after.state, ClaudeConfigSlotCollectionStateV1::NeedsLogin);
+        assert_eq!(
+            projected_claude_quota_access_state(&after),
+            Some(ClaudeQuotaAccessState::ReconnectRequired),
+            "the existing sign-in-again state"
+        );
+        assert_eq!(
+            fixture
+                .spawns()
+                .into_iter()
+                .filter(|line| line != "|--version")
+                .count(),
+            1,
+            "no retry until a new credential appears"
+        );
+        // The user signs in again: a new credential clears it.
+        fixture.item(&fixture.slot(0), TimeDuration::hours(8));
+        fixture.collect();
+        assert_eq!(
+            fixture.slot_collection(0).state,
+            ClaudeConfigSlotCollectionStateV1::Fresh
+        );
+    }
+
+    #[test]
+    fn lifetime_warnings_come_3_days_and_1_day_before() {
+        let now = OffsetDateTime::from_unix_timestamp(1_900_000_000).expect("time");
+        let at = |offset: TimeDuration| (now + offset).format(&Rfc3339).expect("format");
+        assert_eq!(
+            claude_relogin_warning(Some(&at(TimeDuration::days(4))), now),
+            None
+        );
+        assert!(
+            claude_relogin_warning(Some(&at(TimeDuration::days(3))), now)
+                .expect("3 days")
+                .contains("within 3 days")
+        );
+        assert!(
+            claude_relogin_warning(Some(&at(TimeDuration::hours(20))), now)
+                .expect("1 day")
+                .contains("within 1 day")
+        );
+        assert_eq!(
+            claude_relogin_warning(Some(&at(-TimeDuration::hours(1))), now),
+            None
+        );
     }
 
     /// The quiet paused presentation: no new wire values, never
@@ -30984,7 +31283,8 @@ exit 44
         fs::write(&env_key, r#"{"env":{"ANTHROPIC_API_KEY":"x"}}"#).expect("env");
         let paths = |path: &Path| vec![("settings".to_string(), path.to_path_buf())];
         let none = |_: &str| None;
-        let detect = |path: &Path| claude_default_alternative_auth(&paths(path), &none, true, &[]);
+        let detect =
+            |path: &Path| claude_default_alternative_auth(&paths(path), &none, true, &[], false);
         assert_eq!(detect(&plain), None);
         assert_eq!(detect(&helper), Some(ClaudeAlternativeAuth::ApiKey));
         assert_eq!(detect(&root.join("missing.json")), None);
@@ -31004,7 +31304,7 @@ exit 44
             ("managed".to_string(), managed_off.clone()),
         ];
         assert_eq!(
-            claude_default_alternative_auth(&layered, &none, false, &[]),
+            claude_default_alternative_auth(&layered, &none, false, &[], false),
             None
         );
         let reversed = vec![
@@ -31012,14 +31312,20 @@ exit 44
             ("managed".to_string(), bedrock.clone()),
         ];
         assert_eq!(
-            claude_default_alternative_auth(&reversed, &none, false, &[]),
+            claude_default_alternative_auth(&reversed, &none, false, &[], false),
             Some(ClaudeAlternativeAuth::Bedrock)
         );
         // Settings env outranks the ambient environment.
         let ambient_bedrock =
             |key: &str| (key == "CLAUDE_CODE_USE_BEDROCK").then(|| "1".to_string());
         assert_eq!(
-            claude_default_alternative_auth(&paths(&managed_off), &ambient_bedrock, false, &[]),
+            claude_default_alternative_auth(
+                &paths(&managed_off),
+                &ambient_bedrock,
+                false,
+                &[],
+                false
+            ),
             None
         );
 
@@ -31029,20 +31335,29 @@ exit 44
         let suffix = key[key.len() - 20..].to_string();
         let ambient_key = |name: &str| (name == "ANTHROPIC_API_KEY").then(|| key.to_string());
         assert_eq!(
-            claude_default_alternative_auth(&paths(&plain), &ambient_key, true, &[]),
+            claude_default_alternative_auth(&paths(&plain), &ambient_key, true, &[], false),
             None,
             "a declined or unapproved key leaves the subscription login in charge"
         );
         assert_eq!(
-            claude_default_alternative_auth(&paths(&plain), &ambient_key, true, &[suffix]),
+            claude_default_alternative_auth(&paths(&plain), &ambient_key, true, &[suffix], false),
             Some(ClaudeAlternativeAuth::ApiKey)
         );
         assert_eq!(
-            claude_default_alternative_auth(&paths(&plain), &ambient_key, false, &[]),
+            claude_default_alternative_auth(&paths(&plain), &ambient_key, false, &[], false),
+            Some(ClaudeAlternativeAuth::ApiKey)
+        );
+        // A Console API key saved by `/login` counts only without OAuth.
+        assert_eq!(
+            claude_default_alternative_auth(&paths(&plain), &none, false, &[], true),
             Some(ClaudeAlternativeAuth::ApiKey)
         );
         assert_eq!(
-            claude_default_alternative_auth(&paths(&env_key), &none, true, &[]),
+            claude_default_alternative_auth(&paths(&plain), &none, true, &[], true),
+            None
+        );
+        assert_eq!(
+            claude_default_alternative_auth(&paths(&env_key), &none, true, &[], false),
             None,
             "settings env ANTHROPIC_API_KEY follows the same approval rule"
         );

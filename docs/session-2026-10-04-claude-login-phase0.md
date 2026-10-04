@@ -1,8 +1,8 @@
-# Claude logins: no Ottto-caused sign-outs (Phase 0)
+# Claude logins: no Ottto-caused sign-outs, plus one safe background refresh
 
 **Date:** 2026-10-04
-**Scope:** daemon Claude login state, upkeep and every Claude CLI spawn; no
-wire field or protocol enum change
+**Scope:** daemon Claude login state, upkeep, short Claude runs and a new
+background refresher; no wire field or protocol enum change
 
 ## Problem
 
@@ -10,110 +10,45 @@ Short Claude Code commands that the daemon ran signed users out. A command that
 starts near or after the access token's expiry starts a token refresh. If it
 exits, or is killed, before the rotated token is saved, the refresh token is
 spent; the next run gets `invalid_grant` and Claude Code blanks the login
-(anthropics/claude-code issue 95822). The daemon ran such commands all the time:
+(anthropics/claude-code issue 95822). The daemon ran `claude auth status` on
+every pass, `claude doctor` as upkeep, and the killable `-p /context` read and
+Verify smoke.
 
-- `claude auth status --json` for the default login and every registered slot,
-  on every status pass;
-- `claude doctor` as consented post-expiry upkeep;
-- `claude -p /context`, killed at its timeout;
-- the Verify smoke prompt, killed at its timeout.
+## Change (re-scoped with Ron, 2026-10-04)
 
-## Change
+- **Login state from local metadata.** No `claude auth status`. `.claude.json`
+  (identity: email, organization), the stored credential (deadlines, token
+  presence, scopes, plan from `subscriptionType`), `.claude.json` again. A
+  keychain failure, a missing `security` tool or a malformed item fails closed;
+  a missing item is not signed in; a missing or lapsed refresh grant is
+  `needs_login`. #478/#479 states and auto-resume are kept. Default-login
+  precedence follows Claude Code: Bedrock/Vertex, `ANTHROPIC_AUTH_TOKEN`,
+  `apiKeyHelper`, an approved `ANTHROPIC_API_KEY`, and a stored Console API key
+  (only without OAuth).
+- **`doctor` upkeep off.**
+- **Quiet window** (`claude_spawn_gate.rs`): the `-p /context` read and the
+  Verify smoke do not start from 15 minutes before access expiry until a new
+  expiry is confirmed, nor while expired, on a failed read, or while Claude
+  Code holds its refresh lock.
+- **Background refresher** (`claude_refresher.rs`, "Keep my Claude accounts
+  signed in" = `background_upkeep_consent`, on by default until chosen): per
+  registered slot and the default login, one
+  `claude -p /usage --no-session-persistence --strict-mcp-config` when the
+  access token is within 5 minutes of expiry or expired; empty cwd, own process
+  group, Mac kept awake (`caffeinate -i -w`), never killed (reported after
+  120 s), success only when `expiresAt` advances (keychain `mdat` logged).
+  Failure or blanking: no retry for that credential, the slot asks to sign in
+  again; a new credential clears it.
+- **Lifetime warnings** 3 days and 1 day before `refreshTokenExpiresAt`, on
+  the existing `relogin_approaching` diagnostic.
+- **No expired-token usage requests.**
 
-- **Login state from local metadata.** `auth status` read only the stored
-  token's presence and scopes, the stored plan and the `.claude.json` account.
-  The daemon now reads those directly: `.claude.json`, the stored credential,
-  `.claude.json` again. The plan comes from the credential's
-  `subscriptionType`, refined by the existing `.claude.json` rules. A keychain
-  failure or a malformed item fails closed (`probe_failed`); a missing item is
-  not signed in; a missing or lapsed refresh grant is `needs_login`.
-- **`doctor` upkeep off.** Nothing is queued and the production process runner
-  never spawns. Consent and the upkeep state file are kept for a later phase.
-- **One spawn gate** (`crates/ottto-service/src/claude_spawn_gate.rs`). It is
-  the only code that may build a `claude` `Command`, with an exact argv
-  allowlist: `--version`; `auth login --claudeai` in a managed root;
-  `-p /context --output-format json --strict-mcp-config`; the smoke argv
-  (also with `--strict-mcp-config`).
-  A credential-using spawn re-reads its login right before the spawn and is
-  refused unless the access token stays valid for 5 min (Claude Code's refresh
-  window) + 10 min + the command's runtime. Failed reads, missing deadlines,
-  deadlines more than 24 h out, a fresh `.oauth_refresh.lock` and the usage
-  off-switch also refuse. Children run on monotonic and wall-clock deadlines.
-  A source-scan test fails on any Claude spawn pattern outside the gate.
-- **Paused, then auto-resume.** An access token that lapsed while its refresh
-  grant is alive is paused: `refresh_due` + upkeep `upkeep_disabled`
-  (quota access `paused`), the last reading kept stale. Never
-  `stale_access_token`. Every pass re-reads the credential, so when Claude Code
-  refreshes the login the same pass collects again. The #479 identity gates
-  still run first.
-- **No expired-token usage requests.** A token expired by the local clock (or
-  within 60 s) is never sent to `/api/oauth/usage`; the last reading is served
-  stale under `claude_oauth_usage_check_suppressed`.
-- **MCP.** A user MCP server that would run the Claude Code CLI is reported
-  unreachable and never spawned.
+All three CLI flags (`/usage` with `supportsNonInteractive`,
+`--no-session-persistence`, `--strict-mcp-config`) were verified in Claude
+Code 2.1.288's source; the real CLI was not run.
 
-## Cost and open decision
+## Dropped (earlier review rounds)
 
-A managed-only account has live limits for about 8 hours after each browser
-sign-in, then its reading ages. An account that is also the default login is
-read through the default credential instead. Q-A (quiet "Paused" vs a louder
-"Sign in again") is open; the quiet default is behind
-`claude_upkeep::PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN`.
-
-## Tests
-
-Gate boundaries with a fake clock; argv allowlist; target environment; source
-scan; status passes across the expiry boundary with a logging fake `claude`
-and fake `security` (only `--version` runs, one keychain read per login per
-pass); paused presentation; auto-resume; identity mismatch stays; expired
-default makes no request; default takes over from a paused slot; `/context`
-and Verify refusals; MCP refusal; local-metadata account equals the old
-`auth status` account for Max 20x and Team Premium. Provider requests are
-forbidden in these tests.
-
-## Review round 1 (R17 + GPT-6.1-Sol)
-
-- Every admitted credential-using run (`/context`, Verify smoke) uses
-  `--strict-mcp-config` with no `--mcp-config` (verified statically in Claude
-  Code 2.1.288: "Only use MCP servers from --mcp-config, ignoring all other MCP
-  configurations"). The sampled MCP-enabled `/context` run is gone; MCP tool
-  costs come from the MCP inventory.
-- The MCP inventory refuses servers that can reach Claude: a `claude` command,
-  a renamed copy (realpath compare), the npm package, any shell, an
-  interpreter with an inline script, a script naming Claude, or argv/env
-  referencing `claude`/`CLAUDE_CONFIG_DIR`. They carry a new optional
-  `skipped_reason` field (they are still sent as `reachable: false`).
-- A permit's clock starts at the credential read, and a credential-using
-  permit re-reads and re-evaluates the login immediately before `spawn()`.
-- No `security` tool means the login cannot be confirmed (`Unreadable`), never
-  "no login"; the gate refuses. A refreshable item with no access token or no
-  `user:inference` scope is refused by the gate.
-- The default login checks Bedrock/Vertex and API keys (settings, helper or
-  ambient environment) before the OAuth state.
-- The expiry check before the usage request uses a fresh clock reading, taken
-  immediately before the request.
-- `ClaudeExecutable` is opaque to the gate; the display path is a string for
-  the detection row only. The source scan also flags commands, argv and shell
-  scripts that name `claude`, and the Claude search helpers outside their
-  owners.
-- Deadline kills send SIGTERM and wait three seconds before SIGKILL.
-
-## Review round 2 (owner design change: isolate by environment)
-
-- **MCP probes run credential-isolated** instead of relying on an ever-longer
-  denylist: a fresh empty per-probe dir is both `CLAUDE_CONFIG_DIR` and
-  `CLAUDE_SECURESTORAGE_CONFIG_DIR` (in 2.1.288 the latter picks the keychain
-  service `Claude Code-credentials-<sha256(dir)[..8]>` and the
-  `.credentials.json` dir; `.claude.json` and user settings live under the
-  former), and every credential/config selector Claude Code reads is removed,
-  after the server's own env. The whole process group is killed at the
-  deadline. The denylist stays as defence in depth, with no new patterns.
-- **Admitted runs** are pinned to exactly the admitted login (the same
-  selector list removed; only the slot's `CLAUDE_CONFIG_DIR` set), add
-  `--settings '{"disableAllHooks":true}'` (verified statically: `--settings`
-  takes a JSON string, and `disableAllHooks` there switches off every
-  non-managed hook), and run in their own process group.
-- **Settings precedence** follows the CLI (user < project < local < flag <
-  policy; settings `env` over the process environment), and
-  `ANTHROPIC_API_KEY` outranks a usable OAuth login only when its last 20
-  characters are in `.claude.json` `customApiKeyResponses.approved`.
+MCP credential isolation, hook disabling, process-group kills of short runs,
+the opaque-executable structure and the strict-MCP `/context`. MCP probes and
+`/context` are back to master behaviour apart from the quiet window.

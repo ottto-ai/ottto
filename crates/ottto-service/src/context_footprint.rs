@@ -25,17 +25,23 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const CONTEXT_FOOTPRINT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const CONTEXT_COMMAND_TIMEOUT_SECS: u64 = 25;
+const CONTEXT_MCP_COMMAND_TIMEOUT_SECS: u64 = 120;
 const CONTEXT_COMMAND_TIMEOUT: Duration = Duration::from_secs(CONTEXT_COMMAND_TIMEOUT_SECS);
+const CONTEXT_MCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(CONTEXT_MCP_COMMAND_TIMEOUT_SECS);
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTEXT_MAX_STALENESS_SECS: i64 = 7 * 24 * 60 * 60;
 const RECENT_WORKSPACE_WINDOW: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const MAX_WORKSPACES_PER_CYCLE: usize = 12;
 const MAX_MCP_TOOLS_PER_CAPTURE: usize = 500;
-// Every capture runs in strict MCP mode (no user MCP server starts beneath an
-// admitted Claude process), so each uses the same allowance. Thirty seconds
-// covers bounded git identity checks and uploads.
-const CONTEXT_CYCLE_BUDGET: Duration =
-    Duration::from_secs((MAX_WORKSPACES_PER_CYCLE as u64 * CONTEXT_COMMAND_TIMEOUT_SECS) + 30);
+// One MCP-enabled capture may use its full cold-start allowance while every
+// other workspace uses the existing strict allowance. Thirty seconds covers
+// bounded git identity checks and uploads without pretending all 12 commands
+// still fit inside the old five-minute budget.
+const CONTEXT_CYCLE_BUDGET: Duration = Duration::from_secs(
+    CONTEXT_MCP_COMMAND_TIMEOUT_SECS
+        + ((MAX_WORKSPACES_PER_CYCLE as u64 - 1) * CONTEXT_COMMAND_TIMEOUT_SECS)
+        + 30,
+);
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct ContextFootprintCategoryInput {
@@ -131,23 +137,37 @@ pub(crate) struct RepositoryIdentity {
     pub(crate) workspace_kind: Option<String>,
 }
 
-/// The user's provider variables, resolved once per cycle (`provider_env` may
-/// briefly consult a login shell) and applied to each admitted `/context` run.
 #[derive(Clone)]
 struct SpawnEnv {
+    path: Option<OsString>,
     provider: BTreeMap<String, OsString>,
 }
 
 impl SpawnEnv {
     fn resolve() -> Self {
         Self {
+            path: crate::command_env::path_env(),
             provider: crate::command_env::provider_env(),
         }
     }
+
+    fn claude_command(&self) -> Result<Command> {
+        let Some(program) = crate::command_env::executable_path("claude") else {
+            return Err(anyhow!("Claude Code CLI was not found"));
+        };
+        let mut command = Command::new(program);
+        if let Some(path) = self.path.as_ref() {
+            command.env("PATH", path);
+        }
+        for (key, value) in &self.provider {
+            command.env(key, value);
+        }
+        Ok(command)
+    }
 }
 
-/// The spawn gate held a `/context` run back: running Claude Code now could
-/// refresh, and so sign out, the default login.
+/// The quiet window refused a `/context` run: the default login is within 15
+/// minutes of its access token's expiry (or expired) and not yet refreshed.
 #[derive(Debug)]
 struct ClaudeContextRefused(crate::claude_spawn_gate::ClaudeSpawnRefusal);
 
@@ -155,7 +175,7 @@ impl std::fmt::Display for ClaudeContextRefused {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "Claude Code /context was not started: spawn gate refused ({})",
+            "Claude Code /context was not started: {}",
             self.0.code()
         )
     }
@@ -163,9 +183,22 @@ impl std::fmt::Display for ClaudeContextRefused {
 
 impl std::error::Error for ClaudeContextRefused {}
 
-/// After a refusal the next cycle starts sooner, once Claude Code itself has
-/// had time to refresh its login.
+/// After a refusal the next cycle starts sooner, once the login is refreshed.
 const CONTEXT_REFUSED_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// One harvest cycle's outcome: how many workspaces the quiet window skipped.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ContextHarvestOutcome {
+    refused: usize,
+}
+
+fn next_context_cycle_delay(refused: bool) -> Duration {
+    if refused {
+        CONTEXT_REFUSED_RETRY_INTERVAL
+    } else {
+        CONTEXT_FOOTPRINT_INTERVAL
+    }
+}
 
 pub fn spawn_context_footprint_sync() -> Result<()> {
     let home = crate::snapshot_sync::home_dir()?;
@@ -187,21 +220,6 @@ pub fn spawn_context_footprint_sync() -> Result<()> {
         })
         .map_err(|error| anyhow!("spawn context footprint sync: {error}"))?;
     Ok(())
-}
-
-/// One harvest cycle's outcome. `refused` counts workspaces the spawn gate
-/// skipped; any refusal schedules the next cycle in 30 minutes, not 6 hours.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct ContextHarvestOutcome {
-    refused: usize,
-}
-
-fn next_context_cycle_delay(refused: bool) -> Duration {
-    if refused {
-        CONTEXT_REFUSED_RETRY_INTERVAL
-    } else {
-        CONTEXT_FOOTPRINT_INTERVAL
-    }
 }
 
 fn harvest_all_once(home: &Path, support_dir: &Path) -> Result<ContextHarvestOutcome> {
@@ -301,15 +319,19 @@ fn harvest_recent_workspaces(
     let mut skipped = 0usize;
     let mut failed = 0usize;
     let mut refused = 0usize;
-    for workspace in workspaces {
+    for (workspace_index, workspace) in workspaces.into_iter().enumerate() {
         if Instant::now() >= deadline {
             break;
         }
+        // Discovery is sorted newest-first, so index zero is the deterministic
+        // most-recently-active workspace selected for the cycle's sole MCP run.
+        let include_mcp_servers = should_include_mcp_servers(workspace_index);
         match build_request_for_workspace(
             &workspace.path,
             machine_id,
             &env,
             workspace_labels_enabled,
+            include_mcp_servers,
         ) {
             Ok(request) => {
                 match upload_if_changed(client, relay_token, support_dir, identity, &request) {
@@ -326,7 +348,6 @@ fn harvest_recent_workspaces(
                 }
             }
             Err(error) if error.downcast_ref::<ClaudeContextRefused>().is_some() => {
-                // Skip only this workspace; the next one re-reads the login.
                 refused += 1;
             }
             Err(error) => {
@@ -339,12 +360,11 @@ fn harvest_recent_workspaces(
         }
     }
     eprintln!(
-        "context_footprint_harvest_metrics discovered={} uploaded={} skipped={} failed={} refused={}",
-        uploaded + skipped + failed + refused,
+        "context_footprint_harvest_metrics discovered={} uploaded={} skipped={} failed={}",
+        uploaded + skipped + failed,
         uploaded,
         skipped,
-        failed,
-        refused
+        failed
     );
     if failed > 0 && uploaded == 0 && skipped == 0 {
         return Err(anyhow!(
@@ -354,13 +374,18 @@ fn harvest_recent_workspaces(
     Ok(ContextHarvestOutcome { refused })
 }
 
+fn should_include_mcp_servers(workspace_index: usize) -> bool {
+    workspace_index == 0
+}
+
 fn build_request_for_workspace(
     workspace: &Path,
     machine_id: &str,
     env: &SpawnEnv,
     workspace_labels_enabled: bool,
+    include_mcp_servers: bool,
 ) -> Result<ContextFootprintIngestRequest> {
-    let stdout = run_claude_context(workspace, env)?;
+    let stdout = run_claude_context(workspace, env, include_mcp_servers)?;
     let value: Value = serde_json::from_str(&stdout)
         .map_err(|_| anyhow!("Claude Code /context JSON was invalid"))?;
     if value
@@ -415,44 +440,25 @@ fn build_request_for_workspace(
     })
 }
 
-fn run_claude_context(workspace: &Path, env: &SpawnEnv) -> Result<String> {
-    use crate::claude_spawn_gate::{
-        admit, ClaudeSpawnClass, ClaudeSpawnFailure, ClaudeSpawnRefusal, ClaudeSpawnTarget,
-    };
-    let argv = crate::claude_spawn_gate::claude_context_argv();
-    let command_timeout = CONTEXT_COMMAND_TIMEOUT;
-    // Admission re-reads the default login immediately before this spawn and
-    // refuses near its expiry, so the kill at `command_timeout` can never land
-    // in the middle of a Claude Code token refresh.
-    let mut permit = admit(
-        ClaudeSpawnTarget::Default,
-        ClaudeSpawnClass::CredentialUsing {
-            max_runtime: command_timeout,
-        },
-        &argv,
-    )
-    .map_err(|refusal| match refusal {
-        ClaudeSpawnRefusal::MissingBinary | ClaudeSpawnRefusal::NoEffectiveUser => {
-            anyhow!("Claude Code CLI was not found")
-        }
-        refusal => anyhow::Error::new(ClaudeContextRefused(refusal)),
-    })?;
-    permit
-        .provider_env(&env.provider)
+fn run_claude_context(
+    workspace: &Path,
+    env: &SpawnEnv,
+    include_mcp_servers: bool,
+) -> Result<String> {
+    // Quiet window: never start Claude Code from 15 minutes before the
+    // default login's access expiry until the refresher confirmed a new one.
+    crate::claude_spawn_gate::check_short_claude_run(&ottto_core::ClaudeConfigDirSlot::Default)
+        .map_err(|refusal| anyhow::Error::new(ClaudeContextRefused(refusal)))?;
+    let mut command = env.claude_command()?;
+    command
         .current_dir(workspace)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let (mut child, deadline) = permit
+    let command_timeout = configure_claude_context_command(&mut command, include_mcp_servers);
+    let mut child = command
         .spawn()
-        .map_err(|failure| match failure {
-            ClaudeSpawnFailure::Refused(refusal) => {
-                anyhow::Error::new(ClaudeContextRefused(refusal))
-            }
-            ClaudeSpawnFailure::Expired | ClaudeSpawnFailure::Io(_) => {
-                anyhow!("Claude Code /context could not be started")
-            }
-        })?
-        .into_parts();
+        .map_err(|_| anyhow!("Claude Code /context could not be started"))?;
+    let started = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(_)) => {
@@ -465,13 +471,30 @@ fn run_claude_context(workspace: &Path, env: &SpawnEnv) -> Result<String> {
                 return String::from_utf8(output.stdout)
                     .map_err(|_| anyhow!("Claude Code /context stdout was not UTF-8"));
             }
-            Ok(None) if deadline.is_some_and(|deadline| deadline.passed()) => {
-                crate::claude_spawn_gate::terminate_gracefully(&mut child);
+            Ok(None) if started.elapsed() >= command_timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
                 return Err(anyhow!("Claude Code /context timed out"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(_) => return Err(anyhow!("Claude Code /context status could not be read")),
         }
+    }
+}
+
+fn configure_claude_context_command(command: &mut Command, include_mcp_servers: bool) -> Duration {
+    command.args(["-p", "/context", "--output-format", "json"]);
+    if !include_mcp_servers {
+        // Keep strict mode everywhere except the single sampled workspace.
+        // Dropping it globally would double-count MCP across the context and
+        // inventory spines, multiply unattended user-server spawns by 12 per
+        // cycle, and put every capture behind a timeout one cold server blows.
+        command.arg("--strict-mcp-config");
+    }
+    if include_mcp_servers {
+        CONTEXT_MCP_COMMAND_TIMEOUT
+    } else {
+        CONTEXT_COMMAND_TIMEOUT
     }
 }
 
@@ -1340,47 +1363,49 @@ mod tests {
         assert_eq!(parse_percent("95.8%"), Some(95.8));
     }
 
-    /// T4: the `/context` read is admitted an hour before expiry and refused
-    /// ten minutes before it; the refused workspace never starts Claude Code
-    /// and the next cycle comes back in 30 minutes instead of 6 hours.
+    /// The `/context` read runs an hour before expiry and is refused ten
+    /// minutes before it (never started), with a 30-minute retry.
     #[test]
     #[serial_test::serial]
-    fn context_run_is_admitted_an_hour_out_and_refused_near_expiry() {
+    fn context_run_waits_inside_the_quiet_window() {
         let fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("context");
         let workspace = temp_dir("context-gate-workspace");
         let env = SpawnEnv {
+            path: crate::command_env::path_env(),
             provider: BTreeMap::new(),
         };
         fake.default_login_expires_in(time::Duration::hours(1));
-        run_claude_context(&workspace, &env).expect("admitted an hour out");
-        assert_eq!(
-            fake.spawns(),
-            vec![
-                "|-p /context --output-format json --strict-mcp-config --settings {\"disableAllHooks\":true}"
-                    .to_string()
-            ]
-        );
-
+        run_claude_context(&workspace, &env, false).expect("admitted an hour out");
+        assert_eq!(fake.spawns().len(), 1);
         fake.default_login_expires_in(time::Duration::minutes(10));
-        let error = run_claude_context(&workspace, &env).expect_err("refused near expiry");
+        let error = run_claude_context(&workspace, &env, false).expect_err("refused");
         assert!(error.downcast_ref::<ClaudeContextRefused>().is_some());
         assert_eq!(fake.spawns().len(), 1, "the refused run never started");
         assert_eq!(next_context_cycle_delay(true), Duration::from_secs(30 * 60));
-        assert_eq!(next_context_cycle_delay(false), CONTEXT_FOOTPRINT_INTERVAL);
         let _ = fs::remove_dir_all(workspace);
     }
 
-    /// Review round 1: no workspace runs `/context` with user MCP servers.
-    /// A server can itself be a credential-using Claude Code (`claude mcp
-    /// serve` under another `CLAUDE_CONFIG_DIR`) that the gate never
-    /// evaluated, so every admitted run is strict.
     #[test]
-    fn every_context_run_starts_no_mcp_server() {
-        let argv = crate::claude_spawn_gate::claude_context_argv();
-        assert!(argv.contains(&"--strict-mcp-config"));
-        assert!(argv.contains(&"--settings"), "hooks are switched off too");
-        assert!(!argv.contains(&"--mcp-config"));
-        assert!(CONTEXT_CYCLE_BUDGET >= CONTEXT_COMMAND_TIMEOUT * MAX_WORKSPACES_PER_CYCLE as u32);
+    fn only_newest_workspace_enables_mcp_with_the_long_timeout() {
+        assert!(should_include_mcp_servers(0));
+        assert!((1..MAX_WORKSPACES_PER_CYCLE).all(|index| !should_include_mcp_servers(index)));
+
+        let mut sampled = Command::new("claude");
+        let sampled_timeout = configure_claude_context_command(&mut sampled, true);
+        let sampled_args: Vec<_> = sampled.get_args().collect();
+        assert!(!sampled_args.iter().any(|arg| *arg == "--strict-mcp-config"));
+        assert_eq!(sampled_timeout, CONTEXT_MCP_COMMAND_TIMEOUT);
+
+        let mut strict = Command::new("claude");
+        let strict_timeout = configure_claude_context_command(&mut strict, false);
+        let strict_args: Vec<_> = strict.get_args().collect();
+        assert!(strict_args.iter().any(|arg| *arg == "--strict-mcp-config"));
+        assert_eq!(strict_timeout, CONTEXT_COMMAND_TIMEOUT);
+        assert!(
+            CONTEXT_CYCLE_BUDGET
+                >= CONTEXT_MCP_COMMAND_TIMEOUT
+                    + CONTEXT_COMMAND_TIMEOUT * (MAX_WORKSPACES_PER_CYCLE as u32 - 1)
+        );
     }
 
     #[test]

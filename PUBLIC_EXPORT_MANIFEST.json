@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 425,
-  "content_sha256": "b9e766378936fc22ec92c53b30438e39d1b28574f43b6516d612bd9218abbfb9",
+  "candidate_file_count": 426,
+  "content_sha256": "bb929c35c0b4cd6b9b8ff8c0a7e8e29c35a2ac110cdd6a631ba2a04697a7a187",
   "files": [
     {
       "executable": false,
@@ -139,15 +139,15 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/claude-code/POLICY.md",
-      "sha256": "2eeb31d9dd4ec28644e09f133b8bff449aa68f30c7be2266570697afbb578363",
-      "size_bytes": 5494
+      "sha256": "3c42ff25f03ad6ab941debf232145ec916e8dee92df284bd424dfa2aeaf733ee",
+      "size_bytes": 3921
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/claude-code/README.md",
-      "sha256": "c49bbccbfe5c8ca2bb32c5dac0701d7d717f17475c569e061b91380930544402",
-      "size_bytes": 1581
+      "sha256": "0a6662ff972359b6e96ca812d81de69c6d5a7d5bb471068c95c1c412979b3153",
+      "size_bytes": 1560
     },
     {
       "executable": false,
@@ -503,8 +503,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/claude_config_slots.rs",
-      "sha256": "4ace71c28de0b0f71a373819167ea1fe9fd312295e8954b60d62aee75f88ea20",
-      "size_bytes": 177229
+      "sha256": "6cc154d3885a7bc7fab80d1b0cfb5c1dc8919fbfbd1ae47687511445cc89e2f1",
+      "size_bytes": 178232
     },
     {
       "executable": false,
@@ -629,8 +629,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_configs/detection.rs",
-      "sha256": "30c0105f9f525d98824d5e6ae92f2859e1238920e9d76efa7c7dfda3b12738d5",
-      "size_bytes": 16311
+      "sha256": "74dfe27147aad98509119ccd57644df82ba66f1053cb5248ccc4d1ae81c9254c",
+      "size_bytes": 15116
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "29ca8b743ebd5592fa43e41d08039e98c5fa660e4ba5e24b2a178ba1ab8dac2f",
-      "size_bytes": 1263556
+      "sha256": "d6b6b82a58f20cb47b3c56368761d7f16244543742ae798758c431c98e759c0d",
+      "size_bytes": 1275659
     },
     {
       "executable": false,
@@ -671,8 +671,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_browser_auth.rs",
-      "sha256": "b1cac3764cf0277e7af8d6d507071bd31be558b2902d02627331b61fd6936dea",
-      "size_bytes": 346745
+      "sha256": "d3a2cd476ccd93e0b9022162bb12785a9c200e7cbf53b4529ed9d071e691a5a9",
+      "size_bytes": 346216
     },
     {
       "executable": false,
@@ -684,16 +684,23 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/claude_refresher.rs",
+      "sha256": "58123f9767699d9792e7c95ae02a14067a0ba0427a740e05c75e7d03674f276a",
+      "size_bytes": 25972
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/claude_spawn_gate.rs",
-      "sha256": "0a386067f84cee9058782d87f210f7ca7fc0539fc103e40e5b74929c959e1d55",
-      "size_bytes": 82197
+      "sha256": "a7af12273c2329f24fe3103e6f0f8f696d4afb5fb0fe5db10c60b0a6f4bc1e2f",
+      "size_bytes": 15442
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_upkeep.rs",
-      "sha256": "72b4b19ecd670446ac886877a55e8ebf062277b98bb2a03498c50384abc0ecb4",
-      "size_bytes": 125856
+      "sha256": "1c808bed1a470e87be6aa088e379cca34e8a41808ac1ebca6adff36493012220",
+      "size_bytes": 127540
     },
     {
       "executable": false,
@@ -720,8 +727,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/command_env.rs",
-      "sha256": "04dba00e51db10a036ac1810788f4880753791c3e95cfebdfb45df8a16c7b34d",
-      "size_bytes": 25006
+      "sha256": "36becb714c0fd5c145ed3a2a64f8e423947d849e72a175752a62af2b7df61f00",
+      "size_bytes": 24727
     },
     {
       "executable": false,
@@ -741,8 +748,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_footprint.rs",
-      "sha256": "9ba56c061431927a99817e302cd6cafe3f00ebd75e26cef046a981b32c4e2bc9",
-      "size_bytes": 58996
+      "sha256": "0ca1c998d6b97c8b53297386b20aa773f9cac44b3480cef8f2e4304810fb7d49",
+      "size_bytes": 59962
     },
     {
       "executable": false,
@@ -755,8 +762,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "ab278b93b69f3dae23a225ab3d723d6b69bf24b49356eb872bd85c340e4e446f",
-      "size_bytes": 1181434
+      "sha256": "5f63831059cea0b1dc429ca9bd3f171f0e73b31793294fb7e52913a3d2ec23fb",
+      "size_bytes": 1178340
     },
     {
       "executable": false,
@@ -818,8 +825,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "25bc3c71a0a8846c11d523b6d669fc07abd81930d4a0c5d4c4c3094e2d82739b",
-      "size_bytes": 332953
+      "sha256": "3fee39f6921ebd9145da8db1ccd27aab2def7c3d1bf70d188611bc34ecf46e21",
+      "size_bytes": 332986
     },
     {
       "executable": false,
@@ -839,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/mcp_inventory.rs",
-      "sha256": "296b6aa32614dfc6793516422ff22bebe671f6938c2b2fbe03f980905ca3ec65",
-      "size_bytes": 112888
+      "sha256": "c0ff606bf0fe79314f3e8d8c080f24aa1943b2c7b25e6d8450a33d31fa5e3ceb",
+      "size_bytes": 101975
     },
     {
       "executable": false,
@@ -1000,8 +1007,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/claude-accounts.md",
-      "sha256": "1309e2da23e0be5a2c1289a29c282752144b2e3bcc5945bb1c8c3801fe70fa0f",
-      "size_bytes": 24901
+      "sha256": "b71fc94ec7cacedcbf4eda1cd166be584d37a112bdd9df349ba7082dc9d6e567",
+      "size_bytes": 23045
     },
     {
       "executable": false,
@@ -1910,8 +1917,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-04-claude-login-phase0.md",
-      "sha256": "b5a22c759815906e6bd6cd3cddeddda7b18021d0624a9a0c91c2f57b09846d13",
-      "size_bytes": 6867
+      "sha256": "da6bfdad4d2d39cc6bc0c6b37ba147aba97b30d458e8b68a2ef8459a530b97b1",
+      "size_bytes": 2918
     },
     {
       "executable": false,
@@ -2978,9 +2985,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-04T07:35:46+00:00",
+  "generated_at": "2026-10-04T08:57:16+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 426,
+  "output_file_count": 427,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3014,5 +3021,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "405e93faf95e435fe9b68e1cadf176e84e73eb56"
+  "source_commit": "ea047df92b4248ffd57694ef1da517bac51d9981"
 }

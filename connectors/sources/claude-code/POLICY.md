@@ -16,18 +16,12 @@ Review tier: `official`
 - The documented status-line `rate_limits` payload may be used for quota evidence when the Ottto wrapper is enabled.
 - `identity_probe` reads the same fields `claude auth status --json` printed, from their local sources: `email`, `organizationUuid` and `organizationName` from `.claude.json` `oauthAccount`, and `subscriptionType`, token presence, deadlines and scopes from the stored Claude Code credential. Email never leaves the machine. The organization id leaves the machine only as the raw `organization_id` of the agent-status account block and plan observations, next to its hash.
 
-## Login state and the Claude CLI spawn gate
+## Login state and the background refresher
 
 - The daemon never runs `claude auth status` or `claude doctor`. A short Claude Code command that starts near or after access expiry can begin a token refresh and exit before the rotated token is saved, which signs the login out (anthropics/claude-code#95822).
 - Login state comes from `.claude.json`, then the stored credential (the `Claude Code-credentials[-<hash>]` Keychain item read with `security find-generic-password -w`, or `<config>/.credentials.json`), then `.claude.json` again. The credential passes into daemon memory only: the access token is used solely for the documented subscription usage request and is never sent once it is locally expired; the refresh token is checked for presence and never used. Nothing from the item is stored, logged or uploaded. A failed or unavailable Keychain read fails closed.
-- Every daemon spawn of the Claude Code CLI goes through one gate with an exact argv allowlist: `--version`; `auth login --claudeai` in an Ottto-managed auth root; `-p /context --output-format json --strict-mcp-config --settings {"disableAllHooks":true}`; and the Verify smoke prompt with the same two switches. The credential-using commands re-read the login immediately before spawning and are refused unless the access token stays valid for Claude Code's 5-minute refresh window, a 10-minute margin and the command's runtime. They start no user MCP servers and no hooks, their credential environment is pinned to exactly the admitted login, and they run in their own process group.
-- Every MCP server the inventory probes runs credential-isolated (empty per-probe `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR`, no credential variables), so a Claude Code started beneath it cannot reach a real login. As defence in depth, servers recognised as Claude Code itself are not started and are reported with a `skipped_reason`.
-- `~/.claude/settings.json` may be read for `ANTHROPIC_VERTEX_PROJECT_ID`, `CLOUD_ML_REGION`, and similar gateway env values when a Vertex/Bedrock novelty trigger fires. Read-only.
-- Claude Desktop app-managed metadata may be read only from:
-  - `~/Library/Application Support/Claude/config.json` for `lastKnownAccountUuid`.
-  - `~/Library/Application Support/Claude/claude-code-sessions/<account>/<org>/local_*.json` for bounded session recency, org-bucket, and CLI session-id metadata.
-  - `~/Library/Application Support/Claude/local-agent-mode-sessions/<account>/<org>/local_*.json` for display-safe account email/name, org/workspace label, plan label if present, recency, and CLI session-id metadata.
-  These files may be used to distinguish Claude Desktop Code from Claude CLI when the active Desktop account/org differs from the CLI login. Prompt, response, system prompt, cwd, and tool/audit fields in those files must not be uploaded.
+- With "Keep my Claude accounts signed in" on, the daemon runs one `claude -p /usage --no-session-persistence --strict-mcp-config` per login when its access token is within 5 minutes of expiry or expired, never kills it, and accepts the refresh only when `expiresAt` advances.
+- The `-p /context` read and the Verify smoke do not start from 15 minutes before a login's access expiry until it is refreshed.
 
 ## Undocumented Surfaces
 

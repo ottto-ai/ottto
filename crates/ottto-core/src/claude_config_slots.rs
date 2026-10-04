@@ -158,6 +158,12 @@ pub enum ClaudeConfigSlotSettingsError {
 struct PersistedClaudeConfigSlotSettingsV1 {
     schema_version: u16,
     background_upkeep_consent: bool,
+    /// Whether the user ever set "Keep my Claude accounts signed in"
+    /// (`background_upkeep_consent`). Until they do, the setting is on by
+    /// default. Older daemons ignore this field; a downgrade rewrite drops it,
+    /// which only returns the setting to its default.
+    #[serde(default)]
+    background_upkeep_consent_chosen: bool,
     #[serde(default)]
     registered_slots: Vec<PersistedClaudeConfigSlotV1>,
     #[serde(default)]
@@ -326,6 +332,7 @@ impl Default for PersistedClaudeConfigSlotSettingsV1 {
         Self {
             schema_version: CLAUDE_CONFIG_SLOT_PERSISTED_SCHEMA_VERSION,
             background_upkeep_consent: false,
+            background_upkeep_consent_chosen: false,
             registered_slots: Vec::new(),
             setup_operations: Vec::new(),
             reconnect_operations: Vec::new(),
@@ -373,6 +380,7 @@ impl FileClaudeConfigSlotSettingsStore {
     ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
         self.transact(schema_version, |settings| {
             settings.background_upkeep_consent = consent;
+            settings.background_upkeep_consent_chosen = true;
             Ok(())
         })
     }
@@ -2550,7 +2558,11 @@ fn status_contract_with_selected_operation(
         });
     ClaudeAccountsStatusV1 {
         schema_version: CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
-        consent: if persisted.background_upkeep_consent {
+        // "Keep my Claude accounts signed in" is on until the user turns it
+        // off.
+        consent: if persisted.background_upkeep_consent
+            || !persisted.background_upkeep_consent_chosen
+        {
             ClaudeAccountUpkeepConsentState::Granted
         } else {
             ClaudeAccountUpkeepConsentState::ConsentRequired
@@ -2702,16 +2714,21 @@ mod tests {
     }
 
     #[test]
-    fn settings_default_to_consent_required_with_the_bare_slot() {
+    fn settings_default_to_kept_signed_in_with_the_bare_slot() {
         let path = temp_path("default");
         let _ = fs::remove_dir_all(path.parent().expect("parent"));
         let store = FileClaudeConfigSlotSettingsStore::new(&path);
         let settings = store.load().expect("load default");
         assert_eq!(settings.schema_version, 1);
+        // "Keep my Claude accounts signed in" defaults on until chosen.
+        assert_eq!(settings.consent, ClaudeAccountUpkeepConsentState::Granted);
+        let off = store.set_upkeep_consent(1, false).expect("turn off");
         assert_eq!(
-            settings.consent,
+            off.consent,
             ClaudeAccountUpkeepConsentState::ConsentRequired
         );
+        let on = store.set_upkeep_consent(1, true).expect("turn on");
+        assert_eq!(on.consent, ClaudeAccountUpkeepConsentState::Granted);
         assert_eq!(
             settings.setup_operation.state,
             ClaudeAccountSetupOperationState::Idle
@@ -2751,10 +2768,8 @@ mod tests {
         );
         assert!(saved.external_slots[0].slot_id.starts_with("claude_slot_"));
         assert_ne!(saved.external_slots[0].slot_id, "registered:03abf0ee");
-        assert_eq!(
-            saved.consent,
-            ClaudeAccountUpkeepConsentState::ConsentRequired
-        );
+        // Kept signed in by default until the user chooses.
+        assert_eq!(saved.consent, ClaudeAccountUpkeepConsentState::Granted);
         let saved = store.set_upkeep_consent(1, true).expect("grant consent");
         assert_eq!(saved.consent, ClaudeAccountUpkeepConsentState::Granted);
         assert_eq!(store.load().expect("reload"), saved);
