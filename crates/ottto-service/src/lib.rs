@@ -1035,7 +1035,9 @@ impl LocalDaemon {
                     .problems
                     .iter()
                     .filter(|problem| match problem.code {
-                        StableProblemCode::ConfigDrift | StableProblemCode::ConfigMissing => false,
+                        StableProblemCode::ConfigDrift
+                        | StableProblemCode::ConfigMissing
+                        | StableProblemCode::SourceNotInstalled => false,
                         StableProblemCode::TelemetryNotVerified => !retired_transport,
                         _ => true,
                     })
@@ -6373,6 +6375,31 @@ mod tests {
             .problems
             .iter()
             .any(|problem| problem.code == StableProblemCode::TelemetryNotVerified));
+    }
+
+    #[test]
+    fn codex_source_off_readiness_clears_resolved_source_absence() {
+        let daemon = daemon().with_account(account("user_1", "test@example.com"));
+        let mut result = verified_codex("2026-05-05T10:20:00Z");
+        result.status = SourceVerificationStatus::Failed;
+        result.verified = false;
+        result.message.code = "source_not_installed".into();
+        result.records_seen = 0;
+        result.last_record_id = None;
+        result.last_received_at = None;
+        result.smoke_after = None;
+        daemon.record_verification_result(&result).unwrap();
+        assert_eq!(
+            daemon.status(TOKEN).unwrap().sources[0].state,
+            SourceState::NotFound
+        );
+        result.status = SourceVerificationStatus::Warning;
+        result.message.code = "codex_local_import".into();
+        daemon.record_verification_result(&result).unwrap();
+        let status = daemon.status(TOKEN).unwrap();
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert!(status.sources[0].problems.is_empty());
+        assert!(status.sources[0].recommended_actions.is_empty());
     }
 
     #[test]

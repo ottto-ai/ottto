@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 427,
-  "content_sha256": "632b4b5eda28b31cad5e8b5f3f533a742690cf8aef767d6ea47a0bd202b7416c",
+  "candidate_file_count": 428,
+  "content_sha256": "17ba7d96c24f39fe51f6ed3cbc1d00db7e230a60812963cbcff23b9e9f5ae87f",
   "files": [
     {
       "executable": false,
@@ -734,22 +734,22 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition.rs",
-      "sha256": "eb61992cbc6ce108e2f51e058e141c21308edcc34bbdc87232aa1a017fc801cf",
-      "size_bytes": 62218
+      "sha256": "9b304abdc31b608b1330543281b20af5552e731bf8eb44d2eef27936ba5fd7bb",
+      "size_bytes": 62989
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/tests.rs",
-      "sha256": "e056a876cca0cb0f08ced9fe152c50b936aaa692e20facd3d0e89a939657a7a6",
-      "size_bytes": 36367
+      "sha256": "a2c0c2353a594643473ffbb79202c941a43a853795ebbbd7d0b57ca27daab9dd",
+      "size_bytes": 38472
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_footprint.rs",
-      "sha256": "1a426207bf18b464c5697f19a25127aa69c39dbdb232487ca4f466218ccbeecc",
-      "size_bytes": 60066
+      "sha256": "5572eb420a4369587b50fdd61b2083f42ec8f02b2113a7140f08dc383c76053d",
+      "size_bytes": 74368
     },
     {
       "executable": false,
@@ -762,8 +762,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "0e2db84029f65b4958e6702d5b9ac4eb3c6779a9ccd9418924bfa0208b666f0d",
-      "size_bytes": 1167197
+      "sha256": "adaa5bde1e15f37f3b152b2a688c7c976d777f906e93fa057ffccefe5e8df596",
+      "size_bytes": 1168550
     },
     {
       "executable": false,
@@ -825,8 +825,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "ef744b4e758f06315598906228c98cbe97f0c0f38a14704e057ccdf024557cf6",
-      "size_bytes": 339453
+      "sha256": "815dba6865169e33fb66157b4d33cc0fcc9508ec3d32340b90c6eafabcc3cb05",
+      "size_bytes": 340682
     },
     {
       "executable": false,
@@ -1924,8 +1924,15 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-04-codex-managed-telemetry-source-off.md",
-      "sha256": "05980b81b280075ee9b6c35edfadef81cbcdad5909ca4b1a8b40d9d156d10238",
-      "size_bytes": 2540
+      "sha256": "65ba2701707c8164f34c06f4af9600714f639c1c8c9a5f7db9e0eaeb5ff10cb5",
+      "size_bytes": 3005
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-04-composition-workspace-discovery.md",
+      "sha256": "69d84d673101bec3710cc9517049b7b790c827825ab4a4d1cf49c37de91a9d9c",
+      "size_bytes": 1934
     },
     {
       "executable": false,
@@ -2992,9 +2999,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-04T20:14:23+00:00",
+  "generated_at": "2026-10-04T21:03:22+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 428,
+  "output_file_count": 429,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3028,5 +3035,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "3e10da501c9f21db979d0378b3e844bd6a0d9948"
+  "source_commit": "18ec5a35cbd2fc1df63e4def1231738a9bb89823"
 }

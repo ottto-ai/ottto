@@ -39,3 +39,10 @@ Companion checks must say **Local import configured** and **Upload not checked**
 first-data onboarding still requires accepted data. Source tests are separate from
 installed acceptance: a signed containing release and ordinary client restart
 are needed before claiming the managed exporter has stopped in live processes.
+
+Independent AutoReview found and prompted fixes for legacy-fence TOML scope and
+recovery from resolved source absence. Cleanup retains the table header when
+settings after the fence depend on it. Current local readiness clears a prior
+source-not-installed problem; unrelated auth, collector and upload failures stay
+actionable. The registration-readiness fixture stages local configuration and
+isolates executable detection, including hosts without the Codex CLI.

@@ -10124,7 +10124,15 @@ fn codex_source_off_body(existing: &str) -> Result<String, LocalApiError> {
                     "log_user_prompt" => value.as_bool() == Some(false),
                     _ => false,
                 }) && fenced.iter().count() == 1;
-                if generated_only {
+                let full_table_generated_only =
+                    document["otel"].as_table_like().is_some_and(|table| {
+                        table.iter().all(|(key, value)| match key {
+                            "environment" => value.as_str() == Some("prod"),
+                            "log_user_prompt" => value.as_bool() == Some(false),
+                            _ => false,
+                        })
+                    });
+                if generated_only && full_table_generated_only {
                     let mut offset = 0;
                     let mut start = None;
                     for line in existing.split_inclusive('\n') {
@@ -25732,6 +25740,17 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
+    fn codex_source_off_preserves_table_scope_after_legacy_fence() {
+        let body = "# ottto:start\n[otel]\nenvironment = \"prod\"\nlog_user_prompt = false\nexporter = { otlp-http = { endpoint = \"http://127.0.0.1:44621/v1/logs\", headers = { X-Ottto-Local-Relay = \"codex\" } } }\n# ottto:end\ncustom_setting = true\n";
+        let next = codex_source_off_body(body).unwrap();
+        let doc = next.parse::<DocumentMut>().unwrap();
+        assert_eq!(doc["otel"]["custom_setting"].as_bool(), Some(true));
+        assert!(doc.get("custom_setting").is_none());
+        assert!(!next.contains("/v1/logs"));
+        assert_eq!(codex_source_off_body(&next).unwrap(), next);
+    }
+
+    #[test]
     fn codex_source_off_handles_inline_otel_without_false_clean() {
         let body = "otel = { exporter = { otlp-http = { endpoint = \"http://127.0.0.1:44621/v1/logs\", headers = { X-Ottto-Local-Relay = \"codex\" } } }, environment = \"custom\" }\n";
         let next = codex_source_off_body(body).unwrap();
@@ -26177,6 +26196,8 @@ X-API-Key = "otel_redacted"
         let _lock = lock_backend_test_env();
         let root = control_test_root("codex-source-off-verify");
         fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::write(root.join(".codex/config.toml"), "model = \"test-model\"\n").unwrap();
+        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("empty-bin"));
         let _home = EnvVarGuard::set_path("HOME", &root);
         let _support =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
