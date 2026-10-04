@@ -1059,6 +1059,55 @@ mod tests {
     }
 
     #[test]
+    fn changed_login_keeps_proven_session_account_and_withholds_only_fallback() {
+        let mut status = test_status();
+        status.source = ottto_protocol::SourceKind::Codex;
+        status.account = Some(test_current_account("old-login"));
+        let retained = crate::agent_status_refresh::status_for_reconciliation(&status, &[], true);
+        assert!(retained.account.is_none());
+        let mut proven = test_snapshot("proven", "2026-07-19T10:04:00Z");
+        proven.model_usage[0].account_identifier_hash = Some("session-owner".into());
+        proven.usage_buckets[0].model_usage[0].account_identifier_hash =
+            Some("session-owner".into());
+        let active = active_session_from_snapshot(SnapshotSource::Codex, &proven, Some(&retained));
+        assert_eq!(
+            active.account_identifier_hash.as_deref(),
+            Some("session-owner")
+        );
+        assert_eq!(
+            active.account_attribution_source.as_deref(),
+            Some("snapshot_account_identity")
+        );
+        let unbound = test_snapshot("unbound", "2026-07-19T10:04:00Z");
+        let unsafe_fallback =
+            active_session_from_snapshot(SnapshotSource::Codex, &unbound, Some(&status));
+        assert_eq!(
+            unsafe_fallback.account_identifier_hash.as_deref(),
+            Some("old-login")
+        );
+        let withheld =
+            active_session_from_snapshot(SnapshotSource::Codex, &unbound, Some(&retained));
+        assert!(withheld.account_identifier_hash.is_none());
+        let stable_home = crate::agent_status::CodexHomeBinding {
+            home: std::path::PathBuf::from("/synthetic/stable-home"),
+            account_identifier_hash: "old-login".into(),
+            workspace_identifier_hash: "workspace".into(),
+            auth_modified_at: std::time::UNIX_EPOCH,
+        };
+        status
+            .account
+            .as_mut()
+            .unwrap()
+            .organization_identifier_hash = Some("workspace".into());
+        let still_current =
+            crate::agent_status_refresh::status_for_reconciliation(&status, &[stable_home], true);
+        assert_eq!(
+            still_current.account, status.account,
+            "an unchanged home retains its current-login metadata"
+        );
+    }
+
+    #[test]
     fn inherits_high_confidence_account_from_direct_root_lineage() {
         let mut snapshot = test_snapshot("parent_agent-child", "2026-07-19T10:04:00Z");
         snapshot

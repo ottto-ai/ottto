@@ -530,9 +530,9 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
             eprintln!("Codex managed telemetry cleanup needs config review; collection continues")
         }
     }
-    // Existing per-user LaunchAgent startup is a post-expiry freshness
-    // opportunity even when the Companion app is closed.
-    ottto_service::snapshot_sync::spawn_claude_agent_status_refresh("startup");
+    if let Err(error) = ottto_service::agent_status_refresh::start(daemon.clone()) {
+        eprintln!("agent status refresh unavailable: {error}");
+    }
     // Proactively rebuild upstream HTTP pools on macOS network transitions so
     // pooled sockets bound to a dead local IP never stall uploads (2026-07-17).
     match ottto_service::net_transition::spawn_network_transition_observer() {

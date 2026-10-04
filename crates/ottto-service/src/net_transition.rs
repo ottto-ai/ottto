@@ -170,10 +170,10 @@ fn observe_route_socket(socket: RouteSocket) {
             "a macOS network transition (interface/address change)",
         );
         // Sleep/wake and restored network state are a lazy catch-up
-        // opportunity. The coalesced collection worker shares the cadence
+        // opportunity. The coalesced collection worker is independent of the transcript
         // sync lock; consent/off-switch and the durable per-slot claim remain
         // the final command boundaries.
-        crate::snapshot_sync::spawn_claude_agent_status_refresh("wake");
+        crate::agent_status_refresh::request_all();
     }
 }
 
