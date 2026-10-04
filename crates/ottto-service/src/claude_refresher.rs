@@ -235,41 +235,51 @@ fn maybe_refresh_with(
         .failed
         .get(slot_id)
         .map(|failed| failed.access_expires_at.clone());
-    let already_running = running()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains_key(slot_id);
     let network_enabled = !crate::agent_status::claude_oauth_usage_network_disabled();
-    let decision = decide_refresh(
-        live,
-        enabled && network_enabled,
-        already_running,
-        failed_for.as_deref(),
-        now,
-    );
-    if decision != RefreshDecision::Started {
-        return decision;
+    // Check and reserve the slot in one critical section, so two overlapping
+    // collection passes can never both start a refresher for it.
+    {
+        let mut reserved = running()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let decision = decide_refresh(
+            live,
+            enabled && network_enabled,
+            reserved.contains_key(slot_id),
+            failed_for.as_deref(),
+            now,
+        );
+        if decision != RefreshDecision::Started || current_expiry.is_none() {
+            return if decision == RefreshDecision::Started {
+                RefreshDecision::NotNeeded
+            } else {
+                decision
+            };
+        }
+        reserved.insert(slot_id.to_string(), ());
     }
-    let Some(before_expires_at) = current_expiry else {
-        return RefreshDecision::NotNeeded;
+    let release = || {
+        running()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(slot_id);
     };
+    let before_expires_at = current_expiry.expect("checked above");
     let Ok(cwd) = crate::claude_spawn_gate::empty_working_dir() else {
+        release();
         eprintln!("claude_refresher result=not_started reason=working_dir target={slot_id}");
         return RefreshDecision::NotNeeded;
     };
+    let before_mdat = credential_modified_marker(slot);
     let mut child = match launcher.launch(slot, cwd.path()) {
         Ok(child) => child,
         Err(_) => {
+            release();
             eprintln!("claude_refresher result=not_started reason=spawn target={slot_id}");
             return RefreshDecision::NotNeeded;
         }
     };
     keep_awake_while(&child);
-    running()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(slot_id.to_string(), ());
-    let before_mdat = credential_modified_marker(slot);
     eprintln!("claude_refresher result=started target={slot_id}");
     let caller_slot_id = slot_id;
     let slot_id = slot_id.to_string();
@@ -318,7 +328,8 @@ fn maybe_refresh_with(
             crate::snapshot_sync::spawn_claude_agent_status_refresh("claude_refresher");
         });
     if spawned.is_err() {
-        // The child keeps running; a later pass verifies the stored expiry.
+        // No waiter thread: the child keeps running unobserved; a later pass
+        // reads the stored expiry and may refresh again if it did not move.
         running()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -496,6 +507,74 @@ mod tests {
                 RefreshDecision::NotNeeded
             );
         }
+    }
+
+    /// Two overlapping passes can never both start a refresher for a slot:
+    /// the check and the reservation happen together.
+    #[test]
+    #[serial_test::serial]
+    fn concurrent_passes_start_one_refresher_per_slot() {
+        struct SlowLauncher {
+            launches: std::sync::atomic::AtomicUsize,
+        }
+        impl RefreshLauncher for SlowLauncher {
+            fn launch(&self, _slot: &ClaudeConfigDirSlot, _cwd: &Path) -> std::io::Result<Child> {
+                self.launches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(200));
+                std::process::Command::new("/bin/sleep").arg("0.3").spawn()
+            }
+        }
+        let support = std::env::temp_dir().join(format!(
+            "ottto-claude-refresher-race-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(support.join("empty-bin")).expect("support");
+        // No `security` on the search path: no keychain is ever queried.
+        let previous_search = std::env::var_os("OTTTO_COMMAND_SEARCH_PATH");
+        std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", support.join("empty-bin"));
+        let launcher = std::sync::Arc::new(SlowLauncher {
+            launches: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let due = live(
+            ClaudeLocalLoginState::RefreshPending,
+            OffsetDateTime::now_utc() - TimeDuration::minutes(1),
+        );
+        let slot = ClaudeConfigDirSlot::registered("/tmp/ottto-refresher-race-slot".to_string())
+            .expect("slot");
+        let decisions = (0..4)
+            .map(|_| {
+                let launcher = launcher.clone();
+                let due = due.clone();
+                let slot = slot.clone();
+                let support = support.clone();
+                std::thread::spawn(move || {
+                    maybe_refresh_with("race-slot", &slot, &due, true, &support, launcher.as_ref())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("join"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|decision| **decision == RefreshDecision::Started)
+                .count(),
+            1,
+            "{decisions:?}"
+        );
+        assert_eq!(
+            launcher.launches.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        wait_until_idle("race-slot");
+        match previous_search {
+            Some(value) => std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", value),
+            None => std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH"),
+        }
+        let _ = std::fs::remove_dir_all(support);
     }
 
     #[test]
