@@ -656,9 +656,13 @@ fn harvest_stdio(
     cwd: Option<&str>,
     config_dir: Option<&Path>,
     server_env: &BTreeMap<String, String>,
+    claude_login: Option<&ottto_core::ClaudeConfigDirSlot>,
 ) -> Result<Vec<McpToolInput>> {
-    let mut child = env
-        .command_in(command, args, cwd, config_dir, server_env)
+    let mut command = env.command_in(command, args, cwd, config_dir, server_env);
+    if let Some(login) = claude_login {
+        crate::claude_spawn_gate::pin_claude_login(&mut command, login);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -687,17 +691,17 @@ fn harvest_stdio(
 
     match rx.recv_timeout(HANDSHAKE_TIMEOUT) {
         Ok(result) => {
-            reap_child(&mut child);
+            reap_unless_refreshing(child, claude_login);
             result
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             // Kill the child; the detached handshake thread unblocks on the
             // closed pipe and exits, then its send fails silently.
-            reap_child(&mut child);
+            reap_unless_refreshing(child, claude_login);
             Err(anyhow!("mcp handshake timed out"))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            reap_child(&mut child);
+            reap_unless_refreshing(child, claude_login);
             Err(anyhow!("mcp handshake thread ended unexpectedly"))
         }
     }
@@ -706,6 +710,60 @@ fn harvest_stdio(
 fn reap_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Stop a probed server. A Claude Code server is stopped through the shared
+/// `claude_spawn_gate::stop_claude_child`, which never kills it while that
+/// could cut its login's token refresh short.
+fn reap_unless_refreshing(
+    mut child: Child,
+    claude_login: Option<&ottto_core::ClaudeConfigDirSlot>,
+) {
+    match claude_login {
+        Some(login) => {
+            crate::claude_spawn_gate::stop_claude_child(child, login, "mcp_inventory");
+        }
+        None => reap_child(&mut child),
+    }
+}
+
+/// The Claude login a stdio MCP server uses when the server is Claude Code
+/// itself (`claude mcp serve`, or the `@anthropic-ai/claude-code` package
+/// through a launcher such as `npx`). Claude Code may refresh that login as
+/// it starts. `CLAUDE_CONFIG_DIR` resolves as the child sees it: the server's
+/// own env, then the provider env, then the daemon's. `Err` when it is not an
+/// absolute, valid config dir (fail closed: not probed).
+fn claude_login_of_server(
+    command: &str,
+    args: &[String],
+    server_env: &BTreeMap<String, String>,
+    provider_env: &BTreeMap<String, OsString>,
+) -> Option<std::result::Result<ottto_core::ClaudeConfigDirSlot, ()>> {
+    let is_claude = Path::new(command)
+        .file_name()
+        .is_some_and(|name| name == "claude")
+        || args
+            .iter()
+            .any(|arg| arg.contains("@anthropic-ai/claude-code"));
+    if !is_claude {
+        return None;
+    }
+    let config_dir = server_env
+        .get("CLAUDE_CONFIG_DIR")
+        .cloned()
+        .or_else(|| {
+            provider_env
+                .get("CLAUDE_CONFIG_DIR")
+                .map(|value| value.to_string_lossy().into_owned())
+        })
+        .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok());
+    Some(match config_dir.filter(|dir| !dir.is_empty()) {
+        None => Ok(ottto_core::ClaudeConfigDirSlot::Default),
+        // A relative dir resolves against the server's working directory,
+        // not the daemon's: its login cannot be checked here.
+        Some(dir) if !Path::new(&dir).is_absolute() => Err(()),
+        Some(dir) => ottto_core::ClaudeConfigDirSlot::registered(dir).map_err(|_| ()),
+    })
 }
 
 /// Drive the JSON-RPC handshake over the child's stdio pipes.
@@ -842,28 +900,56 @@ fn parse_tools(response: &Value) -> Vec<McpToolInput> {
 /// Harvest one configured server into its wire shape. An unreachable server (or
 /// an unimplemented network transport) is reported with `reachable = false` and
 /// no tools, so it contributes zero context cost.
-fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv) -> McpServerInput {
+///
+/// A server that is Claude Code itself is not started inside its login's
+/// quiet window (15 minutes before the access token expires until a new
+/// expiry is saved, or while another Claude Code process refreshes it): it is
+/// returned unreachable with `deferred = true`, and the cycle keeps the last
+/// good inventory (see `harvest_source`).
+fn harvest_server(
+    server: &ConfiguredServer,
+    loading_mode: &str,
+    env: &SpawnEnv,
+) -> (McpServerInput, bool) {
     let tools = match &server.transport {
         Transport::Stdio {
             command,
             args,
             cwd,
             env: server_env,
-        } => harvest_stdio(
-            command,
-            args,
-            env,
-            cwd.as_deref(),
-            server.config_dir.as_deref(),
-            server_env,
-        )
-        .ok(),
+        } => {
+            let claude_login =
+                match claude_login_of_server(command, args, server_env, &env.provider) {
+                    None => None,
+                    Some(Err(())) => {
+                        eprintln!("mcp_harvest claude_server=deferred reason=config_dir");
+                        return (unreachable_server(server, loading_mode), true);
+                    }
+                    Some(Ok(slot)) => {
+                        if crate::claude_spawn_gate::check_short_claude_run(&slot).is_err() {
+                            eprintln!("mcp_harvest claude_server=deferred reason=quiet_window");
+                            return (unreachable_server(server, loading_mode), true);
+                        }
+                        Some(slot)
+                    }
+                };
+            harvest_stdio(
+                command,
+                args,
+                env,
+                cwd.as_deref(),
+                server.config_dir.as_deref(),
+                server_env,
+                claude_login.as_ref(),
+            )
+            .ok()
+        }
         // TODO(mcp-http-transport): implement Streamable HTTP + SSE handshakes.
         // Until then network servers are reported unreachable (cost zero) rather
         // than fabricating a footprint.
         Transport::Http { .. } | Transport::Sse { .. } => None,
     };
-    match tools {
+    let input = match tools {
         Some(tools) => McpServerInput {
             server: server.name.clone(),
             transport: Some(server.transport.label().to_string()),
@@ -882,7 +968,8 @@ fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv)
 
             tools: Vec::new(),
         },
-    }
+    };
+    (input, false)
 }
 
 /// One harvest cycle's outcome: the assembled payload, whether the wall-clock
@@ -895,15 +982,17 @@ struct BuildResult {
 /// Harvest the configured servers concurrently, at most
 /// [`MCP_HARVEST_MAX_CONCURRENCY`] at a time, stopping before a chunk once
 /// `deadline` passes. Returns the harvested servers (in discovery order, minus
-/// any dropped by the budget) and whether the cycle was throttled.
+/// any dropped by the budget), whether the cycle was throttled, and how many
+/// Claude Code servers were deferred by their login's quiet window.
 fn harvest_servers(
     configured: &[ConfiguredServer],
     loading_mode: &'static str,
     deadline: Instant,
     env: &SpawnEnv,
-) -> (Vec<McpServerInput>, bool) {
+) -> (Vec<McpServerInput>, bool, usize) {
     let mut out: Vec<McpServerInput> = Vec::with_capacity(configured.len());
     let mut throttled = false;
+    let mut deferred = 0;
     for chunk in configured.chunks(MCP_HARVEST_MAX_CONCURRENCY) {
         // The deadline is checked between chunks (not mid-probe), so a cycle can
         // overrun by at most one chunk's handshake timeout — acceptable for a
@@ -927,16 +1016,18 @@ fn harvest_servers(
             match handle {
                 // A spawn failure or a panicked worker degrades that one server to
                 // unreachable rather than dropping it from the inventory silently.
-                Ok(joined) => out.push(
-                    joined
+                Ok(joined) => {
+                    let (input, was_deferred) = joined
                         .join()
-                        .unwrap_or_else(|_| unreachable_server(server, loading_mode)),
-                ),
+                        .unwrap_or_else(|_| (unreachable_server(server, loading_mode), false));
+                    deferred += usize::from(was_deferred);
+                    out.push(input);
+                }
                 Err(_) => out.push(unreachable_server(server, loading_mode)),
             }
         }
     }
-    (out, throttled)
+    (out, throttled, deferred)
 }
 
 /// A configured server reported unreachable with no tools (cost zero).
@@ -966,7 +1057,8 @@ fn build_inventory(
     let configured = discover_servers(home, source);
     let capabilities = discover_capabilities(home, source);
     let spawn_env = SpawnEnv::resolve();
-    let (servers, throttled) = harvest_servers(&configured, loading_mode, deadline, &spawn_env);
+    let (servers, throttled, claude_deferred) =
+        harvest_servers(&configured, loading_mode, deadline, &spawn_env);
     let reachable = servers.iter().filter(|s| s.reachable).count();
     let metrics = HarvestMetrics {
         source,
@@ -976,6 +1068,7 @@ fn build_inventory(
         unreachable: servers.len() - reachable,
         dropped: configured.len() - servers.len(),
         throttled,
+        claude_deferred,
     };
     BuildResult {
         inventory: McpInventoryIngestRequest {
@@ -1010,6 +1103,9 @@ struct HarvestMetrics {
     unreachable: usize,
     dropped: usize,
     throttled: bool,
+    /// Claude Code servers not started because their login was inside its
+    /// refresh quiet window.
+    claude_deferred: usize,
 }
 
 impl HarvestMetrics {
@@ -1017,7 +1113,7 @@ impl HarvestMetrics {
         let (self_rss_mb, children_rss_mb, cpu_s) = process_resource_usage();
         eprintln!(
             "mcp_harvest_metrics source={} wall_ms={} configured={} reachable={} \
-             unreachable={} dropped={} throttled={} max_rss_self_mb={} \
+             unreachable={} dropped={} throttled={} claude_deferred={} max_rss_self_mb={} \
              max_rss_children_mb={} cpu_s={:.2}",
             self.source.api_slug(),
             self.wall.as_millis(),
@@ -1026,6 +1122,7 @@ impl HarvestMetrics {
             self.unreachable,
             self.dropped,
             self.throttled,
+            self.claude_deferred,
             self_rss_mb,
             children_rss_mb,
             cpu_s,
@@ -1216,6 +1313,21 @@ fn inventory_hash(inventory: &McpInventoryIngestRequest) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(&canonical);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// A cycle that deferred a Claude Code server (its login was in the refresh
+/// quiet window) keeps the last good inventory while this destination has a
+/// fresh one. Without one (first upload, or past the staleness bound) it
+/// uploads with that server unreachable, so a login that stays expired cannot
+/// stop uploads for good.
+fn keep_last_inventory(
+    claude_deferred: usize,
+    cached: Option<&InventoryCacheEntry>,
+    identity: &str,
+    now: OffsetDateTime,
+) -> bool {
+    claude_deferred > 0
+        && cached.is_some_and(|entry| entry.identity == identity && !cache_is_stale(entry, now))
 }
 
 fn cache_is_stale(entry: &InventoryCacheEntry, now: OffsetDateTime) -> bool {
@@ -1429,8 +1541,13 @@ fn harvest_source(
     let hash = inventory_hash(&inventory)?;
     let path = cache_path(support_dir, source);
     let now = OffsetDateTime::now_utc();
+    let cached = read_cache(&path);
 
-    if let Some(entry) = read_cache(&path) {
+    if keep_last_inventory(metrics.claude_deferred, cached.as_ref(), &identity, now) {
+        return Ok(());
+    }
+
+    if let Some(entry) = cached {
         // Skip the upload when the SAME destination already has this exact
         // inventory and it is still fresh. A new device/machine/backend (re-claim,
         // re-onboard, repoint) invalidates the skip so the new principal is
@@ -1587,7 +1704,7 @@ mod tests {
         assert_eq!(s.name, "noupstream");
         assert_eq!(s.transport, Transport::Http { url: String::new() });
         // And it harvests as unreachable (cost zero), not a panic.
-        let h = harvest_server(&s, "on_demand", &test_spawn_env());
+        let (h, _) = harvest_server(&s, "on_demand", &test_spawn_env());
         assert!(!h.reachable);
         assert!(h.tools.is_empty());
     }
@@ -1673,7 +1790,7 @@ enabled = true
             },
             disabled: false,
         };
-        let harvested = harvest_server(&http, "always_on", &test_spawn_env());
+        let (harvested, _) = harvest_server(&http, "always_on", &test_spawn_env());
 
         assert_eq!(harvested.server, "remote");
         assert_eq!(harvested.transport.as_deref(), Some("http"));
@@ -1695,7 +1812,7 @@ enabled = true
             },
             disabled: false,
         };
-        let harvested = harvest_server(&server, "on_demand", &test_spawn_env());
+        let (harvested, _) = harvest_server(&server, "on_demand", &test_spawn_env());
 
         assert!(!harvested.reachable);
         assert!(harvested.tools.is_empty());
@@ -2068,7 +2185,7 @@ enabled = true
             },
         ];
         let past = Instant::now() - Duration::from_secs(1);
-        let (servers, throttled) =
+        let (servers, throttled, _) =
             harvest_servers(&configured, "on_demand", past, &test_spawn_env());
         assert!(throttled);
         assert!(servers.is_empty(), "no probes launched after the deadline");
@@ -2088,7 +2205,7 @@ enabled = true
                 },
             })
             .collect();
-        let (servers, throttled) = harvest_servers(
+        let (servers, throttled, _) = harvest_servers(
             &configured,
             "always_on",
             Instant::now() + Duration::from_secs(30),
@@ -2205,6 +2322,7 @@ done
             None,
             None,
             &std::collections::BTreeMap::new(),
+            None,
         )
         .expect("handshake succeeds");
         assert_eq!(tools.len(), 1);
@@ -2652,5 +2770,163 @@ done
         assert!(!is_truthy("off"));
 
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn claude_code_servers_are_recognised_with_the_login_they_use() {
+        let args = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| item.to_string())
+                .collect::<Vec<_>>()
+        };
+        let none = BTreeMap::new();
+        let unset: BTreeMap<String, OsString> =
+            [("CLAUDE_CONFIG_DIR".to_string(), OsString::new())].into();
+        let env = |dir: &str| -> BTreeMap<String, String> {
+            [("CLAUDE_CONFIG_DIR".to_string(), dir.to_string())].into()
+        };
+        assert_eq!(
+            claude_login_of_server("npx", &args(&["-y", "@acme/server"]), &none, &unset),
+            None
+        );
+        assert_eq!(
+            claude_login_of_server("claude", &args(&["mcp", "serve"]), &none, &unset),
+            Some(Ok(ottto_core::ClaudeConfigDirSlot::Default))
+        );
+        assert_eq!(
+            claude_login_of_server(
+                "npx",
+                &args(&["-y", "@anthropic-ai/claude-code", "mcp", "serve"]),
+                &none,
+                &unset
+            ),
+            Some(Ok(ottto_core::ClaudeConfigDirSlot::Default))
+        );
+        assert_eq!(
+            claude_login_of_server(
+                "/opt/homebrew/bin/claude",
+                &args(&["mcp", "serve"]),
+                &env("/tmp/ottto-fixture-slot"),
+                &unset
+            ),
+            Some(Ok(ottto_core::ClaudeConfigDirSlot::registered(
+                "/tmp/ottto-fixture-slot"
+            )
+            .expect("slot")))
+        );
+        assert_eq!(
+            claude_login_of_server("claude", &args(&["mcp", "serve"]), &env("rel/slot"), &unset),
+            Some(Err(())),
+            "fail closed on a relative config dir"
+        );
+    }
+
+    /// Fake `claude` and fake keychain only: a Claude Code server is not
+    /// started inside its login's quiet window, and is started outside it.
+    #[test]
+    #[serial_test::serial]
+    fn a_claude_code_server_is_not_started_inside_its_logins_quiet_window() {
+        let fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("mcp");
+        let server = ConfiguredServer {
+            name: "claude-self".to_string(),
+            transport: Transport::Stdio {
+                command: "claude".to_string(),
+                args: vec!["mcp".to_string(), "serve".to_string()],
+                cwd: None,
+                env: BTreeMap::new(),
+            },
+            disabled: false,
+            config_dir: None,
+        };
+        let env = SpawnEnv {
+            path: None,
+            provider: [("CLAUDE_CONFIG_DIR".to_string(), OsString::new())].into(),
+        };
+        fake.default_login_expires_in(time::Duration::minutes(10));
+        let (input, deferred) = harvest_server(&server, "unknown", &env);
+        assert!(deferred);
+        assert!(!input.reachable);
+        assert!(fake.spawns().is_empty(), "not started in the quiet window");
+
+        fake.default_login_expires_in(time::Duration::hours(3));
+        let (_, deferred) = harvest_server(&server, "unknown", &env);
+        assert!(!deferred);
+        assert_eq!(fake.spawns(), vec!["|mcp serve".to_string()]);
+    }
+
+    #[test]
+    fn a_deferred_claude_server_keeps_only_a_fresh_last_inventory() {
+        let now = OffsetDateTime::now_utc();
+        let entry = |identity: &str, age_days: i64| InventoryCacheEntry {
+            identity: identity.to_string(),
+            inventory_sha256: "hash".to_string(),
+            posted_at: (now - time::Duration::days(age_days))
+                .format(&Rfc3339)
+                .expect("format"),
+        };
+        assert!(keep_last_inventory(1, Some(&entry("dest", 1)), "dest", now));
+        assert!(!keep_last_inventory(
+            0,
+            Some(&entry("dest", 1)),
+            "dest",
+            now
+        ));
+        assert!(!keep_last_inventory(1, None, "dest", now), "first upload");
+        assert!(!keep_last_inventory(
+            1,
+            Some(&entry("other", 1)),
+            "dest",
+            now
+        ));
+        assert!(
+            !keep_last_inventory(1, Some(&entry("dest", 8)), "dest", now),
+            "stale"
+        );
+    }
+
+    /// A Claude Code server is never killed while its login's refresh lock
+    /// exists (any age); it is stopped once the lock is gone. Other servers
+    /// are stopped at once. Fake keychain only.
+    #[test]
+    #[serial_test::serial]
+    fn a_claude_code_server_is_never_killed_mid_refresh() {
+        let _fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("mcp-kill");
+        let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-mcp-refresh-lock-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("dir");
+        let login = ottto_core::ClaudeConfigDirSlot::registered(dir.to_string_lossy().to_string())
+            .expect("slot");
+        let lock = dir.join(crate::claude_spawn_gate::REFRESH_LOCK_FILE);
+        fs::write(&lock, "").expect("lock");
+        // An old lock still counts.
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .and_then(|file| file.set_modified(old))
+            .expect("age the lock");
+
+        let child = Command::new("/bin/sleep").arg("30").spawn().expect("sleep");
+        let pid = i32::try_from(child.id()).expect("pid");
+        reap_unless_refreshing(child, Some(&login));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(alive(pid), "left running while the refresh lock exists");
+        fs::remove_file(&lock).expect("unlock");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(pid), "stopped once the refresh lock is gone");
+
+        let other = Command::new("/bin/sleep").arg("30").spawn().expect("sleep");
+        let other_pid = i32::try_from(other.id()).expect("pid");
+        reap_unless_refreshing(other, None);
+        assert!(!alive(other_pid));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

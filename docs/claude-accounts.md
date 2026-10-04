@@ -30,7 +30,7 @@ terminal bill the terminal's account. Ottto tracks them separately.
 ## What Ottto can read, per surface
 
 **Verified Claude Code slots - the full picture, while valid.** For each
-registered slot whose exact local identity agrees with `claude auth status`,
+registered slot whose exact local login is signed in and strongly identified,
 Ottto reads Claude's own usage summary:
 the 5-hour session window, the weekly window, per-model weekly limits (a
 single model can be exhausted while the account-level weekly still looks
@@ -280,61 +280,116 @@ When the machine off-switch is enabled, exact-slot usage collection reports
 consent, and account-scoped caches with their original age. Re-enabling resumes
 normal collection without another login prompt.
 
-## Consented background upkeep
+## Login state without running Claude Code
 
-Registered custom slots can stay readable after their short-lived access
-credential expires without keeping the Companion app open. One explicit
-machine-level consent applies to every registered custom slot and persists until
-revoked. It does not apply to Claude Code's default slot.
+Ottto decides each slot's login state from local metadata only, and never runs
+`claude auth status`. It reads the slot's `.claude.json` account, then the
+stored Claude Code credential, then `.claude.json` again (a change between the
+two reads is a concurrent login). From the credential it uses only token
+presence, the access and refresh deadlines, the scopes and the stored plan;
+`claude auth status` printed exactly these fields. The credential is read with
+`security find-generic-password -w`, so it passes through a pipe into daemon
+memory; Ottto keeps only the access token, for the usage request, and never
+stores, logs or uploads it.
 
-At daemon startup, after wake/network restoration, after registry or consent
-changes, and on the daemon's bounded five-minute collection cadence, Ottto
-checks persisted slot deadlines without synchronously reading Keychain. Due
-slots are coalesced into one background queue, so five due anchors cannot turn a
-settings request or snapshot pass into five serial 20-second waits. The worker
-owns the authoritative credential reads and vendor command outside the snapshot
-and settings locks, and schedules a normal collection/upload after each
-successful slot rather than waiting for later siblings. Ottto does nothing
-before the exact access expiry. After expiry, and only while the
-absolute refresh deadline remains valid, the daemon may run the resolved
-installed Claude binary once with argument `doctor` and the exact registered
-`CLAUDE_CONFIG_DIR`. The command receives a cleared minimal environment, closed
-stdin, discarded output, and a bounded timeout. It receives no prompt, login,
-model, or inference flag. Ottto treats the attempt as successful only when a
-second read-only deadline observation proves `expiresAt` advanced into the
-future; exit status zero alone is not success.
+- No stored login: `credential_unavailable`.
+- A keychain error, a locked keychain, no `security` tool, unparseable JSON,
+  or a refresh token without an access deadline, without an access token or
+  without the `user:inference` scope: the read fails closed (`probe_failed`,
+  "cannot confirm").
+- No refresh token, a passed `refreshTokenExpiresAt`, or the blanked item
+  Claude Code writes after a rejected refresh: `needs_login`.
+- A valid access token: collect as usual.
+- An access token that expired (or expires within 60 seconds) while the
+  refresh grant is alive: the background refresher below runs (`refresh_due`,
+  upkeep `in_progress`). With "Keep my Claude accounts signed in" off, the slot
+  is **paused** instead (`refresh_due`, upkeep `upkeep_disabled`, quota access
+  `paused`). Either way it keeps its last reading marked stale, and Ottto sends
+  no usage request with an expired token.
 
-Each due expiry is atomically claimed before the command starts. Startup, wake,
-collection, daemon restart, and multiple daemon processes therefore cannot
-start duplicate commands. A failed same-expiry attempt can retry only after a
-durable five-minute exponential backoff, capped at six hours. The local witness
-contains only the opaque slot id, safe deadlines/attempt times, a typed result,
-and a failure count—never a token, token fingerprint, account UUID, or config
-path.
+For the default login, Claude Code's own precedence is checked first. Settings
+layers apply from user to managed (the highest layer that sets a value wins,
+and settings `env` outranks the daemon's environment). A Bedrock or Vertex
+route, `ANTHROPIC_AUTH_TOKEN` or an `apiKeyHelper` is used ahead of OAuth.
+`ANTHROPIC_API_KEY` outranks a usable OAuth login only once the user approved
+that key in Claude Code (`.claude.json` `customApiKeyResponses.approved`), and
+a Console API key saved by `/login` counts only when no OAuth login is usable;
+a Max user who declined a key stays on the subscription.
 
-The existing **Read subscription usage** off-switch always wins: while it is
-off, Ottto performs neither provider usage reads nor background upkeep, but it
-keeps registrations, consent, caches, and their honest age. Turning collection
-back on resumes the prior consent automatically. Operators can also create the
-absent-by-default `claude-background-upkeep-disabled` sentinel in Ottto's
-support directory to stop only new `doctor` commands while investigating a
-vendor-command problem; it does not change consent or provider collection.
+The decision uses a fresh read on every pass, never a persisted deadline. When
+the login is refreshed (or the customer signs in again), the next pass collects
+again without a reconnect.
 
-`refreshTokenExpiresAt` is an absolute login horizon. Within 72 hours the slot
-reports `relogin_approaching`; once elapsed it reports `needs_login` and waits
-for the customer to complete official Claude Code `/login` again. Claude Code
-may also clear the refresh grant while leaving an old future deadline in its
-credential record. Ottto treats a missing refresh grant as `needs_login`
-immediately and does not keep running `doctor` against a login it cannot
-recover. Background upkeep cannot promise an indefinitely fresh login.
+## Keep my Claude accounts signed in
+
+`claude doctor` upkeep is off: a short Claude Code command that starts near or
+after access expiry begins a token refresh and can exit, or be killed, before
+the rotated token is saved, and Claude Code then signs the login out
+(anthropics/claude-code issue 95822). Ottto never runs `claude auth status`
+either.
+
+Instead, when "Keep my Claude accounts signed in" is on (the existing
+`background_upkeep_consent` setting, on by default until the customer turns it
+off), Ottto keeps each registered slot and the default login signed in:
+
+- When a login's access token is within 5 minutes of expiry (Claude Code's own
+  refresh window) or already expired, for example on the first pass after the
+  Mac wakes, Ottto starts exactly one
+  `claude -p /usage --no-session-persistence --strict-mcp-config` for that
+  login, in an empty working directory and its own process group, and keeps
+  the Mac awake while it runs. `/usage` reads plan usage and uses no model
+  quota; Claude Code refreshes the token before it.
+- The refresher is never killed. After 120 seconds it is reported as still
+  running and left to finish. Concurrency is left to Claude Code's own refresh
+  lock.
+- It runs only for logins whose `/usage` refreshes: the stored scopes include
+  `user:profile`, `.claude.json` `oauthAccount.billingType` is not
+  `usage_based`, and no other credential takes precedence (Bedrock, Vertex, an
+  auth token, `apiKeyHelper`, or any `ANTHROPIC_API_KEY` in that login's
+  settings, approved or not, because `claude -p` uses it either way).
+  "Keep my Claude accounts signed in" is re-read right before each start. A plan-usage snapshot under 60 seconds old
+  postpones it to a later pass.
+- Success is proved only by a new, later `expiresAt`. A first failure that
+  leaves the login intact (refresh token present, not blanked; typically a
+  refresh right after the Mac wakes, before the network is back) gets exactly
+  one retry on a pass at least 5 minutes later. If that fails too, or the login
+  was blanked, it is not refreshed again and asks to sign in again until a new
+  credential appears.
+
+The daemon's other short Claude runs (the `-p /context` footprint read, the
+Verify smoke, and the MCP inventory probe of a server that is Claude Code
+itself, such as `claude mcp serve`) do not start from 15 minutes before a login's access expiry until
+the refresh has advanced it, nor while it is expired or Claude Code holds its
+refresh lock. A skipped `/context` read retries in 30 minutes; a skipped Verify
+returns a warning asking to open Claude Code once (or wait), then Verify. A
+deferred MCP probe keeps the last uploaded inventory (or, without a fresh one,
+reports that server unreachable). Each of these runs is pinned to the login
+its gate checked (`CLAUDE_CONFIG_DIR` set to it, or unset for the default;
+no `CLAUDE_SECURESTORAGE_CONFIG_DIR`). A timed-out run is never killed while
+its login is inside Claude Code's 5-minute refresh window, expired, or has a
+refresh lock (any age); it is left to finish. If the registered-slot settings
+cannot be read, the saved slot states are kept for at most 6 passes or 1 hour,
+then marked stale.
+
+`refreshTokenExpiresAt` (about 28 days after a browser sign-in) is an absolute
+login horizon. Three days and one day before it, the slot (and the default
+login) report `relogin_approaching`; once elapsed it reports `needs_login` and
+waits for the customer to sign in again.
+
+Residual risks not removed: a server-side 401 makes Claude Code refresh
+regardless of the local clock; a crash or power loss between the provider
+rotating the token and Claude Code saving it; the customer's own short Claude
+Code commands; and Claude processes started under user MCP servers or hooks of
+the `/context` read.
 
 ## Tips
 
 - To get full quota visibility for an account, its default or explicitly
   registered Claude Code credential must remain valid. Claude Code credentials
   are the only full-picture source.
-- Background upkeep is post-expiry catch-up, not proactive renewal. The
-  absolute refresh deadline still requires customer-owned official login.
+- With "Keep my Claude accounts signed in" on, Ottto refreshes each login once
+  near its access expiry; the absolute refresh deadline (about 28 days) always
+  requires customer-owned official login.
 - Remember `/login` replaces the terminal account rather than adding one.
   After switching, the previous account's terminal readings stop refreshing
   and will show their age honestly.

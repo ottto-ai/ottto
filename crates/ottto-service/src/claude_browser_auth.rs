@@ -6973,7 +6973,7 @@ mod tests {
         .expect("wrong identity");
         fs::write(
             reusable.join(".credentials.json"),
-            br#"{"claudeAiOauth":{"accessToken":"fixture-wrong-token"}}"#,
+            br#"{"claudeAiOauth":{"accessToken":"fixture-wrong-token","refreshToken":"fixture-wrong-token-refresh","expiresAt":4102444800000,"scopes":["user:inference"]}}"#,
         )
         .expect("wrong credential");
         let store = FileClaudeConfigSlotSettingsStore::default();
@@ -7072,7 +7072,7 @@ mod tests {
         .expect("wrong identity");
         fs::write(
             managed.join(".credentials.json"),
-            br#"{"claudeAiOauth":{"accessToken":"fixture-wrong-token"}}"#,
+            br#"{"claudeAiOauth":{"accessToken":"fixture-wrong-token","refreshToken":"fixture-wrong-token-refresh","expiresAt":4102444800000,"scopes":["user:inference"]}}"#,
         )
         .expect("wrong credential");
         let operation_id = "claude_setup_82828282828282828282828282828282";
@@ -7950,6 +7950,10 @@ exit 1
         )
         .expect("fake claude");
         fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).expect("claude mode");
+        // Keychain item not found: the credentials file is the store.
+        let security = bin.join("security");
+        fs::write(&security, "#!/bin/sh\nexit 44\n").expect("fake security");
+        fs::set_permissions(&security, fs::Permissions::from_mode(0o755)).expect("security mode");
         let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
         let _path = EnvGuard::set("OTTTO_COMMAND_SEARCH_PATH", &bin);
         let _home = EnvGuard::set("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", &home);
@@ -7992,7 +7996,7 @@ exit 1
         .expect("identity write");
         fs::write(
             Path::new(&operation.config_dir).join(".credentials.json"),
-            br#"{"claudeAiOauth":{"accessToken":"fixture-fallback-token"}}"#,
+            br#"{"claudeAiOauth":{"accessToken":"fixture-fallback-token","refreshToken":"fixture-fallback-token-refresh","expiresAt":4102444800000,"scopes":["user:inference"]}}"#,
         )
         .expect("credential write");
         for _ in 0..80 {

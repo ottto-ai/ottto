@@ -1568,6 +1568,7 @@ fn remove_claude_account(
     // failure that cannot be retried honestly.
     let _ = crate::agent_status::prune_claude_slot_collection_state(slot_id);
     let _ = crate::claude_upkeep::prune_slot_upkeep_state(slot_id);
+    crate::claude_refresher::prune_slot(slot_id);
     Ok(complete_claude_registry_mutation(status))
 }
 
@@ -11070,7 +11071,31 @@ struct SmokeResult {
     local_session_observed: Option<bool>,
 }
 
+/// Code for a Verify smoke the quiet window held back: starting Claude Code
+/// now could refresh, and so sign out, the saved login.
+pub(crate) const CLAUDE_LOGIN_REFRESH_PENDING_CODE: &str = "claude_login_refresh_pending";
+
 fn run_smoke_prompt(source: &SourceKind) -> SmokeResult {
+    if matches!(source, SourceKind::ClaudeCode) {
+        if let Err(refusal) = crate::claude_spawn_gate::check_short_claude_run(
+            &ottto_core::ClaudeConfigDirSlot::Default,
+        ) {
+            return SmokeResult {
+                command_found: true,
+                succeeded: false,
+                exit_status: None,
+                duration_ms: 0,
+                message: if refusal.waits_for_claude_refresh() {
+                    "Claude Code needs to refresh its sign-in first: open Claude Code once (or wait a few minutes), then Verify. Ottto did not start Claude Code, because doing so now could sign this account out.".to_string()
+                } else {
+                    "Ottto could not safely check Claude Code's saved sign-in, so it skipped the live check: open Claude Code once, then Verify.".to_string()
+                },
+                diagnostic: Some(format!("quiet_window:{}", refusal.code())),
+                error_code: Some(CLAUDE_LOGIN_REFRESH_PENDING_CODE.to_string()),
+                local_session_observed: None,
+            };
+        }
+    }
     let command = smoke_command(source);
     let before_session_count = if matches!(source, SourceKind::Pi) {
         Some(pi_session_file_count())
@@ -11207,6 +11232,11 @@ fn run_bounded_command(
     if program == "pi" {
         command.envs(crate::command_env::provider_env());
     }
+    // The Claude smoke runs on the default login, the one its gate checked.
+    let claude_login = (program == "claude").then_some(ottto_core::ClaudeConfigDirSlot::Default);
+    if let Some(login) = claude_login.as_ref() {
+        crate::claude_spawn_gate::pin_claude_login(&mut command, login);
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
@@ -11258,10 +11288,22 @@ fn run_bounded_command(
                 };
             }
             Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let (diagnostic, usage_limited) =
-                    read_command_diagnostic_with_flags(stdout_reader, stderr_reader);
+                let left_running = match claude_login.as_ref() {
+                    Some(login) => {
+                        crate::claude_spawn_gate::stop_claude_child(child, login, "smoke")
+                    }
+                    None => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        false
+                    }
+                };
+                // A run left to finish keeps its pipes open: do not wait on them.
+                let (diagnostic, usage_limited) = if left_running {
+                    (None, false)
+                } else {
+                    read_command_diagnostic_with_flags(stdout_reader, stderr_reader)
+                };
                 return SmokeResult {
                     command_found: true,
                     succeeded: false,
@@ -12466,12 +12508,15 @@ fn smoke_failure_verification_result_with_config(
         return cli_unavailable_verification_result(source, config);
     }
     let usage_limited = smoke.error_code.as_deref() == Some(SMOKE_USAGE_LIMIT_ERROR_CODE);
+    // The quiet window held the smoke back so the login can refresh first:
+    // nothing failed, the check simply waits for that.
+    let refresh_pending = smoke.error_code.as_deref() == Some(CLAUDE_LOGIN_REFRESH_PENDING_CODE);
     let provider_reauth_required =
         smoke.error_code.as_deref() == Some(CLAUDE_OAUTH_REAUTH_REQUIRED_CODE);
     verification_result_with_config(
         source,
         config,
-        if usage_limited {
+        if usage_limited || refresh_pending {
             SourceVerificationStatus::Warning
         } else if provider_reauth_required {
             SourceVerificationStatus::ReconnectRequired
@@ -17462,6 +17507,16 @@ mod tests {
         fs::create_dir_all(&bin_dir).expect("fake bin dir");
         let binary = bin_dir.join(name);
         fs::write(&binary, "#!/bin/sh\n").expect("fake binary");
+        if name == "claude" {
+            // The quiet window reads the keychain before a Claude smoke and
+            // fails closed without `security`. This fake reports "item not
+            // found" (exit 44): no stored login.
+            let security = bin_dir.join("security");
+            fs::write(&security, "#!/bin/sh\nexit 44\n").expect("fake security");
+            #[cfg(unix)]
+            fs::set_permissions(&security, fs::Permissions::from_mode(0o755))
+                .expect("fake security mode");
+        }
         binary
     }
 
@@ -17635,7 +17690,8 @@ mod tests {
         );
         assert!(registered.ok, "{registered:?}");
         let register_payload = registered.payload.expect("register payload");
-        assert_eq!(register_payload["consent"], "consent_required");
+        // "Keep my Claude accounts signed in" is on until the user chooses.
+        assert_eq!(register_payload["consent"], "granted");
         assert_eq!(
             register_payload["default_slot"]["service_name"],
             "Claude Code-credentials"
@@ -25499,6 +25555,29 @@ mod tests {
         assert_eq!(result.message.code, "pi_route_warnings");
         assert!(result.message.text.contains("0 live and 1 local-only"));
         assert!(!result.message.text.contains("No Pi model routes passed"));
+    }
+
+    /// Inside the quiet window the Verify smoke does not start Claude Code
+    /// and returns a typed, non-blocking warning; outside it, it runs.
+    #[test]
+    #[serial]
+    fn claude_smoke_waits_inside_the_quiet_window() {
+        let fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("smoke");
+        fake.default_login_expires_in(time::Duration::minutes(10));
+        let smoke = run_smoke_prompt(&SourceKind::ClaudeCode);
+        assert!(!smoke.succeeded);
+        assert_eq!(
+            smoke.error_code.as_deref(),
+            Some(CLAUDE_LOGIN_REFRESH_PENDING_CODE)
+        );
+        assert!(fake.spawns().is_empty(), "Claude Code was not started");
+        let result = smoke_failure_verification_result(SourceKind::ClaudeCode, &smoke, None);
+        assert_eq!(result.status, SourceVerificationStatus::Warning);
+
+        fake.default_login_expires_in(time::Duration::hours(2));
+        let smoke = run_smoke_prompt(&SourceKind::ClaudeCode);
+        assert!(smoke.succeeded, "{}", smoke.message);
+        assert_eq!(fake.spawns().len(), 1);
     }
 
     #[test]

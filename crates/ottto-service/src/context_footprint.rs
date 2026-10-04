@@ -166,34 +166,72 @@ impl SpawnEnv {
     }
 }
 
+/// The quiet window refused a `/context` run: the default login is within 15
+/// minutes of its access token's expiry (or expired) and not yet refreshed.
+#[derive(Debug)]
+struct ClaudeContextRefused(crate::claude_spawn_gate::ClaudeSpawnRefusal);
+
+impl std::fmt::Display for ClaudeContextRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Claude Code /context was not started: {}",
+            self.0.code()
+        )
+    }
+}
+
+impl std::error::Error for ClaudeContextRefused {}
+
+/// After a refusal the next cycle starts sooner, once the login is refreshed.
+const CONTEXT_REFUSED_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// One harvest cycle's outcome: how many workspaces the quiet window skipped.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ContextHarvestOutcome {
+    refused: usize,
+}
+
+fn next_context_cycle_delay(refused: bool) -> Duration {
+    if refused {
+        CONTEXT_REFUSED_RETRY_INTERVAL
+    } else {
+        CONTEXT_FOOTPRINT_INTERVAL
+    }
+}
+
 pub fn spawn_context_footprint_sync() -> Result<()> {
     let home = crate::snapshot_sync::home_dir()?;
     let support_dir = default_support_dir();
     std::thread::Builder::new()
         .name("ottto-context-footprint-sync".to_string())
         .spawn(move || loop {
-            if let Err(error) = harvest_all_once(&home, &support_dir) {
-                eprintln!(
-                    "context footprint harvest skipped: {}",
-                    crate::snapshot_sync::safe_error(&error)
-                );
-            }
-            std::thread::sleep(CONTEXT_FOOTPRINT_INTERVAL);
+            let refused = match harvest_all_once(&home, &support_dir) {
+                Ok(outcome) => outcome.refused > 0,
+                Err(error) => {
+                    eprintln!(
+                        "context footprint harvest skipped: {}",
+                        crate::snapshot_sync::safe_error(&error)
+                    );
+                    false
+                }
+            };
+            std::thread::sleep(next_context_cycle_delay(refused));
         })
         .map_err(|error| anyhow!("spawn context footprint sync: {error}"))?;
     Ok(())
 }
 
-fn harvest_all_once(home: &Path, support_dir: &Path) -> Result<()> {
+fn harvest_all_once(home: &Path, support_dir: &Path) -> Result<ContextHarvestOutcome> {
     if local_harvest_disabled(support_dir) {
-        return Ok(());
+        return Ok(ContextHarvestOutcome::default());
     }
     let (device, device_secret) = load_snapshot_device_credentials()?;
     if !crate::snapshot_sync::enabled_snapshot_sources(&device)
         .into_iter()
         .any(|source| matches!(source, SnapshotSource::ClaudeCode))
     {
-        return Ok(());
+        return Ok(ContextHarvestOutcome::default());
     }
     let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
@@ -219,7 +257,7 @@ fn harvest_source(
     api_base_url: &str,
     home: &Path,
     support_dir: &Path,
-) -> Result<()> {
+) -> Result<ContextHarvestOutcome> {
     let relay_token =
         client.issue_relay_token(device, device_secret, SnapshotSource::ClaudeCode)?;
     let identity = destination_identity(device, machine_id, api_base_url);
@@ -229,10 +267,10 @@ fn harvest_source(
             let workspace_labels_enabled = hint.workspace_labels_enabled;
             if !hint.context_footprint_harvest_enabled {
                 write_marker(&marker, &identity);
-                return Ok(());
+                return Ok(ContextHarvestOutcome::default());
             }
             let _ = fs::remove_file(&marker);
-            harvest_recent_workspaces(
+            return harvest_recent_workspaces(
                 client,
                 &relay_token,
                 support_dir,
@@ -240,10 +278,11 @@ fn harvest_source(
                 home,
                 machine_id,
                 workspace_labels_enabled,
-            )?;
-            return Ok(());
+            );
         }
-        Err(_) if read_marker(&marker).as_deref() == Some(identity.as_str()) => return Ok(()),
+        Err(_) if read_marker(&marker).as_deref() == Some(identity.as_str()) => {
+            return Ok(ContextHarvestOutcome::default())
+        }
         Err(_) => {}
     }
 
@@ -266,12 +305,12 @@ fn harvest_recent_workspaces(
     home: &Path,
     machine_id: &str,
     workspace_labels_enabled: bool,
-) -> Result<()> {
+) -> Result<ContextHarvestOutcome> {
     let now = SystemTime::now();
     let mut workspaces = discover_recent_claude_workspaces(home, now);
     workspaces.truncate(MAX_WORKSPACES_PER_CYCLE);
     if workspaces.is_empty() {
-        return Ok(());
+        return Ok(ContextHarvestOutcome::default());
     }
 
     let env = SpawnEnv::resolve();
@@ -279,6 +318,7 @@ fn harvest_recent_workspaces(
     let mut uploaded = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
+    let mut refused = 0usize;
     for (workspace_index, workspace) in workspaces.into_iter().enumerate() {
         if Instant::now() >= deadline {
             break;
@@ -307,6 +347,9 @@ fn harvest_recent_workspaces(
                     }
                 }
             }
+            Err(error) if error.downcast_ref::<ClaudeContextRefused>().is_some() => {
+                refused += 1;
+            }
             Err(error) => {
                 failed += 1;
                 eprintln!(
@@ -328,7 +371,7 @@ fn harvest_recent_workspaces(
             "context footprint harvest failed for all workspaces"
         ));
     }
-    Ok(())
+    Ok(ContextHarvestOutcome { refused })
 }
 
 fn should_include_mcp_servers(workspace_index: usize) -> bool {
@@ -402,7 +445,13 @@ fn run_claude_context(
     env: &SpawnEnv,
     include_mcp_servers: bool,
 ) -> Result<String> {
+    // Quiet window: never start Claude Code from 15 minutes before the
+    // default login's access expiry until the refresher confirmed a new one.
+    let login = ottto_core::ClaudeConfigDirSlot::Default;
+    crate::claude_spawn_gate::check_short_claude_run(&login)
+        .map_err(|refusal| anyhow::Error::new(ClaudeContextRefused(refusal)))?;
     let mut command = env.claude_command()?;
+    crate::claude_spawn_gate::pin_claude_login(&mut command, &login);
     command
         .current_dir(workspace)
         .stdout(Stdio::piped())
@@ -425,8 +474,7 @@ fn run_claude_context(
                     .map_err(|_| anyhow!("Claude Code /context stdout was not UTF-8"));
             }
             Ok(None) if started.elapsed() >= command_timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::claude_spawn_gate::stop_claude_child(child, &login, "context");
                 return Err(anyhow!("Claude Code /context timed out"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
@@ -1314,6 +1362,28 @@ mod tests {
         assert_eq!(parse_token_count("1m"), Some(1_000_000));
         assert_eq!(parse_token_count("8"), Some(8));
         assert_eq!(parse_percent("95.8%"), Some(95.8));
+    }
+
+    /// The `/context` read runs an hour before expiry and is refused ten
+    /// minutes before it (never started), with a 30-minute retry.
+    #[test]
+    #[serial_test::serial]
+    fn context_run_waits_inside_the_quiet_window() {
+        let fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("context");
+        let workspace = temp_dir("context-gate-workspace");
+        let env = SpawnEnv {
+            path: crate::command_env::path_env(),
+            provider: BTreeMap::new(),
+        };
+        fake.default_login_expires_in(time::Duration::hours(1));
+        run_claude_context(&workspace, &env, false).expect("admitted an hour out");
+        assert_eq!(fake.spawns().len(), 1);
+        fake.default_login_expires_in(time::Duration::minutes(10));
+        let error = run_claude_context(&workspace, &env, false).expect_err("refused");
+        assert!(error.downcast_ref::<ClaudeContextRefused>().is_some());
+        assert_eq!(fake.spawns().len(), 1, "the refused run never started");
+        assert_eq!(next_context_cycle_delay(true), Duration::from_secs(30 * 60));
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
