@@ -19380,15 +19380,16 @@ for line in sys.stdin:
             .iter()
             .all(|window| window.account_identifier_hash.is_some()));
 
-        assert!(snapshot
-            .quota_windows
-            .iter()
-            .all(|window| window.observed_at.is_none()));
         let check = snapshot
             .diagnostics
             .iter()
             .find(|diagnostic| diagnostic.code == "codex_app_server_usage_response")
             .expect("successful completion witness");
+        assert!(check.observed_at.is_some());
+        assert!(snapshot
+            .quota_windows
+            .iter()
+            .all(|window| window.observed_at == check.observed_at));
         assert_eq!(
             check.account_identifier_hash,
             account.account_identifier_hash
