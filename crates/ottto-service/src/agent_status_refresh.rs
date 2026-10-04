@@ -144,11 +144,12 @@ impl StatusLane {
         }
         let age = state.schedule.last_started.map(|at| now.saturating_sub(at));
         if !state.collecting
-            && state.collection.is_some()
             && (state.running && !manual
                 || age.is_some_and(|age| age < if manual { MANUAL_COALESCE } else { INTERVAL }))
         {
-            return Ok(state.collection.as_ref().unwrap().clone());
+            if let Some(collection) = &state.collection {
+                return Ok(collection.clone());
+            }
         }
         let generation = state.generation;
         // Concurrent callers share the in-flight collection. No new thread,
