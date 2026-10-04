@@ -2096,17 +2096,23 @@ fn claude_saved_connection_serves(
         )
 }
 
-fn login_command(config_dir: &str) -> Option<std::process::Command> {
+/// The official browser sign-in for one managed auth root, admitted by the
+/// spawn gate's `BrowserLogin` class (exact argv, managed roots only).
+fn login_command(config_dir: &str) -> Option<crate::claude_spawn_gate::ClaudeSpawnPermit> {
     ottto_core::validate_managed_claude_auth_root(config_dir).ok()?;
     let slot = ClaudeConfigDirSlot::registered(config_dir.to_string()).ok()?;
-    let mut command =
-        crate::agent_status::resolved_claude_slot_command(&slot, &["auth", "login", "--claudeai"])?;
-    command
+    let mut permit = crate::claude_spawn_gate::admit(
+        crate::claude_spawn_gate::ClaudeSpawnTarget::Registered(slot),
+        crate::claude_spawn_gate::ClaudeSpawnClass::BrowserLogin,
+        &crate::claude_spawn_gate::CLAUDE_BROWSER_LOGIN_ARGV,
+    )
+    .ok()?;
+    permit
         .current_dir(config_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    Some(command)
+    Some(permit)
 }
 
 #[cfg(unix)]
@@ -2262,9 +2268,10 @@ fn spawn_supervised_login(
     _operation_id: &str,
     config_dir: &str,
 ) -> std::io::Result<SupervisedChild> {
-    let child = login_command(config_dir)
+    let (child, _) = login_command(config_dir)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Claude unavailable"))?
-        .spawn()?;
+        .spawn()?
+        .into_parts();
     Ok(SupervisedChild {
         child,
         control: None,
@@ -2318,9 +2325,9 @@ pub fn run_auth_supervisor(
         // authorization code is never reflected into the scanner.
         let (provider_io, provider_tty) = private_provider_pty()?;
         command
-            .env("TERM", "dumb")
-            .env("NO_COLOR", "1")
-            .env("FORCE_COLOR", "0")
+            .terminal_env("TERM", "dumb")
+            .terminal_env("NO_COLOR", "1")
+            .terminal_env("FORCE_COLOR", "0")
             .stdin(Stdio::from(
                 provider_tty
                     .try_clone()
@@ -2344,7 +2351,10 @@ pub fn run_auth_supervisor(
         // no later exec, so removing the fallible post-spawn CLOEXEC restore
         // closes the only window that could return while a live child retained
         // credentials but the supervisor explicitly unlocked its evidence.
-        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        let (mut child, _) = command
+            .spawn()
+            .map_err(|error| error.to_string())?
+            .into_parts();
         let child_pid = child.id() as libc::pid_t;
         let event_writer = Arc::new(Mutex::new(ready));
         let provider_output = provider_io.try_clone().map_err(|error| error.to_string())?;
@@ -4868,10 +4878,11 @@ mod tests {
         let _provider = EnvGuard::set("ANTHROPIC_API_KEY", "must-not-survive");
         let _poison = EnvGuard::set("OTTTO_SECRET_PROBE", "must-not-survive");
 
-        let mut child = login_command(managed.to_str().expect("utf8"))
+        let (mut child, _) = login_command(managed.to_str().expect("utf8"))
             .expect("hardened login command")
             .spawn()
-            .expect("spawn");
+            .expect("spawn")
+            .into_parts();
         assert!(child.wait().expect("wait").success());
         let observed = fs::read_to_string(&capture).expect("capture");
         assert!(observed.contains("argc=3\n"));
@@ -6973,7 +6984,7 @@ mod tests {
         .expect("wrong identity");
         fs::write(
             reusable.join(".credentials.json"),
-            br#"{"claudeAiOauth":{"accessToken":"fixture-wrong-token"}}"#,
+            br#"{"claudeAiOauth":{"accessToken":"fixture-wrong-token","refreshToken":"fixture-wrong-token-refresh","expiresAt":4102444800000,"scopes":["user:inference"]}}"#,
         )
         .expect("wrong credential");
         let store = FileClaudeConfigSlotSettingsStore::default();
@@ -7072,7 +7083,7 @@ mod tests {
         .expect("wrong identity");
         fs::write(
             managed.join(".credentials.json"),
-            br#"{"claudeAiOauth":{"accessToken":"fixture-wrong-token"}}"#,
+            br#"{"claudeAiOauth":{"accessToken":"fixture-wrong-token","refreshToken":"fixture-wrong-token-refresh","expiresAt":4102444800000,"scopes":["user:inference"]}}"#,
         )
         .expect("wrong credential");
         let operation_id = "claude_setup_82828282828282828282828282828282";
@@ -7992,7 +8003,7 @@ exit 1
         .expect("identity write");
         fs::write(
             Path::new(&operation.config_dir).join(".credentials.json"),
-            br#"{"claudeAiOauth":{"accessToken":"fixture-fallback-token"}}"#,
+            br#"{"claudeAiOauth":{"accessToken":"fixture-fallback-token","refreshToken":"fixture-fallback-token-refresh","expiresAt":4102444800000,"scopes":["user:inference"]}}"#,
         )
         .expect("credential write");
         for _ in 0..80 {

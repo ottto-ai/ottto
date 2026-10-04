@@ -657,6 +657,19 @@ fn harvest_stdio(
     config_dir: Option<&Path>,
     server_env: &BTreeMap<String, String>,
 ) -> Result<Vec<McpToolInput>> {
+    if crate::claude_spawn_gate::is_claude_cli_mcp_server(command, args) {
+        // `claude mcp serve` (or the npm Claude Code package) is a
+        // credential-using Claude Code process outside the spawn gate: killing
+        // it at the handshake timeout could interrupt a token refresh and sign
+        // the login out. It is reported unreachable (cost zero), never spawned.
+        eprintln!(
+            "mcp_harvest_skip reason={}",
+            crate::claude_spawn_gate::CLAUDE_CLI_MCP_SERVER_SKIPPED
+        );
+        return Err(anyhow!(
+            crate::claude_spawn_gate::CLAUDE_CLI_MCP_SERVER_SKIPPED
+        ));
+    }
     let mut child = env
         .command_in(command, args, cwd, config_dir, server_env)
         .stdin(Stdio::piped())
@@ -2142,6 +2155,42 @@ enabled = true
         assert!(dump_inventory("bogus").is_err());
 
         let _ = fs::remove_dir_all(&home);
+    }
+
+    /// A user MCP server that runs the Claude Code CLI itself is never
+    /// spawned: it would be a credential-using `claude` outside the gate.
+    #[test]
+    #[serial_test::serial]
+    fn claude_cli_mcp_servers_are_never_spawned() {
+        let fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("mcp");
+        let _path = EnvGuard::set("PATH", fake.bin.to_str().expect("utf8"));
+        let fake_claude = fake.bin.join("claude");
+        for (command, args) in [
+            ("claude", vec!["mcp".to_string(), "serve".to_string()]),
+            (
+                fake_claude.to_str().expect("utf8"),
+                vec!["mcp".to_string(), "serve".to_string()],
+            ),
+            (
+                "npx",
+                vec![
+                    "-y".to_string(),
+                    "@anthropic-ai/claude-code".to_string(),
+                    "mcp".to_string(),
+                ],
+            ),
+        ] {
+            let result = harvest_stdio(
+                command,
+                &args,
+                &test_spawn_env(),
+                None,
+                None,
+                &BTreeMap::new(),
+            );
+            assert!(result.is_err(), "{command} must be skipped");
+        }
+        assert!(fake.spawns().is_empty(), "no Claude Code process ran");
     }
 
     /// Minimal scoped env-var guard for the HOME-dependent dump test.

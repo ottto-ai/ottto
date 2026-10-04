@@ -1,13 +1,17 @@
-//! Consented, post-expiry Claude Code credential upkeep for registered custom
-//! slots.
+//! Claude Code login upkeep decisions for registered custom slots.
 //!
-//! The only vendor command this module may spawn is the resolved installed
-//! `claude` binary with argv `doctor`. It never handles tokens, invokes a shell,
-//! initiates login, or calls an OAuth endpoint. Success is proved only by a
-//! read-only post-command metadata observation whose access expiry advanced.
+//! Phase 0 of the durable-login fix: Ottto no longer refreshes any Claude
+//! login. A short `claude doctor` run after access expiry could start a token
+//! refresh and exit before the rotated token was saved, which signs the login
+//! out (anthropics/claude-code#95822). The foreground decision now reads the
+//! slot's stored credential on every pass and either collects, waits for
+//! Claude Code itself to refresh (paused), or asks for sign-in when the
+//! refresh grant is gone. The background worker below is retained but its
+//! production process runner never spawns anything, and nothing enqueues it.
 
 use crate::agent_status::{
-    read_claude_oauth_credential_metadata_for_slot, ClaudeOAuthCredentialMetadata,
+    read_claude_oauth_credential_metadata_for_slot, ClaudeLiveLogin, ClaudeLocalLoginState,
+    ClaudeOAuthCredentialMetadata,
 };
 use ottto_core::{
     default_support_dir, write_owner_only_file_atomic, ClaudeConfigDirSlot,
@@ -21,10 +25,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
 const UPKEEP_STATE_SCHEMA_VERSION: u16 = 1;
@@ -33,7 +36,15 @@ const UPKEEP_STATE_LOCK_FILE: &str = ".claude-background-upkeep-state.lock";
 /// Operational stop: absent means normal consent/network-gated GA behavior.
 pub(crate) const UPKEEP_DISABLED_FILE: &str = "claude-background-upkeep-disabled";
 const DOCTOR_TIMEOUT: Duration = Duration::from_secs(20);
-const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Open product decision Q-A. `false` (recommended, current): a managed slot
+/// whose access login lapsed while its refresh grant is alive stays quiet
+/// ("Paused", the last reading shown with its age; Reconnect stays in the
+/// account menu). `true`: present it as needing sign-in
+/// (`credential_unavailable` + `attention_required`, the Mac app's "Sign in
+/// again" gate). Flipping it changes presentation only; nothing is spawned
+/// either way.
+pub(crate) const PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN: bool = false;
 const RELLOGIN_APPROACHING_SECONDS: i64 = 72 * 60 * 60;
 const INITIAL_BACKOFF_SECONDS: i64 = 5 * 60;
 const MAX_BACKOFF_SECONDS: i64 = 6 * 60 * 60;
@@ -54,6 +65,9 @@ pub(crate) struct ClaudeUpkeepObservation {
     pub(crate) status: ClaudeConfigSlotUpkeepStatusV1,
     /// A completed local upkeep observation, never a provider quota check.
     pub(crate) result_observed_at: Option<String>,
+    /// The access login lapsed while its refresh grant is alive: only Claude
+    /// Code may refresh it, so collection waits (presented as paused).
+    pub(crate) paused_awaiting_claude_refresh: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,9 +145,14 @@ enum ClaimOutcome {
     Deferred(ClaudeConfigSlotUpkeepStatusV1),
 }
 
+// Only test runners construct the process outcomes now that the production
+// runner never spawns (Phase 0).
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoctorProcessResult {
     ExitZero,
+    /// Phase 0: the production runner never spawns `claude doctor`.
+    Disabled,
     MissingBinary,
     SpawnFailed,
     TimedOut,
@@ -173,15 +192,13 @@ trait DoctorProcessRunner {
 }
 
 enum DoctorProcessStart {
-    Started(std::process::Child),
     Finished(DoctorProcessResult),
 }
 
 impl DoctorProcessStart {
-    fn wait(self, timeout: Duration) -> DoctorProcessResult {
+    fn wait(self, _timeout: Duration) -> DoctorProcessResult {
         match self {
             Self::Finished(result) => result,
-            Self::Started(child) => wait_for_doctor_process(child, timeout),
         }
     }
 }
@@ -393,168 +410,117 @@ pub(crate) fn registered_slot_publication_allowed(
         && !support_dir.join(UPKEEP_DISABLED_FILE).is_file()
 }
 
+/// Phase 0: `claude doctor` is never spawned. A short `doctor` run after
+/// access expiry starts a token refresh and can exit before the rotated token
+/// is saved, signing the login out.
 impl DoctorProcessRunner for ProductionDoctorProcessRunner {
-    fn run(&self, config_dir: &str, timeout: Duration) -> DoctorProcessResult {
-        run_doctor_process(config_dir, timeout)
+    fn run(&self, _config_dir: &str, _timeout: Duration) -> DoctorProcessResult {
+        DoctorProcessResult::Disabled
     }
 
-    fn start(&self, config_dir: &str) -> DoctorProcessStart {
-        start_doctor_process(config_dir)
+    fn start(&self, _config_dir: &str) -> DoctorProcessStart {
+        DoctorProcessStart::Finished(DoctorProcessResult::Disabled)
     }
 }
 
+/// Foreground upkeep decision for one registered slot, from the live local
+/// read the caller made this pass (`live`). Never spawns anything and never
+/// enqueues the background worker.
 pub(crate) fn observe_registered_slot_upkeep(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     consent: bool,
     network_enabled: bool,
+    live: &ClaudeLiveLogin,
 ) -> ClaudeUpkeepObservation {
     observe_registered_slot_upkeep_reading(
         descriptor,
         consent,
         network_enabled,
-        &ProductionCredentialMetadataReader,
-        &mut enqueue_production_upkeep,
+        live,
+        OffsetDateTime::now_utc(),
     )
 }
 
-/// Foreground upkeep decision for one registered slot.
-///
-/// `credentials` is consulted only when the persisted collection status has
-/// no parseable access deadline. A failed probe can persist a status without
-/// one (for example `claude auth status` exiting non-zero right after the
-/// CLI rotated the slot's token), and treating that missing field as
-/// "credential unreadable" forever left the slot stuck until a manual
-/// reconnect. The live read is the same secret-free metadata projection the
-/// background worker uses; no token value leaves it.
+/// The decision always comes from the live read, never from the persisted
+/// `access_expires_at`: a stale persisted deadline latched slots in the past
+/// (H58), and a login the user restored must resume in the same pass.
 fn observe_registered_slot_upkeep_reading(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     consent: bool,
     network_enabled: bool,
-    credentials: &dyn CredentialMetadataReader,
-    enqueue: &mut dyn FnMut(ClaudeConfigSlotDescriptorV1) -> Result<(), OffsetDateTime>,
+    live: &ClaudeLiveLogin,
+    now: OffsetDateTime,
 ) -> ClaudeUpkeepObservation {
-    let now = OffsetDateTime::now_utc();
-    let mut metadata = ClaudeOAuthCredentialMetadata {
-        access_expires_at: descriptor.collection.access_expires_at.clone(),
-        refresh_token_expires_at: descriptor.collection.relogin_required_at.clone(),
-        // Persisted local status intentionally records deadlines, not grant
-        // contents. The background worker performs the authoritative read.
-        has_refresh_token: true,
-        cleared_by_cli: false,
-    };
     if !network_enabled {
+        let persisted = ClaudeOAuthCredentialMetadata {
+            access_expires_at: descriptor.collection.access_expires_at.clone(),
+            refresh_token_expires_at: descriptor.collection.relogin_required_at.clone(),
+            has_refresh_token: true,
+            cleared_by_cli: false,
+        };
         return observation_with_metadata(
             false,
             ClaudeConfigSlotUpkeepResultV1::CollectionPaused,
-            &metadata,
+            &persisted,
         );
     }
-    // Persisted deadlines are a cache of the last observation, not proof the
-    // credential is gone. Re-read the slot's own metadata (one keychain read,
-    // never a CLI spawn) when the deadline is missing, and while the slot is
-    // waiting for login so a reconnect or official login resumes it.
-    let mut witness_descriptor = None;
-    let waiting_for_login = descriptor
-        .collection
-        .upkeep
-        .as_ref()
-        .is_some_and(|status| status.result == ClaudeConfigSlotUpkeepResultV1::NeedsLogin);
-    if waiting_for_login || parse_timestamp(metadata.access_expires_at.as_deref()).is_none() {
-        let live = descriptor
-            .config_dir
-            .as_deref()
-            .and_then(|config_dir| ClaudeConfigDirSlot::registered(config_dir.to_string()).ok())
-            .and_then(|slot| credentials.read(&slot));
-        if let Some(cleared) = live.as_ref().filter(|live| live.cleared_by_cli) {
-            // Claude Code signed this slot out after a rejected refresh. No
-            // `auth status` or `doctor` can restore it; wait for the stored
-            // item to carry tokens again.
-            return observation_with_metadata(
-                false,
-                ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
-                cleared,
-            );
+    let metadata = live
+        .metadata
+        .clone()
+        .unwrap_or(ClaudeOAuthCredentialMetadata {
+            access_expires_at: None,
+            refresh_token_expires_at: None,
+            has_refresh_token: false,
+            cleared_by_cli: false,
+        });
+    match live.state {
+        // Claude Code signed this slot out, or its refresh grant is gone. No
+        // command can restore it; wait for the stored item to change.
+        ClaudeLocalLoginState::SignedOutByCli | ClaudeLocalLoginState::NeedsLogin => {
+            observation_with_metadata(false, ClaudeConfigSlotUpkeepResultV1::NeedsLogin, &metadata)
         }
-        if let Some(live) =
-            live.filter(|live| parse_timestamp(live.access_expires_at.as_deref()).is_some())
-        {
-            let mut current = descriptor.clone();
-            current.collection.access_expires_at = live.access_expires_at.clone();
-            current.collection.relogin_required_at = live.refresh_token_expires_at.clone();
-            witness_descriptor = Some(current);
-            metadata = live;
-        }
-    }
-    let Some(access_expiry) = parse_timestamp(metadata.access_expires_at.as_deref()) else {
-        return observation_with_metadata(
+        // Resolution reports the exact failure (credential unavailable, or a
+        // transient fail-closed read) from the same local read.
+        ClaudeLocalLoginState::NotSignedIn => observation_with_metadata(
             true,
             ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
             &metadata,
-        );
-    };
-    if access_expiry > now {
-        let approaching = parse_timestamp(metadata.refresh_token_expires_at.as_deref())
-            .is_some_and(|expiry| {
-                expiry > now && expiry - now <= TimeDuration::seconds(RELLOGIN_APPROACHING_SECONDS)
-            });
-        return observation_with_metadata(
-            true,
-            if approaching {
-                ClaudeConfigSlotUpkeepResultV1::ReloginApproaching
-            } else if consent {
-                ClaudeConfigSlotUpkeepResultV1::NotRequired
-            } else {
-                ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented
-            },
-            &metadata,
-        );
+        ),
+        ClaudeLocalLoginState::Unreadable => {
+            observation_with_metadata(true, ClaudeConfigSlotUpkeepResultV1::ProbeFailed, &metadata)
+        }
+        ClaudeLocalLoginState::AccessValid => {
+            let approaching = parse_timestamp(metadata.refresh_token_expires_at.as_deref())
+                .is_some_and(|expiry| {
+                    expiry > now
+                        && expiry - now <= TimeDuration::seconds(RELLOGIN_APPROACHING_SECONDS)
+                });
+            observation_with_metadata(
+                true,
+                if approaching {
+                    ClaudeConfigSlotUpkeepResultV1::ReloginApproaching
+                } else if consent {
+                    ClaudeConfigSlotUpkeepResultV1::NotRequired
+                } else {
+                    ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented
+                },
+                &metadata,
+            )
+        }
+        ClaudeLocalLoginState::RefreshPending => {
+            let mut observation = observation_with_metadata(
+                false,
+                if PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
+                    ClaudeConfigSlotUpkeepResultV1::RefreshDue
+                } else {
+                    ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled
+                },
+                &metadata,
+            );
+            observation.paused_awaiting_claude_refresh = true;
+            observation
+        }
     }
-    if descriptor
-        .collection
-        .upkeep
-        .as_ref()
-        .is_some_and(|status| status.result == ClaudeConfigSlotUpkeepResultV1::NeedsLogin)
-    {
-        return observation_with_metadata(
-            false,
-            ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
-            &metadata,
-        );
-    }
-    if !consent {
-        return observation_with_metadata(
-            false,
-            ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented,
-            &metadata,
-        );
-    }
-    if default_support_dir().join(UPKEEP_DISABLED_FILE).is_file() {
-        return observation_with_metadata(
-            false,
-            ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled,
-            &metadata,
-        );
-    }
-    if let Some(completed) = persisted_production_upkeep_observation(
-        witness_descriptor.as_ref().unwrap_or(descriptor),
-        now,
-    ) {
-        return completed;
-    }
-    // The worker performs its own authoritative read and spawns only the CLI,
-    // which serializes token rotation on its own refresh lock; enqueue the
-    // registration as published so its final gate compares like for like.
-    if let Err(observed_at) = enqueue(descriptor.clone()) {
-        let mut observation = observation_with_metadata(
-            false,
-            ClaudeConfigSlotUpkeepResultV1::SpawnFailed,
-            &metadata,
-        );
-        observation.result_observed_at = format_timestamp(observed_at).ok();
-        return observation;
-    }
-    // Enqueueing is not a durable claim and does not prove a vendor process started.
-    observation_with_metadata(false, ClaudeConfigSlotUpkeepResultV1::RefreshDue, &metadata)
 }
 
 /// Return the durable result from the current credential-expiry attempt while
@@ -563,6 +529,10 @@ fn observe_registered_slot_upkeep_reading(
 /// returned `InProgress`; without this readback every later status request
 /// starts from that transient presentation again and account reconnect actions
 /// remain unreachable.
+// Phase 0: the foreground no longer reads worker witnesses (an old
+// `Backoff`/`InProgress` witness must not be resurrected for an expired
+// slot). Kept for the dormant worker and its tests until Phase 1 replaces it.
+#[cfg_attr(not(test), allow(dead_code))]
 fn persisted_production_upkeep_observation(
     descriptor: &ClaudeConfigSlotDescriptorV1,
     now: OffsetDateTime,
@@ -591,12 +561,17 @@ fn persisted_production_upkeep_observation(
         return None;
     }
     Some(ClaudeUpkeepObservation {
+        paused_awaiting_claude_refresh: false,
         proceed_with_collection: witness.result == ClaudeConfigSlotUpkeepResultV1::Refreshed,
         status: witness.local_status(),
         result_observed_at,
     })
 }
 
+// Phase 0: nothing enqueues the background worker. It is kept, dormant and
+// unable to spawn (`ProductionDoctorProcessRunner` returns `Disabled`), until
+// Phase 1 replaces it with a consented, waiting refresher.
+#[allow(dead_code)]
 fn enqueue_production_upkeep(
     descriptor: ClaudeConfigSlotDescriptorV1,
 ) -> Result<(), OffsetDateTime> {
@@ -942,6 +917,7 @@ fn observe_registered_slot_upkeep_with_gate(
                 ClaudeConfigSlotUpkeepResultV1::Backoff
             };
             return ClaudeUpkeepObservation {
+                paused_awaiting_claude_refresh: false,
                 proceed_with_collection: false,
                 status: ClaudeConfigSlotUpkeepStatusV1 { result, ..status },
                 result_observed_at: None,
@@ -966,6 +942,7 @@ fn observe_registered_slot_upkeep_with_gate(
                 let _ = prune_slot_upkeep_state_at(support_dir, &descriptor.slot_id);
             }
             return ClaudeUpkeepObservation {
+                paused_awaiting_claude_refresh: false,
                 proceed_with_collection: false,
                 status: completed,
                 result_observed_at: format_timestamp(clock.now()).ok(),
@@ -986,6 +963,7 @@ fn observe_registered_slot_upkeep_with_gate(
             Some(_) => (ClaudeConfigSlotUpkeepResultV1::ExpiryUnchanged, false),
             None => (ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable, false),
         },
+        DoctorProcessResult::Disabled => (ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled, false),
         DoctorProcessResult::MissingBinary => {
             (ClaudeConfigSlotUpkeepResultV1::MissingBinary, false)
         }
@@ -1000,6 +978,7 @@ fn observe_registered_slot_upkeep_with_gate(
         },
     );
     ClaudeUpkeepObservation {
+        paused_awaiting_claude_refresh: false,
         proceed_with_collection: proceed,
         status: completed,
         result_observed_at: format_timestamp(clock.now()).ok(),
@@ -1013,6 +992,7 @@ fn observation(
 ) -> ClaudeUpkeepObservation {
     ClaudeUpkeepObservation {
         proceed_with_collection,
+        paused_awaiting_claude_refresh: false,
         result_observed_at: witness.and_then(|witness| witness.result_observed_at.clone()),
         status: witness.map_or(
             ClaudeConfigSlotUpkeepStatusV1 {
@@ -1035,6 +1015,7 @@ fn observation_with_metadata(
 ) -> ClaudeUpkeepObservation {
     ClaudeUpkeepObservation {
         proceed_with_collection,
+        paused_awaiting_claude_refresh: false,
         result_observed_at: None,
         status: ClaudeConfigSlotUpkeepStatusV1 {
             result,
@@ -1398,51 +1379,6 @@ fn upkeep_state_guard(support_dir: &Path) -> std::io::Result<UpkeepStateGuard> {
     })
 }
 
-fn run_doctor_process(config_dir: &str, timeout: Duration) -> DoctorProcessResult {
-    start_doctor_process(config_dir).wait(timeout)
-}
-
-fn start_doctor_process(config_dir: &str) -> DoctorProcessStart {
-    let slot = ClaudeConfigDirSlot::registered(config_dir.to_string())
-        .expect("registered descriptor must retain a valid exact path");
-    let Some(mut command) = crate::agent_status::resolved_claude_slot_command(&slot, &["doctor"])
-    else {
-        return DoctorProcessStart::Finished(DoctorProcessResult::MissingBinary);
-    };
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let Ok(child) = command.spawn() else {
-        return DoctorProcessStart::Finished(DoctorProcessResult::SpawnFailed);
-    };
-    DoctorProcessStart::Started(child)
-}
-
-fn wait_for_doctor_process(
-    mut child: std::process::Child,
-    timeout: Duration,
-) -> DoctorProcessResult {
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return DoctorProcessResult::ExitZero,
-            Ok(Some(_)) => return DoctorProcessResult::NonzeroExit,
-            Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return DoctorProcessResult::TimedOut;
-            }
-            Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return DoctorProcessResult::SpawnFailed;
-            }
-        }
-    }
-}
-
 fn parse_timestamp(value: Option<&str>) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(value?, &Rfc3339).ok()
 }
@@ -1460,7 +1396,8 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     struct FixedClock(OffsetDateTime);
@@ -1654,80 +1591,6 @@ mod tests {
             "the same slot id pointing at a different config dir must fail closed"
         );
 
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn five_due_registered_anchors_enqueue_without_blocking_collection_or_settings() {
-        let root = temp_dir("five-due-production-queue");
-        let _support_guard = EnvGuard::set(
-            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-            root.as_os_str().to_os_string(),
-        );
-        let store = FileClaudeConfigSlotSettingsStore::default();
-        store
-            .set_upkeep_consent(
-                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
-                true,
-            )
-            .expect("grant upkeep consent");
-        let mut descriptors = Vec::new();
-        for index in 0..5 {
-            let config_dir = root.join(format!("account-{index}"));
-            fs::create_dir_all(&config_dir).expect("create config dir");
-            let status = store
-                .register_path(
-                    ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
-                    config_dir.to_string_lossy().into_owned(),
-                )
-                .expect("register anchor");
-            let mut descriptor = status
-                .external_slots
-                .last()
-                .expect("registered slot")
-                .clone();
-            descriptor.collection.access_expires_at = Some("2020-01-01T00:00:00Z".to_string());
-            descriptor.collection.relogin_required_at = Some("2099-01-01T00:00:00Z".to_string());
-            descriptors.push(descriptor);
-        }
-
-        let collection_started = Instant::now();
-        for descriptor in &descriptors {
-            let observation = observe_registered_slot_upkeep(descriptor, true, true);
-            assert!(!observation.proceed_with_collection);
-            assert_eq!(
-                observation.status.result,
-                ClaudeConfigSlotUpkeepResultV1::RefreshDue
-            );
-        }
-        assert!(
-            collection_started.elapsed() < Duration::from_millis(250),
-            "five due anchors must enqueue without synchronous credential or doctor waits"
-        );
-
-        let settings_started = Instant::now();
-        store
-            .set_upkeep_consent(
-                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
-                false,
-            )
-            .expect("settings remain responsive while worker owns upkeep");
-        assert!(
-            settings_started.elapsed() < Duration::from_millis(250),
-            "background upkeep must not retain the registry lock while waiting"
-        );
-        let drain_deadline = Instant::now() + Duration::from_secs(5);
-        while PRODUCTION_UPKEEP_QUEUE.get().is_some_and(|queue| {
-            !queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .queued_slot_ids
-                .is_empty()
-        }) && Instant::now() < drain_deadline
-        {
-            thread::sleep(Duration::from_millis(10));
-        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2915,71 +2778,6 @@ mod tests {
         );
     }
 
-    struct SharedCredentialState {
-        refreshed: Arc<AtomicBool>,
-    }
-
-    impl CredentialMetadataReader for SharedCredentialState {
-        fn read(&self, _slot: &ClaudeConfigDirSlot) -> Option<ClaudeOAuthCredentialMetadata> {
-            Some(if self.refreshed.load(Ordering::SeqCst) {
-                metadata("2026-08-04T18:00:00Z", "2026-08-20T00:00:00Z")
-            } else {
-                metadata("2026-08-04T10:00:00Z", "2026-08-20T00:00:00Z")
-            })
-        }
-    }
-
-    struct RefreshingProcess {
-        refreshed: Arc<AtomicBool>,
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl DoctorProcessRunner for RefreshingProcess {
-        fn run(&self, _config_dir: &str, _timeout: Duration) -> DoctorProcessResult {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.refreshed.store(true, Ordering::SeqCst);
-            DoctorProcessResult::ExitZero
-        }
-    }
-
-    #[test]
-    fn startup_wake_and_collection_storm_spawn_one_doctor() {
-        let dir = Arc::new(temp_dir("three-hooks"));
-        let refreshed = Arc::new(AtomicBool::new(false));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let barrier = Arc::new(Barrier::new(4));
-        let mut workers = Vec::new();
-        for _opportunity in ["startup", "wake", "collection"] {
-            let dir = Arc::clone(&dir);
-            let refreshed = Arc::clone(&refreshed);
-            let calls = Arc::clone(&calls);
-            let barrier = Arc::clone(&barrier);
-            workers.push(thread::spawn(move || {
-                barrier.wait();
-                observe_registered_slot_upkeep_with(
-                    &descriptor(),
-                    true,
-                    true,
-                    &dir,
-                    &FixedClock(at("2026-08-04T10:00:00Z")),
-                    &SharedCredentialState {
-                        refreshed: Arc::clone(&refreshed),
-                    },
-                    &RefreshingProcess { refreshed, calls },
-                )
-            }));
-        }
-        barrier.wait();
-        let observations = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("hook worker"))
-            .collect::<Vec<_>>();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(observations
-            .iter()
-            .any(|result| { result.status.result == ClaudeConfigSlotUpkeepResultV1::Refreshed }));
-    }
-
     #[test]
     fn one_failed_slot_does_not_suppress_a_sibling_due_boundary() {
         let dir = temp_dir("siblings");
@@ -3020,51 +2818,53 @@ mod tests {
         assert!(second.proceed_with_collection);
     }
 
+    /// Phase 0: the production runner never spawns `claude doctor`, even when
+    /// a `claude` binary is on the search path and the worker is called.
     #[test]
     #[serial]
-    fn doctor_process_uses_exact_argv_shared_cleared_env_and_closed_streams() {
-        let root = temp_dir("process-contract");
+    fn production_doctor_runner_never_spawns() {
+        let root = temp_dir("doctor-disabled");
         let bin = root.join("bin");
         fs::create_dir_all(&bin).expect("bin");
         let capture = root.join("capture.txt");
-        let script = format!(
-            "#!/bin/sh\n{{\nprintf 'argc=%s\\n' \"$#\"\nprintf 'argv=%s\\n' \"$*\"\nprintf 'config=%s\\n' \"$CLAUDE_CONFIG_DIR\"\nprintf 'home=%s\\n' \"$HOME\"\nprintf 'user=%s\\n' \"$USER\"\nprintf 'provider=%s\\n' \"${{ANTHROPIC_API_KEY-unset}}\"\nprintf 'poison=%s\\n' \"${{OTTTO_SECRET_PROBE-unset}}\"\nif IFS= read -r ignored; then printf 'stdin=open\\n'; else printf 'stdin=closed\\n'; fi\n}} > \"{}\"\nprintf 'secret-shaped stdout'\nprintf 'secret-shaped stderr' >&2\n",
-            capture.display()
-        );
         let claude = bin.join("claude");
-        fs::write(&claude, script).expect("fake claude");
+        fs::write(
+            &claude,
+            format!("#!/bin/sh\necho \"$*\" >> \"{}\"\n", capture.display()),
+        )
+        .expect("fake claude");
         let mut permissions = fs::metadata(&claude).expect("metadata").permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&claude, permissions).expect("chmod");
         let _path = EnvGuard::set("OTTTO_COMMAND_SEARCH_PATH", bin.as_os_str());
-        let effective_home = root.join("effective-home");
-        fs::create_dir_all(&effective_home).expect("effective home");
-        let _effective_home = EnvGuard::set(
-            "OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS",
-            effective_home.as_os_str(),
-        );
-        let _ambient_home = EnvGuard::set("HOME", "relative-ambient-home-must-not-win");
-        let _provider = EnvGuard::set("ANTHROPIC_API_KEY", "must-not-survive");
-        let _poison = EnvGuard::set("OTTTO_SECRET_PROBE", "must-not-survive");
 
         assert_eq!(
-            run_doctor_process("/tmp/exact-claude-slot/", Duration::from_secs(2)),
-            DoctorProcessResult::ExitZero
+            ProductionDoctorProcessRunner.run("/tmp/exact-claude-slot/", Duration::from_secs(2)),
+            DoctorProcessResult::Disabled
         );
-        let observed = fs::read_to_string(capture).expect("capture");
-        assert!(observed.contains("argc=1\n"));
-        assert!(observed.contains("argv=doctor\n"));
-        assert!(observed.contains("config=/tmp/exact-claude-slot/\n"));
-        assert!(observed.contains("stdin=closed\n"));
-        assert!(observed.contains("provider=unset\n"));
-        assert!(observed.contains("poison=unset\n"));
-        assert!(observed.contains(&format!("home={}\n", effective_home.display())));
-        assert!(!observed.contains("relative-ambient-home-must-not-win"));
-        assert!(observed
-            .lines()
-            .any(|line| line.starts_with("user=") && line.len() > 5));
-        assert!(!observed.contains("--model"));
-        assert!(!observed.contains("--prompt"));
+        assert!(matches!(
+            ProductionDoctorProcessRunner.start("/tmp/exact-claude-slot/"),
+            DoctorProcessStart::Finished(DoctorProcessResult::Disabled)
+        ));
+        let observation = observe_registered_slot_upkeep_with(
+            &descriptor(),
+            true,
+            true,
+            &root,
+            &FixedClock(at("2026-08-04T10:00:00Z")),
+            &SequenceCredentials::new(vec![Some(metadata(
+                "2026-08-04T10:00:00Z",
+                "2026-08-20T00:00:00Z",
+            ))]),
+            &ProductionDoctorProcessRunner,
+        );
+        assert_eq!(
+            observation.status.result,
+            ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled
+        );
+        assert!(!observation.proceed_with_collection);
+        assert!(!capture.exists(), "no claude process ran");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3178,38 +2978,38 @@ mod tests {
         descriptor
     }
 
+    fn live(state: ClaudeLocalLoginState, access: &str, refresh: &str) -> ClaudeLiveLogin {
+        ClaudeLiveLogin {
+            state,
+            metadata: Some(metadata(access, refresh)),
+        }
+    }
+
+    fn production_queue_idle() -> bool {
+        PRODUCTION_UPKEEP_QUEUE.get().map_or(true, |queue| {
+            let queue = queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            !queue.running && queue.queued_slot_ids.is_empty() && queue.descriptors.is_empty()
+        })
+    }
+
     #[test]
     #[serial]
-    fn missing_persisted_deadline_rereads_live_metadata_instead_of_latching() {
-        let root = temp_dir("missing-deadline-live-valid");
-        let _support_guard = EnvGuard::set(
-            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-            root.as_os_str().to_os_string(),
-        );
+    fn missing_persisted_deadline_uses_the_live_read_instead_of_latching() {
         let access = rfc3339_from_now(TimeDuration::hours(7));
         let refresh = rfc3339_from_now(TimeDuration::days(20));
-        let reads = Arc::new(AtomicUsize::new(0));
-        let mut enqueued = Vec::new();
 
         let observation = observe_registered_slot_upkeep_reading(
             &descriptor_without_persisted_deadline(),
             true,
             true,
-            &CountingCredentials {
-                value: Some(metadata(&access, &refresh)),
-                calls: reads.clone(),
-            },
-            &mut |descriptor| {
-                enqueued.push(descriptor);
-                Ok(())
-            },
+            &live(ClaudeLocalLoginState::AccessValid, &access, &refresh),
+            OffsetDateTime::now_utc(),
         );
 
-        assert_eq!(reads.load(Ordering::SeqCst), 1, "one live metadata read");
-        assert!(
-            observation.proceed_with_collection,
-            "a valid live credential must re-probe on this pass"
-        );
+        assert!(observation.proceed_with_collection);
+        assert!(!observation.paused_awaiting_claude_refresh);
         assert_eq!(
             observation.status.result,
             ClaudeConfigSlotUpkeepResultV1::NotRequired,
@@ -3223,110 +3023,187 @@ mod tests {
             observation.status.refresh_token_expires_at.as_deref(),
             Some(refresh.as_str())
         );
-        assert!(enqueued.is_empty(), "valid access needs no refresh worker");
-        let _ = fs::remove_dir_all(root);
     }
 
+    /// H58 latch regression: the decision never comes from the persisted
+    /// deadline. A past persisted deadline with a valid live login resumes in
+    /// the same pass.
     #[test]
     #[serial]
-    fn persisted_deadline_skips_the_live_metadata_read() {
-        let root = temp_dir("persisted-deadline-no-live-read");
-        let _support_guard = EnvGuard::set(
-            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-            root.as_os_str().to_os_string(),
-        );
+    fn persisted_past_deadline_with_a_valid_live_login_resumes() {
         let mut descriptor = descriptor();
-        descriptor.collection.access_expires_at = Some(rfc3339_from_now(TimeDuration::hours(3)));
-        let reads = Arc::new(AtomicUsize::new(0));
+        descriptor.collection.access_expires_at = Some(rfc3339_from_now(-TimeDuration::hours(9)));
+        descriptor.collection.upkeep = Some(ClaudeConfigSlotUpkeepStatusV1 {
+            result: ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled,
+            due_access_expires_at: descriptor.collection.access_expires_at.clone(),
+            refresh_token_expires_at: None,
+            attempted_at: None,
+            next_allowed_attempt_at: None,
+            consecutive_failures: 0,
+        });
+        let access = rfc3339_from_now(TimeDuration::hours(8));
 
         let observation = observe_registered_slot_upkeep_reading(
             &descriptor,
             true,
             true,
-            &CountingCredentials {
-                value: None,
-                calls: reads.clone(),
-            },
-            &mut |_| panic!("valid persisted access must not enqueue"),
+            &live(
+                ClaudeLocalLoginState::AccessValid,
+                &access,
+                &rfc3339_from_now(TimeDuration::days(25)),
+            ),
+            OffsetDateTime::now_utc(),
         );
 
-        assert_eq!(reads.load(Ordering::SeqCst), 0);
         assert!(observation.proceed_with_collection);
-        assert_eq!(
-            observation.status.result,
-            ClaudeConfigSlotUpkeepResultV1::NotRequired
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn missing_persisted_deadline_with_expired_live_access_hands_refresh_to_one_worker() {
-        let root = temp_dir("missing-deadline-live-expired");
-        let _support_guard = EnvGuard::set(
-            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-            root.as_os_str().to_os_string(),
-        );
-        let access = rfc3339_from_now(-TimeDuration::minutes(1));
-        let refresh = rfc3339_from_now(TimeDuration::days(20));
-        let published = descriptor_without_persisted_deadline();
-        let mut enqueued = Vec::new();
-
-        let observation = observe_registered_slot_upkeep_reading(
-            &published,
-            true,
-            true,
-            &SequenceCredentials::new(vec![Some(metadata(&access, &refresh))]),
-            &mut |descriptor| {
-                enqueued.push(descriptor);
-                Ok(())
-            },
-        );
-
-        // Single refresher: the foreground pass must not proceed to
-        // `claude auth status` (which can itself rotate the token) while the
-        // worker owns the refresh for this slot.
-        assert!(!observation.proceed_with_collection);
-        assert_eq!(
-            observation.status.result,
-            ClaudeConfigSlotUpkeepResultV1::RefreshDue
-        );
         assert_eq!(
             observation.status.due_access_expires_at.as_deref(),
             Some(access.as_str())
         );
-        assert_eq!(enqueued.len(), 1, "exactly one worker hand-off");
-        assert_eq!(
-            enqueued[0], published,
-            "the worker receives the registration as published and re-reads itself"
-        );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     #[serial]
-    fn missing_persisted_deadline_and_unreadable_live_metadata_stays_unreadable() {
-        let root = temp_dir("missing-deadline-live-unreadable");
-        let _support_guard = EnvGuard::set(
-            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-            root.as_os_str().to_os_string(),
-        );
+    fn expired_live_access_pauses_without_worker_spawn_or_collection() {
+        let access = rfc3339_from_now(-TimeDuration::minutes(1));
+        let refresh = rfc3339_from_now(TimeDuration::days(20));
 
         let observation = observe_registered_slot_upkeep_reading(
             &descriptor_without_persisted_deadline(),
             true,
             true,
-            &SequenceCredentials::new(vec![None]),
-            &mut |_| panic!("unreadable metadata must not enqueue"),
+            &live(ClaudeLocalLoginState::RefreshPending, &access, &refresh),
+            OffsetDateTime::now_utc(),
         );
 
-        assert!(
-            observation.proceed_with_collection,
-            "collection still probes and reports the exact failure"
-        );
+        assert!(!observation.proceed_with_collection);
+        assert!(observation.paused_awaiting_claude_refresh);
         assert_eq!(
             observation.status.result,
+            if PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
+                ClaudeConfigSlotUpkeepResultV1::RefreshDue
+            } else {
+                ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled
+            }
+        );
+        assert_eq!(
+            observation.status.due_access_expires_at.as_deref(),
+            Some(access.as_str())
+        );
+        assert_eq!(observation.status.attempted_at, None);
+        assert!(production_queue_idle(), "nothing is handed to a worker");
+    }
+
+    #[test]
+    #[serial]
+    fn unreadable_or_absent_live_login_lets_resolution_report_the_exact_failure() {
+        let unreadable = observe_registered_slot_upkeep_reading(
+            &descriptor_without_persisted_deadline(),
+            true,
+            true,
+            &ClaudeLiveLogin::unreadable(),
+            OffsetDateTime::now_utc(),
+        );
+        assert!(unreadable.proceed_with_collection);
+        assert_eq!(
+            unreadable.status.result,
+            ClaudeConfigSlotUpkeepResultV1::ProbeFailed
+        );
+
+        let absent = observe_registered_slot_upkeep_reading(
+            &descriptor_without_persisted_deadline(),
+            true,
+            true,
+            &ClaudeLiveLogin {
+                state: ClaudeLocalLoginState::NotSignedIn,
+                metadata: None,
+            },
+            OffsetDateTime::now_utc(),
+        );
+        assert!(absent.proceed_with_collection);
+        assert_eq!(
+            absent.status.result,
             ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable
+        );
+        assert!(production_queue_idle());
+    }
+
+    #[test]
+    #[serial]
+    fn network_off_switch_pauses_collection_without_a_live_read() {
+        let observation = observe_registered_slot_upkeep_reading(
+            &descriptor(),
+            true,
+            false,
+            &ClaudeLiveLogin::unreadable(),
+            OffsetDateTime::now_utc(),
+        );
+        assert!(!observation.proceed_with_collection);
+        assert_eq!(
+            observation.status.result,
+            ClaudeConfigSlotUpkeepResultV1::CollectionPaused
+        );
+    }
+
+    /// T5: five expired, consented anchors pause in the foreground. Nothing is
+    /// enqueued, no worker thread starts, and an old `Backoff` witness from a
+    /// pre-upgrade worker is not resurrected.
+    #[test]
+    #[serial]
+    fn expired_consented_slots_pause_without_enqueueing_or_resurrecting_witnesses() {
+        let root = temp_dir("five-expired-paused");
+        let _support_guard = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let access = rfc3339_from_now(-TimeDuration::hours(2));
+        let refresh = rfc3339_from_now(TimeDuration::days(20));
+        let mut state = PersistedUpkeepStateV1::default();
+        let mut descriptors = Vec::new();
+        for index in 0..5 {
+            let mut descriptor = descriptor();
+            descriptor.slot_id = format!("claude_slot_0123456789abcdef0123456789abcd{index:02}");
+            descriptor.collection.access_expires_at = Some(access.clone());
+            descriptor.collection.relogin_required_at = Some(refresh.clone());
+            state.slots.insert(
+                descriptor.slot_id.clone(),
+                PersistedUpkeepWitnessV1 {
+                    due_access_expires_at: access.clone(),
+                    refresh_token_expires_at: Some(refresh.clone()),
+                    attempted_at: Some(rfc3339_from_now(-TimeDuration::minutes(30))),
+                    result_observed_at: Some(rfc3339_from_now(-TimeDuration::minutes(29))),
+                    preclaim_descriptor: None,
+                    next_allowed_attempt_at: rfc3339_from_now(TimeDuration::hours(5)),
+                    result: ClaudeConfigSlotUpkeepResultV1::Backoff,
+                    consecutive_failures: 3,
+                },
+            );
+            descriptors.push(descriptor);
+        }
+        write_state(&root, &state).expect("old worker witnesses");
+
+        for descriptor in &descriptors {
+            let observation = observe_registered_slot_upkeep(
+                descriptor,
+                true,
+                true,
+                &live(ClaudeLocalLoginState::RefreshPending, &access, &refresh),
+            );
+            assert!(!observation.proceed_with_collection);
+            assert!(observation.paused_awaiting_claude_refresh);
+            assert_ne!(
+                observation.status.result,
+                ClaudeConfigSlotUpkeepResultV1::Backoff,
+                "an old witness must not be resurrected"
+            );
+            assert_eq!(observation.status.consecutive_failures, 0);
+            assert_eq!(observation.status.next_allowed_attempt_at, None);
+        }
+        assert!(production_queue_idle(), "no worker hand-off");
+        assert_eq!(
+            load_state(&root).expect("state"),
+            state,
+            "the foreground never rewrites the old upkeep state"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -3378,39 +3255,28 @@ mod tests {
     #[test]
     #[serial]
     fn cli_cleared_credential_needs_login_without_worker_or_collection() {
-        let root = temp_dir("cli-cleared-needs-login");
-        let _support_guard = EnvGuard::set(
-            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-            root.as_os_str().to_os_string(),
-        );
-
         let observation = observe_registered_slot_upkeep_reading(
             &descriptor_without_persisted_deadline(),
             true,
             true,
-            &SequenceCredentials::new(vec![Some(cli_cleared_metadata())]),
-            &mut |_| panic!("a CLI-cleared credential must not queue `claude doctor`"),
+            &ClaudeLiveLogin {
+                state: ClaudeLocalLoginState::SignedOutByCli,
+                metadata: Some(cli_cleared_metadata()),
+            },
+            OffsetDateTime::now_utc(),
         );
 
-        assert!(
-            !observation.proceed_with_collection,
-            "no `claude auth status` for a CLI-cleared credential"
-        );
+        assert!(!observation.proceed_with_collection);
         assert_eq!(
             observation.status.result,
             ClaudeConfigSlotUpkeepResultV1::NeedsLogin
         );
-        let _ = fs::remove_dir_all(root);
+        assert!(production_queue_idle());
     }
 
     #[test]
     #[serial]
     fn needs_login_slot_resumes_once_the_stored_item_carries_tokens_again() {
-        let root = temp_dir("needs-login-resumes");
-        let _support_guard = EnvGuard::set(
-            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
-            root.as_os_str().to_os_string(),
-        );
         let mut waiting = descriptor();
         waiting.collection.access_expires_at = Some("1970-01-01T00:00:00Z".to_string());
         waiting.collection.upkeep = Some(ClaudeConfigSlotUpkeepStatusV1 {
@@ -3426,8 +3292,11 @@ mod tests {
             &waiting,
             true,
             true,
-            &SequenceCredentials::new(vec![Some(cli_cleared_metadata())]),
-            &mut |_| panic!("still cleared: no worker"),
+            &ClaudeLiveLogin {
+                state: ClaudeLocalLoginState::SignedOutByCli,
+                metadata: Some(cli_cleared_metadata()),
+            },
+            OffsetDateTime::now_utc(),
         );
         assert!(!still_cleared.proceed_with_collection);
         assert_eq!(
@@ -3440,11 +3309,12 @@ mod tests {
             &waiting,
             true,
             true,
-            &SequenceCredentials::new(vec![Some(metadata(
+            &live(
+                ClaudeLocalLoginState::AccessValid,
                 &access,
                 &rfc3339_from_now(TimeDuration::days(30)),
-            ))]),
-            &mut |_| panic!("valid access needs no worker"),
+            ),
+            OffsetDateTime::now_utc(),
         );
         assert!(
             reconnected.proceed_with_collection,
@@ -3458,6 +3328,5 @@ mod tests {
             reconnected.status.due_access_expires_at.as_deref(),
             Some(access.as_str())
         );
-        let _ = fs::remove_dir_all(root);
     }
 }

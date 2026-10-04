@@ -252,6 +252,11 @@ const CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION: u16 = 3;
 #[cfg(test)]
 static CLAUDE_OAUTH_PROVIDER_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Tests that must never reach the provider set this: an attempted request is
+/// still counted in `CLAUDE_OAUTH_PROVIDER_CALLS`, then refused locally.
+#[cfg(test)]
+static CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Everything the Claude OAuth usage endpoint yields in one fetch.
 #[derive(Debug, Clone, Default)]
@@ -320,6 +325,122 @@ struct ClaudeOAuthCredential {
     has_refresh_token: bool,
     access_expires_at: Option<String>,
     relogin_required_at: Option<String>,
+    /// `Some(true)` when the stored `scopes` list carries `user:inference`,
+    /// `Some(false)` when the list lacks it, `None` when no list is stored.
+    /// Claude Code itself reports `loggedIn` only for an inference-scoped
+    /// token, so this is the same local evidence `claude auth status` used.
+    has_inference_scope: Option<bool>,
+    /// The plan Claude Code stored with the login (`subscriptionType`), the
+    /// same field `claude auth status` printed. Display metadata, not a secret.
+    subscription_type: Option<String>,
+}
+
+/// Seconds before the stored access deadline at which a login no longer counts
+/// as usable. Claude Code itself refreshes inside a five-minute window; the
+/// daemon never refreshes, so this only stops a usage read with a token that
+/// is about to lapse.
+const CLAUDE_ACCESS_EXPIRY_MARGIN_SECONDS: i64 = 60;
+
+/// What one local read of a Claude login found. `Absent` means there is no
+/// stored OAuth login at all (no keychain item and no credentials file, or an
+/// item without `claudeAiOauth`). `Unreadable` is every failed or malformed
+/// read: callers fail closed on it and never treat it as "signed out".
+enum ClaudeCredentialRead {
+    Absent,
+    Unreadable,
+    Present(ClaudeOAuthCredential),
+}
+
+impl ClaudeCredentialRead {
+    fn into_credential(self) -> Option<ClaudeOAuthCredential> {
+        match self {
+            Self::Present(credential) => Some(credential),
+            Self::Absent | Self::Unreadable => None,
+        }
+    }
+
+    fn metadata(&self) -> Option<ClaudeOAuthCredentialMetadata> {
+        match self {
+            Self::Present(credential) => Some(ClaudeOAuthCredentialMetadata {
+                cleared_by_cli: credential.cleared_by_cli(),
+                access_expires_at: credential.access_expires_at.clone(),
+                refresh_token_expires_at: credential.relogin_required_at.clone(),
+                has_refresh_token: credential.has_refresh_token,
+            }),
+            Self::Absent | Self::Unreadable => None,
+        }
+    }
+}
+
+/// Login state derived from local metadata alone (the stored credential's
+/// deadlines, token presence and scopes). This replaces `claude auth status`,
+/// which read exactly these fields but could refresh, and so sign out, the
+/// login it was asked about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeLocalLoginState {
+    /// No stored OAuth login.
+    NotSignedIn,
+    /// The read failed or the stored item is malformed. Fail closed.
+    Unreadable,
+    /// Claude Code blanked the login after a rejected refresh.
+    SignedOutByCli,
+    /// No refresh token, or its absolute deadline passed.
+    NeedsLogin,
+    /// The access token is usable for more than the expiry margin.
+    AccessValid,
+    /// The access token lapsed (or lapses within the margin) while the refresh
+    /// token is still alive. Only Claude Code may refresh it; Ottto waits.
+    RefreshPending,
+}
+
+/// Secret-free result of one live local read, handed to the upkeep decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeLiveLogin {
+    pub(crate) state: ClaudeLocalLoginState,
+    pub(crate) metadata: Option<ClaudeOAuthCredentialMetadata>,
+}
+
+impl ClaudeLiveLogin {
+    pub(crate) fn unreadable() -> Self {
+        Self {
+            state: ClaudeLocalLoginState::Unreadable,
+            metadata: None,
+        }
+    }
+}
+
+fn claude_local_login_state(
+    read: &ClaudeCredentialRead,
+    now: OffsetDateTime,
+) -> ClaudeLocalLoginState {
+    let credential = match read {
+        ClaudeCredentialRead::Absent => return ClaudeLocalLoginState::NotSignedIn,
+        ClaudeCredentialRead::Unreadable => return ClaudeLocalLoginState::Unreadable,
+        ClaudeCredentialRead::Present(credential) => credential,
+    };
+    if credential.cleared_by_cli() {
+        return ClaudeLocalLoginState::SignedOutByCli;
+    }
+    if !credential.has_refresh_token {
+        return ClaudeLocalLoginState::NeedsLogin;
+    }
+    let parse = |at: Option<&str>| at.and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok());
+    if parse(credential.relogin_required_at.as_deref()).is_some_and(|deadline| deadline <= now) {
+        return ClaudeLocalLoginState::NeedsLogin;
+    }
+    let Some(access_expiry) = parse(credential.access_expires_at.as_deref()) else {
+        // A refresh token without a readable access deadline: the gate cannot
+        // prove a spawn is safe and the status cannot say what holds.
+        return ClaudeLocalLoginState::Unreadable;
+    };
+    if credential.access_token.is_none() || credential.has_inference_scope != Some(true) {
+        return ClaudeLocalLoginState::Unreadable;
+    }
+    if access_expiry > now + TimeDuration::seconds(CLAUDE_ACCESS_EXPIRY_MARGIN_SECONDS) {
+        ClaudeLocalLoginState::AccessValid
+    } else {
+        ClaudeLocalLoginState::RefreshPending
+    }
 }
 
 impl ClaudeOAuthCredential {
@@ -799,9 +920,10 @@ enum ClaudeSlotProbeFailure {
     CredentialUnavailable,
     IdentityMismatch,
     ConcurrentMutation,
-    /// `claude auth status` failed while the slot's own credential was still
-    /// present and unexpired. Transient and retried on the next pass; it is
-    /// not evidence that the login is gone.
+    /// The slot's stored login could not be read, or is malformed (for
+    /// example a refresh token without an access deadline). Fail closed:
+    /// transient, retried on the next pass, and not evidence that the login
+    /// is gone.
     ProbeFailed,
     /// Claude Code cleared this slot's tokens after its refresh was rejected
     /// (`invalid_grant`). Detected from the stored credential alone, without
@@ -846,7 +968,7 @@ impl ClaudeSlotProbeFailure {
             Self::ProbeFailed => (
                 ClaudeConfigSlotCollectionStateV1::ProbeFailed,
                 ClaudeConfigSlotDiagnosticCodeV1::ProbeFailed,
-                "Claude Code's local status check failed while this slot's saved login is still valid; collection will retry.",
+                "Claude Code's saved login for this slot could not be read; collection will retry.",
             ),
             Self::SignedOutByCli => (
                 ClaudeConfigSlotCollectionStateV1::NeedsLogin,
@@ -2821,6 +2943,59 @@ fn apply_claude_statusline_context_provenance(
     }
 }
 
+/// `claude --version` through the spawn gate. In the supported CLI this exact
+/// argv prints and returns before any login code runs.
+fn claude_cli_version() -> Option<String> {
+    let permit = crate::claude_spawn_gate::admit(
+        crate::claude_spawn_gate::ClaudeSpawnTarget::Default,
+        crate::claude_spawn_gate::ClaudeSpawnClass::VersionProbe {
+            max_runtime: COMMAND_TIMEOUT,
+        },
+        &["--version"],
+    )
+    .ok()?;
+    let output = crate::claude_spawn_gate::run_to_completion(permit);
+    output.success.then_some(output.stdout)
+}
+
+/// A signed-in default login whose `.claude.json` identity could not be
+/// trusted: keep the plan stored with the credential, claim no identity.
+fn claude_signed_in_account_without_identity(
+    credential_plan: Option<String>,
+) -> AgentAccountStatus {
+    let mut auth = serde_json::Map::new();
+    auth.insert("loggedIn".to_string(), Value::Bool(true));
+    auth.insert("authMethod".to_string(), Value::from("claude.ai"));
+    auth.insert("apiProvider".to_string(), Value::from("firstParty"));
+    if let Some(plan) = credential_plan {
+        auth.insert("subscriptionType".to_string(), Value::from(plan));
+    }
+    parse_claude_auth_json(&Value::Object(auth))
+}
+
+/// Whether the user's Claude Code settings select an API key ahead of the
+/// OAuth login (`apiKeyHelper`, or `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`
+/// in the settings `env`). Only key presence is read; no value is kept.
+fn claude_default_settings_select_api_key(paths: &[(String, PathBuf)]) -> bool {
+    paths.iter().any(|(_, path)| {
+        let Some(value) = fs::read_to_string(path)
+            .ok()
+            .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        else {
+            return false;
+        };
+        let present = |value: Option<&Value>| match value {
+            Some(Value::String(text)) => !text.trim().is_empty(),
+            Some(Value::Null) | None => false,
+            Some(_) => true,
+        };
+        present(value.get("apiKeyHelper"))
+            || ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+                .into_iter()
+                .any(|key| present(value.get("env").and_then(|env| env.get(key))))
+    })
+}
+
 /// `slot_owned_bindings` names exact account+organization bindings that a
 /// registered managed slot has proved it reads (see
 /// `claude_slot_owned_usage_bindings`). For those, the default login is not a
@@ -2848,47 +3023,78 @@ fn collect_claude_status(
         captured_at,
         expires_at,
     );
-    let default_slot = ClaudeConfigDirSlot::Default;
-    let claude_oauth_account = read_claude_cli_oauth_account(&claude_cli_config_path());
-    let initial_credential = read_claude_oauth_credential_for_slot(&default_slot);
-    let auth = run_claude_slot_command(
-        &default_slot,
-        &["auth", "status", "--json"],
-        COMMAND_TIMEOUT,
-    );
+    // Login state comes from local metadata only: `.claude.json` (before),
+    // the stored credential, `.claude.json` (after). `claude auth status`
+    // printed exactly these fields but could refresh, and so sign out, the
+    // default login on every pass.
+    let local = read_claude_slot_locally(&ClaudeConfigDirSlot::Default);
+    let login_state = local.state;
+    let credential_plan = match &local.credential {
+        ClaudeCredentialRead::Present(credential) => credential.subscription_type.clone(),
+        ClaudeCredentialRead::Absent | ClaudeCredentialRead::Unreadable => None,
+    };
     let stable_default_credential = stable_claude_slot_credential(
-        claude_oauth_account.clone(),
-        initial_credential,
-        read_claude_cli_oauth_account(&claude_cli_config_path()),
+        local.initial_oauth_account,
+        local.credential.into_credential(),
+        local.final_oauth_account,
     );
-    if auth.command_found && auth.success {
-        snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
-        if let Ok(json) = serde_json::from_str::<Value>(&auth.stdout) {
-            let mut account = parse_claude_auth_json(&json);
+    match login_state {
+        ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending => {
+            snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
             let mut refined_seat_plan = None;
             let mut refined_max_plan = None;
-            match stable_default_credential.as_ref() {
+            let account = match stable_default_credential.as_ref() {
                 Ok(stable) => {
-                    match require_claude_auth_identity_agreement(&account, &stable.oauth_account) {
-                        Ok(()) => {
-                            let refined = refine_claude_local_plan_metadata(
-                                &mut account,
+                    match claude_account_from_local_metadata(
+                        &stable.oauth_account,
+                        &stable.credential,
+                    ) {
+                        Ok(mut account) => {
+                            match require_claude_auth_identity_agreement(
+                                &account,
                                 &stable.oauth_account,
-                            );
-                            refined_seat_plan = refined.seat_plan;
-                            refined_max_plan = refined.max_plan;
-                            // Positive account + organization agreement is required
-                            // before local metadata can stamp full-meter identity.
-                            stamp_claude_cli_account_identity(&mut account, &stable.oauth_account);
+                            ) {
+                                Ok(()) => {
+                                    let refined = refine_claude_local_plan_metadata(
+                                        &mut account,
+                                        &stable.oauth_account,
+                                    );
+                                    refined_seat_plan = refined.seat_plan;
+                                    refined_max_plan = refined.max_plan;
+                                    // Positive account + organization identity is
+                                    // required before local metadata can stamp
+                                    // full-meter identity.
+                                    stamp_claude_cli_account_identity(
+                                        &mut account,
+                                        &stable.oauth_account,
+                                    );
+                                }
+                                Err(failure) => snapshot
+                                    .diagnostics
+                                    .push(default_claude_identity_diagnostic(failure)),
+                            }
+                            account
                         }
-                        Err(failure) => snapshot
-                            .diagnostics
-                            .push(default_claude_identity_diagnostic(failure)),
+                        Err(failure) => {
+                            snapshot
+                                .diagnostics
+                                .push(default_claude_identity_diagnostic(failure));
+                            claude_signed_in_account_without_identity(credential_plan.clone())
+                        }
                     }
                 }
-                Err(failure) => snapshot
-                    .diagnostics
-                    .push(default_claude_identity_diagnostic(*failure)),
+                Err(failure) => {
+                    snapshot
+                        .diagnostics
+                        .push(default_claude_identity_diagnostic(*failure));
+                    claude_signed_in_account_without_identity(credential_plan.clone())
+                }
+            };
+            let mut account = account;
+            if claude_default_settings_select_api_key(&claude_settings_paths()) {
+                // Settings-based credentials outrank the OAuth login in Claude
+                // Code; say so instead of claiming an OAuth session.
+                account.auth_method = Some("api_key".to_string());
             }
             snapshot.account = Some(account);
             snapshot.status = AgentStatusState::Available;
@@ -2910,7 +3116,19 @@ fn collect_claude_status(
                     ),
                 ));
             }
-        } else {
+        }
+        ClaudeLocalLoginState::Unreadable => {
+            // Fail closed: a failed or malformed read is not "signed out".
+            snapshot.account = Some(unsupported_account("anthropic"));
+            snapshot
+                .diagnostics
+                .push(default_claude_identity_diagnostic(
+                    ClaudeSlotProbeFailure::ProbeFailed,
+                ));
+        }
+        ClaudeLocalLoginState::NotSignedIn
+        | ClaudeLocalLoginState::NeedsLogin
+        | ClaudeLocalLoginState::SignedOutByCli => {
             snapshot.account = Some(unsupported_account("anthropic"));
             snapshot
                 .diagnostics
@@ -2918,17 +3136,8 @@ fn collect_claude_status(
                     ClaudeSlotProbeFailure::CredentialUnavailable,
                 ));
         }
-    } else {
-        snapshot.account = Some(unsupported_account("anthropic"));
-        if auth.command_found {
-            snapshot.diagnostics.push(command_diagnostic(
-                "claude_auth_status_failed",
-                "claude auth status --json did not return usable JSON.",
-                &auth,
-            ));
-        }
     }
-    let version = run_command_capture("claude", &["--version"], COMMAND_TIMEOUT);
+    let version = claude_cli_version();
     snapshot.model = Some(AgentModelStatus {
         active_model: None,
         default_model: None,
@@ -3174,7 +3383,7 @@ fn collect_claude_status(
     snapshot.capabilities = vec![
         supported_capability(
             "account_status",
-            "Read from claude auth status --json when available.",
+            "Read from local Claude Code login metadata (stored credential deadlines and .claude.json); no Claude command runs.",
         ),
         quota_capability,
         context_capability,
@@ -3183,7 +3392,7 @@ fn collect_claude_status(
     if let Some(diagnostic) = runtime_defaults.diagnostic {
         snapshot.diagnostics.push(diagnostic);
     }
-    if version.command_found && version.success {
+    if version.is_some() {
         snapshot.diagnostics.push(AgentStatusDiagnostic::source(
             "claude_version_detected",
             AgentDiagnosticSeverity::Info,
@@ -3343,29 +3552,48 @@ fn collect_claude_status_snapshots(
                     continue;
                 }
             };
+        // One live local read per slot per pass (identity, stored credential,
+        // identity), shared by the upkeep decision and the resolution below.
+        // Never a `claude` spawn.
+        let network_enabled = !claude_oauth_usage_network_disabled();
+        let local = network_enabled
+            .then(|| read_registered_claude_slot_locally(&descriptor))
+            .flatten();
+        let live = local
+            .as_ref()
+            .map_or_else(ClaudeLiveLogin::unreadable, ClaudeSlotLocalRead::live_login);
         let upkeep = crate::claude_upkeep::observe_registered_slot_upkeep(
             &descriptor,
             upkeep_consent,
-            !claude_oauth_usage_network_disabled(),
+            network_enabled,
+            &live,
         );
         if !upkeep.proceed_with_collection {
             let result_observed_at = upkeep.result_observed_at.clone();
-            let mut status =
-                blocked_claude_upkeep_status(&descriptor.slot_id, &captured_at, upkeep.status);
+            let paused = upkeep.paused_awaiting_claude_refresh;
+            let mut status = if paused {
+                paused_claude_refresh_status(&descriptor.slot_id, &captured_at, upkeep.status)
+            } else {
+                blocked_claude_upkeep_status(&descriptor.slot_id, &captured_at, upkeep.status)
+            };
             if let Some(slot) = claude_config_slot_for_descriptor(&descriptor) {
                 retain_verified_claude_slot_binding(&descriptor.slot_id, &slot, &mut status);
             } else {
                 clear_claude_slot_binding(&mut status);
             }
             append_claude_upkeep_result_receipt(&mut status, &descriptor, result_observed_at);
-            if status.state == ClaudeConfigSlotCollectionStateV1::RefreshDue {
+            if status.state == ClaudeConfigSlotCollectionStateV1::RefreshDue && !paused {
                 blocked_worker_receipt_descriptors
                     .insert(descriptor.slot_id.clone(), descriptor.clone());
             }
             slot_states.insert(descriptor.slot_id, status);
             continue;
         }
-        let mut resolved = match resolve_registered_claude_slot(descriptor.clone()) {
+        let resolved = match local {
+            Some(local) => resolve_registered_claude_slot_from_local(descriptor.clone(), local),
+            None => Err(ClaudeSlotProbeFailure::IdentityUnknown),
+        };
+        let mut resolved = match resolved {
             Ok(resolved) => resolved,
             Err(failure) => {
                 let status = registered_claude_failure_status(
@@ -4263,14 +4491,26 @@ pub(crate) fn collect_registered_claude_slot_status(
                 return status;
             }
         };
+    let network_enabled = !claude_oauth_usage_network_disabled();
+    let local = network_enabled
+        .then(|| read_registered_claude_slot_locally(&descriptor))
+        .flatten();
+    let live = local
+        .as_ref()
+        .map_or_else(ClaudeLiveLogin::unreadable, ClaudeSlotLocalRead::live_login);
     let upkeep = crate::claude_upkeep::observe_registered_slot_upkeep(
         &descriptor,
         upkeep_consent,
-        !claude_oauth_usage_network_disabled(),
+        network_enabled,
+        &live,
     );
     if !upkeep.proceed_with_collection {
         let result_observed_at = upkeep.result_observed_at.clone();
-        let mut status = blocked_claude_upkeep_status(slot_id, &captured_at, upkeep.status);
+        let mut status = if upkeep.paused_awaiting_claude_refresh {
+            paused_claude_refresh_status(slot_id, &captured_at, upkeep.status)
+        } else {
+            blocked_claude_upkeep_status(slot_id, &captured_at, upkeep.status)
+        };
         if let Some(slot) = claude_config_slot_for_descriptor(&descriptor) {
             retain_verified_claude_slot_binding(slot_id, &slot, &mut status);
         } else {
@@ -4280,7 +4520,11 @@ pub(crate) fn collect_registered_claude_slot_status(
         let _ = persist_one_claude_slot_collection_state(slot_id, &status);
         return status;
     }
-    let mut resolved = match resolve_registered_claude_slot(descriptor.clone()) {
+    let resolved = match local {
+        Some(local) => resolve_registered_claude_slot_from_local(descriptor.clone(), local),
+        None => Err(ClaudeSlotProbeFailure::IdentityUnknown),
+    };
+    let mut resolved = match resolved {
         Ok(resolved) => resolved,
         Err(failure) => {
             let status =
@@ -4762,57 +5006,83 @@ fn reconciled_valid_access_status_with_worker_receipt(
     Some(status)
 }
 
+/// One local observation of an exact slot: its `.claude.json` identity, the
+/// stored credential, then the identity again (a change between the two reads
+/// is a concurrent login). Never spawns `claude`.
+struct ClaudeSlotLocalRead {
+    initial_oauth_account: Option<ClaudeCliOauthAccount>,
+    credential: ClaudeCredentialRead,
+    final_oauth_account: Option<ClaudeCliOauthAccount>,
+    state: ClaudeLocalLoginState,
+}
+
+impl ClaudeSlotLocalRead {
+    fn live_login(&self) -> ClaudeLiveLogin {
+        ClaudeLiveLogin {
+            state: self.state,
+            metadata: self.credential.metadata(),
+        }
+    }
+}
+
+fn read_claude_slot_locally(slot: &ClaudeConfigDirSlot) -> ClaudeSlotLocalRead {
+    let identity_path = slot.identity_path(&home_dir());
+    let initial_oauth_account = read_claude_cli_oauth_account(&identity_path);
+    let credential = read_claude_oauth_credential_state_for_slot(slot);
+    let final_oauth_account = read_claude_cli_oauth_account(&identity_path);
+    let state = claude_local_login_state(&credential, OffsetDateTime::now_utc());
+    ClaudeSlotLocalRead {
+        initial_oauth_account,
+        credential,
+        final_oauth_account,
+        state,
+    }
+}
+
+fn read_registered_claude_slot_locally(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+) -> Option<ClaudeSlotLocalRead> {
+    claude_config_slot_for_descriptor(descriptor)
+        .filter(|slot| slot.config_dir().is_some())
+        .map(|slot| read_claude_slot_locally(&slot))
+}
+
 fn resolve_registered_claude_slot(
     descriptor: ClaudeConfigSlotDescriptorV1,
 ) -> Result<ResolvedClaudeSlot, ClaudeSlotProbeFailure> {
-    let config_dir = descriptor
-        .config_dir
-        .as_ref()
+    let local = read_registered_claude_slot_locally(&descriptor)
         .ok_or(ClaudeSlotProbeFailure::IdentityUnknown)?;
-    let slot = ClaudeConfigDirSlot::registered(config_dir.clone())
-        .map_err(|_| ClaudeSlotProbeFailure::IdentityUnknown)?;
-    let initial_oauth_account = read_claude_cli_oauth_account(&slot.identity_path(&home_dir()));
-    let initial_credential = read_claude_oauth_credential_for_slot(&slot);
-    // A credential Claude Code already cleared cannot be revived by any CLI
-    // command; do not spawn one until the stored item changes.
-    if initial_credential
-        .as_ref()
-        .is_some_and(ClaudeOAuthCredential::cleared_by_cli)
-    {
-        return Err(ClaudeSlotProbeFailure::SignedOutByCli);
-    }
-    let auth = run_claude_slot_command(&slot, &["auth", "status", "--json"], COMMAND_TIMEOUT);
-    let final_oauth_account = read_claude_cli_oauth_account(&slot.identity_path(&home_dir()));
-    if !auth.command_found || !auth.success {
-        // An explicit signed-out answer is authoritative even when stale
-        // credential material is still readable. Otherwise the CLI may have
-        // rotated the token inside this very call, so judge the credential by
-        // a read taken after it, never the pre-call copy.
-        let explicitly_signed_out = serde_json::from_str::<Value>(&auth.stdout).is_ok_and(|json| {
-            parse_claude_auth_json(&json).login_state == AgentLoginState::SignedOut
-        });
-        if auth.command_found
-            && !explicitly_signed_out
-            && claude_credential_present_and_unexpired(
-                read_claude_oauth_credential_for_slot(&slot).as_ref(),
-                OffsetDateTime::now_utc(),
-            )
-        {
-            return Err(ClaudeSlotProbeFailure::ProbeFailed);
+    resolve_registered_claude_slot_from_local(descriptor, local)
+}
+
+/// Resolve a registered slot from local metadata alone. `claude auth status`
+/// added no independent evidence: it printed the stored token's presence and
+/// scopes, the plan stored with the token, and the `.claude.json` account. The
+/// same fields are read here directly, so no Claude command runs and nothing
+/// can refresh (or sign out) the login.
+fn resolve_registered_claude_slot_from_local(
+    descriptor: ClaudeConfigSlotDescriptorV1,
+    local: ClaudeSlotLocalRead,
+) -> Result<ResolvedClaudeSlot, ClaudeSlotProbeFailure> {
+    match local.state {
+        ClaudeLocalLoginState::SignedOutByCli => {
+            return Err(ClaudeSlotProbeFailure::SignedOutByCli)
         }
-        return Err(ClaudeSlotProbeFailure::CredentialUnavailable);
+        ClaudeLocalLoginState::NotSignedIn | ClaudeLocalLoginState::NeedsLogin => {
+            return Err(ClaudeSlotProbeFailure::CredentialUnavailable)
+        }
+        // Fail closed and transient: a failed or malformed read is not
+        // evidence that the login is gone.
+        ClaudeLocalLoginState::Unreadable => return Err(ClaudeSlotProbeFailure::ProbeFailed),
+        ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending => {}
     }
     let stable = stable_claude_slot_credential(
-        initial_oauth_account,
-        initial_credential,
-        final_oauth_account,
+        local.initial_oauth_account,
+        local.credential.into_credential(),
+        local.final_oauth_account,
     )?;
-    let auth_json = serde_json::from_str::<Value>(&auth.stdout)
-        .map_err(|_| ClaudeSlotProbeFailure::IdentityMismatch)?;
-    let mut account = parse_claude_auth_json(&auth_json);
-    if account.login_state != AgentLoginState::SignedIn {
-        return Err(ClaudeSlotProbeFailure::CredentialUnavailable);
-    }
+    let mut account =
+        claude_account_from_local_metadata(&stable.oauth_account, &stable.credential)?;
     require_claude_auth_identity_agreement(&account, &stable.oauth_account)?;
     refine_claude_local_plan_metadata(&mut account, &stable.oauth_account);
     let (account_identifier_hash, organization_identifier_hash) =
@@ -4837,20 +5107,64 @@ fn resolve_registered_claude_slot(
     })
 }
 
-/// Whether a slot credential is still usable without any refresh: an access
-/// token is present and its vendor deadline is in the future.
-fn claude_credential_present_and_unexpired(
-    credential: Option<&ClaudeOAuthCredential>,
-    now: OffsetDateTime,
+/// Build the signed-in Claude account from local metadata: email, organization
+/// and organization name from `.claude.json` `oauthAccount`, the plan from the
+/// stored credential's `subscriptionType`. This is the same field set
+/// `claude auth status --json` printed, and it goes through the same parser so
+/// plan normalization and billing channel stay identical.
+///
+/// Two present plan facts that contradict each other (the credential says one
+/// plan, `.claude.json` names another organization type) mean the two files
+/// were written by different logins: `ConcurrentMutation`.
+fn claude_account_from_local_metadata(
+    oauth: &ClaudeCliOauthAccount,
+    credential: &ClaudeOAuthCredential,
+) -> Result<AgentAccountStatus, ClaudeSlotProbeFailure> {
+    if claude_local_plan_facts_contradict(
+        credential.subscription_type.as_deref(),
+        oauth.organization_type.as_deref(),
+    ) {
+        return Err(ClaudeSlotProbeFailure::ConcurrentMutation);
+    }
+    let mut auth = serde_json::Map::new();
+    auth.insert("loggedIn".to_string(), Value::Bool(true));
+    auth.insert("authMethod".to_string(), Value::from("claude.ai"));
+    auth.insert("apiProvider".to_string(), Value::from("firstParty"));
+    for (key, value) in [
+        ("email", oauth.email_address.as_deref()),
+        ("orgId", oauth.organization_uuid.as_deref()),
+        ("orgName", oauth.organization_name.as_deref()),
+        ("subscriptionType", credential.subscription_type.as_deref()),
+    ] {
+        if let Some(value) = value {
+            auth.insert(key.to_string(), Value::from(value));
+        }
+    }
+    Ok(parse_claude_auth_json(&Value::Object(auth)))
+}
+
+/// Only plan families both files can name are compared; an unknown value on
+/// either side is never a contradiction.
+fn claude_local_plan_facts_contradict(
+    subscription_type: Option<&str>,
+    organization_type: Option<&str>,
 ) -> bool {
-    credential.is_some_and(|credential| {
-        credential.access_token.is_some()
-            && credential
-                .access_expires_at
-                .as_deref()
-                .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
-                .is_some_and(|expiry| expiry > now)
-    })
+    const KNOWN: &[&str] = &["pro", "max", "team", "enterprise"];
+    let family = |value: &str| {
+        let normalized = normalize_plan_type(value.to_string());
+        let family = normalized
+            .strip_prefix("claude_")
+            .unwrap_or(&normalized)
+            .to_string();
+        KNOWN.contains(&family.as_str()).then_some(family)
+    };
+    match (
+        subscription_type.and_then(family),
+        organization_type.and_then(family),
+    ) {
+        (Some(left), Some(right)) => left != right,
+        _ => false,
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -6235,6 +6549,7 @@ fn claude_default_slot_collection_status(
 ) -> ClaudeConfigSlotCollectionStatusV1 {
     for failure in [
         ClaudeSlotProbeFailure::CredentialUnavailable,
+        ClaudeSlotProbeFailure::ProbeFailed,
         ClaudeSlotProbeFailure::ConcurrentMutation,
         ClaudeSlotProbeFailure::IdentityMismatch,
         ClaudeSlotProbeFailure::IdentityUnknown,
@@ -6407,6 +6722,66 @@ fn blocked_claude_upkeep_status(
         message: message.to_string(),
     }];
     status.upkeep = Some(upkeep);
+    status
+}
+
+/// A registered slot whose access login lapsed while its refresh grant is
+/// alive. Ottto does not refresh it (that can sign the account out), so the
+/// last reading stays, marked stale, until Claude Code refreshes the login or
+/// the user signs in again; the next pass resumes on its own.
+///
+/// No new wire values: the quiet default is collection `refresh_due` with
+/// upkeep `upkeep_disabled` (quota access `paused`), never
+/// `stale_access_token`, which tells the app the provider ended the session.
+/// `PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN` (open decision Q-A) switches to
+/// `credential_unavailable`, which the app presents as "Sign in again".
+fn paused_claude_refresh_status(
+    slot_id: &str,
+    observed_at: &str,
+    upkeep: ottto_protocol::ClaudeConfigSlotUpkeepStatusV1,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    let mut status = read_persisted_claude_slot_collection_state()
+        .slots
+        .get(slot_id)
+        .cloned()
+        .unwrap_or_default();
+    status.observed_at = Some(observed_at.to_string());
+    if upkeep.due_access_expires_at.is_some() {
+        status.access_expires_at = upkeep.due_access_expires_at.clone();
+    }
+    if upkeep.refresh_token_expires_at.is_some() {
+        status.relogin_required_at = upkeep.refresh_token_expires_at.clone();
+    }
+    let expired_at = upkeep
+        .due_access_expires_at
+        .clone()
+        .unwrap_or_else(|| "an unknown time".to_string());
+    let message = format!(
+        "Claude Code has not refreshed this sign-in since it expired at {expired_at}. Ottto no longer refreshes it in the background, because that can sign the account out. The last reading is shown with its age. Sign in again to resume now."
+    );
+    let (state, code) = if crate::claude_upkeep::PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
+        (
+            ClaudeConfigSlotCollectionStateV1::CredentialUnavailable,
+            ClaudeConfigSlotDiagnosticCodeV1::CredentialUnavailable,
+        )
+    } else {
+        (
+            ClaudeConfigSlotCollectionStateV1::RefreshDue,
+            ClaudeConfigSlotDiagnosticCodeV1::RefreshDue,
+        )
+    };
+    status.state = state;
+    status.quota_snapshot = status
+        .quota_snapshot
+        .as_ref()
+        .map(stale_local_claude_quota_snapshot);
+    status.diagnostics = vec![ClaudeConfigSlotDiagnosticV1 { code, message }];
+    // Old background-worker receipts describe a refresher that no longer
+    // runs; they must not escalate or explain this state.
+    status
+        .quota_check_diagnostics
+        .retain(|diagnostic| !diagnostic.code.starts_with("claude_slot_worker_"));
+    apply_claude_upkeep_observation(&mut status, upkeep);
     status
 }
 
@@ -8442,6 +8817,18 @@ fn claude_oauth_stamp_account_identity(
     }
 }
 
+/// Whether an access deadline (RFC 3339) is at or within the expiry margin
+/// of `now` (unix seconds). An absent or unparseable deadline is not
+/// "expired" here; the local login state already failed those closed.
+fn claude_access_token_locally_expired(credential_expires_at: Option<&str>, now: u64) -> bool {
+    credential_expires_at
+        .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+        .is_some_and(|expiry| {
+            let now = i64::try_from(now).unwrap_or(i64::MAX);
+            expiry.unix_timestamp() <= now.saturating_add(CLAUDE_ACCESS_EXPIRY_MARGIN_SECONDS)
+        })
+}
+
 fn collect_claude_oauth_usage_unstamped(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
@@ -8620,6 +9007,29 @@ fn collect_claude_oauth_usage_unstamped(
             "Claude OAuth credentials were not available locally.".to_string(),
         ));
     };
+    // Never send an access token that is expired by the local clock: the
+    // request could only be rejected (adding a per-caller hold), and only
+    // Claude Code itself may refresh the login. The daemon never uses the
+    // refresh token.
+    if claude_access_token_locally_expired(credential_expires_at, now) {
+        drop(token);
+        let result = match exact_stale_fallback {
+            Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
+            None => Err(
+                "Claude Code has not refreshed this login since its access token expired."
+                    .to_string(),
+            ),
+        };
+        return ClaudeOAuthUsageOutcome {
+            result,
+            diagnostics: Vec::new(),
+        }
+        .with_check_outcome(
+            "claude_oauth_usage_check_suppressed",
+            "This Claude login's access token has expired locally and Claude Code has not refreshed it yet; no provider request was made, and any served readings are last-known local readings.",
+            now,
+        );
+    }
     if let Some(breaker) = open_breaker {
         if let Some(cache) = exact_stale_fallback {
             return ClaudeOAuthUsageOutcome {
@@ -8661,6 +9071,12 @@ fn collect_claude_oauth_usage_unstamped(
     let user_agent = ottto_user_agent();
     #[cfg(test)]
     CLAUDE_OAUTH_PROVIDER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(test)]
+    if CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN.load(std::sync::atomic::Ordering::SeqCst) {
+        return ClaudeOAuthUsageOutcome::from(Err(
+            "This test forbids Claude OAuth provider requests.".to_string(),
+        ));
+    }
     let response = ureq::get(CLAUDE_OAUTH_USAGE_ENDPOINT)
         .set("Accept", "application/json")
         .set("Content-Type", "application/json")
@@ -9695,33 +10111,81 @@ fn claude_oauth_usage_failure_class(error: &ureq::Error) -> Option<ClaudeOAuthUs
 fn read_claude_oauth_credential_for_slot(
     slot: &ClaudeConfigDirSlot,
 ) -> Option<ClaudeOAuthCredential> {
-    read_claude_oauth_credential_from_keychain(slot)
-        .or_else(|| read_claude_oauth_credential_from_credentials_file(slot))
+    read_claude_oauth_credential_state_for_slot(slot).into_credential()
 }
 
 pub(crate) fn read_claude_oauth_credential_metadata_for_slot(
     slot: &ClaudeConfigDirSlot,
 ) -> Option<ClaudeOAuthCredentialMetadata> {
-    let credential = read_claude_oauth_credential_for_slot(slot)?;
-    Some(ClaudeOAuthCredentialMetadata {
-        cleared_by_cli: credential.cleared_by_cli(),
-        access_expires_at: credential.access_expires_at,
-        refresh_token_expires_at: credential.relogin_required_at,
-        has_refresh_token: credential.has_refresh_token,
-    })
+    read_claude_oauth_credential_state_for_slot(slot).metadata()
 }
 
-fn read_claude_oauth_credential_from_keychain(
+/// Read one exact slot's stored Claude login: the keychain item first, then
+/// the credentials-file fallback. `security` exit 44 (item not found) or no
+/// `security` tool on the search path falls through to the file; every other
+/// keychain failure (locked keychain, timeout, spawn failure, unparseable
+/// JSON) is `Unreadable`, never "signed out".
+///
+/// The item is read with `security find-generic-password -w`, so the secret
+/// passes through a pipe into daemon memory. It is parsed here and dropped;
+/// only the access token travels on, to the usage request.
+fn read_claude_oauth_credential_state_for_slot(slot: &ClaudeConfigDirSlot) -> ClaudeCredentialRead {
+    match read_claude_oauth_credential_from_keychain(slot) {
+        ClaudeKeychainRead::Found(payload) => parse_claude_oauth_credential_read(&payload),
+        ClaudeKeychainRead::NotFound => read_claude_oauth_credential_from_credentials_file(slot),
+        ClaudeKeychainRead::Failed => ClaudeCredentialRead::Unreadable,
+    }
+}
+
+/// Spawn-gate view of one exact slot's stored credential: token presence and
+/// the raw access deadline only.
+pub(crate) fn read_claude_spawn_gate_credential(
     slot: &ClaudeConfigDirSlot,
-) -> Option<ClaudeOAuthCredential> {
-    let account = effective_user_account_name()?;
-    let arguments = claude_oauth_keychain_lookup_arguments(slot, &account)?;
+) -> crate::claude_spawn_gate::ClaudeGateCredential {
+    use crate::claude_spawn_gate::ClaudeGateCredential;
+    match read_claude_oauth_credential_state_for_slot(slot) {
+        ClaudeCredentialRead::Absent => ClaudeGateCredential::Absent,
+        ClaudeCredentialRead::Unreadable => ClaudeGateCredential::ReadFailed,
+        ClaudeCredentialRead::Present(credential) => ClaudeGateCredential::Present {
+            has_refresh_token: credential.has_refresh_token,
+            access_expires_at: credential
+                .access_expires_at
+                .as_deref()
+                .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok()),
+        },
+    }
+}
+
+enum ClaudeKeychainRead {
+    Found(String),
+    NotFound,
+    Failed,
+}
+
+/// `security` exits 44 (`errSecItemNotFound`) when the item does not exist.
+const SECURITY_ITEM_NOT_FOUND_EXIT_CODE: i32 = 44;
+
+fn read_claude_oauth_credential_from_keychain(slot: &ClaudeConfigDirSlot) -> ClaudeKeychainRead {
+    if crate::command_env::executable_path("security").is_none() {
+        // No keychain tool on this search path: there is no keychain item to
+        // read, so the credentials-file fallback is the only store.
+        return ClaudeKeychainRead::NotFound;
+    }
+    let Some(account) = effective_user_account_name() else {
+        return ClaudeKeychainRead::Failed;
+    };
+    let Some(arguments) = claude_oauth_keychain_lookup_arguments(slot, &account) else {
+        return ClaudeKeychainRead::Failed;
+    };
     let argument_refs: Vec<_> = arguments.iter().map(String::as_str).collect();
     let output = run_command_capture("security", &argument_refs, COMMAND_TIMEOUT);
-    if !output.command_found || !output.success {
-        return None;
+    if output.success {
+        return ClaudeKeychainRead::Found(output.stdout);
     }
-    parse_claude_oauth_credential(&output.stdout)
+    if output.command_found && output.status_code == Some(SECURITY_ITEM_NOT_FOUND_EXIT_CODE) {
+        return ClaudeKeychainRead::NotFound;
+    }
+    ClaudeKeychainRead::Failed
 }
 
 struct EffectiveUserIdentity {
@@ -9731,6 +10195,12 @@ struct EffectiveUserIdentity {
 
 fn effective_user_account_name() -> Option<String> {
     effective_user_identity().map(|identity| identity.account_name)
+}
+
+/// Account name and home directory of the user this daemon runs as, for the
+/// Claude spawn gate's binary resolution and sanitized environment.
+pub(crate) fn claude_spawn_user_identity() -> Option<(String, PathBuf)> {
+    effective_user_identity().map(|identity| (identity.account_name, identity.home_dir))
 }
 
 #[cfg(unix)]
@@ -9823,10 +10293,33 @@ fn claude_oauth_keychain_lookup_arguments(
 
 fn read_claude_oauth_credential_from_credentials_file(
     slot: &ClaudeConfigDirSlot,
-) -> Option<ClaudeOAuthCredential> {
+) -> ClaudeCredentialRead {
     let path = slot.credentials_path(&home_dir());
-    let body = fs::read_to_string(path).ok()?;
-    parse_claude_oauth_credential(&body)
+    match fs::read_to_string(path) {
+        Ok(body) => parse_claude_oauth_credential_read(&body),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ClaudeCredentialRead::Absent,
+        Err(_) => ClaudeCredentialRead::Unreadable,
+    }
+}
+
+/// A stored payload that is not JSON, or whose `claudeAiOauth` is not an
+/// object, is `Unreadable`. A JSON object without `claudeAiOauth` (for example
+/// an item that holds only MCP server logins) carries no Claude login.
+fn parse_claude_oauth_credential_read(payload: &str) -> ClaudeCredentialRead {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return ClaudeCredentialRead::Unreadable;
+    };
+    if !value.is_object() {
+        return ClaudeCredentialRead::Unreadable;
+    }
+    match value.get("claudeAiOauth") {
+        None | Some(Value::Null) => ClaudeCredentialRead::Absent,
+        Some(oauth) if oauth.is_object() => parse_claude_oauth_credential_value(oauth).map_or(
+            ClaudeCredentialRead::Unreadable,
+            ClaudeCredentialRead::Present,
+        ),
+        Some(_) => ClaudeCredentialRead::Unreadable,
+    }
 }
 
 #[cfg(test)]
@@ -9834,9 +10327,13 @@ fn parse_claude_oauth_access_token(payload: &str) -> Option<String> {
     parse_claude_oauth_credential(payload)?.access_token
 }
 
+#[cfg(test)]
 fn parse_claude_oauth_credential(payload: &str) -> Option<ClaudeOAuthCredential> {
     let value: Value = serde_json::from_str(payload).ok()?;
-    let oauth = value.get("claudeAiOauth")?;
+    parse_claude_oauth_credential_value(value.get("claudeAiOauth")?)
+}
+
+fn parse_claude_oauth_credential_value(oauth: &Value) -> Option<ClaudeOAuthCredential> {
     let access_token = oauth
         .get("accessToken")
         .and_then(Value::as_str)
@@ -9853,13 +10350,30 @@ fn parse_claude_oauth_credential(payload: &str) -> Option<ClaudeOAuthCredential>
             .and_then(Value::as_i64)
             .and_then(rfc3339_from_epoch_millis)
     };
+    let has_inference_scope = oauth.get("scopes").and_then(Value::as_array).map(|scopes| {
+        scopes
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|scope| scope.trim() == CLAUDE_INFERENCE_SCOPE)
+    });
+    let subscription_type = oauth
+        .get("subscriptionType")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     Some(ClaudeOAuthCredential {
         access_token,
         has_refresh_token,
         access_expires_at: timestamp("expiresAt"),
         relogin_required_at: timestamp("refreshTokenExpiresAt"),
+        has_inference_scope,
+        subscription_type,
     })
 }
+
+/// The OAuth scope Claude Code requires before it reports a login as signed in.
+const CLAUDE_INFERENCE_SCOPE: &str = "user:inference";
 
 fn rfc3339_from_epoch_millis(epoch_millis: i64) -> Option<String> {
     let seconds = epoch_millis.div_euclid(1_000);
@@ -9959,6 +10473,8 @@ fn stable_claude_slot_credential(
             has_refresh_token: false,
             access_expires_at: None,
             relogin_required_at: None,
+            has_inference_scope: None,
+            subscription_type: None,
         }),
     })
 }
@@ -12810,17 +13326,20 @@ struct ClaudeCliOauthAccount {
     account_uuid: Option<String>,
     email_address: Option<String>,
     organization_uuid: Option<String>,
+    /// Display only; replaces the `orgName` that `claude auth status` printed.
+    organization_name: Option<String>,
     organization_type: Option<String>,
     seat_tier: Option<String>,
     organization_rate_limit_tier: Option<String>,
     user_rate_limit_tier: Option<String>,
 }
 
-/// Full-meter collection requires positive agreement from the exact slot's
-/// live auth status and its local account metadata. The real Claude auth JSON
-/// reports email and organization UUID (not account UUID), so both fields must
-/// be present and equal before the account UUID from that exact slot's identity
-/// file may become strong meter identity. Absence of contradiction is not
+/// Full-meter collection requires a signed-in account whose email and
+/// organization UUID are both present and equal to the exact slot's local
+/// account metadata before the account UUID from that identity file may become
+/// strong meter identity. The account is now built from that same local
+/// metadata (as `claude auth status` itself did), so this check keeps its old
+/// requirement that both fields exist. Absence of contradiction is not
 /// identity evidence.
 fn require_claude_auth_identity_agreement(
     account: &AgentAccountStatus,
@@ -12873,6 +13392,7 @@ fn parse_claude_cli_oauth_account(value: &Value) -> Option<ClaudeCliOauthAccount
         account_uuid: field("accountUuid"),
         email_address: field("emailAddress"),
         organization_uuid: field("organizationUuid"),
+        organization_name: field("organizationName"),
         organization_type: field("organizationType"),
         seat_tier: field("seatTier"),
         organization_rate_limit_tier: field("organizationRateLimitTier"),
@@ -12954,10 +13474,11 @@ struct RefinedClaudeLocalPlan {
 /// Apply every local-metadata plan refinement to a freshly parsed Claude
 /// account.
 ///
-/// `claude auth status` reports a bare `team` for every seat tier and a bare
-/// `max` for BOTH Max tiers, so the only disambiguator is the rate-limit /
-/// seat metadata in the slot's own `.claude.json`. Every collector that parses
-/// `claude auth status` must run these refinements, not just the default slot:
+/// The stored `subscriptionType` (what `claude auth status` printed) is a bare
+/// `team` for every seat tier and a bare `max` for BOTH Max tiers, so the only
+/// disambiguator is the rate-limit / seat metadata in the slot's own
+/// `.claude.json`. Every collector must run these refinements, not just the
+/// default slot:
 /// a registered (`CLAUDE_CONFIG_DIR`) slot left unrefined ships a bare plan,
 /// and the backend then prices the conservative lower bound — a Max 20x
 /// account reads as Max 5x ($100 instead of $200), a Team Premium seat as
@@ -14528,7 +15049,7 @@ fn extract_percent_before(text: &str, markers: &[&str]) -> Option<u8> {
 }
 
 fn run_command_capture(program: &str, args: &[&str], timeout: Duration) -> CommandOutput {
-    run_command_capture_with_exact_env(program, args, timeout, None)
+    run_command_capture_with_exact_env(program, args, timeout)
 }
 
 fn run_codex_home_command(
@@ -14583,66 +15104,10 @@ fn resolved_codex_home_command(
     Some(command)
 }
 
-fn run_claude_slot_command(
-    slot: &ClaudeConfigDirSlot,
-    args: &[&str],
-    timeout: Duration,
-) -> CommandOutput {
-    let Some(mut command) = resolved_claude_slot_command(slot, args) else {
-        return CommandOutput {
-            command_found: false,
-            success: false,
-            status_code: None,
-            stdout: String::new(),
-            stderr: String::new(),
-        };
-    };
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    run_prepared_command_capture(command, timeout)
-}
-
-/// Resolve Claude once and apply the single shared sanitized exact-slot
-/// environment used by auth observation and background upkeep. No provider or
-/// token-shaped ambient variables survive `env_clear`.
-pub(crate) fn resolved_claude_slot_command(
-    slot: &ClaudeConfigDirSlot,
-    args: &[&str],
-) -> Option<Command> {
-    let identity = effective_user_identity()?;
-    let program_path = crate::command_env::claude_executable_path(&identity.home_dir)?;
-    let mut command = Command::new(program_path);
-    command
-        .args(args)
-        .env_clear()
-        .env("HOME", &identity.home_dir)
-        .env("USER", identity.account_name);
-    for locale_key in ["LANG", "LC_ALL", "LC_CTYPE"] {
-        if let Some(value) = std::env::var_os(locale_key) {
-            command.env(locale_key, value);
-        }
-    }
-    if let Some(path_env) = crate::command_env::claude_path_env(&identity.home_dir) {
-        command.env("PATH", path_env);
-    }
-    match slot.config_dir() {
-        Some(config_dir) => {
-            command.env("CLAUDE_CONFIG_DIR", config_dir);
-        }
-        None => {
-            command.env_remove("CLAUDE_CONFIG_DIR");
-        }
-    }
-    Some(command)
-}
-
 fn run_command_capture_with_exact_env(
     program: &str,
     args: &[&str],
     timeout: Duration,
-    claude_slot: Option<&ClaudeConfigDirSlot>,
 ) -> CommandOutput {
     let Some(program_path) = crate::command_env::executable_path(program) else {
         return CommandOutput {
@@ -14653,25 +15118,11 @@ fn run_command_capture_with_exact_env(
             stderr: String::new(),
         };
     };
-    let mut command = if let Some(slot) = claude_slot {
-        let Some(command) = resolved_claude_slot_command(slot, args) else {
-            return CommandOutput {
-                command_found: false,
-                success: false,
-                status_code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-            };
-        };
-        command
-    } else {
-        let mut command = Command::new(program_path);
-        command.args(args);
-        if let Some(path_env) = crate::command_env::path_env() {
-            command.env("PATH", path_env);
-        }
-        command
-    };
+    let mut command = Command::new(program_path);
+    command.args(args);
+    if let Some(path_env) = crate::command_env::path_env() {
+        command.env("PATH", path_env);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -15427,6 +15878,28 @@ mod tests {
     use serial_test::serial;
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
+
+    /// The credential item shape Claude Code writes after a browser sign-in:
+    /// both tokens, both deadlines (epoch milliseconds), the inference scope
+    /// and the plan. Values are fixtures, never real secrets.
+    fn claude_credential_fixture(
+        access_token: &str,
+        access_expires_in: TimeDuration,
+        subscription_type: Option<&str>,
+    ) -> Value {
+        let now = OffsetDateTime::now_utc();
+        let mut oauth = serde_json::json!({
+            "accessToken": access_token,
+            "refreshToken": format!("{access_token}-refresh"),
+            "expiresAt": (now + access_expires_in).unix_timestamp() * 1_000,
+            "refreshTokenExpiresAt": (now + TimeDuration::days(28)).unix_timestamp() * 1_000,
+            "scopes": ["user:inference", "user:profile"],
+        });
+        if let Some(plan) = subscription_type {
+            oauth["subscriptionType"] = serde_json::json!(plan);
+        }
+        serde_json::json!({ "claudeAiOauth": oauth })
+    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -17187,7 +17660,7 @@ exit 1
         )
         .expect("write fake claude");
         let security = bin.join("security");
-        fs::write(&security, "#!/bin/sh\nexit 1\n").expect("write fake security");
+        fs::write(&security, "#!/bin/sh\nexit 44\n").expect("write fake security");
         for executable in [&claude, &security] {
             let mut permissions = fs::metadata(executable).expect("metadata").permissions();
             permissions.set_mode(0o755);
@@ -17211,23 +17684,27 @@ exit 1
             )
             .expect("write identity");
         };
-        let write_credential = |dir: &Path| {
+        let write_credential_with_plan = |dir: &Path, plan: &str| {
             fs::write(
                 dir.join(".credentials.json"),
-                serde_json::to_vec(&serde_json::json!({
-                    "claudeAiOauth": {"accessToken": "fixture"}
-                }))
+                serde_json::to_vec(&claude_credential_fixture(
+                    "fixture",
+                    TimeDuration::hours(6),
+                    Some(plan),
+                ))
                 .expect("serialize credential fixture"),
             )
             .expect("write credential fixture");
         };
+        let write_credential = |dir: &Path| write_credential_with_plan(dir, "max");
 
         write_identity(&home, "account-primary", "organization-primary");
         write_credential(&home.join(".claude"));
         let managed = root.join("managed-slot");
         write_identity(&managed, "account-secondary", "organization-secondary");
-        // No token: stable exact identity must still serve this slot's
-        // same-account, same-organization cache without a network fetch.
+        // A fresh exact same-account, same-organization cache serves this
+        // slot without a network fetch.
+        write_credential(&managed);
         let healthy_external = root.join("healthy-external-slot");
         write_identity(
             &healthy_external,
@@ -17240,29 +17717,39 @@ exit 1
         write_credential(&duplicate);
         let failed = root.join("failed-slot");
         write_identity(&failed, "account-failed", "organization-failed");
+        // Signed in to an account but no stored login at all.
         let auth_failed = root.join("auth-failed-slot");
         write_identity(&auth_failed, "account-secondary", "organization-secondary");
-        write_credential(&auth_failed);
-        fs::write(auth_failed.join(".auth-mode"), "command_failure")
-            .expect("write auth failure mode");
+        // `.claude.json` without an email: no complete local identity.
         let missing_identity = root.join("missing-identity-slot");
         write_identity(
             &missing_identity,
             "account-missing-identity",
             "organization-missing-identity",
         );
+        let mut identity: Value = serde_json::from_slice(
+            &fs::read(missing_identity.join(".claude.json")).expect("read identity"),
+        )
+        .expect("identity json");
+        identity["oauthAccount"]
+            .as_object_mut()
+            .expect("oauth account")
+            .remove("emailAddress");
+        fs::write(
+            missing_identity.join(".claude.json"),
+            serde_json::to_vec(&identity).expect("serialize identity"),
+        )
+        .expect("write identity without email");
         write_credential(&missing_identity);
-        fs::write(missing_identity.join(".auth-mode"), "missing_email")
-            .expect("write missing identity mode");
+        // The stored login names a Team plan while `.claude.json` names a Max
+        // organization: the two files were written by different logins.
         let mismatched_identity = root.join("mismatched-identity-slot");
         write_identity(
             &mismatched_identity,
             "account-stale-identity",
             "organization-stale-identity",
         );
-        write_credential(&mismatched_identity);
-        fs::write(mismatched_identity.join(".auth-mode"), "identity_mismatch")
-            .expect("write mismatch mode");
+        write_credential_with_plan(&mismatched_identity, "team");
 
         let _home_guard = EnvVarGuard::set_os("HOME", home.as_os_str().to_os_string());
         let _support_guard = EnvVarGuard::set_os(
@@ -17331,8 +17818,6 @@ exit 1
                 .expect("tertiary org hash");
         let failed_hash = billing_identity_hash("anthropic", "account", "account-failed")
             .expect("failed account hash");
-        let failed_org = billing_identity_hash("anthropic", "organization", "organization-failed")
-            .expect("failed org hash");
         let usage_cache = |account_hash: &str,
                            organization_hash: &str,
                            used_percent: u8,
@@ -17407,10 +17892,13 @@ exit 1
         );
         let snapshots = collection.snapshots;
 
+        // A slot with no stored login proves no account locally (as `claude
+        // auth status` reported `loggedIn: false` for it), so it emits no
+        // strongly bound snapshot; its local state says why.
         assert_eq!(
             snapshots.len(),
-            4,
-            "two healthy accounts plus two strongly bound degraded accounts are emitted"
+            3,
+            "two healthy accounts plus the strongly bound degraded default are emitted"
         );
         assert!(snapshots
             .iter()
@@ -17428,7 +17916,7 @@ exit 1
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(by_account.len(), 4);
+        assert_eq!(by_account.len(), 3);
         for (account_hash, organization_hash, expected_percent, expected_credits) in [
             (&secondary_hash, &secondary_org, 77, 777),
             (&tertiary_hash, &tertiary_org, 33, 333),
@@ -17463,26 +17951,9 @@ exit 1
                 Some(ClaudeQuotaAccessState::Full)
             );
         }
-        let failed_snapshot = by_account
-            .get(&failed_hash)
-            .expect("strongly bound failed slot snapshot");
-        assert_eq!(failed_snapshot.status, AgentStatusState::Degraded);
-        assert!(failed_snapshot.quota_windows.is_empty());
-        assert!(failed_snapshot.credit_balances.is_empty());
-        assert!(failed_snapshot.plan_observations.is_empty());
-        assert_eq!(
-            failed_snapshot
-                .account
-                .as_ref()
-                .and_then(|account| account.organization_identifier_hash.as_ref()),
-            Some(&failed_org)
-        );
-        assert_eq!(
-            failed_snapshot
-                .account
-                .as_ref()
-                .and_then(|account| account.claude_quota_access_state),
-            Some(ClaudeQuotaAccessState::AttentionRequired)
+        assert!(
+            !by_account.contains_key(&failed_hash),
+            "no stored login: no account is claimed for the failed slot"
         );
         let primary_snapshot = by_account
             .get(&primary_hash)
@@ -17584,7 +18055,7 @@ exit 1
                 ClaudeConfigSlotCollectionStateV1::Fresh
                     | ClaudeConfigSlotCollectionStateV1::DuplicateAccount
             ),
-            "the no-token slot must reach candidate ranking via its exact cache"
+            "the managed slot must reach candidate ranking via its exact cache"
         );
         assert!(status.external_slots.iter().any(|slot| {
             slot.collection.state == ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
@@ -17593,7 +18064,7 @@ exit 1
             slot.collection.state == ClaudeConfigSlotCollectionStateV1::IdentityUnknown
         }));
         assert!(status.external_slots.iter().any(|slot| {
-            slot.collection.state == ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+            slot.collection.state == ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
         }));
         for (path, expected) in [
             (
@@ -17606,7 +18077,7 @@ exit 1
             ),
             (
                 &mismatched_identity,
-                ClaudeConfigSlotCollectionStateV1::IdentityMismatch,
+                ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
             ),
         ] {
             let slot = status
@@ -17796,9 +18267,11 @@ exit 1
             .expect("write rotation identity");
             fs::write(
                 credential_dir.join(".credentials.json"),
-                serde_json::to_vec(&serde_json::json!({
-                    "claudeAiOauth": {"accessToken": "test-captured-value"}
-                }))
+                serde_json::to_vec(&claude_credential_fixture(
+                    "test-captured-value",
+                    TimeDuration::hours(6),
+                    Some("max"),
+                ))
                 .expect("serialize rotation credential"),
             )
             .expect("write rotation credential");
@@ -17807,44 +18280,32 @@ exit 1
         write_slot(&custom, &custom, "custom");
 
         let claude = bin.join("claude");
-        fs::write(
-            &claude,
-            r#"#!/bin/sh
-if [ "$1" = "--version" ]; then
-  echo "test-version"
-  exit 0
-fi
-if [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then
-  if [ -n "$CLAUDE_CONFIG_DIR" ]; then
-    config="$CLAUDE_CONFIG_DIR/.claude.json"
-  else
-    config="$HOME/.claude.json"
-  fi
-  exec /usr/bin/python3 - "$config" <<'PY'
-import json, sys
-path = sys.argv[1]
-value = json.load(open(path))
-account = value["oauthAccount"]
-result = {
-  "status": "authenticated",
-  "email": account["emailAddress"],
-  "organizationId": account["organizationUuid"],
-  "subscriptionType": "max"
-}
-account["accountUuid"] += "-rotated"
-account["organizationUuid"] += "-rotated"
-account["emailAddress"] = "rotated@example.invalid"
-with open(path, "w") as output:
-    json.dump(value, output)
-print(json.dumps(result))
-PY
-fi
-exit 1
-"#,
-        )
-        .expect("write rotating claude");
+        fs::write(&claude, "#!/bin/sh\necho test-version\n").expect("write fake claude");
+        // A login written by another Claude Code process while the stored
+        // credential is being read: `.claude.json` differs before and after.
         let security = bin.join("security");
-        fs::write(&security, "#!/bin/sh\nexit 1\n").expect("write security fallback");
+        fs::write(
+            &security,
+            format!(
+                r#"#!/bin/sh
+/usr/bin/python3 - '{default}' '{custom}' <<'PY'
+import json, sys
+for path in sys.argv[1:]:
+    value = json.load(open(path))
+    account = value["oauthAccount"]
+    account["accountUuid"] += "-rotated"
+    account["organizationUuid"] += "-rotated"
+    account["emailAddress"] = "rotated@example.invalid"
+    with open(path, "w") as output:
+        json.dump(value, output)
+PY
+exit 44
+"#,
+                default = home.join(".claude.json").display(),
+                custom = custom.join(".claude.json").display(),
+            ),
+        )
+        .expect("write rotating security");
         for executable in [&claude, &security] {
             let mut permissions = fs::metadata(executable).expect("metadata").permissions();
             permissions.set_mode(0o755);
@@ -21317,272 +21778,446 @@ for line in sys.stdin:
         assert_eq!(account.subscription_product.as_deref(), Some("claude_max"));
     }
 
-    #[test]
-    #[serial]
-    fn registered_slot_resolution_refines_max_20x_from_slot_local_metadata() {
-        // End-to-end regression over `resolve_registered_claude_slot` itself,
-        // which is where the refinement used to be missing. The fake
-        // `claude auth status --json` returns the bare `max` the real CLI
-        // returns for BOTH Max tiers; only the slot's own `.claude.json`
-        // carries `default_claude_max_20x`. Asserting on the resolved account
-        // pins the call site, not just the helper: deleting the
-        // `refine_claude_local_plan_metadata` call from the slot path fails
-        // this test while every helper-level test still passes.
-        let root =
-            std::env::temp_dir().join(format!("ottto-claude-slot-max-tier-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let home = root.join("home");
-        let bin = root.join("bin");
-        let slot_dir = root.join("max-20x-slot");
-        fs::create_dir_all(&home).expect("create home");
-        fs::create_dir_all(&bin).expect("create bin");
-        fs::create_dir_all(&slot_dir).expect("create slot dir");
+    /// One registered slot on a throwaway HOME with a fake `claude` that only
+    /// records that it ran and a fake `security` whose behaviour the test
+    /// chooses. Nothing touches the real keychain or the real CLI.
+    struct LocalSlotFixture {
+        root: PathBuf,
+        slot_dir: PathBuf,
+        descriptor: ClaudeConfigSlotDescriptorV1,
+        _guards: Vec<EnvVarGuard>,
+    }
 
-        let claude = bin.join("claude");
-        fs::write(
-            &claude,
-            r#"#!/bin/sh
-if [ "$1" = "--version" ]; then
-  echo "fixture-version"
-  exit 0
-fi
-if [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then
-  exec /usr/bin/python3 - "$CLAUDE_CONFIG_DIR/.claude.json" <<'PY'
-import json, sys
-account = json.load(open(sys.argv[1]))["oauthAccount"]
-# The real CLI collapses Max 5x and Max 20x to a bare `max`.
-print(json.dumps({
-  "status": "authenticated",
-  "email": account["emailAddress"],
-  "organizationId": account["organizationUuid"],
-  "subscriptionType": "max",
-}))
-PY
-fi
-exit 1
-"#,
-        )
-        .expect("write fake claude");
-        let security = bin.join("security");
-        fs::write(&security, "#!/bin/sh\nexit 1\n").expect("write fake security");
-        for executable in [&claude, &security] {
-            let mut permissions = fs::metadata(executable).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(executable, permissions).expect("chmod executable");
+    impl LocalSlotFixture {
+        fn new(label: &str, security_script: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "ottto-claude-local-slot-{label}-{}-{}",
+                std::process::id(),
+                OffsetDateTime::now_utc().unix_timestamp_nanos()
+            ));
+            let home = root.join("home");
+            let bin = root.join("bin");
+            let support = root.join("support");
+            let slot_dir = root.join("slot");
+            for dir in [&home, &bin, &support, &slot_dir] {
+                fs::create_dir_all(dir).expect("create fixture dir");
+            }
+            let claude = bin.join("claude");
+            fs::write(
+                &claude,
+                "#!/bin/sh\n/usr/bin/touch \"$(/usr/bin/dirname \"$0\")/claude-spawned\"\nexit 0\n",
+            )
+            .expect("write fake claude");
+            let security = bin.join("security");
+            fs::write(&security, security_script).expect("write fake security");
+            for executable in [&claude, &security] {
+                let mut permissions = fs::metadata(executable).expect("metadata").permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(executable, permissions).expect("chmod executable");
+            }
+            let guards = vec![
+                EnvVarGuard::set_os("HOME", home.as_os_str().to_os_string()),
+                EnvVarGuard::set_os(
+                    "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+                    support.as_os_str().to_os_string(),
+                ),
+                EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", bin.as_os_str().to_os_string()),
+            ];
+            let descriptor =
+                ClaudeConfigDirSlot::registered(slot_dir.to_string_lossy().to_string())
+                    .expect("registered slot")
+                    .descriptor(
+                        format!("claude_slot_{label}"),
+                        ClaudeConfigSlotOwnership::Managed,
+                    );
+            Self {
+                root,
+                slot_dir,
+                descriptor,
+                _guards: guards,
+            }
         }
 
-        fs::write(
-            slot_dir.join(".claude.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "oauthAccount": {
+        fn write_identity(&self, oauth_account: Value) {
+            fs::write(
+                self.slot_dir.join(".claude.json"),
+                serde_json::to_vec(&serde_json::json!({ "oauthAccount": oauth_account }))
+                    .expect("serialize identity"),
+            )
+            .expect("write slot identity");
+        }
+
+        fn write_credential(&self, credential: &Value) {
+            fs::write(
+                self.slot_dir.join(".credentials.json"),
+                serde_json::to_vec(credential).expect("serialize credential"),
+            )
+            .expect("write slot credential");
+        }
+
+        fn slot(&self) -> ClaudeConfigDirSlot {
+            ClaudeConfigDirSlot::registered(self.slot_dir.to_string_lossy().to_string())
+                .expect("slot")
+        }
+
+        fn claude_spawned(&self) -> bool {
+            self.root.join("bin").join("claude-spawned").exists()
+        }
+    }
+
+    impl Drop for LocalSlotFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    const SECURITY_ITEM_NOT_FOUND: &str = "#!/bin/sh\nexit 44\n";
+
+    /// What `claude auth status --json` printed for a slot, rebuilt through
+    /// the same parse + identity + refinement path the old resolver used, so
+    /// the local-metadata account can be compared field by field.
+    fn account_from_legacy_auth_status(
+        auth_status: Value,
+        oauth: &ClaudeCliOauthAccount,
+    ) -> AgentAccountStatus {
+        let mut account = parse_claude_auth_json(&auth_status);
+        require_claude_auth_identity_agreement(&account, oauth).expect("legacy agreement");
+        refine_claude_local_plan_metadata(&mut account, oauth);
+        assert!(stamp_claude_cli_account_identity(&mut account, oauth));
+        account
+    }
+
+    /// T8: the plan comes from the stored login's `subscriptionType` and the
+    /// `.claude.json` refinements, and the account matches what `claude auth
+    /// status` produced, for Max 20x and Team Premium. No CLI runs.
+    #[test]
+    #[serial]
+    fn local_metadata_resolution_matches_the_auth_status_account() {
+        for (label, identity, plan, legacy, expected_plan) in [
+            (
+                "max-20x",
+                serde_json::json!({
                     "accountUuid": "account-max-20x",
                     "organizationUuid": "organization-max-20x",
                     "emailAddress": "max20x@example.invalid",
                     "organizationType": "claude_max",
                     "organizationRateLimitTier": "default_claude_max_20x"
-                }
-            }))
-            .expect("serialize identity"),
-        )
-        .expect("write slot identity");
-        fs::write(
-            slot_dir.join(".credentials.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "claudeAiOauth": {"accessToken": "fixture"}
-            }))
-            .expect("serialize credential"),
-        )
-        .expect("write slot credential");
-
-        let _home_guard = EnvVarGuard::set_os("HOME", home.as_os_str().to_os_string());
-        let _command_guard =
-            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", bin.as_os_str().to_os_string());
-
-        let descriptor = ClaudeConfigDirSlot::registered(slot_dir.to_string_lossy().to_string())
-            .expect("registered slot")
-            .descriptor(
-                "claude_slot_max_20x".to_string(),
-                ClaudeConfigSlotOwnership::External,
-            );
-        let resolved = resolve_registered_claude_slot(descriptor).expect("resolve slot");
-
-        assert_eq!(resolved.account.plan_type.as_deref(), Some("max_20x"));
-        assert_eq!(
-            resolved.account.subscription_product.as_deref(),
-            Some("claude_max_20x")
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// Fake `claude` whose `auth status --json` exits 1 with no JSON, as the
-    /// daemon observed from Claude Code 2.1.288 right after the CLI rotated a
-    /// slot token, plus a slot whose own credential file holds `expires_at_ms`.
-    fn registered_slot_with_failing_auth_status(
-        label: &str,
-        expires_at_ms: i64,
-        auth_stdout: &str,
-    ) -> (
-        PathBuf,
-        ClaudeConfigSlotDescriptorV1,
-        EnvVarGuard,
-        EnvVarGuard,
-    ) {
-        let root = std::env::temp_dir().join(format!(
-            "ottto-claude-slot-{label}-{}-{}",
-            std::process::id(),
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ));
-        let home = root.join("home");
-        let bin = root.join("bin");
-        let slot_dir = root.join("slot");
-        for dir in [&home, &bin, &slot_dir] {
-            fs::create_dir_all(dir).expect("create fixture dir");
-        }
-        let claude = bin.join("claude");
-        fs::write(
-            &claude,
-            format!(
-                "#!/bin/sh\n/usr/bin/touch \"$(/usr/bin/dirname \"$0\")/claude-spawned\"\necho 'status unavailable' >&2\nprintf '%s' '{auth_stdout}'\nexit 1\n"
-            ),
-        )
-        .expect("write fake claude");
-        let security = bin.join("security");
-        fs::write(&security, "#!/bin/sh\nexit 1\n").expect("write fake security");
-        for executable in [&claude, &security] {
-            let mut permissions = fs::metadata(executable).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(executable, permissions).expect("chmod executable");
-        }
-        fs::write(
-            slot_dir.join(".claude.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "oauthAccount": {
-                    "accountUuid": "account-rotated",
-                    "organizationUuid": "organization-rotated",
-                    "emailAddress": "rotated@example.invalid"
-                }
-            }))
-            .expect("serialize identity"),
-        )
-        .expect("write slot identity");
-        fs::write(
-            slot_dir.join(".credentials.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "claudeAiOauth": {
-                    "accessToken": "fixture-access",
-                    "refreshToken": "fixture-refresh",
-                    "expiresAt": expires_at_ms
-                }
-            }))
-            .expect("serialize credential"),
-        )
-        .expect("write slot credential");
-        let home_guard = EnvVarGuard::set_os("HOME", home.as_os_str().to_os_string());
-        let command_guard =
-            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", bin.as_os_str().to_os_string());
-        let descriptor = ClaudeConfigDirSlot::registered(slot_dir.to_string_lossy().to_string())
-            .expect("registered slot")
-            .descriptor(
-                format!("claude_slot_{label}"),
-                ClaudeConfigSlotOwnership::Managed,
-            );
-        (root, descriptor, home_guard, command_guard)
-    }
-
-    #[test]
-    #[serial]
-    fn failed_auth_status_with_valid_credential_is_a_transient_probe_failure() {
-        let expires_at_ms =
-            (OffsetDateTime::now_utc() + TimeDuration::hours(7)).unix_timestamp() * 1_000;
-        let (root, descriptor, _home, _command) =
-            registered_slot_with_failing_auth_status("auth-exit-valid", expires_at_ms, "");
-
-        let failure = resolve_registered_claude_slot(descriptor)
-            .err()
-            .expect("auth status exit 1 must not resolve");
-
-        assert_eq!(
-            failure,
-            ClaudeSlotProbeFailure::ProbeFailed,
-            "a present, unexpired credential makes a non-zero auth status transient"
-        );
-        let status = failure.status("2026-10-03T13:30:00Z");
-        assert_eq!(status.state, ClaudeConfigSlotCollectionStateV1::ProbeFailed);
-        assert!(
-            !claude_custom_slot_needs_attention(&status.state),
-            "a transient probe failure must not raise the needs-attention warning"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn failed_auth_status_with_expired_credential_stays_credential_unavailable() {
-        let expires_at_ms =
-            (OffsetDateTime::now_utc() - TimeDuration::minutes(5)).unix_timestamp() * 1_000;
-        let (root, descriptor, _home, _command) =
-            registered_slot_with_failing_auth_status("auth-exit-expired", expires_at_ms, "");
-
-        assert_eq!(
-            resolve_registered_claude_slot(descriptor).err(),
-            Some(ClaudeSlotProbeFailure::CredentialUnavailable)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn failed_auth_status_reporting_signed_out_stays_credential_unavailable() {
-        // Claude Code prints `loggedIn: false` and exits 1 when signed out.
-        // Stale readable token material must not turn that into a transient.
-        let expires_at_ms =
-            (OffsetDateTime::now_utc() + TimeDuration::hours(7)).unix_timestamp() * 1_000;
-        let (root, descriptor, _home, _command) = registered_slot_with_failing_auth_status(
-            "auth-exit-signed-out",
-            expires_at_ms,
-            r#"{"loggedIn": false, "authMethod": "none"}"#,
-        );
-
-        assert_eq!(
-            resolve_registered_claude_slot(descriptor).err(),
-            Some(ClaudeSlotProbeFailure::CredentialUnavailable)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn cli_cleared_credential_is_signed_out_without_spawning_auth_status_until_rewritten() {
-        let (root, descriptor, _home, _command) =
-            registered_slot_with_failing_auth_status("cli-cleared", 0, "");
-        let slot_dir = root.join("slot");
-        let spawned = root.join("bin").join("claude-spawned");
-        // The exact shape Claude Code writes after an `invalid_grant` refresh.
-        fs::write(
-            slot_dir.join(".credentials.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "claudeAiOauth": {
-                    "accessToken": "",
-                    "refreshToken": "",
-                    "expiresAt": 0,
-                    "refreshTokenExpiresAt": 1_793_000_000_000_i64,
-                    "scopes": ["user:inference"],
+                }),
+                "max",
+                serde_json::json!({
+                    "loggedIn": true,
+                    "authMethod": "claude.ai",
+                    "apiProvider": "firstParty",
+                    "email": "max20x@example.invalid",
+                    "orgId": "organization-max-20x",
                     "subscriptionType": "max"
-                }
+                }),
+                "max_20x",
+            ),
+            (
+                "team-premium",
+                serde_json::json!({
+                    "accountUuid": "account-team",
+                    "organizationUuid": "organization-team",
+                    "organizationName": "Example Team",
+                    "emailAddress": "team@example.invalid",
+                    "organizationType": "claude_team",
+                    "seatTier": "premium"
+                }),
+                "team",
+                serde_json::json!({
+                    "loggedIn": true,
+                    "authMethod": "claude.ai",
+                    "apiProvider": "firstParty",
+                    "email": "team@example.invalid",
+                    "orgId": "organization-team",
+                    "orgName": "Example Team",
+                    "subscriptionType": "team"
+                }),
+                "team_premium",
+            ),
+        ] {
+            let fixture = LocalSlotFixture::new(label, SECURITY_ITEM_NOT_FOUND);
+            fixture.write_identity(identity.clone());
+            fixture.write_credential(&claude_credential_fixture(
+                "fixture",
+                TimeDuration::hours(6),
+                Some(plan),
+            ));
+
+            let resolved = resolve_registered_claude_slot(fixture.descriptor.clone())
+                .expect("resolve from local metadata");
+
+            let oauth = parse_claude_cli_oauth_account(&serde_json::json!({
+                "oauthAccount": identity
             }))
-            .expect("serialize cleared credential"),
-        )
-        .expect("write cleared credential");
+            .expect("oauth account");
+            let legacy = account_from_legacy_auth_status(legacy, &oauth);
+            assert_eq!(resolved.account.plan_type.as_deref(), Some(expected_plan));
+            assert_eq!(resolved.account.plan_type, legacy.plan_type, "{label}");
+            assert_eq!(
+                resolved.account.subscription_product, legacy.subscription_product,
+                "{label}"
+            );
+            assert_eq!(resolved.account.billing_channel, legacy.billing_channel);
+            assert_eq!(resolved.account.auth_method, legacy.auth_method);
+            assert_eq!(resolved.account.login_state, AgentLoginState::SignedIn);
+            assert_eq!(resolved.account.email, legacy.email);
+            assert_eq!(resolved.account.organization_id, legacy.organization_id);
+            assert_eq!(
+                resolved.account.organization_label,
+                legacy.organization_label
+            );
+            assert_eq!(resolved.account.account_id, legacy.account_id);
+            assert!(!fixture.claude_spawned(), "no Claude command ran");
+        }
+    }
+
+    #[test]
+    fn local_login_state_follows_the_stored_credential_fields() {
+        let now = OffsetDateTime::now_utc();
+        let state = |payload: Value| {
+            claude_local_login_state(
+                &parse_claude_oauth_credential_read(&payload.to_string()),
+                now,
+            )
+        };
+        let with = |patch: &[(&str, Value)]| {
+            let mut credential =
+                claude_credential_fixture("fixture", TimeDuration::hours(2), Some("max"));
+            for (key, value) in patch {
+                if value.is_null() {
+                    credential["claudeAiOauth"]
+                        .as_object_mut()
+                        .expect("oauth object")
+                        .remove(*key);
+                } else {
+                    credential["claudeAiOauth"][*key] = value.clone();
+                }
+            }
+            credential
+        };
+        let ms = |offset: TimeDuration| serde_json::json!((now + offset).unix_timestamp() * 1_000);
+
+        assert_eq!(
+            claude_local_login_state(&ClaudeCredentialRead::Absent, now),
+            ClaudeLocalLoginState::NotSignedIn
+        );
+        assert_eq!(
+            claude_local_login_state(&ClaudeCredentialRead::Unreadable, now),
+            ClaudeLocalLoginState::Unreadable
+        );
+        assert_eq!(state(with(&[])), ClaudeLocalLoginState::AccessValid);
+        // The exact shape Claude Code writes after an `invalid_grant` refresh.
+        assert_eq!(
+            state(with(&[
+                ("accessToken", serde_json::json!("")),
+                ("refreshToken", serde_json::json!("")),
+                ("expiresAt", serde_json::json!(0)),
+            ])),
+            ClaudeLocalLoginState::SignedOutByCli
+        );
+        assert_eq!(
+            state(with(&[("refreshToken", serde_json::json!(""))])),
+            ClaudeLocalLoginState::NeedsLogin
+        );
+        assert_eq!(
+            state(with(&[(
+                "refreshTokenExpiresAt",
+                ms(-TimeDuration::seconds(1))
+            )])),
+            ClaudeLocalLoginState::NeedsLogin
+        );
+        // Malformed: fail closed, never "signed out".
+        for patch in [
+            ("expiresAt", Value::Null),
+            ("expiresAt", serde_json::json!("soon")),
+            ("expiresAt", serde_json::json!(1.5e12)),
+            ("accessToken", serde_json::json!("")),
+            ("scopes", Value::Null),
+            ("scopes", serde_json::json!(["user:profile"])),
+        ] {
+            assert_eq!(
+                state(with(std::slice::from_ref(&patch))),
+                ClaudeLocalLoginState::Unreadable,
+                "{patch:?}"
+            );
+        }
+        // The 60 s margin: at or inside it the login waits for Claude Code.
+        assert_eq!(
+            state(with(&[("expiresAt", ms(TimeDuration::seconds(61)))])),
+            ClaudeLocalLoginState::AccessValid
+        );
+        for offset in [
+            TimeDuration::seconds(60),
+            TimeDuration::seconds(1),
+            -TimeDuration::seconds(1),
+            -TimeDuration::hours(8),
+        ] {
+            assert_eq!(
+                state(with(&[("expiresAt", ms(offset))])),
+                ClaudeLocalLoginState::RefreshPending,
+                "{offset}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn keychain_read_failures_fail_closed_and_only_not_found_falls_back_to_the_file() {
+        for (label, script, expected) in [
+            ("not-found", SECURITY_ITEM_NOT_FOUND, "absent"),
+            ("locked", "#!/bin/sh\nexit 36\n", "unreadable"),
+            ("garbage", "#!/bin/sh\necho not-json\n", "unreadable"),
+            (
+                "mcp-only",
+                "#!/bin/sh\necho '{\"mcpOAuth\":{}}'\n",
+                "absent",
+            ),
+            (
+                "oauth-not-object",
+                "#!/bin/sh\necho '{\"claudeAiOauth\":\"x\"}'\n",
+                "unreadable",
+            ),
+        ] {
+            let fixture = LocalSlotFixture::new(label, script);
+            let read = read_claude_oauth_credential_state_for_slot(&fixture.slot());
+            let observed = match read {
+                ClaudeCredentialRead::Absent => "absent",
+                ClaudeCredentialRead::Unreadable => "unreadable",
+                ClaudeCredentialRead::Present(_) => "present",
+            };
+            assert_eq!(observed, expected, "{label}");
+        }
+        // Not found in the keychain: the credentials file decides; a corrupt
+        // file is unreadable, not absent.
+        let fixture = LocalSlotFixture::new("file-fallback", SECURITY_ITEM_NOT_FOUND);
+        fs::write(fixture.slot_dir.join(".credentials.json"), "{").expect("corrupt file");
+        assert!(matches!(
+            read_claude_oauth_credential_state_for_slot(&fixture.slot()),
+            ClaudeCredentialRead::Unreadable
+        ));
+        fixture.write_credential(&claude_credential_fixture(
+            "fixture",
+            TimeDuration::hours(2),
+            None,
+        ));
+        assert!(matches!(
+            read_claude_oauth_credential_state_for_slot(&fixture.slot()),
+            ClaudeCredentialRead::Present(_)
+        ));
+        // A failed keychain read never resolves the slot, and never spawns.
+        let locked = LocalSlotFixture::new("locked-resolve", "#!/bin/sh\nexit 36\n");
+        locked.write_identity(serde_json::json!({
+            "accountUuid": "account-locked",
+            "organizationUuid": "organization-locked",
+            "emailAddress": "locked@example.invalid"
+        }));
+        locked.write_credential(&claude_credential_fixture(
+            "fixture",
+            TimeDuration::hours(2),
+            None,
+        ));
+        assert_eq!(
+            resolve_registered_claude_slot(locked.descriptor.clone()).err(),
+            Some(ClaudeSlotProbeFailure::ProbeFailed)
+        );
+        assert!(!locked.claude_spawned());
+    }
+
+    #[test]
+    #[serial]
+    fn expired_login_still_proves_identity_and_a_lapsed_grant_needs_login() {
+        let fixture = LocalSlotFixture::new("expired-identity", SECURITY_ITEM_NOT_FOUND);
+        fixture.write_identity(serde_json::json!({
+            "accountUuid": "account-expired",
+            "organizationUuid": "organization-expired",
+            "emailAddress": "expired@example.invalid"
+        }));
+        fixture.write_credential(&claude_credential_fixture(
+            "fixture",
+            -TimeDuration::hours(3),
+            Some("max"),
+        ));
+        let resolved = resolve_registered_claude_slot(fixture.descriptor.clone())
+            .expect("an expired but refreshable login still proves its account");
+        assert_eq!(
+            resolved.account_identifier_hash,
+            billing_identity_hash("anthropic", "account", "account-expired").expect("hash")
+        );
+
+        let mut lapsed = claude_credential_fixture("fixture", -TimeDuration::hours(3), None);
+        lapsed["claudeAiOauth"]["refreshTokenExpiresAt"] = serde_json::json!(
+            (OffsetDateTime::now_utc() - TimeDuration::minutes(1)).unix_timestamp() * 1_000
+        );
+        fixture.write_credential(&lapsed);
+        assert_eq!(
+            resolve_registered_claude_slot(fixture.descriptor.clone()).err(),
+            Some(ClaudeSlotProbeFailure::CredentialUnavailable)
+        );
+        assert!(!fixture.claude_spawned());
+    }
+
+    #[test]
+    fn contradicting_local_plan_facts_are_a_concurrent_login() {
+        assert!(claude_local_plan_facts_contradict(
+            Some("team"),
+            Some("claude_max")
+        ));
+        assert!(claude_local_plan_facts_contradict(
+            Some("max"),
+            Some("claude_pro")
+        ));
+        assert!(!claude_local_plan_facts_contradict(
+            Some("max"),
+            Some("claude_max")
+        ));
+        assert!(!claude_local_plan_facts_contradict(
+            Some("team"),
+            Some("claude_team")
+        ));
+        assert!(!claude_local_plan_facts_contradict(
+            None,
+            Some("claude_max")
+        ));
+        assert!(!claude_local_plan_facts_contradict(Some("max"), None));
+        // Unknown families are never a contradiction.
+        assert!(!claude_local_plan_facts_contradict(
+            Some("max"),
+            Some("claude_free")
+        ));
+        assert!(!claude_local_plan_facts_contradict(
+            Some("future_plan"),
+            Some("claude_team")
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn cli_cleared_credential_is_signed_out_without_any_spawn_until_rewritten() {
+        let fixture = LocalSlotFixture::new("cli-cleared", SECURITY_ITEM_NOT_FOUND);
+        fixture.write_identity(serde_json::json!({
+            "accountUuid": "account-rotated",
+            "organizationUuid": "organization-rotated",
+            "emailAddress": "rotated@example.invalid"
+        }));
+        // The exact shape Claude Code writes after an `invalid_grant` refresh.
+        fixture.write_credential(&serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "",
+                "refreshToken": "",
+                "expiresAt": 0,
+                "refreshTokenExpiresAt": 1_793_000_000_000_i64,
+                "scopes": ["user:inference"],
+                "subscriptionType": "max"
+            }
+        }));
+        let descriptor = fixture.descriptor.clone();
 
         let failure = resolve_registered_claude_slot(descriptor.clone())
             .err()
             .expect("cleared credential must not resolve");
         assert_eq!(failure, ClaudeSlotProbeFailure::SignedOutByCli);
-        assert!(
-            !spawned.exists(),
-            "a CLI-cleared credential must not spawn `claude auth status`"
-        );
         let status = registered_claude_failure_status(
             &descriptor,
             failure,
@@ -21609,35 +22244,19 @@ exit 1
             status.access_expires_at, None,
             "stale pre-wipe deadlines must not look like a valid login"
         );
-        let metadata = read_claude_oauth_credential_metadata_for_slot(
-            &ClaudeConfigDirSlot::registered(slot_dir.to_string_lossy().to_string()).expect("slot"),
-        )
-        .expect("cleared item is still readable");
+        let metadata = read_claude_oauth_credential_metadata_for_slot(&fixture.slot())
+            .expect("cleared item is still readable");
         assert!(metadata.cleared_by_cli);
         assert!(!metadata.has_refresh_token);
 
-        // A reconnect rewrites the item with tokens; probing resumes.
-        let expires_at_ms =
-            (OffsetDateTime::now_utc() + TimeDuration::hours(8)).unix_timestamp() * 1_000;
-        fs::write(
-            slot_dir.join(".credentials.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "claudeAiOauth": {
-                    "accessToken": "fixture-access",
-                    "refreshToken": "fixture-refresh",
-                    "expiresAt": expires_at_ms
-                }
-            }))
-            .expect("serialize credential"),
-        )
-        .expect("rewrite credential");
-        assert_eq!(
-            resolve_registered_claude_slot(descriptor).err(),
-            Some(ClaudeSlotProbeFailure::ProbeFailed),
-            "the fixture CLI still exits 1, but the slot is probed again"
-        );
-        assert!(spawned.exists(), "probing resumed after the rewrite");
-        let _ = fs::remove_dir_all(root);
+        // A reconnect rewrites the item with tokens; the slot resolves again.
+        fixture.write_credential(&claude_credential_fixture(
+            "fixture-access",
+            TimeDuration::hours(8),
+            Some("max"),
+        ));
+        assert!(resolve_registered_claude_slot(descriptor).is_ok());
+        assert!(!fixture.claude_spawned(), "no Claude command ever ran");
     }
 
     #[test]
@@ -27245,6 +27864,8 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
                 has_refresh_token: true,
                 access_expires_at: None,
                 relogin_required_at: None,
+                has_inference_scope: None,
+                subscription_type: None,
             },
         };
         let status = custom_claude_snapshot_from_usage(
@@ -28350,7 +28971,7 @@ exit 0
             )
             .expect("write fake claude");
             let security = bin.join("security");
-            fs::write(&security, "#!/bin/sh\nexit 1\n").expect("write fake security");
+            fs::write(&security, "#!/bin/sh\nexit 44\n").expect("write fake security");
             for executable in [&claude, &security] {
                 let mut permissions = fs::metadata(executable).expect("metadata").permissions();
                 permissions.set_mode(0o755);
@@ -28443,17 +29064,13 @@ exit 0
                     .expect("serialize identity"),
             )
             .expect("write identity");
-            let expires_at_ms =
-                (OffsetDateTime::now_utc() + TimeDuration::hours(6)).unix_timestamp() * 1_000;
             fs::write(
                 self.slot_dir.join(".credentials.json"),
-                serde_json::to_vec(&serde_json::json!({
-                    "claudeAiOauth": {
-                        "accessToken": format!("fixture-secret-token-{}", which.0),
-                        "refreshToken": "fixture-secret-refresh",
-                        "expiresAt": expires_at_ms
-                    }
-                }))
+                serde_json::to_vec(&claude_credential_fixture(
+                    &format!("fixture-secret-token-{}", which.0),
+                    TimeDuration::hours(6),
+                    Some(if team { "team" } else { "max" }),
+                ))
                 .expect("serialize credential"),
             )
             .expect("write credential");
@@ -29318,5 +29935,665 @@ mod usage_checks_paused_tests {
         assert!(message.starts_with(
             "Claude usage checks paused for 2 accounts after the provider rejected sign-in;"
         ));
+    }
+}
+
+/// Phase 0 of the durable Claude login fix: status passes never spawn a
+/// credential-using `claude`, paused slots resume on their own, and a locally
+/// expired access token is never sent. Every test runs on throwaway HOME and
+/// support dirs with a logging fake `claude`, a fixture-emitting fake
+/// `security`, fresh usage caches and provider requests forbidden.
+#[cfg(test)]
+mod claude_login_phase0_tests {
+    use super::*;
+    use serial_test::serial;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::Ordering;
+
+    struct Guard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl Guard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    struct ForbidProviderCalls;
+
+    impl ForbidProviderCalls {
+        fn new() -> Self {
+            CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN.store(true, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for ForbidProviderCalls {
+        fn drop(&mut self) {
+            CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn provider_calls() -> usize {
+        CLAUDE_OAUTH_PROVIDER_CALLS.load(Ordering::SeqCst)
+    }
+
+    const DEFAULT_ACCOUNT: (&str, &str) = ("account-default", "organization-default");
+    const SLOT_ACCOUNTS: [(&str, &str); 3] = [
+        ("account-slot-a", "organization-slot-a"),
+        ("account-slot-b", "organization-slot-b"),
+        ("account-slot-c", "organization-slot-c"),
+    ];
+
+    struct Phase0Fixture {
+        root: PathBuf,
+        items: PathBuf,
+        spawn_log: PathBuf,
+        security_log: PathBuf,
+        slot_dirs: Vec<PathBuf>,
+        slot_ids: Vec<String>,
+        _forbid: ForbidProviderCalls,
+        _guards: Vec<Guard>,
+    }
+
+    impl Phase0Fixture {
+        /// `managed` registers the slots as Ottto-managed anchors.
+        fn new(label: &str, managed: bool) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "ottto-claude-phase0-{label}-{}-{}",
+                std::process::id(),
+                OffsetDateTime::now_utc().unix_timestamp_nanos()
+            ));
+            let home = root.join("home");
+            let support = root.join("support");
+            let bin = root.join("bin");
+            let items = root.join("keychain-items");
+            for dir in [&home.join(".claude"), &support, &bin, &items] {
+                fs::create_dir_all(dir).expect("fixture dir");
+            }
+            let spawn_log = root.join("claude-spawns.log");
+            let security_log = root.join("security-reads.log");
+            let claude = bin.join("claude");
+            fs::write(
+                &claude,
+                format!(
+                    "#!/bin/sh\necho \"$CLAUDE_CONFIG_DIR|$*\" >> '{}'\n[ \"$1\" = \"--version\" ] && echo 2.1.288\nexit 0\n",
+                    spawn_log.display()
+                ),
+            )
+            .expect("fake claude");
+            let security = bin.join("security");
+            fs::write(
+                &security,
+                format!(
+                    r#"#!/bin/sh
+service=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-s" ]; then service="$2"; shift; fi
+  shift
+done
+echo "$service" >> '{log}'
+if [ -f '{items}'/"$service.json" ]; then
+  /bin/cat '{items}'/"$service.json"
+  exit 0
+fi
+exit 44
+"#,
+                    log = security_log.display(),
+                    items = items.display()
+                ),
+            )
+            .expect("fake security");
+            for executable in [&claude, &security] {
+                let mut permissions = fs::metadata(executable).expect("meta").permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(executable, permissions).expect("chmod");
+            }
+            let guards = vec![
+                Guard::set("HOME", &home),
+                Guard::set("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", &home),
+                Guard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
+                Guard::set("OTTTO_COMMAND_SEARCH_PATH", &bin),
+            ];
+            let store = FileClaudeConfigSlotSettingsStore::default();
+            store
+                .set_upkeep_consent(
+                    ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                    true,
+                )
+                .expect("consent");
+            let mut fixture = Self {
+                root: root.clone(),
+                items,
+                spawn_log,
+                security_log,
+                slot_dirs: Vec::new(),
+                slot_ids: Vec::new(),
+                _forbid: ForbidProviderCalls::new(),
+                _guards: guards,
+            };
+            fixture.write_identity(&home, DEFAULT_ACCOUNT);
+            for (index, account) in SLOT_ACCOUNTS.iter().enumerate() {
+                let dir = root.join(format!("slot-{index}"));
+                fs::create_dir_all(&dir).expect("slot dir");
+                fixture.write_identity(&dir, *account);
+                let status = if managed {
+                    store.register_managed_path(
+                        ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                        dir.to_string_lossy().to_string(),
+                    )
+                } else {
+                    store.register_path(
+                        ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                        dir.to_string_lossy().to_string(),
+                    )
+                }
+                .expect("register slot");
+                let slot_id = status
+                    .managed_slots
+                    .iter()
+                    .chain(status.external_slots.iter())
+                    .find(|slot| slot.config_dir.as_deref() == dir.to_str())
+                    .expect("registered")
+                    .slot_id
+                    .clone();
+                fixture.slot_dirs.push(dir);
+                fixture.slot_ids.push(slot_id);
+            }
+            for account in std::iter::once(DEFAULT_ACCOUNT).chain(SLOT_ACCOUNTS) {
+                fixture.write_cache(account, 0);
+            }
+            fixture
+        }
+
+        fn write_identity(&self, dir: &Path, (account, organization): (&str, &str)) {
+            fs::write(
+                dir.join(".claude.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "oauthAccount": {
+                        "accountUuid": account,
+                        "organizationUuid": organization,
+                        "emailAddress": format!("{account}@example.invalid"),
+                        "organizationType": "claude_max"
+                    }
+                }))
+                .expect("identity"),
+            )
+            .expect("write identity");
+        }
+
+        fn hashes((account, organization): (&str, &str)) -> (String, String) {
+            (
+                billing_identity_hash("anthropic", "account", account).expect("hash"),
+                billing_identity_hash("anthropic", "organization", organization).expect("hash"),
+            )
+        }
+
+        /// A usage cache `age_seconds` old. Age 0 is served without a request.
+        fn write_cache(&self, account: (&str, &str), age_seconds: u64) {
+            let (account_hash, organization_hash) = Self::hashes(account);
+            let now = current_unix_seconds();
+            // Distinct meters per account: identical readings on two accounts
+            // are quarantined as a cross-account collision.
+            let percent = u8::try_from(account.0.bytes().map(u32::from).sum::<u32>() % 90 + 5)
+                .expect("percent");
+            let mut usage = ClaudeOAuthUsage {
+                windows: ["session", "weekly"]
+                    .into_iter()
+                    .map(|name| AgentQuotaWindow {
+                        name: name.to_string(),
+                        scope: AgentQuotaWindowScope::Account,
+                        status: AgentQuotaWindowStatus::Ok,
+                        freshness: AgentQuotaWindowFreshness::Fresh,
+                        used_percent: Some(percent),
+                        ..Default::default()
+                    })
+                    .chain(std::iter::once(AgentQuotaWindow {
+                        name: "weekly_sonnet".to_string(),
+                        scope: AgentQuotaWindowScope::Model,
+                        status: AgentQuotaWindowStatus::Ok,
+                        freshness: AgentQuotaWindowFreshness::Fresh,
+                        model: Some("claude-sonnet".to_string()),
+                        used_percent: Some(percent),
+                        ..Default::default()
+                    }))
+                    .collect(),
+                credit_balances: Vec::new(),
+            };
+            claude_oauth_stamp_account_identity(
+                &mut usage,
+                &account_hash,
+                Some(&organization_hash),
+            );
+            write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
+                schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+                account_identifier_hash: account_hash,
+                organization_identifier_hash: organization_hash,
+                observed_at_epoch_seconds: now - age_seconds,
+                next_refresh_after_epoch_seconds: if age_seconds == 0 {
+                    now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS
+                } else {
+                    now - 1
+                },
+                windows: usage.windows,
+                credit_balances: usage.credit_balances,
+            })
+            .expect("write cache");
+        }
+
+        fn item(&self, slot: &ClaudeConfigDirSlot, expires_in: TimeDuration) {
+            let credential = serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "fixture-access",
+                    "refreshToken": "fixture-refresh",
+                    "expiresAt": (OffsetDateTime::now_utc() + expires_in).unix_timestamp() * 1_000,
+                    "refreshTokenExpiresAt":
+                        (OffsetDateTime::now_utc() + TimeDuration::days(25)).unix_timestamp() * 1_000,
+                    "scopes": ["user:inference", "user:profile"],
+                    "subscriptionType": "max"
+                }
+            });
+            fs::write(
+                self.items.join(format!("{}.json", slot.service_name())),
+                serde_json::to_vec(&credential).expect("item"),
+            )
+            .expect("write item");
+        }
+
+        fn slot(&self, index: usize) -> ClaudeConfigDirSlot {
+            ClaudeConfigDirSlot::registered(self.slot_dirs[index].to_string_lossy().to_string())
+                .expect("slot")
+        }
+
+        fn set_all_expiries(&self, expires_in: TimeDuration) {
+            self.item(&ClaudeConfigDirSlot::Default, expires_in);
+            for index in 0..self.slot_dirs.len() {
+                self.item(&self.slot(index), expires_in);
+            }
+        }
+
+        fn collect(&self) -> AgentStatusCollection {
+            let now = OffsetDateTime::now_utc();
+            collect_agent_status_collection(
+                &SourceKind::ClaudeCode,
+                now.format(&Rfc3339).expect("time"),
+                (now + TimeDuration::minutes(15))
+                    .format(&Rfc3339)
+                    .expect("time"),
+            )
+        }
+
+        fn status(&self) -> ClaudeAccountsStatusV1 {
+            annotate_claude_accounts_status(
+                FileClaudeConfigSlotSettingsStore::default()
+                    .load()
+                    .expect("load slots"),
+            )
+        }
+
+        fn slot_collection(&self, index: usize) -> ClaudeConfigSlotCollectionStatusV1 {
+            let status = self.status();
+            status
+                .managed_slots
+                .iter()
+                .chain(status.external_slots.iter())
+                .find(|slot| slot.slot_id == self.slot_ids[index])
+                .expect("slot status")
+                .collection
+                .clone()
+        }
+
+        fn spawns(&self) -> Vec<String> {
+            fs::read_to_string(&self.spawn_log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn security_reads(&self) -> Vec<String> {
+            fs::read_to_string(&self.security_log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn clear_logs(&self) {
+            let _ = fs::remove_file(&self.spawn_log);
+            let _ = fs::remove_file(&self.security_log);
+        }
+    }
+
+    impl Drop for Phase0Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn assert_only_version_probes(spawns: &[String], context: &str) {
+        assert!(
+            spawns.iter().all(|line| line == "|--version"),
+            "{context}: only `claude --version` on the default target may run: {spawns:?}"
+        );
+    }
+
+    /// T3: full status passes for the default login plus three slots across
+    /// the expiry boundary spawn nothing but `--version`, and read each
+    /// login's keychain item once per pass.
+    #[test]
+    #[serial]
+    fn status_passes_spawn_only_version_probes_across_the_expiry_boundary() {
+        let fixture = Phase0Fixture::new("no-spawn", false);
+        let calls_before = provider_calls();
+        for (label, expires_in) in [
+            ("T-14min", TimeDuration::minutes(14)),
+            ("T-1min", TimeDuration::minutes(1)),
+            ("T+1min", -TimeDuration::minutes(1)),
+            ("T+8h", -TimeDuration::hours(8)),
+            ("after-wake", -TimeDuration::minutes(30)),
+        ] {
+            fixture.clear_logs();
+            fixture.set_all_expiries(expires_in);
+            fixture.collect();
+            let spawns = fixture.spawns();
+            assert_only_version_probes(&spawns, label);
+            assert!(
+                spawns.iter().all(|line| fixture
+                    .slot_dirs
+                    .iter()
+                    .all(|dir| !line.contains(dir.to_str().unwrap()))),
+                "{label}: zero slot spawns"
+            );
+            let reads = fixture.security_reads();
+            for slot in std::iter::once(ClaudeConfigDirSlot::Default)
+                .chain((0..3).map(|index| fixture.slot(index)))
+            {
+                assert_eq!(
+                    reads
+                        .iter()
+                        .filter(|service| **service == slot.service_name())
+                        .count(),
+                    1,
+                    "{label}: one keychain read per login per pass: {reads:?}"
+                );
+            }
+            let expired = expires_in <= TimeDuration::seconds(CLAUDE_ACCESS_EXPIRY_MARGIN_SECONDS);
+            for index in 0..3 {
+                let collection = fixture.slot_collection(index);
+                if expired {
+                    let expected_state =
+                        if crate::claude_upkeep::PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
+                            ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
+                        } else {
+                            ClaudeConfigSlotCollectionStateV1::RefreshDue
+                        };
+                    assert_eq!(collection.state, expected_state, "{label}");
+                    assert_ne!(
+                        collection.state,
+                        ClaudeConfigSlotCollectionStateV1::StaleAccessToken
+                    );
+                } else {
+                    assert_eq!(
+                        collection.state,
+                        ClaudeConfigSlotCollectionStateV1::Fresh,
+                        "{label}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            provider_calls(),
+            calls_before,
+            "every reading came from cache"
+        );
+
+        // The connect workflow's single-slot check and identity proof read
+        // local metadata only.
+        fixture.clear_logs();
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).expect("time");
+        let proof = verify_claude_local_identity(
+            &fixture.slot_ids[0],
+            fixture.slot_dirs[0].to_str().expect("utf8"),
+            &now,
+        )
+        .expect("identity proof from local metadata");
+        assert_eq!(
+            proof.account_identifier_hash,
+            Phase0Fixture::hashes(SLOT_ACCOUNTS[0]).0
+        );
+        let single = collect_registered_claude_slot_status(&fixture.slot_ids[1], now.clone(), now);
+        assert_eq!(single.state, ClaudeConfigSlotCollectionStateV1::Fresh);
+        assert!(fixture.spawns().is_empty(), "no `claude` of any kind");
+    }
+
+    /// The quiet paused presentation: no new wire values, never
+    /// `stale_access_token`, stale reading kept, quota access `paused`.
+    #[test]
+    #[serial]
+    fn expired_slot_is_presented_as_paused_with_its_stale_reading() {
+        let fixture = Phase0Fixture::new("paused-presentation", false);
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        fixture.collect();
+        assert_eq!(
+            fixture.slot_collection(0).state,
+            ClaudeConfigSlotCollectionStateV1::Fresh
+        );
+        fixture.set_all_expiries(-TimeDuration::hours(1));
+        fixture.collect();
+        let paused = fixture.slot_collection(0);
+        if crate::claude_upkeep::PAUSED_EXPIRED_SLOT_ASKS_FOR_SIGN_IN {
+            assert_eq!(
+                paused.state,
+                ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
+            );
+            assert_eq!(
+                projected_claude_quota_access_state(&paused),
+                Some(ClaudeQuotaAccessState::AttentionRequired)
+            );
+            return;
+        }
+        assert_eq!(paused.state, ClaudeConfigSlotCollectionStateV1::RefreshDue);
+        assert_eq!(
+            paused.upkeep.as_ref().map(|upkeep| upkeep.result),
+            Some(ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled)
+        );
+        assert_eq!(
+            projected_claude_quota_access_state(&paused),
+            Some(ClaudeQuotaAccessState::Paused),
+            "quiet: never attention_required or reconnect_required"
+        );
+        assert_eq!(
+            paused.diagnostics[0].code,
+            ClaudeConfigSlotDiagnosticCodeV1::RefreshDue
+        );
+        assert!(paused.diagnostics[0]
+            .message
+            .starts_with("Claude Code has not refreshed this sign-in since it expired at "));
+        let snapshot = paused.quota_snapshot.as_ref().expect("last reading kept");
+        assert_eq!(snapshot.state, ClaudeConfigSlotQuotaSnapshotStateV1::Stale);
+        assert_eq!(
+            paused.account_identifier_hash.as_deref(),
+            Some(Phase0Fixture::hashes(SLOT_ACCOUNTS[0]).0.as_str())
+        );
+    }
+
+    /// T6: a paused slot resumes in the same pass once Claude Code refreshed
+    /// the login (the stored `expiresAt` advanced); no reconnect is needed.
+    #[test]
+    #[serial]
+    fn paused_slot_resumes_in_the_same_pass_when_the_stored_expiry_advances() {
+        let fixture = Phase0Fixture::new("auto-resume", false);
+        // Readings older than the refresh gate, so a resumed slot asks the
+        // provider (forbidden here, and counted).
+        for account in SLOT_ACCOUNTS {
+            fixture.write_cache(account, 2 * 60 * 60);
+        }
+        fixture.set_all_expiries(-TimeDuration::minutes(20));
+        let before = provider_calls();
+        fixture.collect();
+        fixture.collect();
+        assert_eq!(provider_calls(), before, "paused slots make no request");
+        assert_ne!(
+            fixture.slot_collection(0).state,
+            ClaudeConfigSlotCollectionStateV1::Fresh
+        );
+
+        fixture.item(&fixture.slot(0), TimeDuration::hours(8));
+        let before = provider_calls();
+        fixture.collect();
+        assert_eq!(
+            provider_calls(),
+            before + 1,
+            "the refreshed slot is read again in the same pass, once"
+        );
+        let resumed = fixture.slot_collection(0);
+        assert!(
+            resumed.state != ClaudeConfigSlotCollectionStateV1::RefreshDue
+                && resumed.upkeep.as_ref().map(|upkeep| upkeep.result)
+                    != Some(ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled),
+            "no longer paused: {resumed:?}"
+        );
+        assert!(fixture.spawns().iter().all(|line| line == "|--version"));
+    }
+
+    /// T6: an approved slot whose login became valid for another account
+    /// stays `identity_mismatch`; nothing is requested for either account.
+    #[test]
+    #[serial]
+    fn mismatched_slot_stays_mismatched_when_the_other_login_becomes_valid() {
+        let fixture = Phase0Fixture::new("mismatch-resume", false);
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        fixture.collect();
+        assert_eq!(
+            fixture.slot_collection(0).state,
+            ClaudeConfigSlotCollectionStateV1::Fresh,
+            "first pass approves the observed account"
+        );
+        fixture.write_identity(
+            &fixture.slot_dirs[0],
+            ("account-other", "organization-other"),
+        );
+        fixture.item(&fixture.slot(0), -TimeDuration::hours(1));
+        fixture.collect();
+        fixture.item(&fixture.slot(0), TimeDuration::hours(8));
+        let before = provider_calls();
+        fixture.collect();
+        assert_eq!(
+            fixture.slot_collection(0).state,
+            ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        );
+        assert_eq!(provider_calls(), before);
+        assert_only_version_probes(&fixture.spawns(), "mismatch");
+    }
+
+    /// T7: a locally expired default login sends nothing and serves its
+    /// last reading as stale.
+    #[test]
+    #[serial]
+    fn expired_default_login_makes_no_request_and_serves_its_stale_reading() {
+        let fixture = Phase0Fixture::new("default-expired", false);
+        fixture.write_cache(DEFAULT_ACCOUNT, 2 * 60 * 60);
+        fixture.set_all_expiries(-TimeDuration::minutes(10));
+        let before = provider_calls();
+        let collection = fixture.collect();
+        assert_eq!(provider_calls(), before, "zero provider calls");
+        let default = &collection.source_health_snapshot;
+        assert!(!default.quota_windows.is_empty(), "last reading served");
+        assert!(default
+            .quota_windows
+            .iter()
+            .filter(|window| window.account_identifier_hash.is_some())
+            .all(|window| window.freshness == AgentQuotaWindowFreshness::Stale));
+        assert!(default.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "claude_oauth_usage_check_suppressed"
+                && diagnostic.message.contains("expired locally")
+        }));
+    }
+
+    /// T7: once a managed slot that owned the account's reads is paused, the
+    /// default login (same account, valid) becomes the provider caller again.
+    #[test]
+    #[serial]
+    fn default_login_takes_over_reads_when_the_owning_slot_is_paused() {
+        let fixture = Phase0Fixture::new("default-takeover", true);
+        // Slot 0 is the same account as the default login.
+        fixture.write_identity(&fixture.slot_dirs[0], DEFAULT_ACCOUNT);
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        fixture.collect();
+        fixture.collect();
+        fixture.write_cache(DEFAULT_ACCOUNT, 2 * 60 * 60);
+        fixture.item(&fixture.slot(0), -TimeDuration::minutes(5));
+        // The pass after the slot paused still defers once (it reads the
+        // previous pass's state); the next one reads through the default.
+        fixture.collect();
+        let before = provider_calls();
+        let collection = fixture.collect();
+        assert!(
+            !collection
+                .source_health_snapshot
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == "claude_oauth_usage_deferred_to_registered_slot"),
+            "a paused slot no longer owns the account's reads"
+        );
+        assert_eq!(provider_calls(), before + 1, "the default login asks once");
+        assert_only_version_probes(&fixture.spawns(), "takeover");
+    }
+
+    #[test]
+    fn locally_expired_access_tokens_are_never_sent() {
+        let now = 1_900_000_000_u64;
+        let at = |offset: i64| {
+            OffsetDateTime::from_unix_timestamp(now as i64 + offset)
+                .expect("time")
+                .format(&Rfc3339)
+                .expect("format")
+        };
+        assert!(claude_access_token_locally_expired(Some(&at(-1)), now));
+        assert!(claude_access_token_locally_expired(Some(&at(60)), now));
+        assert!(!claude_access_token_locally_expired(Some(&at(61)), now));
+        assert!(!claude_access_token_locally_expired(None, now));
+        assert!(!claude_access_token_locally_expired(Some("garbage"), now));
+    }
+
+    #[test]
+    #[serial]
+    fn settings_api_key_presence_is_reported_without_reading_values() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-settings-api-key-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("root");
+        let plain = root.join("plain.json");
+        let helper = root.join("helper.json");
+        let env_key = root.join("env.json");
+        fs::write(&plain, r#"{"model":"opus"}"#).expect("plain");
+        fs::write(&helper, r#"{"apiKeyHelper":"/usr/local/bin/key"}"#).expect("helper");
+        fs::write(&env_key, r#"{"env":{"ANTHROPIC_API_KEY":"x"}}"#).expect("env");
+        let paths = |path: &Path| vec![("settings".to_string(), path.to_path_buf())];
+        assert!(!claude_default_settings_select_api_key(&paths(&plain)));
+        assert!(claude_default_settings_select_api_key(&paths(&helper)));
+        assert!(claude_default_settings_select_api_key(&paths(&env_key)));
+        assert!(!claude_default_settings_select_api_key(&paths(
+            &root.join("missing.json")
+        )));
+        let _ = fs::remove_dir_all(root);
     }
 }

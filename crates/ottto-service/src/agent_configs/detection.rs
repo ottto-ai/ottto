@@ -37,6 +37,12 @@ pub fn detect_agent_installation(source: &SourceKind) -> AgentInstallationDetect
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let spec = detection_spec(source, &home);
+    if matches!(source, SourceKind::ClaudeCode) {
+        // Claude Code is located and probed only through the spawn gate.
+        let binary_path = crate::claude_spawn_gate::claude_binary_display_path();
+        let version = binary_path.as_ref().and_then(|_| claude_version());
+        return detect_agent_installation_with_paths(source, spec, binary_path, version);
+    }
     let binary_path = crate::command_env::executable_path(spec.binary_name);
     let version = binary_path
         .as_deref()
@@ -65,7 +71,11 @@ pub fn source_present_locally(source: &SourceKind) -> bool {
 
 fn source_present_with_home(source: &SourceKind, home: &Path) -> bool {
     let spec = detection_spec(source, home);
-    let binary_found = crate::command_env::executable_path(spec.binary_name).is_some();
+    let binary_found = if matches!(source, SourceKind::ClaudeCode) {
+        crate::claude_spawn_gate::claude_binary_present()
+    } else {
+        crate::command_env::executable_path(spec.binary_name).is_some()
+    };
     source_present_with_paths(spec, binary_found)
 }
 
@@ -163,6 +173,31 @@ fn claude_desktop_support_dir(home: &Path) -> PathBuf {
         .join("Claude")
 }
 
+/// `claude --version` through the spawn gate (exact argv, no login code).
+fn claude_version() -> Option<String> {
+    let permit = crate::claude_spawn_gate::admit(
+        crate::claude_spawn_gate::ClaudeSpawnTarget::Default,
+        crate::claude_spawn_gate::ClaudeSpawnClass::VersionProbe {
+            max_runtime: VERSION_TIMEOUT,
+        },
+        &["--version"],
+    )
+    .ok()?;
+    let output = crate::claude_spawn_gate::run_to_completion(permit);
+    if !output.success {
+        return None;
+    }
+    first_version_line(&output.stdout, &output.stderr)
+}
+
+fn first_version_line(stdout: &str, stderr: &str) -> Option<String> {
+    [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .find(|value| !value.is_empty())
+        .map(|value| value.lines().next().unwrap_or("").trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn capture_version(binary_path: &Path, args: &[&str]) -> Option<String> {
     let start = Instant::now();
     let mut child = Command::new(binary_path)
@@ -179,13 +214,10 @@ fn capture_version(binary_path: &Path, args: &[&str]) -> Option<String> {
                 if !status.success() {
                     return None;
                 }
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return [stdout, stderr]
-                    .into_iter()
-                    .find(|value| !value.is_empty())
-                    .map(|value| value.lines().next().unwrap_or("").trim().to_string())
-                    .filter(|value| !value.is_empty());
+                return first_version_line(
+                    &String::from_utf8_lossy(&output.stdout),
+                    &String::from_utf8_lossy(&output.stderr),
+                );
             }
             Ok(None) if start.elapsed() >= VERSION_TIMEOUT => {
                 let _ = child.kill();

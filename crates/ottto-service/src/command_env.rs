@@ -26,7 +26,15 @@ const PROVIDER_ENV_KEYS: &[&str] = &[
     "AZURE_OPENAI_ENDPOINT",
 ];
 
+/// Generic resolver for every agent CLI except Claude Code. `claude` is never
+/// resolved here: the only code allowed to locate and spawn it is
+/// `crate::claude_spawn_gate`, which refuses a spawn that could refresh (and
+/// so sign out) a Claude login. Presence checks use
+/// `claude_spawn_gate::claude_binary_present`.
 pub(crate) fn executable_path(program: &str) -> Option<PathBuf> {
+    if is_claude_program(program) {
+        return None;
+    }
     executable_search_dirs_for_program(program)
         .into_iter()
         .find_map(|dir| {
@@ -39,18 +47,16 @@ pub(crate) fn executable_path(program: &str) -> Option<PathBuf> {
         })
 }
 
-/// Hardened Claude-only resolver. Every candidate comes from an absolute
-/// search directory, remains an absolute path even when the file is an
-/// official-install symlink, and must be executable by at least one class.
-pub(crate) fn claude_executable_path(effective_home: &Path) -> Option<PathBuf> {
-    claude_search_dirs(effective_home)
-        .into_iter()
-        .map(|dir| dir.join("claude"))
-        .find(|candidate| is_absolute_executable(candidate))
+fn is_claude_program(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "claude")
 }
 
-pub(crate) fn claude_path_env(effective_home: &Path) -> Option<OsString> {
-    env::join_paths(claude_search_dirs(effective_home)).ok()
+/// Claude Code search directories for the spawn gate's hardened resolver.
+pub(crate) fn claude_search_dirs_for_gate(effective_home: &Path) -> Vec<PathBuf> {
+    claude_search_dirs(effective_home)
 }
 
 fn claude_search_dirs(effective_home: &Path) -> Vec<PathBuf> {
@@ -66,7 +72,7 @@ fn claude_search_dirs(effective_home: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(unix)]
-fn is_absolute_executable(candidate: &Path) -> bool {
+pub(crate) fn is_absolute_executable(candidate: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     candidate.is_absolute()
         && std::fs::metadata(candidate).ok().is_some_and(|metadata| {
@@ -75,7 +81,7 @@ fn is_absolute_executable(candidate: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_absolute_executable(candidate: &Path) -> bool {
+pub(crate) fn is_absolute_executable(candidate: &Path) -> bool {
     candidate.is_absolute() && candidate.is_file()
 }
 
@@ -183,6 +189,10 @@ pub(crate) fn path_env() -> Option<OsString> {
         return path_env_from_override(Some(path_var));
     }
     path_env_from(env::var_os("PATH"), env::var_os("HOME"))
+}
+
+pub(crate) fn is_provider_env_key(key: &str) -> bool {
+    PROVIDER_ENV_KEYS.contains(&key)
 }
 
 pub(crate) fn provider_env() -> BTreeMap<String, OsString> {

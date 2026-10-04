@@ -6,6 +6,7 @@ pub mod backfill;
 pub mod canonical_json;
 pub mod claude_browser_auth;
 pub mod claude_local_otel;
+pub(crate) mod claude_spawn_gate;
 pub mod claude_upkeep;
 pub mod client_report;
 pub mod cloud_sessions;
