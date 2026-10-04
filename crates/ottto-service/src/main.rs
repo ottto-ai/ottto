@@ -523,6 +523,13 @@ fn cleanup_legacy_services_at_startup() {
 fn cleanup_legacy_services_at_startup() {}
 
 fn start_builtin_relays(daemon: &LocalDaemon) {
+    match ottto_service::control::reconcile_codex_source_off_at_startup() {
+        Ok(true) => eprintln!("Codex managed telemetry disabled; restart existing Codex processes"),
+        Ok(_) => {}
+        Err(_) => {
+            eprintln!("Codex managed telemetry cleanup needs config review; collection continues")
+        }
+    }
     // Existing per-user LaunchAgent startup is a post-expiry freshness
     // opportunity even when the Companion app is closed.
     ottto_service::snapshot_sync::spawn_claude_agent_status_refresh("startup");

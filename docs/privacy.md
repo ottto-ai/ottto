@@ -316,9 +316,23 @@ only for setup-safe actions tied to an active setup-run binding. Credential,
 auth-adjacent, stale-account, or disconnected cases require browser approval.
 `ottto verify --repair --json` is narrower: it can repair only Codex or Claude
 Code WriteConfig drift after a read-only config check, then re-read config before
-telemetry smoke. `OTTTO_PATCH_CODEX_DISABLED` and
+source verification. `OTTTO_PATCH_CODEX_DISABLED` and
 `OTTTO_PATCH_CLAUDE_CODE_DISABLED` block repair writes and return
 `patch_disabled`.
+
+Ottto does not enable Codex live telemetry. Startup, installation and repair
+remove only exporters identified by an Ottto source header and a loopback signal
+endpoint, including older unfenced configurations. External exporters and other
+settings remain. Ambiguous markers or invalid TOML require review. The explicit
+`OTTTO_PATCH_CODEX_DISABLED` override also prevents startup cleanup.
+
+Codex verification reports local-import readiness without running a provider
+smoke or waiting for raw OTLP. It returns `verified: false` and zero observed
+records: readiness is not proof of an accepted usage upload. Existing Codex
+processes must be restarted after cleanup to discard cached exporter settings.
+Local session usage, quota, plan and check-in collection continue independently.
+This does not establish capture of background provider calls absent from local
+session files. Claude Code capture and raw forwarding behavior are unchanged.
 
 ## Diagnostics Redaction
 
