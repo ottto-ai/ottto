@@ -2270,7 +2270,8 @@ fn spawn_supervised_login(
 ) -> std::io::Result<SupervisedChild> {
     let (child, _) = login_command(config_dir)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Claude unavailable"))?
-        .spawn()?
+        .spawn()
+        .map_err(|failure| std::io::Error::other(failure.to_string()))?
         .into_parts();
     Ok(SupervisedChild {
         child,
@@ -7961,6 +7962,10 @@ exit 1
         )
         .expect("fake claude");
         fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).expect("claude mode");
+        // Keychain item not found: the credentials file is the store.
+        let security = bin.join("security");
+        fs::write(&security, "#!/bin/sh\nexit 44\n").expect("fake security");
+        fs::set_permissions(&security, fs::Permissions::from_mode(0o755)).expect("security mode");
         let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
         let _path = EnvGuard::set("OTTTO_COMMAND_SEARCH_PATH", &bin);
         let _home = EnvGuard::set("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", &home);

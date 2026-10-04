@@ -11137,7 +11137,8 @@ pub(crate) const CLAUDE_LOGIN_REFRESH_PENDING_CODE: &str = "claude_login_refresh
 /// times out can no longer kill Claude Code in the middle of a refresh.
 fn run_claude_smoke_prompt() -> SmokeResult {
     use crate::claude_spawn_gate::{
-        admit, claude_smoke_argv, ClaudeSpawnClass, ClaudeSpawnRefusal, ClaudeSpawnTarget,
+        admit, claude_smoke_argv, ClaudeSpawnClass, ClaudeSpawnFailure, ClaudeSpawnRefusal,
+        ClaudeSpawnTarget,
     };
     let start = Instant::now();
     let display_name = source_display_name(&SourceKind::ClaudeCode);
@@ -11162,25 +11163,17 @@ fn run_claude_smoke_prompt() -> SmokeResult {
         Err(ClaudeSpawnRefusal::MissingBinary | ClaudeSpawnRefusal::NoEffectiveUser) => {
             return not_found(start)
         }
-        Err(refusal) => {
-            return SmokeResult {
-                command_found: true,
-                succeeded: false,
-                exit_status: None,
-                duration_ms: start.elapsed().as_millis(),
-                message: claude_login_refresh_pending_message(refusal),
-                diagnostic: Some(format!("spawn_gate_refused:{}", refusal.code())),
-                error_code: Some(CLAUDE_LOGIN_REFRESH_PENDING_CODE.to_string()),
-                local_session_observed: None,
-            }
-        }
+        Err(refusal) => return claude_smoke_refused(start, refusal),
     };
     permit
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let Ok(child) = permit.spawn() else {
-        return not_found(start);
+    let child = match permit.spawn() {
+        Ok(child) => child,
+        // The re-read immediately before the spawn refused it.
+        Err(ClaudeSpawnFailure::Refused(refusal)) => return claude_smoke_refused(start, refusal),
+        Err(ClaudeSpawnFailure::Expired | ClaudeSpawnFailure::Io(_)) => return not_found(start),
     };
     let (child, deadline) = child.into_parts();
     wait_bounded_smoke_child(
@@ -11189,7 +11182,24 @@ fn run_claude_smoke_prompt() -> SmokeResult {
         move || deadline.is_some_and(|deadline| deadline.passed()),
         display_name,
         None,
+        true,
     )
+}
+
+fn claude_smoke_refused(
+    start: Instant,
+    refusal: crate::claude_spawn_gate::ClaudeSpawnRefusal,
+) -> SmokeResult {
+    SmokeResult {
+        command_found: true,
+        succeeded: false,
+        exit_status: None,
+        duration_ms: start.elapsed().as_millis(),
+        message: claude_login_refresh_pending_message(refusal),
+        diagnostic: Some(format!("spawn_gate_refused:{}", refusal.code())),
+        error_code: Some(CLAUDE_LOGIN_REFRESH_PENDING_CODE.to_string()),
+        local_session_observed: None,
+    }
 }
 
 fn claude_login_refresh_pending_message(
@@ -11298,6 +11308,7 @@ fn run_bounded_command(
         move || start.elapsed() >= timeout,
         display_name,
         before_session_count,
+        false,
     )
 }
 
@@ -11307,6 +11318,7 @@ fn wait_bounded_smoke_child(
     deadline_passed: impl Fn() -> bool,
     display_name: &str,
     before_session_count: Option<usize>,
+    graceful_kill: bool,
 ) -> SmokeResult {
     let stdout_reader = child.stdout.take().map(spawn_pipe_reader);
     let stderr_reader = child.stderr.take().map(spawn_pipe_reader);
@@ -11344,8 +11356,12 @@ fn wait_bounded_smoke_child(
                 };
             }
             Ok(None) if deadline_passed() => {
-                let _ = child.kill();
-                let _ = child.wait();
+                if graceful_kill {
+                    crate::claude_spawn_gate::terminate_gracefully(&mut child);
+                } else {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
                 let (diagnostic, usage_limited) =
                     read_command_diagnostic_with_flags(stdout_reader, stderr_reader);
                 return SmokeResult {
@@ -17551,6 +17567,16 @@ mod tests {
         fs::create_dir_all(&bin_dir).expect("fake bin dir");
         let binary = bin_dir.join(name);
         fs::write(&binary, "#!/bin/sh\n").expect("fake binary");
+        if name == "claude" {
+            // The Claude spawn gate reads the keychain before admitting a
+            // credential-using spawn and fails closed without `security`.
+            // This fake reports "item not found" (exit 44): no stored login.
+            let security = bin_dir.join("security");
+            fs::write(&security, "#!/bin/sh\nexit 44\n").expect("fake security");
+            #[cfg(unix)]
+            fs::set_permissions(&security, fs::Permissions::from_mode(0o755))
+                .expect("fake security mode");
+        }
         binary
     }
 
@@ -25616,7 +25642,7 @@ mod tests {
         assert_eq!(
             fake.spawns(),
             vec![format!(
-                "|-p {SMOKE_PROMPT} --name ottto test --disallowedTools *"
+                "|-p {SMOKE_PROMPT} --name ottto test --disallowedTools * --strict-mcp-config"
             )]
         );
     }

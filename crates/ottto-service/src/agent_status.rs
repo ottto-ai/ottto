@@ -257,6 +257,10 @@ static CLAUDE_OAUTH_PROVIDER_CALLS: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 static CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// Test-only hook run just before the final pre-request expiry check, to
+/// simulate time passing (blocking I/O or sleep) inside the collection path.
+#[cfg(test)]
+static CLAUDE_OAUTH_BEFORE_SEND_HOOK: Mutex<Option<fn()>> = Mutex::new(None);
 
 /// Everything the Claude OAuth usage endpoint yields in one fetch.
 #[derive(Debug, Clone, Default)]
@@ -2973,27 +2977,93 @@ fn claude_signed_in_account_without_identity(
     parse_claude_auth_json(&Value::Object(auth))
 }
 
-/// Whether the user's Claude Code settings select an API key ahead of the
-/// OAuth login (`apiKeyHelper`, or `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`
-/// in the settings `env`). Only key presence is read; no value is kept.
-fn claude_default_settings_select_api_key(paths: &[(String, PathBuf)]) -> bool {
-    paths.iter().any(|(_, path)| {
-        let Some(value) = fs::read_to_string(path)
-            .ok()
-            .and_then(|body| serde_json::from_str::<Value>(&body).ok())
-        else {
-            return false;
-        };
-        let present = |value: Option<&Value>| match value {
-            Some(Value::String(text)) => !text.trim().is_empty(),
-            Some(Value::Null) | None => false,
-            Some(_) => true,
-        };
-        present(value.get("apiKeyHelper"))
-            || ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
-                .into_iter()
-                .any(|key| present(value.get("env").and_then(|env| env.get(key))))
-    })
+/// A non-OAuth way the default Claude Code login authenticates. Claude Code
+/// gives these precedence over the stored OAuth login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeAlternativeAuth {
+    Bedrock,
+    Vertex,
+    ApiKey,
+}
+
+impl ClaudeAlternativeAuth {
+    fn auth_method(self) -> &'static str {
+        match self {
+            Self::Bedrock => "bedrock",
+            Self::Vertex => "vertex",
+            Self::ApiKey => "api_key",
+        }
+    }
+
+    fn api_provider(self) -> &'static str {
+        match self {
+            Self::Bedrock => "bedrock",
+            Self::Vertex => "vertex",
+            Self::ApiKey => "anthropic",
+        }
+    }
+}
+
+/// Whether the default login authenticates without OAuth, from the settings
+/// chain (`apiKeyHelper`, or `env` keys) or the ambient environment: Bedrock
+/// or Vertex (`CLAUDE_CODE_USE_BEDROCK`/`CLAUDE_CODE_USE_VERTEX`), else an API
+/// key (`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, `apiKeyHelper`). Only
+/// presence is read; no value is kept.
+fn claude_default_alternative_auth(
+    paths: &[(String, PathBuf)],
+    ambient: &dyn Fn(&str) -> Option<String>,
+) -> Option<ClaudeAlternativeAuth> {
+    let settings = paths
+        .iter()
+        .filter_map(|(_, path)| {
+            fs::read_to_string(path)
+                .ok()
+                .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        })
+        .collect::<Vec<_>>();
+    let present = |value: Option<&Value>| match value {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
+    };
+    let truthy = |value: Option<String>| {
+        value.is_some_and(|text| {
+            let text = text.trim().to_ascii_lowercase();
+            !text.is_empty() && text != "0" && text != "false"
+        })
+    };
+    let env_value = |key: &str| {
+        ambient(key).or_else(|| {
+            settings.iter().find_map(|value| {
+                value
+                    .get("env")
+                    .and_then(|env| env.get(key))
+                    .and_then(|value| match value {
+                        Value::String(text) => Some(text.clone()),
+                        Value::Bool(flag) => Some(flag.to_string()),
+                        Value::Number(number) => Some(number.to_string()),
+                        _ => None,
+                    })
+            })
+        })
+    };
+    if truthy(env_value("CLAUDE_CODE_USE_BEDROCK")) {
+        return Some(ClaudeAlternativeAuth::Bedrock);
+    }
+    if truthy(env_value("CLAUDE_CODE_USE_VERTEX")) {
+        return Some(ClaudeAlternativeAuth::Vertex);
+    }
+    let api_key = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+        .into_iter()
+        .any(|key| env_value(key).is_some_and(|value| !value.trim().is_empty()))
+        || settings
+            .iter()
+            .any(|value| present(value.get("apiKeyHelper")));
+    api_key.then_some(ClaudeAlternativeAuth::ApiKey)
+}
+
+fn claude_default_alternative_auth_now() -> Option<ClaudeAlternativeAuth> {
+    claude_default_alternative_auth(&claude_settings_paths(), &|key| std::env::var(key).ok())
 }
 
 /// `slot_owned_bindings` names exact account+organization bindings that a
@@ -3038,6 +3108,9 @@ fn collect_claude_status(
         local.credential.into_credential(),
         local.final_oauth_account,
     );
+    // Claude Code uses a configured Bedrock/Vertex route or API key ahead of
+    // the stored OAuth login, so it is evaluated first.
+    let alternative = claude_default_alternative_auth_now();
     match login_state {
         ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending => {
             snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
@@ -3091,10 +3164,10 @@ fn collect_claude_status(
                 }
             };
             let mut account = account;
-            if claude_default_settings_select_api_key(&claude_settings_paths()) {
-                // Settings-based credentials outrank the OAuth login in Claude
-                // Code; say so instead of claiming an OAuth session.
-                account.auth_method = Some("api_key".to_string());
+            if let Some(alternative) = alternative {
+                // The OAuth login still supplies identity and subscription
+                // usage; Claude Code itself authenticates the other way.
+                account.auth_method = Some(alternative.auth_method().to_string());
             }
             snapshot.account = Some(account);
             snapshot.status = AgentStatusState::Available;
@@ -3117,6 +3190,28 @@ fn collect_claude_status(
                 ));
             }
         }
+        _ if alternative.is_some() => {
+            // No usable OAuth login, but Claude Code authenticates another way:
+            // signed in, with no subscription identity or usage.
+            let alternative = alternative.expect("checked");
+            let mut auth = serde_json::Map::new();
+            auth.insert("loggedIn".to_string(), Value::Bool(true));
+            auth.insert(
+                "authMethod".to_string(),
+                Value::from(alternative.auth_method()),
+            );
+            auth.insert(
+                "apiProvider".to_string(),
+                Value::from(alternative.api_provider()),
+            );
+            snapshot.account = Some(parse_claude_auth_json(&Value::Object(auth)));
+            snapshot.status = AgentStatusState::Available;
+            snapshot
+                .diagnostics
+                .push(default_claude_identity_diagnostic(
+                    ClaudeSlotProbeFailure::IdentityUnknown,
+                ));
+        }
         ClaudeLocalLoginState::Unreadable => {
             // Fail closed: a failed or malformed read is not "signed out".
             snapshot.account = Some(unsupported_account("anthropic"));
@@ -3124,23 +3219,6 @@ fn collect_claude_status(
                 .diagnostics
                 .push(default_claude_identity_diagnostic(
                     ClaudeSlotProbeFailure::ProbeFailed,
-                ));
-        }
-        ClaudeLocalLoginState::NotSignedIn
-            if claude_default_settings_select_api_key(&claude_settings_paths()) =>
-        {
-            // No OAuth login, but the settings authenticate Claude Code with an
-            // API key: signed in, with no subscription identity or usage.
-            let mut auth = serde_json::Map::new();
-            auth.insert("loggedIn".to_string(), Value::Bool(true));
-            auth.insert("authMethod".to_string(), Value::from("api_key"));
-            auth.insert("apiProvider".to_string(), Value::from("anthropic"));
-            snapshot.account = Some(parse_claude_auth_json(&Value::Object(auth)));
-            snapshot.status = AgentStatusState::Available;
-            snapshot
-                .diagnostics
-                .push(default_claude_identity_diagnostic(
-                    ClaudeSlotProbeFailure::IdentityUnknown,
                 ));
         }
         ClaudeLocalLoginState::NotSignedIn
@@ -9028,7 +9106,9 @@ fn collect_claude_oauth_usage_unstamped(
     // request could only be rejected (adding a per-caller hold), and only
     // Claude Code itself may refresh the login. The daemon never uses the
     // refresh token.
-    if claude_access_token_locally_expired(credential_expires_at, now) {
+    // A fresh clock sample: cache, breaker and lock reads above can block, and
+    // the Mac can sleep, after `now` was taken.
+    if claude_access_token_locally_expired(credential_expires_at, current_unix_seconds()) {
         drop(token);
         let result = match exact_stale_fallback {
             Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
@@ -9082,6 +9162,33 @@ fn collect_claude_oauth_usage_unstamped(
             "claude_oauth_usage_check_suppressed",
             "The local quota breaker suppressed this provider request after this credential was rejected.",
             now,
+        );
+    }
+    #[cfg(test)]
+    if let Some(hook) = *CLAUDE_OAUTH_BEFORE_SEND_HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        hook();
+    }
+    // Last check, with a clock read immediately before the request.
+    if claude_access_token_locally_expired(credential_expires_at, current_unix_seconds()) {
+        drop(token);
+        let result = match exact_stale_fallback {
+            Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
+            None => Err(
+                "Claude Code has not refreshed this login since its access token expired."
+                    .to_string(),
+            ),
+        };
+        return ClaudeOAuthUsageOutcome {
+            result,
+            diagnostics: Vec::new(),
+        }
+        .with_check_outcome(
+            "claude_oauth_usage_check_suppressed",
+            "This Claude login's access token has expired locally and Claude Code has not refreshed it yet; no provider request was made, and any served readings are last-known local readings.",
+            current_unix_seconds(),
         );
     }
     let authorization = format!("Bearer {token}");
@@ -10138,10 +10245,11 @@ pub(crate) fn read_claude_oauth_credential_metadata_for_slot(
 }
 
 /// Read one exact slot's stored Claude login: the keychain item first, then
-/// the credentials-file fallback. `security` exit 44 (item not found) or no
-/// `security` tool on the search path falls through to the file; every other
-/// keychain failure (locked keychain, timeout, spawn failure, unparseable
-/// JSON) is `Unreadable`, never "signed out".
+/// the credentials-file fallback. Only `security` exit 44 (item not found)
+/// falls through to the file; every other keychain outcome (no `security`
+/// tool on the search path, locked keychain, timeout, spawn failure,
+/// unparseable JSON) is `Unreadable`: the login cannot be confirmed either
+/// way, never "signed out".
 ///
 /// The item is read with `security find-generic-password -w`, so the secret
 /// passes through a pipe into daemon memory. It is parsed here and dropped;
@@ -10163,6 +10271,15 @@ pub(crate) fn read_claude_spawn_gate_credential(
     match read_claude_oauth_credential_state_for_slot(slot) {
         ClaudeCredentialRead::Absent => ClaudeGateCredential::Absent,
         ClaudeCredentialRead::Unreadable => ClaudeGateCredential::ReadFailed,
+        // A refreshable item without an access token or without the inference
+        // scope is malformed (Claude Code always writes both): fail closed.
+        ClaudeCredentialRead::Present(credential)
+            if credential.has_refresh_token
+                && (credential.access_token.is_none()
+                    || credential.has_inference_scope != Some(true)) =>
+        {
+            ClaudeGateCredential::ReadFailed
+        }
         ClaudeCredentialRead::Present(credential) => ClaudeGateCredential::Present {
             has_refresh_token: credential.has_refresh_token,
             access_expires_at: credential
@@ -10184,9 +10301,9 @@ const SECURITY_ITEM_NOT_FOUND_EXIT_CODE: i32 = 44;
 
 fn read_claude_oauth_credential_from_keychain(slot: &ClaudeConfigDirSlot) -> ClaudeKeychainRead {
     if crate::command_env::executable_path("security").is_none() {
-        // No keychain tool on this search path: there is no keychain item to
-        // read, so the credentials-file fallback is the only store.
-        return ClaudeKeychainRead::NotFound;
+        // Without the keychain tool the stored login cannot be confirmed
+        // either way: fail closed, never "no login".
+        return ClaudeKeychainRead::Failed;
     }
     let Some(account) = effective_user_account_name() else {
         return ClaudeKeychainRead::Failed;
@@ -22142,6 +22259,76 @@ for line in sys.stdin:
         assert!(!locked.claude_spawned());
     }
 
+    /// Review round 1: without the keychain tool the login cannot be
+    /// confirmed either way. It is `Unreadable` (never "no login"), the
+    /// status fails closed, and the spawn gate refuses.
+    #[test]
+    #[serial]
+    fn missing_keychain_tool_fails_closed_and_the_gate_refuses() {
+        let fixture = LocalSlotFixture::new("no-security", SECURITY_ITEM_NOT_FOUND);
+        fs::remove_file(fixture.root.join("bin").join("security")).expect("remove security");
+        fixture.write_identity(serde_json::json!({
+            "accountUuid": "account-keychain-only",
+            "organizationUuid": "organization-keychain-only",
+            "emailAddress": "keychain@example.invalid"
+        }));
+        assert!(matches!(
+            read_claude_oauth_credential_state_for_slot(&fixture.slot()),
+            ClaudeCredentialRead::Unreadable
+        ));
+        assert_eq!(
+            read_claude_spawn_gate_credential(&fixture.slot()),
+            crate::claude_spawn_gate::ClaudeGateCredential::ReadFailed
+        );
+        assert_eq!(
+            resolve_registered_claude_slot(fixture.descriptor.clone()).err(),
+            Some(ClaudeSlotProbeFailure::ProbeFailed),
+            "cannot confirm, not credential_unavailable"
+        );
+    }
+
+    /// Review round 1: a refreshable item with a blank access token or
+    /// without `user:inference` is malformed, and the gate refuses it.
+    #[test]
+    #[serial]
+    fn gate_refuses_a_refreshable_item_without_access_token_or_inference_scope() {
+        let fixture = LocalSlotFixture::new("gate-malformed", SECURITY_ITEM_NOT_FOUND);
+        for patch in [
+            ("accessToken", serde_json::json!("")),
+            ("scopes", serde_json::json!(["user:profile"])),
+            ("scopes", Value::Null),
+        ] {
+            let mut credential =
+                claude_credential_fixture("fixture", TimeDuration::hours(3), Some("max"));
+            if patch.1.is_null() {
+                credential["claudeAiOauth"]
+                    .as_object_mut()
+                    .expect("oauth")
+                    .remove(patch.0);
+            } else {
+                credential["claudeAiOauth"][patch.0] = patch.1.clone();
+            }
+            fixture.write_credential(&credential);
+            assert_eq!(
+                read_claude_spawn_gate_credential(&fixture.slot()),
+                crate::claude_spawn_gate::ClaudeGateCredential::ReadFailed,
+                "{patch:?}"
+            );
+        }
+        fixture.write_credential(&claude_credential_fixture(
+            "fixture",
+            TimeDuration::hours(3),
+            Some("max"),
+        ));
+        assert!(matches!(
+            read_claude_spawn_gate_credential(&fixture.slot()),
+            crate::claude_spawn_gate::ClaudeGateCredential::Present {
+                has_refresh_token: true,
+                ..
+            }
+        ));
+    }
+
     #[test]
     #[serial]
     fn expired_login_still_proves_identity_and_a_lapsed_grant_needs_login() {
@@ -30604,6 +30791,81 @@ exit 44
         assert_only_version_probes(&fixture.spawns(), "api-key");
     }
 
+    /// Review round 1: a working API key outranks the OAuth state, so a
+    /// CLI-cleared OAuth item does not make the default login look signed
+    /// out; a Bedrock-only default login is signed in too.
+    #[test]
+    #[serial]
+    fn api_key_or_bedrock_outranks_a_cleared_oauth_login() {
+        let fixture = Phase0Fixture::new("api-key-over-cleared", false);
+        let home = fixture.root.join("home");
+        fs::write(
+            fixture.items.join("Claude Code-credentials.json"),
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "",
+                    "refreshToken": "",
+                    "expiresAt": 0,
+                    "scopes": ["user:inference"]
+                }
+            })
+            .to_string(),
+        )
+        .expect("cleared item");
+        for (settings, method) in [
+            (r#"{"apiKeyHelper":"/usr/local/bin/print-key"}"#, "api_key"),
+            (r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#, "bedrock"),
+        ] {
+            fs::write(home.join(".claude").join("settings.json"), settings).expect("settings");
+            let collection = fixture.collect();
+            let account = collection
+                .source_health_snapshot
+                .account
+                .clone()
+                .expect("default account");
+            assert_eq!(account.login_state, AgentLoginState::SignedIn, "{method}");
+            assert_eq!(account.auth_method.as_deref(), Some(method));
+            assert_ne!(
+                fixture.status().default_slot.collection.state,
+                ClaudeConfigSlotCollectionStateV1::CredentialUnavailable,
+                "{method}"
+            );
+        }
+        assert_only_version_probes(&fixture.spawns(), "api-key-over-cleared");
+    }
+
+    /// Review round 1: the expiry check uses a clock read immediately before
+    /// the request, not the sample taken when collection started. A token
+    /// that lapses while the collection path blocks is never sent.
+    #[test]
+    #[serial]
+    fn token_that_lapses_during_collection_is_never_sent() {
+        let _fixture = Phase0Fixture::new("lapse-before-send", false);
+        fn wait_past_the_margin() {
+            std::thread::sleep(Duration::from_millis(3_100));
+        }
+        let (account_hash, organization_hash) =
+            Phase0Fixture::hashes(("account-lapse", "org-lapse"));
+        let expires_at = OffsetDateTime::from_unix_timestamp(
+            i64::try_from(current_unix_seconds()).expect("time") + 62,
+        )
+        .expect("time")
+        .format(&Rfc3339)
+        .expect("format");
+        *CLAUDE_OAUTH_BEFORE_SEND_HOOK.lock().unwrap() = Some(wait_past_the_margin);
+        let before = provider_calls();
+        let outcome = collect_claude_oauth_usage_with_credential(
+            &account_hash,
+            &organization_hash,
+            Some("fixture-access".to_string()),
+            Some(expires_at),
+            &ClaudeOAuthUsageCaller::Default,
+        );
+        *CLAUDE_OAUTH_BEFORE_SEND_HOOK.lock().unwrap() = None;
+        assert_eq!(provider_calls(), before, "the lapsed token was not sent");
+        assert!(outcome.result.is_err());
+    }
+
     #[test]
     fn locally_expired_access_tokens_are_never_sent() {
         let now = 1_900_000_000_u64;
@@ -30635,12 +30897,24 @@ exit 44
         fs::write(&helper, r#"{"apiKeyHelper":"/usr/local/bin/key"}"#).expect("helper");
         fs::write(&env_key, r#"{"env":{"ANTHROPIC_API_KEY":"x"}}"#).expect("env");
         let paths = |path: &Path| vec![("settings".to_string(), path.to_path_buf())];
-        assert!(!claude_default_settings_select_api_key(&paths(&plain)));
-        assert!(claude_default_settings_select_api_key(&paths(&helper)));
-        assert!(claude_default_settings_select_api_key(&paths(&env_key)));
-        assert!(!claude_default_settings_select_api_key(&paths(
-            &root.join("missing.json")
-        )));
+        let none = |_: &str| None;
+        let detect = |path: &Path| claude_default_alternative_auth(&paths(path), &none);
+        assert_eq!(detect(&plain), None);
+        assert_eq!(detect(&helper), Some(ClaudeAlternativeAuth::ApiKey));
+        assert_eq!(detect(&env_key), Some(ClaudeAlternativeAuth::ApiKey));
+        assert_eq!(detect(&root.join("missing.json")), None);
+        let bedrock = root.join("bedrock.json");
+        fs::write(&bedrock, r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#).expect("bedrock");
+        assert_eq!(detect(&bedrock), Some(ClaudeAlternativeAuth::Bedrock));
+        let vertex_off = root.join("vertex-off.json");
+        fs::write(&vertex_off, r#"{"env":{"CLAUDE_CODE_USE_VERTEX":"0"}}"#).expect("vertex");
+        assert_eq!(detect(&vertex_off), None);
+        // The ambient environment counts too.
+        let ambient = |key: &str| (key == "ANTHROPIC_API_KEY").then(|| "x".to_string());
+        assert_eq!(
+            claude_default_alternative_auth(&paths(&plain), &ambient),
+            Some(ClaudeAlternativeAuth::ApiKey)
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

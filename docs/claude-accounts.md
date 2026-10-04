@@ -293,9 +293,11 @@ memory; Ottto keeps only the access token, for the usage request, and never
 stores, logs or uploads it.
 
 - No stored login: `credential_unavailable`.
-- A keychain error, a locked keychain, unparseable JSON, or a refresh token
-  without an access deadline or without the `user:inference` scope: the read
-  fails closed (`probe_failed`), and no Claude command may run for that login.
+- A keychain error, a locked keychain, no `security` tool, unparseable JSON,
+  or a refresh token without an access deadline, without an access token or
+  without the `user:inference` scope: the read fails closed (`probe_failed`,
+  "cannot confirm"), and no credential-using Claude command may run for that
+  login.
 - No refresh token, a passed `refreshTokenExpiresAt`, or the blanked item
   Claude Code writes after a rejected refresh: `needs_login`.
 - A valid access token: collect as usual.
@@ -304,6 +306,12 @@ stores, logs or uploads it.
   upkeep `upkeep_disabled` and quota access `paused`, keeps its last reading
   marked stale, and says when the sign-in expired. Ottto sends no usage request
   with an expired token.
+
+For the default login, a configured Bedrock or Vertex route or an API key
+(`apiKeyHelper`, or `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` in the settings
+`env` or the environment) is checked first, as Claude Code does: the login then
+reads as signed in with that method even when the OAuth item is missing or
+cleared.
 
 The decision uses a fresh read on every pass, never a persisted deadline. When
 Claude Code refreshes the login (or the customer signs in again), the next pass
@@ -332,18 +340,32 @@ Every daemon spawn of the Claude Code CLI goes through one gate:
 - The official browser sign-in, `claude auth login --claudeai`, only in an
   Ottto-managed auth root. A reconnect runs it in place; cancelling it can
   leave the slot signed out instead of merely expired.
-- The `-p /context` footprint read and the Verify smoke prompt. Right before
-  each spawn the gate re-reads that login and refuses unless the access token
-  stays valid for Claude Code's 5-minute refresh window, a 10-minute margin and
-  the command's whole runtime; it also refuses on a failed read, a missing
-  deadline, a deadline more than 24 hours out, a refresh lock touched in the
-  last minute, or the usage off-switch. A refused `/context` read retries in
-  30 minutes; a refused Verify returns a warning asking to open Claude Code
-  once, then Verify.
+- The `-p /context` footprint read and the Verify smoke prompt, both with
+  `--strict-mcp-config` and no `--mcp-config`, so no user MCP server starts
+  beneath them. At admission and again immediately before the spawn the gate
+  reads that login and refuses unless the access token stays valid for Claude
+  Code's 5-minute refresh window, a 10-minute margin and the command's whole
+  runtime; it also refuses on a failed read, a missing deadline, a missing
+  access token or inference scope, a deadline more than 24 hours out, a
+  refresh lock touched in the last minute, or the usage off-switch. A permit
+  expires one second after its read on both clocks. A command past its
+  deadline gets SIGTERM and three seconds before SIGKILL. A refused `/context`
+  read retries in 30 minutes; a refused Verify returns a warning asking to
+  open Claude Code once, then Verify.
 
 Nothing else (`auth status`, `doctor`, `setup-token`, `mcp serve`) can be
-spawned, and a user MCP server that runs Claude Code itself is reported
-unreachable instead of started.
+spawned. The MCP inventory never starts a server that can reach the Claude
+Code CLI: a `claude` command, a renamed copy of it, the npm package, any
+shell, an interpreter running an inline script, a script that names Claude, or
+an argv/env referencing `claude` or `CLAUDE_CONFIG_DIR`. Such a server is
+reported with `skipped_reason: claude_cli_mcp_server_skipped` instead of being
+started.
+
+Residual risks the gate cannot remove: a server-side 401 makes Claude Code
+refresh regardless of the local clock; a backward clock jump of more than
+10 minutes; a Mac that sleeps while an admitted command runs past expiry; a
+crash or power loss between the provider rotating the token and Claude Code
+saving it; and the customer's own short Claude Code commands.
 
 `refreshTokenExpiresAt` is an absolute login horizon. Within 72 hours the slot
 reports `relogin_approaching`; once elapsed it reports `needs_login` and waits

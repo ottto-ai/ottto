@@ -134,6 +134,12 @@ struct McpServerInput {
     reachable: bool,
     loading_mode: String,
     tools: Vec<McpToolInput>,
+    /// Set when the server was deliberately not started (for example
+    /// `claude_cli_mcp_server_skipped`): "skipped", not "unreachable". Absent
+    /// otherwise, so existing payloads are unchanged; the backend ignores the
+    /// field until it adopts it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped_reason: Option<String>,
 }
 
 /// Explicit machine-level capability state discovered without executing the
@@ -657,7 +663,7 @@ fn harvest_stdio(
     config_dir: Option<&Path>,
     server_env: &BTreeMap<String, String>,
 ) -> Result<Vec<McpToolInput>> {
-    if crate::claude_spawn_gate::is_claude_cli_mcp_server(command, args) {
+    if crate::claude_spawn_gate::is_claude_cli_mcp_server(command, args, server_env) {
         // `claude mcp serve` (or the npm Claude Code package) is a
         // credential-using Claude Code process outside the spawn gate: killing
         // it at the handshake timeout could interrupt a token refresh and sign
@@ -856,6 +862,26 @@ fn parse_tools(response: &Value) -> Vec<McpToolInput> {
 /// an unimplemented network transport) is reported with `reachable = false` and
 /// no tools, so it contributes zero context cost.
 fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv) -> McpServerInput {
+    if let Transport::Stdio {
+        command,
+        args,
+        env: server_env,
+        ..
+    } = &server.transport
+    {
+        if crate::claude_spawn_gate::is_claude_cli_mcp_server(command, args, server_env) {
+            // Never started: it can reach the Claude Code CLI outside the
+            // spawn gate. Reported as skipped (cost zero), not as broken.
+            eprintln!(
+                "mcp_harvest_skip reason={}",
+                crate::claude_spawn_gate::CLAUDE_CLI_MCP_SERVER_SKIPPED
+            );
+            let mut skipped = unreachable_server(server, loading_mode);
+            skipped.skipped_reason =
+                Some(crate::claude_spawn_gate::CLAUDE_CLI_MCP_SERVER_SKIPPED.to_string());
+            return skipped;
+        }
+    }
     let tools = match &server.transport {
         Transport::Stdio {
             command,
@@ -885,6 +911,7 @@ fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv)
             disabled: false,
 
             tools,
+            skipped_reason: None,
         },
         None => McpServerInput {
             server: server.name.clone(),
@@ -894,6 +921,7 @@ fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv)
             disabled: false,
 
             tools: Vec::new(),
+            skipped_reason: None,
         },
     }
 }
@@ -962,6 +990,7 @@ fn unreachable_server(server: &ConfiguredServer, loading_mode: &str) -> McpServe
         disabled: false,
 
         tools: Vec::new(),
+        skipped_reason: None,
     }
 }
 
@@ -1986,6 +2015,7 @@ enabled = true
                     description: "Fetch a URL".to_string(),
                     input_schema: json!({ "type": "object" }),
                 }],
+                skipped_reason: None,
             }],
             capabilities: vec![McpCapabilityInput {
                 capability_id: "browser.chrome".to_string(),
@@ -2280,6 +2310,7 @@ done
                     description: String::new(),
                     input_schema: json!({ "type": "object" }),
                 }],
+                skipped_reason: None,
             }],
             capabilities: Vec::new(),
         }

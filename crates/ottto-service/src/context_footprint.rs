@@ -25,23 +25,17 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const CONTEXT_FOOTPRINT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const CONTEXT_COMMAND_TIMEOUT_SECS: u64 = 25;
-const CONTEXT_MCP_COMMAND_TIMEOUT_SECS: u64 = 120;
 const CONTEXT_COMMAND_TIMEOUT: Duration = Duration::from_secs(CONTEXT_COMMAND_TIMEOUT_SECS);
-const CONTEXT_MCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(CONTEXT_MCP_COMMAND_TIMEOUT_SECS);
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTEXT_MAX_STALENESS_SECS: i64 = 7 * 24 * 60 * 60;
 const RECENT_WORKSPACE_WINDOW: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const MAX_WORKSPACES_PER_CYCLE: usize = 12;
 const MAX_MCP_TOOLS_PER_CAPTURE: usize = 500;
-// One MCP-enabled capture may use its full cold-start allowance while every
-// other workspace uses the existing strict allowance. Thirty seconds covers
-// bounded git identity checks and uploads without pretending all 12 commands
-// still fit inside the old five-minute budget.
-const CONTEXT_CYCLE_BUDGET: Duration = Duration::from_secs(
-    CONTEXT_MCP_COMMAND_TIMEOUT_SECS
-        + ((MAX_WORKSPACES_PER_CYCLE as u64 - 1) * CONTEXT_COMMAND_TIMEOUT_SECS)
-        + 30,
-);
+// Every capture runs in strict MCP mode (no user MCP server starts beneath an
+// admitted Claude process), so each uses the same allowance. Thirty seconds
+// covers bounded git identity checks and uploads.
+const CONTEXT_CYCLE_BUDGET: Duration =
+    Duration::from_secs((MAX_WORKSPACES_PER_CYCLE as u64 * CONTEXT_COMMAND_TIMEOUT_SECS) + 30);
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct ContextFootprintCategoryInput {
@@ -307,19 +301,15 @@ fn harvest_recent_workspaces(
     let mut skipped = 0usize;
     let mut failed = 0usize;
     let mut refused = 0usize;
-    for (workspace_index, workspace) in workspaces.into_iter().enumerate() {
+    for workspace in workspaces {
         if Instant::now() >= deadline {
             break;
         }
-        // Discovery is sorted newest-first, so index zero is the deterministic
-        // most-recently-active workspace selected for the cycle's sole MCP run.
-        let include_mcp_servers = should_include_mcp_servers(workspace_index);
         match build_request_for_workspace(
             &workspace.path,
             machine_id,
             &env,
             workspace_labels_enabled,
-            include_mcp_servers,
         ) {
             Ok(request) => {
                 match upload_if_changed(client, relay_token, support_dir, identity, &request) {
@@ -364,18 +354,13 @@ fn harvest_recent_workspaces(
     Ok(ContextHarvestOutcome { refused })
 }
 
-fn should_include_mcp_servers(workspace_index: usize) -> bool {
-    workspace_index == 0
-}
-
 fn build_request_for_workspace(
     workspace: &Path,
     machine_id: &str,
     env: &SpawnEnv,
     workspace_labels_enabled: bool,
-    include_mcp_servers: bool,
 ) -> Result<ContextFootprintIngestRequest> {
-    let stdout = run_claude_context(workspace, env, include_mcp_servers)?;
+    let stdout = run_claude_context(workspace, env)?;
     let value: Value = serde_json::from_str(&stdout)
         .map_err(|_| anyhow!("Claude Code /context JSON was invalid"))?;
     if value
@@ -430,15 +415,12 @@ fn build_request_for_workspace(
     })
 }
 
-fn run_claude_context(
-    workspace: &Path,
-    env: &SpawnEnv,
-    include_mcp_servers: bool,
-) -> Result<String> {
+fn run_claude_context(workspace: &Path, env: &SpawnEnv) -> Result<String> {
     use crate::claude_spawn_gate::{
-        admit, ClaudeSpawnClass, ClaudeSpawnRefusal, ClaudeSpawnTarget,
+        admit, ClaudeSpawnClass, ClaudeSpawnFailure, ClaudeSpawnRefusal, ClaudeSpawnTarget,
     };
-    let (argv, command_timeout) = claude_context_command(include_mcp_servers);
+    let argv = crate::claude_spawn_gate::claude_context_argv();
+    let command_timeout = CONTEXT_COMMAND_TIMEOUT;
     // Admission re-reads the default login immediately before this spawn and
     // refuses near its expiry, so the kill at `command_timeout` can never land
     // in the middle of a Claude Code token refresh.
@@ -462,7 +444,14 @@ fn run_claude_context(
         .stderr(Stdio::null());
     let (mut child, deadline) = permit
         .spawn()
-        .map_err(|_| anyhow!("Claude Code /context could not be started"))?
+        .map_err(|failure| match failure {
+            ClaudeSpawnFailure::Refused(refusal) => {
+                anyhow::Error::new(ClaudeContextRefused(refusal))
+            }
+            ClaudeSpawnFailure::Expired | ClaudeSpawnFailure::Io(_) => {
+                anyhow!("Claude Code /context could not be started")
+            }
+        })?
         .into_parts();
     loop {
         match child.try_wait() {
@@ -477,29 +466,13 @@ fn run_claude_context(
                     .map_err(|_| anyhow!("Claude Code /context stdout was not UTF-8"));
             }
             Ok(None) if deadline.is_some_and(|deadline| deadline.passed()) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::claude_spawn_gate::terminate_gracefully(&mut child);
                 return Err(anyhow!("Claude Code /context timed out"));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(_) => return Err(anyhow!("Claude Code /context status could not be read")),
         }
     }
-}
-
-/// The `/context` argv and its runtime budget. Strict MCP mode everywhere
-/// except the single sampled workspace: dropping it globally would
-/// double-count MCP across the context and inventory spines, multiply
-/// unattended user-server spawns by 12 per cycle, and put every capture behind
-/// a timeout one cold server blows.
-fn claude_context_command(include_mcp_servers: bool) -> (Vec<&'static str>, Duration) {
-    let argv = crate::claude_spawn_gate::claude_context_argv(include_mcp_servers);
-    let timeout = if include_mcp_servers {
-        CONTEXT_MCP_COMMAND_TIMEOUT
-    } else {
-        CONTEXT_COMMAND_TIMEOUT
-    };
-    (argv, timeout)
 }
 
 pub(crate) fn resolve_repository_identity(
@@ -1379,41 +1352,31 @@ mod tests {
             provider: BTreeMap::new(),
         };
         fake.default_login_expires_in(time::Duration::hours(1));
-        run_claude_context(&workspace, &env, false).expect("admitted an hour out");
+        run_claude_context(&workspace, &env).expect("admitted an hour out");
         assert_eq!(
             fake.spawns(),
             vec!["|-p /context --output-format json --strict-mcp-config".to_string()]
         );
 
         fake.default_login_expires_in(time::Duration::minutes(10));
-        for include_mcp_servers in [false, true] {
-            let error = run_claude_context(&workspace, &env, include_mcp_servers)
-                .expect_err("refused near expiry");
-            assert!(error.downcast_ref::<ClaudeContextRefused>().is_some());
-        }
-        assert_eq!(fake.spawns().len(), 1, "the refused runs never started");
+        let error = run_claude_context(&workspace, &env).expect_err("refused near expiry");
+        assert!(error.downcast_ref::<ClaudeContextRefused>().is_some());
+        assert_eq!(fake.spawns().len(), 1, "the refused run never started");
         assert_eq!(next_context_cycle_delay(true), Duration::from_secs(30 * 60));
         assert_eq!(next_context_cycle_delay(false), CONTEXT_FOOTPRINT_INTERVAL);
         let _ = fs::remove_dir_all(workspace);
     }
 
+    /// Review round 1: no workspace runs `/context` with user MCP servers.
+    /// A server can itself be a credential-using Claude Code (`claude mcp
+    /// serve` under another `CLAUDE_CONFIG_DIR`) that the gate never
+    /// evaluated, so every admitted run is strict.
     #[test]
-    fn only_newest_workspace_enables_mcp_with_the_long_timeout() {
-        assert!(should_include_mcp_servers(0));
-        assert!((1..MAX_WORKSPACES_PER_CYCLE).all(|index| !should_include_mcp_servers(index)));
-
-        let (sampled_args, sampled_timeout) = claude_context_command(true);
-        assert!(!sampled_args.contains(&"--strict-mcp-config"));
-        assert_eq!(sampled_timeout, CONTEXT_MCP_COMMAND_TIMEOUT);
-
-        let (strict_args, strict_timeout) = claude_context_command(false);
-        assert!(strict_args.contains(&"--strict-mcp-config"));
-        assert_eq!(strict_timeout, CONTEXT_COMMAND_TIMEOUT);
-        assert!(
-            CONTEXT_CYCLE_BUDGET
-                >= CONTEXT_MCP_COMMAND_TIMEOUT
-                    + CONTEXT_COMMAND_TIMEOUT * (MAX_WORKSPACES_PER_CYCLE as u32 - 1)
-        );
+    fn every_context_run_starts_no_mcp_server() {
+        let argv = crate::claude_spawn_gate::claude_context_argv();
+        assert_eq!(argv.last(), Some(&"--strict-mcp-config"));
+        assert!(!argv.contains(&"--mcp-config"));
+        assert!(CONTEXT_CYCLE_BUDGET >= CONTEXT_COMMAND_TIMEOUT * MAX_WORKSPACES_PER_CYCLE as u32);
     }
 
     #[test]

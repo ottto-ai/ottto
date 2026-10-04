@@ -32,7 +32,8 @@ spent; the next run gets `invalid_grant` and Claude Code blanks the login
 - **One spawn gate** (`crates/ottto-service/src/claude_spawn_gate.rs`). It is
   the only code that may build a `claude` `Command`, with an exact argv
   allowlist: `--version`; `auth login --claudeai` in a managed root;
-  `-p /context --output-format json [--strict-mcp-config]`; the smoke argv.
+  `-p /context --output-format json --strict-mcp-config`; the smoke argv
+  (also with `--strict-mcp-config`).
   A credential-using spawn re-reads its login right before the spawn and is
   refused unless the access token stays valid for 5 min (Claude Code's refresh
   window) + 10 min + the command's runtime. Failed reads, missing deadlines,
@@ -69,3 +70,30 @@ default makes no request; default takes over from a paused slot; `/context`
 and Verify refusals; MCP refusal; local-metadata account equals the old
 `auth status` account for Max 20x and Team Premium. Provider requests are
 forbidden in these tests.
+
+## Review round 1 (R17 + GPT-6.1-Sol)
+
+- Every admitted credential-using run (`/context`, Verify smoke) uses
+  `--strict-mcp-config` with no `--mcp-config` (verified statically in Claude
+  Code 2.1.288: "Only use MCP servers from --mcp-config, ignoring all other MCP
+  configurations"). The sampled MCP-enabled `/context` run is gone; MCP tool
+  costs come from the MCP inventory.
+- The MCP inventory refuses servers that can reach Claude: a `claude` command,
+  a renamed copy (realpath compare), the npm package, any shell, an
+  interpreter with an inline script, a script naming Claude, or argv/env
+  referencing `claude`/`CLAUDE_CONFIG_DIR`. They carry a new optional
+  `skipped_reason` field instead of looking unreachable.
+- A permit's clock starts at the credential read, and a credential-using
+  permit re-reads and re-evaluates the login immediately before `spawn()`.
+- No `security` tool means the login cannot be confirmed (`Unreadable`), never
+  "no login"; the gate refuses. A refreshable item with no access token or no
+  `user:inference` scope is refused by the gate.
+- The default login checks Bedrock/Vertex and API keys (settings, helper or
+  ambient environment) before the OAuth state.
+- The expiry check before the usage request uses a fresh clock reading, taken
+  immediately before the request.
+- `ClaudeExecutable` is opaque to the gate; the display path is a string for
+  the detection row only. The source scan also flags commands, argv and shell
+  scripts that name `claude`, and the Claude search helpers outside their
+  owners.
+- Deadline kills send SIGTERM and wait three seconds before SIGKILL.

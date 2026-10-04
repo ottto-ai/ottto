@@ -29,6 +29,7 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -48,11 +49,18 @@ pub(crate) const REFRESH_LOCK_FRESHNESS: Duration = Duration::from_secs(60);
 const PERMIT_SPAWN_WINDOW: Duration = Duration::from_secs(1);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// SIGTERM-to-SIGKILL grace for a deadline kill (Claude Code waits up to 2 s
+/// for a held refresh on a clean exit).
+const TERMINATE_GRACE: Duration = Duration::from_secs(3);
 /// Claude Code's advisory refresh lock inside the config directory.
 const REFRESH_LOCK_FILE: &str = ".oauth_refresh.lock";
 
-/// The exact Verify smoke argv (`claude -p <prompt> ...`).
-pub(crate) fn claude_smoke_argv() -> [&'static str; 6] {
+/// The exact Verify smoke argv (`claude -p <prompt> ...`). Like every
+/// credential-using run it starts no MCP server: `--strict-mcp-config` with no
+/// `--mcp-config` uses none (Claude Code 2.1.288: "Only use MCP servers from
+/// --mcp-config, ignoring all other MCP configurations"; with an enterprise
+/// MCP config present Claude Code refuses to start, which fails closed).
+pub(crate) fn claude_smoke_argv() -> [&'static str; 7] {
     [
         "-p",
         crate::control::SMOKE_PROMPT,
@@ -60,6 +68,7 @@ pub(crate) fn claude_smoke_argv() -> [&'static str; 6] {
         "ottto test",
         "--disallowedTools",
         "*",
+        STRICT_MCP_FLAG,
     ]
 }
 
@@ -69,14 +78,19 @@ pub(crate) const CLAUDE_BROWSER_LOGIN_ARGV: [&str; 3] = ["auth", "login", "--cla
 const CONTEXT_ARGV: [&str; 4] = ["-p", "/context", "--output-format", "json"];
 const STRICT_MCP_FLAG: &str = "--strict-mcp-config";
 
-/// The `/context` footprint argv, with `--strict-mcp-config` unless the user's
-/// MCP servers should load for this one sampled workspace.
-pub(crate) fn claude_context_argv(include_mcp_servers: bool) -> Vec<&'static str> {
-    let mut argv = CONTEXT_ARGV.to_vec();
-    if !include_mcp_servers {
-        argv.push(STRICT_MCP_FLAG);
-    }
-    argv
+/// The `/context` footprint argv. Always `--strict-mcp-config`: an admitted
+/// Claude process must not start user MCP servers, because a server can itself
+/// be a credential-using Claude Code (`claude mcp serve` under another
+/// `CLAUDE_CONFIG_DIR`) that this gate never evaluated. MCP tool costs come
+/// from the separate MCP inventory instead.
+pub(crate) fn claude_context_argv() -> [&'static str; 5] {
+    [
+        CONTEXT_ARGV[0],
+        CONTEXT_ARGV[1],
+        CONTEXT_ARGV[2],
+        CONTEXT_ARGV[3],
+        STRICT_MCP_FLAG,
+    ]
 }
 
 /// Token-carrying variables that would make the child use a credential other
@@ -294,12 +308,9 @@ fn argv_allowed(class: ClaudeSpawnClass, argv: &[&str]) -> bool {
     match class {
         ClaudeSpawnClass::VersionProbe { .. } => argv == ["--version"],
         ClaudeSpawnClass::BrowserLogin => argv == CLAUDE_BROWSER_LOGIN_ARGV,
+        // Both credential-using argvs end in `--strict-mcp-config`.
         ClaudeSpawnClass::CredentialUsing { .. } => {
-            argv == CONTEXT_ARGV
-                || (argv.len() == CONTEXT_ARGV.len() + 1
-                    && argv[..CONTEXT_ARGV.len()] == CONTEXT_ARGV
-                    && argv[CONTEXT_ARGV.len()] == STRICT_MCP_FLAG)
-                || argv == claude_smoke_argv()
+            argv == claude_context_argv() || argv == claude_smoke_argv()
         }
     }
 }
@@ -311,10 +322,42 @@ fn argv_allowed(class: ClaudeSpawnClass, argv: &[&str]) -> bool {
 pub(crate) struct ClaudeSpawnPermit {
     command: Command,
     class: ClaudeSpawnClass,
-    admitted_at: Instant,
-    /// Wall-clock admission time: `Instant` does not advance while the Mac
-    /// sleeps, so a permit held across sleep must still expire.
-    admitted_wall: SystemTime,
+    /// When the admitted evidence was read (the credential read for
+    /// `CredentialUsing`), never a later point: logging or any other blocking
+    /// step after the read cannot make old evidence look fresh.
+    evidence_read_at: Instant,
+    /// Wall-clock read time: `Instant` does not advance while the Mac sleeps,
+    /// so a permit held across sleep must still expire.
+    evidence_read_wall: SystemTime,
+    /// `CredentialUsing` only: the credential is read and evaluated again
+    /// immediately before the spawn.
+    revalidation: Option<ClaudeRevalidation>,
+}
+
+struct ClaudeRevalidation {
+    target: ClaudeSpawnTarget,
+    max_runtime: Duration,
+    evidence: Rc<dyn ClaudeSpawnEvidence>,
+}
+
+/// Why an admitted permit did not produce a child.
+#[derive(Debug)]
+pub(crate) enum ClaudeSpawnFailure {
+    /// The re-read immediately before the spawn refused it.
+    Refused(ClaudeSpawnRefusal),
+    /// The permit outlived its spawn window.
+    Expired,
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for ClaudeSpawnFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(refusal) => write!(formatter, "Claude spawn refused: {}", refusal.code()),
+            Self::Expired => write!(formatter, "Claude spawn permit expired before spawn"),
+            Self::Io(error) => write!(formatter, "Claude spawn failed: {error}"),
+        }
+    }
 }
 
 impl std::fmt::Debug for ClaudeSpawnPermit {
@@ -375,20 +418,27 @@ impl ClaudeSpawnPermit {
         self
     }
 
-    /// Spawn the admitted command. The returned deadline uses both a monotonic
-    /// and a wall clock, so a Mac that sleeps while the child runs still kills
-    /// it once the real time budget is gone.
-    pub(crate) fn spawn(mut self) -> std::io::Result<ClaudeChild> {
-        let wall_elapsed_ok = SystemTime::now()
-            .duration_since(self.admitted_wall)
-            .is_ok_and(|elapsed| elapsed <= PERMIT_SPAWN_WINDOW);
-        if self.admitted_at.elapsed() > PERMIT_SPAWN_WINDOW || !wall_elapsed_ok {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Claude spawn permit expired before spawn",
-            ));
+    /// Spawn the admitted command. The evidence must be under one second old
+    /// on both clocks, and a credential-using permit re-reads and re-evaluates
+    /// its login immediately before the spawn. The returned deadline uses both
+    /// a monotonic and a wall clock.
+    pub(crate) fn spawn(mut self) -> Result<ClaudeChild, ClaudeSpawnFailure> {
+        if !evidence_within_spawn_window(self.evidence_read_at, self.evidence_read_wall) {
+            return Err(ClaudeSpawnFailure::Expired);
         }
-        let child = self.command.spawn()?;
+        if let Some(revalidation) = &self.revalidation {
+            let (read_at, read_wall) = (Instant::now(), SystemTime::now());
+            let (_, decision) = evaluate_target_credential(
+                &revalidation.target,
+                revalidation.max_runtime,
+                revalidation.evidence.as_ref(),
+            );
+            decision.map_err(ClaudeSpawnFailure::Refused)?;
+            if !evidence_within_spawn_window(read_at, read_wall) {
+                return Err(ClaudeSpawnFailure::Expired);
+            }
+        }
+        let child = self.command.spawn().map_err(ClaudeSpawnFailure::Io)?;
         let deadline = self.class.max_runtime().map(ClaudeDeadline::after);
         Ok(ClaudeChild { child, deadline })
     }
@@ -397,6 +447,37 @@ impl ClaudeSpawnPermit {
     pub(crate) fn command_for_tests(&self) -> &Command {
         &self.command
     }
+}
+
+fn evidence_within_spawn_window(read_at: Instant, read_wall: SystemTime) -> bool {
+    read_at.elapsed() <= PERMIT_SPAWN_WINDOW
+        && SystemTime::now()
+            .duration_since(read_wall)
+            .is_ok_and(|elapsed| elapsed <= PERMIT_SPAWN_WINDOW)
+}
+
+/// Stop an admitted child whose deadline passed. SIGTERM first, then up to
+/// three seconds before SIGKILL: Claude Code waits up to two seconds for a
+/// refresh it holds on a clean exit, so a child that woke past expiry and
+/// began a refresh can still save the rotated token.
+pub(crate) fn terminate_gracefully(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+        let grace = Instant::now() + TERMINATE_GRACE;
+        while Instant::now() < grace {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            thread::sleep(PROCESS_POLL_INTERVAL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Monotonic plus wall-clock deadline for an admitted child (`Instant` does
@@ -464,8 +545,7 @@ pub(crate) fn run_to_completion(mut permit: ClaudeSpawnPermit) -> ClaudeCaptured
                 };
             }
             Ok(None) if deadline.is_some_and(|deadline| deadline.passed()) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_gracefully(&mut child);
                 return ClaudeCapturedOutput {
                     success: false,
                     stdout: collect_pipe(stdout),
@@ -508,24 +588,59 @@ pub(crate) fn admit(
     class: ClaudeSpawnClass,
     argv: &[&str],
 ) -> Result<ClaudeSpawnPermit, ClaudeSpawnRefusal> {
-    admit_with(target, class, argv, &ProductionEvidence)
+    admit_with(target, class, argv, Rc::new(ProductionEvidence))
 }
 
 fn admit_with(
     target: ClaudeSpawnTarget,
     class: ClaudeSpawnClass,
     argv: &[&str],
-    evidence: &dyn ClaudeSpawnEvidence,
+    evidence: Rc<dyn ClaudeSpawnEvidence>,
 ) -> Result<ClaudeSpawnPermit, ClaudeSpawnRefusal> {
     let mut evaluated = None;
-    let decision = admit_decision(&target, class, argv, evidence, &mut evaluated);
+    let decision = admit_decision(&target, class, argv, evidence.as_ref(), &mut evaluated);
     log_decision(&target, class, &decision, evaluated, evidence.now());
-    decision.map(|command| ClaudeSpawnPermit {
+    let (command, read_at, read_wall) = decision?;
+    let revalidation = match class {
+        ClaudeSpawnClass::CredentialUsing { max_runtime } => Some(ClaudeRevalidation {
+            target,
+            max_runtime,
+            evidence,
+        }),
+        ClaudeSpawnClass::VersionProbe { .. } | ClaudeSpawnClass::BrowserLogin => None,
+    };
+    Ok(ClaudeSpawnPermit {
         command,
         class,
-        admitted_at: Instant::now(),
-        admitted_wall: SystemTime::now(),
+        evidence_read_at: read_at,
+        evidence_read_wall: read_wall,
+        revalidation,
     })
+}
+
+/// Read and evaluate one target's credential. Returns what was read (for the
+/// log bucket) and the decision.
+fn evaluate_target_credential(
+    target: &ClaudeSpawnTarget,
+    max_runtime: Duration,
+    evidence: &dyn ClaudeSpawnEvidence,
+) -> (ClaudeGateCredential, Result<(), ClaudeSpawnRefusal>) {
+    let slot = target.slot();
+    let lock_dir = slot
+        .credentials_path(&crate::agent_status::home_dir())
+        .parent()
+        .map(Path::to_path_buf);
+    let credential = evidence.credential(&slot);
+    let decision = evaluate_credential_spawn(
+        credential,
+        lock_dir
+            .as_deref()
+            .and_then(|dir| evidence.refresh_lock_modified(dir)),
+        evidence.network_disabled(),
+        evidence.now(),
+        max_runtime,
+    );
+    (credential, decision)
 }
 
 fn admit_decision(
@@ -534,7 +649,7 @@ fn admit_decision(
     argv: &[&str],
     evidence: &dyn ClaudeSpawnEvidence,
     evaluated: &mut Option<ClaudeGateCredential>,
-) -> Result<Command, ClaudeSpawnRefusal> {
+) -> Result<(Command, Instant, SystemTime), ClaudeSpawnRefusal> {
     if !argv_allowed(class, argv) {
         return Err(ClaudeSpawnRefusal::ArgvNotAllowed);
     }
@@ -553,25 +668,14 @@ fn admit_decision(
     // Build the command before reading the credential so the read-to-spawn
     // gap stays as short as possible.
     let command = build_command(target, class, argv)?;
+    // The permit's clock starts at the evidence read, before logging.
+    let (read_at, read_wall) = (Instant::now(), SystemTime::now());
     if let ClaudeSpawnClass::CredentialUsing { max_runtime } = class {
-        let slot = target.slot();
-        let lock_dir = slot
-            .credentials_path(&crate::agent_status::home_dir())
-            .parent()
-            .map(Path::to_path_buf);
-        let credential = evidence.credential(&slot);
+        let (credential, decision) = evaluate_target_credential(target, max_runtime, evidence);
         *evaluated = Some(credential);
-        evaluate_credential_spawn(
-            credential,
-            lock_dir
-                .as_deref()
-                .and_then(|dir| evidence.refresh_lock_modified(dir)),
-            evidence.network_disabled(),
-            evidence.now(),
-            max_runtime,
-        )?;
+        decision?;
     }
-    Ok(command)
+    Ok((command, read_at, read_wall))
 }
 
 fn build_command(
@@ -582,7 +686,7 @@ fn build_command(
     let (account_name, home) = crate::agent_status::claude_spawn_user_identity()
         .ok_or(ClaudeSpawnRefusal::NoEffectiveUser)?;
     let program = resolve_claude_binary(&home).ok_or(ClaudeSpawnRefusal::MissingBinary)?;
-    let mut command = Command::new(program);
+    let mut command = Command::new(program.0);
     command.args(argv);
     match class {
         ClaudeSpawnClass::BrowserLogin => {
@@ -635,15 +739,20 @@ fn build_command(
     Ok(command)
 }
 
+/// The resolved Claude Code executable. Opaque: only this module can build
+/// one, and nothing hands its path out for spawning.
+struct ClaudeExecutable(PathBuf);
+
 /// Hardened resolver: every candidate comes from an absolute search
 /// directory, stays absolute even through an official-install symlink, and
 /// must be executable.
-fn resolve_claude_binary(home: &Path) -> Option<PathBuf> {
+fn resolve_claude_binary(home: &Path) -> Option<ClaudeExecutable> {
     crate::command_env::claude_search_dirs_for_gate(home)
         .into_iter()
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join("claude"))
         .find(|candidate| crate::command_env::is_absolute_executable(candidate))
+        .map(ClaudeExecutable)
 }
 
 fn claude_path_env(home: &Path) -> Option<OsString> {
@@ -661,37 +770,140 @@ fn effective_home() -> Option<PathBuf> {
 
 /// Whether Claude Code's CLI is installed, without spawning it.
 pub(crate) fn claude_binary_present() -> bool {
-    claude_binary_display_path().is_some()
+    effective_home()
+        .and_then(|home| resolve_claude_binary(&home))
+        .is_some()
 }
 
-/// Where the Claude Code CLI is installed, for display only. Never spawned.
-pub(crate) fn claude_binary_display_path() -> Option<PathBuf> {
-    resolve_claude_binary(&effective_home()?)
+/// Where the Claude Code CLI is installed, as display text for the apps
+/// detection row only. Never use it to build a command.
+pub(crate) fn claude_binary_display_path() -> Option<String> {
+    resolve_claude_binary(&effective_home()?).map(|exe| exe.0.display().to_string())
 }
 
-/// Whether a user-configured MCP server would run the Claude Code CLI itself
-/// (`claude mcp serve`, a direct path into an install, or the npm package).
-/// Such a server is never spawned: it would be a credential-using `claude`
-/// outside this gate.
-pub(crate) fn is_claude_cli_mcp_server(command: &str, args: &[String]) -> bool {
+/// Canonical path of the resolved Claude Code executable, compared (never
+/// spawned) by the MCP refusal.
+fn claude_binary_canonical_path() -> Option<PathBuf> {
+    resolve_claude_binary(&effective_home()?).and_then(|exe| std::fs::canonicalize(exe.0).ok())
+}
+
+/// Shells: any shell as an MCP server command can run Claude Code (inline
+/// with `-c`/`-lc`, or from a script it sources), so it is never started.
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"];
+/// Interpreters that run an inline script given in argv.
+const INLINE_SCRIPT_RUNNERS: &[(&str, &[&str])] = &[
+    ("node", &["-e", "--eval", "-p", "--print"]),
+    ("bun", &["-e", "--eval", "-p", "--print"]),
+    ("deno", &["eval"]),
+    ("python", &["-c"]),
+    ("python3", &["-c"]),
+    ("ruby", &["-e"]),
+    ("perl", &["-e", "-E"]),
+    ("osascript", &["-e"]),
+];
+/// Largest script file the MCP refusal reads to look for a Claude reference.
+const SCRIPT_SCAN_LIMIT: u64 = 256 * 1024;
+
+/// Whether a user-configured stdio MCP server must not be started because it
+/// can reach the Claude Code CLI outside this gate: `claude mcp serve`, a
+/// renamed copy or symlink of the Claude binary (realpath compare), the npm
+/// package, a shell or interpreter running an inline script, a script that
+/// names Claude, or an argv/env that references `claude`,
+/// `CLAUDE_CONFIG_DIR` or `@anthropic-ai/claude-code`. Fails closed: anything
+/// it cannot classify (for example an unreadable script) is refused.
+pub(crate) fn is_claude_cli_mcp_server(
+    command: &str,
+    args: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+) -> bool {
     let path = Path::new(command);
-    let basename_is_claude = path
+    let basename = path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "claude");
-    let resolved = if path.is_absolute() {
-        std::fs::canonicalize(path).ok()
-    } else {
-        crate::command_env::executable_path(command).and_then(|p| std::fs::canonicalize(p).ok())
-    };
-    let resolves_into_install = resolved.is_some_and(|resolved| {
-        let text = resolved.to_string_lossy();
-        text.contains("/claude/versions/") || text.contains("claude.app/Contents/MacOS/")
-    });
-    let npm_package = std::iter::once(command)
+        .unwrap_or("");
+    if basename == "claude" || basename.is_empty() {
+        return true;
+    }
+    if std::iter::once(command)
         .chain(args.iter().map(String::as_str))
-        .any(|value| value.contains("@anthropic-ai/claude-code"));
-    basename_is_claude || resolves_into_install || npm_package
+        .any(references_claude)
+        || env
+            .iter()
+            .any(|(key, value)| references_claude(key) || references_claude(value))
+    {
+        return true;
+    }
+    if SHELLS.contains(&basename) {
+        return true;
+    }
+    // `env claude ...`, `exec`, `nohup`, `npx -y <pkg>`-style launchers pass
+    // their program through argv; the argv check above covers named Claude.
+    if let Some((_, flags)) = INLINE_SCRIPT_RUNNERS
+        .iter()
+        .find(|(runner, _)| basename == *runner || basename.starts_with(&format!("{runner}.")))
+    {
+        if args.iter().any(|arg| flags.contains(&arg.as_str())) {
+            return true;
+        }
+    }
+    let resolved = if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        crate::command_env::executable_path(command)
+    };
+    let Some(resolved) = resolved else {
+        // Not found on the daemon's search path: it cannot start, so it
+        // cannot reach Claude either (it reports unreachable as before).
+        return false;
+    };
+    let Ok(canonical) = std::fs::canonicalize(&resolved) else {
+        return true;
+    };
+    let text = canonical.to_string_lossy();
+    if text.contains("/claude/versions/")
+        || text.contains("claude.app/Contents/MacOS/")
+        || text.contains("@anthropic-ai/claude-code")
+        || claude_binary_canonical_path().is_some_and(|claude| claude == canonical)
+    {
+        return true;
+    }
+    script_references_claude(&canonical)
+}
+
+/// A whole word `claude` (a path segment or word; `.claude` config dirs and
+/// names like `claude-design` do not count), `CLAUDE_CONFIG_DIR`, the
+/// `CLAUDE_CODE_OAUTH_*` variables or the npm package.
+fn references_claude(value: &str) -> bool {
+    value.contains("@anthropic-ai/claude-code")
+        || value.contains("CLAUDE_CONFIG_DIR")
+        || value.contains(STRIPPED_TOKEN_ENV_PREFIX)
+        || value
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'))
+            .any(|word| word == "claude")
+}
+
+/// For an executable script (`#!`), whether its text names Claude. A script
+/// that cannot be read, or is too large to scan, fails closed.
+fn script_references_claude(path: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok(file) = std::fs::File::open(path) else {
+        return true;
+    };
+    let mut head = Vec::new();
+    if file
+        .take(SCRIPT_SCAN_LIMIT + 1)
+        .read_to_end(&mut head)
+        .is_err()
+    {
+        return true;
+    }
+    if !head.starts_with(b"#!") {
+        return false;
+    }
+    if head.len() as u64 > SCRIPT_SCAN_LIMIT {
+        return true;
+    }
+    references_claude(&String::from_utf8_lossy(&head))
 }
 
 /// Skip reason logged for a refused Claude-CLI MCP server.
@@ -700,7 +912,7 @@ pub(crate) const CLAUDE_CLI_MCP_SERVER_SKIPPED: &str = "claude_cli_mcp_server_sk
 fn log_decision(
     target: &ClaudeSpawnTarget,
     class: ClaudeSpawnClass,
-    decision: &Result<Command, ClaudeSpawnRefusal>,
+    decision: &Result<(Command, Instant, SystemTime), ClaudeSpawnRefusal>,
     evaluated: Option<ClaudeGateCredential>,
     now: OffsetDateTime,
 ) {
@@ -863,10 +1075,14 @@ pub(crate) mod test_support {
             std::fs::write(&self.item, item.to_string()).expect("write item");
         }
 
+        /// Every logged spawn except `--version` probes, which a detached
+        /// status refresh from another test may run under this fixture's
+        /// search path (they never touch a login).
         pub(crate) fn spawns(&self) -> Vec<String> {
             std::fs::read_to_string(&self.spawn_log)
                 .unwrap_or_default()
                 .lines()
+                .filter(|line| *line != "|--version")
                 .map(str::to_string)
                 .collect()
         }
@@ -1029,14 +1245,14 @@ mod tests {
     }
 
     struct FakeEvidence {
-        credential: ClaudeGateCredential,
+        credential: Cell<ClaudeGateCredential>,
         reads: Cell<usize>,
     }
 
     impl ClaudeSpawnEvidence for FakeEvidence {
         fn credential(&self, _slot: &ClaudeConfigDirSlot) -> ClaudeGateCredential {
             self.reads.set(self.reads.get() + 1);
-            self.credential
+            self.credential.get()
         }
         fn refresh_lock_modified(&self, _config_dir: &Path) -> Option<SystemTime> {
             None
@@ -1049,14 +1265,14 @@ mod tests {
         }
     }
 
-    fn fresh_evidence() -> FakeEvidence {
-        FakeEvidence {
-            credential: ClaudeGateCredential::Present {
+    fn fresh_evidence() -> Rc<FakeEvidence> {
+        Rc::new(FakeEvidence {
+            credential: Cell::new(ClaudeGateCredential::Present {
                 has_refresh_token: true,
                 access_expires_at: Some(OffsetDateTime::now_utc() + TimeDuration::hours(3)),
-            },
+            }),
             reads: Cell::new(0),
-        }
+        })
     }
 
     /// Sets one variable for a test and restores it on drop. Setting `HOME`
@@ -1169,7 +1385,7 @@ mod tests {
                     ClaudeSpawnTarget::Default,
                     credential_using,
                     argv,
-                    &evidence
+                    evidence.clone()
                 )
                 .err(),
                 Some(ClaudeSpawnRefusal::ArgvNotAllowed),
@@ -1181,7 +1397,7 @@ mod tests {
         };
         for argv in [&["--version", "--verbose"][..], &["--version", "x"], &[]] {
             assert_eq!(
-                admit_with(ClaudeSpawnTarget::Default, version, argv, &evidence).err(),
+                admit_with(ClaudeSpawnTarget::Default, version, argv, evidence.clone()).err(),
                 Some(ClaudeSpawnRefusal::ArgvNotAllowed),
                 "{argv:?}"
             );
@@ -1190,7 +1406,7 @@ mod tests {
             ClaudeSpawnTarget::Default,
             version,
             &["--version"],
-            &evidence
+            evidence.clone()
         )
         .is_ok());
         // A browser sign-in is only for an Ottto-managed auth root.
@@ -1199,7 +1415,7 @@ mod tests {
                 ClaudeSpawnTarget::Default,
                 ClaudeSpawnClass::BrowserLogin,
                 &CLAUDE_BROWSER_LOGIN_ARGV,
-                &evidence
+                evidence.clone()
             )
             .err(),
             Some(ClaudeSpawnRefusal::TargetNotAllowed)
@@ -1225,8 +1441,8 @@ mod tests {
         let permit = admit_with(
             ClaudeSpawnTarget::Registered(slot),
             class,
-            &CONTEXT_ARGV,
-            &evidence,
+            &claude_context_argv(),
+            evidence.clone(),
         )
         .expect("fresh credential admitted");
         let command = permit.command_for_tests();
@@ -1241,8 +1457,8 @@ mod tests {
         let default = admit_with(
             ClaudeSpawnTarget::Default,
             class,
-            &[&CONTEXT_ARGV[..], &[STRICT_MCP_FLAG]].concat(),
-            &evidence,
+            &claude_smoke_argv(),
+            evidence.clone(),
         )
         .expect("default admitted");
         let command = default.command_for_tests();
@@ -1265,19 +1481,19 @@ mod tests {
             ClaudeSpawnTarget::Default,
             version,
             &["--version"],
-            &evidence,
+            evidence.clone(),
         )
         .expect("admitted");
-        slept.admitted_wall = SystemTime::now() - Duration::from_secs(3 * 60 * 60);
+        slept.evidence_read_wall = SystemTime::now() - Duration::from_secs(3 * 60 * 60);
         assert!(slept.spawn().is_err(), "wall clock advanced during sleep");
         let mut future = admit_with(
             ClaudeSpawnTarget::Default,
             version,
             &["--version"],
-            &evidence,
+            evidence.clone(),
         )
         .expect("admitted");
-        future.admitted_wall = SystemTime::now() + Duration::from_secs(60);
+        future.evidence_read_wall = SystemTime::now() + Duration::from_secs(60);
         assert!(
             future.spawn().is_err(),
             "a backward clock jump fails closed"
@@ -1286,7 +1502,7 @@ mod tests {
             ClaudeSpawnTarget::Default,
             version,
             &["--version"],
-            &evidence,
+            evidence.clone(),
         )
         .expect("admitted");
         let (mut child, _) = fresh.spawn().expect("prompt spawn").into_parts();
@@ -1297,47 +1513,186 @@ mod tests {
     #[serial_test::serial]
     fn near_expiry_credential_refuses_admission_through_the_reader() {
         let _fixture = GateFixture::new("near-expiry");
-        let evidence = FakeEvidence {
-            credential: ClaudeGateCredential::Present {
+        let evidence = Rc::new(FakeEvidence {
+            credential: Cell::new(ClaudeGateCredential::Present {
                 has_refresh_token: true,
                 access_expires_at: Some(OffsetDateTime::now_utc() + TimeDuration::minutes(10)),
-            },
+            }),
             reads: Cell::new(0),
-        };
+        });
         let refusal = admit_with(
             ClaudeSpawnTarget::Default,
             ClaudeSpawnClass::CredentialUsing {
                 max_runtime: Duration::from_secs(45),
             },
             &claude_smoke_argv(),
-            &evidence,
+            evidence.clone(),
         )
         .expect_err("refused near expiry");
         assert_eq!(refusal, ClaudeSpawnRefusal::TooCloseToExpiry);
         assert!(refusal.waits_for_claude_refresh());
     }
 
+    /// Review round 1: a credential-using permit re-reads and re-evaluates the
+    /// login immediately before the spawn. Evidence that went stale after
+    /// admission (here: the login moved into its refresh window) never
+    /// spawns, and a permit's clock starts at the read, not after logging.
     #[test]
-    fn mcp_servers_that_run_the_claude_cli_are_recognised() {
-        assert!(is_claude_cli_mcp_server(
-            "claude",
-            &["mcp".into(), "serve".into()]
+    #[serial_test::serial]
+    fn stale_admission_evidence_never_becomes_a_spawn() {
+        let _fixture = GateFixture::new("stale-proof");
+        let evidence = fresh_evidence();
+        let class = ClaudeSpawnClass::CredentialUsing {
+            max_runtime: Duration::from_secs(25),
+        };
+        let permit = admit_with(
+            ClaudeSpawnTarget::Default,
+            class,
+            &claude_context_argv(),
+            evidence.clone(),
+        )
+        .expect("fresh login admitted");
+        evidence.credential.set(ClaudeGateCredential::Present {
+            has_refresh_token: true,
+            access_expires_at: Some(OffsetDateTime::now_utc() + TimeDuration::minutes(4)),
+        });
+        assert!(matches!(
+            permit.spawn(),
+            Err(ClaudeSpawnFailure::Refused(
+                ClaudeSpawnRefusal::TooCloseToExpiry
+            ))
         ));
-        assert!(is_claude_cli_mcp_server("/opt/homebrew/bin/claude", &[]));
+        assert_eq!(
+            evidence.reads.get(),
+            2,
+            "admission read plus pre-spawn read"
+        );
+
+        evidence.credential.set(ClaudeGateCredential::Present {
+            has_refresh_token: true,
+            access_expires_at: Some(OffsetDateTime::now_utc() + TimeDuration::hours(3)),
+        });
+        let mut old = admit_with(
+            ClaudeSpawnTarget::Default,
+            class,
+            &claude_context_argv(),
+            evidence.clone(),
+        )
+        .expect("admitted");
+        // The read happened 2 s ago (for example logging blocked): expired.
+        old.evidence_read_at = Instant::now() - Duration::from_secs(2);
+        assert!(matches!(old.spawn(), Err(ClaudeSpawnFailure::Expired)));
+    }
+
+    /// Review round 1: every credential-using argv runs with no user MCP
+    /// server (`--strict-mcp-config`, no `--mcp-config`).
+    #[test]
+    #[serial_test::serial]
+    fn credential_using_argv_without_strict_mcp_is_refused() {
+        let _fixture = GateFixture::new("strict-mcp");
+        let evidence = fresh_evidence();
+        let class = ClaudeSpawnClass::CredentialUsing {
+            max_runtime: Duration::from_secs(25),
+        };
+        let unsafe_smoke = [
+            "-p",
+            crate::control::SMOKE_PROMPT,
+            "--name",
+            "ottto test",
+            "--disallowedTools",
+            "*",
+        ];
+        for argv in [&CONTEXT_ARGV[..], &unsafe_smoke[..]] {
+            assert_eq!(
+                admit_with(ClaudeSpawnTarget::Default, class, argv, evidence.clone()).err(),
+                Some(ClaudeSpawnRefusal::ArgvNotAllowed),
+                "{argv:?}"
+            );
+        }
+        for argv in [&claude_context_argv()[..], &claude_smoke_argv()[..]] {
+            assert_eq!(argv.last(), Some(&STRICT_MCP_FLAG));
+            assert!(!argv.contains(&"--mcp-config"));
+            assert!(admit_with(ClaudeSpawnTarget::Default, class, argv, evidence.clone()).is_ok());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mcp_servers_that_can_reach_the_claude_cli_are_recognised() {
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = GateFixture::new("mcp-predicate");
+        let no_env = BTreeMap::new();
+        let strings = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        let refused = [
+            ("claude", strings(&["mcp", "serve"])),
+            ("/opt/homebrew/bin/claude", strings(&[])),
+            ("npx", strings(&["-y", "@anthropic-ai/claude-code", "mcp"])),
+            ("/bin/sh", strings(&["-c", "exec claude mcp serve"])),
+            ("bash", strings(&["-lc", "true"])),
+            ("/bin/zsh", strings(&["-c", "my-server"])),
+            ("node", strings(&["-e", "require('child_process')"])),
+            ("python3", strings(&["-c", "import os"])),
+            ("env", strings(&["claude", "mcp", "serve"])),
+            (
+                "node",
+                strings(&["/opt/lib/node_modules/@anthropic-ai/claude-code/cli.js"]),
+            ),
+        ];
+        for (command, args) in &refused {
+            assert!(
+                is_claude_cli_mcp_server(command, args, &no_env),
+                "{command} {args:?} must be refused"
+            );
+        }
+        let with_config_dir =
+            BTreeMap::from([("CLAUDE_CONFIG_DIR".to_string(), "/tmp/slot".to_string())]);
+        assert!(is_claude_cli_mcp_server("my-server", &[], &with_config_dir));
+
+        // A renamed copy (symlink) of the resolved Claude binary.
+        let bin = fixture.root.join("bin");
+        let renamed = bin.join("cc-renamed");
+        std::os::unix::fs::symlink(bin.join("claude"), &renamed).expect("symlink");
         assert!(is_claude_cli_mcp_server(
-            "npx",
-            &[
-                "-y".into(),
-                "@anthropic-ai/claude-code".into(),
-                "mcp".into()
-            ]
+            renamed.to_str().unwrap(),
+            &[],
+            &no_env
+        ));
+        // A wrapper script that names Claude.
+        let wrapper = bin.join("wrapper-server");
+        std::fs::write(&wrapper, "#!/bin/sh\nexec claude mcp serve\n").expect("wrapper");
+        let mut permissions = std::fs::metadata(&wrapper).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, permissions).expect("chmod");
+        assert!(is_claude_cli_mcp_server(
+            wrapper.to_str().unwrap(),
+            &[],
+            &no_env
+        ));
+
+        // Ordinary servers still run.
+        let plain = bin.join("plain-server");
+        std::fs::write(
+            &plain,
+            "#!/bin/sh\nexec node server.js --root ~/.claude/x\n",
+        )
+        .expect("plain");
+        std::fs::set_permissions(&plain, std::fs::metadata(&wrapper).unwrap().permissions())
+            .expect("chmod");
+        assert!(!is_claude_cli_mcp_server(
+            plain.to_str().unwrap(),
+            &[],
+            &no_env
         ));
         assert!(!is_claude_cli_mcp_server(
             "npx",
-            &[
-                "-y".into(),
-                "@modelcontextprotocol/server-filesystem".into()
-            ]
+            &strings(&["-y", "@modelcontextprotocol/server-filesystem"]),
+            &no_env
+        ));
+        assert!(!is_claude_cli_mcp_server(
+            "uvx",
+            &strings(&["claude-design-mcp"]),
+            &no_env
         ));
     }
 
@@ -1387,6 +1742,9 @@ mod tests {
                 if code.starts_with("//") {
                     continue;
                 }
+                for violation in source_line_violations(file, code) {
+                    violations.push(format!("{}:{number}: {violation}", file.display()));
+                }
                 for pattern in FORBIDDEN {
                     if code.contains(pattern) {
                         violations.push(format!("{}:{number}: {pattern}", file.display()));
@@ -1398,6 +1756,74 @@ mod tests {
             violations.is_empty(),
             "claude spawn outside the gate: {violations:#?}"
         );
+    }
+
+    /// Structural rules beyond the literal patterns: the Claude search
+    /// helpers stay private to their owners, and no command, argv or shell
+    /// script outside the gate names `claude`.
+    fn source_line_violations(file: &Path, code: &str) -> Vec<&'static str> {
+        let mut found = Vec::new();
+        let in_file = |name: &str| file.ends_with(name);
+        if code.contains("claude_search_dirs_for_gate(") && !in_file("command_env.rs") {
+            found.push("claude search dirs outside the gate");
+        }
+        if code.contains("claude_binary_display_path(")
+            && !file.ends_with(Path::new("agent_configs").join("detection.rs"))
+        {
+            found.push("Claude display path outside detection");
+        }
+        let names_claude = string_literals(code)
+            .iter()
+            .any(|literal| super::references_claude(literal));
+        if names_claude
+            && (code.contains("Command::new(")
+                || code.contains(".arg(")
+                || code.contains(".args(")
+                || ["\"-c\"", "\"-lc\"", "\"-ic\"", "\"-lic\""]
+                    .iter()
+                    .any(|flag| code.contains(flag)))
+        {
+            found.push("command, argv or shell script naming claude");
+        }
+        if code.contains("Command::new(") && code.to_ascii_lowercase().contains("claude") {
+            found.push("Command::new on a claude-derived value");
+        }
+        found
+    }
+
+    fn string_literals(code: &str) -> Vec<String> {
+        let mut literals = Vec::new();
+        let mut current: Option<String> = None;
+        let mut chars = code.chars();
+        while let Some(character) = chars.next() {
+            match (&mut current, character) {
+                (Some(text), '\\') => {
+                    if let Some(next) = chars.next() {
+                        text.push(next);
+                    }
+                }
+                (Some(_), '"') => literals.push(current.take().unwrap_or_default()),
+                (Some(text), other) => text.push(other),
+                (None, '"') => current = Some(String::new()),
+                (None, _) => {}
+            }
+        }
+        literals
+    }
+
+    #[test]
+    fn source_scan_catches_indirect_claude_spawns() {
+        let file = Path::new("crates/ottto-service/src/control.rs");
+        for line in [
+            "let mut c = Command::new(claude_program);",
+            "Command::new(\"/bin/sh\").args([\"-c\", \"claude doctor\"]);",
+            "command.arg(\"claude\");",
+            "let p = crate::claude_spawn_gate::claude_binary_display_path()?;",
+            "let dirs = crate::command_env::claude_search_dirs_for_gate(&home);",
+        ] {
+            assert!(!source_line_violations(file, line).is_empty(), "{line}");
+        }
+        assert!(source_line_violations(file, "Command::new(\"git\").arg(\"status\");").is_empty());
     }
 
     #[test]

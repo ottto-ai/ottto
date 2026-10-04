@@ -39,7 +39,8 @@ pub fn detect_agent_installation(source: &SourceKind) -> AgentInstallationDetect
     let spec = detection_spec(source, &home);
     if matches!(source, SourceKind::ClaudeCode) {
         // Claude Code is located and probed only through the spawn gate.
-        let binary_path = crate::claude_spawn_gate::claude_binary_display_path();
+        // Display text only; the path is never used to build a command.
+        let binary_path = crate::claude_spawn_gate::claude_binary_display_path().map(PathBuf::from);
         let version = binary_path.as_ref().and_then(|_| claude_version());
         return detect_agent_installation_with_paths(source, spec, binary_path, version);
     }
