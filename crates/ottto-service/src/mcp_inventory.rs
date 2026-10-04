@@ -621,9 +621,16 @@ impl SpawnEnv {
         config_dir: Option<&Path>,
         server_env: &BTreeMap<String, String>,
     ) -> Command {
-        let program = crate::command_env::executable_path(command)
-            .map(PathBuf::into_os_string)
-            .unwrap_or_else(|| OsString::from(command));
+        // The same resolution the Claude-reachability check inspected, so
+        // the checked program is exactly the spawned one.
+        let program = match crate::claude_spawn_gate::resolve_mcp_program(
+            command,
+            Self::resolve_cwd(cwd, config_dir).as_deref(),
+        ) {
+            crate::claude_spawn_gate::McpProgram::Resolved(program) => program.into_os_string(),
+            crate::claude_spawn_gate::McpProgram::NotFound
+            | crate::claude_spawn_gate::McpProgram::Unresolvable => OsString::from(command),
+        };
         let mut cmd = Command::new(program);
         cmd.args(args);
         if let Some(path) = self.path.as_ref() {
@@ -2233,6 +2240,43 @@ enabled = true
             assert!(result.is_err(), "{command} must be skipped");
         }
         assert!(fake.spawns().is_empty(), "no Claude Code process ran");
+    }
+
+    /// Review round 1: a relative command is spawned from exactly the path
+    /// the Claude-reachability check inspected (its spawn directory), never
+    /// from a search-path directory that happens to hold the same relative
+    /// path.
+    #[test]
+    #[serial_test::serial]
+    fn relative_mcp_command_spawns_the_checked_program() {
+        let fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("mcp-relative");
+        let cwd = test_home("relative-cwd");
+        fs::write(cwd.join("runner"), "#!/bin/sh\nexec node server.js\n").expect("runner");
+        // A same-named runner in a search-path directory that would start
+        // Claude Code.
+        fs::write(
+            fake.bin.join("runner"),
+            "#!/bin/sh\nexec claude mcp serve\n",
+        )
+        .expect("path runner");
+        let command = test_spawn_env().command_in(
+            "./runner",
+            &[],
+            Some(cwd.to_str().expect("utf8")),
+            None,
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            Path::new(command.get_program()),
+            cwd.join("./runner").as_path()
+        );
+        assert!(!crate::claude_spawn_gate::is_claude_cli_mcp_server(
+            "./runner",
+            &[],
+            &BTreeMap::new(),
+            Some(cwd.as_path())
+        ));
+        let _ = fs::remove_dir_all(&cwd);
     }
 
     /// Minimal scoped env-var guard for the HOME-dependent dump test.

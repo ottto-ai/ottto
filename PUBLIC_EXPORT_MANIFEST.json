@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 425,
-  "content_sha256": "15a593cd7e3a90315ee656695ce6e1256fa360ac204033416857505edb67c91c",
+  "content_sha256": "b77d38c7e552c08668a623f4718aa90d1fe5e47868987c9e2102a4cf23af25a1",
   "files": [
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_spawn_gate.rs",
-      "sha256": "5a85ef50e32c685d87e0c0f1bc8b18d28c34e6c294406c3409bc3bc12d98572b",
-      "size_bytes": 71651
+      "sha256": "d248a73afa2a8ac38f7a1b3e8250e1c3dd240273134edd645b21bdf13c56bea0",
+      "size_bytes": 72469
     },
     {
       "executable": false,
@@ -839,8 +839,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/mcp_inventory.rs",
-      "sha256": "fb7291be30a735e68002e0c3b73bfde9248cf8abe7acfc5b2203b88b2a073ce3",
-      "size_bytes": 105533
+      "sha256": "0d36d9326621fbc81ef0f1af9ed21700da0881e5564b5229ff8b41cb76aadfd2",
+      "size_bytes": 107299
     },
     {
       "executable": false,
@@ -2978,7 +2978,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-04T06:51:10+00:00",
+  "generated_at": "2026-10-04T06:55:58+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 426,
   "public_roots": [
@@ -3014,5 +3014,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "09774c789ab5915a4f5193c1d93a71f87a01b902"
+  "source_commit": "77b2cbcbff846a34be5e00a430e2a14dac357ab1"
 }

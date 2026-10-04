@@ -847,26 +847,13 @@ pub(crate) fn is_claude_cli_mcp_server(
             return true;
         }
     }
-    let resolved = if path.is_absolute() {
-        Some(path.to_path_buf())
-    } else if path.components().count() > 1 {
-        // A relative path (`./runner`, `bin/server`) runs from the spawn
-        // directory; resolve it exactly there. Unresolvable: refuse below.
-        let base = match spawn_dir {
-            Some(dir) => Some(dir.to_path_buf()),
-            None => std::env::current_dir().ok(),
-        };
-        match base {
-            Some(base) => Some(base.join(path)),
-            None => return true,
-        }
-    } else {
-        crate::command_env::executable_path(command)
-    };
-    let Some(resolved) = resolved else {
+    let resolved = match resolve_mcp_program(command, spawn_dir) {
+        McpProgram::Resolved(program) => program,
+        // A relative path whose spawn directory cannot be known: refuse.
+        McpProgram::Unresolvable => return true,
         // A bare name not on the daemon's search path cannot start: the
         // spawn's `PATH` is that same search path.
-        return false;
+        McpProgram::NotFound => return false,
     };
     let Ok(canonical) = std::fs::canonicalize(&resolved) else {
         return true;
@@ -880,6 +867,36 @@ pub(crate) fn is_claude_cli_mcp_server(
         return true;
     }
     script_references_claude(&canonical)
+}
+
+/// Where a stdio MCP server's program resolves. The MCP inventory spawns
+/// exactly this path, so the check and the spawn can never disagree.
+pub(crate) enum McpProgram {
+    Resolved(PathBuf),
+    /// A bare name that is not on the daemon's search path.
+    NotFound,
+    /// A relative path with no known spawn directory.
+    Unresolvable,
+}
+
+/// Absolute commands as given; relative paths (`./runner`, `bin/server`)
+/// against the server's spawn directory (or the daemon's own working
+/// directory when it has none); bare names on the daemon's search path.
+pub(crate) fn resolve_mcp_program(command: &str, spawn_dir: Option<&Path>) -> McpProgram {
+    let path = Path::new(command);
+    if path.is_absolute() {
+        return McpProgram::Resolved(path.to_path_buf());
+    }
+    if path.components().count() > 1 {
+        let base = match spawn_dir {
+            Some(dir) => Some(dir.to_path_buf()),
+            None => std::env::current_dir().ok(),
+        };
+        return base.map_or(McpProgram::Unresolvable, |base| {
+            McpProgram::Resolved(base.join(path))
+        });
+    }
+    crate::command_env::executable_path(command).map_or(McpProgram::NotFound, McpProgram::Resolved)
 }
 
 /// A whole word `claude` (a path segment or word; `.claude` config dirs and
