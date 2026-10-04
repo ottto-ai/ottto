@@ -24,8 +24,8 @@
 //! workspace so backend scoping joins line up.
 
 use crate::context_footprint::{
-    collect_recent_jsonl_files, cwd_values_from_jsonl, resolve_repository_identity, safe_text,
-    sha256_hex, workspace_label, RepositoryIdentity,
+    collect_recent_jsonl_files, first_existing_cwd_from_jsonl, resolve_repository_identity,
+    safe_text, sha256_hex, workspace_label, RepositoryIdentity,
 };
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::SnapshotSource;
@@ -1325,7 +1325,14 @@ struct WorkspaceScan {
     last_seen: SystemTime,
 }
 
-fn discover_workspaces(root_dir: &Path, now: SystemTime) -> Vec<WorkspaceScan> {
+fn discover_workspaces(
+    root_dir: &Path,
+    now: SystemTime,
+    deadline: Instant,
+) -> Result<Vec<WorkspaceScan>> {
+    if Instant::now() >= deadline {
+        return Err(anyhow!("workspace discovery budget expired"));
+    }
     let mut files = Vec::new();
     collect_recent_jsonl_files(root_dir, now, &mut files);
     files.sort_by_key(|item| std::cmp::Reverse(item.1));
@@ -1333,10 +1340,7 @@ fn discover_workspaces(root_dir: &Path, now: SystemTime) -> Vec<WorkspaceScan> {
     // Map each transcript to a single workspace (its first resolvable cwd).
     let mut by_cwd: BTreeMap<String, WorkspaceScan> = BTreeMap::new();
     for (file, mtime) in files {
-        let Some(cwd) = cwd_values_from_jsonl(&file).into_iter().find(|cwd| {
-            let path = Path::new(cwd);
-            path.is_dir()
-        }) else {
+        let Some(cwd) = first_existing_cwd_from_jsonl(&file, deadline)? else {
             continue;
         };
         let entry = by_cwd.entry(cwd.clone()).or_insert_with(|| WorkspaceScan {
@@ -1355,6 +1359,9 @@ fn discover_workspaces(root_dir: &Path, now: SystemTime) -> Vec<WorkspaceScan> {
     // up. All the scope's transcripts are aggregated into that one snapshot.
     let mut by_scope: BTreeMap<String, WorkspaceScan> = BTreeMap::new();
     for (_, scan) in by_cwd {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("workspace discovery budget expired"));
+        }
         let identity = resolve_repository_identity(&scan.workspace, false);
         let fallback = scan.workspace.to_string_lossy();
         let scope = identity
@@ -1377,7 +1384,10 @@ fn discover_workspaces(root_dir: &Path, now: SystemTime) -> Vec<WorkspaceScan> {
     let mut out: Vec<WorkspaceScan> = by_scope.into_values().collect();
     out.sort_by_key(|scan| std::cmp::Reverse(scan.last_seen));
     out.truncate(MAX_WORKSPACES_PER_CYCLE);
-    out
+    if Instant::now() >= deadline {
+        return Err(anyhow!("workspace discovery budget expired"));
+    }
+    Ok(out)
 }
 
 fn file_date(mtime: SystemTime) -> Date {
@@ -1389,11 +1399,11 @@ fn build_report_for_scan(
     agent_source: SnapshotSource,
     window: DateWindow,
     deadline: Instant,
-) -> WorkspaceReport {
+) -> Option<WorkspaceReport> {
     let mut report = WorkspaceReport::new(window);
     for (file, mtime) in &scan.files {
         if Instant::now() >= deadline {
-            break;
+            return None;
         }
         if fs::metadata(file)
             .map(|m| m.len() > MAX_TRANSCRIPT_BYTES)
@@ -1408,7 +1418,7 @@ fn build_report_for_scan(
             _ => {}
         }
     }
-    report
+    (Instant::now() < deadline).then_some(report)
 }
 
 // -------------------------------------------------------------------------
@@ -1626,19 +1636,21 @@ fn harvest_source(
         Err(_) => true,
     };
 
+    let deadline = Instant::now() + CONTEXT_COMPOSITION_CYCLE_BUDGET;
     let now = SystemTime::now();
     let root_dir = match source {
         SnapshotSource::ClaudeCode => home.join(".claude").join("projects"),
         SnapshotSource::Codex => home.join(".codex").join("sessions"),
         _ => return Ok(()),
     };
-    let workspaces = discover_workspaces(&root_dir, now);
+    // An unresolved transcript can change grouping and full-replacement scope.
+    // Abort before uploads or cache writes; retain last-good workspace data.
+    let workspaces = discover_workspaces(&root_dir, now, deadline)?;
     if workspaces.is_empty() {
         return Ok(());
     }
 
     let window = DateWindow::current();
-    let deadline = Instant::now() + CONTEXT_COMPOSITION_CYCLE_BUDGET;
     let agent_source = agent_source_label(source);
     let mut uploaded = 0usize;
     let mut skipped = 0usize;
@@ -1646,7 +1658,7 @@ fn harvest_source(
 
     for scan in workspaces {
         if Instant::now() >= deadline {
-            break;
+            return Err(anyhow!("context composition report budget expired"));
         }
         let workspace_text = scan.workspace.to_string_lossy();
         let workspace_hash = sha256_hex(&[workspace_text.as_ref()]);
@@ -1659,7 +1671,10 @@ fn harvest_source(
             continue;
         }
 
-        let report = build_report_for_scan(&scan, source, window, deadline);
+        // A budget-limited report must not replace a complete cached report.
+        let Some(report) = build_report_for_scan(&scan, source, window, deadline) else {
+            return Err(anyhow!("context composition report budget expired"));
+        };
         let Some(request) = build_request(
             &report,
             &scan.workspace,
