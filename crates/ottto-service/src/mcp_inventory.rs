@@ -620,6 +620,7 @@ impl SpawnEnv {
         cwd: Option<&str>,
         config_dir: Option<&Path>,
         server_env: &BTreeMap<String, String>,
+        isolated_claude_dir: &Path,
     ) -> Command {
         // The same resolution the Claude-reachability check inspected, so
         // the checked program is exactly the spawned one.
@@ -654,6 +655,16 @@ impl SpawnEnv {
         if let Some(dir) = Self::resolve_cwd(cwd, config_dir) {
             cmd.current_dir(dir);
         }
+        // Last, so neither the provider block nor the server's own env can
+        // undo it: any Claude Code started beneath this server, by any
+        // wrapper, sees only an empty config and no credential variable.
+        crate::claude_spawn_gate::isolate_claude_credentials(&mut cmd, isolated_claude_dir);
+        // Own process group, so a timeout kill reaches every descendant.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         cmd
     }
 }
@@ -677,10 +688,8 @@ fn harvest_stdio(
         server_env,
         spawn_dir.as_deref(),
     ) {
-        // `claude mcp serve` (or the npm Claude Code package) is a
-        // credential-using Claude Code process outside the spawn gate: killing
-        // it at the handshake timeout could interrupt a token refresh and sign
-        // the login out. It is reported unreachable (cost zero), never spawned.
+        // Defence in depth only: every probe already runs credential-isolated.
+        // A server recognised as Claude Code itself is not started at all.
         eprintln!(
             "mcp_harvest_skip reason={}",
             crate::claude_spawn_gate::CLAUDE_CLI_MCP_SERVER_SKIPPED
@@ -689,8 +698,11 @@ fn harvest_stdio(
             crate::claude_spawn_gate::CLAUDE_CLI_MCP_SERVER_SKIPPED
         ));
     }
+    // Lives until this function returns, after the child is reaped.
+    let isolated = crate::claude_spawn_gate::ClaudeIsolatedConfigDir::new()
+        .map_err(|error| anyhow!("isolated Claude config dir failed: {error}"))?;
     let mut child = env
-        .command_in(command, args, cwd, config_dir, server_env)
+        .command_in(command, args, cwd, config_dir, server_env, isolated.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -736,8 +748,7 @@ fn harvest_stdio(
 }
 
 fn reap_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+    crate::claude_spawn_gate::kill_process_group(child);
 }
 
 /// Drive the JSON-RPC handshake over the child's stdio pipes.
@@ -1770,7 +1781,10 @@ enabled = true
 
         let env = SpawnEnv {
             path: Some(OsString::from("/opt/homebrew/bin:/usr/bin")),
-            provider: BTreeMap::from([("ANTHROPIC_API_KEY".to_string(), OsString::from("k"))]),
+            provider: BTreeMap::from([
+                ("ANTHROPIC_API_KEY".to_string(), OsString::from("k")),
+                ("GOOGLE_CLOUD_PROJECT".to_string(), OsString::from("p")),
+            ]),
         };
         // An unresolvable command falls back to the literal name (still spawnable
         // on a machine where it IS on PATH); a resolvable launcher would become an
@@ -1781,6 +1795,7 @@ enabled = true
             None,
             None,
             &BTreeMap::new(),
+            Path::new("/tmp/isolated"),
         );
         assert_eq!(cmd.get_program(), OsStr::new("ottto-not-a-real-binary-xyz"));
         assert_eq!(
@@ -1793,8 +1808,26 @@ enabled = true
             Some(OsStr::new("/opt/homebrew/bin:/usr/bin"))
         );
         assert_eq!(
+            envs.get(OsStr::new("GOOGLE_CLOUD_PROJECT"))
+                .copied()
+                .flatten(),
+            Some(OsStr::new("p"))
+        );
+        // Claude credential selectors never reach an MCP probe (review round
+        // 2): the probe is credential-isolated.
+        assert_eq!(
             envs.get(OsStr::new("ANTHROPIC_API_KEY")).copied().flatten(),
-            Some(OsStr::new("k"))
+            None
+        );
+        assert_eq!(
+            envs.get(OsStr::new("CLAUDE_CONFIG_DIR")).copied().flatten(),
+            Some(OsStr::new("/tmp/isolated"))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("CLAUDE_SECURESTORAGE_CONFIG_DIR"))
+                .copied()
+                .flatten(),
+            Some(OsStr::new("/tmp/isolated"))
         );
     }
 
@@ -1936,7 +1969,14 @@ enabled = true
             path: Some(OsString::from("/opt/homebrew/bin:/usr/bin")),
             provider: BTreeMap::new(),
         };
-        let cmd = env.command_in("true", &[], Some(&dir.to_string_lossy()), None, &server_env);
+        let cmd = env.command_in(
+            "true",
+            &[],
+            Some(&dir.to_string_lossy()),
+            None,
+            &server_env,
+            Path::new("/tmp/isolated"),
+        );
 
         assert_eq!(cmd.get_current_dir(), Some(dir.as_path()));
         let envs: BTreeMap<_, _> = cmd.get_envs().collect();
@@ -1959,6 +1999,7 @@ enabled = true
             Some(&missing.to_string_lossy()),
             None,
             &BTreeMap::new(),
+            Path::new("/tmp/isolated"),
         );
         assert_eq!(cmd.get_current_dir(), None);
 
@@ -2265,6 +2306,7 @@ enabled = true
             Some(cwd.to_str().expect("utf8")),
             None,
             &BTreeMap::new(),
+            Path::new("/tmp/isolated"),
         );
         assert_eq!(
             Path::new(command.get_program()),
@@ -2277,6 +2319,98 @@ enabled = true
             Some(cwd.as_path())
         ));
         let _ = fs::remove_dir_all(&cwd);
+    }
+
+    /// Review round 2: every MCP probe runs credential-isolated. A wrapper
+    /// the denylist does not recognise starts a (fake) `claude`; that nested
+    /// Claude sees only an empty isolated config and secure-storage dir and
+    /// none of the ambient credential selectors, so it cannot reach, refresh
+    /// or sign out a real login.
+    #[test]
+    #[serial_test::serial]
+    fn nested_claude_under_an_mcp_wrapper_sees_only_isolated_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("mcp-isolation");
+        let capture = fake.root.join("nested-claude-env.txt");
+        // A fake `claude` that records what credential environment it got.
+        let claude = fake.bin.join("claude");
+        fs::write(
+            &claude,
+            format!(
+                "#!/bin/sh\n{{\necho \"config=$CLAUDE_CONFIG_DIR\"\necho \"securestorage=$CLAUDE_SECURESTORAGE_CONFIG_DIR\"\necho \"oauth=${{CLAUDE_CODE_OAUTH_TOKEN-unset}}\"\necho \"apikey=${{ANTHROPIC_API_KEY-unset}}\"\necho \"profile=${{ANTHROPIC_PROFILE-unset}}\"\n[ -n \"$(ls -A \"$CLAUDE_CONFIG_DIR\" 2>/dev/null)\" ] && echo config_not_empty\n}} > '{}'\n",
+                capture.display()
+            ),
+        )
+        .expect("fake claude");
+        // A wrapper whose text does not name Claude, so only isolation stands
+        // between it and a real login.
+        let wrapper = fake.root.join("wrapper-mcp");
+        fs::write(
+            &wrapper,
+            "#!/bin/sh\nexec \"$(printf 'cl%sude' a)\" mcp serve\n",
+        )
+        .expect("wrapper");
+        for path in [&claude, &wrapper] {
+            let mut permissions = fs::metadata(path).expect("meta").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).expect("chmod");
+        }
+        let _ambient = [
+            EnvGuard::set("CLAUDE_CONFIG_DIR", "/tmp/real-slot"),
+            EnvGuard::set("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/tmp/real-expired-login"),
+            EnvGuard::set("CLAUDE_CODE_OAUTH_TOKEN", "fixture-real-token"),
+            EnvGuard::set("ANTHROPIC_API_KEY", "fixture-real-key"),
+            EnvGuard::set("ANTHROPIC_PROFILE", "fixture-profile"),
+        ];
+        let env = SpawnEnv {
+            path: Some(fake.bin.clone().into_os_string()),
+            provider: BTreeMap::from([(
+                "ANTHROPIC_API_KEY".to_string(),
+                OsString::from("fixture-provider-key"),
+            )]),
+        };
+        assert!(!crate::claude_spawn_gate::is_claude_cli_mcp_server(
+            wrapper.to_str().expect("utf8"),
+            &[],
+            &BTreeMap::new(),
+            None
+        ));
+        // The fake server is not MCP: the handshake fails, which is fine.
+        let _ = harvest_stdio(
+            wrapper.to_str().expect("utf8"),
+            &[],
+            &env,
+            None,
+            None,
+            &BTreeMap::new(),
+        );
+        let observed = fs::read_to_string(&capture).expect("nested claude ran");
+        let value = |key: &str| {
+            observed
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key}=")))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let config = value("config");
+        assert!(
+            config.contains("ottto-claude-isolated-"),
+            "isolated config dir: {config}"
+        );
+        assert_eq!(
+            value("securestorage"),
+            config,
+            "secure storage pinned to it"
+        );
+        assert_eq!(value("oauth"), "unset");
+        assert_eq!(value("apikey"), "unset");
+        assert_eq!(value("profile"), "unset");
+        assert!(!observed.contains("config_not_empty"));
+        assert!(!observed.contains("/tmp/real-"));
+        assert!(
+            !Path::new(&config).exists(),
+            "the isolated dir is removed after the probe"
+        );
     }
 
     /// Minimal scoped env-var guard for the HOME-dependent dump test.

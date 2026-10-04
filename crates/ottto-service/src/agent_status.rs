@@ -3013,27 +3013,43 @@ impl ClaudeAlternativeAuth {
     }
 }
 
-/// Whether the default login authenticates without OAuth, from the settings
-/// chain (`apiKeyHelper`, or `env` keys) or the ambient environment: Bedrock
-/// or Vertex (`CLAUDE_CODE_USE_BEDROCK`/`CLAUDE_CODE_USE_VERTEX`), else an API
-/// key (`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, `apiKeyHelper`). Only
-/// presence is read; no value is kept.
+/// Whether the default login authenticates without OAuth, following Claude
+/// Code 2.1.288's own rules (read statically from its source):
+///
+/// - Settings layers are applied low to high (`user`, `project`, `local`,
+///   `flag`, `policy`); the highest layer that defines a value wins, and the
+///   settings `env` overrides the process environment. `paths` must be ordered
+///   lowest precedence first. `ambient` is the daemon's own environment,
+///   consulted last.
+/// - `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX` route all inference.
+/// - `ANTHROPIC_AUTH_TOKEN` and `apiKeyHelper` are used ahead of OAuth.
+/// - `ANTHROPIC_API_KEY` is used in an interactive session only once the user
+///   approved it (its last 20 characters are in `.claude.json`
+///   `customApiKeyResponses.approved`); otherwise only when no OAuth login is
+///   usable. A Max user who declined the key stays on the subscription.
+///
+/// Only presence (and, for the API key, the approval suffix compared in
+/// memory) is read; no value is kept.
 fn claude_default_alternative_auth(
     paths: &[(String, PathBuf)],
     ambient: &dyn Fn(&str) -> Option<String>,
+    oauth_usable: bool,
+    approved_api_key_suffixes: &[String],
 ) -> Option<ClaudeAlternativeAuth> {
-    let settings = paths
+    // Highest precedence first.
+    let layers = paths
         .iter()
+        .rev()
         .filter_map(|(_, path)| {
             fs::read_to_string(path)
                 .ok()
                 .and_then(|body| serde_json::from_str::<Value>(&body).ok())
         })
         .collect::<Vec<_>>();
-    let present = |value: Option<&Value>| match value {
-        Some(Value::String(text)) => !text.trim().is_empty(),
-        Some(Value::Null) | None => false,
-        Some(_) => true,
+    let present = |value: &Value| match value {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Null => false,
+        _ => true,
     };
     let truthy = |value: Option<String>| {
         value.is_some_and(|text| {
@@ -3042,19 +3058,19 @@ fn claude_default_alternative_auth(
         })
     };
     let env_value = |key: &str| {
-        ambient(key).or_else(|| {
-            settings.iter().find_map(|value| {
-                value
+        layers
+            .iter()
+            .find_map(|layer| {
+                layer
                     .get("env")
                     .and_then(|env| env.get(key))
-                    .and_then(|value| match value {
-                        Value::String(text) => Some(text.clone()),
-                        Value::Bool(flag) => Some(flag.to_string()),
-                        Value::Number(number) => Some(number.to_string()),
-                        _ => None,
+                    .map(|value| match value {
+                        Value::String(text) => text.clone(),
+                        Value::Null => String::new(),
+                        other => other.to_string(),
                     })
             })
-        })
+            .or_else(|| ambient(key))
     };
     if truthy(env_value("CLAUDE_CODE_USE_BEDROCK")) {
         return Some(ClaudeAlternativeAuth::Bedrock);
@@ -3062,17 +3078,61 @@ fn claude_default_alternative_auth(
     if truthy(env_value("CLAUDE_CODE_USE_VERTEX")) {
         return Some(ClaudeAlternativeAuth::Vertex);
     }
-    let api_key = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
-        .into_iter()
-        .any(|key| env_value(key).is_some_and(|value| !value.trim().is_empty()))
-        || settings
-            .iter()
-            .any(|value| present(value.get("apiKeyHelper")));
-    api_key.then_some(ClaudeAlternativeAuth::ApiKey)
+    let auth_token =
+        env_value("ANTHROPIC_AUTH_TOKEN").is_some_and(|value| !value.trim().is_empty());
+    let api_key_helper = layers
+        .iter()
+        .find_map(|layer| layer.get("apiKeyHelper"))
+        .is_some_and(present);
+    if auth_token || api_key_helper {
+        return Some(ClaudeAlternativeAuth::ApiKey);
+    }
+    let api_key_active = env_value("ANTHROPIC_API_KEY").is_some_and(|key| {
+        let key = key.trim();
+        !key.is_empty()
+            && (!oauth_usable || {
+                let suffix = key
+                    .char_indices()
+                    .rev()
+                    .nth(19)
+                    .map_or(key, |(index, _)| &key[index..]);
+                approved_api_key_suffixes
+                    .iter()
+                    .any(|approved| approved == suffix)
+            })
+    });
+    api_key_active.then_some(ClaudeAlternativeAuth::ApiKey)
 }
 
-fn claude_default_alternative_auth_now() -> Option<ClaudeAlternativeAuth> {
-    claude_default_alternative_auth(&claude_settings_paths(), &|key| std::env::var(key).ok())
+/// `.claude.json` `customApiKeyResponses.approved`: suffixes of API keys the
+/// user accepted in Claude Code.
+fn claude_approved_api_key_suffixes(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        .and_then(|value| {
+            value
+                .get("customApiKeyResponses")?
+                .get("approved")?
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn claude_default_alternative_auth_now(oauth_usable: bool) -> Option<ClaudeAlternativeAuth> {
+    claude_default_alternative_auth(
+        &claude_settings_paths(),
+        &|key| std::env::var(key).ok(),
+        oauth_usable,
+        &claude_approved_api_key_suffixes(&claude_cli_config_path()),
+    )
 }
 
 /// `slot_owned_bindings` names exact account+organization bindings that a
@@ -3119,7 +3179,10 @@ fn collect_claude_status(
     );
     // Claude Code uses a configured Bedrock/Vertex route or API key ahead of
     // the stored OAuth login, so it is evaluated first.
-    let alternative = claude_default_alternative_auth_now();
+    let alternative = claude_default_alternative_auth_now(matches!(
+        login_state,
+        ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending
+    ));
     match login_state {
         ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending => {
             snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
@@ -30921,10 +30984,9 @@ exit 44
         fs::write(&env_key, r#"{"env":{"ANTHROPIC_API_KEY":"x"}}"#).expect("env");
         let paths = |path: &Path| vec![("settings".to_string(), path.to_path_buf())];
         let none = |_: &str| None;
-        let detect = |path: &Path| claude_default_alternative_auth(&paths(path), &none);
+        let detect = |path: &Path| claude_default_alternative_auth(&paths(path), &none, true, &[]);
         assert_eq!(detect(&plain), None);
         assert_eq!(detect(&helper), Some(ClaudeAlternativeAuth::ApiKey));
-        assert_eq!(detect(&env_key), Some(ClaudeAlternativeAuth::ApiKey));
         assert_eq!(detect(&root.join("missing.json")), None);
         let bedrock = root.join("bedrock.json");
         fs::write(&bedrock, r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#).expect("bedrock");
@@ -30932,11 +30994,57 @@ exit 44
         let vertex_off = root.join("vertex-off.json");
         fs::write(&vertex_off, r#"{"env":{"CLAUDE_CODE_USE_VERTEX":"0"}}"#).expect("vertex");
         assert_eq!(detect(&vertex_off), None);
-        // The ambient environment counts too.
-        let ambient = |key: &str| (key == "ANTHROPIC_API_KEY").then(|| "x".to_string());
+
+        // Review round 2: the highest settings layer wins. Managed settings
+        // turning Bedrock off override user settings turning it on.
+        let managed_off = root.join("managed.json");
+        fs::write(&managed_off, r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"0"}}"#).expect("managed");
+        let layered = vec![
+            ("user".to_string(), bedrock.clone()),
+            ("managed".to_string(), managed_off.clone()),
+        ];
         assert_eq!(
-            claude_default_alternative_auth(&paths(&plain), &ambient),
+            claude_default_alternative_auth(&layered, &none, false, &[]),
+            None
+        );
+        let reversed = vec![
+            ("user".to_string(), managed_off.clone()),
+            ("managed".to_string(), bedrock.clone()),
+        ];
+        assert_eq!(
+            claude_default_alternative_auth(&reversed, &none, false, &[]),
+            Some(ClaudeAlternativeAuth::Bedrock)
+        );
+        // Settings env outranks the ambient environment.
+        let ambient_bedrock =
+            |key: &str| (key == "CLAUDE_CODE_USE_BEDROCK").then(|| "1".to_string());
+        assert_eq!(
+            claude_default_alternative_auth(&paths(&managed_off), &ambient_bedrock, false, &[]),
+            None
+        );
+
+        // Review round 2: ANTHROPIC_API_KEY outranks a usable OAuth login only
+        // once approved in Claude Code; otherwise only without OAuth.
+        let key = "sk-ant-fixture-0123456789abcdefghijklmnop";
+        let suffix = key[key.len() - 20..].to_string();
+        let ambient_key = |name: &str| (name == "ANTHROPIC_API_KEY").then(|| key.to_string());
+        assert_eq!(
+            claude_default_alternative_auth(&paths(&plain), &ambient_key, true, &[]),
+            None,
+            "a declined or unapproved key leaves the subscription login in charge"
+        );
+        assert_eq!(
+            claude_default_alternative_auth(&paths(&plain), &ambient_key, true, &[suffix]),
             Some(ClaudeAlternativeAuth::ApiKey)
+        );
+        assert_eq!(
+            claude_default_alternative_auth(&paths(&plain), &ambient_key, false, &[]),
+            Some(ClaudeAlternativeAuth::ApiKey)
+        );
+        assert_eq!(
+            claude_default_alternative_auth(&paths(&env_key), &none, true, &[]),
+            None,
+            "settings env ANTHROPIC_API_KEY follows the same approval rule"
         );
         let _ = fs::remove_dir_all(root);
     }

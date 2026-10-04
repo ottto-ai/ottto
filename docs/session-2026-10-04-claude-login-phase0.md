@@ -82,7 +82,7 @@ forbidden in these tests.
   a renamed copy (realpath compare), the npm package, any shell, an
   interpreter with an inline script, a script naming Claude, or argv/env
   referencing `claude`/`CLAUDE_CONFIG_DIR`. They carry a new optional
-  `skipped_reason` field instead of looking unreachable.
+  `skipped_reason` field (they are still sent as `reachable: false`).
 - A permit's clock starts at the credential read, and a credential-using
   permit re-reads and re-evaluates the login immediately before `spawn()`.
 - No `security` tool means the login cannot be confirmed (`Unreadable`), never
@@ -97,3 +97,23 @@ forbidden in these tests.
   scripts that name `claude`, and the Claude search helpers outside their
   owners.
 - Deadline kills send SIGTERM and wait three seconds before SIGKILL.
+
+## Review round 2 (owner design change: isolate by environment)
+
+- **MCP probes run credential-isolated** instead of relying on an ever-longer
+  denylist: a fresh empty per-probe dir is both `CLAUDE_CONFIG_DIR` and
+  `CLAUDE_SECURESTORAGE_CONFIG_DIR` (in 2.1.288 the latter picks the keychain
+  service `Claude Code-credentials-<sha256(dir)[..8]>` and the
+  `.credentials.json` dir; `.claude.json` and user settings live under the
+  former), and every credential/config selector Claude Code reads is removed,
+  after the server's own env. The whole process group is killed at the
+  deadline. The denylist stays as defence in depth, with no new patterns.
+- **Admitted runs** are pinned to exactly the admitted login (the same
+  selector list removed; only the slot's `CLAUDE_CONFIG_DIR` set), add
+  `--settings '{"disableAllHooks":true}'` (verified statically: `--settings`
+  takes a JSON string, and `disableAllHooks` there switches off every
+  non-managed hook), and run in their own process group.
+- **Settings precedence** follows the CLI (user < project < local < flag <
+  policy; settings `env` over the process environment), and
+  `ANTHROPIC_API_KEY` outranks a usable OAuth login only when its last 20
+  characters are in `.claude.json` `customApiKeyResponses.approved`.

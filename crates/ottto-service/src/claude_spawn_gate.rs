@@ -60,7 +60,7 @@ const REFRESH_LOCK_FILE: &str = ".oauth_refresh.lock";
 /// `--mcp-config` uses none (Claude Code 2.1.288: "Only use MCP servers from
 /// --mcp-config, ignoring all other MCP configurations"; with an enterprise
 /// MCP config present Claude Code refuses to start, which fails closed).
-pub(crate) fn claude_smoke_argv() -> [&'static str; 7] {
+pub(crate) fn claude_smoke_argv() -> [&'static str; 9] {
     [
         "-p",
         crate::control::SMOKE_PROMPT,
@@ -69,8 +69,19 @@ pub(crate) fn claude_smoke_argv() -> [&'static str; 7] {
         "--disallowedTools",
         "*",
         STRICT_MCP_FLAG,
+        SETTINGS_FLAG,
+        DISABLE_ALL_HOOKS_SETTINGS,
     ]
 }
+
+/// `--settings` accepts a JSON string (2.1.288: "Path to a settings JSON file
+/// or a JSON string to load additional settings from"). `disableAllHooks`
+/// there switches off every hook and statusLine from user, project, local and
+/// plugin settings ("All hooks are switched off in your user settings or
+/// --settings file (disableAllHooks)"), so no hook can start another Claude
+/// Code beneath an admitted process. Managed-policy hooks still run.
+const SETTINGS_FLAG: &str = "--settings";
+const DISABLE_ALL_HOOKS_SETTINGS: &str = r#"{"disableAllHooks":true}"#;
 
 /// The official browser sign-in argv.
 pub(crate) const CLAUDE_BROWSER_LOGIN_ARGV: [&str; 3] = ["auth", "login", "--claudeai"];
@@ -83,25 +94,125 @@ const STRICT_MCP_FLAG: &str = "--strict-mcp-config";
 /// be a credential-using Claude Code (`claude mcp serve` under another
 /// `CLAUDE_CONFIG_DIR`) that this gate never evaluated. MCP tool costs come
 /// from the separate MCP inventory instead.
-pub(crate) fn claude_context_argv() -> [&'static str; 5] {
+pub(crate) fn claude_context_argv() -> [&'static str; 7] {
     [
         CONTEXT_ARGV[0],
         CONTEXT_ARGV[1],
         CONTEXT_ARGV[2],
         CONTEXT_ARGV[3],
         STRICT_MCP_FLAG,
+        SETTINGS_FLAG,
+        DISABLE_ALL_HOOKS_SETTINGS,
     ]
 }
 
-/// Token-carrying variables that would make the child use a credential other
-/// than the target's stored login, or none the gate evaluated.
-const STRIPPED_TOKEN_ENV: &[&str] = &[
+/// Every credential and config selector Claude Code 2.1.288 reads, found
+/// statically in its source (its own list of credential-bearing variables
+/// plus the secure-storage selector). `CLAUDE_SECURESTORAGE_CONFIG_DIR`
+/// chooses the keychain service (`Claude Code-credentials-<sha256(dir)[..8]>`)
+/// and `.credentials.json` directory independently of `CLAUDE_CONFIG_DIR`;
+/// the rest are API keys, OAuth/session tokens, federation identities,
+/// profiles, host-managed credentials and settings overrides that could carry
+/// an `apiKeyHelper`. A Claude process the daemon starts sees none of them:
+/// admitted runs are pinned to the evaluated login, everything else is
+/// isolated in an empty config.
+pub(crate) const CLAUDE_CREDENTIAL_SELECTORS: &[&str] = &[
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    "ANTHROPIC_CONFIG_DIR",
+    "ANTHROPIC_PROFILE",
+    "CLAUDE_CODE_FEDERATION_CACHE_DIR",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_AWS_API_KEY",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+    "ANTHROPIC_IDENTITY_TOKEN",
+    "ANTHROPIC_IDENTITY_TOKEN_FILE",
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_WORKSPACE_ID",
+    "ANTHROPIC_SERVICE_ACCOUNT_ID",
+    "ANTHROPIC_SCOPE",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "AWS_BEARER_TOKEN_BEDROCK",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
-    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
+    "CLAUDE_CODE_OAUTH_CLIENT_ID",
+    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+    "CLAUDE_SESSION_INGRESS_TOKEN_FILE",
+    "CLAUDE_CODE_HOST_CREDS_FILE",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
+    "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+    "CLAUDE_CODE_ENABLE_PROXY_AUTH_HELPER",
+    "CLAUDE_CODE_REMOTE_SETTINGS_PATH",
+    "CLAUDE_CODE_MANAGED_SETTINGS_PATH",
+    "CLAUDE_CODE_MOCK_REMOTE_SETTINGS",
+    "USE_LOCAL_OAUTH",
+    "USE_STAGING_OAUTH",
+    "CLAUDE_BRIDGE_OAUTH_TOKEN",
+    "CLAUDE_TRUSTED_DEVICE_TOKEN",
+];
+/// Selector families removed by prefix from the ambient environment.
+const CLAUDE_CREDENTIAL_SELECTOR_PREFIXES: &[&str] = &[
+    "CLAUDE_CODE_OAUTH_",
+    "CLAUDE_BG_",
+    "CLAUDE_LOCAL_OAUTH_",
+    "CLAUDE_BRIDGE_",
 ];
 const STRIPPED_TOKEN_ENV_PREFIX: &str = "CLAUDE_CODE_OAUTH_";
+
+fn is_credential_selector(key: &str) -> bool {
+    CLAUDE_CREDENTIAL_SELECTORS.contains(&key)
+        || CLAUDE_CREDENTIAL_SELECTOR_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+}
+
+/// Remove every credential/config selector the command would otherwise pass
+/// on, whether set on the command or inherited from the daemon.
+fn remove_credential_selectors(command: &mut Command) {
+    let explicit = command
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|_| key.to_os_string()))
+        .collect::<Vec<_>>();
+    let ambient = std::env::vars_os().map(|(key, _)| key);
+    for key in explicit.into_iter().chain(ambient) {
+        if key.to_str().is_some_and(is_credential_selector) {
+            command.env_remove(key);
+        }
+    }
+    for key in CLAUDE_CREDENTIAL_SELECTORS {
+        command.env_remove(key);
+    }
+}
+
+/// Pin an admitted command to exactly the login the gate evaluated: the
+/// registered slot's config dir (which also selects its keychain item), or no
+/// selector at all for the default login.
+fn pin_claude_credentials(command: &mut Command, config_dir: Option<&str>) {
+    remove_credential_selectors(command);
+    if let Some(config_dir) = config_dir {
+        command.env("CLAUDE_CONFIG_DIR", config_dir);
+    }
+}
+
+/// Isolate a process the daemon starts but does not admit (an MCP server
+/// probe): any Claude Code started beneath it, by any wrapper, finds an empty
+/// config and secure-storage dir (a keychain service no login uses, no
+/// `.claude.json`, no settings) and no credential variable, so it cannot
+/// refresh, or sign out, a real login.
+pub(crate) fn isolate_claude_credentials(command: &mut Command, empty_dir: &Path) {
+    remove_credential_selectors(command);
+    command
+        .env("CLAUDE_CONFIG_DIR", empty_dir)
+        .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", empty_dir);
+}
 /// Presentation-only variables a caller may add to an admitted command.
 const TERMINAL_ENV: &[&str] = &["TERM", "NO_COLOR", "FORCE_COLOR"];
 
@@ -399,10 +510,7 @@ impl ClaudeSpawnPermit {
         values: &std::collections::BTreeMap<String, OsString>,
     ) -> &mut Self {
         for (key, value) in values {
-            if crate::command_env::is_provider_env_key(key)
-                && !STRIPPED_TOKEN_ENV.contains(&key.as_str())
-                && !key.starts_with(STRIPPED_TOKEN_ENV_PREFIX)
-            {
+            if crate::command_env::is_provider_env_key(key) && !is_credential_selector(key) {
                 self.command.env(key, value);
             }
         }
@@ -463,17 +571,83 @@ fn evidence_within_spawn_window(read_at: Instant, read_wall: SystemTime) -> bool
 pub(crate) fn terminate_gracefully(child: &mut Child) {
     #[cfg(unix)]
     {
-        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // Admitted children lead their own process group (pgid == pid).
+        let group = libc::pid_t::try_from(child.id()).ok();
+        if let Some(group) = group {
             unsafe {
-                libc::kill(pid, libc::SIGTERM);
+                libc::killpg(group, libc::SIGTERM);
             }
         }
         let grace = Instant::now() + TERMINATE_GRACE;
         while Instant::now() < grace {
             if child.try_wait().ok().flatten().is_some() {
-                return;
+                break;
             }
             thread::sleep(PROCESS_POLL_INTERVAL);
+        }
+        if let Some(group) = group {
+            unsafe {
+                libc::killpg(group, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A fresh, empty, owner-only directory used as `CLAUDE_CONFIG_DIR` and
+/// `CLAUDE_SECURESTORAGE_CONFIG_DIR` for one isolated probe. Removed on drop.
+pub(crate) struct ClaudeIsolatedConfigDir {
+    path: PathBuf,
+}
+
+impl ClaudeIsolatedConfigDir {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for _ in 0..16 {
+            let path = std::env::temp_dir().join(format!(
+                "ottto-claude-isolated-{}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                OffsetDateTime::now_utc().unix_timestamp_nanos()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+                    }
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create an isolated Claude config dir",
+        ))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ClaudeIsolatedConfigDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Kill a whole process group immediately (MCP inventory probes, which run
+/// credential-isolated and so hold no real login to save).
+pub(crate) fn kill_process_group(child: &mut Child) {
+    #[cfg(unix)]
+    if let Ok(group) = libc::pid_t::try_from(child.id()) {
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
         }
     }
     let _ = child.kill();
@@ -717,24 +891,12 @@ fn build_command(
         }
     }
     // The evaluated credential is exactly the one the child uses.
-    match target.config_dir() {
-        Some(config_dir) => {
-            command.env("CLAUDE_CONFIG_DIR", config_dir);
-        }
-        None => {
-            command.env_remove("CLAUDE_CONFIG_DIR");
-        }
-    }
-    for key in STRIPPED_TOKEN_ENV {
-        command.env_remove(key);
-    }
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_str()
-            .is_some_and(|key| key.starts_with(STRIPPED_TOKEN_ENV_PREFIX))
-        {
-            command.env_remove(key);
-        }
+    pin_claude_credentials(&mut command, target.config_dir());
+    // Own process group, so a deadline kill reaches every descendant.
+    #[cfg(unix)]
+    if !matches!(class, ClaudeSpawnClass::BrowserLogin) {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
     }
     Ok(command)
 }
@@ -1384,6 +1546,13 @@ mod tests {
                 EnvGuard::set("OTTTO_COMMAND_SEARCH_PATH", bin.as_os_str()),
                 EnvGuard::set("CLAUDE_CODE_OAUTH_TOKEN", "fixture-ambient-token"),
                 EnvGuard::set("CLAUDE_CONFIG_DIR", "/tmp/ambient-claude-config"),
+                EnvGuard::set(
+                    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+                    "/tmp/ambient-expired-login",
+                ),
+                EnvGuard::set("ANTHROPIC_API_KEY", "fixture-ambient-key"),
+                EnvGuard::set("ANTHROPIC_PROFILE", "fixture-profile"),
+                EnvGuard::set("CLAUDE_BG_AUTH_SNAPSHOT_PATH", "/tmp/fixture-snapshot"),
             ]
             .into_iter()
             .flatten()
@@ -1509,6 +1678,19 @@ mod tests {
         assert_eq!(env_value(command, "CLAUDE_CONFIG_DIR"), Some(None));
         assert_eq!(env_value(command, "CLAUDE_CODE_OAUTH_TOKEN"), Some(None));
         assert_eq!(evidence.reads.get(), 2);
+        // Review round 2: every other credential selector is pinned away, for
+        // the registered slot and the default login alike.
+        for permit in [&permit, &default] {
+            let command = permit.command_for_tests();
+            for key in [
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_PROFILE",
+                "CLAUDE_BG_AUTH_SNAPSHOT_PATH",
+            ] {
+                assert_eq!(env_value(command, key), Some(None), "{key}");
+            }
+        }
     }
 
     /// A permit held across sleep (wall clock moved, monotonic clock did not)
@@ -1668,7 +1850,19 @@ mod tests {
             "--disallowedTools",
             "*",
         ];
-        for argv in [&CONTEXT_ARGV[..], &unsafe_smoke[..]] {
+        // Review round 2: strict MCP without the hooks switch is refused too.
+        let strict_without_hooks_off = [
+            CONTEXT_ARGV[0],
+            CONTEXT_ARGV[1],
+            CONTEXT_ARGV[2],
+            CONTEXT_ARGV[3],
+            STRICT_MCP_FLAG,
+        ];
+        for argv in [
+            &CONTEXT_ARGV[..],
+            &unsafe_smoke[..],
+            &strict_without_hooks_off[..],
+        ] {
             assert_eq!(
                 admit_with(ClaudeSpawnTarget::Default, class, argv, evidence.clone()).err(),
                 Some(ClaudeSpawnRefusal::ArgvNotAllowed),
@@ -1676,8 +1870,15 @@ mod tests {
             );
         }
         for argv in [&claude_context_argv()[..], &claude_smoke_argv()[..]] {
-            assert_eq!(argv.last(), Some(&STRICT_MCP_FLAG));
+            assert!(argv.contains(&STRICT_MCP_FLAG));
             assert!(!argv.contains(&"--mcp-config"));
+            let settings = argv
+                .iter()
+                .position(|arg| *arg == SETTINGS_FLAG)
+                .expect("--settings");
+            let value: serde_json::Value =
+                serde_json::from_str(argv[settings + 1]).expect("settings JSON");
+            assert_eq!(value["disableAllHooks"], serde_json::json!(true));
             assert!(admit_with(ClaudeSpawnTarget::Default, class, argv, evidence.clone()).is_ok());
         }
     }

@@ -25642,7 +25642,7 @@ mod tests {
         assert_eq!(
             fake.spawns(),
             vec![format!(
-                "|-p {SMOKE_PROMPT} --name ottto test --disallowedTools * --strict-mcp-config"
+                "|-p {SMOKE_PROMPT} --name ottto test --disallowedTools * --strict-mcp-config --settings {{\"disableAllHooks\":true}}"
             )]
         );
     }

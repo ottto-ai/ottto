@@ -307,11 +307,15 @@ stores, logs or uploads it.
   marked stale, and says when the sign-in expired. Ottto sends no usage request
   with an expired token.
 
-For the default login, a configured Bedrock or Vertex route or an API key
-(`apiKeyHelper`, or `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` in the settings
-`env` or the environment) is checked first, as Claude Code does: the login then
-reads as signed in with that method even when the OAuth item is missing or
-cleared.
+For the default login, Claude Code's own precedence is checked first. Settings
+layers apply from user to managed (the highest layer that sets a value wins,
+and settings `env` outranks the daemon's environment). A Bedrock or Vertex
+route, `ANTHROPIC_AUTH_TOKEN` or an `apiKeyHelper` is used ahead of OAuth.
+`ANTHROPIC_API_KEY` outranks a usable OAuth login only once the user approved
+that key in Claude Code (`.claude.json` `customApiKeyResponses.approved`);
+otherwise it counts only when there is no usable OAuth login, so a Max user
+who declined a key stays on the subscription. The login then reads as signed
+in with that method even when the OAuth item is missing or cleared.
 
 The decision uses a fresh read on every pass, never a persisted deadline. When
 Claude Code refreshes the login (or the customer signs in again), the next pass
@@ -341,8 +345,14 @@ Every daemon spawn of the Claude Code CLI goes through one gate:
   Ottto-managed auth root. A reconnect runs it in place; cancelling it can
   leave the slot signed out instead of merely expired.
 - The `-p /context` footprint read and the Verify smoke prompt, both with
-  `--strict-mcp-config` and no `--mcp-config`, so no user MCP server starts
-  beneath them. At admission and again immediately before the spawn the gate
+  `--strict-mcp-config` and no `--mcp-config` (no user MCP server starts
+  beneath them) and `--settings '{"disableAllHooks":true}'` (no user, project
+  or plugin hook runs; managed-policy hooks still do). Their environment is
+  pinned to exactly the admitted login: the slot's `CLAUDE_CONFIG_DIR`, or
+  none for the default login, with every other credential or config selector
+  Claude Code reads (`CLAUDE_SECURESTORAGE_CONFIG_DIR`, API keys, OAuth and
+  session tokens, profiles, settings overrides) removed. Each runs in its own
+  process group. At admission and again immediately before the spawn the gate
   reads that login and refuses unless the access token stays valid for Claude
   Code's 5-minute refresh window, a 10-minute margin and the command's whole
   runtime; it also refuses on a failed read, a missing deadline, a missing
@@ -354,12 +364,18 @@ Every daemon spawn of the Claude Code CLI goes through one gate:
   open Claude Code once, then Verify.
 
 Nothing else (`auth status`, `doctor`, `setup-token`, `mcp serve`) can be
-spawned. The MCP inventory never starts a server that can reach the Claude
-Code CLI: a `claude` command, a renamed copy of it, the npm package, any
-shell, an interpreter running an inline script, a script that names Claude, or
-an argv/env referencing `claude` or `CLAUDE_CONFIG_DIR`. Such a server is
-reported with `skipped_reason: claude_cli_mcp_server_skipped` instead of being
-started.
+spawned. Every MCP server the inventory probes runs credential-isolated:
+`CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` point at a fresh,
+empty, per-probe directory (so a nested Claude Code finds no `.claude.json`,
+no settings and a keychain service no login uses) and every other credential
+selector is removed, applied after the server's own env. A Claude Code started
+beneath it by any wrapper therefore cannot refresh, or sign out, a real login.
+The whole process group is killed at the handshake deadline. As defence in
+depth, a server recognised as Claude Code itself (a `claude` command or
+renamed copy, the npm package, a shell, an inline-script interpreter, a script
+naming Claude, or argv/env naming `claude`/`CLAUDE_CONFIG_DIR`) is not started;
+it carries `skipped_reason: claude_cli_mcp_server_skipped` and is still sent as
+`reachable: false`.
 
 Residual risks the gate cannot remove: a server-side 401 makes Claude Code
 refresh regardless of the local clock; a backward clock jump of more than

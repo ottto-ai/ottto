@@ -1355,7 +1355,10 @@ mod tests {
         run_claude_context(&workspace, &env).expect("admitted an hour out");
         assert_eq!(
             fake.spawns(),
-            vec!["|-p /context --output-format json --strict-mcp-config".to_string()]
+            vec![
+                "|-p /context --output-format json --strict-mcp-config --settings {\"disableAllHooks\":true}"
+                    .to_string()
+            ]
         );
 
         fake.default_login_expires_in(time::Duration::minutes(10));
@@ -1374,7 +1377,8 @@ mod tests {
     #[test]
     fn every_context_run_starts_no_mcp_server() {
         let argv = crate::claude_spawn_gate::claude_context_argv();
-        assert_eq!(argv.last(), Some(&"--strict-mcp-config"));
+        assert!(argv.contains(&"--strict-mcp-config"));
+        assert!(argv.contains(&"--settings"), "hooks are switched off too");
         assert!(!argv.contains(&"--mcp-config"));
         assert!(CONTEXT_CYCLE_BUDGET >= CONTEXT_COMMAND_TIMEOUT * MAX_WORKSPACES_PER_CYCLE as u32);
     }
