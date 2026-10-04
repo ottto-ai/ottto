@@ -2,6 +2,7 @@ pub mod active_sessions;
 pub mod adaptive_collector;
 pub mod agent_configs;
 pub mod agent_status;
+pub mod agent_status_refresh;
 pub mod backfill;
 pub mod canonical_json;
 pub mod claude_browser_auth;
@@ -1205,22 +1206,40 @@ impl LocalDaemon {
         let collections = sources
             .iter()
             .map(|source| {
-                agent_status::collect_agent_status_collection(
+                agent_status_refresh::collection(
                     source,
                     captured_at.clone(),
                     expires_at.clone(),
+                    true,
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let snapshots = collections
             .iter()
             .flat_map(|collection| collection.snapshots.iter().cloned())
             .collect::<Vec<_>>();
         let mut state = self.state()?;
         for collection in collections {
-            upsert_agent_status_snapshot(&mut state, collection.source_health_snapshot);
+            upsert_agent_status_snapshot(&mut state, collection.source_health_snapshot.clone());
         }
         Ok(snapshots)
+    }
+
+    pub(crate) fn record_agent_status_health(
+        &self,
+        snapshot: AgentStatusSnapshot,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        if !state.running {
+            return Ok(());
+        }
+        let seeded = state.sources.iter().any(|health| {
+            health.source == snapshot.source && health.state == SourceState::Verifying
+        });
+        if !seeded || snapshot.status == AgentStatusState::Available {
+            upsert_agent_status_snapshot(&mut state, snapshot);
+        }
+        Ok(())
     }
 
     /// Reconfirm any sources still in the seeded post-restart `verifying` state
@@ -1257,16 +1276,17 @@ impl LocalDaemon {
         let collections = verifying
             .iter()
             .map(|source| {
-                agent_status::collect_agent_status_collection(
+                agent_status_refresh::collection(
                     source,
                     captured_at.clone(),
                     expires_at.clone(),
+                    true,
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let snapshots = collections
             .into_iter()
-            .map(|collection| collection.source_health_snapshot)
+            .map(|collection| collection.source_health_snapshot.clone())
             .collect();
         let mut state = self.state()?;
         Ok(apply_verifying_reconfirm(&mut state, snapshots))
@@ -1382,6 +1402,8 @@ impl LocalDaemon {
     fn stop_authorized(&self) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
         state.running = false;
+        drop(state);
+        agent_status_refresh::stop();
         Ok(())
     }
 

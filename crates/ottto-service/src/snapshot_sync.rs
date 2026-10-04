@@ -1,5 +1,5 @@
 use crate::adaptive_collector::{CadenceConfig, SourceCadence};
-use crate::agent_status::{collect_agent_status_collection, AgentStatusCollection};
+use crate::agent_status::AgentStatusCollection;
 use crate::backfill::{
     apply_backfill_cutoff, current_historical_replay, load_backfill_state,
     mark_backfill_complete_for_destination, pending_backfill_sources_for_destination,
@@ -86,14 +86,14 @@ const SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
 const LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
 const SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION: u16 = 3;
 static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
-static CLAUDE_REFRESH_ACTIVITY: OnceLock<Mutex<ClaudeRefreshActivity>> = OnceLock::new();
-
-#[derive(Default)]
-struct ClaudeRefreshActivity {
-    running: bool,
-    pending: bool,
-}
 static SNAPSHOT_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+#[cfg(test)]
+pub(crate) fn status_test_scan_lock() -> std::sync::MutexGuard<'static, ()> {
+    SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Bootstrap only through existing ordinary authority followed by an exact
 /// CAS repeat. Both settlements share the normal atomic ACK progress seam.
@@ -1820,7 +1820,7 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                 }
                 // The cycle cadence itself is unchanged. What the tiers gate is the
                 // expensive part — the local transcript scan and its upload — while
-                // agent-status/quota freshness keeps the cycle it already had.
+                // agent-status/quota freshness has an independent source owner.
                 collect_file_activity_for(
                     SNAPSHOT_SYNC_INTERVAL,
                     watcher.as_ref(),
@@ -2018,100 +2018,10 @@ pub fn spawn_startup_source_reverify(daemon: LocalDaemon) {
     }
 }
 
-/// Startup/wake Claude freshness uses the normal collection and upload path.
-/// This avoids a refresh-only worker winning the durable claim and leaving a
-/// concurrent collector with no post-refresh reading to upload.
-pub fn spawn_claude_agent_status_refresh(opportunity: &'static str) {
-    let Some(refresh_claim) = claim_claude_refresh_slot() else {
-        return;
-    };
-    let spawn = std::thread::Builder::new()
-        .name(format!("ottto-claude-refresh-{opportunity}"))
-        .spawn(move || {
-            let mut refresh_claim = refresh_claim;
-            loop {
-                // Serialize with the cadence/full-sync path as well as other
-                // startup/wake hooks. This bounds worker count and prevents a
-                // hook collection from racing the same local indexes/uploads.
-                {
-                    let _sync_guard = SNAPSHOT_SYNC_LOCK
-                        .get_or_init(|| Mutex::new(()))
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let captured_at = current_rfc3339();
-                    let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
-                        .unwrap_or_else(|| captured_at.clone());
-                    let collection = collect_agent_status_collection(
-                        &SourceKind::ClaudeCode,
-                        captured_at,
-                        expires_at,
-                    );
-                    if let Err(error) = upload_agent_status_snapshots(&collection.snapshots) {
-                        eprintln!(
-                            "Claude agent-status {opportunity} refresh skipped: {}",
-                            safe_error(&error)
-                        );
-                    }
-                }
-                if !refresh_claim.take_pending_or_finish() {
-                    break;
-                }
-            }
-        });
-    if let Err(error) = spawn {
-        eprintln!("Claude agent-status {opportunity} refresh unavailable: {error}");
-    }
-}
-
-struct ClaudeRefreshClaim {
-    active: bool,
-}
-
-impl ClaudeRefreshClaim {
-    fn take_pending_or_finish(&mut self) -> bool {
-        let lock =
-            CLAUDE_REFRESH_ACTIVITY.get_or_init(|| Mutex::new(ClaudeRefreshActivity::default()));
-        let mut activity = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if activity.pending {
-            activity.pending = false;
-            true
-        } else {
-            activity.running = false;
-            self.active = false;
-            false
-        }
-    }
-}
-
-impl Drop for ClaudeRefreshClaim {
-    fn drop(&mut self) {
-        if self.active {
-            reset_claude_refresh_activity();
-        }
-    }
-}
-
-fn claim_claude_refresh_slot() -> Option<ClaudeRefreshClaim> {
-    let lock = CLAUDE_REFRESH_ACTIVITY.get_or_init(|| Mutex::new(ClaudeRefreshActivity::default()));
-    let mut activity = lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if activity.running {
-        activity.pending = true;
-        None
-    } else {
-        activity.running = true;
-        Some(ClaudeRefreshClaim { active: true })
-    }
-}
-
-fn reset_claude_refresh_activity() {
-    let lock = CLAUDE_REFRESH_ACTIVITY.get_or_init(|| Mutex::new(ClaudeRefreshActivity::default()));
-    *lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = ClaudeRefreshActivity::default();
+/// Startup/wake/upkeep share the source owner; transcript scans hold no
+/// status lock and no hook starts a competing upload thread.
+pub fn spawn_claude_agent_status_refresh(_opportunity: &'static str) {
+    crate::agent_status_refresh::request(&SourceKind::ClaudeCode);
 }
 
 /// Cadence for the blocking-verification retry loop below: how often it checks
@@ -2507,6 +2417,14 @@ fn upload_local_health_projection_with(
     Ok(())
 }
 
+pub(crate) fn agent_status_source_enabled(source: &SourceKind) -> bool {
+    load_snapshot_device_credentials().is_ok_and(|(device, _)| {
+        enabled_snapshot_sources(&device)
+            .into_iter()
+            .any(|item| &source_kind(item) == source)
+    })
+}
+
 pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Result<usize> {
     let (device, device_secret) = load_snapshot_device_credentials()?;
     let Some(machine_id) = snapshot_machine_id(&device)? else {
@@ -2527,7 +2445,6 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
             .iter()
             .filter(|snapshot| snapshot.source == source_kind)
             .cloned()
-            .map(AgentStatusSnapshot::redacted_for_backend)
             .collect::<Vec<_>>();
         if source_snapshots.is_empty() {
             continue;
@@ -2540,16 +2457,10 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
                 continue;
             }
         };
-        let request = AgentStatusSnapshotUploadRequest {
-            machine_id: machine_id.clone(),
-            snapshots: source_snapshots,
-        };
-        match client.upload_agent_status(&relay_token, &request) {
-            Ok(response) => {
-                uploaded += response.accepted as usize;
-                persist_machine_icon(&response);
+        match upload_agent_status(&client, &relay_token, &machine_id, &source_snapshots) {
+            Ok(accepted) => {
+                uploaded += accepted;
                 transport_cycle.note_success();
-                crate::net_resilience::note_upstream_upload_succeeded("agent_status");
             }
             Err(error) => {
                 transport_cycle.note_error(&error);
@@ -2675,27 +2586,25 @@ fn sync_source(
     let agent_status_captured_at = current_rfc3339();
     let agent_status_expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
         .unwrap_or_else(|| agent_status_captured_at.clone());
-    let scan_agent_status_collection = collect_agent_status_collection(
+    let scan_agent_status_collection = crate::agent_status_refresh::collection(
         &source_kind(source),
         agent_status_captured_at,
         agent_status_expires_at,
-    );
+        false,
+    )?;
     let scan_agent_status = reconciliation_agent_status(&scan_agent_status_collection);
-    if let Err(error) = upload_agent_status(
-        client,
-        &relay_token,
-        machine_id,
-        &scan_agent_status_collection.snapshots,
-    ) {
-        // Best-effort for the sync itself, but not for outage tracking: a
-        // persistent transport-only failure here must still feed the streak
-        // instead of being swallowed with the log line.
-        transport_cycle.note_error(&error);
-        eprintln!(
-            "local agent status upload skipped for {}: {}",
-            source.api_slug(),
-            safe_error(&error)
-        );
+    // Standalone/manual one-shot sync has no periodic daemon owner. Preserve
+    // its original status upload without restoring the automatic duplicate.
+    if !crate::agent_status_refresh::active() {
+        if let Err(error) = upload_agent_status(
+            client,
+            &relay_token,
+            machine_id,
+            &scan_agent_status_collection.snapshots,
+        ) {
+            transport_cycle.note_error(&error);
+            eprintln!("local agent status upload skipped: {}", safe_error(&error));
+        }
     }
 
     // The configured-MCP context-footprint harvest runs on its own slower
@@ -2734,8 +2643,8 @@ fn sync_source(
         return Ok(());
     }
 
-    // Everything above this line keeps the cycle it already had: quota and
-    // agent-status freshness, the reconciliation policy cache, and the
+    // Status acquisition/upload runs on its independent source owner. The
+    // reconciliation policy cache and the
     // active-session projection are all cheap and all product-visible. The
     // negotiated cadence gates what is actually expensive — the local transcript
     // scan below, which re-reads every changed transcript on this machine.
@@ -3007,11 +2916,17 @@ fn sync_source(
         }
     }
 
+    // Recheck after the potentially long scan, not only when status was
+    // acquired. A cached login must not claim sessions created after a switch.
+    let current_codex_bindings =
+        crate::agent_status_refresh::current_codex_home_bindings(&scan_agent_status_collection);
+    let cached_codex_login_changed = source == SnapshotSource::Codex
+        && current_codex_bindings.len() != scan_agent_status_collection.codex_home_bindings.len();
     let deferred_accounts = index.bind_session_accounts(
         source,
         machine_id,
         &mut scan_result.snapshots,
-        &scan_agent_status_collection.codex_home_bindings,
+        &current_codex_bindings,
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
 
@@ -3075,11 +2990,16 @@ fn sync_source(
     if upload_progress.retain_current_quarantines(&index.current_snapshot_fingerprints()) {
         upload_progress.save(&upload_progress_path)?;
     }
+    let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
+        scan_agent_status,
+        &current_codex_bindings,
+        cached_codex_login_changed,
+    );
     if crate::active_sessions::reconcile_active_sessions(
         support_dir,
         source,
         &scan_result.snapshots,
-        Some(scan_agent_status),
+        Some(&reconciliation_status),
         &scan_started_at,
     )
     .is_err()
@@ -4696,9 +4616,9 @@ fn upload_agent_status(
     relay_token: &str,
     machine_id: &str,
     snapshots: &[AgentStatusSnapshot],
-) -> Result<()> {
+) -> Result<usize> {
     if snapshots.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let request = AgentStatusSnapshotUploadRequest {
         machine_id: machine_id.to_string(),
@@ -4711,7 +4631,7 @@ fn upload_agent_status(
     let response = client.upload_agent_status(relay_token, &request)?;
     persist_machine_icon(&response);
     crate::net_resilience::note_upstream_upload_succeeded("agent_status");
-    Ok(())
+    Ok(response.accepted as usize)
 }
 
 fn source_kind(source: SnapshotSource) -> SourceKind {
@@ -8209,27 +8129,6 @@ mod tests {
         assert_eq!(upload_calls, 0);
         assert_eq!(accepted, 0);
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    #[serial]
-    fn claude_refresh_hook_coalesces_and_raii_releases() {
-        reset_claude_refresh_activity();
-        let mut first = claim_claude_refresh_slot().expect("first hook claim");
-        assert!(claim_claude_refresh_slot().is_none());
-        assert!(claim_claude_refresh_slot().is_none());
-        assert!(
-            first.take_pending_or_finish(),
-            "triggers during startup queue one trailing wake run"
-        );
-        assert!(
-            !first.take_pending_or_finish(),
-            "trailing run drains pending"
-        );
-        let after_drop = claim_claude_refresh_slot().expect("RAII releases hook claim");
-        drop(after_drop);
-        assert!(claim_claude_refresh_slot().is_some());
-        reset_claude_refresh_activity();
     }
 
     /// A unique poison-ledger scope per call, so tests that run in parallel

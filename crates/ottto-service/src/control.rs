@@ -4504,7 +4504,9 @@ fn refresh_agent_status_for(
         }
         RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
     }?;
-    upload_agent_status_snapshots_in_background(snapshots.clone());
+    if !crate::agent_status_refresh::active() {
+        upload_agent_status_snapshots_in_background(snapshots.clone());
+    }
     Ok(snapshots)
 }
 
