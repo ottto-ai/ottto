@@ -1558,6 +1558,9 @@ pub struct AgentQuotaWindow {
     pub window_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<Rfc3339Timestamp>,
+    /// Whether the start uses a reported or nominal recurring duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_basis: Option<String>,
     pub resets_at: Option<Rfc3339Timestamp>,
     pub quota: Option<u64>,
     pub remaining: Option<u64>,

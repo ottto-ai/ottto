@@ -160,8 +160,10 @@ struct CodexUsageProbe {
     account: Option<AgentAccountStatus>,
     identity: Option<CodexStrongIdentity>,
     credential_read_failed: bool,
-    /// Successful local read completion, never a provider observation clock.
+    /// Completion of the app-server read, distinct from quota value changes.
     response_completed_at: Option<String>,
+    /// Fixed vocabulary and aggregate counts only; never provider ids/titles.
+    reset_credit_detail_summary: Option<String>,
 }
 
 /// Strong active Codex identity from one exact credential home. This type is
@@ -2659,11 +2661,22 @@ fn collect_codex_status_for_home(
                     && account.organization_identifier_hash.is_some()
             });
             if let Some(diagnostic) = codex_app_server_success_diagnostic(
-                usage.response_completed_at,
+                usage.response_completed_at.clone(),
                 strong_identity.as_ref(),
                 !usage.quota_windows.is_empty() || !usage.credit_balances.is_empty(),
             ) {
                 snapshot.diagnostics.push(diagnostic);
+            }
+            if let Some(summary) = usage.reset_credit_detail_summary {
+                if let Some(mut diagnostic) = codex_app_server_success_diagnostic(
+                    usage.response_completed_at,
+                    strong_identity.as_ref(),
+                    true,
+                ) {
+                    diagnostic.code = "codex_reset_credit_details_observed".to_string();
+                    diagnostic.message = summary;
+                    snapshot.diagnostics.push(diagnostic);
+                }
             }
             if quota_is_bound && !usage.quota_windows.is_empty() {
                 snapshot.collection_method = AgentStatusCollectionMethod::AppServer;
@@ -11435,8 +11448,9 @@ fn claude_oauth_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
 
 fn claude_oauth_spend_credit_balance(spend: Option<&Value>) -> Option<AgentCreditBalance> {
     let spend = spend?;
-    if spend.get("enabled").and_then(Value::as_bool) != Some(true) {
-        return None;
+    let enabled = spend.get("enabled").and_then(Value::as_bool)?;
+    if !enabled {
+        return Some(claude_disabled_usage_credit_balance());
     }
     let used = claude_oauth_money_cents(spend.get("used"));
     let quota = claude_oauth_money_cents(spend.get("cap"))
@@ -11446,9 +11460,6 @@ fn claude_oauth_spend_credit_balance(spend: Option<&Value>) -> Option<AgentCredi
             (Some(quota), Some(used)) => Some(quota.saturating_sub(used)),
             _ => None,
         });
-    if used.is_none() && quota.is_none() && remaining.is_none() {
-        return None;
-    }
     let used_percent = json_u8(spend, &["percent"]).or_else(|| match (used, quota) {
         (Some(used), Some(quota)) if quota > 0 => {
             Some(((used.saturating_mul(100)) / quota).min(100) as u8)
@@ -11458,7 +11469,11 @@ fn claude_oauth_spend_credit_balance(spend: Option<&Value>) -> Option<AgentCredi
     let severity = spend.get("severity").and_then(Value::as_str).unwrap_or("");
     Some(AgentCreditBalance {
         name: "Usage credits".to_string(),
-        status: claude_oauth_credit_status(severity, used, quota, remaining),
+        status: if used.is_none() && quota.is_none() && remaining.is_none() {
+            AgentCreditBalanceStatus::Unknown
+        } else {
+            claude_oauth_credit_status(severity, used, quota, remaining)
+        },
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Usd,
         remaining,
@@ -11475,8 +11490,9 @@ fn claude_oauth_spend_credit_balance(spend: Option<&Value>) -> Option<AgentCredi
 
 fn claude_oauth_extra_usage_credit_balance(extra: Option<&Value>) -> Option<AgentCreditBalance> {
     let extra = extra?;
-    if extra.get("is_enabled").and_then(Value::as_bool) != Some(true) {
-        return None;
+    let enabled = extra.get("is_enabled").and_then(Value::as_bool)?;
+    if !enabled {
+        return Some(claude_disabled_usage_credit_balance());
     }
     let quota = claude_oauth_money_cents(extra.get("monthly_limit"));
     let used = claude_oauth_money_cents(extra.get("used_credits"));
@@ -11484,24 +11500,40 @@ fn claude_oauth_extra_usage_credit_balance(extra: Option<&Value>) -> Option<Agen
         (Some(quota), Some(used)) => Some(quota.saturating_sub(used)),
         _ => None,
     };
-    if used.is_none() && quota.is_none() {
-        return None;
-    }
+    // The client uses an explicitly null monthly_limit for unlimited usage;
+    // an omitted or malformed limit remains unknown.
+    let unlimited = extra.get("monthly_limit").is_some_and(Value::is_null);
     let used_percent = json_u8(extra, &["utilization"]);
     Some(AgentCreditBalance {
         name: "Usage credits".to_string(),
-        status: claude_oauth_credit_status("", used, quota, remaining),
+        status: if unlimited {
+            AgentCreditBalanceStatus::Unlimited
+        } else {
+            claude_oauth_credit_status("", used, quota, remaining)
+        },
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Usd,
-        remaining,
+        remaining: if unlimited { None } else { remaining },
         used,
         quota,
         currency: json_trimmed_string(extra, "currency"),
         resets_at: None,
         used_percent,
         enabled: Some(true),
+        unlimited: unlimited.then_some(true),
         ..Default::default()
     })
+}
+
+fn claude_disabled_usage_credit_balance() -> AgentCreditBalance {
+    AgentCreditBalance {
+        name: "Usage credits".to_string(),
+        status: AgentCreditBalanceStatus::Unknown,
+        freshness: AgentQuotaWindowFreshness::Fresh,
+        unit: AgentCreditBalanceUnit::Usd,
+        enabled: Some(false),
+        ..Default::default()
+    }
 }
 
 fn claude_oauth_credit_status(
@@ -11608,6 +11640,7 @@ fn claude_oauth_quota_window(
         model: None,
         account_label: None,
         window_seconds: Some(window_seconds),
+        started_at_basis: started_at.as_ref().map(|_| "assumed_duration".to_string()),
         started_at,
         resets_at,
         quota: None,
@@ -11801,15 +11834,24 @@ fn prefer_newer_exact_claude_statusline_windows(
             else {
                 continue;
             };
-            // Same window only: whole-second statusLine vs microsecond OAuth.
-            // A reading taken at or after its own reset describes a finished
-            // window and never wins.
-            if !claude_statusline_same_instant(old_reset, new_reset) || new_reset <= new_time {
+            // Preserve same-reset tolerance. A later cycle wins only after the
+            // old one ended, with a nominal start containing the new reading.
+            // All account/org/meter and money gates above still apply.
+            let same_cycle = claude_statusline_same_instant(old_reset, new_reset);
+            let rolled_over = !same_cycle
+                && new_reset > old_reset
+                && old_reset <= new_time
+                && newer
+                    .window_seconds
+                    .and_then(|seconds| i64::try_from(seconds).ok())
+                    .filter(|seconds| *seconds > 0)
+                    .is_some_and(|seconds| new_reset - TimeDuration::seconds(seconds) <= new_time);
+            if (!same_cycle && !rolled_over) || new_reset <= new_time {
                 continue;
             }
             // A start is a period boundary, not a reading clock. It can survive
             // only when the same verified reset/duration derives that boundary.
-            if let Some(start) = older.started_at.as_deref() {
+            if let Some(start) = older.started_at.as_deref().filter(|_| same_cycle) {
                 let start = OffsetDateTime::parse(start, &Rfc3339).ok();
                 let derived = newer
                     .window_seconds
@@ -11830,7 +11872,19 @@ fn prefer_newer_exact_claude_statusline_windows(
             };
             if new_time > old_time {
                 let mut selected = newer.clone();
-                selected.started_at = older.started_at.clone().or(selected.started_at);
+                if same_cycle {
+                    selected.started_at = older.started_at.clone().or(selected.started_at);
+                    selected.started_at_basis =
+                        older.started_at_basis.clone().or(selected.started_at_basis);
+                } else {
+                    selected.started_at = newer.window_seconds.and_then(|seconds| {
+                        rfc3339_minus_seconds(newer.resets_at.as_deref()?, seconds)
+                    });
+                    selected.started_at_basis = selected
+                        .started_at
+                        .as_ref()
+                        .map(|_| "assumed_duration".to_string());
+                }
                 *older = selected;
                 replaced = true;
             }
@@ -12840,14 +12894,52 @@ fn codex_usage_probe_from_app_server_observation(
                 true,
             )
         });
+    let mut quota_windows = codex_app_server_quota_windows(&observation.rate_limits);
+    for window in &mut quota_windows {
+        window.observed_at = observation.response_completed_at.clone();
+    }
     CodexUsageProbe {
-        quota_windows: codex_app_server_quota_windows(&observation.rate_limits),
+        quota_windows,
         credit_balances: codex_app_server_credit_balances(&observation.rate_limits),
         account: codex_app_server_account(&observation.account),
         identity,
         credential_read_failed: observation.credential_read_failed,
         response_completed_at: observation.response_completed_at,
+        reset_credit_detail_summary: codex_reset_credit_detail_summary(&observation.rate_limits),
     }
+}
+
+/// V1 acquisition evidence from the existing read. Summarize at most 20 rows,
+/// without grant ids, titles, descriptions, timestamps or invented semantics.
+fn codex_reset_credit_detail_summary(value: &Value) -> Option<String> {
+    let credits = value.get("rateLimitResetCredits")?.as_object()?;
+    let count = credits
+        .get("availableCount")
+        .and_then(Value::as_u64)
+        .filter(|n| *n <= 10_000)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unreported".to_string());
+    let Some(rows) = credits.get("credits").and_then(Value::as_array) else {
+        return Some(format!(
+            "Codex reset details: count {count}; list unobserved."
+        ));
+    };
+    let mut states = [0usize; 4];
+    let mut expiry_present = 0;
+    for row in rows.iter().take(20) {
+        let bucket = match row.get("status").and_then(Value::as_str) {
+            Some("available") => 0,
+            Some("redeeming") => 1,
+            Some("redeemed") => 2,
+            _ => 3,
+        };
+        states[bucket] += 1;
+        if row.get("expiresAt").is_some_and(|v| !v.is_null()) {
+            expiry_present += 1;
+        }
+    }
+    Some(format!("Codex reset details: count {count}; list rows {}; sampled {}; available {}, redeeming {}, redeemed {}, unknown {}; expiry present {}.",
+        rows.len(), rows.len().min(20), states[0], states[1], states[2], states[3], expiry_present))
 }
 
 struct CodexAppServerObservation {
@@ -12870,7 +12962,7 @@ fn codex_app_server_success_diagnostic(
         AgentStatusDiagnostic::source(
             "codex_app_server_usage_response",
             AgentDiagnosticSeverity::Info,
-            "Codex app-server account and quota read completed successfully; original quota observation time is not reported.",
+            "Codex app-server account and quota read completed successfully; this clock records the read, not when quota last changed.",
         )
         .with_observed_at(Some(completed_at))
         .with_quota_binding(
@@ -13234,6 +13326,7 @@ fn codex_app_server_quota_window(
         model: None,
         account_label: None,
         window_seconds,
+        started_at_basis: started_at.as_ref().map(|_| "provider_duration".to_string()),
         started_at,
         resets_at,
         quota: None,
@@ -13508,14 +13601,20 @@ fn collect_codex_oauth_usage_at(
         .map_err(codex_usage_probe_error)?
         .into_json()
         .map_err(|_| "Codex usage endpoint returned an unreadable response.".to_string())?;
+    let response_completed_at = rfc3339_from_unix_seconds(current_unix_seconds());
     let identity = validated_codex_identity(&credentials, None, None, true);
+    let mut quota_windows = codex_usage_quota_windows(&value);
+    for window in &mut quota_windows {
+        window.observed_at = response_completed_at.clone();
+    }
     Ok(CodexUsageProbe {
-        quota_windows: codex_usage_quota_windows(&value),
+        quota_windows,
         credit_balances: codex_usage_credit_balances(&value),
         account: None,
         identity,
         credential_read_failed: false,
         response_completed_at: None,
+        reset_credit_detail_summary: None,
     })
 }
 
@@ -13639,6 +13738,7 @@ fn codex_usage_quota_window(window_key: &str, value: &Value) -> Option<AgentQuot
         model: None,
         account_label: None,
         window_seconds,
+        started_at_basis: started_at.as_ref().map(|_| "provider_duration".to_string()),
         started_at,
         resets_at,
         quota: None,
@@ -19280,15 +19380,16 @@ for line in sys.stdin:
             .iter()
             .all(|window| window.account_identifier_hash.is_some()));
 
-        assert!(snapshot
-            .quota_windows
-            .iter()
-            .all(|window| window.observed_at.is_none()));
         let check = snapshot
             .diagnostics
             .iter()
             .find(|diagnostic| diagnostic.code == "codex_app_server_usage_response")
             .expect("successful completion witness");
+        assert!(check.observed_at.is_some());
+        assert!(snapshot
+            .quota_windows
+            .iter()
+            .all(|window| window.observed_at == check.observed_at));
         assert_eq!(
             check.account_identifier_hash,
             account.account_identifier_hash
@@ -19343,7 +19444,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn codex_app_server_check_clock_requires_bound_usage_and_keeps_observation_unknown() {
+    fn codex_app_server_read_clock_requires_bound_check_and_stamps_windows() {
         let completed_at = "2026-09-01T10:00:00Z".to_string();
         let probe = codex_usage_probe_from_app_server_observation(CodexAppServerObservation {
             account: serde_json::json!({"account": {"type": "chatgpt", "planType": "pro"}}),
@@ -19360,7 +19461,7 @@ for line in sys.stdin:
         assert!(probe
             .quota_windows
             .iter()
-            .all(|window| window.observed_at.is_none()));
+            .all(|window| window.observed_at.as_deref() == Some(completed_at.as_str())));
         let identity = CodexStrongIdentity {
             account_identifier_hash: "account-a".to_string(),
             workspace_identifier_hash: "workspace-a".to_string(),
@@ -26257,7 +26358,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_oauth_spend_disabled_emits_no_credit_balance() {
+    fn claude_oauth_spend_disabled_emits_unknown_amounts() {
         // Live disabled-state sample observed 2026-07-06 (Max account).
         let json = serde_json::json!({
             "spend": {
@@ -26268,7 +26369,196 @@ for line in sys.stdin:
             },
             "extra_usage": {"is_enabled": false, "monthly_limit": null, "used_credits": null}
         });
-        assert!(claude_oauth_credit_balances(&json).is_empty());
+        let balances = claude_oauth_credit_balances(&json);
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].enabled, Some(false));
+        assert_eq!(balances[0].status, AgentCreditBalanceStatus::Unknown);
+        assert_eq!(balances[0].remaining, None);
+        assert_eq!(balances[0].used, None);
+        assert_eq!(balances[0].quota, None);
+    }
+
+    #[test]
+    fn quota_coverage_reset_detail_witness_is_bounded_and_identity_gated() {
+        assert_eq!(
+            codex_reset_credit_detail_summary(&serde_json::json!({})),
+            None
+        );
+        let missing = codex_reset_credit_detail_summary(
+            &serde_json::json!({"rateLimitResetCredits":{"availableCount":3,"credits":null}}),
+        )
+        .unwrap();
+        assert_eq!(missing, "Codex reset details: count 3; list unobserved.");
+        let empty = codex_reset_credit_detail_summary(
+            &serde_json::json!({"rateLimitResetCredits":{"availableCount":0,"credits":[]}}),
+        )
+        .unwrap();
+        assert!(empty.contains("list rows 0; sampled 0"));
+        let rows = vec![
+            serde_json::json!({"id":"sensitive-id","title":"sensitive-title","status":"available","expiresAt":10});
+            25
+        ];
+        let summary = codex_reset_credit_detail_summary(
+            &serde_json::json!({"rateLimitResetCredits":{"availableCount":30,"credits":rows}}),
+        )
+        .unwrap();
+        assert!(summary.contains("list rows 25; sampled 20; available 20"));
+        assert!(!summary.contains("sensitive"));
+        assert!(summary.len() < 256);
+        // The witness uses this same exact-binding/time envelope before upload.
+        assert!(codex_app_server_success_diagnostic(
+            Some("2026-10-01T00:00:00Z".to_string()),
+            None,
+            true
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn quota_coverage_credit_states_do_not_invent_amounts() {
+        for (value, status, enabled) in [
+            (
+                serde_json::json!({"extra_usage":{"is_enabled":false,"used_credits":2}}),
+                AgentCreditBalanceStatus::Unknown,
+                false,
+            ),
+            (
+                serde_json::json!({"extra_usage":{"is_enabled":true}}),
+                AgentCreditBalanceStatus::Unknown,
+                true,
+            ),
+            (
+                serde_json::json!({"extra_usage":{"is_enabled":true,"monthly_limit":null}}),
+                AgentCreditBalanceStatus::Unlimited,
+                true,
+            ),
+            (
+                serde_json::json!({"extra_usage":{"is_enabled":true,"monthly_limit":0,"used_credits":0}}),
+                AgentCreditBalanceStatus::Exhausted,
+                true,
+            ),
+        ] {
+            let rows = claude_oauth_credit_balances(&value);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].status, status);
+            assert_eq!(rows[0].enabled, Some(enabled));
+            if status != AgentCreditBalanceStatus::Exhausted {
+                assert_eq!(rows[0].remaining, None);
+            }
+        }
+        assert!(claude_oauth_credit_balances(&serde_json::json!({})).is_empty());
+        assert!(claude_oauth_credit_balances(
+            &serde_json::json!({"extra_usage":{"is_enabled":"true"}})
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn quota_coverage_start_basis_and_provider_clock() {
+        let observation = CodexAppServerObservation {
+            account: serde_json::json!({}),
+            rate_limits: serde_json::json!({"rateLimits":{"primary":{"usedPercent":10,"windowDurationMins":300,"resetsAt":1791150000}}}),
+            refreshed_credentials: None,
+            credential_read_failed: false,
+            response_completed_at: Some("2026-10-04T19:00:00Z".to_string()),
+        };
+        let probe = codex_usage_probe_from_app_server_observation(observation);
+        assert_eq!(probe.quota_windows.len(), 1);
+        assert_eq!(
+            probe.quota_windows[0].observed_at,
+            probe.response_completed_at
+        );
+        assert_eq!(
+            probe.quota_windows[0].started_at_basis.as_deref(),
+            Some("provider_duration")
+        );
+        let claude = claude_oauth_quota_window(
+            "session",
+            Some(&serde_json::json!({"utilization":1,"resets_at":"2026-10-05T00:00:00Z"})),
+            18000,
+        )
+        .unwrap();
+        assert_eq!(claude.started_at_basis.as_deref(), Some("assumed_duration"));
+        let absent = codex_app_server_quota_window(
+            "session",
+            "codex",
+            &serde_json::json!({"usedPercent":1}),
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        assert_eq!(absent.started_at_basis, None);
+    }
+
+    #[test]
+    fn quota_coverage_passive_rollover_requires_ended_exact_meter() {
+        let old = AgentQuotaWindow {
+            name: "session".to_string(),
+            scope: AgentQuotaWindowScope::Account,
+            account_identifier_hash: Some("synthetic-account".to_string()),
+            organization_identifier_hash: Some("synthetic-org".to_string()),
+            window_seconds: Some(18000),
+            started_at: Some("2026-10-01T00:00:00Z".to_string()),
+            started_at_basis: Some("assumed_duration".to_string()),
+            resets_at: Some("2026-10-01T05:00:00Z".to_string()),
+            observed_at: Some("2026-10-01T04:00:00Z".to_string()),
+            used_percent: Some(99),
+            ..Default::default()
+        };
+        let newer = AgentQuotaWindow {
+            observed_at: Some("2026-10-01T05:05:00Z".to_string()),
+            resets_at: Some("2026-10-01T10:00:00Z".to_string()),
+            started_at: None,
+            started_at_basis: None,
+            used_percent: Some(2),
+            ..old.clone()
+        };
+        let mut windows = vec![old.clone()];
+        assert!(prefer_newer_exact_claude_statusline_windows(
+            &mut windows,
+            vec![newer.clone()]
+        ));
+        assert_eq!(windows[0].used_percent, Some(2));
+        assert_eq!(
+            windows[0].started_at.as_deref(),
+            Some("2026-10-01T05:00:00Z")
+        );
+        assert_eq!(
+            windows[0].started_at_basis.as_deref(),
+            Some("assumed_duration")
+        );
+        for field in [
+            "account",
+            "org",
+            "model",
+            "unfinished",
+            "future_start",
+            "old_clock",
+            "ended_new",
+        ] {
+            let mut invalid = newer.clone();
+            match field {
+                "account" => invalid.account_identifier_hash = Some("other".to_string()),
+                "org" => invalid.organization_identifier_hash = Some("other".to_string()),
+                "model" => invalid.model = Some("other".to_string()),
+                "unfinished" => invalid.observed_at = Some("2026-10-01T04:05:00Z".to_string()),
+                "future_start" => invalid.resets_at = Some("2026-10-01T11:00:00Z".to_string()),
+                "old_clock" => invalid.observed_at = old.observed_at.clone(),
+                "ended_new" => invalid.resets_at = Some("2026-10-01T05:04:00Z".to_string()),
+                _ => unreachable!(),
+            }
+            let mut preserved = vec![old.clone()];
+            assert!(
+                !prefer_newer_exact_claude_statusline_windows(&mut preserved, vec![invalid]),
+                "{field}"
+            );
+            assert_eq!(preserved[0], old);
+        }
+        let mut money = old.clone();
+        money.used_cents = Some(1);
+        assert!(!prefer_newer_exact_claude_statusline_windows(
+            &mut [money],
+            vec![newer]
+        ));
     }
 
     #[test]
