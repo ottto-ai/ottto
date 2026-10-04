@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 426,
-  "content_sha256": "ec310d97504cad25a7438219fba8162eb0fbef9bda83fb435a2adce80dd9f83e",
+  "content_sha256": "9ab7f0d0540df62471b5e932012c3684f69834adfada8d8a54c52e9bb3fc2b12",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "b570f2f70a6f5703796e35794860d61c0448451b1d4485818d46b6fa64a5edb1",
-      "size_bytes": 1306213
+      "sha256": "941150912ed391c10c9e2cfa7a8441da24bae7b40cf21be943ca75317abfb597",
+      "size_bytes": 1305885
     },
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_refresher.rs",
-      "sha256": "9dc6a60fd79ea249ffdd6a214ff6eb4a1d95c489150dccdb705025160bc4bb0b",
-      "size_bytes": 42905
+      "sha256": "b6ea245b6fdc15210f8a77d886a425043a960dffc3d8b566f3af2c37bd947885",
+      "size_bytes": 56037
     },
     {
       "executable": false,
@@ -1007,8 +1007,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/claude-accounts.md",
-      "sha256": "3986db1dea452479c6505893cae1a0714e177b21a40bdb1246334c3751a0a577",
-      "size_bytes": 24418
+      "sha256": "1b6c83055c559e322ff834ab38004971e1b1f6b7a8203dd2d9d17b99718c1b63",
+      "size_bytes": 24592
     },
     {
       "executable": false,
@@ -2985,7 +2985,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-04T13:17:19+00:00",
+  "generated_at": "2026-10-04T17:53:10+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 427,
   "public_roots": [
@@ -3021,5 +3021,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "0eb2e5271a1a18b2f3948afd13983b2e7a4544a8"
+  "source_commit": "5660d0e02ddc623a8075c477626c7eb00e620fca"
 }

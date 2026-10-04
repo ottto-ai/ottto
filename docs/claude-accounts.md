@@ -347,8 +347,11 @@ off), Ottto keeps each registered slot and the default login signed in:
   `usage_based`, and no other credential takes precedence (Bedrock, Vertex, an
   auth token, `apiKeyHelper`, or any `ANTHROPIC_API_KEY` in that login's
   settings, approved or not, because `claude -p` uses it either way).
-  "Keep my Claude accounts signed in" is re-read right before each start. A plan-usage snapshot under 60 seconds old
-  postpones it to a later pass.
+  The command is prepared first; then "Keep my Claude accounts signed in" is
+  re-read and the refresher started under the lock the setting is saved under,
+  so turning it off either prevents the start or waits only until the start
+  has returned. A plan-usage snapshot under 60 seconds old postpones it to a
+  later pass.
 - Success is proved only by a new, later `expiresAt`. A first failure that
   leaves the login intact (refresh token present, not blanked; typically a
   refresh right after the Mac wakes, before the network is back) gets exactly

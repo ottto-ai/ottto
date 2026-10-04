@@ -3217,15 +3217,6 @@ fn claude_settings_paths_for_slot(slot: &ClaudeConfigDirSlot) -> Vec<(String, Pa
     }
 }
 
-/// "Keep my Claude accounts signed in", read now. A failed read counts as off.
-pub(crate) fn claude_keep_signed_in_now() -> bool {
-    FileClaudeConfigSlotSettingsStore::default()
-        .load()
-        .is_ok_and(|status| {
-            status.consent == ottto_protocol::ClaudeAccountUpkeepConsentState::Granted
-        })
-}
-
 /// A plan-usage snapshot younger than this is reused by `/usage`, which then
 /// refreshes nothing.
 const CLAUDE_USAGE_CACHE_REUSE_MS: i64 = 60_000;

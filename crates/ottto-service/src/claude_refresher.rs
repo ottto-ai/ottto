@@ -12,6 +12,10 @@
 //!   --strict-mcp-config` per login, in an empty working directory, in its own
 //!   process group (a daemon restart does not stop it), with the Mac kept
 //!   awake while it runs;
+//! - prepares the whole command first, then re-reads "Keep my Claude accounts
+//!   signed in" and spawns under the settings lock the consent writer takes
+//!   (released as soon as `spawn()` returns), so a switch-off never races a
+//!   start;
 //! - is never killed: after 120 seconds it is reported as still running and
 //!   left to finish;
 //! - leaves concurrency to Claude Code's own `.oauth_refresh.lock`;
@@ -32,11 +36,15 @@
 //! no MCP server. All three are verified in Claude Code 2.1.288's source.
 
 use crate::agent_status::{ClaudeLiveLogin, ClaudeLocalLoginState};
-use ottto_core::{default_support_dir, write_owner_only_file_atomic, ClaudeConfigDirSlot};
+use ottto_core::{
+    default_support_dir, write_owner_only_file_atomic, ClaudeConfigDirSlot,
+    FileClaudeConfigSlotSettingsStore,
+};
+use ottto_protocol::ClaudeAccountUpkeepConsentState;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
@@ -200,20 +208,73 @@ pub(crate) fn maybe_refresh(
         &|| {
             crate::agent_status::claude_refresher_skip_reason(slot, live, OffsetDateTime::now_utc())
         },
-        &crate::agent_status::claude_keep_signed_in_now,
+        &credential_modified_marker,
+        &SettingsConsentGate,
     )
 }
 
-/// Starts the refresher process. Tests substitute a fake CLI through the
-/// command search path; the launcher seam keeps the decision testable.
+/// Prepares and starts the refresher process. Tests substitute a fake CLI
+/// through the command search path; the launcher seam keeps the decision
+/// testable.
+///
+/// Preparing (resolving the executable, building the search path and the
+/// pinned environment) reads the filesystem and can stall; it happens before
+/// the final consent check. `spawn` runs inside that check, so it must only
+/// start the prepared command.
 pub(crate) trait RefreshLauncher {
-    fn launch(&self, slot: &ClaudeConfigDirSlot, cwd: &Path) -> std::io::Result<Child>;
+    fn prepare(&self, slot: &ClaudeConfigDirSlot, cwd: &Path) -> std::io::Result<Command>;
+    fn spawn(&self, command: &mut Command) -> std::io::Result<Child> {
+        command.spawn()
+    }
+}
+
+/// The final "Keep my Claude accounts signed in" check, made together with
+/// the spawn.
+pub(crate) trait ConsentGate {
+    /// Run `spawn` only if consent is on, as one step against the consent
+    /// writer. `None`: consent is off (or unreadable) and nothing ran.
+    fn spawn_if_consented(
+        &self,
+        spawn: &mut dyn FnMut() -> std::io::Result<Child>,
+    ) -> Option<std::io::Result<Child>>;
+}
+
+/// Reads consent under the settings transaction lock the consent writer
+/// takes, and spawns before releasing it: a switch-off either lands before
+/// the read (nothing starts) or waits until the spawn has returned. The lock
+/// is released as soon as `spawn()` returns; nothing waits on the child under
+/// it. A failed read counts as off.
+struct SettingsConsentGate;
+
+impl ConsentGate for SettingsConsentGate {
+    fn spawn_if_consented(
+        &self,
+        spawn: &mut dyn FnMut() -> std::io::Result<Child>,
+    ) -> Option<std::io::Result<Child>> {
+        FileClaudeConfigSlotSettingsStore::default()
+            .with_locked_status(|status| {
+                (status.consent == ClaudeAccountUpkeepConsentState::Granted).then(spawn)
+            })
+            .ok()
+            .flatten()
+    }
+}
+
+/// Tests: a plain consent read with no lock.
+#[cfg(test)]
+impl<F: Fn() -> bool> ConsentGate for F {
+    fn spawn_if_consented(
+        &self,
+        spawn: &mut dyn FnMut() -> std::io::Result<Child>,
+    ) -> Option<std::io::Result<Child>> {
+        self().then(spawn)
+    }
 }
 
 struct ProductionLauncher;
 
 impl RefreshLauncher for ProductionLauncher {
-    fn launch(&self, slot: &ClaudeConfigDirSlot, cwd: &Path) -> std::io::Result<Child> {
+    fn prepare(&self, slot: &ClaudeConfigDirSlot, cwd: &Path) -> std::io::Result<Command> {
         let mut command = crate::agent_status::resolved_claude_slot_command(slot, &REFRESH_ARGV)
             .ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "Claude Code CLI not found")
@@ -231,7 +292,7 @@ impl RefreshLauncher for ProductionLauncher {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        command.spawn()
+        Ok(command)
     }
 }
 
@@ -244,7 +305,8 @@ fn maybe_refresh_with(
     support_dir: &Path,
     launcher: &dyn RefreshLauncher,
     skip_reason: &dyn Fn() -> Option<&'static str>,
-    still_enabled: &dyn Fn() -> bool,
+    credential_marker: &dyn Fn(&ClaudeConfigDirSlot) -> Option<String>,
+    consent: &dyn ConsentGate,
 ) -> RefreshDecision {
     let now = OffsetDateTime::now_utc();
     let current_expiry = live
@@ -308,20 +370,27 @@ fn maybe_refresh_with(
         eprintln!("claude_refresher result=not_started reason=working_dir target={slot_id}");
         return RefreshDecision::NotNeeded;
     };
-    let before_mdat = credential_modified_marker(slot);
-    // Re-read "Keep my Claude accounts signed in" immediately before the
-    // spawn, after every blocking read: the pass's copy may predate the
-    // user's switch-off.
-    if !still_enabled() {
+    let before_mdat = credential_marker(slot);
+    // Prepare the whole command (executable, search path, pinned login,
+    // argv) first: these reads can stall.
+    let Ok(mut command) = launcher.prepare(slot, cwd.path()) else {
         release();
-        eprintln!("claude_refresher result=not_started reason=consent_off target={slot_id}");
+        eprintln!("claude_refresher result=not_started reason=spawn target={slot_id}");
         return RefreshDecision::NotNeeded;
-    }
-    let mut child = match launcher.launch(slot, cwd.path()) {
-        Ok(child) => child,
-        Err(_) => {
+    };
+    // Then re-read "Keep my Claude accounts signed in" and spawn as one step
+    // against the consent writer: the pass's copy, and any read before the
+    // blocking reads above, may predate the user's switch-off.
+    let mut child = match consent.spawn_if_consented(&mut || launcher.spawn(&mut command)) {
+        Some(Ok(child)) => child,
+        Some(Err(_)) => {
             release();
             eprintln!("claude_refresher result=not_started reason=spawn target={slot_id}");
+            return RefreshDecision::NotNeeded;
+        }
+        None => {
+            release();
+            eprintln!("claude_refresher result=not_started reason=consent_off target={slot_id}");
             return RefreshDecision::NotNeeded;
         }
     };
@@ -649,11 +718,20 @@ mod tests {
             launches: std::sync::atomic::AtomicUsize,
         }
         impl RefreshLauncher for SlowLauncher {
-            fn launch(&self, _slot: &ClaudeConfigDirSlot, _cwd: &Path) -> std::io::Result<Child> {
+            fn prepare(
+                &self,
+                _slot: &ClaudeConfigDirSlot,
+                _cwd: &Path,
+            ) -> std::io::Result<Command> {
+                let mut command = Command::new("/bin/sleep");
+                command.arg("0.3");
+                Ok(command)
+            }
+            fn spawn(&self, command: &mut Command) -> std::io::Result<Child> {
                 self.launches
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(200));
-                std::process::Command::new("/bin/sleep").arg("0.3").spawn()
+                command.spawn()
             }
         }
         let support = std::env::temp_dir().join(format!(
@@ -689,6 +767,7 @@ mod tests {
                         &support,
                         launcher.as_ref(),
                         &|| None,
+                        &|_| None,
                         &|| true,
                     )
                 })
@@ -763,9 +842,16 @@ mod tests {
     fn an_ineligible_login_never_starts_a_refresher() {
         struct CountingLauncher(std::sync::atomic::AtomicUsize);
         impl RefreshLauncher for CountingLauncher {
-            fn launch(&self, _slot: &ClaudeConfigDirSlot, _cwd: &Path) -> std::io::Result<Child> {
+            fn prepare(
+                &self,
+                _slot: &ClaudeConfigDirSlot,
+                _cwd: &Path,
+            ) -> std::io::Result<Command> {
+                Ok(Command::new("/usr/bin/true"))
+            }
+            fn spawn(&self, command: &mut Command) -> std::io::Result<Child> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::process::Command::new("/usr/bin/true").spawn()
+                command.spawn()
             }
         }
         let support = std::env::temp_dir().join(format!(
@@ -795,6 +881,7 @@ mod tests {
                     &support,
                     &launcher,
                     &|| Some(reason),
+                    &|_| None,
                     &|| true
                 ),
                 RefreshDecision::NotNeeded,
@@ -814,9 +901,16 @@ mod tests {
     fn consent_turned_off_during_the_reads_starts_nothing() {
         struct CountingLauncher(std::sync::atomic::AtomicUsize);
         impl RefreshLauncher for CountingLauncher {
-            fn launch(&self, _slot: &ClaudeConfigDirSlot, _cwd: &Path) -> std::io::Result<Child> {
+            fn prepare(
+                &self,
+                _slot: &ClaudeConfigDirSlot,
+                _cwd: &Path,
+            ) -> std::io::Result<Command> {
+                Ok(Command::new("/usr/bin/true"))
+            }
+            fn spawn(&self, command: &mut Command) -> std::io::Result<Child> {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::process::Command::new("/usr/bin/true").spawn()
+                command.spawn()
             }
         }
         let support = std::env::temp_dir().join(format!(
@@ -849,6 +943,7 @@ mod tests {
                 switched_off.store(true, std::sync::atomic::Ordering::SeqCst);
                 None
             },
+            &|_| None,
             &|| !switched_off.load(std::sync::atomic::Ordering::SeqCst),
         );
         assert_eq!(decision, RefreshDecision::NotNeeded);
@@ -859,6 +954,255 @@ mod tests {
             None => std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH"),
         }
         let _ = std::fs::remove_dir_all(support);
+    }
+
+    /// A real settings file (consent on) in a throwaway support dir, read by
+    /// the production consent gate. No `security` on the search path, so no
+    /// keychain is ever queried.
+    struct ConsentFixture {
+        root: std::path::PathBuf,
+        store: FileClaudeConfigSlotSettingsStore,
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ConsentFixture {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "ottto-claude-refresher-{label}-{}-{}",
+                std::process::id(),
+                OffsetDateTime::now_utc().unix_timestamp_nanos()
+            ));
+            std::fs::create_dir_all(root.join("empty-bin")).expect("root");
+            let previous = [
+                (
+                    "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+                    root.as_os_str().to_os_string(),
+                ),
+                (
+                    "OTTTO_COMMAND_SEARCH_PATH",
+                    root.join("empty-bin").into_os_string(),
+                ),
+            ]
+            .into_iter()
+            .map(|(key, value)| {
+                let previous = std::env::var_os(key);
+                std::env::set_var(key, value);
+                (key, previous)
+            })
+            .collect();
+            let store = FileClaudeConfigSlotSettingsStore::default();
+            store
+                .set_upkeep_consent(
+                    ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                    true,
+                )
+                .expect("consent on");
+            Self {
+                root,
+                store,
+                previous,
+            }
+        }
+
+        fn switch_off(&self) {
+            self.store
+                .set_upkeep_consent(
+                    ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                    false,
+                )
+                .expect("consent off");
+        }
+
+        fn refresh(&self, slot_id: &str, launcher: &dyn RefreshLauncher) -> RefreshDecision {
+            self.refresh_with_marker(slot_id, launcher, &|_| None)
+        }
+
+        fn refresh_with_marker(
+            &self,
+            slot_id: &str,
+            launcher: &dyn RefreshLauncher,
+            marker: &dyn Fn(&ClaudeConfigDirSlot) -> Option<String>,
+        ) -> RefreshDecision {
+            let due = live(
+                ClaudeLocalLoginState::RefreshPending,
+                OffsetDateTime::now_utc() - TimeDuration::minutes(1),
+            );
+            let slot = ClaudeConfigDirSlot::registered(
+                self.root.join("slot").to_string_lossy().to_string(),
+            )
+            .expect("slot");
+            // The pass read consent "on" (`enabled`).
+            maybe_refresh_with(
+                slot_id,
+                &slot,
+                &due,
+                true,
+                &self.root,
+                launcher,
+                &|| None,
+                marker,
+                &SettingsConsentGate,
+            )
+        }
+    }
+
+    impl Drop for ConsentFixture {
+        fn drop(&mut self) {
+            for (key, previous) in self.previous.drain(..) {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Counts preparations and spawns; runs a hook inside each.
+    struct HookLauncher<'a> {
+        prepared: std::sync::atomic::AtomicUsize,
+        spawned: std::sync::atomic::AtomicUsize,
+        on_prepare: &'a dyn Fn(),
+        on_spawn: &'a dyn Fn(),
+        long_child: bool,
+    }
+
+    impl<'a> HookLauncher<'a> {
+        fn new(on_prepare: &'a dyn Fn(), on_spawn: &'a dyn Fn()) -> Self {
+            Self {
+                prepared: std::sync::atomic::AtomicUsize::new(0),
+                spawned: std::sync::atomic::AtomicUsize::new(0),
+                on_prepare,
+                on_spawn,
+                long_child: false,
+            }
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.prepared.load(std::sync::atomic::Ordering::SeqCst),
+                self.spawned.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+    }
+
+    impl RefreshLauncher for HookLauncher<'_> {
+        fn prepare(&self, _slot: &ClaudeConfigDirSlot, _cwd: &Path) -> std::io::Result<Command> {
+            self.prepared
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (self.on_prepare)();
+            if self.long_child {
+                let mut command = Command::new("/bin/sleep");
+                command.arg("2");
+                return Ok(command);
+            }
+            Ok(Command::new("/usr/bin/true"))
+        }
+        fn spawn(&self, command: &mut Command) -> std::io::Result<Child> {
+            self.spawned
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (self.on_spawn)();
+            command.spawn()
+        }
+    }
+
+    /// Consent switched off (by the real writer) after the credential-marker
+    /// read: the final read comes after it, so nothing spawns and the slot is
+    /// released. Fails if the final consent read moves before the marker
+    /// read.
+    #[test]
+    #[serial_test::serial]
+    fn consent_turned_off_after_the_marker_read_starts_nothing() {
+        let fixture = ConsentFixture::new("consent-after-marker");
+        let launcher = HookLauncher::new(&|| {}, &|| {});
+        let decision = fixture.refresh_with_marker("consent-after-marker", &launcher, &|_| {
+            fixture.switch_off();
+            None
+        });
+        assert_eq!(decision, RefreshDecision::NotNeeded);
+        assert_eq!(launcher.counts(), (1, 0), "prepared, never spawned");
+        assert!(!running()
+            .lock()
+            .unwrap()
+            .contains_key("consent-after-marker"));
+    }
+
+    /// Consent switched off (by the real writer) while the command is being
+    /// prepared (executable and search-path reads that can stall): nothing
+    /// spawns and the slot is released. Fails if consent is read before the
+    /// preparation.
+    #[test]
+    #[serial_test::serial]
+    fn consent_turned_off_during_preparation_starts_nothing() {
+        let fixture = ConsentFixture::new("consent-during-prepare");
+        let switch_off = || fixture.switch_off();
+        let launcher = HookLauncher::new(&switch_off, &|| {});
+        let decision = fixture.refresh("consent-during-prepare", &launcher);
+        assert_eq!(decision, RefreshDecision::NotNeeded);
+        assert_eq!(launcher.counts(), (1, 0), "prepared, never spawned");
+        assert!(!running()
+            .lock()
+            .unwrap()
+            .contains_key("consent-during-prepare"));
+    }
+
+    /// The final consent read and the spawn are one step against the writer:
+    /// a switch-off that starts while the spawn is in progress waits until
+    /// `spawn()` has returned, and the lock is released right after it (the
+    /// switch-off completes while the refresher still runs). Fails if the
+    /// spawn runs outside the writer's lock.
+    #[test]
+    #[serial_test::serial]
+    fn a_switch_off_waits_for_an_in_flight_spawn_only() {
+        let fixture = ConsentFixture::new("consent-in-flight");
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let writer = std::sync::Mutex::new(None);
+        let blocked_during_spawn = std::sync::atomic::AtomicBool::new(false);
+        let on_spawn = || {
+            let store = fixture.store.clone();
+            let done_tx = done_tx.clone();
+            *writer.lock().unwrap() = Some(std::thread::spawn(move || {
+                store
+                    .set_upkeep_consent(
+                        ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                        false,
+                    )
+                    .expect("consent off");
+                let _ = done_tx.send(());
+            }));
+            // The writer cannot finish while the spawn holds its lock.
+            blocked_during_spawn.store(
+                done_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        };
+        let mut launcher = HookLauncher::new(&|| {}, &on_spawn);
+        launcher.long_child = true;
+        let decision = fixture.refresh("consent-in-flight", &launcher);
+        assert_eq!(decision, RefreshDecision::Started);
+        assert_eq!(launcher.counts(), (1, 1));
+        assert!(
+            blocked_during_spawn.load(std::sync::atomic::Ordering::SeqCst),
+            "the switch-off completed while the spawn was in progress"
+        );
+        // Released right after spawn(): the switch-off now completes, without
+        // waiting for the refresher to finish.
+        writer
+            .lock()
+            .unwrap()
+            .take()
+            .expect("writer")
+            .join()
+            .expect("join");
+        assert!(
+            running().lock().unwrap().contains_key("consent-in-flight"),
+            "the switch-off finished while the refresher still runs"
+        );
+        assert_eq!(
+            fixture.store.load().expect("load").consent,
+            ClaudeAccountUpkeepConsentState::ConsentRequired
+        );
+        wait_until_idle("consent-in-flight");
     }
 
     #[test]
@@ -987,6 +1331,7 @@ mod tests {
                 &support,
                 &ProductionLauncher,
                 &|| None,
+                &credential_modified_marker,
                 &|| true
             ),
             RefreshDecision::Started
@@ -1019,6 +1364,7 @@ mod tests {
                 &support,
                 &ProductionLauncher,
                 &|| None,
+                &credential_modified_marker,
                 &|| true
             ),
             RefreshDecision::Started
@@ -1037,6 +1383,7 @@ mod tests {
                 &support,
                 &ProductionLauncher,
                 &|| None,
+                &credential_modified_marker,
                 &|| true
             ),
             RefreshDecision::RetryWaiting,
@@ -1057,6 +1404,7 @@ mod tests {
                 &support,
                 &ProductionLauncher,
                 &|| None,
+                &credential_modified_marker,
                 &|| true
             ),
             RefreshDecision::Started
@@ -1072,6 +1420,7 @@ mod tests {
                 &support,
                 &ProductionLauncher,
                 &|| None,
+                &credential_modified_marker,
                 &|| true
             ),
             RefreshDecision::FailedWaitingForSignIn,
@@ -1095,6 +1444,7 @@ mod tests {
                 &support,
                 &ProductionLauncher,
                 &|| None,
+                &credential_modified_marker,
                 &|| true
             ),
             RefreshDecision::NotNeeded
