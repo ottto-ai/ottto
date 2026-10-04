@@ -3755,13 +3755,27 @@ fn collect_claude_status(
     snapshot
 }
 
+/// The registered-slot settings for one collection pass. A failed read is
+/// retried once (a reader can land between a writer's two atomic renames of
+/// the settings file and its sidecar) and then logged: such a pass must not
+/// look like a machine without registered slots.
+fn load_claude_slot_settings_for_pass(
+) -> Result<ClaudeAccountsStatusV1, ottto_core::ClaudeConfigSlotSettingsError> {
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    store
+        .load()
+        .or_else(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            store.load()
+        })
+        .inspect_err(|_| eprintln!("claude_status registered_slots=unavailable"))
+}
+
 fn collect_claude_status_snapshots(
     captured_at: String,
     expires_at: String,
 ) -> AgentStatusCollection {
-    let settings = FileClaudeConfigSlotSettingsStore::default()
-        .load()
-        .map(annotate_claude_accounts_status);
+    let settings = load_claude_slot_settings_for_pass().map(annotate_claude_accounts_status);
     let slot_owned_bindings = settings
         .as_ref()
         .map(|status| {
@@ -4063,6 +4077,13 @@ fn collect_claude_status_snapshots(
     registered_slot_ids.sort();
     let canonical_anchors = canonical_registered_anchors(registered_slot_ids.clone(), &slot_states);
     let anchor_health_by_binding = canonical_anchor_health(&canonical_anchors, &slot_states);
+    let mut registered_owned = claude_registered_owned_bindings(
+        settings.is_ok(),
+        &registered_slot_ids,
+        &slot_states,
+        &previous_states.slots,
+    );
+    registered_owned.extend(slot_owned_bindings.iter().cloned());
     let selection = select_claude_snapshot_candidates(&candidates, &canonical_anchors);
     let winning_accounts = selection
         .winning_by_binding
@@ -4120,11 +4141,23 @@ fn collect_claude_status_snapshots(
     for (index, candidate) in candidates.into_iter().enumerate() {
         match dispositions[index] {
             ClaudeSnapshotDisposition::Upload => {
+                if claude_default_upload_withheld(&candidate, &registered_owned, &canonical_anchors)
+                {
+                    // A registered slot owns this account but produced no
+                    // anchor this pass (its settings read failed or it dropped
+                    // out). Upload nothing for it rather than a default-only
+                    // snapshot; the backend keeps the last anchored one.
+                    eprintln!(
+                        "claude_status default_upload=withheld reason=slot_owned_without_anchor"
+                    );
+                    continue;
+                }
                 snapshots.push(claude_uploaded_candidate_snapshot(
                     candidate,
                     &anchor_health_by_binding,
                     &canonical_anchors,
                     &slot_states,
+                    &registered_owned,
                 ));
             }
             ClaudeSnapshotDisposition::ShadowDefault => {
@@ -4160,11 +4193,15 @@ fn collect_claude_status_snapshots(
         &slot_states,
         OffsetDateTime::parse(&captured_at, &Rfc3339).unwrap_or_else(|_| OffsetDateTime::now_utc()),
     );
-    let _ = persist_claude_slot_collection_states(
-        &slot_states,
-        &unresolved_accounts,
-        &blocked_worker_receipt_descriptors,
-    );
+    // Without the registered set this pass saw only the default login: keep
+    // the last persisted slot states rather than overwrite them with it.
+    if settings.is_ok() {
+        let _ = persist_claude_slot_collection_states(
+            &slot_states,
+            &unresolved_accounts,
+            &blocked_worker_receipt_descriptors,
+        );
+    }
 
     let mut source_health_snapshot = default_snapshot.clone();
     let mut custom_slot_states = slot_states
@@ -4526,7 +4563,15 @@ fn claude_uploaded_candidate_snapshot(
     anchor_health_by_binding: &BTreeMap<ClaudeStrongBinding, Option<ClaudeAccountAnchorHealthV1>>,
     canonical_anchors: &BTreeMap<ClaudeStrongBinding, String>,
     slot_states: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+    registered_owned: &BTreeSet<ClaudeStrongBinding>,
 ) -> AgentStatusSnapshot {
+    if candidate.slot_class == ClaudeSnapshotSlotClass::Default {
+        strip_slot_owned_plan_observations(
+            &mut candidate.snapshot.plan_observations,
+            &candidate.binding,
+            registered_owned,
+        );
+    }
     let (durability, health) = anchor_health_by_binding
         .get(&candidate.binding)
         .map(|health| (ClaudeAccountAnchorDurabilityV1::Anchored, *health))
@@ -4540,6 +4585,80 @@ fn claude_uploaded_candidate_snapshot(
         slot_states,
     );
     candidate.snapshot
+}
+
+/// Accounts owned by a registered slot: the bindings of the registered slots
+/// this pass and in the last persisted state. When the registered set could
+/// not be read this pass, every non-default slot in the last persisted state.
+fn claude_registered_owned_bindings(
+    registered_set_known: bool,
+    registered_slot_ids: &[String],
+    slot_states: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+    previous: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+) -> BTreeSet<ClaudeStrongBinding> {
+    let binding = |status: &ClaudeConfigSlotCollectionStatusV1| {
+        ClaudeStrongBinding::new(
+            status.account_identifier_hash.as_deref()?,
+            status.organization_identifier_hash.as_deref()?,
+        )
+    };
+    let slot_ids: Vec<&String> = if registered_set_known {
+        registered_slot_ids.iter().collect()
+    } else {
+        previous
+            .keys()
+            .filter(|slot_id| slot_id.as_str() != "default")
+            .collect()
+    };
+    slot_ids
+        .into_iter()
+        .flat_map(|slot_id| {
+            [
+                slot_states.get(slot_id).and_then(binding),
+                previous.get(slot_id).and_then(binding),
+            ]
+        })
+        .flatten()
+        .collect()
+}
+
+/// A default-login candidate for an account a registered slot owns uploads
+/// only while that account's registered anchor is present this pass.
+fn claude_default_upload_withheld(
+    candidate: &ClaudeSnapshotCandidate,
+    registered_owned: &BTreeSet<ClaudeStrongBinding>,
+    canonical_anchors: &BTreeMap<ClaudeStrongBinding, String>,
+) -> bool {
+    candidate.slot_class == ClaudeSnapshotSlotClass::Default
+        && registered_owned.contains(&candidate.binding)
+        && !canonical_anchors.contains_key(&candidate.binding)
+}
+
+/// The default login's upload never speaks for another account a registered
+/// slot owns: its plan observations for such an account (for example Claude
+/// Desktop session buckets marked current) are dropped. An observation with
+/// only an account hash is matched on the account.
+fn strip_slot_owned_plan_observations(
+    observations: &mut Vec<AgentStatusPlanObservation>,
+    candidate: &ClaudeStrongBinding,
+    registered_owned: &BTreeSet<ClaudeStrongBinding>,
+) {
+    let matches = |observation: &AgentStatusPlanObservation, binding: &ClaudeStrongBinding| {
+        observation.account_identifier_hash.as_deref()
+            == Some(binding.account_identifier_hash.as_str())
+            && observation
+                .organization_identifier_hash
+                .as_deref()
+                .map_or(true, |organization| {
+                    organization == binding.organization_identifier_hash
+                })
+    };
+    observations.retain(|observation| {
+        matches(observation, candidate)
+            || !registered_owned
+                .iter()
+                .any(|owned| owned != candidate && matches(observation, owned))
+    });
 }
 
 /// Carry the canonical registered anchor's closed local worker receipt onto
@@ -17039,6 +17158,7 @@ mod tests {
                 &health,
                 &canonical,
                 &slot_states,
+                &BTreeSet::new(),
             )
         };
         let account = |snapshot: &AgentStatusSnapshot| snapshot.account.clone().unwrap();
@@ -31105,6 +31225,142 @@ exit 44
         assert_eq!(
             fixture.slot_collection(0).state,
             ClaudeConfigSlotCollectionStateV1::Fresh
+        );
+    }
+
+    /// A pass whose registered-slot settings cannot be read sees only the
+    /// default login. When that login is an account a registered slot owns,
+    /// the pass uploads nothing for it (no default-only snapshot, no Desktop
+    /// or current claims), and the persisted slot states are kept.
+    #[test]
+    #[serial]
+    fn a_registered_set_dropout_uploads_nothing_misleading() {
+        let fixture = Phase0Fixture::new("dropout", true);
+        fixture.write_identity(&fixture.root.join("home"), SLOT_ACCOUNTS[0]);
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        let (owned_account, owned_organization) = Phase0Fixture::hashes(SLOT_ACCOUNTS[0]);
+        let first = fixture.collect();
+        let anchored = first
+            .snapshots
+            .iter()
+            .find(|snapshot| {
+                snapshot
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.account_identifier_hash.as_deref())
+                    == Some(owned_account.as_str())
+            })
+            .expect("the slot uploads its account");
+        assert_eq!(
+            anchored
+                .account
+                .as_ref()
+                .and_then(|account| account.claude_anchor_durability),
+            Some(ClaudeAccountAnchorDurabilityV1::Anchored)
+        );
+
+        let settings_path = FileClaudeConfigSlotSettingsStore::default()
+            .path()
+            .to_path_buf();
+        let original = fs::read(&settings_path).expect("settings");
+        fs::write(&settings_path, b"{").expect("unreadable settings");
+        let dropout = fixture.collect();
+        fs::write(&settings_path, original).expect("restore settings");
+
+        for snapshot in &dropout.snapshots {
+            let account = snapshot.account.as_ref();
+            assert_ne!(
+                account.and_then(|account| account.account_identifier_hash.as_deref()),
+                Some(owned_account.as_str()),
+                "no default-only snapshot for a slot-owned account"
+            );
+            assert_ne!(
+                account.and_then(|account| account.claude_anchor_durability),
+                Some(ClaudeAccountAnchorDurabilityV1::DefaultOnly)
+            );
+            assert!(snapshot.plan_observations.iter().all(|observation| {
+                observation.account_identifier_hash.as_deref() != Some(owned_account.as_str())
+                    || observation.organization_identifier_hash.as_deref()
+                        != Some(owned_organization.as_str())
+            }));
+        }
+        assert_eq!(
+            fixture.slot_collection(0).state,
+            ClaudeConfigSlotCollectionStateV1::Fresh,
+            "the persisted slot states are kept"
+        );
+    }
+
+    /// The default login's upload drops plan observations (for example a
+    /// Claude Desktop session bucket marked current) for accounts registered
+    /// slots own, and keeps its own and unowned ones. A default candidate for
+    /// a slot-owned account uploads only while that account has an anchor.
+    #[test]
+    fn default_upload_never_speaks_for_a_slot_owned_account() {
+        let binding = |account: &str, organization: &str| {
+            ClaudeStrongBinding::new(account, organization).expect("binding")
+        };
+        let observation = |account: &str, organization: Option<&str>| {
+            serde_json::from_value::<AgentStatusPlanObservation>(serde_json::json!({
+                "evidence_method": "claude_desktop_session_bucket",
+                "account_label": "Claude Desktop",
+                "account_identifier_hash": account,
+                "organization_identifier_hash": organization,
+                "confidence": "high",
+                "is_current": true
+            }))
+            .expect("observation")
+        };
+        let own = binding("acct-default", "org-default");
+        let owned = BTreeSet::from([binding("acct-slot", "org-slot"), own.clone()]);
+        let mut observations = vec![
+            observation("acct-default", Some("org-default")),
+            observation("acct-slot", Some("org-slot")),
+            observation("acct-slot", None),
+            observation("acct-slot", Some("org-other")),
+            observation("acct-unowned", Some("org-unowned")),
+        ];
+        strip_slot_owned_plan_observations(&mut observations, &own, &owned);
+        let kept = observations
+            .iter()
+            .map(|observation| {
+                (
+                    observation
+                        .account_identifier_hash
+                        .clone()
+                        .unwrap_or_default(),
+                    observation.organization_identifier_hash.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            vec![
+                ("acct-default".to_string(), Some("org-default".to_string())),
+                ("acct-slot".to_string(), Some("org-other".to_string())),
+                ("acct-unowned".to_string(), Some("org-unowned".to_string())),
+            ]
+        );
+
+        let status = |account: Option<&str>| ClaudeConfigSlotCollectionStatusV1 {
+            account_identifier_hash: account.map(str::to_string),
+            organization_identifier_hash: account.map(|_| "org-slot".to_string()),
+            ..ClaudeConfigSlotCollectionStatusV1::default()
+        };
+        let previous = BTreeMap::from([
+            ("default".to_string(), status(Some("acct-default"))),
+            ("slot-a".to_string(), status(Some("acct-slot"))),
+        ]);
+        // Registered set unknown: every non-default persisted slot owns.
+        assert_eq!(
+            claude_registered_owned_bindings(false, &[], &BTreeMap::new(), &previous),
+            BTreeSet::from([binding("acct-slot", "org-slot")])
+        );
+        // Known: this pass's status (binding cleared) or the persisted one.
+        let current = BTreeMap::from([("slot-a".to_string(), status(None))]);
+        assert_eq!(
+            claude_registered_owned_bindings(true, &["slot-a".to_string()], &current, &previous),
+            BTreeSet::from([binding("acct-slot", "org-slot")])
         );
     }
 
