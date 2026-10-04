@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 428,
-  "content_sha256": "cba2594c007f58409fbbc3e67ef55fc99222745c3bdab9750dd9bd1a7f4736f6",
+  "content_sha256": "61db97eb1df71675d4682ca9538227ce21d100b51adeec6917f0abfb617cc80a",
   "files": [
     {
       "executable": false,
@@ -1931,8 +1931,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-04-quota-window-truth.md",
-      "sha256": "846f4fb560f5de22c4ecbf7cb2754d3bc11b1eb5d4195b53cd68c709d47853d9",
-      "size_bytes": 2452
+      "sha256": "e6601a0dd93348dca655d75a6b2b9553e82fa27d5047d5273b6e2dd2940663e0",
+      "size_bytes": 2551
     },
     {
       "executable": false,
