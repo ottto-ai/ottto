@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 433,
-  "content_sha256": "19db7f7db27bc470a164166f2883c667945ad4fc0c62855d64f1d59270311ea6",
+  "candidate_file_count": 435,
+  "content_sha256": "57b1f31dac89671f338dcdda76165e0991a644749644aed131ec655488e2e0d6",
   "files": [
     {
       "executable": false,
@@ -580,8 +580,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "cc34008c43ad3cf3e0062a3614564c86c50af40a6e0424cf4b85a3cbe4582803",
-      "size_bytes": 284586
+      "sha256": "6df7e1b68ce06874a54083ba016d8a698e0d2e5932b3e1b724a76158e63d9227",
+      "size_bytes": 293072
     },
     {
       "executable": false,
@@ -1084,8 +1084,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "092e1a1d4434bebf5ebc8c206f228e26dc738ea43d6c68484a66f746555f6aed",
-      "size_bytes": 21578
+      "sha256": "6c55a60521fb575f0ff154eac6b94c589f71b29ac1f10408736bcdae854aeaef",
+      "size_bytes": 22443
     },
     {
       "executable": false,
@@ -1951,6 +1951,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-05-account-display-carrier.md",
+      "sha256": "bb2d6857615a5f848d801a4335a0012ac4c9ac513fee9d75fcc7754b98bbc68f",
+      "size_bytes": 1729
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-05-daemon-status-freshness.md",
       "sha256": "c5d4482d8a1332f2e2259072481c53ca4f324b62eef615e484396cf60e02962a",
       "size_bytes": 3506
@@ -2024,6 +2031,13 @@
       "path": "fixtures/agent-status/claude-quota-access-witness.json",
       "sha256": "60a0c55ffed9141d1d68029754656306bfb75e9191cac97d2b026c5cd39d5600",
       "size_bytes": 1418
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/display-carrier.json",
+      "sha256": "f5ba9ea9f9dc55405bb42d071592de1bbf0a456c053a85bfe87c26e2f45d230a",
+      "size_bytes": 1361
     },
     {
       "executable": false,
@@ -2785,8 +2799,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_contract_check.sh",
-      "sha256": "940883b53b09956defc2c5198ab7c4d52c9a83b76592aa75c2705c822994bc83",
-      "size_bytes": 121129
+      "sha256": "9f602c8ceda4b3d611d97c15f06f99d96302a56240fb07d97a17047e3e2d5028",
+      "size_bytes": 121350
     },
     {
       "executable": true,
@@ -2981,8 +2995,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_contract_check.sh",
-      "sha256": "15599e3c75ac91b4d70611d15fe149cf6d018baf2201d309ae489f2c201a78b3",
-      "size_bytes": 98832
+      "sha256": "32027e183845a28710457c70e3a4a9b7d27a281acbf238b69382997781bf1b79",
+      "size_bytes": 99153
     },
     {
       "executable": true,
@@ -3034,9 +3048,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-05T09:36:50+00:00",
+  "generated_at": "2026-10-05T12:14:48+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 434,
+  "output_file_count": 436,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3070,5 +3084,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f21023b4f4c25941f17c64d882e4d504e54ec6a4"
+  "source_commit": "114b2d57feb64b11b1ef620562b5f9c22b2c0e50"
 }
