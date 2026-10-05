@@ -361,8 +361,8 @@ pub(crate) const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v
 pub(crate) const SNAPSHOT_REVISION_CONTRACT_VERSION: &str = "snapshot_revision:v1";
 pub(crate) const SNAPSHOT_REVISION_V2_CONTRACT_VERSION: &str = "snapshot_revision:v2";
 pub(crate) const MAX_SEMANTIC_ENVELOPE_BYTES: usize = 2 * 1024;
-pub(crate) const MAX_SNAPSHOT_ITEM_WIRE_BYTES: usize = 128 * 1024;
-pub(crate) const MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES: usize = 129 * 1024;
+pub(crate) const MAX_SNAPSHOT_ITEM_WIRE_BYTES: usize = 640 * 1024;
+pub(crate) const MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES: usize = 641 * 1024;
 pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_USAGE_NAME_LENGTH: usize = 128;
 const MAX_TOOL_USAGE_NAMES: usize = 200;
@@ -1925,6 +1925,14 @@ pub struct SnapshotQuarantineWitness {
     pub scan_identity_version: String,
     pub snapshot_schema_version: u16,
     pub entity_ack_contract: String,
+    /// Local admission policy, not part of wire or semantic identity. Legacy
+    /// records predate the backend-first 640 KiB admission repair.
+    #[serde(default = "legacy_snapshot_item_wire_byte_limit")]
+    pub item_wire_byte_limit: usize,
+}
+
+const fn legacy_snapshot_item_wire_byte_limit() -> usize {
+    128 * 1024
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1962,6 +1970,7 @@ pub fn snapshot_quarantine_witness(source: SnapshotSource) -> SnapshotQuarantine
         scan_identity_version: source.scan_identity_version().to_string(),
         snapshot_schema_version: SNAPSHOT_SCHEMA_VERSION,
         entity_ack_contract: SNAPSHOT_ENTITY_ACK_CONTRACT.to_string(),
+        item_wire_byte_limit: MAX_SNAPSHOT_ITEM_WIRE_BYTES,
     }
 }
 
@@ -18702,6 +18711,57 @@ impl ScanIndex {
         self.context_curve_capability_enabled = false;
     }
 
+    /// Reuse the existing quarantine retry page after a reviewed admission
+    /// increase. Legacy records have no rejection reason: re-offer current
+    /// refusals, preserving accepted marks and absent/superseded disclosures.
+    pub(crate) fn prepare_snapshot_admission_reoffer(&mut self, limit: usize) -> bool {
+        let current = self.current_snapshot_fingerprints();
+        let selected = self
+            .quarantined_snapshot_fingerprints
+            .iter()
+            .filter(|(fingerprint, record)| {
+                current.contains(*fingerprint)
+                    && !self.accepted_snapshot_fingerprints.contains(*fingerprint)
+                    && record.witness.item_wire_byte_limit < MAX_SNAPSHOT_ITEM_WIRE_BYTES
+                    && record.disposition != SnapshotQuarantineDisposition::SupersededTerminal
+            })
+            .take(limit)
+            .map(|(fingerprint, _)| fingerprint.clone())
+            .collect::<Vec<_>>();
+        for fingerprint in &selected {
+            let record = self
+                .quarantined_snapshot_fingerprints
+                .get_mut(fingerprint)
+                .unwrap();
+            record.witness.item_wire_byte_limit = MAX_SNAPSHOT_ITEM_WIRE_BYTES;
+            record.retry_after_unix_seconds = 0;
+            record.failed_reconstruction_count = 0;
+            record.disposition = SnapshotQuarantineDisposition::RetryPending;
+        }
+        if !selected.is_empty() {
+            // Match legacy settlement recovery: only a completed unhealthy
+            // traversal needs discovery re-opened. Never restart a live page.
+            if self.traversal.as_ref().is_some_and(|t| {
+                t.pending_directories.is_empty()
+                    && t.pending_candidates.is_empty()
+                    && t.counts.has_errors()
+            }) {
+                self.traversal = None;
+            }
+            self.bounded_sweep_had_unsettled_upload = true;
+        }
+        !selected.is_empty()
+    }
+
+    pub(crate) fn snapshot_admission_reoffer_pending(&self) -> bool {
+        self.quarantined_snapshot_fingerprints
+            .values()
+            .any(|record| {
+                record.witness.item_wire_byte_limit == MAX_SNAPSHOT_ITEM_WIRE_BYTES
+                    && record.disposition == SnapshotQuarantineDisposition::RetryPending
+            })
+    }
+
     fn activate_quarantine_witness(&mut self, source: SnapshotSource) {
         self.active_quarantine_witness = Some(snapshot_quarantine_witness(source));
     }
@@ -22170,6 +22230,274 @@ mod tests {
             fingerprints.len()
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_admission_boundaries_match_backend_640_kib() {
+        assert_eq!(MAX_SNAPSHOT_ITEM_WIRE_BYTES, 655_360);
+        assert_eq!(MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES, 656_384);
+        for size in [128 * 1024, 128 * 1024 + 1, 640 * 1024] {
+            assert!(snapshot_item_wire_size_is_allowed(size, size, None));
+        }
+        assert!(!snapshot_item_wire_size_is_allowed(655_361, 655_361, None));
+        assert!(snapshot_item_wire_size_is_allowed(
+            656_384,
+            655_360,
+            Some("payload_budget_exceeded")
+        ));
+        assert!(!snapshot_item_wire_size_is_allowed(
+            656_385,
+            655_360,
+            Some("payload_budget_exceeded")
+        ));
+        assert!(!snapshot_item_wire_size_is_allowed(
+            656_384,
+            655_361,
+            Some("payload_budget_exceeded")
+        ));
+        assert!(!snapshot_item_wire_size_is_allowed(
+            656_384,
+            655_360,
+            Some("sampled")
+        ));
+    }
+
+    #[test]
+    fn admission_reoffer_reconstructs_terminal_file_through_existing_scanner() {
+        let root = temp_dir("admission-reoffer-scanner");
+        fs::create_dir_all(&root).unwrap();
+        for id in ["refused", "healthy"] {
+            fs::write(root.join(format!("{id}.jsonl")), format!(
+                "{{\"type\":\"session\",\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}\n{{\"type\":\"message\",\"timestamp\":\"2026-01-01T00:01:00Z\",\"message\":{{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"usage\":{{\"input\":12,\"output\":4}}}}}}\n"
+            )).unwrap();
+        }
+        let old_mtime = OffsetDateTime::parse("2026-01-01T00:02:00Z", &Rfc3339)
+            .unwrap()
+            .unix_timestamp() as u64;
+        for id in ["refused", "healthy"] {
+            fs::File::open(root.join(format!("{id}.jsonl")))
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(old_mtime)),
+                )
+                .unwrap();
+        }
+        let source = SnapshotSource::Pi;
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            source,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-10-05T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .unwrap();
+        assert_eq!(first.snapshots.len(), 2);
+        let refused = first
+            .snapshots
+            .iter()
+            .find(|s| s.source_session_id == "refused")
+            .unwrap();
+        let healthy = first
+            .snapshots
+            .iter()
+            .find(|s| s.source_session_id == "healthy")
+            .unwrap();
+        let mut record = snapshot_quarantine_record(source);
+        record.witness.item_wire_byte_limit = 128 * 1024;
+        record.retry_after_unix_seconds = 0;
+        record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        record.upload_body_witness = Some(snapshot_upload_body_witness(refused));
+        index
+            .quarantined_snapshot_fingerprints
+            .insert(refused.snapshot_fingerprint.clone(), record);
+        index.record_accepted_snapshot_fingerprints(&BTreeSet::from([healthy
+            .snapshot_fingerprint
+            .clone()]));
+        let suppressed = scan_source_roots(
+            source,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-10-05T00:01:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .unwrap();
+        assert!(
+            suppressed.snapshots.is_empty(),
+            "unchanged terminal and accepted bodies were settled"
+        );
+        assert!(index.prepare_snapshot_admission_reoffer(50));
+        let path = root.join("index.json");
+        index.save(&path).unwrap();
+        index = ScanIndex::load(&path).unwrap();
+        let replay = scan_source_roots(
+            source,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-10-05T00:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .unwrap();
+        assert_eq!(replay.snapshots.len(), 1);
+        assert_eq!(replay.snapshots[0].source_session_id, "refused");
+        assert_eq!(
+            replay.snapshots[0].snapshot_fingerprint,
+            refused.snapshot_fingerprint
+        );
+        assert_eq!(replay.snapshots[0].input_tokens, 12);
+        assert!(index
+            .accepted_snapshot_fingerprints
+            .contains(&healthy.snapshot_fingerprint));
+        let record = index
+            .quarantined_snapshot_fingerprints
+            .get_mut(&refused.snapshot_fingerprint)
+            .unwrap();
+        record.failed_reconstruction_count = 1;
+        record.retry_after_unix_seconds = 0;
+        assert!(index.snapshot_admission_reoffer_pending());
+        let window = if index.snapshot_admission_reoffer_pending() {
+            u64::MAX
+        } else {
+            7
+        };
+        let after_conflict = scan_source_roots(
+            source,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-10-05T00:03:00Z",
+            window,
+        )
+        .unwrap();
+        assert_eq!(
+            after_conflict.snapshots.len(),
+            1,
+            "old-mtime conflict body stays retryable beyond receipt window"
+        );
+        assert_eq!(
+            after_conflict.snapshots[0].snapshot_fingerprint,
+            refused.snapshot_fingerprint
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admission_retry_window_stays_open_until_ack_or_terminal() {
+        let fp = "a".repeat(64);
+        let mut index = ScanIndex::default();
+        let mut record = snapshot_quarantine_record(SnapshotSource::Pi);
+        for failures in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+            record.failed_reconstruction_count = failures;
+            index
+                .quarantined_snapshot_fingerprints
+                .insert(fp.clone(), record.clone());
+            assert!(
+                index.snapshot_admission_reoffer_pending(),
+                "historical retry still needs reconstruction after conflict {failures}"
+            );
+        }
+        record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        record.retry_after_unix_seconds = 0;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert(fp.clone(), record.clone());
+        assert!(!index.snapshot_admission_reoffer_pending());
+        record.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert(fp.clone(), record);
+        assert!(!index.snapshot_admission_reoffer_pending());
+        index.quarantined_snapshot_fingerprints.clear();
+        assert!(
+            !index.snapshot_admission_reoffer_pending(),
+            "ACK retires the obligation"
+        );
+    }
+
+    #[test]
+    fn admission_reoffer_is_bounded_durable_and_preserves_terminal_disclosure() {
+        let mut index = ScanIndex::default();
+        let current = (0..61)
+            .map(|n| format!("{n:064x}"))
+            .collect::<BTreeSet<_>>();
+        index
+            .file_snapshot_fingerprints
+            .insert("synthetic.jsonl".into(), current.clone());
+        for fingerprint in &current {
+            let mut record = snapshot_quarantine_record(SnapshotSource::Pi);
+            record.witness.item_wire_byte_limit = 128 * 1024;
+            record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+            record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+            record.retry_after_unix_seconds = 0;
+            index
+                .quarantined_snapshot_fingerprints
+                .insert(fingerprint.clone(), record);
+        }
+        let accepted = format!("{:064x}", 60);
+        index
+            .accepted_snapshot_fingerprints
+            .insert(accepted.clone());
+        let absent = "e".repeat(64);
+        let superseded = format!("{:064x}", 59);
+        let mut absent_record = index.quarantined_snapshot_fingerprints[&superseded].clone();
+        index
+            .quarantined_snapshot_fingerprints
+            .insert(absent.clone(), absent_record.clone());
+        index
+            .quarantined_snapshot_fingerprints
+            .get_mut(&superseded)
+            .unwrap()
+            .disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+        // Deserialize actual old witness shape, with no admission policy field.
+        let mut old = serde_json::to_value(&index).unwrap();
+        for record in old["quarantined_snapshot_fingerprints"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            record["witness"]
+                .as_object_mut()
+                .unwrap()
+                .remove("item_wire_byte_limit");
+        }
+        index = serde_json::from_value(old).unwrap();
+        assert!(index.prepare_snapshot_admission_reoffer(50));
+        assert_eq!(
+            index
+                .quarantined_snapshot_fingerprints
+                .values()
+                .filter(|r| r.failed_reconstruction_count == 0)
+                .count(),
+            50
+        );
+        assert!(index.snapshot_admission_reoffer_pending());
+        let mut resumed: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        assert!(resumed.prepare_snapshot_admission_reoffer(50));
+        assert!(
+            !resumed.prepare_snapshot_admission_reoffer(50),
+            "no second policy rearm"
+        );
+        assert_eq!(
+            resumed.quarantined_snapshot_fingerprints[&absent],
+            absent_record
+        );
+        assert_eq!(
+            resumed.quarantined_snapshot_fingerprints[&superseded].disposition,
+            SnapshotQuarantineDisposition::SupersededTerminal
+        );
+        assert!(resumed.accepted_snapshot_fingerprints.contains(&accepted));
+        let rearmed = format!("{:064x}", 0);
+        absent_record.witness.item_wire_byte_limit = MAX_SNAPSHOT_ITEM_WIRE_BYTES;
+        resumed
+            .quarantined_snapshot_fingerprints
+            .insert(rearmed.clone(), absent_record);
+        assert!(
+            !resumed.prepare_snapshot_admission_reoffer(50),
+            "four failures under new admission stay terminal"
+        );
     }
 
     #[test]
