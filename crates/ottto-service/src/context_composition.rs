@@ -25,7 +25,8 @@
 
 use crate::context_footprint::{
     collect_recent_jsonl_files, first_existing_cwd_from_jsonl, resolve_repository_identity,
-    safe_text, sha256_hex, workspace_label, RepositoryIdentity,
+    safe_text, sha256_hex, transcript_file_metadata, workspace_label, RepositoryIdentity,
+    TranscriptFileMetadata,
 };
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::SnapshotSource;
@@ -51,6 +52,9 @@ const IMAGE_NOMINAL_TOKENS: u64 = 1300;
 
 const COLLECTOR_VERSION: &str = "context-composition-0.1.0";
 const COUNTER_SOURCE: &str = "context_composition_v1";
+/// Local cache identity only. Bump when parsing/classification/ordering changes
+/// without a methodology or collector-version change; never a wire field.
+const COMPOSITION_PARSER_VERSION: &str = "context-composition-parser-v1";
 /// Aggregate rows bucket by the UTC calendar day. `time` in this crate has no
 /// timezone database (formatting/parsing features only) and local-offset lookup
 /// is unsound in a multithreaded daemon, so UTC is the deterministic,
@@ -624,10 +628,8 @@ fn iso_utc(ts: OffsetDateTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-fn read_jsonl(path: &Path) -> Vec<Value> {
-    let Ok(text) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
+fn read_jsonl(path: &Path) -> std::io::Result<Vec<Value>> {
+    let text = fs::read_to_string(path)?;
     let mut out = Vec::new();
     for raw in text.lines() {
         let raw = raw.trim();
@@ -638,7 +640,7 @@ fn read_jsonl(path: &Path) -> Vec<Value> {
             out.push(value);
         }
     }
-    out
+    Ok(out)
 }
 
 // -------------------------------------------------------------------------
@@ -655,10 +657,10 @@ pub(crate) fn parse_claude_session(
     report: &mut WorkspaceReport,
     fallback: Date,
     include_subagents: bool,
-) {
-    let lines = read_jsonl(path);
+) -> std::io::Result<()> {
+    let lines = read_jsonl(path)?;
     if lines.is_empty() {
-        return;
+        return Ok(());
     }
 
     let mut session_id: Option<String> = None;
@@ -678,7 +680,7 @@ pub(crate) fn parse_claude_session(
 
     if is_sub {
         if !include_subagents {
-            return;
+            return Ok(());
         }
         let agent_id = lines
             .iter()
@@ -862,16 +864,21 @@ pub(crate) fn parse_claude_session(
     }
 
     report.note_session_start(&session_id, session_min_ts);
+    Ok(())
 }
 
 // -------------------------------------------------------------------------
 // Codex parsing (ported 1:1 from the reference).
 // -------------------------------------------------------------------------
 
-pub(crate) fn parse_codex_session(path: &Path, report: &mut WorkspaceReport, fallback: Date) {
-    let lines = read_jsonl(path);
+pub(crate) fn parse_codex_session(
+    path: &Path,
+    report: &mut WorkspaceReport,
+    fallback: Date,
+) -> std::io::Result<()> {
+    let lines = read_jsonl(path)?;
     if lines.is_empty() {
-        return;
+        return Ok(());
     }
 
     let mut session_id: Option<String> = None;
@@ -1035,6 +1042,7 @@ pub(crate) fn parse_codex_session(path: &Path, report: &mut WorkspaceReport, fal
     }
 
     report.note_session_start(&session_id, session_min_ts);
+    Ok(())
 }
 
 fn is_truthy_json(value: &Value) -> bool {
@@ -1396,6 +1404,7 @@ fn file_date(mtime: SystemTime) -> Date {
 
 fn build_report_for_scan(
     scan: &WorkspaceScan,
+    signature: &CompositionFilesSignature,
     agent_source: SnapshotSource,
     window: DateWindow,
     deadline: Instant,
@@ -1405,20 +1414,33 @@ fn build_report_for_scan(
         if Instant::now() >= deadline {
             return None;
         }
-        if fs::metadata(file)
-            .map(|m| m.len() > MAX_TRANSCRIPT_BYTES)
-            .unwrap_or(false)
-        {
+        let before = fs::metadata(file).ok()?;
+        let expected = signature.get(file.to_string_lossy().as_ref())?;
+        if transcript_file_metadata(&before).ok()?.ne(expected) {
+            return None;
+        }
+        if before.len() > MAX_TRANSCRIPT_BYTES {
             continue;
         }
         let fallback = file_date(*mtime);
         match agent_source {
             SnapshotSource::ClaudeCode => parse_claude_session(file, &mut report, fallback, true),
             SnapshotSource::Codex => parse_codex_session(file, &mut report, fallback),
-            _ => {}
+            _ => Ok(()),
+        }
+        .ok()?;
+        let after = fs::metadata(file).ok()?;
+        if transcript_file_metadata(&after).ok()?.ne(expected) {
+            return None;
         }
     }
-    (Instant::now() < deadline).then_some(report)
+    // Also fence files parsed earlier while later files were being processed.
+    (Instant::now() < deadline
+        && workspace_files_signature(&scan.files, deadline)
+            .as_ref()
+            .ok()
+            == Some(signature))
+    .then_some(report)
 }
 
 // -------------------------------------------------------------------------
@@ -1429,31 +1451,79 @@ fn build_report_for_scan(
 struct CompositionCacheEntry {
     identity: String,
     agent_source: String,
-    files: BTreeMap<String, i64>,
+    files: CompositionFilesSignature,
+    scan_identity: CompositionScanIdentity,
     payload_sha256: String,
     posted_at: String,
 }
 
-fn workspace_files_signature(files: &[(PathBuf, SystemTime)]) -> BTreeMap<String, i64> {
+type CompositionFilesSignature = BTreeMap<String, TranscriptFileMetadata>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CompositionScanIdentity {
+    window_floor: String,
+    window_today: String,
+    parser_version: String,
+    methodology_hash: String,
+    labels_enabled: bool,
+}
+
+fn composition_scan_identity(
+    agent_source: &str,
+    window: DateWindow,
+    labels_enabled: bool,
+) -> CompositionScanIdentity {
+    CompositionScanIdentity {
+        window_floor: date_ymd(window.floor),
+        window_today: date_ymd(window.today),
+        parser_version: COMPOSITION_PARSER_VERSION.to_string(),
+        methodology_hash: composition_config_hash(agent_source),
+        labels_enabled,
+    }
+}
+
+fn workspace_files_signature(
+    files: &[(PathBuf, SystemTime)],
+    deadline: Instant,
+) -> std::io::Result<CompositionFilesSignature> {
     let mut sig = BTreeMap::new();
     for (path, mtime) in files {
-        let secs = mtime
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        sig.insert(path.to_string_lossy().to_string(), secs);
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "composition metadata budget expired",
+            ));
+        }
+        let metadata = fs::metadata(path)?;
+        if !metadata.is_file() || metadata.modified()? != *mtime {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "composition source changed since discovery",
+            ));
+        }
+        sig.insert(
+            path.to_string_lossy().to_string(),
+            transcript_file_metadata(&metadata)?,
+        );
     }
-    sig
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "composition metadata budget expired",
+        ));
+    }
+    Ok(sig)
 }
 
 /// A workspace is rescanned when there is no cache for it, the destination or
-/// agent changed, any transcript's mtime changed (the watermark), or the cached
-/// upload is older than the staleness bound.
+/// agent, metadata, active date window, parser/methodology or label policy
+/// changed, or the cached upload is older than the staleness bound.
 fn should_rescan(
     cache: Option<&CompositionCacheEntry>,
     identity: &str,
     agent_source: &str,
-    signature: &BTreeMap<String, i64>,
+    signature: &CompositionFilesSignature,
+    scan_identity: &CompositionScanIdentity,
     now: OffsetDateTime,
 ) -> bool {
     let Some(cache) = cache else {
@@ -1462,7 +1532,7 @@ fn should_rescan(
     if cache.identity != identity || cache.agent_source != agent_source {
         return true;
     }
-    if &cache.files != signature {
+    if &cache.files != signature || &cache.scan_identity != scan_identity {
         return true;
     }
     cache_is_stale(cache, now)
@@ -1652,6 +1722,7 @@ fn harvest_source(
 
     let window = DateWindow::current();
     let agent_source = agent_source_label(source);
+    let scan_identity = composition_scan_identity(agent_source, window, labels_enabled);
     let mut uploaded = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
@@ -1662,18 +1733,44 @@ fn harvest_source(
         }
         let workspace_text = scan.workspace.to_string_lossy();
         let workspace_hash = sha256_hex(&[workspace_text.as_ref()]);
-        let signature = workspace_files_signature(&scan.files);
+        let signature = match workspace_files_signature(&scan.files, deadline) {
+            Ok(signature) => signature,
+            Err(_) if Instant::now() >= deadline => {
+                return Err(anyhow!("context composition report budget expired"));
+            }
+            Err(_) => {
+                failed += 1;
+                eprintln!(
+                    "context composition metadata incomplete for workspace_hash={workspace_hash}"
+                );
+                continue;
+            }
+        };
         let path = cache_path(support_dir, agent_source, &workspace_hash);
         let cache = read_cache(&path);
         let now_dt = OffsetDateTime::now_utc();
-        if !should_rescan(cache.as_ref(), &identity, agent_source, &signature, now_dt) {
+        if !should_rescan(
+            cache.as_ref(),
+            &identity,
+            agent_source,
+            &signature,
+            &scan_identity,
+            now_dt,
+        ) {
             skipped += 1;
             continue;
         }
 
-        // A budget-limited report must not replace a complete cached report.
-        let Some(report) = build_report_for_scan(&scan, source, window, deadline) else {
-            return Err(anyhow!("context composition report budget expired"));
+        // Retain this workspace's last good report on an incomplete read, but
+        // keep healthy workspaces progressing within the shared deadline.
+        let Some(report) = build_report_for_scan(&scan, &signature, source, window, deadline)
+        else {
+            if Instant::now() >= deadline {
+                return Err(anyhow!("context composition report budget expired"));
+            }
+            failed += 1;
+            eprintln!("context composition report incomplete for workspace_hash={workspace_hash}");
+            continue;
         };
         let Some(request) = build_request(
             &report,
@@ -1738,6 +1835,7 @@ fn harvest_source(
                 identity: identity.clone(),
                 agent_source: agent_source.to_string(),
                 files: signature,
+                scan_identity: scan_identity.clone(),
                 payload_sha256: payload_sha,
                 posted_at: now_dt.format(&Rfc3339).unwrap_or_default(),
             },
