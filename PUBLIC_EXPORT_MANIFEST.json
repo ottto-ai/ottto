@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 437,
-  "content_sha256": "3d8799ef563aaae3a431fd42846250d399cee6074a0c8acd23f91eee55dc61a3",
+  "content_sha256": "160a6474a373cba1334462a0978456ac7805f621058274b4c55cbe3a90213e5e",
   "files": [
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_local_otel.rs",
-      "sha256": "513517cf7a2715678f1ee27d4af8267481767b60feb4e915c4ed9fcefca0ef08",
-      "size_bytes": 96731
+      "sha256": "3f27df0c7fca93cebddcaef06dca379b71b8a349b9ebe25a16c05a32b882ae97",
+      "size_bytes": 96729
     },
     {
       "executable": false,
@@ -3062,7 +3062,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-05T20:42:22+00:00",
+  "generated_at": "2026-10-05T20:51:12+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 438,
   "public_roots": [
@@ -3098,5 +3098,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "3815d71c2ac242ec469b4f4eecbb821f1312a303"
+  "source_commit": "16f6337399dce5bba99f70847ed75a8e92c391be"
 }

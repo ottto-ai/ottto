@@ -1487,7 +1487,7 @@ mod tests {
         let trace_body = trace_body(vec![llm_span("req-cap", None)]);
         // Capture once through both public APIs, then exercise the actual file
         // path at exactly and over the boundary without allocating a giant row.
-        assert!(capture_claude_api_request_logs(&dir, &api_body, "application/json").unwrap() > 0);
+        assert!(capture_claude_api_request_logs(&dir, api_body, "application/json").unwrap() > 0);
         assert_eq!(
             capture_claude_llm_request_traces(&dir, &trace_body, "application/x-protobuf").unwrap(),
             1
@@ -1509,7 +1509,7 @@ mod tests {
                 .unwrap()
                 .set_len(bytes)
                 .unwrap();
-            assert!(capture_claude_api_request_logs(&dir, &api_body, "application/json").is_err());
+            assert!(capture_claude_api_request_logs(&dir, api_body, "application/json").is_err());
             assert!(
                 capture_claude_llm_request_traces(&dir, &trace_body, "application/x-protobuf")
                     .is_err()
