@@ -24153,7 +24153,7 @@ mod tests {
         assert_eq!(error.code, CliErrorCode::ManualFenceReviewRequired);
         assert_eq!(
             error.message,
-            "Ottto found a manually edited managed fence and needs you to review it."
+            "Ottto left the configuration unchanged. Review the Ottto telemetry entries and fence markers in the source config, then retry."
         );
         assert!(!error.retryable);
         assert!(store.load(&SourceKind::Codex, "key_manual_fence").is_ok());
