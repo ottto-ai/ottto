@@ -1,6 +1,7 @@
+use std::ops::Range;
 use std::path::Path;
 
-use toml_edit::DocumentMut;
+use toml_edit::{DocumentMut, ImDocument, Item, Key, TableLike};
 
 use super::fence::{
     remove_fence_with_validator, upsert_fence_with_validator, upsert_would_change_with_validator,
@@ -23,6 +24,167 @@ fn validate_toml(body: &str) -> Result<(), String> {
     body.parse::<DocumentMut>()
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+pub(crate) enum SourceOffFence {
+    Absent,
+    Complete {
+        start: Range<usize>,
+        end: Range<usize>,
+    },
+    Recovered(String),
+}
+
+/// The orphan exception authorizes byte ranges, never a reconstructed fence.
+/// A parsed value's span excludes marker-looking lines inside TOML strings.
+pub(crate) fn source_off_fence(
+    body: &str,
+    owned_port: impl Fn(&dyn TableLike, &str, &str) -> Option<u16>,
+) -> Result<SourceOffFence, ()> {
+    let document = ImDocument::parse(body).map_err(|_| ())?;
+    let mut values = Vec::new();
+    value_spans(document.as_item(), &mut values);
+    let mut offset = 0;
+    let mut markers = Vec::new();
+    for line in body.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let trimmed = line.trim();
+        if matches!(trimmed, "# ottto:start" | "# ottto:end")
+            && !values.iter().any(|span| span.contains(&start))
+        {
+            markers.push((trimmed == "# ottto:start", start..offset));
+        }
+    }
+    match markers.as_slice() {
+        [] => Ok(SourceOffFence::Absent),
+        [(true, start), (false, end)] => Ok(SourceOffFence::Complete {
+            start: start.clone(),
+            end: end.clone(),
+        }),
+        [(false, end)] => recover_orphan(body, &document, end.clone(), owned_port),
+        _ => Err(()),
+    }
+}
+
+fn value_spans(item: &Item, spans: &mut Vec<Range<usize>>) {
+    if let Some(value) = item.as_value() {
+        if let Some(span) = value.span() {
+            spans.push(span);
+        }
+    } else if let Some(table) = item.as_table() {
+        for (_, child) in table.iter() {
+            value_spans(child, spans);
+        }
+    } else if let Some(tables) = item.as_array_of_tables() {
+        for table in tables.iter() {
+            for (_, child) in table.iter() {
+                value_spans(child, spans);
+            }
+        }
+    }
+}
+
+fn recover_orphan(
+    body: &str,
+    document: &ImDocument<&str>,
+    end: Range<usize>,
+    owned_port: impl Fn(&dyn TableLike, &str, &str) -> Option<u16>,
+) -> Result<SourceOffFence, ()> {
+    let otel = document
+        .get("otel")
+        .and_then(Item::as_table_like)
+        .ok_or(())?;
+    let mut ranges = Vec::new();
+    let mut ports = std::collections::BTreeSet::new();
+    for (key, signal) in [
+        ("exporter", "logs"),
+        ("trace_exporter", "traces"),
+        ("metrics_exporter", "metrics"),
+    ] {
+        let Some(port) = owned_port(otel, key, signal) else {
+            continue;
+        };
+        if port == 0 {
+            return Err(());
+        }
+        let exporter = otel.get(key).ok_or(())?;
+        let table = exporter.as_table_like().ok_or(())?;
+        let http = table.get("otlp-http").ok_or(())?;
+        let fields = http.as_table_like().ok_or(())?;
+        // A familiar header cannot authorize deleting additional user settings.
+        if fields
+            .iter()
+            .any(|(key, _)| !matches!(key, "endpoint" | "protocol" | "headers"))
+            || fields
+                .get("protocol")
+                .is_some_and(|value| value.as_str() != Some("binary"))
+            || fields
+                .get("headers")
+                .and_then(Item::as_table_like)
+                .ok_or(())?
+                .iter()
+                .count()
+                != 1
+        {
+            return Err(());
+        }
+        let endpoint = fields.get("endpoint").and_then(Item::as_str).ok_or(())?;
+        if endpoint != format!("http://127.0.0.1:{port}/v1/{signal}")
+            && endpoint != format!("http://localhost:{port}/v1/{signal}")
+        {
+            return Err(());
+        }
+        // Accept the generated dotted leaf, or the sole inline exporter in an
+        // [otel] assignment. Nested section tables / mixed inline parents need
+        // manual review: removing them could change subsequent TOML scope.
+        let assignment = if exporter.as_inline_table().is_some() {
+            if table.iter().count() != 1 {
+                return Err(());
+            }
+            exporter
+        } else {
+            http
+        };
+        if assignment.as_inline_table().is_none() {
+            return Err(());
+        }
+        let span = assignment.span().ok_or(())?;
+        let start = body[..span.start].rfind('\n').map_or(0, |index| index + 1);
+        let prefix = body[start..span.start].trim();
+        let key_text = prefix.strip_suffix('=').ok_or(())?.trim();
+        // Parsing the complete prefix as a key rejects values embedded inside
+        // an unrelated inline assignment on the same physical line.
+        let keys = Key::parse(key_text).map_err(|_| ())?;
+        let names = keys.iter().map(Key::get).collect::<Vec<_>>();
+        let expected = if exporter.as_inline_table().is_some() {
+            vec![key]
+        } else {
+            vec![key, "otlp-http"]
+        };
+        if names != expected && names != [vec!["otel"], expected].concat() {
+            return Err(());
+        }
+        if span.end > end.start {
+            return Err(());
+        }
+        ports.insert(port);
+        ranges.push(start..span.end);
+    }
+    if ranges.is_empty() || ports.len() != 1 {
+        return Err(());
+    }
+    ranges.push(end);
+    ranges.sort_by_key(|span| span.start);
+    if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
+        return Err(());
+    }
+    let mut next = body.to_string();
+    for span in ranges.into_iter().rev() {
+        next.replace_range(span, "");
+    }
+    ImDocument::parse(next.as_str()).map_err(|_| ())?;
+    Ok(SourceOffFence::Recovered(next))
 }
 
 #[cfg(test)]

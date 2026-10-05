@@ -175,7 +175,7 @@ pub enum LocalApiError {
     IdentityMutationInProgress,
     #[error("invalid local control request: {0}")]
     InvalidRequest(String),
-    #[error("Ottto found a manually edited managed fence and needs you to review it.")]
+    #[error("Ottto left the configuration unchanged. Review the Ottto telemetry entries and fence markers in the source config, then retry.")]
     ManualFenceReviewRequired,
     #[error("local operation failed: {0}")]
     LocalOperationFailed(String),
