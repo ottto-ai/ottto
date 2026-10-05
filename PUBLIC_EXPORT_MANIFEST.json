@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 432,
-  "content_sha256": "618fd8bab66601da728669b5b4b3091c8b59097c0b7b24184a6a4a61d17cc2d2",
+  "candidate_file_count": 433,
+  "content_sha256": "19db7f7db27bc470a164166f2883c667945ad4fc0c62855d64f1d59270311ea6",
   "files": [
     {
       "executable": false,
@@ -909,8 +909,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "246d3f2373aa460a49630de07703467c8cbd77614ef9a2811edd5ef4fbb523ed",
-      "size_bytes": 620727
+      "sha256": "f27f25025b9cfb41ab9fa4a1bca00fb235a6006e813afbd4cdf10efeae89beb7",
+      "size_bytes": 640519
     },
     {
       "executable": false,
@@ -1954,6 +1954,13 @@
       "path": "docs/session-2026-10-05-daemon-status-freshness.md",
       "sha256": "c5d4482d8a1332f2e2259072481c53ca4f324b62eef615e484396cf60e02962a",
       "size_bytes": 3506
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-05-partial-upload-error-checkpoints.md",
+      "sha256": "0182b7cbb2358ab260e6566004babaf505f155858e3f8017cff7faa7a287501c",
+      "size_bytes": 2387
     },
     {
       "executable": false,
@@ -3027,9 +3034,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-05T05:22:51+00:00",
+  "generated_at": "2026-10-05T09:36:50+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 433,
+  "output_file_count": 434,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3063,5 +3070,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "04001336a7ba201e0128472e9df0572022f71725"
+  "source_commit": "f21023b4f4c25941f17c64d882e4d504e54ec6a4"
 }
