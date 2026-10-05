@@ -9501,7 +9501,7 @@ mod tests {
         // Model a long-lived session with enough ordinary hourly usage buckets
         // to exceed the daemon/backend per-item wire cap. Keep every aggregate
         // internally consistent so the only preflight failure is the byte cap.
-        let bucket_count = 1_000_u64;
+        let bucket_count = 2_000_u64;
         let bucket_start =
             OffsetDateTime::parse("2026-06-01T00:00:00Z", &Rfc3339).expect("parse bucket start");
         let mut bucket_template = first.snapshots[0].usage_buckets[0].clone();
