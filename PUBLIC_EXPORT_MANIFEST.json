@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 431,
-  "content_sha256": "0857c364ae24a8976af91572b9aafdf55744c8eeed351b871f8c20ca3ec0e9f1",
+  "candidate_file_count": 432,
+  "content_sha256": "7955a678214bee84c6d75f293c0b8300e5ff45019bc02a02e8999bd49a69c161",
   "files": [
     {
       "executable": false,
@@ -902,15 +902,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "7500d479b68342e8e17016c55d9349578c43d100b8082b2cdd255e4881c08da4",
-      "size_bytes": 166254
+      "sha256": "949fd633bad4ca44d2971636ba10903f7c2e7618567442b161b68acbecb96933",
+      "size_bytes": 167953
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "1ba53098637540573528e9e3d711068f76f2efdd2bfaa0fff4c91443ce542f06",
-      "size_bytes": 609709
+      "sha256": "3d784d9c79c51f7f2b4d73b55ca5a2694bcc0f20672c9043b34c2560e6f6b655",
+      "size_bytes": 620727
     },
     {
       "executable": false,
@@ -923,8 +923,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "f1d325e42707b6e17e84a6ed9215e8a28f03b2ccec68c398345c484382e4f977",
-      "size_bytes": 2109575
+      "sha256": "7b03682297a8f6b3707dd716871ba0a9a91bfbb643015152467677ae829323dc",
+      "size_bytes": 2122935
     },
     {
       "executable": false,
@@ -1084,7 +1084,7 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "cdb827d5419d456ba91064b47687b973811feb3436b4b69dfcb905279b664213",
+      "sha256": "092e1a1d4434bebf5ebc8c206f228e26dc738ea43d6c68484a66f746555f6aed",
       "size_bytes": 21578
     },
     {
@@ -1954,6 +1954,13 @@
       "path": "docs/session-2026-10-05-daemon-status-freshness.md",
       "sha256": "c5d4482d8a1332f2e2259072481c53ca4f324b62eef615e484396cf60e02962a",
       "size_bytes": 3506
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-05-session-admission-reoffer.md",
+      "sha256": "dbd2d499f24a314a2c0bf43137ebdb2ede9d0023a0cf627c487869d6889ec29a",
+      "size_bytes": 2614
     },
     {
       "executable": false,
@@ -3020,9 +3027,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-04T22:00:57+00:00",
+  "generated_at": "2026-10-05T05:07:32+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 432,
+  "output_file_count": 433,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3056,5 +3063,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "87d640e3f7971519c869a36bd34ff4a24ab10c93"
+  "source_commit": "b3da2349fcd95707c194ed5b7599c6bb040d0732"
 }

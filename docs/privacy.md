@@ -61,9 +61,9 @@ and 64 KiB. Deterministic sampling preserves early anchors, retained
 compaction-adjacent requests, the peak, and the tail. Missing ownership proof,
 unsupported parser shapes, and pre-capture history emit an explicit zero-data
 coverage object instead of a guessed curve. If the optional curve would push
-the complete snapshot over its 128 KiB item budget, fill-only points are
+the complete snapshot over its 640 KiB item budget, fill-only points are
 removed first; mandatory evidence then yields to a zero-data
-`payload_budget_exceeded` object using a narrow 129 KiB explicit-clear reserve,
+`payload_budget_exceeded` object using a narrow 641 KiB explicit-clear reserve,
 so ordinary usage still
 uploads. The reserve is unavailable to populated curves and does not change
 the 4 MiB batch cap. The curve never contains prompts,

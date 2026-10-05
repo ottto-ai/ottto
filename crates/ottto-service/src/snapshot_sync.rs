@@ -514,6 +514,19 @@ impl SnapshotUploadProgress {
             .retain(|fingerprint, _| !self.accepted_fingerprints.contains(fingerprint));
         for (fingerprint, record) in index_quarantine {
             if !self.accepted_fingerprints.contains(fingerprint) {
+                // The durable index claims a bounded admission re-offer before
+                // this disposable ledger leases it. A stale terminal upload
+                // record must not suppress that newer admission obligation.
+                if self
+                    .quarantined_fingerprints
+                    .get(fingerprint)
+                    .is_some_and(|old| {
+                        old.witness.item_wire_byte_limit < record.witness.item_wire_byte_limit
+                    })
+                {
+                    self.quarantined_fingerprints
+                        .insert(fingerprint.clone(), record.clone());
+                }
                 self.quarantined_fingerprints
                     .entry(fingerprint.clone())
                     .or_insert_with(|| record.clone());
@@ -2798,6 +2811,14 @@ fn sync_source(
     let curve_replay_pending =
         context_curve_enabled && index.context_curve_replay_needed(&replay_generation);
     let historical_replay_pending = backfill_pending || curve_replay_pending;
+    if !historical_replay_pending
+        && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
+    {
+        // Persist the one-shot policy adoption before progress or scan can
+        // advance. Existing generation CAS rejects overlapping stale writers.
+        index.save(&index_path)?;
+    }
+    let admission_reoffer_pending = index.snapshot_admission_reoffer_pending();
     let mut legacy_reconciliation_pending = BTreeSet::new();
     if !historical_replay_pending && index.legacy_settlement_ledger_needs_migration() {
         let (armed, changed) = index.prepare_legacy_settlement_reconciliation(
@@ -2856,7 +2877,11 @@ fn sync_source(
         &roots,
         &mut index,
         &scan_started_at,
-        scan_request_window_days(receipt_window_days, backfill_pending, curve_replay_pending),
+        scan_request_window_days(
+            receipt_window_days,
+            backfill_pending || admission_reoffer_pending,
+            curve_replay_pending,
+        ),
         upload_policy.session_artifacts_enabled,
         attribution_context.as_ref(),
         (source == SnapshotSource::ClaudeCode).then_some(support_dir),
@@ -11144,6 +11169,219 @@ mod tests {
         );
         assert_eq!(quarantined.failed_reconstruction_count, 2);
         assert!(quarantined.retry_after_unix_seconds > current_unix_seconds());
+    }
+
+    #[test]
+    fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
+        let root = test_dir("admission-native-hourly");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = SnapshotSource::ClaudeCode;
+        let start = OffsetDateTime::parse("2026-07-01T00:00:00Z", &Rfc3339).unwrap();
+        let mut items = Vec::new();
+        for hours in [1, 1000, 1500] {
+            let path = root.join(format!("synthetic-{hours}.jsonl"));
+            let mut lines = String::new();
+            for n in 0..hours {
+                let timestamp = (start + TimeDuration::hours(n)).format(&Rfc3339).unwrap();
+                let row = serde_json::json!({
+                    "timestamp": timestamp, "type": "assistant",
+                    "sessionId": format!("synthetic-{hours}"),
+                    "requestId": format!("request-{hours}-{n}"),
+                    "message": {"id": format!("message-{hours}-{n}"), "role": "assistant",
+                        "model": "claude-sonnet-4", "content": [],
+                        "usage": {"input_tokens": 100, "output_tokens": 10,
+                            "cache_read_input_tokens": 50, "cache_creation_input_tokens": 20}}
+                });
+                lines.push_str(&row.to_string());
+                lines.push('\n');
+            }
+            std::fs::write(&path, lines).unwrap();
+            let mut parsed = crate::snapshots::parse_claude_code_jsonl_file(
+                &path,
+                "2026-10-05T00:00:00Z",
+                format!("{hours:064x}"),
+            )
+            .unwrap();
+            assert_eq!(parsed.len(), 1);
+            let item = parsed.pop().unwrap();
+            assert_eq!(item.request_count, hours as u64);
+            assert_eq!(item.usage_buckets.len(), hours as usize);
+            assert_eq!(item.input_tokens, hours as u64 * 100);
+            assert_eq!(item.output_tokens, hours as u64 * 10);
+            assert_eq!(item.cache_read_tokens, hours as u64 * 50);
+            assert_eq!(item.cache_creation_5m_tokens, hours as u64 * 20);
+            items.push(item);
+        }
+        let request = |snapshots| SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: source.api_slug().into(),
+            machine_id: "otm_synthetic".into(),
+            collector_version: Some(collector_version()),
+            snapshots,
+            upload_policy: SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let large = &items[1];
+        let oversized = &items[2];
+        let wire = serde_json::to_value(request(items.clone())).unwrap();
+        let large_bytes = serde_json::to_vec(&wire["snapshots"][1]).unwrap().len();
+        assert!(large_bytes > 128 * 1024 && large_bytes <= 640 * 1024);
+        assert!(serde_json::to_vec(&wire["snapshots"][2]).unwrap().len() > 640 * 1024);
+        validate_snapshot_batch_request(&request(vec![large.clone()])).unwrap();
+        let mut progress = test_upload_progress();
+        progress
+            .active_quarantine_witness
+            .as_mut()
+            .unwrap()
+            .item_wire_byte_limit = 128 * 1024;
+        for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+            progress.quarantine_body(
+                &large.snapshot_fingerprint,
+                &snapshot_upload_body_witness(large),
+            );
+        }
+        let mut index = ScanIndex::default();
+        index.file_snapshot_fingerprints.insert(
+            "synthetic-large.jsonl".into(),
+            BTreeSet::from([large.snapshot_fingerprint.clone()]),
+        );
+        index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
+        assert!(index.prepare_snapshot_admission_reoffer(50));
+        index.save(&root.join("index.json")).unwrap();
+        progress.active_quarantine_witness = Some(test_quarantine_witness());
+        assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+        let before = snapshot_upload_body_witness(large);
+        let mut accepted = 0;
+        let mut sent = Vec::new();
+        upload_resumable_batches_with_body_witness(
+            &items,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |batch| {
+                let req = request(batch);
+                validate_snapshot_batch_request(&req).map_err(|reason| {
+                    anyhow::Error::new(SnapshotBatchPreflightRejected { reason })
+                })?;
+                sent.extend(req.snapshots.iter().map(|item| {
+                    (
+                        item.source_session_id.clone(),
+                        item.request_count,
+                        item.usage_buckets.len(),
+                    )
+                }));
+                Ok(accepted_batch(req.snapshots.len()))
+            },
+            |p| p.save(&root.join("progress.json")),
+        )
+        .unwrap();
+        assert_eq!(accepted, 2);
+        assert!(sent.contains(&("synthetic-1000".into(), 1000, 1000)));
+        assert!(sent.contains(&("synthetic-1".into(), 1, 1)));
+        assert!(!sent.iter().any(|(id, _, _)| id == "synthetic-1500"));
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&large.snapshot_fingerprint));
+        assert!(progress
+            .quarantined_fingerprints
+            .contains_key(&oversized.snapshot_fingerprint));
+        assert_eq!(
+            before,
+            snapshot_upload_body_witness(large),
+            "admission recovery never edits accounting/body identity"
+        );
+        println!("native admission: item_bytes={large_bytes} hours=1000 accepted=2 quarantined=1 private_reads=0");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admission_reoffer_replaces_stale_terminal_progress_and_survives_restart() {
+        let root = test_dir("admission-reoffer-progress");
+        let path = root.join("progress.json");
+        let namespace = "c".repeat(64);
+        let fingerprint = "a".repeat(64);
+        let sibling = "b".repeat(64);
+        let mut progress =
+            SnapshotUploadProgress::new(namespace.clone(), test_quarantine_witness());
+        progress
+            .active_quarantine_witness
+            .as_mut()
+            .unwrap()
+            .item_wire_byte_limit = 128 * 1024;
+        for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+            progress.quarantine([fingerprint.as_str()]);
+        }
+        progress.record([sibling.as_str()]);
+        progress.save(&path).unwrap();
+        let mut index = ScanIndex::default();
+        index.file_snapshot_fingerprints.insert(
+            "synthetic.jsonl".into(),
+            BTreeSet::from([fingerprint.clone(), sibling.clone()]),
+        );
+        index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
+        let index_path = root.join("index.json");
+        assert!(index.prepare_snapshot_admission_reoffer(50));
+        index.save(&index_path).unwrap();
+        progress =
+            SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
+        assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+        assert!(progress.active_quarantine_retries.contains(&fingerprint));
+        assert!(progress.contains(&sibling));
+        progress.save(&path).unwrap();
+        progress =
+            SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
+        assert!(
+            !progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints),
+            "restart honors the durable lease deadline"
+        );
+        progress
+            .quarantined_fingerprints
+            .get_mut(&fingerprint)
+            .unwrap()
+            .retry_after_unix_seconds = 0;
+        assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+        let mut accepted = 0;
+        let mut sent = Vec::new();
+        upload_resumable_batches(
+            &[fingerprint.clone(), sibling.clone()],
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |batch| {
+                sent.extend(batch.clone());
+                let response = entity_ack_batch(&[], &batch, &[]);
+                let identities = batch
+                    .iter()
+                    .map(|fp| (format!("session-{fp}"), fp.clone()))
+                    .collect::<Vec<_>>();
+                response.validate_entity_ack_identities(
+                    identities.iter().map(|(id, fp)| (id.as_str(), fp.as_str())),
+                )?;
+                Ok(response)
+            },
+            |p| p.save(&path),
+        )
+        .unwrap();
+        assert_eq!(sent, vec![fingerprint.clone()]);
+        assert_eq!(accepted, 1);
+        assert!(progress.accepted_fingerprints.contains(&fingerprint));
+        assert!(
+            !progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints),
+            "durable ACK dominates stale index"
+        );
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        assert!(!index.prepare_snapshot_admission_reoffer(50));
+        let mut unrelated =
+            SnapshotUploadProgress::load(&path, &"d".repeat(64), test_quarantine_witness())
+                .unwrap();
+        assert!(unrelated.accepted_fingerprints.is_empty());
+        assert!(unrelated.quarantined_fingerprints.is_empty());
+        assert!(!unrelated.prepare_quarantine_retries(&BTreeMap::new()));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

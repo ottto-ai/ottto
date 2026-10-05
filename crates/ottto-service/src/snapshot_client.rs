@@ -108,6 +108,17 @@ fn gzip(body: &[u8]) -> Option<Vec<u8>> {
     encoder.finish().ok()
 }
 
+/// Keep encoded requests inside the backend's independent gzip budgets.
+/// Identity requests retain the existing exact 4 MiB preflight and packing.
+fn gzip_snapshot_batch(body: &[u8], enabled: bool) -> Option<Vec<u8>> {
+    const MAX_DECODED_BYTES: usize = 1024 * 1024;
+    const MAX_COMPRESSED_BYTES: usize = 2 * 1024 * 1024;
+    if !enabled || body.len() > MAX_DECODED_BYTES {
+        return None;
+    }
+    gzip(body).filter(|encoded| encoded.len() <= MAX_COMPRESSED_BYTES)
+}
+
 /// A rejection that means "I could not read your encoding", as opposed to "your
 /// payload is wrong". A server without request decompression cannot parse the
 /// body at all, so it answers 400 (unreadable JSON) or 415 (unsupported media
@@ -1594,9 +1605,7 @@ impl SnapshotApiClient {
             serde_json::to_vec(request)
         }
         .map_err(|error| anyhow!("serialize snapshot batch failed: {error}"))?;
-        let compressed = snapshot_upload_gzip_enabled()
-            .then(|| gzip(&body))
-            .flatten();
+        let compressed = gzip_snapshot_batch(&body, snapshot_upload_gzip_enabled());
         let request_builder = || {
             self.batch_agent
                 .post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
@@ -3001,6 +3010,36 @@ mod tests {
         );
         assert_eq!(parse_retry_after("", now), None);
         assert_eq!(parse_retry_after("later", now), None);
+    }
+
+    #[test]
+    fn snapshot_gzip_respects_decoded_and_compressed_budgets() {
+        for size in [128 * 1024, 640 * 1024, 1024 * 1024] {
+            // Deterministic poorly compressible bytes test gzip overhead too.
+            let mut state = 0x12345678u32;
+            let body = (0..size)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect::<Vec<_>>();
+            let encoded = gzip_snapshot_batch(&body, true).expect("within budgets");
+            assert!(encoded.len() <= 2 * 1024 * 1024);
+            let mut decoded = Vec::new();
+            flate2::read::GzDecoder::new(encoded.as_slice())
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, body);
+            assert!(gzip_snapshot_batch(&body, false).is_none());
+        }
+        for size in [1024 * 1024 + 1, 2 * 640 * 1024, 2 * 1024 * 1024] {
+            assert!(
+                gzip_snapshot_batch(&vec![b'x'; size], true).is_none(),
+                "identity fallback preserves large packed requests without a gzip 413"
+            );
+        }
     }
 
     #[test]
