@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 436,
-  "content_sha256": "30ddd32d7c7179e790b03fcbc8b7df76822e1b0489628d2a280c275c9498ad08",
+  "candidate_file_count": 437,
+  "content_sha256": "3d8799ef563aaae3a431fd42846250d399cee6074a0c8acd23f91eee55dc61a3",
   "files": [
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_local_otel.rs",
-      "sha256": "b35b544955269ec60a383e7082f953f25974953497f231e0cff6b4da31d7eb95",
-      "size_bytes": 87477
+      "sha256": "513517cf7a2715678f1ee27d4af8267481767b60feb4e915c4ed9fcefca0ef08",
+      "size_bytes": 96731
     },
     {
       "executable": false,
@@ -874,8 +874,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/otlp_relay.rs",
-      "sha256": "2d603e02051bc6b5098d98a34b417b86af8fe8e30ab4bef9a05753502663b199",
-      "size_bytes": 95543
+      "sha256": "2af4497c1810559ba49ad1dd432b30801fed14babb7f8184023961567c0c19e8",
+      "size_bytes": 95550
     },
     {
       "executable": false,
@@ -1954,6 +1954,13 @@
       "path": "docs/session-2026-10-05-account-display-carrier.md",
       "sha256": "26cc44cc1877cb73b4cc52306347a3e03ac92e31e5760999a5669a449aea07ed",
       "size_bytes": 2003
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-05-claude-evidence-cap-refusal.md",
+      "sha256": "deaaafc4d1f43d6337b8bf722163ee017e1c0489f7c25330bb72270daed72ec2",
+      "size_bytes": 3242
     },
     {
       "executable": false,
@@ -3055,9 +3062,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-05T13:07:38+00:00",
+  "generated_at": "2026-10-05T20:42:22+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 437,
+  "output_file_count": 438,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3091,5 +3098,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "a537f781ad36ce115567571af367f5e9ac81b6f1"
+  "source_commit": "3815d71c2ac242ec469b4f4eecbb821f1312a303"
 }

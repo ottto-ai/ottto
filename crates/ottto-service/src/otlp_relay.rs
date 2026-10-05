@@ -717,7 +717,7 @@ fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDae
             Ok(_) => {}
             Err(_error) => {
                 relay_log!(
-                    "local Claude effort reduction skipped: invalid local OTLP logs payload"
+                    "local Claude API-request reduction failed; raw forwarding remains independent"
                 );
             }
         }
@@ -735,7 +735,7 @@ fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDae
             Ok(_) => {}
             Err(_error) => {
                 relay_log!(
-                    "local Claude trace ownership reduction skipped: invalid local OTLP traces payload"
+                    "local Claude trace ownership reduction failed; raw forwarding remains independent"
                 );
             }
         }
