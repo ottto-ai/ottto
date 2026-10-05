@@ -1207,6 +1207,83 @@ fn save_index_and_publish_manifest(
     Ok(())
 }
 
+/// Preserve only delivery-owned file checkpoints on an unfinished upload.
+/// Hold the progress lock through index CAS: neither an unsaved ACK nor a
+/// racing ledger generation may certify the scan's new file/body witnesses.
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_partial_snapshot_index(
+    index: &ScanIndex,
+    committed_index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    snapshots: &[SnapshotItem],
+    locally_held: &BTreeSet<String>,
+    index_path: &Path,
+    progress_path: &Path,
+    validate_destination: impl FnOnce() -> Result<()>,
+) -> Result<ScanIndex> {
+    let _lock = SnapshotProgressLock::acquire(progress_path)?;
+    let mut durable: SnapshotUploadProgress = match std::fs::read(progress_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .context("parse snapshot progress for partial checkpoint")?,
+        Err(error) if error.kind() == ErrorKind::NotFound && progress.generation == 0 => {
+            SnapshotUploadProgress::new(
+                progress.destination_namespace_hash.clone(),
+                progress
+                    .active_quarantine_witness
+                    .clone()
+                    .ok_or_else(|| anyhow!("partial checkpoint lacks a source witness"))?,
+            )
+        }
+        Err(error) => return Err(error).context("read snapshot progress for partial checkpoint"),
+    };
+    // These fields are runtime leases, not persisted settlement evidence.
+    durable.active_quarantine_witness = progress.active_quarantine_witness.clone();
+    durable.active_quarantine_retries = progress.active_quarantine_retries.clone();
+    if durable != *progress || durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "snapshot progress changed before partial checkpoint"
+        ));
+    }
+    let mut current_bodies = BTreeMap::new();
+    for item in snapshots {
+        let witness = snapshot_upload_body_witness(item);
+        if current_bodies
+            .insert(item.snapshot_fingerprint.as_str(), witness.clone())
+            .is_some_and(|previous| previous != witness)
+        {
+            return Err(anyhow!(
+                "conflicting snapshot bodies before partial checkpoint"
+            ));
+        }
+    }
+    let accepted = durable
+        .accepted_fingerprints
+        .iter()
+        .filter(|fingerprint| {
+            !locally_held.contains(*fingerprint)
+                && durable.accepted_body_witnesses.get(*fingerprint)
+                    == current_bodies.get(fingerprint.as_str())
+                && current_bodies.contains_key(fingerprint.as_str())
+        })
+        .cloned()
+        .collect();
+    let quarantined = durable
+        .quarantined_fingerprints
+        .iter()
+        .filter(|(fingerprint, record)| {
+            !locally_held.contains(*fingerprint)
+                && record.upload_body_witness.as_ref() == current_bodies.get(fingerprint.as_str())
+                && current_bodies.contains_key(fingerprint.as_str())
+        })
+        .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
+        .collect();
+    let mut committable = index.committable_subset(committed_index, &accepted, &quarantined);
+    committable.mark_bounded_sweep_unsettled();
+    validate_destination()?;
+    committable.save(index_path)?;
+    Ok(committable)
+}
+
 fn cached_source_manifest(
     destination_namespace: &str,
     source: SnapshotSource,
@@ -3331,52 +3408,33 @@ fn sync_source(
         Ok(ResumableUploadResult::Shed { retry_after }) => {
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
-            // Commit what the server demonstrably holds. Committing everything
-            // would drop the pages it never received; committing nothing means
-            // the next cycle replays the whole scan, which is today's behaviour
-            // and the reason a shed request produces an identical re-upload every
-            // five minutes forever.
-            let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
-            accepted_fingerprints
-                .retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
-            let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
-            server_quarantine
-                .retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
-            let mut committable = index.committable_subset(
+            let committable = match checkpoint_partial_snapshot_index(
+                &index,
                 &committed_index,
-                &accepted_fingerprints,
-                &server_quarantine,
-            );
-            committable.mark_bounded_sweep_unsettled();
-            // `committable_subset` also retains an older quarantine witness for
-            // restored prior entities. Replacing it with only this pass's
-            // progress would make an absent retry look server-held.
-            if let Err(error) = save_index_and_publish_manifest(
-                &mut committable,
+                &upload_progress,
+                &scan_result.snapshots,
+                &locally_held_fingerprints,
                 &index_path,
-                &upload_destination_namespace,
-                source,
-                scan_result.census_complete,
-                &manifest_window_start,
-                &manifest_window_end,
+                &upload_progress_path,
+                || ensure_snapshot_destination_current(&upload_destination_namespace),
             ) {
-                eprintln!(
-                    "local snapshot partial scan checkpoint failed for {}: {}",
-                    source.api_slug(),
-                    safe_error(&error)
-                );
-            }
+                Ok(committable) => committable,
+                Err(error) => {
+                    eprintln!(
+                        "local snapshot partial scan checkpoint failed for {}: {}",
+                        source.api_slug(),
+                        safe_error(&error)
+                    );
+                    committed_index.clone()
+                }
+            };
             report_status_with_fresh_relay_token(
                 client,
                 device,
                 device_secret,
                 support_dir,
                 source,
-                if scan_result.census_complete {
-                    TerminalManifestSource::CompleteCensus(&committable)
-                } else {
-                    TerminalManifestSource::Withdraw
-                },
+                TerminalManifestSource::Withdraw,
                 CollectorStatus {
                     source,
                     machine_id,
@@ -3424,6 +3482,29 @@ fn sync_source(
             return Ok(());
         }
         Err(error) => {
+            // Earlier pages may have durable exact ACKs even though this pass
+            // failed. Save their wholly settled files before a later upload
+            // delta can prune those ACKs. Local-state failures leave durability
+            // uncertain and must not certify an in-memory mutated ledger.
+            if snapshot_upload_error_class(&error) != Some(SnapshotUploadErrorClass::LocalState) {
+                match checkpoint_partial_snapshot_index(
+                    &index,
+                    &committed_index,
+                    &upload_progress,
+                    &scan_result.snapshots,
+                    &locally_held_fingerprints,
+                    &index_path,
+                    &upload_progress_path,
+                    || ensure_snapshot_destination_current(&upload_destination_namespace),
+                ) {
+                    Ok(committable) => index = committable,
+                    Err(checkpoint_error) => eprintln!(
+                        "local snapshot partial scan checkpoint failed for {}: {}",
+                        source.api_slug(),
+                        safe_error(&checkpoint_error)
+                    ),
+                }
+            }
             // Distinguish local serializer drift, authorization failures, and
             // backend payload rejection. The resumable driver has already
             // checkpointed every accepted sibling before this terminal error.
@@ -14649,5 +14730,424 @@ mod tests {
         content_length
             .map(|length| request.len() >= body_start + length)
             .unwrap_or(true)
+    }
+    struct PartialCheckpointFixture {
+        root: PathBuf,
+        index_path: PathBuf,
+        progress_path: PathBuf,
+        baseline: ScanIndex,
+        index: ScanIndex,
+        scan: SourceScanResult,
+        items: Vec<SnapshotItem>,
+        progress: SnapshotUploadProgress,
+    }
+
+    impl PartialCheckpointFixture {
+        fn new() -> Self {
+            let root = cache_effective_wire_fixture_root();
+            let index_path = root.join("partial-index.json");
+            let progress_path = root.join("partial-progress.json");
+            let mut baseline = ScanIndex::default();
+            baseline.prepare_historical_replay("partial-pending-replay".into());
+            baseline.save(&index_path).unwrap();
+            let mut index = baseline.clone();
+            index.activate_upload_context("partial-current-policy".into());
+            index.activate_effective_upload_body_witness_revision(1);
+            let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-09-30T10:05:00Z",
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap();
+            for item in &mut scan.snapshots {
+                item.cache_observations = None;
+                item.cache_observations_state = None;
+                item.session_account_evidence = None;
+            }
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+            assert_eq!(scan.snapshots.len(), 1);
+            let a = scan.snapshots[0].clone();
+            let mut b = a.clone();
+            b.source_file_fingerprint = None;
+            for n in 0..512 {
+                b.source_session_id = format!("partial-pending-synthetic-{n}");
+                let mut derived = scan.clone();
+                derived.snapshots = vec![b.clone()];
+                finalize_scan_after_policy(
+                    SnapshotSource::Codex,
+                    &mut derived,
+                    &mut ScanIndex::default(),
+                );
+                b = derived.snapshots.remove(0);
+                if b.snapshot_fingerprint > a.snapshot_fingerprint {
+                    break;
+                }
+            }
+            assert!(b.snapshot_fingerprint > a.snapshot_fingerprint);
+            let mut progress = test_upload_progress();
+            progress.destination_namespace_hash =
+                format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
+            progress.prepare_historical_replay("partial-pending-replay");
+            Self {
+                root,
+                index_path,
+                progress_path,
+                baseline,
+                index,
+                scan,
+                items: vec![a, b],
+                progress,
+            }
+        }
+
+        fn ack_then_fail(&mut self) {
+            let mut accepted = 0;
+            let error = upload_resumable_batches_with_body_witness_partitioned(
+                &self.items,
+                &unique_poison_scope(),
+                &mut self.progress,
+                &mut accepted,
+                |i| i.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |i| i.source_session_id == self.items[1].source_session_id,
+                |items| {
+                    if items[0].source_session_id == self.items[1].source_session_id {
+                        Err(anyhow!("synthetic terminal transport failure"))
+                    } else {
+                        Self::ack(items)
+                    }
+                },
+                |p| p.save(&self.progress_path),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "synthetic terminal transport failure");
+            assert_eq!(accepted, 1);
+        }
+
+        fn ack(items: Vec<SnapshotItem>) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+            let request = SnapshotBatchRequest {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                source: "codex".into(),
+                machine_id: "a".repeat(64),
+                collector_version: Some(collector_version()),
+                snapshots: items,
+                upload_policy: SnapshotUploadPolicy::default(),
+                client_report: crate::client_report::ClientReport::empty(),
+            };
+            validate_snapshot_batch_request(&request)
+                .map_err(|reason| anyhow!("synthetic preflight: {reason}"))?;
+            let mut response = accepted_batch(request.snapshots.len());
+            response.entity_ack_contract =
+                Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+            for item in &request.snapshots {
+                response
+                    .accepted_entities
+                    .push(crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: item.source_session_id.clone(),
+                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: Some(6),
+                        body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                        head_etag: None,
+                        head_challenge: None,
+                    });
+            }
+            response.validate_entity_ack_with_head_cas(&request, false)?;
+            Ok(response)
+        }
+
+        fn checkpoint(
+            &self,
+            held: &BTreeSet<String>,
+            destination: impl FnOnce() -> Result<()>,
+        ) -> Result<ScanIndex> {
+            checkpoint_partial_snapshot_index(
+                &self.index,
+                &self.baseline,
+                &self.progress,
+                &self.items,
+                held,
+                &self.index_path,
+                &self.progress_path,
+                destination,
+            )
+        }
+    }
+
+    impl Drop for PartialCheckpointFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn partial_checkpoint_omitted_item_restart_keeps_settled_file() {
+        let mut f = PartialCheckpointFixture::new();
+        f.ack_then_fail();
+        assert!(ScanIndex::load(&f.index_path).unwrap().files.is_empty());
+        let partial = f.checkpoint(&BTreeSet::new(), || Ok(())).unwrap();
+        assert_eq!(partial.files.len(), 1);
+        let state = serde_json::to_value(&partial).unwrap();
+        assert_eq!(
+            state["historical_replay_generation"],
+            "partial-pending-replay"
+        );
+        assert!(state["completed_context_curve_replay_generation"].is_null());
+        assert!(state["upload_context_fingerprint"].is_null());
+        assert_eq!(state["bounded_sweep_had_unsettled_upload"], true);
+        assert!(cached_source_manifest(
+            &f.progress.destination_namespace_hash,
+            SnapshotSource::Codex
+        )
+        .is_none());
+        // This intervening failed delta still prunes A's disposable ACK. Its
+        // saved file checkpoint, rather than the ledger, now suppresses A.
+        let mut accepted = 0;
+        assert!(upload_resumable_batches_with_body_witness(
+            &f.items[1..],
+            &unique_poison_scope(),
+            &mut f.progress,
+            &mut accepted,
+            |i| i.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |_| Err(anyhow!("synthetic terminal transport failure")),
+            |p| p.save(&f.progress_path),
+        )
+        .is_err());
+        assert!(f.progress.accepted_fingerprints.is_empty());
+        let mut loaded = ScanIndex::load(&f.index_path).unwrap();
+        loaded.activate_upload_context("partial-current-policy".into());
+        loaded.activate_effective_upload_body_witness_revision(1);
+        let mut next = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&f.root),
+            &mut loaded,
+            "2026-09-30T10:05:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        for item in &mut next.snapshots {
+            item.cache_observations = None;
+            item.cache_observations_state = None;
+            item.session_account_evidence = None;
+        }
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut next, &mut loaded);
+        assert!(
+            next.snapshots.is_empty(),
+            "ordinary restarted scan does not reoffer settled A"
+        );
+        next.snapshots.push(f.items[1].clone());
+        let mut sent = Vec::new();
+        upload_resumable_batches_with_body_witness(
+            &next.snapshots,
+            &unique_poison_scope(),
+            &mut f.progress,
+            &mut accepted,
+            |i| i.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                sent.extend(items.iter().map(|i| i.snapshot_fingerprint.clone()));
+                PartialCheckpointFixture::ack(items)
+            },
+            |p| p.save(&f.progress_path),
+        )
+        .unwrap();
+        assert_eq!(sent, vec![f.items[1].snapshot_fingerprint.clone()]);
+    }
+
+    #[test]
+    fn partial_checkpoint_stable_inventory_still_resumes_exact_ack() {
+        let mut f = PartialCheckpointFixture::new();
+        f.ack_then_fail();
+        f.checkpoint(&BTreeSet::new(), || Ok(())).unwrap();
+        f.progress = SnapshotUploadProgress::load(
+            &f.progress_path,
+            &f.progress.destination_namespace_hash,
+            test_quarantine_witness(),
+        )
+        .unwrap();
+        let mut sent = Vec::new();
+        upload_resumable_batches_with_body_witness(
+            &f.items,
+            &unique_poison_scope(),
+            &mut f.progress,
+            &mut 0,
+            |i| i.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                sent.extend(items.iter().map(|i| i.snapshot_fingerprint.clone()));
+                PartialCheckpointFixture::ack(items)
+            },
+            |p| p.save(&f.progress_path),
+        )
+        .unwrap();
+        assert_eq!(sent, vec![f.items[1].snapshot_fingerprint.clone()]);
+    }
+
+    #[test]
+    fn partial_checkpoint_requires_saved_progress_and_exact_generation() {
+        let mut f = PartialCheckpointFixture::new();
+        f.progress.record_body(
+            &f.items[0].snapshot_fingerprint,
+            &snapshot_upload_body_witness(&f.items[0]),
+        );
+        assert!(f.checkpoint(&BTreeSet::new(), || Ok(())).is_err());
+        assert!(ScanIndex::load(&f.index_path).unwrap().files.is_empty());
+        f.progress.save(&f.progress_path).unwrap();
+        let mut competing = f.progress.clone();
+        competing.save(&f.progress_path).unwrap();
+        assert!(f.checkpoint(&BTreeSet::new(), || Ok(())).is_err());
+        assert!(ScanIndex::load(&f.index_path).unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn partial_checkpoint_failed_ack_save_cannot_certify_memory() {
+        let mut f = PartialCheckpointFixture::new();
+        f.progress.save(&f.progress_path).unwrap();
+        f.progress.record_body(
+            &f.items[0].snapshot_fingerprint,
+            &snapshot_upload_body_witness(&f.items[0]),
+        );
+        let temp = f
+            .progress_path
+            .with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::create_dir(&temp).unwrap();
+        assert!(f.progress.save(&f.progress_path).is_err());
+        assert!(f.checkpoint(&BTreeSet::new(), || Ok(())).is_err());
+        assert!(ScanIndex::load(&f.index_path).unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn partial_checkpoint_index_save_failure_and_race_keep_ack_pending() {
+        let mut f = PartialCheckpointFixture::new();
+        f.ack_then_fail();
+        let temp = f
+            .index_path
+            .with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::create_dir(&temp).unwrap();
+        assert!(f.checkpoint(&BTreeSet::new(), || Ok(())).is_err());
+        assert!(ScanIndex::load(&f.index_path).unwrap().files.is_empty());
+        assert_eq!(
+            SnapshotUploadProgress::load(
+                &f.progress_path,
+                &f.progress.destination_namespace_hash,
+                test_quarantine_witness()
+            )
+            .unwrap()
+            .accepted_fingerprints
+            .len(),
+            1
+        );
+        std::fs::remove_dir(&temp).unwrap();
+        let mut competing = f.baseline.clone();
+        competing.save(&f.index_path).unwrap();
+        assert!(f.checkpoint(&BTreeSet::new(), || Ok(())).is_err());
+        assert_eq!(
+            ScanIndex::load(&f.index_path).unwrap().generation,
+            competing.generation
+        );
+    }
+
+    #[test]
+    fn partial_checkpoint_destination_change_and_held_group_do_not_adopt() {
+        let mut f = PartialCheckpointFixture::new();
+        f.ack_then_fail();
+        let device = LocalDeviceBinding {
+            device_id: "synthetic-switched-device".into(),
+            machine_id: Some("synthetic-machine".into()),
+            sources: vec!["codex".into()],
+        };
+        assert!(f
+            .checkpoint(&BTreeSet::new(), || validate_snapshot_destination(
+                &f.progress.destination_namespace_hash,
+                &device,
+                "synthetic-new-account-secret"
+            ))
+            .is_err());
+        assert!(ScanIndex::load(&f.index_path).unwrap().files.is_empty());
+        let held = BTreeSet::from([f.items[0].snapshot_fingerprint.clone()]);
+        assert!(f.checkpoint(&held, || Ok(())).unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn partial_checkpoint_changed_body_or_quarantine_body_is_not_settlement() {
+        let mut f = PartialCheckpointFixture::new();
+        f.ack_then_fail();
+        f.items[0].context_curve = None;
+        assert!(f
+            .checkpoint(&BTreeSet::new(), || Ok(()))
+            .unwrap()
+            .files
+            .is_empty());
+        f.baseline = ScanIndex::load(&f.index_path).unwrap();
+        f.index.generation = f.baseline.generation;
+        f.progress.accepted_fingerprints.clear();
+        f.progress.accepted_body_witnesses.clear();
+        f.progress
+            .quarantine_body(&f.items[0].snapshot_fingerprint, &"f".repeat(64));
+        f.progress.save(&f.progress_path).unwrap();
+        assert!(f
+            .checkpoint(&BTreeSet::new(), || Ok(()))
+            .unwrap()
+            .files
+            .is_empty());
+    }
+
+    #[test]
+    fn partial_checkpoint_multi_entity_file_waits_for_unsettled_member() {
+        let mut f = PartialCheckpointFixture::new();
+        f.ack_then_fail();
+        f.items[1].source_file_fingerprint = f.items[0].source_file_fingerprint.clone();
+        f.scan.snapshots = f.items.clone();
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut f.scan, &mut f.index);
+        assert_eq!(
+            f.index
+                .file_snapshot_fingerprints
+                .values()
+                .next()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            f.checkpoint(&BTreeSet::new(), || Ok(()))
+                .unwrap()
+                .files
+                .is_empty(),
+            "one exact ACK cannot settle a two-entity file"
+        );
+        assert_eq!(
+            f.progress.accepted_fingerprints.len(),
+            1,
+            "residual member obligation retains page progress"
+        );
+    }
+
+    #[test]
+    fn partial_checkpoint_holds_progress_lock_through_destination_and_index_save() {
+        let mut f = PartialCheckpointFixture::new();
+        f.ack_then_fail();
+        let mut racing = f.progress.clone();
+        f.checkpoint(&BTreeSet::new(), || {
+            assert!(racing.save(&f.progress_path).is_err());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            SnapshotUploadProgress::load(
+                &f.progress_path,
+                &f.progress.destination_namespace_hash,
+                test_quarantine_witness()
+            )
+            .unwrap()
+            .generation,
+            f.progress.generation
+        );
     }
 }
