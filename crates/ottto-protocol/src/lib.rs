@@ -4089,14 +4089,33 @@ fn safe_status_display_text(value: Option<String>, max_chars: usize) -> Option<S
             ]
             .iter()
             .any(|fragment| normalized.contains(fragment))
-            && !text.split_whitespace().any(|part| {
-                let part = part.trim_start_matches(['\"', '\'', '(', '[', '{']);
-                part.starts_with('/')
-                    || part.starts_with("~/")
-                    || part.starts_with('\\')
-                    || (part.as_bytes().get(1) == Some(&b':')
-                        && matches!(part.as_bytes().get(2), Some(b'/' | b'\\')))
-            })
+            && !text
+                .split(|ch: char| {
+                    ch.is_whitespace()
+                        || matches!(
+                            ch,
+                            '=' | ':'
+                                | '\"'
+                                | '\''
+                                | '('
+                                | ')'
+                                | '['
+                                | ']'
+                                | '{'
+                                | '}'
+                                | ','
+                                | ';'
+                                | '|'
+                        )
+                })
+                .any(|part| {
+                    let part = part.trim_start_matches(['\"', '\'', '(', '[', '{']);
+                    part.starts_with('/')
+                        || part.starts_with("~/")
+                        || part.starts_with('\\')
+                        || (part.as_bytes().get(1) == Some(&b':')
+                            && matches!(part.as_bytes().get(2), Some(b'/' | b'\\')))
+                })
     })
 }
 
@@ -6132,6 +6151,10 @@ mod tests {
             "/tmp/private",
             " /tmp/private",
             "Label /tmp/private",
+            "directory=/tmp/private",
+            "workspace=C:\\private",
+            "workspace:C:/private",
+            "directory|/tmp/private",
             "C:\\private",
             "Name https://example.invalid",
             "~/private",

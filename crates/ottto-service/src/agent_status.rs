@@ -18405,8 +18405,8 @@ mod tests {
         let value = serde_json::to_value(raw_provider_id_backend_wire_snapshots())
             .expect("serialize backend wire snapshots");
         let wire = value.to_string();
-        assert!(!wire.contains('@'), "email must not reach the backend");
-        assert!(!wire.contains("Synthetic Workspace Label"));
+        assert!(wire.contains("synthetic-owner@example.invalid"));
+        assert!(wire.contains("Synthetic Workspace Label"));
         for raw in [
             "00000000-0000-4000-8000-00000000c1a1",
             "00000000-0000-4000-8000-00000000c1b2",
@@ -28802,8 +28802,8 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             .redacted_for_backend()
             .account
             .expect("upload account");
-        assert!(upload.email.is_none());
-        assert!(upload.organization_label.is_none());
+        assert_eq!(upload.email, account.email);
+        assert_eq!(upload.organization_label, account.organization_label);
         assert_eq!(upload.plan_type, account.plan_type);
         assert_eq!(
             upload.account_identifier_hash,
@@ -30388,7 +30388,12 @@ exit 0
                 .collect::<Vec<_>>(),
         )
         .expect("serialize upload");
-        assert!(!wire.contains('@'), "no email in uploads");
+        for snapshot in &snapshots {
+            let diagnostics =
+                serde_json::to_string(&snapshot.clone().redacted_for_backend().diagnostics)
+                    .expect("serialize redacted diagnostics");
+            assert!(!diagnostics.contains('@'), "no email in diagnostic uploads");
+        }
         assert!(
             !wire.contains("Claude Max 20x"),
             "the local message is not uploaded"

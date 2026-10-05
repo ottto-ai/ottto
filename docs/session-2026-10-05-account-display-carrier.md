@@ -20,6 +20,10 @@ accounts, a weak-only current observation and a route without display acquisitio
 Native serialization tests cover ownership, exact weak text, absence, boundaries,
 idempotence, adversarial payloads and generic diagnostic email redaction. The
 public privacy contract check now enforces the scoped status display policy.
+The existing collector raw-id wire fixture now carries its own safe display
+fields; degraded and mismatched-slot tests retain account isolation and diagnostic
+redaction under the same contract. Absolute paths after label delimiters are
+rejected as well as standalone paths.
 
 A containing release and installed-to-SOURCE acceptance remain required. Verify
 fresh accepted status display under the exact account/workspace pair, then its
