@@ -1202,15 +1202,16 @@ pub struct AgentStatusSnapshot {
 impl AgentStatusSnapshot {
     pub fn redacted_for_backend(mut self) -> Self {
         if let Some(account) = self.account.as_mut() {
-            // Emails and labels stay on the machine. The raw provider account
-            // id and the selected organization/workspace id are identifiers,
+            // Display text travels only on this status carrier. Raw provider
+            // account and selected organization/workspace ids are identifiers,
             // not credentials, and are uploaded beside their domain-separated
             // hashes so the backend can recompute the hashes from the original
             // roles. Anything that is not a plain provider id is dropped.
-            account.email = None;
+            account.email = safe_status_display_text(account.email.take(), 320);
             account.account_id = safe_provider_identifier(account.account_id.take());
             account.organization_id = safe_provider_identifier(account.organization_id.take());
-            account.organization_label = None;
+            account.organization_label =
+                safe_status_display_text(account.organization_label.take(), 255);
             account.provider = safe_optional_text(account.provider.take());
             account.auth_method = safe_optional_text(account.auth_method.take());
             account.plan_type = safe_optional_text(account.plan_type.take());
@@ -4062,12 +4063,69 @@ fn safe_provider_identifier(value: Option<String>) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+/// Only already-acquired status display fields may contain email addresses.
+/// Keep exact text for weak member identity; reject unsafe/overlong values
+/// rather than trimming, truncating, or borrowing another account's label.
+fn safe_status_display_text(value: Option<String>, max_chars: usize) -> Option<String> {
+    value.filter(|text| {
+        let normalized = text.to_ascii_lowercase();
+        text.chars().count() <= max_chars
+            && !text.chars().any(char::is_control)
+            && is_safe_backend_text_without_email_guard(text.trim())
+            && ![
+                "access_token",
+                "refresh_token",
+                "id_token",
+                "api_key",
+                "password=",
+                "password:",
+                "cookie:",
+                "-----begin",
+                "transcript_path",
+                "workspace_path",
+                "http://",
+                "https://",
+                "file:/",
+            ]
+            .iter()
+            .any(|fragment| normalized.contains(fragment))
+            && !text
+                .split(|ch: char| {
+                    ch.is_whitespace()
+                        || matches!(
+                            ch,
+                            '=' | ':'
+                                | '\"'
+                                | '\''
+                                | '('
+                                | ')'
+                                | '['
+                                | ']'
+                                | '{'
+                                | '}'
+                                | ','
+                                | ';'
+                                | '|'
+                        )
+                })
+                .any(|part| {
+                    let part = part.trim_start_matches(['\"', '\'', '(', '[', '{']);
+                    part.starts_with('/')
+                        || part.starts_with("~/")
+                        || part.starts_with('\\')
+                        || (part.as_bytes().get(1) == Some(&b':')
+                            && matches!(part.as_bytes().get(2), Some(b'/' | b'\\')))
+                })
+    })
+}
+
 fn is_safe_backend_text(value: &str) -> bool {
+    !value.contains('@') && is_safe_backend_text_without_email_guard(value)
+}
+
+fn is_safe_backend_text_without_email_guard(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
     if normalized.trim().is_empty() {
-        return false;
-    }
-    if normalized.contains('@') {
         return false;
     }
     let forbidden_fragments = [
@@ -4167,9 +4225,10 @@ fn redact_plan_observation_for_backend(
     observation.gateway_provider = safe_optional_text(observation.gateway_provider.take());
     observation.subscription_product = safe_optional_text(observation.subscription_product.take());
     observation.plan_type = safe_optional_text(observation.plan_type.take());
-    observation.account_label = None;
+    observation.account_label = safe_status_display_text(observation.account_label.take(), 255);
     observation.account_id = safe_provider_identifier(observation.account_id.take());
-    observation.organization_label = None;
+    observation.organization_label =
+        safe_status_display_text(observation.organization_label.take(), 255);
     observation.organization_id = safe_provider_identifier(observation.organization_id.take());
     observation.account_identifier_hash =
         safe_optional_text(observation.account_identifier_hash.take());
@@ -4740,7 +4799,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_status_body_carries_raw_provider_ids_but_no_labels_or_email() {
+    fn backend_status_body_carries_raw_provider_ids_and_scoped_display() {
         let raw_account = "00000000-0000-4000-8000-0000000000a1";
         let raw_organization = "00000000-0000-4000-8000-0000000000b2";
         let mut snapshot = w3_multi_anchor_snapshot(
@@ -4768,28 +4827,37 @@ mod tests {
         let body = |item: AgentStatusSnapshot| {
             serde_json::json!({"machine_id": "machine-test", "snapshots": [item]}).to_string()
         };
-        let unsafe_body = body(snapshot.clone());
-        assert!(unsafe_body.contains("owner@example.test"));
-        assert!(unsafe_body.contains("Private Org Label"));
+        let local_body = body(snapshot.clone());
+        assert!(local_body.contains("owner@example.test"));
+        assert!(local_body.contains("Private Org Label"));
 
         let redacted = snapshot.redacted_for_backend();
         let account = redacted.account.as_ref().expect("account");
         assert_eq!(account.account_id.as_deref(), Some(raw_account));
         assert_eq!(account.organization_id.as_deref(), Some(raw_organization));
-        assert_eq!(account.email, None);
-        assert_eq!(account.organization_label, None);
+        assert_eq!(account.email.as_deref(), Some("owner@example.test"));
+        assert_eq!(
+            account.organization_label.as_deref(),
+            Some("Private Org Label")
+        );
         let observation = redacted.plan_observations.last().expect("observation");
         assert_eq!(observation.account_id.as_deref(), Some(raw_account));
         assert_eq!(
             observation.organization_id.as_deref(),
             Some(raw_organization)
         );
-        assert_eq!(observation.account_label, None);
-        assert_eq!(observation.organization_label, None);
+        assert_eq!(
+            observation.account_label.as_deref(),
+            Some("owner@example.test")
+        );
+        assert_eq!(
+            observation.organization_label.as_deref(),
+            Some("Private Org Label")
+        );
 
         let safe_body = body(redacted);
-        assert!(!safe_body.contains('@'));
-        assert!(!safe_body.contains("Private Org Label"));
+        assert!(safe_body.contains("owner@example.test"));
+        assert!(safe_body.contains("Private Org Label"));
         assert!(safe_body.contains(raw_account));
         assert!(safe_body.contains(raw_organization));
         assert!(safe_body.contains(&"a".repeat(64)));
@@ -5945,15 +6013,15 @@ mod tests {
         assert_eq!(account.provider.as_deref(), Some("openai"));
         assert_eq!(account.auth_method.as_deref(), Some("oauth"));
         assert_eq!(account.subscription_product.as_deref(), Some("ChatGPT Pro"));
-        assert_eq!(account.email, None);
+        assert_eq!(account.email.as_deref(), Some("ron@example.com"));
         // Raw provider ids are identifiers, not credentials: they survive so
-        // the backend can recompute the hashes; labels and email do not.
+        // the backend can recompute the hashes independently of display text.
         assert_eq!(account.account_id.as_deref(), Some("user-SyntheticUser01"));
         assert_eq!(
             account.organization_id.as_deref(),
             Some("00000000-0000-4000-8000-00000000a001")
         );
-        assert_eq!(account.organization_label, None);
+        assert_eq!(account.organization_label.as_deref(), Some("Private Org"));
         assert_eq!(
             account.account_identifier_hash.as_deref(),
             Some("abc123hash")
@@ -5976,8 +6044,14 @@ mod tests {
                 .as_deref(),
             Some("ChatGPT Pro")
         );
-        assert_eq!(snapshot.plan_observations[0].account_label, None);
-        assert_eq!(snapshot.plan_observations[0].organization_label, None);
+        assert_eq!(
+            snapshot.plan_observations[0].account_label.as_deref(),
+            Some("ron@example.com")
+        );
+        assert_eq!(
+            snapshot.plan_observations[0].organization_label.as_deref(),
+            Some("Private Org")
+        );
         assert_eq!(
             snapshot.plan_observations[0].account_id.as_deref(),
             Some("user-SyntheticUser01")
@@ -6029,6 +6103,145 @@ mod tests {
         );
         // Path-like config value is stripped by backend redaction.
         assert!(!runtime_defaults.selector_context.contains_key("leaked"));
+    }
+
+    fn status_display_fixture() -> AgentStatusSnapshot {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/agent-status/display-carrier.json"
+        ))
+        .expect("synthetic account display fixture")
+    }
+
+    #[test]
+    fn status_display_serialization_preserves_own_roles_and_weak_text() {
+        let original = status_display_fixture();
+        let redacted = original.clone().redacted_for_backend();
+        // Includes a distinct previous slot, weak-only current observation and
+        // a route without acquired text: no root fallback or identity rewrite.
+        assert_eq!(redacted, original);
+        let wire = serde_json::to_value(&redacted).unwrap();
+        assert_eq!(wire["account"]["email"], "root@example.invalid");
+        assert_eq!(
+            wire["plan_observations"][0]["account_label"],
+            "member@example.invalid"
+        );
+        assert_eq!(
+            wire["plan_observations"][0]["organization_label"],
+            "Member workspace"
+        );
+        assert_eq!(wire["plan_observations"][0]["is_current"], false);
+        assert_eq!(
+            wire["plan_observations"][1]["account_label"],
+            "  Weak account @ workspace  "
+        );
+        assert!(wire["plan_observations"][2].get("account_label").is_none());
+        assert!(wire["plan_observations"][2]
+            .get("organization_label")
+            .is_none());
+        assert_eq!(redacted.clone().redacted_for_backend(), redacted);
+    }
+
+    #[test]
+    fn status_display_rejects_adversarial_text_without_widening_other_fields() {
+        for forbidden in [
+            "",
+            "   ",
+            "/Users/test@example.invalid/private",
+            "\\Users\\test\\private",
+            "/tmp/private",
+            " /tmp/private",
+            "Label /tmp/private",
+            "directory=/tmp/private",
+            "workspace=C:\\private",
+            "workspace:C:/private",
+            "directory|/tmp/private",
+            "C:\\private",
+            "Name https://example.invalid",
+            "~/private",
+            "https://test@example.invalid",
+            "file:/private",
+            "Bearer synthetic",
+            "authorization: synthetic",
+            "sk-synthetic",
+            "otdev_synthetic",
+            "otsi_synthetic",
+            "otsr_synthetic",
+            "otsct_synthetic",
+            "otel_synthetic",
+            "otrelay_synthetic",
+            "access_token=synthetic",
+            "refresh_token=synthetic",
+            "id_token=synthetic",
+            "password=synthetic",
+            "Cookie: synthetic",
+            concat!("-----BEGIN ", "PRIVATE KEY-----"),
+            "name\n@example.invalid",
+            "name\r@example.invalid",
+            "name\0@example.invalid",
+        ] {
+            let mut snapshot = status_display_fixture();
+            let account = snapshot.account.as_mut().unwrap();
+            account.email = Some(forbidden.into());
+            account.organization_label = Some(forbidden.into());
+            for observation in &mut snapshot.plan_observations {
+                observation.account_label = Some(forbidden.into());
+                observation.organization_label = Some(forbidden.into());
+            }
+            let redacted = snapshot.redacted_for_backend();
+            let wire = serde_json::to_value(redacted).unwrap();
+            assert!(wire["account"]["email"].is_null());
+            assert!(wire["account"]["organization_label"].is_null());
+            for observation in wire["plan_observations"].as_array().unwrap() {
+                assert!(observation.get("account_label").is_none());
+                assert!(observation.get("organization_label").is_none());
+            }
+        }
+        let mut snapshot = status_display_fixture();
+        snapshot.account.as_mut().unwrap().provider = Some("provider@example.invalid".into());
+        snapshot.plan_observations[0].evidence_method = Some("method@example.invalid".into());
+        let mut diagnostic = AgentStatusDiagnostic::source(
+            "email@example.invalid",
+            AgentDiagnosticSeverity::Warning,
+            "root@example.invalid",
+        );
+        diagnostic.account_label = Some("member@example.invalid".into());
+        diagnostic.scope = Some(AgentDiagnosticScope::Account);
+        snapshot.diagnostics.push(diagnostic);
+        let redacted = snapshot.redacted_for_backend();
+        assert!(redacted.account.unwrap().provider.is_none());
+        assert!(redacted.plan_observations[0].evidence_method.is_none());
+        assert_eq!(redacted.diagnostics[0].code, "redacted");
+        assert_eq!(redacted.diagnostics[0].message, "diagnostic redacted");
+        assert!(redacted.diagnostics[0].account_label.is_none());
+        assert!(redacted.diagnostics[0].scope.is_none());
+    }
+
+    #[test]
+    fn status_display_bounds_and_absence_keep_existing_wire_semantics() {
+        let mut snapshot = status_display_fixture();
+        snapshot.account.as_mut().unwrap().email = Some("a".repeat(320));
+        snapshot.account.as_mut().unwrap().organization_label = Some("é".repeat(255));
+        snapshot.plan_observations[0].account_label = Some("é".repeat(255));
+        snapshot.plan_observations[0].organization_label = Some("a".repeat(255));
+        assert_eq!(snapshot.clone().redacted_for_backend(), snapshot);
+        snapshot.account.as_mut().unwrap().email = Some("a".repeat(321));
+        snapshot.account.as_mut().unwrap().organization_label = Some("é".repeat(256));
+        snapshot.plan_observations[0].account_label = Some("é".repeat(256));
+        snapshot.plan_observations[0].organization_label = Some("a".repeat(256));
+        let wire = serde_json::to_value(snapshot.redacted_for_backend()).unwrap();
+        assert!(wire["account"]["email"].is_null());
+        assert!(wire["account"]["organization_label"].is_null());
+        assert!(wire["plan_observations"][0].get("account_label").is_none());
+        assert!(wire["plan_observations"][0]
+            .get("organization_label")
+            .is_none());
+        let mut absent = status_display_fixture();
+        absent.account = None;
+        for observation in &mut absent.plan_observations {
+            observation.account_label = None;
+            observation.organization_label = None;
+        }
+        assert_eq!(absent.clone().redacted_for_backend(), absent);
     }
 
     fn context_status_with_posture() -> AgentContextStatus {

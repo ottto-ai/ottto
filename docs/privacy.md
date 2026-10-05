@@ -32,8 +32,7 @@ ids, or hardware UUID.
 
 The local platform must not upload raw prompts, raw responses, tool output,
 command output, browser cookies, OAuth credentials, API keys, passwords,
-absolute local paths, provider account emails, or account and organization
-labels.
+absolute local paths.
 
 Raw provider account and organization ids are identifiers, not credentials.
 Agent status uploads carry them on the account block and on plan observations,
@@ -44,9 +43,23 @@ hashes from the original roles:
 - Codex: the ChatGPT user id and the selected ChatGPT workspace (account) id.
 
 Only plain ids (ASCII letters, digits and `-`, at most 128 characters) are
-sent; anything else is dropped. Emails, labels, tokens and credentials stay
-local. Other uploads, such as usage snapshots and diagnostics, still carry only
-hashed account identity.
+sent; anything else is dropped.
+
+The same agent-status carrier sends already-acquired account email and account
+and organization/workspace display labels for account cards. Each field belongs
+to its own account or plan observation; missing text stays missing. Safe text is
+sent unmasked and unchanged, bounded to 320 characters for the account email and
+255 for display labels. Unsafe or longer values are dropped, never truncated.
+Paths, secret-shaped values and control characters remain excluded. Display text
+does not establish account identity, payer, subscription selection, or historical
+session ownership. This changes no collection permissions or provider calls.
+
+The backend's existing accepted status fact retains these fields for replay into
+its SOURCE account display read model. This forward path does not copy labels
+into historical sessions or create a historical backfill. Other upload fields,
+credit-balance labels, diagnostics, logs and support receipts retain their
+existing redaction rules; email is permitted only in the named status display
+fields. Tokens and credentials stay local.
 
 Local usage snapshots use derived and redacted fields such as session ids,
 timestamps, usage totals, model usage, hashed workspace identity, and

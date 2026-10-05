@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 433,
-  "content_sha256": "19db7f7db27bc470a164166f2883c667945ad4fc0c62855d64f1d59270311ea6",
+  "candidate_file_count": 435,
+  "content_sha256": "cc4773f8a2ed0cf06198bd282f00045c751ac8524b2b5d5ccf31e65ba289542c",
   "files": [
     {
       "executable": false,
@@ -580,8 +580,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "cc34008c43ad3cf3e0062a3614564c86c50af40a6e0424cf4b85a3cbe4582803",
-      "size_bytes": 284586
+      "sha256": "f2367032d7317e0fd27da5a2f2c0b85bfd95930258e8f5c6f165755b478bf136",
+      "size_bytes": 293894
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "e117ab0de55f36daa8354f8c69fe0389f07f2404d082dbcb8563e9042130f5c1",
-      "size_bytes": 1318385
+      "sha256": "7a2fa772f08031a1ac65b9e77fe3fe205c0d36e4483d2404ade84b46ab83f342",
+      "size_bytes": 1318660
     },
     {
       "executable": false,
@@ -1084,8 +1084,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "092e1a1d4434bebf5ebc8c206f228e26dc738ea43d6c68484a66f746555f6aed",
-      "size_bytes": 21578
+      "sha256": "6c55a60521fb575f0ff154eac6b94c589f71b29ac1f10408736bcdae854aeaef",
+      "size_bytes": 22443
     },
     {
       "executable": false,
@@ -1951,6 +1951,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-05-account-display-carrier.md",
+      "sha256": "26cc44cc1877cb73b4cc52306347a3e03ac92e31e5760999a5669a449aea07ed",
+      "size_bytes": 2003
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-05-daemon-status-freshness.md",
       "sha256": "c5d4482d8a1332f2e2259072481c53ca4f324b62eef615e484396cf60e02962a",
       "size_bytes": 3506
@@ -2028,6 +2035,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/agent-status/display-carrier.json",
+      "sha256": "f5ba9ea9f9dc55405bb42d071592de1bbf0a456c053a85bfe87c26e2f45d230a",
+      "size_bytes": 1361
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/agent-status/quota-check-diagnostics-leaf-types.v1.json",
       "sha256": "30c1e1a06405e3080c268985aa64fecbde626b63ca055e6973dc0c93def2a3bc",
       "size_bytes": 2870
@@ -2043,8 +2057,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/raw-provider-ids-backend-wire.v1.json",
-      "sha256": "26a9fde493f2f53893b37cbb10c084680ec5962df700dd0f3266d16b569703ec",
-      "size_bytes": 3770
+      "sha256": "a9bc07d95cf3317f51d9ce8c3ad35d56ef7ad63d8d165ef86c53710666f1541d",
+      "size_bytes": 4112
     },
     {
       "executable": false,
@@ -2785,8 +2799,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_contract_check.sh",
-      "sha256": "940883b53b09956defc2c5198ab7c4d52c9a83b76592aa75c2705c822994bc83",
-      "size_bytes": 121129
+      "sha256": "9f602c8ceda4b3d611d97c15f06f99d96302a56240fb07d97a17047e3e2d5028",
+      "size_bytes": 121350
     },
     {
       "executable": true,
@@ -2981,8 +2995,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_contract_check.sh",
-      "sha256": "15599e3c75ac91b4d70611d15fe149cf6d018baf2201d309ae489f2c201a78b3",
-      "size_bytes": 98832
+      "sha256": "32027e183845a28710457c70e3a4a9b7d27a281acbf238b69382997781bf1b79",
+      "size_bytes": 99153
     },
     {
       "executable": true,
@@ -3034,9 +3048,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-05T09:36:50+00:00",
+  "generated_at": "2026-10-05T12:21:37+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 434,
+  "output_file_count": 436,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3070,5 +3084,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f21023b4f4c25941f17c64d882e4d504e54ec6a4"
+  "source_commit": "0761983427f53c31b4dd5af885338c4471d1bb34"
 }
