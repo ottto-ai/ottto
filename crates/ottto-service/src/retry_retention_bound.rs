@@ -1,4 +1,4 @@
-// Scratch-only requested-layout bound for stripped ordinary typed pages.
+// Closed, pinned requested-layout bound for stripped ordinary typed pages.
 use crate::session_attribution::{SessionAttributionFact, SessionFieldEvidence};
 use crate::snapshots::*;
 use std::collections::BTreeMap;

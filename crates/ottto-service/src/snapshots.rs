@@ -5770,7 +5770,7 @@ pub(crate) fn snapshot_fingerprint_from_component_hashes(
     ])
 }
 
-fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
+pub(crate) fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
     snapshot_fingerprint_from_component_hashes(
         source,
         &item.source_session_id,
@@ -19445,15 +19445,27 @@ impl ScanIndex {
     }
 
     pub fn save(&mut self, path: &Path) -> Result<()> {
+        self.save_internal(path, None)
+    }
+    pub(crate) fn save_with_read_limit(&mut self, path: &Path, cap: usize) -> Result<()> {
+        self.save_internal(path, Some(cap))
+    }
+    fn save_internal(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create scan index directory {}", parent.display()))?;
         }
         let _lock = CheckpointLock::acquire(path)?;
         if path.exists() {
-            let current: Self = serde_json::from_reader(
-                File::open(path).context("open current local snapshot scan index")?,
-            )
+            let current: Self = match read_limit {
+                Some(cap) => serde_json::from_slice(
+                    &crate::snapshot_retry::read_state(path, cap)
+                        .context("read bounded current local snapshot scan index")?,
+                ),
+                None => serde_json::from_reader(
+                    File::open(path).context("open current local snapshot scan index")?,
+                ),
+            }
             .context("parse current local snapshot scan index for compare-and-swap")?;
             if current.schema_version != SCAN_INDEX_SCHEMA_VERSION
                 || current.generation != self.generation

@@ -27,6 +27,10 @@ pub(crate) trait Owner {
     fn outcome(&mut self, source: Self::Source, result: Result<()>);
     fn monotonic(&self) -> Duration;
     fn parked(&mut self, _bytes: usize) {}
+    /// One optional turn after all due siblings have been offered. Every
+    /// parked source remains busy, so a retry cannot publish beneath its
+    /// unfinished native parser. No new thread, timer or parser ownership.
+    fn boundary(&mut self, _busy: impl Iterator<Item = Self::Source>) {}
 }
 
 pub(crate) fn run<O: Owner>(owner: &mut O, sources: &[O::Source], parked_budget: usize) {
@@ -48,6 +52,9 @@ pub(crate) fn run<O: Owner>(owner: &mut O, sources: &[O::Source], parked_budget:
         .unwrap_or(0);
     let mut parked_bytes = 0usize;
     loop {
+        if remaining.is_empty() {
+            owner.boundary(parked.iter().map(|(source, _, _)| *source));
+        }
         // Offer each due sibling before returning to a previously parked source.
         let (source, frame) = if let Some(source) = remaining.pop_front() {
             match owner.prepare(source) {

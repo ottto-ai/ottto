@@ -746,13 +746,20 @@ impl SnapshotUploadProgress {
     }
 
     fn save(&mut self, path: &Path) -> Result<()> {
+        self.save_with_read_limit(path, None)
+    }
+    fn save_with_read_limit(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("create snapshot upload progress directory")?;
         }
         let _lock = SnapshotProgressLock::acquire(path)?;
         if path.exists() {
             let current: Self = serde_json::from_slice(
-                &std::fs::read(path).context("read current snapshot upload progress")?,
+                &match read_limit {
+                    Some(cap) => crate::snapshot_retry::read_state(path, cap),
+                    None => std::fs::read(path),
+                }
+                .context("read current snapshot upload progress")?,
             )
             .context("parse current snapshot upload progress for compare-and-swap")?;
             if current.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
@@ -1241,8 +1248,36 @@ fn checkpoint_partial_snapshot_index(
     progress_path: &Path,
     validate_destination: impl FnOnce() -> Result<()>,
 ) -> Result<ScanIndex> {
+    checkpoint_partial_snapshot_index_with_read_limit(
+        index,
+        committed_index,
+        progress,
+        snapshots,
+        locally_held,
+        index_path,
+        progress_path,
+        validate_destination,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_partial_snapshot_index_with_read_limit(
+    index: &ScanIndex,
+    committed_index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    snapshots: &[SnapshotItem],
+    locally_held: &BTreeSet<String>,
+    index_path: &Path,
+    progress_path: &Path,
+    validate_destination: impl FnOnce() -> Result<()>,
+    read_limit: Option<usize>,
+) -> Result<ScanIndex> {
     let _lock = SnapshotProgressLock::acquire(progress_path)?;
-    let mut durable: SnapshotUploadProgress = match std::fs::read(progress_path) {
+    let mut durable: SnapshotUploadProgress = match match read_limit {
+        Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
+        None => std::fs::read(progress_path),
+    } {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .context("parse snapshot progress for partial checkpoint")?,
         Err(error) if error.kind() == ErrorKind::NotFound && progress.generation == 0 => {
@@ -1300,7 +1335,11 @@ fn checkpoint_partial_snapshot_index(
     let mut committable = index.committable_subset(committed_index, &accepted, &quarantined);
     committable.mark_bounded_sweep_unsettled();
     validate_destination()?;
-    committable.save(index_path)?;
+    if let Some(cap) = read_limit {
+        committable.save_with_read_limit(index_path, cap)?;
+    } else {
+        committable.save(index_path)?;
+    }
     Ok(committable)
 }
 
@@ -2376,6 +2415,97 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
     }
     Ok(())
 }
+
+#[allow(dead_code)] // Native retained-copy preparation; activation review remains closed.
+fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
+    if item.cache_observations.is_some() || item.cache_base_head_etag.is_some() {
+        return None;
+    }
+    Some(SnapshotItem {
+        session_account_evidence: item.session_account_evidence.clone(),
+        source_session_id: item.source_session_id.clone(),
+        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+        status: item.status.clone(),
+        input_tokens: item.input_tokens,
+        output_tokens: item.output_tokens,
+        cache_read_tokens: item.cache_read_tokens,
+        cache_creation_5m_tokens: item.cache_creation_5m_tokens,
+        cache_creation_1h_tokens: item.cache_creation_1h_tokens,
+        reasoning_output_tokens: item.reasoning_output_tokens,
+        unattributed_total_tokens: item.unattributed_total_tokens,
+        request_count: item.request_count,
+        usage_accounting_contract: item.usage_accounting_contract.clone(),
+        claude_usage_request_ids: BTreeSet::new(),
+        claude_usage_occurrences: BTreeMap::new(),
+        cache_observations: item.cache_observations.clone(),
+        cache_observations_state: None,
+        cache_base_head_etag: None,
+        cache_requests: Vec::new(),
+        cache_requests_complete: false,
+        avg_duration_ms: item.avg_duration_ms,
+        avg_time_to_first_token_ms: item.avg_time_to_first_token_ms,
+        max_duration_ms: item.max_duration_ms,
+        max_time_to_first_token_ms: item.max_time_to_first_token_ms,
+        peak_context_fill_tokens: item.peak_context_fill_tokens,
+        first_turn_context_tokens: item.first_turn_context_tokens,
+        last_turn_context_tokens: item.last_turn_context_tokens,
+        compaction_count: item.compaction_count,
+        compaction_timestamps: item.compaction_timestamps.clone(),
+        compaction_total_pre_tokens: item.compaction_total_pre_tokens,
+        compaction_total_post_tokens: item.compaction_total_post_tokens,
+        compaction_total_cumulative_dropped_tokens: item.compaction_total_cumulative_dropped_tokens,
+        compaction_total_duration_ms: item.compaction_total_duration_ms,
+        context_curve: item.context_curve.clone(),
+        claude_context_curve_boundaries: Vec::new(),
+        claude_context_curve_identity_complete: false,
+        claude_context_curve_request_index_complete: false,
+        claude_context_curve_owned_start_proven: false,
+        activity_summary: item.activity_summary.clone(),
+        tool_usage: item.tool_usage.clone(),
+        tool_usage_truncated: item.tool_usage_truncated,
+        model_usage: item.model_usage.clone(),
+        usage_buckets: item.usage_buckets.clone(),
+        cost: item.cost.clone(),
+        session_display_name: item.session_display_name.clone(),
+        session_display_name_source: item.session_display_name_source.clone(),
+        source_started_at: item.source_started_at.clone(),
+        source_ended_at: item.source_ended_at.clone(),
+        source_last_activity_at: item.source_last_activity_at.clone(),
+        collected_at: item.collected_at.clone(),
+        workspace_hash: item.workspace_hash.clone(),
+        workspace_display_label: item.workspace_display_label.clone(),
+        workspace_label_source: item.workspace_label_source.clone(),
+        repository_hash: item.repository_hash.clone(),
+        repository_label: item.repository_label.clone(),
+        repository_label_source: item.repository_label_source.clone(),
+        repository_identity_source: item.repository_identity_source.clone(),
+        workspace_kind: item.workspace_kind.clone(),
+        source_file_fingerprint: item.source_file_fingerprint.clone(),
+        session_artifacts: item.session_artifacts.clone(),
+        provenance: item.provenance.clone(),
+        origin: item
+            .origin
+            .as_ref()
+            .map(|o| crate::snapshots::SnapshotOrigin {
+                thread_source: o.thread_source.clone(),
+                source: o.source.clone(),
+                source_subagent: o.source_subagent,
+                originator: o.originator.clone(),
+                agent_role: o.agent_role.clone(),
+                entrypoint: o.entrypoint.clone(),
+                is_sidechain: o.is_sidechain,
+                session_kind: o.session_kind.clone(),
+                used_workflow_orchestration: o.used_workflow_orchestration,
+                parent_session_ref: None,
+            }),
+        originator: item.originator.clone(),
+        attribution_facts: item.attribution_facts.clone(),
+    })
+}
+
+#[allow(dead_code)] // Compiled preparation is exercised by native integration before activation.
+#[path = "bounded_snapshot_retry.rs"]
+mod bounded_snapshot_retry;
 
 struct SnapshotCycleOwner<'a> {
     account_witness: [u8; 32],
@@ -15222,92 +15352,6 @@ mod tests {
             .map(|length| request.len() >= body_start + length)
             .unwrap_or(true)
     }
-    fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
-        if item.cache_observations.is_some() || item.cache_base_head_etag.is_some() {
-            return None;
-        }
-        Some(SnapshotItem {
-            session_account_evidence: item.session_account_evidence.clone(),
-            source_session_id: item.source_session_id.clone(),
-            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-            status: item.status.clone(),
-            input_tokens: item.input_tokens,
-            output_tokens: item.output_tokens,
-            cache_read_tokens: item.cache_read_tokens,
-            cache_creation_5m_tokens: item.cache_creation_5m_tokens,
-            cache_creation_1h_tokens: item.cache_creation_1h_tokens,
-            reasoning_output_tokens: item.reasoning_output_tokens,
-            unattributed_total_tokens: item.unattributed_total_tokens,
-            request_count: item.request_count,
-            usage_accounting_contract: item.usage_accounting_contract.clone(),
-            claude_usage_request_ids: BTreeSet::new(),
-            claude_usage_occurrences: BTreeMap::new(),
-            cache_observations: item.cache_observations.clone(),
-            cache_observations_state: None,
-            cache_base_head_etag: None,
-            cache_requests: Vec::new(),
-            cache_requests_complete: false,
-            avg_duration_ms: item.avg_duration_ms,
-            avg_time_to_first_token_ms: item.avg_time_to_first_token_ms,
-            max_duration_ms: item.max_duration_ms,
-            max_time_to_first_token_ms: item.max_time_to_first_token_ms,
-            peak_context_fill_tokens: item.peak_context_fill_tokens,
-            first_turn_context_tokens: item.first_turn_context_tokens,
-            last_turn_context_tokens: item.last_turn_context_tokens,
-            compaction_count: item.compaction_count,
-            compaction_timestamps: item.compaction_timestamps.clone(),
-            compaction_total_pre_tokens: item.compaction_total_pre_tokens,
-            compaction_total_post_tokens: item.compaction_total_post_tokens,
-            compaction_total_cumulative_dropped_tokens: item
-                .compaction_total_cumulative_dropped_tokens,
-            compaction_total_duration_ms: item.compaction_total_duration_ms,
-            context_curve: item.context_curve.clone(),
-            claude_context_curve_boundaries: Vec::new(),
-            claude_context_curve_identity_complete: false,
-            claude_context_curve_request_index_complete: false,
-            claude_context_curve_owned_start_proven: false,
-            activity_summary: item.activity_summary.clone(),
-            tool_usage: item.tool_usage.clone(),
-            tool_usage_truncated: item.tool_usage_truncated,
-            model_usage: item.model_usage.clone(),
-            usage_buckets: item.usage_buckets.clone(),
-            cost: item.cost.clone(),
-            session_display_name: item.session_display_name.clone(),
-            session_display_name_source: item.session_display_name_source.clone(),
-            source_started_at: item.source_started_at.clone(),
-            source_ended_at: item.source_ended_at.clone(),
-            source_last_activity_at: item.source_last_activity_at.clone(),
-            collected_at: item.collected_at.clone(),
-            workspace_hash: item.workspace_hash.clone(),
-            workspace_display_label: item.workspace_display_label.clone(),
-            workspace_label_source: item.workspace_label_source.clone(),
-            repository_hash: item.repository_hash.clone(),
-            repository_label: item.repository_label.clone(),
-            repository_label_source: item.repository_label_source.clone(),
-            repository_identity_source: item.repository_identity_source.clone(),
-            workspace_kind: item.workspace_kind.clone(),
-            source_file_fingerprint: item.source_file_fingerprint.clone(),
-            session_artifacts: item.session_artifacts.clone(),
-            provenance: item.provenance.clone(),
-            origin: item
-                .origin
-                .as_ref()
-                .map(|o| crate::snapshots::SnapshotOrigin {
-                    thread_source: o.thread_source.clone(),
-                    source: o.source.clone(),
-                    source_subagent: o.source_subagent,
-                    originator: o.originator.clone(),
-                    agent_role: o.agent_role.clone(),
-                    entrypoint: o.entrypoint.clone(),
-                    is_sidechain: o.is_sidechain,
-                    session_kind: o.session_kind.clone(),
-                    used_workflow_orchestration: o.used_workflow_orchestration,
-                    parent_session_ref: None,
-                }),
-            originator: item.originator.clone(),
-            attribution_facts: item.attribution_facts.clone(),
-        })
-    }
 
     // Research only. The canonical page seam is executable; the clock/guards
     // below are an explicit candidate model, not daemon scheduling hooks.
@@ -15397,6 +15441,7 @@ mod tests {
 
     include!("retry_integrated_driver.rs");
     include!("retry_owned_rotation.rs");
+    include!("retry_bounded_native_tests.rs");
     fn same_source_fixture_ack(
         items: Vec<SnapshotItem>,
     ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {

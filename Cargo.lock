@@ -778,6 +778,7 @@ dependencies = [
  "time",
  "toml_edit",
  "ureq",
+ "webpki-roots 0.26.11",
  "zeroize",
 ]
 
