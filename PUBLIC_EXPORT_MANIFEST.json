@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 467,
-  "content_sha256": "a055555819942cb336a25e6d91a1f1b035a99d1efe029c06df3c8fd86f81102b",
+  "content_sha256": "4936a2f5a06ff51e1b2d3dd70e226cde0ffbf545d700da9dc83a5bf4f5f959c9",
   "files": [
     {
       "executable": false,
@@ -1049,8 +1049,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "e3e81ab442a810b74e65f9138530da5127c08f47c6d1c6adf248196040a69bc2",
-      "size_bytes": 2244800
+      "sha256": "27f1fff8874a9a263200afbc3a54ade6664283500b53b6a90c44ad7e2f78b2e5",
+      "size_bytes": 2246043
     },
     {
       "executable": false,
@@ -1070,8 +1070,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join.rs",
-      "sha256": "c8a42550359fa81a9252b8b2aa9408753d0a5d35fcf9dd8e880579606cfd2082",
-      "size_bytes": 87695
+      "sha256": "2db423bbcb7dcd9abc9700fdb8123449c83775e2e294c23b0dc4bf4a14044567",
+      "size_bytes": 95484
     },
     {
       "executable": false,
@@ -2169,8 +2169,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-06-codex-physical-file-union.md",
-      "sha256": "3885a8afc2e71240b6f67b4fb459a6667885efcbade77e5d14b61fe3d4701ae4",
-      "size_bytes": 6777
+      "sha256": "62f77109f00bd7847eb5da8e584cc5fe8fc979dc56bcd008c8e40d4440c24cc5",
+      "size_bytes": 7150
     },
     {
       "executable": false,
@@ -3272,7 +3272,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-06T21:08:21+00:00",
+  "generated_at": "2026-10-06T21:24:16+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 468,
   "public_roots": [
@@ -3311,5 +3311,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "07037f5a98c782863027d6bec0f1bf291c97fdc5"
+  "source_commit": "62d4ca7da2409f5f320d89881a5f9399a9279421"
 }
