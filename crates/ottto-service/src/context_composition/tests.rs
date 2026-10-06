@@ -334,6 +334,8 @@ fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
                 }
                 Err(error) => panic!("synthetic fixture accept: {error}"),
             };
+            // macOS inherits the listener's flag; keep the read timeout effective.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
