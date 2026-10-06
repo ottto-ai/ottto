@@ -2206,6 +2206,150 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
 }
 
 pub struct CodexCloudCliRunner;
+
+#[cfg(unix)]
+struct CodexCloudChild {
+    child: Option<std::process::Child>,
+}
+
+#[cfg(unix)]
+impl CodexCloudChild {
+    fn exited(&self) -> std::io::Result<bool> {
+        let child = self.child.as_ref().expect("owned cloud child");
+        // Observe exit without reaping: reserve the PID until the owned process
+        // group has been stopped, even if a descendant retains stdout.
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        Ok(info.si_signo != 0)
+    }
+
+    fn stop_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let mut child = self.child.take().expect("owned cloud child");
+        // Command::process_group(0) created this group; the direct child has
+        // never been reaped, so its PID cannot have been reused by another group.
+        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        let _ = child.kill();
+        child.wait()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CodexCloudChild {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            let _ = self.stop_and_reap();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_codex_cloud_command(command: &mut Command, deadline: Instant) -> Result<String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    if Instant::now() >= deadline {
+        return Err(anyhow!("Codex cloud list timed out"));
+    }
+    command.process_group(0);
+    let mut owned = CodexCloudChild {
+        child: Some(
+            command
+                .spawn()
+                .map_err(|_| anyhow!("Codex cloud list could not be started"))?,
+        ),
+    };
+    let stdout = owned
+        .child
+        .as_mut()
+        .expect("owned cloud child")
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Codex cloud list stdout could not be opened"))?;
+    let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(anyhow!("Codex cloud list output could not be read"));
+    }
+    // Read in this thread, checking the same deadline on every chunk, including
+    // continuously readable output. No blocked reader can outlive this call.
+    let mut stdout = Some(stdout);
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| anyhow!("Codex cloud list timed out"))?;
+        let mut progressed = false;
+        if let Some(pipe) = stdout.as_mut() {
+            let available = (MAX_PAGE_OUTPUT_BYTES as usize - bytes.len()).min(buffer.len());
+            match pipe.read(&mut buffer[..available]) {
+                Ok(0) => stdout = None,
+                Ok(read) => {
+                    bytes.extend_from_slice(&buffer[..read]);
+                    progressed = true;
+                    // Preserve take(MAX_PAGE_OUTPUT_BYTES): close the pipe at
+                    // the cap and let the child's exit status settle the result.
+                    if bytes.len() == MAX_PAGE_OUTPUT_BYTES as usize {
+                        stdout = None;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(anyhow!("Codex cloud list output could not be read")),
+            }
+        }
+        if owned
+            .exited()
+            .map_err(|_| anyhow!("Codex cloud list status could not be read"))?
+            && stdout.is_none()
+        {
+            let status = owned
+                .stop_and_reap()
+                .map_err(|_| anyhow!("Codex cloud list status could not be read"))?;
+            if !status.success() {
+                return Err(anyhow!("Codex cloud list exited unsuccessfully"));
+            }
+            return String::from_utf8(bytes)
+                .map_err(|_| anyhow!("Codex cloud list returned non-UTF-8 JSON"));
+        }
+        if !progressed {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if let Some(pipe) = stdout.as_ref() {
+                let mut ready = libc::pollfd {
+                    fd: pipe.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let timeout_ms = remaining.as_millis().min(50) as libc::c_int;
+                let result = unsafe { libc::poll(&mut ready, 1, timeout_ms) };
+                if result < 0
+                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    return Err(anyhow!("Codex cloud list output could not be read"));
+                }
+            } else {
+                thread::sleep(remaining.min(Duration::from_millis(50)));
+            }
+        }
+    }
+}
+
 impl CloudSessionRunner for CodexCloudCliRunner {
     fn list_page(&self, cursor: Option<&str>, limit: usize) -> Result<String> {
         self.list_page_bounded(cursor, limit, COMMAND_TIMEOUT)
@@ -2217,6 +2361,8 @@ impl CloudSessionRunner for CodexCloudCliRunner {
         limit: usize,
         timeout: Duration,
     ) -> Result<String> {
+        #[cfg(unix)]
+        let deadline = Instant::now() + timeout.min(COMMAND_TIMEOUT);
         let program = crate::command_env::executable_path("codex")
             .ok_or_else(|| anyhow!("Codex CLI is unavailable"))?;
         let mut command = Command::new(program);
@@ -2256,49 +2402,56 @@ impl CloudSessionRunner for CodexCloudCliRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let mut child = command
-            .spawn()
-            .map_err(|_| anyhow!("Codex cloud list could not be started"))?;
-        // Drain stdout while the child runs. Waiting to read after process exit
-        // would deadlock when a valid JSON page fills the OS pipe buffer.
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("Codex cloud list stdout could not be opened"))?;
-        let reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout
-                .take(MAX_PAGE_OUTPUT_BYTES)
-                .read_to_end(&mut bytes)
-                .map(|_| bytes)
-        });
-        let started = Instant::now();
-        let timeout = timeout.min(COMMAND_TIMEOUT);
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let output = reader
-                        .join()
-                        .map_err(|_| anyhow!("Codex cloud list output reader panicked"))?
-                        .map_err(|_| anyhow!("Codex cloud list output could not be read"))?;
-                    if !status.success() {
-                        return Err(anyhow!("Codex cloud list exited unsuccessfully"));
+        #[cfg(unix)]
+        {
+            run_codex_cloud_command(&mut command, deadline)
+        }
+        #[cfg(not(unix))]
+        {
+            let mut child = command
+                .spawn()
+                .map_err(|_| anyhow!("Codex cloud list could not be started"))?;
+            // Drain stdout while the child runs. Waiting to read after process exit
+            // would deadlock when a valid JSON page fills the OS pipe buffer.
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("Codex cloud list stdout could not be opened"))?;
+            let reader = thread::spawn(move || {
+                let mut bytes = Vec::new();
+                stdout
+                    .take(MAX_PAGE_OUTPUT_BYTES)
+                    .read_to_end(&mut bytes)
+                    .map(|_| bytes)
+            });
+            let started = Instant::now();
+            let timeout = timeout.min(COMMAND_TIMEOUT);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let output = reader
+                            .join()
+                            .map_err(|_| anyhow!("Codex cloud list output reader panicked"))?
+                            .map_err(|_| anyhow!("Codex cloud list output could not be read"))?;
+                        if !status.success() {
+                            return Err(anyhow!("Codex cloud list exited unsuccessfully"));
+                        }
+                        return String::from_utf8(output)
+                            .map_err(|_| anyhow!("Codex cloud list returned non-UTF-8 JSON"));
                     }
-                    return String::from_utf8(output)
-                        .map_err(|_| anyhow!("Codex cloud list returned non-UTF-8 JSON"));
-                }
-                Ok(None) if started.elapsed() >= timeout => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = reader.join();
-                    return Err(anyhow!("Codex cloud list timed out"));
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(50)),
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = reader.join();
-                    return Err(anyhow!("Codex cloud list status could not be read"));
+                    Ok(None) if started.elapsed() >= timeout => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = reader.join();
+                        return Err(anyhow!("Codex cloud list timed out"));
+                    }
+                    Ok(None) => thread::sleep(Duration::from_millis(50)),
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = reader.join();
+                        return Err(anyhow!("Codex cloud list status could not be read"));
+                    }
                 }
             }
         }
@@ -4376,6 +4529,307 @@ mod tests {
     }
     fn now() -> OffsetDateTime {
         OffsetDateTime::parse("2026-07-21T12:00:00Z", &Rfc3339).unwrap()
+    }
+
+    #[cfg(unix)]
+    struct CloudCliFixture {
+        root: PathBuf,
+        previous_search_path: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl CloudCliFixture {
+        fn new(mode: &str, output: &[u8], exit_code: u8) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let root = temp_dir("cloud-cli-process");
+            fs::write(root.join("output"), output).unwrap();
+            let quote =
+                |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+            let body = if mode == "output" {
+                format!(
+                    "/bin/cat {}\nexit {exit_code}\n",
+                    quote(&root.join("output"))
+                )
+            } else if mode == "escape" {
+                format!(
+                    "echo $$ > {}\nexport OTTTO_CLOUD_CLI_FIXTURE_DIR={}\n{} --ignored --exact cloud_sessions::tests::cloud_cli_fixture_process --nocapture --test-threads=1 &\nwhile [ ! -s {} ]; do /bin/sleep 0.01; done\nexit 0\n",
+                    quote(&root.join("direct")),
+                    quote(&root),
+                    quote(&std::env::current_exe().unwrap()),
+                    quote(&root.join("descendant")),
+                )
+            } else {
+                format!(
+                    "echo $$ > {}\n/bin/sleep 4 &\necho $! > {}\n{}\n",
+                    quote(&root.join("direct")),
+                    quote(&root.join("descendant")),
+                    if mode == "hold-exit" {
+                        "exit 0"
+                    } else {
+                        "wait"
+                    },
+                )
+            };
+            let script = root.join("codex");
+            fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n{body}",
+                    quote(&root.join("arguments"))
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+            let previous_search_path = std::env::var_os("OTTTO_COMMAND_SEARCH_PATH");
+            std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &root);
+            Self {
+                root,
+                previous_search_path,
+            }
+        }
+
+        fn pid(&self, label: &str) -> libc::pid_t {
+            fs::read_to_string(self.root.join(label))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        }
+
+        fn wait_started(&self) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while fs::read_to_string(self.root.join("descendant"))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())
+                .is_none()
+            {
+                assert!(Instant::now() < deadline, "fake descendant did not start");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn alive(pid: libc::pid_t) -> bool {
+            unsafe { libc::kill(pid, 0) == 0 }
+        }
+
+        fn wait_gone(&self, label: &str) {
+            let pid = self.pid(label);
+            assert!(Self::wait_for_exit(pid), "fake {label} remained alive");
+        }
+
+        fn wait_for_exit(pid: libc::pid_t) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Self::alive(pid) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            !Self::alive(pid)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CloudCliFixture {
+        fn drop(&mut self) {
+            match self.previous_search_path.take() {
+                Some(value) => std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", value),
+                None => std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH"),
+            }
+            // Even a failing oracle releases the finite escaped fixture. All
+            // fake processes also self-terminate after four seconds.
+            let _ = fs::write(self.root.join("release"), []);
+            for label in ["direct", "descendant"] {
+                if let Some(pid) = fs::read_to_string(self.root.join(label))
+                    .ok()
+                    .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())
+                {
+                    let _ = Self::wait_for_exit(pid);
+                }
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "bounded fake child invoked only by cloud CLI process tests"]
+    fn cloud_cli_fixture_process() {
+        let Some(root) = std::env::var_os("OTTTO_CLOUD_CLI_FIXTURE_DIR").map(PathBuf::from) else {
+            return;
+        };
+        assert!(unsafe { libc::setsid() } >= 0);
+        fs::write(root.join("descendant"), std::process::id().to_string()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline && !root.join("release").exists() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        std::process::exit(0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn cloud_cli_drains_large_output_and_preserves_arguments_and_cap() {
+        let payload =
+            json!({"tasks": [], "has_more": false, "padding": "x".repeat(1024 * 1024)}).to_string();
+        let fixture = CloudCliFixture::new("output", payload.as_bytes(), 0);
+        assert_eq!(
+            CodexCloudCliRunner
+                .list_page_bounded(
+                    Some("fixture-cursor"),
+                    PAGE_LIMIT + 1,
+                    Duration::from_secs(2)
+                )
+                .unwrap(),
+            payload
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("arguments")).unwrap(),
+            "cloud\nlist\n--json\n--limit\n20\n--cursor\nfixture-cursor\n"
+        );
+        drop(fixture);
+        for size in [
+            MAX_PAGE_OUTPUT_BYTES as usize,
+            MAX_PAGE_OUTPUT_BYTES as usize + 8192,
+        ] {
+            let _fixture = CloudCliFixture::new("output", &vec![b'x'; size], 0);
+            let output = CodexCloudCliRunner
+                .list_page_bounded(None, PAGE_LIMIT, Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(output.len(), MAX_PAGE_OUTPUT_BYTES as usize);
+            assert!(output.bytes().all(|byte| byte == b'x'));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn cloud_cli_deadline_covers_exit_and_timeout_pipe_holders() {
+        for mode in ["hold-exit", "hold-running"] {
+            let fixture = CloudCliFixture::new(mode, &[], 0);
+            let started = Instant::now();
+            let error = CodexCloudCliRunner
+                .list_page_bounded(None, PAGE_LIMIT, Duration::from_millis(500))
+                .unwrap_err();
+            assert!(error.to_string().contains("timed out"));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            fixture.wait_started();
+            fixture.wait_gone("direct");
+            fixture.wait_gone("descendant");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn cloud_cli_escaped_writer_cannot_hold_deadline_or_kill_other_groups() {
+        let fixture = CloudCliFixture::new("escape", &[], 0);
+        let mut sentinel = Command::new("/bin/sleep").arg("4").spawn().unwrap();
+        let caller_group = unsafe { libc::getpgrp() };
+        let started = Instant::now();
+        let result =
+            CodexCloudCliRunner.list_page_bounded(None, PAGE_LIMIT, Duration::from_secs(2));
+        // Always reap the separately owned sentinel before an oracle can panic.
+        let sentinel_alive = sentinel.try_wait().unwrap().is_none();
+        let _ = sentinel.kill();
+        sentinel.wait().unwrap();
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(unsafe { libc::getpgrp() }, caller_group);
+        assert!(sentinel_alive);
+        fixture.wait_started();
+        fixture.wait_gone("direct");
+        assert!(CloudCliFixture::alive(fixture.pid("descendant")));
+        fs::write(fixture.root.join("release"), []).unwrap();
+        fixture.wait_gone("descendant");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn cloud_cli_keeps_exit_and_utf8_errors_and_skips_expired_launch() {
+        for (output, code, message) in [
+            (b"ignored".as_slice(), 9, "exited unsuccessfully"),
+            ([0xff].as_slice(), 0, "non-UTF-8"),
+        ] {
+            let _fixture = CloudCliFixture::new("output", output, code);
+            let error = CodexCloudCliRunner
+                .list_page_bounded(None, PAGE_LIMIT, Duration::from_secs(2))
+                .unwrap_err();
+            assert!(error.to_string().contains(message));
+        }
+        let fixture = CloudCliFixture::new("output", b"{}", 0);
+        assert!(CodexCloudCliRunner
+            .list_page_bounded(None, PAGE_LIMIT, Duration::ZERO)
+            .unwrap_err()
+            .to_string()
+            .contains("timed out"));
+        assert!(!fixture.root.join("arguments").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn cloud_cli_pause_and_revoke_release_real_collector_fence_without_upload() {
+        for (mode, revoke) in [
+            ("hold-exit", false),
+            ("hold-running", true),
+            ("escape", true),
+        ] {
+            let fixture = CloudCliFixture::new(mode, &[], 0);
+            let (grants, checkpoints) = stores("cloud-cli-stop-fence");
+            enabled(&grants);
+            let checkpoints = Arc::new(checkpoints);
+            let transport = Arc::new(ThreadRecordingTransport {
+                chunks: AtomicUsize::new(0),
+                finalizes: AtomicUsize::new(0),
+                v1_sends: AtomicUsize::new(0),
+                blocking_chunk: Mutex::new(None),
+            });
+            let collector_grants = grants.clone();
+            let collector_checkpoints = Arc::clone(&checkpoints);
+            let collector_transport = Arc::clone(&transport);
+            let collector = thread::spawn(move || {
+                collect_cloud_sessions_once_with_budget(
+                    &collector_grants,
+                    &collector_checkpoints,
+                    &CodexCloudCliRunner,
+                    collector_transport.as_ref(),
+                    now(),
+                    Duration::from_secs(2),
+                )
+            });
+            fixture.wait_started();
+            assert_eq!(*checkpoints.collector_io.active_io.lock().unwrap(), 1);
+            if revoke {
+                grants.revoke(now()).unwrap();
+            } else {
+                grants.pause(now()).unwrap();
+            }
+            let started = Instant::now();
+            let idle = checkpoints.wait_for_collector_io_idle(Duration::from_secs(3));
+            let stopped_in_budget = started.elapsed() < Duration::from_secs(3);
+            // Join even if a deadline oracle fails; release the finite escaped
+            // fixture only after measuring actual collector-fence completion.
+            fs::write(fixture.root.join("release"), []).unwrap();
+            collector.join().unwrap();
+            idle.unwrap();
+            assert!(stopped_in_budget);
+            assert_eq!(*checkpoints.collector_io.active_io.lock().unwrap(), 0);
+            assert_eq!(transport.chunks.load(Ordering::SeqCst), 0);
+            assert_eq!(transport.finalizes.load(Ordering::SeqCst), 0);
+            assert_eq!(transport.v1_sends.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                collect_cloud_sessions_once(
+                    &grants,
+                    &checkpoints,
+                    &CodexCloudCliRunner,
+                    transport.as_ref(),
+                    now(),
+                ),
+                CloudSessionCycleOutcome::Disabled
+            );
+            fixture.wait_gone("direct");
+            fixture.wait_gone("descendant");
+        }
     }
     fn stores(name: &str) -> (CloudSessionGrantStore, CloudSessionCheckpointStore) {
         let root = temp_dir(name);
