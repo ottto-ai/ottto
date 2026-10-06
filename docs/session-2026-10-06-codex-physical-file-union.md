@@ -73,6 +73,8 @@ that crash holds a replacement rather than shrinking accepted usage. Pending
 membership is separate from applied membership and has no account authority.
 Fresh proof must include every previously protected physical path before
 superseding a pending set; expansion/rejection cannot forget an older member.
+Pending evidence also prevents semantic suppression of a correction back to
+an older accepted body: an unresolved POST may have replaced it remotely.
 Only the matching current common ACK and validated checkpoint clear it, so an
 older body's acknowledgement cannot clear newer pending membership.
 
@@ -103,6 +105,10 @@ Age/missing-source reconciliation cannot evict protected entries. Malformed
 owner metadata preserves the index and conservatively holds state-only fallback.
 An operator must restore compatible evidence or perform an explicitly reviewed
 recovery; automatic scans do not erase the protected state.
+
+Historical replay resets delivery checkpoints and reoffers intact groups while
+retaining file-owned membership and pricing evidence. A replay transition does
+not authorize source loss or expired-trace repricing.
 
 These additive fields preserve existing index/wire paths and older files migrate
 without claiming newly proven history. Older binaries that ignore the fields

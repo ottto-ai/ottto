@@ -2501,6 +2501,143 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn pending_correction_return_to_old_accepted_body_is_not_a_noop() {
+        let root = native_join_fixture_root(false);
+        let path = root.join("sessions/b.jsonl");
+        let original = fs::read(&path).unwrap();
+        let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        result.finish_codex_capture_boundary(&mut index);
+        let old_accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        let previous =
+            index.committable_subset(&ScanIndex::default(), &old_accepted, &BTreeMap::new());
+        let rows = member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-b", 400, 500);
+        fs::write(
+            &path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let (mut working, mut result) = scan(&root, previous.clone(), 2);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
+        assert!(result.snapshots.iter().all(|item| item.input_tokens == 500));
+        let (pending, _, _) = working.stage_codex_recovery_capture(&previous, &result.snapshots);
+        // The server may hold500 after a lost response. The old local300 ACK
+        // therefore cannot suppress an independently proved return to300.
+        fs::write(&path, original).unwrap();
+        let (mut corrected, mut result) = scan(&root, pending.clone(), 2);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut corrected);
+        assert_eq!(
+            result.snapshots.len(),
+            2,
+            "pending capture must not suppress a correction to an older body"
+        );
+        assert!(result.snapshots.iter().all(|item| item.input_tokens == 300));
+        let (capture, changed, held) =
+            corrected.stage_codex_recovery_capture(&pending, &result.snapshots);
+        assert_eq!(changed.len(), 1);
+        assert!(held.is_empty());
+        result.finish_codex_capture_boundary(&mut corrected);
+        let settled = corrected.committable_subset(&capture, &old_accepted, &BTreeMap::new());
+        assert!(settled
+            .files
+            .values()
+            .all(|entry| entry.codex_captured_joined_member_set.is_none()));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn historical_replay_preserves_pending_and_applied_protection() {
+        for priority in [false, true] {
+            for applied in [false, true] {
+                let root = native_join_fixture_root(priority);
+                let rows = member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-c", 100, 400);
+                fs::write(
+                    root.join("sessions/c.jsonl"),
+                    rows.iter()
+                        .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                        .collect::<String>(),
+                )
+                .unwrap();
+                let (mut index, mut result) = scan(&root, ScanIndex::default(), 3);
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+                let (capture, _, _) =
+                    index.stage_codex_recovery_capture(&ScanIndex::default(), &result.snapshots);
+                result.finish_codex_capture_boundary(&mut index);
+                let accepted = result
+                    .snapshots
+                    .iter()
+                    .map(|item| item.snapshot_fingerprint.clone())
+                    .collect();
+                let mut previous = if applied {
+                    index.committable_subset(&capture, &accepted, &BTreeMap::new())
+                } else {
+                    capture
+                };
+                let before = previous.clone();
+                previous.prepare_historical_replay("new-context-curve-replay".into());
+                assert_eq!(
+                    previous.files.len(),
+                    3,
+                    "replay must retain file-owned recovery facts"
+                );
+                for (key, entry) in &previous.files {
+                    let old = &before.files[key];
+                    assert_eq!(entry.codex_joined_member_set, old.codex_joined_member_set);
+                    assert_eq!(
+                        entry.codex_captured_joined_member_set,
+                        old.codex_captured_joined_member_set
+                    );
+                    assert_eq!(
+                        entry.codex_applied_tier_receipt,
+                        old.codex_applied_tier_receipt
+                    );
+                    assert_eq!(
+                        entry.codex_captured_tier_receipt,
+                        old.codex_captured_tier_receipt
+                    );
+                    assert!(entry.last_snapshot_fingerprint.is_none());
+                    assert!(entry.last_upload_body_witness.is_none());
+                }
+                assert!(previous.current_snapshot_fingerprints().is_empty());
+                if priority {
+                    fs::remove_file(root.join("logs_2.sqlite")).unwrap();
+                }
+                let (mut rebuilt, mut result) = scan(&root, previous.clone(), 3);
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut rebuilt);
+                assert_eq!(
+                    result.snapshots.len(),
+                    3,
+                    "intact protected replay must reoffer all aliases"
+                );
+                assert!(result.snapshots.iter().all(|item| item.input_tokens == 400));
+                let healthy = member("bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee", "healthy", 100, 100);
+                fs::write(
+                    root.join("sessions/d.jsonl"),
+                    healthy
+                        .iter()
+                        .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                        .collect::<String>(),
+                )
+                .unwrap();
+                fs::remove_file(root.join("sessions/c.jsonl")).unwrap();
+                let (held_index, result) = scan(&root, previous, 3);
+                assert!(!result.census_complete);
+                assert_eq!(result.snapshots.len(), 1);
+                assert_eq!(
+                    result.snapshots[0].source_session_id,
+                    "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                );
+                assert_eq!(held_index.files.len(), 4);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+    #[test]
     fn native_group_reports_finite_scan_capture_and_restart_cost() {
         let root = native_join_fixture_root(true);
         let start = std::time::Instant::now();

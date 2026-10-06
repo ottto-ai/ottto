@@ -2093,6 +2093,12 @@ pub struct ScanIndexEntry {
     pub codex_captured_uncommitted: bool,
 }
 impl ScanIndexEntry {
+    fn codex_recovery_is_pending(&self) -> bool {
+        self.codex_captured_joined_member_set.is_some()
+            || self.codex_captured_tier_receipt_required
+            || self.codex_captured_tier_receipt.is_some()
+            || self.codex_captured_uncommitted
+    }
     fn codex_history_is_protected(&self) -> bool {
         self.codex_protected_owner.is_some()
             || self.codex_joined_member_set.is_some()
@@ -2735,6 +2741,7 @@ impl SourceScanResult {
 
 #[derive(Debug, Clone)]
 struct PendingIndexFinalization {
+    codex_pending_recovery: bool,
     index_key: String,
     source_file_fingerprint: String,
     previous_snapshot_fingerprint: Option<String>,
@@ -3112,6 +3119,9 @@ pub fn finalize_scan_after_policy_with_body_witness(
         if final_group_fingerprint.is_some()
             && final_group_fingerprint == pending.previous_snapshot_fingerprint
             && final_upload_body_witness == pending.previous_upload_body_witness
+            // An unresolved POST may have replaced that older accepted body.
+            // Use the pre-replay fact: record() writes provisional new entries.
+            && !pending.codex_pending_recovery
             && !quarantine_retry_required
         {
             noop_source_files.insert(pending.source_file_fingerprint.clone());
@@ -11955,6 +11965,10 @@ impl OwnedSourceScan {
                     }
                     let alias_fingerprint = alias.source_file_fingerprint.clone();
                     pending_finalization.push(PendingIndexFinalization {
+                        codex_pending_recovery: index
+                            .files
+                            .get(&local_index_key(&alias.path))
+                            .is_some_and(ScanIndexEntry::codex_recovery_is_pending),
                         index_key: local_index_key(&alias.path),
                         source_file_fingerprint: alias_fingerprint.clone(),
                         previous_snapshot_fingerprint: index.last_snapshot_fingerprint(alias),
@@ -11993,6 +12007,10 @@ impl OwnedSourceScan {
                 .map(|snapshot| snapshot.snapshot_fingerprint.clone());
             let parsed_snapshot_count = parsed.len();
             pending_finalization.push(PendingIndexFinalization {
+                codex_pending_recovery: index
+                    .files
+                    .get(&index_key)
+                    .is_some_and(ScanIndexEntry::codex_recovery_is_pending),
                 index_key,
                 source_file_fingerprint: source_file_fingerprint.clone(),
                 previous_snapshot_fingerprint: (decision != CandidateDecision::ReconcileLegacy
@@ -19961,7 +19979,17 @@ impl ScanIndex {
         }
         self.historical_replay_generation = Some(generation);
         self.upload_context_fingerprint = None;
-        self.files.clear();
+        // Replay resets delivery authority, not file-owned recovery evidence.
+        // Otherwise a missing member or expired trace can silently shrink or
+        // reprice a previously joined contribution during ordinary replay.
+        self.files
+            .retain(|_, entry| entry.codex_history_is_protected());
+        for entry in self.files.values_mut() {
+            entry.last_snapshot_fingerprint = None;
+            entry.last_upload_body_witness = None;
+            entry.effective_upload_body_witness_revision = 0;
+            entry.scan_identity_version = None;
+        }
         self.terminal_jsonl_dispositions.clear();
         self.codex_state_only_snapshot_fingerprints.clear();
         self.codex_parent_ownership_refs.clear();
@@ -19980,7 +20008,7 @@ impl ScanIndex {
         self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
         self.legacy_settlement_reconcile_after_fingerprint = None;
         // A replay re-enters terminal entities that are still present because
-        // the file index above is empty and must be rebuilt. Keep the terminal
+        // delivery checkpoints above must be rebuilt. Keep the terminal
         // record until that scan proves a replacement ACK or re-quarantine.
         // If its source is absent, retaining it is the only replay-safe way to
         // preserve the explicit disclosure and counter.
@@ -51656,7 +51684,7 @@ crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns);
 crate::heap_layout_bound::fields!(OwnedActiveFile; candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
 crate::heap_layout_bound::fields!(OwnedSourceScan; source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys);
