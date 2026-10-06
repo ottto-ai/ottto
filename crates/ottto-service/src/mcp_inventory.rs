@@ -29,9 +29,11 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 #[cfg(any(not(unix), test))]
-use std::process::{Child, Stdio};
+use std::process::Child;
+use std::process::Command;
+#[cfg(not(unix))]
+use std::process::Stdio;
 #[cfg(not(unix))]
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
