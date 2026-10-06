@@ -25,6 +25,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
 pub(crate) mod cache_observations;
+mod codex_file_join;
+#[cfg(test)]
+pub(crate) use codex_file_join::tests::native_join_fixture_root;
 mod context_curve;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
@@ -1537,6 +1540,8 @@ struct ScanTraversalCheckpoint {
     /// duplicate source-session id merely because it is not a usage candidate.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     codex_rollout_paths: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_join_directory_census: Option<codex_file_join::DirectoryCensus>,
     reconciliation_upper_bound: Option<String>,
     reconciliation_after: Option<String>,
     reconciliation_started: bool,
@@ -2049,6 +2054,76 @@ pub struct ScanIndexEntry {
     /// when transcript size and mtime are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_identity_version: Option<String>,
+    /// Applied only through the existing common file/body acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_joined_member_set: Option<String>,
+    /// Pending proof, captured before POST; never an applied/accepted witness.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_codex_protected_owner"
+    )]
+    pub codex_captured_joined_member_set: Option<String>,
+    /// Hash-only logical owner for protecting joined/priced history from a
+    /// state-only replacement after physical source retirement. No attribution.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_codex_protected_owner"
+    )]
+    pub codex_protected_owner: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "codex_file_join::deserialize_receipt"
+    )]
+    pub codex_applied_tier_receipt: Option<codex_file_join::AppliedTierReceipt>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub codex_applied_tier_receipt_required: bool,
+    /// Captured selector evidence does not authorize a file/body checkpoint.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "codex_file_join::deserialize_receipt"
+    )]
+    pub codex_captured_tier_receipt: Option<codex_file_join::AppliedTierReceipt>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub codex_captured_tier_receipt_required: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub codex_captured_uncommitted: bool,
+}
+impl ScanIndexEntry {
+    fn codex_recovery_is_pending(&self) -> bool {
+        self.codex_captured_joined_member_set.is_some()
+            || self.codex_captured_tier_receipt_required
+            || self.codex_captured_tier_receipt.is_some()
+            || self.codex_captured_uncommitted
+    }
+    fn codex_history_is_protected(&self) -> bool {
+        self.codex_protected_owner.is_some()
+            || self.codex_joined_member_set.is_some()
+            || self.codex_captured_joined_member_set.is_some()
+            || self.codex_applied_tier_receipt.is_some()
+            || self.codex_applied_tier_receipt_required
+            || self.codex_captured_tier_receipt.is_some()
+            || self.codex_captured_tier_receipt_required
+            || self.codex_captured_uncommitted
+    }
+}
+fn deserialize_codex_protected_owner<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| value.as_str().unwrap_or("").to_owned()))
+}
+fn valid_codex_protected_owner(owner: &str) -> bool {
+    owner.len() == 64
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+fn codex_protected_owner(session: &str) -> String {
+    sha256_hex(&["codex_protected_owner:v1", &resolve_codex_identity(session)])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2466,10 +2541,207 @@ pub struct SourceScanResult {
     pub snapshots: Vec<SnapshotItem>,
     pending_finalization: Vec<PendingIndexFinalization>,
     pub(crate) local_codex_diagnostics: Option<CodexScanDiagnostics>,
+    codex_join_validation: Option<codex_file_join::Validation>,
+    codex_legacy_join_baselines: Vec<codex_file_join::LegacyBaseline>,
+}
+#[derive(Clone, Debug)]
+pub(crate) struct CodexJoinValidator(codex_file_join::Validation);
+impl CodexJoinValidator {
+    pub(crate) fn validate(&self, snapshots: &[SnapshotItem]) -> Result<()> {
+        let owners = snapshots
+            .iter()
+            .map(|item| resolve_codex_identity(&item.source_session_id))
+            .collect();
+        self.0.validate(&owners).map(|_| ())
+    }
+}
+impl SourceScanResult {
+    pub(crate) fn validate_codex_checkpoint(&self) -> Result<()> {
+        if let Some(validation) = &self.codex_join_validation {
+            validation.validate_all()?;
+        }
+        Ok(())
+    }
+    pub(crate) fn reconcile_codex_legacy_joining(
+        &mut self,
+        index: &mut ScanIndex,
+        previous: &ScanIndex,
+        machine_id: &str,
+        mut project: impl FnMut(&mut ScanIndex, &mut Vec<SnapshotItem>),
+    ) {
+        let mut held = BTreeSet::new();
+        for mut baseline in std::mem::take(&mut self.codex_legacy_join_baselines) {
+            project(index, &mut baseline.snapshots);
+            let matches = |snapshots: &[SnapshotItem]| {
+                let fingerprints = snapshots
+                    .iter()
+                    .map(|snapshot| snapshot_fingerprint(SnapshotSource::Codex, snapshot))
+                    .collect::<BTreeSet<_>>();
+                let mut digest = Sha256::new();
+                update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
+                for fingerprint in fingerprints {
+                    update_length_prefixed(&mut digest, fingerprint.as_bytes());
+                }
+                format!("{:x}", digest.finalize()) == baseline.expected
+            };
+            if matches(&baseline.snapshots) {
+                continue;
+            }
+            // Explicit missing/conflict creator evidence intentionally retracts
+            // legacy guessed ownership. Compare with the previously cached
+            // binding only to isolate that authorized correction; never emit it.
+            for item in &mut baseline.snapshots {
+                if item
+                    .session_account_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| {
+                        evidence.evidence_source == "codex_creator_header:v1"
+                            && matches!(evidence.identity_disposition, Some("missing" | "conflict"))
+                    })
+                {
+                    let key =
+                        sha256_hex(&["session_owner:v1", machine_id, &item.source_session_id]);
+                    if let Some(binding) = previous.session_account_bindings.get(&key) {
+                        set_session_account_hash(item, Some(&binding.account_identifier_hash));
+                    }
+                }
+            }
+            if !matches(&baseline.snapshots) {
+                held.insert(baseline.owner);
+            }
+        }
+        if held.is_empty() {
+            if self.census_complete
+                && !self.pending_finalization.iter().any(|pending| {
+                    index
+                        .files
+                        .get(&pending.index_key)
+                        .is_some_and(|entry| entry.codex_applied_tier_receipt.is_some())
+                })
+            {
+                index.traversal = None;
+                index.resume_after_path = None;
+                index.resume_upper_bound_path = None;
+                index.resume_census_window_end = None;
+            }
+            return;
+        }
+        self.hold_codex_groups(
+            index,
+            previous,
+            &held,
+            "legacy applied output could not be reproduced",
+        );
+    }
+    pub(crate) fn hold_codex_groups(
+        &mut self,
+        index: &mut ScanIndex,
+        previous: &ScanIndex,
+        held: &BTreeSet<String>,
+        reason: &str,
+    ) {
+        if held.is_empty() {
+            return;
+        }
+        self.census_complete = false;
+        self.scan_cap_hit = true;
+        if let Some(diagnostic) = self.local_codex_diagnostics.as_mut() {
+            diagnostic.gates.census_complete = false;
+            diagnostic.gates.traversal_healthy = false;
+        }
+        let sources = self
+            .snapshots
+            .iter()
+            .filter(|snapshot| held.contains(&resolve_codex_identity(&snapshot.source_session_id)))
+            .filter_map(|snapshot| snapshot.source_file_fingerprint.as_ref())
+            .collect::<BTreeSet<_>>();
+        let mut keys = index
+            .files
+            .iter()
+            .filter(|(_, entry)| sources.contains(&entry.source_file_fingerprint))
+            .map(|(key, _)| key.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(validation) = &self.codex_join_validation {
+            keys.extend(
+                validation
+                    .groups
+                    .iter()
+                    .filter(|group| held.contains(&group.owner))
+                    .flat_map(|group| {
+                        group
+                            .members
+                            .iter()
+                            .map(|member| local_index_key(&member.path))
+                    }),
+            );
+        }
+        self.ownership_incomplete_file_count += keys.len();
+        for key in &keys {
+            index.remove_file_entry(key);
+            if let Some(entry) = previous.files.get(key) {
+                index.files.insert(key.clone(), entry.clone());
+            }
+            if let Some(fingerprints) = previous.file_snapshot_fingerprints.get(key) {
+                index
+                    .file_snapshot_fingerprints
+                    .insert(key.clone(), fingerprints.clone());
+            }
+            if previous.confirmed_empty_files.contains(key) {
+                index.confirmed_empty_files.insert(key.clone());
+            }
+        }
+        self.pending_finalization
+            .retain(|pending| !keys.contains(&pending.index_key));
+        self.snapshots.retain(|snapshot| {
+            !held.contains(&resolve_codex_identity(&snapshot.source_session_id))
+        });
+        if let Some(traversal) = index.traversal.as_mut() {
+            traversal.counts.ownership_incomplete_file_count += keys.len();
+            traversal.counts.unreadable_path_count += 1;
+            traversal.residue.index_keys.extend(keys);
+            traversal
+                .residue
+                .blocked_session_ids
+                .extend(held.iter().cloned());
+            let now = rfc3339_unix_seconds(&self.census_window_end).unwrap_or_default();
+            traversal.unhealthy_retry_attempt = traversal
+                .unhealthy_retry_attempt
+                .saturating_add(1)
+                .min(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS);
+            traversal.unhealthy_retry_not_before_unix_seconds = Some(now.saturating_add(
+                unhealthy_scan_retry_delay_seconds(traversal.unhealthy_retry_attempt),
+            ));
+        }
+        index
+            .codex_state_only_blocked_session_ids
+            .extend(held.iter().cloned());
+        if let Some(validation) = &mut self.codex_join_validation {
+            validation
+                .groups
+                .retain(|group| !held.contains(&group.owner));
+        }
+        index.scan_residue_witness = previous.scan_residue_witness.clone();
+        eprintln!(
+            "ottto-service: held {} Codex file group(s): {reason}",
+            held.len()
+        );
+    }
+    pub(crate) fn finish_codex_capture_boundary(&self, index: &mut ScanIndex) {
+        if self.census_complete {
+            index.traversal = None;
+            index.resume_after_path = None;
+            index.resume_upper_bound_path = None;
+            index.resume_census_window_end = None;
+        }
+    }
+    pub(crate) fn codex_joining_validator(&self) -> Option<CodexJoinValidator> {
+        self.codex_join_validation.clone().map(CodexJoinValidator)
+    }
 }
 
 #[derive(Debug, Clone)]
 struct PendingIndexFinalization {
+    codex_pending_recovery: bool,
     index_key: String,
     source_file_fingerprint: String,
     previous_snapshot_fingerprint: Option<String>,
@@ -2847,6 +3119,9 @@ pub fn finalize_scan_after_policy_with_body_witness(
         if final_group_fingerprint.is_some()
             && final_group_fingerprint == pending.previous_snapshot_fingerprint
             && final_upload_body_witness == pending.previous_upload_body_witness
+            // An unresolved POST may have replaced that older accepted body.
+            // Use the pre-replay fact: record() writes provisional new entries.
+            && !pending.codex_pending_recovery
             && !quarantine_retry_required
         {
             noop_source_files.insert(pending.source_file_fingerprint.clone());
@@ -7590,18 +7865,12 @@ fn load_claude_desktop_session_title(
 /// Per-turn fast-mode signal lifted from Codex's undocumented `logs_2.sqlite`
 /// debug DB.
 ///
-/// Codex fast mode is "request-is-cost": a turn whose `response.create`
-/// websocket request asked for `service_tier="priority"` is billed at the
-/// priority (fast) rate regardless of what the server served — and that request
-/// tier is the ONLY reliable fast-mode signal. The rollout jsonl carries no
-/// service_tier, and the served tier on `response.completed` is always
-/// `"default"`. So we read the requested tier out of `logs_2.sqlite`.
-///
-/// Keyed by `turn_id` (a globally-unique UUIDv7 from the request's `turn.id`
-/// tracing span), which matches `turn_context.payload.turn_id` in the rollout
-/// jsonl. Because turn ids are globally unique, one map joins per turn across
-/// every session without any session scoping. Only priority (fast) turns are
-/// retained; an absent turn is standard, so the set stays tiny.
+/// Existing requested-priority signal from recent `logs_2.sqlite` request rows.
+/// The turn id links the tracing span to rollout turn_context. This turn-wide
+/// association is inherited application evidence: mixed requests within one
+/// turn lack a durable response-level selector join. Absence is not positive
+/// proof of standard pricing. File-owned receipts preserve previously applied
+/// decisions after traces expire without extending them to new contributions.
 #[derive(Debug, Clone, Default)]
 struct CodexTurnTraceMap {
     priority_turns: BTreeSet<String>,
@@ -7615,8 +7884,8 @@ impl CodexTurnTraceMap {
 
 /// Local opt-out for the experimental Codex fast-mode trace read. Defaults on;
 /// set `OTTTO_CODEX_FAST_MODE_TRACE=off` (also accepts `0`/`false`/`no`/
-/// `disabled`) to skip the `logs_2.sqlite` read entirely, after which every
-/// Codex turn classifies as standard. The master local-usage switch
+/// `disabled`) to skip new `logs_2.sqlite` reads. Protected old decisions remain
+/// subject to exact file-owned receipt replay. The master local-usage switch
 /// (`local_usage_reconciliation_enabled`) already gates all collection; this is
 /// a finer opt-out specific to reading the undocumented debug DB.
 fn codex_fast_mode_trace_enabled() -> bool {
@@ -7823,6 +8092,7 @@ struct SnapshotAccumulator {
     // Per-turn fast-mode signal read once per scan from `logs_2.sqlite`. Shared
     // read-only across every session file in the cycle via `Arc`.
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    codex_tier_replay: Option<codex_file_join::TierReplay>,
     current_selector: SelectorCapture,
     session_cumulative_usage: Option<UsageTotals>,
     codex_session_meta_seen: bool,
@@ -8021,6 +8291,7 @@ impl SnapshotAccumulator {
             latest_reasoning_effort: None,
             latest_turn_id: None,
             codex_turn_traces: None,
+            codex_tier_replay: None,
             current_selector: SelectorCapture::default(),
             session_cumulative_usage: None,
             codex_session_meta_seen: false,
@@ -10617,6 +10888,12 @@ pub(crate) struct OwnedSourceScan {
     forced_claude_family_reparses: BTreeSet<String>,
     identified_candidates: VecDeque<CandidateFile>,
     active_file: Option<OwnedActiveFile>,
+    codex_join_inventory: Option<codex_file_join::HeaderInventory>,
+    codex_join_prepared: bool,
+    codex_join_groups: VecDeque<codex_file_join::Group>,
+    codex_join_active: Option<(codex_file_join::Group, codex_file_join::GroupReader)>,
+    codex_join_completed: Vec<codex_file_join::Group>,
+    codex_legacy_join_baselines: Vec<codex_file_join::LegacyBaseline>,
 }
 struct OwnedActiveFile {
     candidate: CandidateFile,
@@ -10626,6 +10903,8 @@ struct OwnedActiveFile {
     projection_adoption_required: bool,
     source_file_fingerprint: String,
     parser: OwnedJsonlParser,
+    aliases: Vec<CandidateFile>,
+    applied_receipts: BTreeMap<String, Option<codex_file_join::AppliedTierReceipt>>,
 }
 #[allow(clippy::large_enum_variant)] // One active context moves between native collection steps.
 pub(crate) enum OwnedSourceScanStep {
@@ -10760,7 +11039,13 @@ impl OwnedSourceScan {
             .pending_candidates
             .iter()
             .any(|candidate| candidate.census_member && !candidate.watcher_hint);
-        let hinted_budget = file_limit
+        let selection_limit =
+            if source == SnapshotSource::Codex && !traversal.pending_directories.is_empty() {
+                0
+            } else {
+                file_limit
+            };
+        let hinted_budget = selection_limit
             .min(MAX_WATCHER_HINTED_FILES_PER_TICK)
             .saturating_sub(usize::from(ordinary_census_pending && file_limit > 0));
         for _ in 0..hinted_budget {
@@ -10775,7 +11060,7 @@ impl OwnedSourceScan {
                 pending_paths.push(candidate);
             }
         }
-        while pending_paths.len() < file_limit {
+        while pending_paths.len() < selection_limit {
             let Some(position) = traversal
                 .pending_candidates
                 .iter()
@@ -10787,7 +11072,7 @@ impl OwnedSourceScan {
                 pending_paths.push(candidate);
             }
         }
-        while pending_paths.len() < file_limit {
+        while pending_paths.len() < selection_limit {
             let Some(candidate) = traversal.pending_candidates.pop_front() else {
                 break;
             };
@@ -10972,6 +11257,20 @@ impl OwnedSourceScan {
             }
         }
 
+        let codex_join_inventory =
+            (source == SnapshotSource::Codex && !identified_candidates.is_empty()).then(|| {
+                let traversal = index
+                    .traversal
+                    .as_ref()
+                    .expect("Codex traversal initialized");
+                let mut inventory = codex_file_join::HeaderInventory::new(
+                    &traversal.scan_roots,
+                    &traversal.codex_rollout_paths,
+                    traversal.codex_join_directory_census.as_ref(),
+                );
+                inventory.complete &= traversal.pending_directories.is_empty();
+                inventory
+            });
         Self {
             source,
             index: owned_index,
@@ -11007,6 +11306,12 @@ impl OwnedSourceScan {
             forced_claude_family_reparses,
             identified_candidates: identified_candidates.into(),
             active_file: None,
+            codex_join_inventory,
+            codex_join_prepared: false,
+            codex_join_groups: VecDeque::new(),
+            codex_join_active: None,
+            codex_join_completed: Vec::new(),
+            codex_legacy_join_baselines: Vec::new(),
         }
     }
     pub(crate) fn step(
@@ -11048,6 +11353,12 @@ impl OwnedSourceScan {
             forced_claude_family_reparses,
             mut identified_candidates,
             mut active_file,
+            mut codex_join_inventory,
+            mut codex_join_prepared,
+            mut codex_join_groups,
+            mut codex_join_active,
+            mut codex_join_completed,
+            mut codex_legacy_join_baselines,
         } = self;
         let index = &mut index_storage;
         let claude_effort_support_dir_ref = claude_effort_support_dir.as_deref();
@@ -11088,8 +11399,324 @@ impl OwnedSourceScan {
                     forced_claude_family_reparses,
                     identified_candidates,
                     active_file,
+                    codex_join_inventory,
+                    codex_join_prepared,
+                    codex_join_groups,
+                    codex_join_active,
+                    codex_join_completed,
+                    codex_legacy_join_baselines,
                 })
             };
+        }
+        if source == SnapshotSource::Codex && !codex_join_prepared {
+            if let Some(inventory) = codex_join_inventory.as_mut() {
+                if !inventory.step(&codex_title_metadata) {
+                    pending!();
+                }
+                let selected = identified_candidates
+                    .iter()
+                    .map(|candidate| local_index_key(&candidate.path))
+                    .collect::<BTreeSet<_>>();
+                let inventoried = inventory
+                    .headers
+                    .iter()
+                    .map(|header| local_index_key(&header.candidate.path))
+                    .collect::<BTreeSet<_>>();
+                inventory.complete &= selected.is_subset(&inventoried);
+                let mut owners = BTreeMap::<String, BTreeSet<PathBuf>>::new();
+                for header in &inventory.headers {
+                    owners
+                        .entry(header.owner.clone())
+                        .or_default()
+                        .insert(header.home.clone());
+                }
+                let current_owners = inventory
+                    .headers
+                    .iter()
+                    .map(|header| {
+                        (
+                            local_index_key(&header.candidate.path),
+                            codex_protected_owner(&header.owner),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let mut repurposed_protected_paths = BTreeSet::new();
+                let mut missing_protected_owners = BTreeSet::new();
+                let mut missing_unknown_owner = false;
+                for (key, entry) in &index.files {
+                    let repurposed = entry.codex_history_is_protected()
+                        && entry
+                            .codex_protected_owner
+                            .as_ref()
+                            .is_some_and(|previous| {
+                                current_owners
+                                    .get(key)
+                                    .is_some_and(|current| current != previous)
+                            });
+                    if repurposed {
+                        repurposed_protected_paths.insert(key.clone());
+                    }
+                    if entry.codex_history_is_protected()
+                        && (!inventoried.contains(key) || repurposed)
+                    {
+                        if let Some(owner) = entry
+                            .codex_protected_owner
+                            .as_ref()
+                            .filter(|owner| valid_codex_protected_owner(owner))
+                        {
+                            missing_protected_owners.insert(owner.clone());
+                        } else {
+                            missing_unknown_owner = true;
+                        }
+                    }
+                }
+                let mut grouped_paths = BTreeSet::new();
+                let mut used = 0usize;
+                for group in inventory.groups().into_values() {
+                    let protected_history_missing = missing_unknown_owner
+                        || missing_protected_owners.contains(&codex_protected_owner(&group.owner));
+                    let previously_joined = group.members.iter().any(|member| {
+                        index
+                            .files
+                            .get(&local_index_key(&member.path))
+                            .is_some_and(|entry| {
+                                entry.codex_joined_member_set.is_some()
+                                    || entry.codex_captured_joined_member_set.is_some()
+                            })
+                    });
+                    if (group.members.len() < 2
+                        && !previously_joined
+                        && !protected_history_missing
+                        && owners
+                            .get(&group.owner)
+                            .map_or(true, |homes| homes.len() <= 1))
+                        || !group
+                            .members
+                            .iter()
+                            .any(|member| selected.contains(&local_index_key(&member.path)))
+                    {
+                        continue;
+                    }
+                    grouped_paths.extend(
+                        group
+                            .members
+                            .iter()
+                            .map(|member| local_index_key(&member.path)),
+                    );
+                    let malformed_pending = group.members.iter().any(|member| {
+                        index
+                            .files
+                            .get(&local_index_key(&member.path))
+                            .is_some_and(|entry| {
+                                entry
+                                    .codex_captured_joined_member_set
+                                    .as_deref()
+                                    .is_some_and(|marker| {
+                                        !codex_file_join::valid_captured_join(marker)
+                                    })
+                            })
+                    });
+                    if !inventory.complete
+                        || malformed_pending
+                        || protected_history_missing
+                        || group.members.iter().any(|member| {
+                            repurposed_protected_paths.contains(&local_index_key(&member.path))
+                        })
+                        || owners
+                            .get(&group.owner)
+                            .is_some_and(|homes| homes.len() > 1)
+                        || group.members.len() > codex_file_join::MAX_MEMBERS
+                        || group.members.len() < 2
+                        || group.members.len() > file_limit
+                    {
+                        census.ownership_incomplete_file_count += group.members.len();
+                        census.unreadable_path_count += 1;
+                        residue_index_keys.extend(
+                            group
+                                .members
+                                .iter()
+                                .map(|member| local_index_key(&member.path)),
+                        );
+                        residue_blocked_session_ids.insert(group.owner.clone());
+                        codex_state_only_blocked_session_ids.insert(group.owner.clone());
+                        continue;
+                    }
+                    if used + group.members.len() > file_limit {
+                        // Keep the existing traversal as the only queue. A whole
+                        // group is selected on a subsequent ordinary page.
+                        if let Some(traversal) = index.traversal.as_mut() {
+                            for member in &group.members {
+                                if selected.contains(&local_index_key(&member.path)) {
+                                    traversal.pending_candidates.push_back(ScanTraversalPath {
+                                        scan_root: member.scan_root.clone(),
+                                        path: member.path.clone(),
+                                        census_member: true,
+                                        watcher_hint: false,
+                                    });
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    used += group.members.len();
+                    if let Some(traversal) = index.traversal.as_mut() {
+                        traversal.pending_candidates.retain(|pending| {
+                            !group
+                                .members
+                                .iter()
+                                .any(|member| member.path == pending.path)
+                        });
+                    }
+                    codex_join_groups.push_back(group);
+                }
+                identified_candidates
+                    .retain(|candidate| !grouped_paths.contains(&local_index_key(&candidate.path)));
+                if !inventory.complete {
+                    census.unreadable_path_count += 1;
+                    census.ownership_incomplete_file_count += identified_candidates.len();
+                    residue_index_keys.extend(
+                        identified_candidates
+                            .iter()
+                            .map(|candidate| local_index_key(&candidate.path)),
+                    );
+                    let held_owners = inventory
+                        .headers
+                        .iter()
+                        .filter(|header| {
+                            selected.contains(&local_index_key(&header.candidate.path))
+                        })
+                        .map(|header| header.owner.clone())
+                        .collect::<BTreeSet<_>>();
+                    residue_blocked_session_ids.extend(held_owners.iter().cloned());
+                    codex_state_only_blocked_session_ids.extend(held_owners);
+                    identified_candidates.clear();
+                }
+                while used + identified_candidates.len() > file_limit {
+                    if let Some(candidate) = identified_candidates.pop_back() {
+                        if let Some(traversal) = index.traversal.as_mut() {
+                            traversal.pending_candidates.push_front(ScanTraversalPath {
+                                scan_root: candidate.scan_root,
+                                path: candidate.path,
+                                census_member: true,
+                                watcher_hint: false,
+                            });
+                        }
+                    }
+                }
+            }
+            codex_join_prepared = true;
+            pending!();
+        }
+        if let Some((mut group, mut reader)) = codex_join_active.take() {
+            if reader.unchanged_joined(index) {
+                semantic_noop_count += reader.members.len();
+                group.members = reader.members;
+                codex_join_completed.push(group);
+                pending!();
+            }
+            match reader.step(
+                &codex_title_metadata,
+                codex_turn_traces.clone(),
+                codex_parent_ownership_ledgers.clone(),
+                artifacts_enabled,
+                context_curve_enabled,
+                attribution_context,
+            ) {
+                Ok(false) => {
+                    codex_join_active = Some((group, reader));
+                    pending!();
+                }
+                Ok(true) => {
+                    let baselines = reader.take_legacy_baselines();
+                    match reader.finish().and_then(|replayed| {
+                        let actual_owner = replayed
+                            .0
+                            .accumulator
+                            .source_session_id
+                            .as_deref()
+                            .map(resolve_codex_identity);
+                        anyhow::ensure!(
+                            actual_owner.as_deref() == Some(group.owner.as_str()),
+                            "Codex replay owner changed after inventory"
+                        );
+                        Ok(replayed)
+                    }) {
+                        Ok((parser, candidate, members, applied_receipts)) => {
+                            // Member content/object fences were checked at EOF.
+                            // The shared validator checks each home roster once
+                            // at capture/send/checkpoint, after all page replays.
+                            let source_file_fingerprint = candidate.source_file_fingerprint.clone();
+                            active_file = Some(OwnedActiveFile {
+                                previous_snapshot_fingerprint: index
+                                    .last_snapshot_fingerprint(&candidate),
+                                previous_upload_body_witness: index
+                                    .last_upload_body_witness(&candidate),
+                                projection_adoption_required: index
+                                    .effective_upload_body_witness_revision_requires_adoption(
+                                        &local_index_key(&candidate.path),
+                                    ),
+                                candidate,
+                                decision: CandidateDecision::Parse,
+                                source_file_fingerprint,
+                                parser,
+                                aliases: members,
+                                applied_receipts,
+                            });
+                            codex_legacy_join_baselines.extend(baselines);
+                            pending!();
+                        }
+                        Err(_) => {
+                            census.ownership_incomplete_file_count += group.members.len();
+                            census.unreadable_path_count += 1;
+                            residue_index_keys.extend(
+                                group
+                                    .members
+                                    .iter()
+                                    .map(|member| local_index_key(&member.path)),
+                            );
+                            residue_blocked_session_ids.insert(group.owner.clone());
+                            codex_state_only_blocked_session_ids.insert(group.owner);
+                            pending!();
+                        }
+                    }
+                }
+                Err(_) => {
+                    census.ownership_incomplete_file_count += group.members.len();
+                    census.unreadable_path_count += 1;
+                    residue_index_keys.extend(
+                        group
+                            .members
+                            .iter()
+                            .map(|member| local_index_key(&member.path)),
+                    );
+                    residue_blocked_session_ids.insert(group.owner.clone());
+                    codex_state_only_blocked_session_ids.insert(group.owner);
+                    pending!();
+                }
+            }
+        }
+        if active_file.is_none() {
+            if let Some(group) = codex_join_groups.pop_front() {
+                scanned_file_count += group.members.len();
+                match codex_file_join::GroupReader::new(group.members.clone()) {
+                    Ok(mut reader) => {
+                        reader.configure_receipts(index);
+                        codex_join_active = Some((group, reader));
+                    }
+                    Err(_) => {
+                        census.ownership_incomplete_file_count += group.members.len();
+                        census.unreadable_path_count += 1;
+                        residue_index_keys.extend(
+                            group
+                                .members
+                                .iter()
+                                .map(|member| local_index_key(&member.path)),
+                        );
+                        codex_state_only_blocked_session_ids.insert(group.owner);
+                    }
+                }
+                pending!();
+            }
         }
         if let Some(mut active) = active_file.take() {
             match active.parser.step() {
@@ -11111,7 +11738,66 @@ impl OwnedSourceScan {
                 projection_adoption_required,
                 source_file_fingerprint,
                 parser,
+                aliases,
+                mut applied_receipts,
             } = active;
+            let mut parser = parser;
+            if let Some(replay) = parser.accumulator.codex_tier_replay.take() {
+                match replay.finish() {
+                    Ok(receipt) => {
+                        applied_receipts.insert(local_index_key(&candidate.path), receipt);
+                    }
+                    Err(_) => {
+                        census.ownership_incomplete_file_count += 1;
+                        census.unreadable_path_count += 1;
+                        residue_index_keys.insert(local_index_key(&candidate.path));
+                        if let Some(owner) = parser.accumulator.source_session_id.as_ref() {
+                            residue_blocked_session_ids.insert(resolve_codex_identity(owner));
+                            codex_state_only_blocked_session_ids
+                                .insert(resolve_codex_identity(owner));
+                        }
+                        pending!();
+                    }
+                }
+            }
+            let retained_bytes = index
+                .files
+                .iter()
+                .filter(|(key, _)| !applied_receipts.contains_key(*key))
+                .filter_map(|(_, entry)| entry.codex_applied_tier_receipt.as_ref())
+                .map(|receipt| receipt.retained_bytes())
+                .sum::<usize>();
+            let incoming_bytes = applied_receipts
+                .values()
+                .flatten()
+                .map(|receipt| receipt.retained_bytes())
+                .sum::<usize>();
+            if retained_bytes.saturating_add(incoming_bytes) > codex_file_join::MAX_RECEIPT_BYTES {
+                census.ownership_incomplete_file_count += aliases.len().max(1);
+                census.unreadable_path_count += 1;
+                residue_index_keys.insert(local_index_key(&candidate.path));
+                residue_index_keys
+                    .extend(aliases.iter().map(|member| local_index_key(&member.path)));
+                if let Some(owner) = parser.accumulator.source_session_id.as_ref() {
+                    residue_blocked_session_ids.insert(resolve_codex_identity(owner));
+                    codex_state_only_blocked_session_ids.insert(resolve_codex_identity(owner));
+                }
+                codex_state_only_blocked_session_ids.extend(
+                    aliases
+                        .iter()
+                        .flat_map(|member| codex_session_id_candidates_from_path(&member.path)),
+                );
+                pending!();
+            }
+            let joined_owner = if aliases.is_empty() {
+                None
+            } else {
+                parser
+                    .accumulator
+                    .source_session_id
+                    .as_deref()
+                    .map(resolve_codex_identity)
+            };
             let mut parsed_file = match parser.finish(
                 &candidate.opened_object_identity,
                 &candidate.path,
@@ -11134,6 +11820,30 @@ impl OwnedSourceScan {
             );
             codex_parent_resolution_retry_required |= parsed_file.codex_parent_resolution_pending;
             let parse_complete = parsed_file.complete();
+            if !aliases.is_empty() && !parse_complete {
+                // Joining authorizes a complete replacement only. Native
+                // ownership/parser loss cannot publish a partial union body.
+                census.ownership_incomplete_file_count += aliases.len();
+                census.unreadable_path_count += 1;
+                residue_index_keys
+                    .extend(aliases.iter().map(|member| local_index_key(&member.path)));
+                let owners = parsed_file
+                    .snapshots
+                    .iter()
+                    .map(|item| resolve_codex_identity(&item.source_session_id));
+                codex_state_only_blocked_session_ids.extend(owners);
+                codex_state_only_blocked_session_ids
+                    .extend(parsed_file.state_only_blocked_session_ids.iter().cloned());
+                pending!();
+            }
+            if !aliases.is_empty() {
+                codex_join_completed.push(codex_file_join::Group {
+                    owner: joined_owner
+                        .expect("joined replay owner was bound before native finish"),
+                    home: codex_file_join::member_home(&candidate.scan_root),
+                    members: aliases.clone(),
+                });
+            }
             let diagnostic_reason = if parse_complete {
                 FileReason::Complete
             } else if parsed_file.codex_parent_resolution_pending {
@@ -11248,12 +11958,59 @@ impl OwnedSourceScan {
                     }
                 }
             }
+            if parse_complete && !aliases.is_empty() {
+                for alias in &aliases {
+                    if alias.path == candidate.path {
+                        continue;
+                    }
+                    let alias_fingerprint = alias.source_file_fingerprint.clone();
+                    pending_finalization.push(PendingIndexFinalization {
+                        codex_pending_recovery: index
+                            .files
+                            .get(&local_index_key(&alias.path))
+                            .is_some_and(ScanIndexEntry::codex_recovery_is_pending),
+                        index_key: local_index_key(&alias.path),
+                        source_file_fingerprint: alias_fingerprint.clone(),
+                        previous_snapshot_fingerprint: index.last_snapshot_fingerprint(alias),
+                        previous_upload_body_witness: index.last_upload_body_witness(alias),
+                        parse_complete,
+                        diagnostic_reason,
+                        parsed_snapshot_count: parsed.len(),
+                        effective_upload_body_witness_revision: index
+                            .active_effective_upload_body_witness_revision,
+                    });
+                    let alias_items = parsed
+                        .iter()
+                        .cloned()
+                        .map(|mut item| {
+                            item.source_file_fingerprint = Some(alias_fingerprint.clone());
+                            item.snapshot_fingerprint = snapshot_fingerprint(source, &item);
+                            item
+                        })
+                        .collect::<Vec<_>>();
+                    index.record(
+                        alias.clone(),
+                        alias_items
+                            .last()
+                            .map(|item| item.snapshot_fingerprint.clone()),
+                        ScanParseOutcome::Snapshot,
+                    );
+                    census
+                        .observed_index_keys
+                        .insert(local_index_key(&alias.path));
+                    snapshots.extend(alias_items);
+                }
+            }
             scanned_session_count += parsed.len();
             let last_snapshot_fingerprint = parsed
                 .last()
                 .map(|snapshot| snapshot.snapshot_fingerprint.clone());
             let parsed_snapshot_count = parsed.len();
             pending_finalization.push(PendingIndexFinalization {
+                codex_pending_recovery: index
+                    .files
+                    .get(&index_key)
+                    .is_some_and(ScanIndexEntry::codex_recovery_is_pending),
                 index_key,
                 source_file_fingerprint: source_file_fingerprint.clone(),
                 previous_snapshot_fingerprint: (decision != CandidateDecision::ReconcileLegacy
@@ -11270,6 +12027,33 @@ impl OwnedSourceScan {
                 effective_upload_body_witness_revision: index
                     .active_effective_upload_body_witness_revision,
             });
+            if source == SnapshotSource::Codex
+                && parse_complete
+                && aliases.is_empty()
+                && applied_receipts.values().any(Option::is_some)
+            {
+                if let Some(item) = parsed.first() {
+                    codex_join_completed.push(codex_file_join::Group {
+                        owner: resolve_codex_identity(&item.source_session_id),
+                        home: codex_file_join::member_home(&candidate.scan_root),
+                        members: vec![candidate.clone()],
+                    });
+                }
+            }
+            let joined_marker =
+                (!aliases.is_empty()).then(|| codex_file_join::member_set_witness(&aliases));
+            let protected_owner = (!aliases.is_empty()
+                || applied_receipts.values().any(Option::is_some))
+            .then(|| {
+                parsed
+                    .first()
+                    .map(|item| codex_protected_owner(&item.source_session_id))
+            })
+            .flatten();
+            let joined_keys = aliases
+                .iter()
+                .map(|member| local_index_key(&member.path))
+                .collect::<Vec<_>>();
             if parse_complete {
                 index.record_terminal_jsonl_disposition(&candidate, terminal_loss.clone());
                 let outcome = if last_snapshot_fingerprint.is_some() {
@@ -11278,6 +12062,23 @@ impl OwnedSourceScan {
                     ScanParseOutcome::ConfirmedEmpty
                 };
                 index.record(candidate, last_snapshot_fingerprint, outcome);
+                for key in joined_keys {
+                    if let Some(entry) = index.files.get_mut(&key) {
+                        entry.codex_joined_member_set = joined_marker.clone();
+                        entry.codex_protected_owner = protected_owner.clone();
+                    }
+                }
+            }
+            if parse_complete {
+                for (key, receipt) in applied_receipts {
+                    if let Some(entry) = index.files.get_mut(&key) {
+                        if receipt.is_some() {
+                            entry.codex_protected_owner = protected_owner.clone();
+                        }
+                        entry.codex_applied_tier_receipt_required = receipt.is_some();
+                        entry.codex_applied_tier_receipt = receipt;
+                    }
+                }
             }
             census.malformed_json_line_count += report.malformed_json_line_count;
             census.invalid_utf8_line_count += report.invalid_utf8_line_count;
@@ -11314,10 +12115,14 @@ impl OwnedSourceScan {
                 // A residue file that this page parsed to completion, or that a
                 // watcher hint proved absent, leaves the generation's residue set; a
                 // file that reproduced its residue (re)enters it.
-                for index_key in settled_residue_index_keys
-                    .iter()
-                    .chain(census.removed_index_keys.iter())
-                {
+                for index_key in settled_residue_index_keys.iter().chain(
+                    census.removed_index_keys.iter().filter(|key| {
+                        !index
+                            .files
+                            .get(*key)
+                            .is_some_and(ScanIndexEntry::codex_history_is_protected)
+                    }),
+                ) {
                     traversal.residue.index_keys.remove(index_key);
                 }
                 traversal.residue.index_keys.extend(residue_index_keys);
@@ -11373,12 +12178,45 @@ impl OwnedSourceScan {
             // derived index state directly. Any recreation after this absence witness
             // belongs to the next generation.
             for index_key in &census.removed_index_keys {
-                index.remove_file_entry(index_key);
+                if !index
+                    .files
+                    .get(index_key)
+                    .is_some_and(ScanIndexEntry::codex_history_is_protected)
+                {
+                    index.remove_file_entry(index_key);
+                }
             }
             let traversal_discovery_done = index.traversal.as_ref().is_some_and(|traversal| {
                 traversal.pending_directories.is_empty() && traversal.pending_candidates.is_empty()
             });
             if traversal_discovery_done {
+                if source == SnapshotSource::Codex {
+                    let missing = index
+                        .files
+                        .iter()
+                        .filter(|(key, entry)| {
+                            entry.codex_history_is_protected()
+                                && !index
+                                    .traversal
+                                    .as_ref()
+                                    .expect("traversal")
+                                    .codex_rollout_paths
+                                    .contains(*key)
+                        })
+                        .map(|(key, _)| key.clone())
+                        .collect::<BTreeSet<_>>();
+                    if !missing.is_empty() {
+                        let traversal = index.traversal.as_mut().expect("traversal");
+                        // Quiet ticks reuse this generation's red witness. Count
+                        // each absent protected source once, without rearming the
+                        // retry latch or rescanning headers before its deadline.
+                        let newly_missing =
+                            missing.difference(&traversal.residue.index_keys).count();
+                        traversal.counts.ownership_incomplete_file_count += newly_missing;
+                        traversal.counts.unreadable_path_count += usize::from(newly_missing > 0);
+                        traversal.residue.index_keys.extend(missing);
+                    }
+                }
                 // Discovery has visited every directory and parsed every candidate,
                 // so the counts are the complete re-derivation for this generation.
                 // Loss that only a change to the corpus can move is settled now, so a
@@ -11511,7 +12349,17 @@ impl OwnedSourceScan {
             if raw_census_complete {
                 index.record_scan_residue_witness(source, &traversal_snapshot);
             }
-            if raw_census_complete || restart_after_hints || parent_resolution_restart {
+            if (raw_census_complete
+                && codex_legacy_join_baselines.is_empty()
+                && !pending_finalization.iter().any(|pending| {
+                    index.files.get(&pending.index_key).is_some_and(|entry| {
+                        entry.codex_applied_tier_receipt.is_some()
+                            || entry.codex_joined_member_set.is_some()
+                    })
+                }))
+                || restart_after_hints
+                || parent_resolution_restart
+            {
                 index.traversal = None;
                 index.resume_after_path = None;
                 index.resume_upper_bound_path = None;
@@ -11588,6 +12436,13 @@ impl OwnedSourceScan {
                 census_residue_blocked_session_count,
                 snapshots,
                 pending_finalization,
+                codex_legacy_join_baselines,
+                codex_join_validation: codex_join_inventory
+                    .filter(|_| !codex_join_completed.is_empty())
+                    .map(|inventory| codex_file_join::Validation {
+                        inventory,
+                        groups: codex_join_completed,
+                    }),
                 local_codex_diagnostics: (source == SnapshotSource::Codex).then_some(
                     CodexScanDiagnostics {
                         version: 1,
@@ -11693,7 +12548,7 @@ impl OwnedSourceScan {
             ));
         let source_file_fingerprint = candidate.source_file_fingerprint.clone();
 
-        let parser = match OwnedJsonlParser::new(
+        let mut parser = match OwnedJsonlParser::new(
             opened_file,
             &candidate.path,
             source,
@@ -11714,6 +12569,18 @@ impl OwnedSourceScan {
                 pending!();
             }
         };
+        if source == SnapshotSource::Codex {
+            let previous =
+                codex_file_join::receipt_state(index.files.get(&local_index_key(&candidate.path)));
+            parser.accumulator.codex_tier_replay = Some(codex_file_join::TierReplay::new(
+                previous.0,
+                previous.1,
+                index
+                    .active_upload_context_fingerprint
+                    .clone()
+                    .unwrap_or_default(),
+            ));
+        }
         active_file = Some(OwnedActiveFile {
             candidate,
             decision,
@@ -11722,6 +12589,8 @@ impl OwnedSourceScan {
             projection_adoption_required,
             source_file_fingerprint,
             parser,
+            aliases: Vec::new(),
+            applied_receipts: BTreeMap::new(),
         });
         pending!();
     }
@@ -11797,8 +12666,25 @@ fn append_codex_state_only_snapshots(
         .filter_map(|(path, _)| metadata.identity_from_path_evidence(Path::new(path)))
         .collect();
     let mut scanned_session_count = 0;
+    let protected = index
+        .files
+        .values()
+        .filter(|entry| entry.codex_history_is_protected())
+        .collect::<Vec<_>>();
+    let unknown_protected_owner = protected.iter().any(|entry| {
+        entry
+            .codex_protected_owner
+            .as_ref()
+            .map_or(true, |owner| !valid_codex_protected_owner(owner))
+    });
+    let protected_owners = protected
+        .iter()
+        .filter_map(|entry| entry.codex_protected_owner.as_ref())
+        .collect::<BTreeSet<_>>();
     for (source_session_id, thread) in &metadata.state_threads {
         if thread.tokens_used == 0
+            || unknown_protected_owner
+            || protected_owners.contains(&codex_protected_owner(source_session_id))
             || covered_session_ids.contains(source_session_id)
             || covered_in_prior_runs.contains(source_session_id)
             || blocked_session_ids.contains(source_session_id)
@@ -12328,6 +13214,9 @@ impl OwnedJsonlParser {
         })
     }
     fn step(&mut self) -> Result<bool> {
+        self.step_with_observer(|_| {})
+    }
+    fn step_with_observer(&mut self, mut observe: impl FnMut(&Value)) -> Result<bool> {
         let source = self.source;
         let accumulator = &mut self.accumulator;
         let recognized_usage_drop_count = &mut self.recognized_usage_drop_count;
@@ -12335,6 +13224,10 @@ impl OwnedJsonlParser {
         let positive_usage_evidence = &mut self.positive_usage_evidence;
         let apply_line = self.apply_line;
         let step = self.reader.step(|value| {
+            observe(value);
+            if let Some(replay) = accumulator.codex_tier_replay.as_mut() {
+                replay.observe(value);
+            }
             let inherited = source == SnapshotSource::ClaudeCode
                 && claude_fork_line_provenance(value) == ClaudeForkLineProvenance::Inherited;
             if !inherited && recognized_usage_shape_was_dropped(source, value) {
@@ -14408,6 +15301,16 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             .or_else(|| string_at(value, &["payload", "info", "model"]))
             .or_else(|| string_at(value, &["turn_context", "payload", "model"]))
             .or_else(|| string_at(value, &["payload", "model"]));
+        let applied_tier = accumulator.codex_tier_replay.as_mut().and_then(|replay| {
+            replay.selector(
+                value,
+                &mut usage_selector,
+                &accumulator.current_selector,
+                model.as_deref().or(accumulator.latest_model.as_deref()),
+                accumulator.latest_reasoning_effort.as_deref(),
+                accumulator.latest_turn_id.as_deref(),
+            )
+        });
         let last_usage = codex_last_usage(value);
         let usage_event_identity = codex_usage_event_identity(value);
         let admitted = accumulator.set_cumulative_usage_with_selector(
@@ -14420,6 +15323,11 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             implicit_request_count,
             accumulator.latest_reasoning_effort.clone(),
         );
+        if admitted.is_some() {
+            if let Some(replay) = accumulator.codex_tier_replay.as_mut() {
+                replay.admitted(applied_tier);
+            }
+        }
         if admitted.is_some() && accumulator.context_curve_enabled {
             match (last_usage, usage_event_identity) {
                 (Some(last_usage), Some(_)) if last_usage.input_tokens > 0 => {
@@ -16522,8 +17430,8 @@ impl CodexTitleMetadata {
 // `logs_2.sqlite` can be ~1GB+ with a live WAL and a concurrent writer (Codex
 // itself). The read is best-effort, read-only, time-bounded, and row-capped so
 // it can never disrupt Codex or stall the snapshot cycle. Any error (missing
-// file, locked DB, schema churn) yields an empty map and every turn then
-// classifies as standard — the read is never load-bearing for collection.
+// file, locked DB, schema churn) yields an empty map. Exact file-owned receipts
+// retain protected old decisions; absent new signals keep the existing default.
 const CODEX_LOGS2_MAX_ROWS: i64 = 50_000;
 const CODEX_LOGS2_BUSY_TIMEOUT_MS: u64 = 400;
 // The trace read window pads the session backfill window so a turn near a
@@ -17865,6 +18773,8 @@ fn ensure_bounded_traversal(
         pending_candidates: VecDeque::new(),
         observed_index_keys: BTreeSet::new(),
         codex_rollout_paths: BTreeSet::new(),
+        codex_join_directory_census: (source == SnapshotSource::Codex)
+            .then(codex_file_join::DirectoryCensus::new),
         reconciliation_upper_bound: index.files.keys().next_back().cloned(),
         reconciliation_after: None,
         reconciliation_started: false,
@@ -17940,6 +18850,15 @@ fn advance_bounded_directory_traversal_with_budget(
     backfill_window_days: u64,
     max_entries: usize,
 ) {
+    let walk_issues = |counts: &ScanTraversalCounts| {
+        (
+            counts.directory_entry_cap_exceeded_count,
+            counts.symlink_rejected_count,
+            counts.unreadable_path_count,
+            counts.disappeared_file_count,
+        )
+    };
+    let issues_before = walk_issues(&traversal.counts);
     // Eligibility belongs to the frozen census generation, not to whichever
     // later tick happens to reach a directory. Otherwise a multi-page walk can
     // silently age boundary files out while still publishing the earlier
@@ -17980,6 +18899,9 @@ fn advance_bounded_directory_traversal_with_budget(
         // budget was available, that same extra entry proves the directory is
         // too wide to scan truthfully and turns the generation red.
         let mut entries = entries.take(remaining + 1).collect::<Vec<_>>();
+        if let Some(census) = traversal.codex_join_directory_census.as_mut() {
+            census.observe(&directory.path, &metadata);
+        }
         if entries.len() > remaining {
             if remaining == max_entries {
                 traversal.counts.directory_entry_cap_exceeded_count += 1;
@@ -18078,6 +19000,11 @@ fn advance_bounded_directory_traversal_with_budget(
                     watcher_hint: false,
                 });
             }
+        }
+    }
+    if walk_issues(&traversal.counts) != issues_before {
+        if let Some(census) = traversal.codex_join_directory_census.as_mut() {
+            census.invalidate_walk();
         }
     }
 }
@@ -18192,7 +19119,12 @@ fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usiz
             .traversal
             .as_ref()
             .is_some_and(|traversal| traversal.observed_index_keys.contains(key));
-        if !observed {
+        if !observed
+            && !index
+                .files
+                .get(key)
+                .is_some_and(ScanIndexEntry::codex_history_is_protected)
+        {
             index.files.remove(key);
             index.confirmed_empty_files.remove(key);
             index.file_snapshot_fingerprints.remove(key);
@@ -18749,6 +19681,23 @@ impl ScanIndex {
                         set_session_account_hash(item, None);
                         continue;
                     }
+                    // An explicit creator-negative is a source decision, not
+                    // the legacy absence of an optional witness. Neither a
+                    // cached owner nor today's home login can override it.
+                    if item
+                        .session_account_evidence
+                        .as_ref()
+                        .is_some_and(|evidence| {
+                            evidence.evidence_source == "codex_creator_header:v1"
+                                && matches!(
+                                    evidence.identity_disposition,
+                                    Some("missing" | "conflict")
+                                )
+                        })
+                    {
+                        set_session_account_hash(item, None);
+                        continue;
+                    }
                     let owner = existing
                         .cloned()
                         .or_else(|| self.codex_owner_for_item(item, codex_homes));
@@ -19030,7 +19979,17 @@ impl ScanIndex {
         }
         self.historical_replay_generation = Some(generation);
         self.upload_context_fingerprint = None;
-        self.files.clear();
+        // Replay resets delivery authority, not file-owned recovery evidence.
+        // Otherwise a missing member or expired trace can silently shrink or
+        // reprice a previously joined contribution during ordinary replay.
+        self.files
+            .retain(|_, entry| entry.codex_history_is_protected());
+        for entry in self.files.values_mut() {
+            entry.last_snapshot_fingerprint = None;
+            entry.last_upload_body_witness = None;
+            entry.effective_upload_body_witness_revision = 0;
+            entry.scan_identity_version = None;
+        }
         self.terminal_jsonl_dispositions.clear();
         self.codex_state_only_snapshot_fingerprints.clear();
         self.codex_parent_ownership_refs.clear();
@@ -19049,7 +20008,7 @@ impl ScanIndex {
         self.accepted_snapshot_fingerprint_ledger_version = SNAPSHOT_ACCEPTED_LEDGER_VERSION;
         self.legacy_settlement_reconcile_after_fingerprint = None;
         // A replay re-enters terminal entities that are still present because
-        // the file index above is empty and must be rebuilt. Keep the terminal
+        // delivery checkpoints above must be rebuilt. Keep the terminal
         // record until that scan proves a replacement ACK or re-quarantine.
         // If its source is absent, retaining it is the only replay-safe way to
         // preserve the explicit disclosure and counter.
@@ -19257,6 +20216,7 @@ impl ScanIndex {
             pending_candidates: VecDeque::new(),
             observed_index_keys: BTreeSet::new(),
             codex_rollout_paths: BTreeSet::new(),
+            codex_join_directory_census: None,
             reconciliation_upper_bound: None,
             reconciliation_after: None,
             reconciliation_started: false,
@@ -19664,6 +20624,233 @@ impl ScanIndex {
     /// Anything else keeps its previously committed entry, so the next scan
     /// re-parses it and re-uploads. `previous` is the index as loaded from disk,
     /// before this scan mutated it.
+    /// Stage bounded selector and joined-membership recovery facts without changing any committed
+    /// file/body/ACK field. The caller persists this by the existing index CAS
+    /// before a protected POST and adopts only that exact saved generation.
+    pub(crate) fn stage_codex_recovery_capture(
+        &self,
+        previous: &ScanIndex,
+        snapshots: &[SnapshotItem],
+    ) -> (ScanIndex, BTreeSet<String>, BTreeSet<String>) {
+        let mut staged = previous.clone();
+        let mut changed = BTreeSet::new();
+        let mut held = BTreeSet::new();
+        let by_source = snapshots
+            .iter()
+            .filter_map(|item| {
+                item.source_file_fingerprint.as_ref().map(|source| {
+                    (
+                        source.clone(),
+                        resolve_codex_identity(&item.source_session_id),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut by_owner = BTreeMap::<String, Vec<(String, ScanIndexEntry)>>::new();
+        for (key, entry) in &self.files {
+            let Some(owner) = by_source.get(&entry.source_file_fingerprint) else {
+                continue;
+            };
+            let receipt = entry.codex_applied_tier_receipt.as_ref();
+            let marker = entry
+                .codex_joined_member_set
+                .as_ref()
+                .map(|value| codex_file_join::captured_join(value));
+            if receipt.is_none() && marker.is_none() {
+                continue;
+            }
+            let previous_entry = previous.files.get(key);
+            let tiers_covered = receipt.map_or(true, |receipt| {
+                previous_entry
+                    .and_then(|entry| {
+                        entry
+                            .codex_captured_tier_receipt
+                            .as_ref()
+                            .or(entry.codex_applied_tier_receipt.as_ref())
+                    })
+                    .is_some_and(|old| receipt.covered_by(old))
+            });
+            let join_covered = marker.as_ref().map_or(true, |marker| {
+                previous_entry.is_some_and(|old| {
+                    old.codex_captured_joined_member_set.as_ref() == Some(marker)
+                        || (old.codex_captured_joined_member_set.is_none()
+                            && old.codex_joined_member_set == entry.codex_joined_member_set)
+                })
+            });
+            if tiers_covered && join_covered {
+                continue;
+            }
+            let mut capture = previous_entry.cloned().unwrap_or_else(|| {
+                let mut uncommitted = entry.clone();
+                uncommitted.last_snapshot_fingerprint = None;
+                uncommitted.last_upload_body_witness = None;
+                uncommitted.effective_upload_body_witness_revision = 0;
+                uncommitted.codex_joined_member_set = None;
+                uncommitted.codex_applied_tier_receipt = None;
+                uncommitted.codex_applied_tier_receipt_required = false;
+                uncommitted.codex_captured_uncommitted = true;
+                uncommitted
+            });
+            capture.codex_protected_owner = Some(codex_protected_owner(owner));
+            capture.codex_captured_joined_member_set = marker;
+            if let Some(receipt) = receipt {
+                capture.codex_captured_tier_receipt = Some(receipt.clone());
+                capture.codex_captured_tier_receipt_required = true;
+            }
+            by_owner
+                .entry(owner.clone())
+                .or_default()
+                .push((key.clone(), capture));
+        }
+        let bytes = |files: &BTreeMap<String, ScanIndexEntry>| {
+            files
+                .values()
+                .flat_map(|entry| {
+                    [
+                        entry.codex_applied_tier_receipt.as_ref(),
+                        entry.codex_captured_tier_receipt.as_ref(),
+                    ]
+                })
+                .flatten()
+                .fold(0usize, |sum, receipt| {
+                    sum.saturating_add(receipt.retained_bytes())
+                })
+        };
+        let mut retained = bytes(&staged.files);
+        let mut marker_count = staged
+            .files
+            .values()
+            .filter(|entry| entry.codex_captured_joined_member_set.is_some())
+            .count();
+        for (owner, entries) in by_owner {
+            let next_marker_count = marker_count
+                .saturating_sub(
+                    entries
+                        .iter()
+                        .filter_map(|(key, _)| staged.files.get(key))
+                        .filter(|entry| entry.codex_captured_joined_member_set.is_some())
+                        .count(),
+                )
+                .saturating_add(
+                    entries
+                        .iter()
+                        .filter(|(_, entry)| entry.codex_captured_joined_member_set.is_some())
+                        .count(),
+                );
+            let old = entries
+                .iter()
+                .filter_map(|(key, _)| staged.files.get(key))
+                .flat_map(|entry| {
+                    [
+                        entry.codex_applied_tier_receipt.as_ref(),
+                        entry.codex_captured_tier_receipt.as_ref(),
+                    ]
+                })
+                .flatten()
+                .fold(0usize, |sum, receipt| {
+                    sum.saturating_add(receipt.retained_bytes())
+                });
+            let new = entries
+                .iter()
+                .flat_map(|(_, entry)| {
+                    [
+                        entry.codex_applied_tier_receipt.as_ref(),
+                        entry.codex_captured_tier_receipt.as_ref(),
+                    ]
+                })
+                .flatten()
+                .fold(0usize, |sum, receipt| {
+                    sum.saturating_add(receipt.retained_bytes())
+                });
+            let next = retained.saturating_sub(old).saturating_add(new);
+            if next > codex_file_join::MAX_RECEIPT_BYTES
+                || next_marker_count > codex_file_join::MAX_HEADER_FILES
+            {
+                held.insert(owner);
+                continue;
+            }
+            retained = next;
+            marker_count = next_marker_count;
+            changed.insert(owner);
+            for (key, entry) in entries {
+                staged.files.insert(key, entry);
+            }
+        }
+        (staged, changed, held)
+    }
+    pub(crate) fn reconcile_codex_recovery_settlement(
+        &mut self,
+        previous: &ScanIndex,
+        accepted: &BTreeSet<String>,
+    ) {
+        for (key, entry) in &mut self.files {
+            let settled = self
+                .file_snapshot_fingerprints
+                .get(key)
+                .is_some_and(|fingerprints| {
+                    !fingerprints.is_empty()
+                        && fingerprints
+                            .iter()
+                            .all(|fingerprint| accepted.contains(fingerprint))
+                });
+            let old = previous.files.get(key);
+            let pending_tiers = old.is_some_and(|old| {
+                old.codex_captured_tier_receipt_required
+                    || old.codex_captured_tier_receipt.is_some()
+                    || (old.codex_captured_uncommitted
+                        && old.codex_captured_joined_member_set.is_none())
+            });
+            let pending_join = old.and_then(|old| old.codex_captured_joined_member_set.as_ref());
+            let pending_capture = pending_tiers || pending_join.is_some();
+            let capture_covered = (!pending_tiers
+                || old
+                    .and_then(|old| old.codex_captured_tier_receipt.as_ref())
+                    .is_some_and(|captured| {
+                        entry
+                            .codex_applied_tier_receipt
+                            .as_ref()
+                            .is_some_and(|applied| captured.covered_by(applied))
+                    }))
+                && pending_join.map_or(true, |captured| {
+                    entry
+                        .codex_joined_member_set
+                        .as_ref()
+                        .is_some_and(|applied| {
+                            codex_file_join::valid_captured_join(captured)
+                                && *captured == codex_file_join::captured_join(applied)
+                        })
+                });
+            if settled && capture_covered {
+                entry.codex_captured_joined_member_set = None;
+                entry.codex_captured_tier_receipt = None;
+                entry.codex_captured_tier_receipt_required = false;
+                entry.codex_captured_uncommitted = false;
+            } else if pending_capture {
+                // Acceptance of an older body cannot settle newly captured facts.
+                // A rollback/quarantine must never replace them with an older,
+                // smaller applied receipt, or repair missing facts by guessing.
+                entry.codex_captured_tier_receipt = old
+                    .and_then(|old| old.codex_captured_tier_receipt.as_ref())
+                    .map(|captured| {
+                        entry
+                            .codex_applied_tier_receipt
+                            .as_ref()
+                            .filter(|applied| captured.covered_by(applied))
+                            .unwrap_or(captured)
+                            .clone()
+                    });
+                entry.codex_captured_joined_member_set = pending_join.cloned();
+                entry.codex_captured_tier_receipt_required = pending_tiers;
+                entry.codex_captured_uncommitted =
+                    old.is_some_and(|old| old.codex_captured_uncommitted);
+                entry.codex_applied_tier_receipt =
+                    old.and_then(|old| old.codex_applied_tier_receipt.clone());
+                entry.codex_applied_tier_receipt_required =
+                    old.is_some_and(|old| old.codex_applied_tier_receipt_required);
+            }
+        }
+    }
+
     pub fn committable_subset(
         &self,
         previous: &ScanIndex,
@@ -19889,6 +21076,7 @@ impl ScanIndex {
             }
         }
         result.retain_quarantined_fingerprints(&retained_quarantine);
+        result.reconcile_codex_recovery_settlement(previous, accepted);
         result
     }
 
@@ -20049,6 +21237,35 @@ impl ScanIndex {
         if transcript_changed {
             return CandidateDecision::Parse;
         }
+        if entry.codex_captured_uncommitted
+            || entry.codex_captured_tier_receipt_required
+            || entry.codex_captured_joined_member_set.is_some()
+        {
+            // The independent native quarantine owns its existing retry gate;
+            // selector capture never constitutes acceptance or creates a skip.
+            let quarantine_holds = entry.source_file_fingerprint
+                == candidate.source_file_fingerprint
+                && self
+                    .file_snapshot_fingerprints
+                    .get(&key)
+                    .is_some_and(|fingerprints| {
+                        !fingerprints.is_empty()
+                            && fingerprints.iter().all(|fingerprint| {
+                                self.quarantined_snapshot_fingerprints
+                                    .get(fingerprint)
+                                    .is_some_and(|record| {
+                                        self.active_quarantine_witness.as_ref()
+                                            == Some(&record.witness)
+                                            && !self.quarantine_requires_retry(fingerprint)
+                                    })
+                            })
+                    });
+            return if quarantine_holds {
+                CandidateDecision::Skip
+            } else {
+                CandidateDecision::Parse
+            };
+        }
         if entry.last_snapshot_fingerprint.is_none() && !self.confirmed_empty_files.contains(&key) {
             return CandidateDecision::Parse;
         }
@@ -20154,6 +21371,14 @@ impl ScanIndex {
                 last_upload_body_witness,
                 effective_upload_body_witness_revision,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                codex_joined_member_set: None,
+                codex_captured_joined_member_set: None,
+                codex_protected_owner: None,
+                codex_applied_tier_receipt: None,
+                codex_applied_tier_receipt_required: false,
+                codex_captured_tier_receipt: None,
+                codex_captured_tier_receipt_required: false,
+                codex_captured_uncommitted: false,
             },
         );
     }
@@ -20184,6 +21409,14 @@ impl ScanIndex {
                 last_upload_body_witness,
                 effective_upload_body_witness_revision,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                codex_joined_member_set: None,
+                codex_captured_joined_member_set: None,
+                codex_protected_owner: None,
+                codex_applied_tier_receipt: None,
+                codex_applied_tier_receipt_required: false,
+                codex_captured_tier_receipt: None,
+                codex_captured_tier_receipt_required: false,
+                codex_captured_uncommitted: false,
             },
         );
         match parse_outcome {
@@ -21378,6 +22611,7 @@ mod tests {
             pending_candidates: VecDeque::new(),
             observed_index_keys: BTreeSet::new(),
             codex_rollout_paths: BTreeSet::new(),
+            codex_join_directory_census: None,
             reconciliation_upper_bound: None,
             reconciliation_after: None,
             reconciliation_started: false,
@@ -22445,6 +23679,14 @@ mod tests {
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                    codex_joined_member_set: None,
+                    codex_captured_joined_member_set: None,
+                    codex_protected_owner: None,
+                    codex_applied_tier_receipt: None,
+                    codex_applied_tier_receipt_required: false,
+                    codex_captured_tier_receipt: None,
+                    codex_captured_tier_receipt_required: false,
+                    codex_captured_uncommitted: false,
                 },
             )]),
             ..ScanIndex::default()
@@ -23700,6 +24942,14 @@ mod tests {
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                    codex_joined_member_set: None,
+                    codex_captured_joined_member_set: None,
+                    codex_protected_owner: None,
+                    codex_applied_tier_receipt: None,
+                    codex_applied_tier_receipt_required: false,
+                    codex_captured_tier_receipt: None,
+                    codex_captured_tier_receipt_required: false,
+                    codex_captured_uncommitted: false,
                 },
             )]),
             file_snapshot_fingerprints: BTreeMap::from([(
@@ -24133,6 +25383,14 @@ mod tests {
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: None,
+                    codex_joined_member_set: None,
+                    codex_captured_joined_member_set: None,
+                    codex_protected_owner: None,
+                    codex_applied_tier_receipt: None,
+                    codex_applied_tier_receipt_required: false,
+                    codex_captured_tier_receipt: None,
+                    codex_captured_tier_receipt_required: false,
+                    codex_captured_uncommitted: false,
                 },
             )]),
             ..ScanIndex::default()
@@ -24218,6 +25476,14 @@ mod tests {
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: None,
+                    codex_joined_member_set: None,
+                    codex_captured_joined_member_set: None,
+                    codex_protected_owner: None,
+                    codex_applied_tier_receipt: None,
+                    codex_applied_tier_receipt_required: false,
+                    codex_captured_tier_receipt: None,
+                    codex_captured_tier_receipt_required: false,
+                    codex_captured_uncommitted: false,
                 },
             )]),
             ..ScanIndex::default()
@@ -24270,6 +25536,14 @@ mod tests {
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                    codex_joined_member_set: None,
+                    codex_captured_joined_member_set: None,
+                    codex_protected_owner: None,
+                    codex_applied_tier_receipt: None,
+                    codex_applied_tier_receipt_required: false,
+                    codex_captured_tier_receipt: None,
+                    codex_captured_tier_receipt_required: false,
+                    codex_captured_uncommitted: false,
                 },
             )]),
             ..ScanIndex::default()
@@ -24309,6 +25583,14 @@ mod tests {
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: None,
+                    codex_joined_member_set: None,
+                    codex_captured_joined_member_set: None,
+                    codex_protected_owner: None,
+                    codex_applied_tier_receipt: None,
+                    codex_applied_tier_receipt_required: false,
+                    codex_captured_tier_receipt: None,
+                    codex_captured_tier_receipt_required: false,
+                    codex_captured_uncommitted: false,
                 },
             )]),
             ..ScanIndex::default()
@@ -24345,6 +25627,14 @@ mod tests {
                     last_upload_body_witness: None,
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: None,
+                    codex_joined_member_set: None,
+                    codex_captured_joined_member_set: None,
+                    codex_protected_owner: None,
+                    codex_applied_tier_receipt: None,
+                    codex_applied_tier_receipt_required: false,
+                    codex_captured_tier_receipt: None,
+                    codex_captured_tier_receipt_required: false,
+                    codex_captured_uncommitted: false,
                 },
             )]),
             ..ScanIndex::default()
@@ -24493,7 +25783,7 @@ mod tests {
                 concat!(
                     "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-4444-7000-9000-dddddddddddd\"}}\n",
                     "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.5\"}}}\n"
-                ),
+                ).replace("019e253c-4444-7000-9000-dddddddddddd", &format!("019e253c-4444-7000-9000-{index:012}")),
             )
             .expect("write fixture");
         }
@@ -24598,6 +25888,7 @@ mod tests {
             pending_candidates: VecDeque::new(),
             observed_index_keys: BTreeSet::new(),
             codex_rollout_paths: BTreeSet::new(),
+            codex_join_directory_census: None,
             reconciliation_upper_bound: None,
             reconciliation_after: None,
             reconciliation_started: false,
@@ -25129,6 +26420,7 @@ mod tests {
                 pending_candidates: VecDeque::new(),
                 observed_index_keys: ["b".to_string(), "d".to_string()].into_iter().collect(),
                 codex_rollout_paths: BTreeSet::new(),
+                codex_join_directory_census: None,
                 reconciliation_upper_bound: Some("d".to_string()),
                 reconciliation_after: None,
                 reconciliation_started: false,
@@ -26094,7 +27386,10 @@ mod tests {
         )
         .expect("first unhealthy generation");
         assert_eq!(first.symlink_rejected_count, 1);
-        assert_eq!(first.ownership_incomplete_file_count, 1);
+        // The rejected directory prevents proving that either physical file is
+        // the whole logical session, so both remain held before a replacement.
+        assert_eq!(first.ownership_incomplete_file_count, 2);
+        assert!(first.snapshots.is_empty());
         assert!(!first.census_complete);
         assert!(first.scan_cap_hit);
         assert!(index.scan_residue_witness.is_none());
@@ -26248,6 +27543,7 @@ mod tests {
                 pending_candidates: VecDeque::new(),
                 observed_index_keys: BTreeSet::new(),
                 codex_rollout_paths: BTreeSet::new(),
+                codex_join_directory_census: None,
                 reconciliation_upper_bound: None,
                 reconciliation_after: None,
                 reconciliation_started: false,
@@ -29915,6 +31211,14 @@ mod tests {
             last_upload_body_witness: None,
             effective_upload_body_witness_revision: 0,
             scan_identity_version: None,
+            codex_joined_member_set: None,
+            codex_captured_joined_member_set: None,
+            codex_protected_owner: None,
+            codex_applied_tier_receipt: None,
+            codex_applied_tier_receipt_required: false,
+            codex_captured_tier_receipt: None,
+            codex_captured_tier_receipt_required: false,
+            codex_captured_uncommitted: false,
         };
 
         let mut index = ScanIndex {
@@ -46463,6 +47767,14 @@ mod tests {
                 last_upload_body_witness: None,
                 effective_upload_body_witness_revision: 0,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                codex_joined_member_set: None,
+                codex_captured_joined_member_set: None,
+                codex_protected_owner: None,
+                codex_applied_tier_receipt: None,
+                codex_applied_tier_receipt_required: false,
+                codex_captured_tier_receipt: None,
+                codex_captured_tier_receipt_required: false,
+                codex_captured_uncommitted: false,
             },
         );
         let frozen_census_paths = BTreeSet::from([local_index_key(&parent_path)]);
@@ -47392,6 +48704,68 @@ mod tests {
     }
 
     #[test]
+    fn codex_explicit_creator_negative_does_not_inherit_home_or_cached_owner() {
+        let home = PathBuf::from("/synthetic/codex-negative");
+        let binding = crate::agent_status::CodexHomeBinding {
+            home: home.clone(),
+            account_identifier_hash: "current-owner".into(),
+            workspace_identifier_hash: "current-workspace".into(),
+            auth_modified_at: UNIX_EPOCH,
+        };
+        for disposition in ["missing", "conflict"] {
+            for cached in [false, true] {
+                let mut index = ScanIndex::default();
+                let mut item = valid_v6_batch_request().snapshots.remove(0);
+                item.model_usage[0].auth_mode = Some("oauth".into());
+                item.usage_buckets[0].model_usage[0].auth_mode = Some("oauth".into());
+                item.source_session_id = "negative-session".into();
+                item.source_started_at = Some("2026-10-05T00:00:00Z".into());
+                item.source_file_fingerprint = Some("negative-file".into());
+                let mut entry = manifest_index_entry(None);
+                entry.source_file_fingerprint = "negative-file".into();
+                index
+                    .files
+                    .insert(local_index_key(&home.join("sessions/rollout.jsonl")), entry);
+                let key = sha256_hex(&["session_owner:v1", "machine", &item.source_session_id]);
+                if cached {
+                    index.session_account_bindings.insert(
+                        key.clone(),
+                        SessionAccountBinding {
+                            account_identifier_hash: "cached-owner".into(),
+                            workspace_identifier_hash: None,
+                        },
+                    );
+                }
+                item.session_account_evidence = Some(SessionAccountEvidence {
+                    provider: "openai",
+                    account_identifier_hash: None,
+                    provider_workspace_hash: None,
+                    identity_hash_scheme: "provider-sha256:v1",
+                    evidence_source: "codex_creator_header:v1",
+                    identity_disposition: Some(disposition),
+                    source_created_at: None,
+                });
+                set_session_account_hash(&mut item, Some("stale-row-owner"));
+                index.bind_session_accounts(
+                    SnapshotSource::Codex,
+                    "machine",
+                    std::slice::from_mut(&mut item),
+                    std::slice::from_ref(&binding),
+                );
+                assert!(exact_session_account_hash(&item).is_none());
+                assert_eq!(
+                    item.session_account_evidence
+                        .as_ref()
+                        .unwrap()
+                        .identity_disposition,
+                    Some(disposition)
+                );
+                assert_eq!(index.session_account_bindings.contains_key(&key), cached);
+            }
+        }
+    }
+
+    #[test]
     fn session_owner_binding_survives_login_switch_and_missing_evidence() {
         use crate::agent_status::CodexHomeBinding;
 
@@ -47424,6 +48798,14 @@ mod tests {
                 last_upload_body_witness: None,
                 effective_upload_body_witness_revision: 0,
                 scan_identity_version: None,
+                codex_joined_member_set: None,
+                codex_captured_joined_member_set: None,
+                codex_protected_owner: None,
+                codex_applied_tier_receipt: None,
+                codex_applied_tier_receipt_required: false,
+                codex_captured_tier_receipt: None,
+                codex_captured_tier_receipt_required: false,
+                codex_captured_uncommitted: false,
             },
         );
         let a = binding(&home_a, "account-a");
@@ -48899,6 +50281,14 @@ mod tests {
             last_upload_body_witness: None,
             effective_upload_body_witness_revision: 0,
             scan_identity_version: Some("semantic_sync:v1".to_string()),
+            codex_joined_member_set: None,
+            codex_captured_joined_member_set: None,
+            codex_protected_owner: None,
+            codex_applied_tier_receipt: None,
+            codex_applied_tier_receipt_required: false,
+            codex_captured_tier_receipt: None,
+            codex_captured_tier_receipt_required: false,
+            codex_captured_uncommitted: false,
         }
     }
 
@@ -49306,6 +50696,14 @@ mod tests {
                 last_upload_body_witness: None,
                 effective_upload_body_witness_revision: 0,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                codex_joined_member_set: None,
+                codex_captured_joined_member_set: None,
+                codex_protected_owner: None,
+                codex_applied_tier_receipt: None,
+                codex_applied_tier_receipt_required: false,
+                codex_captured_tier_receipt: None,
+                codex_captured_tier_receipt_required: false,
+                codex_captured_uncommitted: false,
             },
         );
         let manifest = index
@@ -49693,6 +51091,7 @@ mod tests {
             pending_candidates: VecDeque::new(),
             observed_index_keys: BTreeSet::new(),
             codex_rollout_paths: BTreeSet::new(),
+            codex_join_directory_census: None,
             reconciliation_upper_bound: None,
             reconciliation_after: None,
             reconciliation_started: false,
@@ -50282,17 +51681,17 @@ crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns);
-crate::heap_layout_bound::fields!(OwnedActiveFile; candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser);
+crate::heap_layout_bound::fields!(OwnedActiveFile; candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
-crate::heap_layout_bound::fields!(OwnedSourceScan; source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(OwnedSourceScan; source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys);
 crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
-crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version);
+crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
-crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
+crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, blocked_session_ids);
@@ -50300,7 +51699,7 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
