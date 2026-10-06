@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 464,
-  "content_sha256": "32a87448c55dafcfb6b76a8f2446d7372adbf69ca4c7501a55e15e75b42af4d3",
+  "candidate_file_count": 465,
+  "content_sha256": "58cd86bd33fffb0fdba3b0560445050b58331ef9f2da549c7ea5468a27067a26",
   "files": [
     {
       "executable": false,
@@ -629,8 +629,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/active_sessions.rs",
-      "sha256": "2e034f088b06ed05e3da27d3da5916cba09694ac61c9432d3aec13ca7dd4b282",
-      "size_bytes": 56521
+      "sha256": "7393d6a7b8eb270a47340296519e0a47ea45db4eca8f16362468e5e2355f4986",
+      "size_bytes": 70491
     },
     {
       "executable": false,
@@ -678,8 +678,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "97490207877f20bdb64ac8f063b001c3852443696628598ecf3b74ff829a2570",
-      "size_bytes": 1318923
+      "sha256": "df148a0e6e35371a92421d67c9017d6bccc712e3d1f9d077d4a82d02eadbaaa5",
+      "size_bytes": 1319383
     },
     {
       "executable": false,
@@ -729,6 +729,13 @@
       "path": "crates/ottto-service/src/claude_refresher.rs",
       "sha256": "b6ea245b6fdc15210f8a77d886a425043a960dffc3d8b566f3af2c37bd947885",
       "size_bytes": 56037
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/claude_session_registrations.rs",
+      "sha256": "cf5594ab5a02ad4e6c83e547a89e07b9c6ad66c096c20a96b9892f26f3a976d2",
+      "size_bytes": 14059
     },
     {
       "executable": false,
@@ -832,8 +839,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/external_scheduler_attribution.rs",
-      "sha256": "d1f7991ccf681caf638cb863ca784f497d24499af8b6bfc75dbb25875c3cd6df",
-      "size_bytes": 44611
+      "sha256": "2f7666f1a7cf13998a6b47339ae6933e6122fc93a41da5e33d8736c764d9269d",
+      "size_bytes": 44922
     },
     {
       "executable": false,
@@ -881,8 +888,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "c25885e8348a9689b50df8f9ce8acf4b5e05c0fec164dc4aed6a3a0da376515e",
-      "size_bytes": 343191
+      "sha256": "7f1c65200a6615ee5bc60534a95237bc565f516ad83b8030d350fb7f145209d9",
+      "size_bytes": 343225
     },
     {
       "executable": false,
@@ -1042,8 +1049,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "d90b71c477040487de206b4060f50f6855a12d8f58c547b53cf689f68be278b8",
-      "size_bytes": 2189056
+      "sha256": "d41c7c57e1526768a50fd3bb0b7eed685e033b5d98a82ee0e53297aeaa0c6cab",
+      "size_bytes": 2189193
     },
     {
       "executable": false,
@@ -2147,6 +2154,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-06-claude-registration-display.md",
+      "sha256": "3f522e6819c44fc5b1a8c684c328de563d40fb231e84f5abe06f830a822f3fa0",
+      "size_bytes": 3437
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-06-codex-recovery-diagnostics.md",
       "sha256": "d566e943046fa278f36843ca4d431a5ba28263cac835693ef5250fabf0e0dba3",
       "size_bytes": 4217
@@ -3244,9 +3258,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-06T16:59:54+00:00",
+  "generated_at": "2026-10-06T20:00:59+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 464,
+  "output_file_count": 466,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3283,5 +3297,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d04d7882321e1dfc11fd03179c9ba99025d84358"
+  "source_commit": "9eea3a587fc5f3002bca8cebcb9683394d30b7db"
 }
