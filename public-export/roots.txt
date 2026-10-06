@@ -3,6 +3,8 @@
 .github/dependabot.yml
 .github/workflows/ci.yml
 .github/workflows/macos-stable-release.yml
+AGENTS.md
+CLAUDE.md
 CODE_OF_CONDUCT.md
 CONTRIBUTING.md
 Cargo.lock
