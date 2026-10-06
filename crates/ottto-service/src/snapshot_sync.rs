@@ -1961,8 +1961,9 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                 );
             }
             let mut account_switch = ClaudeAccountSwitchProbe::default();
+            let mut retry = live_snapshot_retry::LiveRetryOwner::production();
             loop {
-                match sync_once(&home, &support_dir, &daemon) {
+                match sync_once_with_retry(&home, &support_dir, &daemon, &mut retry) {
                     Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
                     Err(error) => {
                         eprintln!("local snapshot sync skipped: {}", safe_error(&error));
@@ -1976,6 +1977,20 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                     SNAPSHOT_SYNC_INTERVAL,
                     watcher.as_ref(),
                     &mut account_switch,
+                    |ordinary| {
+                        if !retry.enabled() {
+                            return ordinary;
+                        }
+                        // The native cycle lock also excludes the UI one-shot
+                        // path during a delivery-only turn. This wake never
+                        // starts a provider scan or resets ordinary cadence.
+                        let _guard = SNAPSHOT_SYNC_LOCK
+                            .get_or_init(|| Mutex::new(()))
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        retry.boundary(std::iter::empty(), &home, &support_dir, &daemon);
+                        retry.wake_before(ordinary)
+                    },
                 );
             }
         })
@@ -2017,6 +2032,23 @@ fn collect_file_activity_for(
     wait: Duration,
     watcher: Option<&crate::snapshot_watcher::SnapshotWatcher>,
     account_switch: &mut ClaudeAccountSwitchProbe,
+    retry_boundary: impl FnMut(Instant) -> Instant,
+) {
+    collect_file_activity_with_retry(
+        wait,
+        watcher,
+        account_switch,
+        retry_boundary,
+        crate::agent_status::claude_default_account_fingerprint,
+    );
+}
+
+fn collect_file_activity_with_retry(
+    wait: Duration,
+    watcher: Option<&crate::snapshot_watcher::SnapshotWatcher>,
+    account_switch: &mut ClaudeAccountSwitchProbe,
+    mut retry_boundary: impl FnMut(Instant) -> Instant,
+    mut read_account: impl FnMut() -> Option<String>,
 ) {
     let deadline = Instant::now() + wait;
     let mut watcher = watcher;
@@ -2025,7 +2057,12 @@ fn collect_file_activity_for(
         if now >= deadline {
             return;
         }
-        let slice = (deadline - now).min(CADENCE_WAIT_SLICE);
+        let wake = retry_boundary(deadline).min(deadline);
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let slice = wake.saturating_duration_since(now).min(CADENCE_WAIT_SLICE);
         match watcher.map(|watcher| watcher.events.recv_timeout(slice)) {
             None => std::thread::sleep(slice),
             Some(Ok(event)) => {
@@ -2040,10 +2077,7 @@ fn collect_file_activity_for(
                 watcher = None;
             }
         }
-        if account_switch.observe(
-            Instant::now(),
-            crate::agent_status::claude_default_account_fingerprint,
-        ) {
+        if account_switch.observe(Instant::now(), &mut read_account) {
             eprintln!("local snapshot sync: Claude account switch detected; refreshing now");
             with_source_cadence(SnapshotSource::ClaudeCode, |cadence| {
                 cadence.record_file_event(Instant::now())
@@ -2313,6 +2347,21 @@ fn set_one_shot_sync_in_flight(value: bool) {
 }
 
 fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()> {
+    // Manual one-shot collection never owns the long-lived background queue.
+    sync_once_with_retry(
+        home,
+        support_dir,
+        daemon,
+        &mut live_snapshot_retry::LiveRetryOwner::closed(),
+    )
+}
+
+fn sync_once_with_retry(
+    home: &Path,
+    support_dir: &Path,
+    daemon: &LocalDaemon,
+    retry: &mut live_snapshot_retry::LiveRetryOwner,
+) -> Result<()> {
     // The periodic loop and setup/UI one-shot path can otherwise scan and save
     // the same per-source index concurrently. Serialize the full cycle so a
     // one-shot rescan cannot race the background loop or publish an older
@@ -2400,6 +2449,7 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
         failed_sources: &mut failed_sources,
         started: Instant::now(),
         account_witness,
+        retry,
     };
     crate::source_rotation::run(
         &mut owner,
@@ -2506,8 +2556,11 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
 #[allow(dead_code)] // Compiled preparation is exercised by native integration before activation.
 #[path = "bounded_snapshot_retry.rs"]
 mod bounded_snapshot_retry;
+#[path = "live_snapshot_retry.rs"]
+mod live_snapshot_retry;
 
 struct SnapshotCycleOwner<'a> {
+    retry: &'a mut live_snapshot_retry::LiveRetryOwner,
     account_witness: [u8; 32],
     client: &'a SnapshotApiClient,
     device: &'a LocalDeviceBinding,
@@ -2543,6 +2596,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             self.daemon,
             self.transport_cycle,
             self.account_witness,
+            self.retry.enabled(),
         )
     }
     fn validate(&mut self, frame: &SourcePreparation) -> Result<()> {
@@ -2588,6 +2642,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             self.support_dir,
             self.daemon,
             self.transport_cycle,
+            self.retry,
         )
     }
     fn outcome(&mut self, source: SnapshotSource, result: Result<()>) {
@@ -2606,6 +2661,10 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     }
     fn monotonic(&self) -> Duration {
         self.started.elapsed()
+    }
+    fn boundary(&mut self, busy: impl Iterator<Item = SnapshotSource>) {
+        self.retry
+            .boundary(busy, self.home, self.support_dir, self.daemon);
     }
 }
 
@@ -2843,6 +2902,7 @@ fn persist_machine_icon(response: &AgentStatusSnapshotUploadResponse) {
 // Preparation stays owned by the existing cycle. No token/report lease or
 // partially finalized body crosses a collection step.
 struct SourcePreparation {
+    retry_authority: Option<live_snapshot_retry::LiveAuthority>,
     source: SnapshotSource,
     account_witness: [u8; 32],
     scan_started_at: String,
@@ -2905,6 +2965,7 @@ fn prepare_sync_source(
     daemon: &LocalDaemon,
     transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
     account_witness: [u8; 32],
+    retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
     if let Some(remaining) = source_upload_backoff_remaining(source) {
         // The server asked for room and we said yes. Re-running the cycle now
@@ -3256,6 +3317,22 @@ fn prepare_sync_source(
     }
     // The initial hint/status relay token dies here; sends acquire fresh tokens.
     drop(relay_token);
+    let retry_authority = if retry_enabled
+        && !index.legacy_settlement_ledger_needs_migration()
+        && legacy_reconciliation_pending.is_empty()
+        && active_legacy_reconciliation.is_empty()
+    {
+        live_snapshot_retry::LiveAuthority::capture(
+            source,
+            home,
+            support_dir,
+            &activity_hint,
+            &upload_destination_namespace,
+            &backfill_state,
+        )
+    } else {
+        None
+    };
     let scan = crate::snapshots::OwnedSourceScan::new(
         source,
         &roots,
@@ -3274,6 +3351,7 @@ fn prepare_sync_source(
         context_curve_enabled,
     );
     Ok(Some(SourcePreparation {
+        retry_authority,
         source,
         account_witness,
         scan_started_at,
@@ -3312,8 +3390,10 @@ fn finish_sync_source(
     support_dir: &Path,
     daemon: &LocalDaemon,
     _transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
+    retry: &mut live_snapshot_retry::LiveRetryOwner,
 ) -> Result<()> {
     let SourcePreparation {
+        retry_authority,
         source,
         account_witness,
         scan_started_at,
@@ -3773,8 +3853,10 @@ fn finish_sync_source(
             );
         }
         Ok(ResumableUploadResult::Shed { retry_after }) => {
+            let first_shed = Instant::now();
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
+            let mut checkpoint_succeeded = true;
             let committable = match checkpoint_partial_snapshot_index(
                 &index,
                 &committed_index,
@@ -3787,6 +3869,7 @@ fn finish_sync_source(
             ) {
                 Ok(committable) => committable,
                 Err(error) => {
+                    checkpoint_succeeded = false;
                     eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",
                         source.api_slug(),
@@ -3795,6 +3878,31 @@ fn finish_sync_source(
                     committed_index.clone()
                 }
             };
+            if retry.enabled()
+                && checkpoint_succeeded
+                && locally_held_fingerprints.is_empty()
+                && legacy_reconciliation_pending.is_empty()
+                && active_legacy_reconciliation.is_empty()
+            {
+                if let Some(live) = retry_authority {
+                    retry.capture_after_shed(
+                        live,
+                        _home,
+                        source,
+                        machine_id,
+                        upload_policy,
+                        account_witness,
+                        &scan_result.snapshots,
+                        &mut index,
+                        &committable,
+                        &upload_progress,
+                        &index_path,
+                        &upload_progress_path,
+                        first_shed,
+                        retry_after,
+                    );
+                }
+            }
             report_status_with_fresh_relay_token(
                 client,
                 device,
@@ -15442,6 +15550,7 @@ mod tests {
     include!("retry_integrated_driver.rs");
     include!("retry_owned_rotation.rs");
     include!("retry_bounded_native_tests.rs");
+    include!("retry_live_native_tests.rs");
     fn same_source_fixture_ack(
         items: Vec<SnapshotItem>,
     ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
@@ -15926,7 +16035,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; source, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; retry_authority, source, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, active_quarantine_witness, active_quarantine_retries);
 

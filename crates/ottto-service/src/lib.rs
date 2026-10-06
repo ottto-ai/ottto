@@ -532,6 +532,11 @@ impl LocalDaemon {
         self.status_for_authorized_client()
     }
 
+    /// Allocation-free stop fence for an optional delivery-only turn.
+    pub(crate) fn snapshot_retry_running(&self) -> Result<bool, LocalApiError> {
+        Ok(self.state()?.running)
+    }
+
     /// Allocation-free account identity fence for suspended snapshot scans.
     pub(crate) fn snapshot_scan_account_witness(&self) -> Result<[u8; 32], LocalApiError> {
         use sha2::{Digest, Sha256};

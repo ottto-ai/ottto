@@ -26,7 +26,10 @@ use toml_edit::{DocumentMut, Item};
 
 pub(crate) mod cache_observations;
 mod context_curve;
+#[path = "pi_retry_inputs.rs"]
+mod pi_retry_inputs;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
+pub(crate) use pi_retry_inputs::PiRetryInputs;
 
 pub(crate) use context_curve::CONTEXT_CURVE_CONTRACT_VERSION;
 use context_curve::{

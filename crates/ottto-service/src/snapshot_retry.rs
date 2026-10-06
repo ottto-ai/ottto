@@ -8,6 +8,65 @@ pub(crate) const NETWORK_TURN: Duration = Duration::from_secs(60);
 pub(crate) const ADDITIONAL_BATCH_POSTS: usize = 3;
 pub(crate) const RESPONSE_BYTES: usize = 128 * 1024;
 pub(crate) const TOKEN_RESPONSE_BYTES: usize = 16 * 1024;
+pub(crate) const REQUEST_BYTES: usize = 256 * 1024;
+
+struct CountJson {
+    bytes: usize,
+    cap: usize,
+}
+impl std::io::Write for CountJson {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len())
+            .filter(|n| *n <= self.cap)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "optional snapshot JSON cap",
+                )
+            })?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+pub(crate) fn json_fits<T: serde::Serialize + ?Sized>(value: &T, cap: usize) -> bool {
+    serde_json::to_writer(CountJson { bytes: 0, cap }, value).is_ok()
+}
+pub(crate) fn encode_json<T: serde::Serialize>(value: &T, cap: usize) -> Result<Vec<u8>> {
+    struct CappedVec {
+        bytes: Vec<u8>,
+        cap: usize,
+    }
+    impl std::io::Write for CappedVec {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self
+                .bytes
+                .len()
+                .checked_add(bytes.len())
+                .map_or(true, |n| n > self.cap)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "optional snapshot request cap",
+                ));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = CappedVec {
+        bytes: Vec::with_capacity(4096.min(cap)),
+        cap,
+    };
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.bytes)
+}
 
 /// One allowance survives every wake, fallback and authentication replay.
 /// Starting another turn never replenishes its physical batch POST counter.
