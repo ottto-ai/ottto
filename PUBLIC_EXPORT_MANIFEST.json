@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 467,
-  "content_sha256": "3935bf2b0b7c21acf4f44f1c406a580c8f82347d68bd4d2708e37fb8301a25f6",
+  "content_sha256": "e12bef055a307a482a5a3e8e22a864f7f94cdcb9b5f424e305248c6305f3701e",
   "files": [
     {
       "executable": false,
@@ -559,8 +559,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/lifecycle.rs",
-      "sha256": "b683e0f08e94a6e5ba054f5b782799223307de6830eca35f18300c9006827696",
-      "size_bytes": 29524
+      "sha256": "12b0e511fe0888c8889a5b496f224af074a542b532a9467e7d14d19cca873dbc",
+      "size_bytes": 28724
     },
     {
       "executable": false,
@@ -594,8 +594,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/token_store.rs",
-      "sha256": "5b5f7a8ba268cfaeb16e23e75f0556f4b9fc10fcadcb4ef2b792c379279e30fc",
-      "size_bytes": 32591
+      "sha256": "16257f50a04fbd778760bcdecf782edad79e8f89f5f32f02913256f0970f504c",
+      "size_bytes": 36048
     },
     {
       "executable": false,
@@ -741,8 +741,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_spawn_gate.rs",
-      "sha256": "bc47a6bd3e31859181e9450d6c568a9e312a17630efa20680ffff71adf0872dd",
-      "size_bytes": 53360
+      "sha256": "f6bfcb45c8a7044c0be4f94609429d4df06fcd69c1903586632853ff60df41cc",
+      "size_bytes": 22226
     },
     {
       "executable": false,
@@ -804,8 +804,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_footprint.rs",
-      "sha256": "b456b4e56d5d7863c9eee57fbf47b6b729a6adebb18aab0cb3042a32bc9b9b4b",
-      "size_bytes": 85013
+      "sha256": "b17177521a44f3704ad643ec5ed34390df1db5b2c101db13864b3dd5f0d418f6",
+      "size_bytes": 75057
     },
     {
       "executable": false,
@@ -860,8 +860,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/keychain.rs",
-      "sha256": "194dfc4701e8ab0d1fc6bf9c95d491621495320d5adea86d1281cfa0c0b8b5dc",
-      "size_bytes": 30582
+      "sha256": "581350863e8ed282fab516e601459e164e47f9ca812d884b6338e08740684f46",
+      "size_bytes": 29800
     },
     {
       "executable": false,
@@ -916,8 +916,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/mcp_inventory.rs",
-      "sha256": "af1516e36b4030d30b00cbb62b934d40f314f6bc4810a0e0e105509e4ebde0b2",
-      "size_bytes": 124749
+      "sha256": "1cbf3b973d35916f3d0f537bcbc5669739f0d47d8979df739b0fea5e6746abf8",
+      "size_bytes": 113321
     },
     {
       "executable": false,
@@ -3272,7 +3272,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-06T23:04:18+00:00",
+  "generated_at": "2026-10-06T22:40:10+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 468,
   "public_roots": [
@@ -3311,5 +3311,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "294639a4d675f1e180da06c3dfa083873568ea32"
+  "source_commit": "17da5611340c8629249836ec493e3d9bd7a2aa9e"
 }
