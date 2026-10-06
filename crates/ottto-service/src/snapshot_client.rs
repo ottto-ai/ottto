@@ -1442,6 +1442,10 @@ pub struct SnapshotApiClient {
 }
 
 impl SnapshotApiClient {
+    pub(crate) fn matches_api_base(&self, expected: &str) -> bool {
+        self.api_base_url == expected
+    }
+
     pub fn from_env() -> Self {
         Self::new(
             std::env::var("OTTTO_API_BASE_URL")
@@ -4107,4 +4111,31 @@ mod tests {
         )
         .expect_err("occurrence sum overflow is rejected");
     }
+}
+
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, snapshot_head_cas_required, census_residue_status_contract, recommended_scan_after);
+
+impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            api_base_url,
+            agent: _,
+            batch_agent: _,
+            receipt_state_dir,
+            receipt_destination_namespace,
+            receipt_context,
+        } = self;
+        // Both Agent handles clone the existing process-wide shared_agents pool;
+        // SourcePreparation creates no new pool. Inline handles are charged by
+        // their owning frame, and this bound covers its incremental owned heap.
+        api_base_url.heap_bound(c)?;
+        receipt_state_dir.heap_bound(c)?;
+        receipt_destination_namespace.heap_bound(c)?;
+        receipt_context.heap_bound(c)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn retention_gzip_probe(body: &[u8]) -> Option<Vec<u8>> {
+    gzip_snapshot_batch(body, true)
 }

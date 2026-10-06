@@ -38,6 +38,7 @@ pub mod snapshot_client;
 pub mod snapshot_sync;
 pub mod snapshot_watcher;
 pub mod snapshots;
+mod source_rotation;
 #[cfg(test)]
 mod test_scratch;
 #[cfg(unix)]
@@ -526,6 +527,33 @@ impl LocalDaemon {
 
     pub fn status_for_trusted_client(&self) -> Result<DaemonStatus, LocalApiError> {
         self.status_for_authorized_client()
+    }
+
+    /// Allocation-free account identity fence for suspended snapshot scans.
+    pub(crate) fn snapshot_scan_account_witness(&self) -> Result<[u8; 32], LocalApiError> {
+        use sha2::{Digest, Sha256};
+        let state = self.state()?;
+        let mut digest = Sha256::new();
+        digest.update(b"ottto:snapshot-scan-account:v1\0");
+        digest.update(match state.account.state {
+            ottto_protocol::LocalAccountState::NotConnected => b"not_connected".as_slice(),
+            ottto_protocol::LocalAccountState::ClaimPending => b"claim_pending".as_slice(),
+            ottto_protocol::LocalAccountState::ReattachRequired => b"reattach_required".as_slice(),
+            ottto_protocol::LocalAccountState::Connected => b"connected".as_slice(),
+            ottto_protocol::LocalAccountState::ResetRequired => b"reset_required".as_slice(),
+            ottto_protocol::LocalAccountState::Error => b"error".as_slice(),
+        });
+        for value in [
+            state.account.user.as_ref().map(|u| u.id.as_str()),
+            state.account.organization.as_ref().map(|o| o.id.as_str()),
+            state.account.connected_at.as_deref(),
+        ] {
+            digest.update([0]);
+            if let Some(value) = value {
+                digest.update(value.as_bytes());
+            }
+        }
+        Ok(digest.finalize().into())
     }
 
     pub fn account_for_trusted_client(&self) -> Result<LocalAccountBinding, LocalApiError> {
@@ -8658,3 +8686,10 @@ mod tests {
         }
     }
 }
+
+mod heap_layout_bound;
+
+#[cfg(test)]
+mod retry_allocation_probe;
+#[cfg(test)]
+mod retry_retention_bound;
