@@ -1297,3 +1297,5 @@ mod tests {
         );
     }
 }
+
+crate::heap_layout_bound::fields!(UploadReceiptContext; device_label, account_binding);

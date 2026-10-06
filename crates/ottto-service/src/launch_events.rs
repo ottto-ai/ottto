@@ -937,3 +937,7 @@ mod tests {
         );
     }
 }
+
+crate::heap_layout_bound::fields!(LaunchEventInventory; events);
+
+crate::heap_layout_bound::fields!(LaunchEvent; controller_session_ref, worker_session_ref, workflow_ref, agent_kind);

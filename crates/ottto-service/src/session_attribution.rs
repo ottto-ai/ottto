@@ -2457,3 +2457,13 @@ status = "ACTIVE"
         assert!(fits_wire_budget(&facts));
     }
 }
+
+// Closed owned-field inventory for optional scan overlap admission.
+crate::heap_layout_bound::fields!(SessionAttributionFact; field, value, display_label, display_label_source, evidence);
+crate::heap_layout_bound::fields!(SessionFieldEvidence; kind, strength, observed_at, source_version, evidence_ref);
+
+crate::heap_layout_bound::fields!(SessionAttributionContext; key, provider_schedules, external_schedulers, launch_events);
+
+crate::heap_layout_bound::fields!(ProviderScheduleInventory; definitions);
+
+crate::heap_layout_bound::fields!(ProviderScheduleDefinition; opaque_id, prompt_signature);

@@ -335,3 +335,19 @@ pub(crate) fn codex_slot(
             .and_then(serde_json::Value::as_u64),
     })
 }
+
+// Closed owned-field inventory for optional scan overlap admission.
+crate::heap_layout_bound::fields!(CacheObservations; schema_version, operations, coverage, omitted_observation_count);
+crate::heap_layout_bound::fields!(OwnedRequest; slot, ordering, compaction_before, configuration_changed, configuration_witness, idle_seconds);
+crate::heap_layout_bound::fields!(RequestSlot; request_ref, occurred_at, model, effort, prompt_tokens, cache_read_tokens, cache_creation_tokens, uncached_tokens, output_tokens);
+
+crate::heap_layout_bound::fields!(Observation; event_id, affected_request_ref, episode_anchor_request_ref, baseline_request_ref, occurred_at, observation_kind, status, previous, affected, immediate_next, ordering_confidence, explanation_code, supporting_conditions, idle_seconds, report_gap_seconds, detector_version);
+
+impl crate::heap_layout_bound::HeapLayoutBound for Operation {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Upsert { observation } => observation.heap_bound(c),
+            Self::Retract { event_id } => event_id.heap_bound(c),
+        }
+    }
+}
