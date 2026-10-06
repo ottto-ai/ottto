@@ -554,6 +554,34 @@ pub(crate) struct ClaudeCompactionObservation {
     response_count_before: u64,
 }
 
+// Both projections consume legacy summaries greedily in current-boundary input
+// order. Equal distances prefer the original legacy index; keep millisecond
+// truncation and the inclusive tolerance identical for both callers.
+fn matching_claude_legacy_compaction(
+    observations: &[ClaudeCompactionObservation],
+    current_millis: i128,
+    matched_legacy: &BTreeSet<usize>,
+) -> Option<usize> {
+    observations
+        .iter()
+        .enumerate()
+        .filter(|(index, observation)| {
+            observation.kind == ClaudeCompactionKind::LegacySummary
+                && !matched_legacy.contains(index)
+        })
+        .filter_map(|(index, observation)| {
+            let legacy_timestamp = observation
+                .timestamp
+                .as_deref()
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())?;
+            let delta =
+                (legacy_timestamp.unix_timestamp_nanos() / 1_000_000 - current_millis).abs();
+            (delta <= CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS).then_some((delta, index))
+        })
+        .min()
+        .map(|(_, index)| index)
+}
+
 fn claude_compaction_summary(
     observations: &[ClaudeCompactionObservation],
 ) -> (u64, Vec<String>, CompactionMetrics) {
@@ -573,24 +601,9 @@ fn claude_compaction_summary(
             continue;
         };
         let current_millis = current_timestamp.unix_timestamp_nanos() / 1_000_000;
-        let candidate = observations
-            .iter()
-            .enumerate()
-            .filter(|(index, observation)| {
-                observation.kind == ClaudeCompactionKind::LegacySummary
-                    && !matched_legacy.contains(index)
-            })
-            .filter_map(|(index, observation)| {
-                let legacy_timestamp = observation
-                    .timestamp
-                    .as_deref()
-                    .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())?;
-                let delta =
-                    (legacy_timestamp.unix_timestamp_nanos() / 1_000_000 - current_millis).abs();
-                (delta <= CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS).then_some((delta, index))
-            })
-            .min();
-        if let Some((_, legacy_index)) = candidate {
+        if let Some(legacy_index) =
+            matching_claude_legacy_compaction(observations, current_millis, &matched_legacy)
+        {
             matched_legacy.insert(legacy_index);
             pair_count += 1;
         }
@@ -649,23 +662,8 @@ fn canonical_claude_curve_boundaries(
             continue;
         };
         let current_millis = current_timestamp.unix_timestamp_nanos() / 1_000_000;
-        if let Some((_, legacy_index)) = observations
-            .iter()
-            .enumerate()
-            .filter(|(index, observation)| {
-                observation.kind == ClaudeCompactionKind::LegacySummary
-                    && !matched_legacy.contains(index)
-            })
-            .filter_map(|(index, observation)| {
-                let legacy_timestamp = observation
-                    .timestamp
-                    .as_deref()
-                    .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())?;
-                let delta =
-                    (legacy_timestamp.unix_timestamp_nanos() / 1_000_000 - current_millis).abs();
-                (delta <= CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS).then_some((delta, index))
-            })
-            .min()
+        if let Some(legacy_index) =
+            matching_claude_legacy_compaction(observations, current_millis, &matched_legacy)
         {
             matched_legacy.insert(legacy_index);
         }
@@ -36866,6 +36864,106 @@ mod tests {
         assert_ne!(item.peak_context_fill_tokens, Some(82_241));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_compaction_matching_preserves_greedy_ties_and_curve_order() {
+        let observation =
+            |kind, timestamp: &str, response_count_before| ClaudeCompactionObservation {
+                kind,
+                timestamp: Some(timestamp.to_string()),
+                pre_tokens: None,
+                post_tokens: None,
+                cumulative_dropped_tokens: None,
+                duration_ms: None,
+                response_count_before,
+            };
+        let legacy = ClaudeCompactionKind::LegacySummary;
+        let current = ClaudeCompactionKind::CurrentBoundary;
+        let observations = vec![
+            observation(legacy, "2026-07-01T11:00:00Z", 5),
+            observation(legacy, "2026-07-01T11:00:00.100Z", 4),
+            // Equal distance consumes index 0, even though its ordinal is later.
+            observation(current, "2026-07-01T11:00:00.050Z", 3),
+            // The remaining legacy is exactly 100 ms away and still matches.
+            observation(current, "2026-07-01T11:00:00Z", 2),
+            observation(legacy, "2026-07-01T11:00:00.151Z", 1),
+            // Repeated currents are retained; 101 ms is outside tolerance.
+            observation(current, "2026-07-01T11:00:00.050Z", 3),
+        ];
+        let (count, timestamps, metrics) = claude_compaction_summary(&observations);
+        assert_eq!(count, 4);
+        assert_eq!(metrics.metrics_count, 0);
+        assert_eq!(
+            timestamps,
+            vec![
+                "2026-07-01T11:00:00.050Z",
+                "2026-07-01T11:00:00.151Z",
+                "2026-07-01T11:00:00Z",
+            ]
+        );
+        let boundaries = canonical_claude_curve_boundaries(&observations);
+        assert_eq!(
+            boundaries
+                .iter()
+                .map(|boundary| boundary.response_count_before)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 3]
+        );
+        assert_eq!(
+            format!("{:?}", boundaries[2]),
+            format!("{:?}", observations[2])
+        );
+        assert_eq!(
+            format!("{:?}", boundaries[3]),
+            format!("{:?}", observations[5])
+        );
+    }
+
+    #[test]
+    fn claude_compaction_matching_keeps_invalid_timestamps_and_valid_metrics() {
+        let observation = |kind, timestamp: Option<&str>, pre_tokens| ClaudeCompactionObservation {
+            kind,
+            timestamp: timestamp.map(str::to_string),
+            pre_tokens,
+            post_tokens: Some(2),
+            cumulative_dropped_tokens: Some(3),
+            duration_ms: Some(4),
+            response_count_before: 0,
+        };
+        let legacy = ClaudeCompactionKind::LegacySummary;
+        let current = ClaudeCompactionKind::CurrentBoundary;
+        let observations = vec![
+            observation(legacy, Some("1969-12-31T23:59:59.9999Z"), Some(50)),
+            observation(current, Some("1970-01-01T01:00:00+01:00"), Some(u64::MAX)),
+            observation(current, Some("1970-01-01T00:00:00Z"), Some(1)),
+            observation(current, Some("malformed"), Some(u64::MAX)),
+            observation(current, None, Some(u64::MAX)),
+            observation(legacy, Some("malformed"), None),
+            observation(legacy, None, None),
+        ];
+        let (count, timestamps, metrics) = claude_compaction_summary(&observations);
+        assert_eq!(count, 6);
+        assert_eq!(
+            timestamps,
+            vec![
+                "1970-01-01T00:00:00Z",
+                "1970-01-01T01:00:00+01:00",
+                "malformed"
+            ]
+        );
+        assert_eq!(metrics.metrics_count, 2);
+        assert_eq!(metrics.total_pre_tokens, u64::MAX);
+        assert_eq!(metrics.total_post_tokens, 4);
+        assert_eq!(metrics.total_cumulative_dropped_tokens, 6);
+        assert_eq!(metrics.total_duration_ms, 8);
+        let boundaries = canonical_claude_curve_boundaries(&observations);
+        assert_eq!(boundaries.len(), 6);
+        assert_eq!(boundaries[0].timestamp, None);
+        assert_eq!(boundaries[1].timestamp, None);
+        // Stable sorting keeps equal malformed timestamps in their input order.
+        assert_eq!(boundaries[4].kind, current);
+        assert_eq!(boundaries[5].kind, legacy);
     }
 
     #[test]
