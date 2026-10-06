@@ -62,8 +62,8 @@ impl ClaudeSpawnRefusal {
         }
     }
 
-    /// Claude Code (or the background refresher) must refresh this login
-    /// first; a later attempt can succeed without user action.
+    /// This login must refresh or its admitted probe must settle first;
+    /// a later attempt can succeed without user action.
     pub(crate) fn waits_for_claude_refresh(self) -> bool {
         match self {
             Self::QuietWindow | Self::RefreshInProgress => true,
@@ -601,7 +601,7 @@ pub(crate) mod probe {
             if test_support::take_probe_fault(test_support::ProbeFault::FillStdin) {
                 if let Some(stdin) = stdin.as_mut() {
                     while stdin.write(&[b'x'; 8192]).is_ok() {}
-                    while stdin.write(&[b'x']).is_ok() {}
+                    while stdin.write(b"x").is_ok() {}
                 }
             }
             Ok(Self {

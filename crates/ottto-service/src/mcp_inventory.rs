@@ -1851,6 +1851,14 @@ mod tests {
         std::thread::sleep(Duration::from_millis(550));
         assert!(ProbeFixture::alive(fixture.pid("direct")));
         assert_eq!(crate::claude_spawn_gate::probe::active_count(), 1);
+        *fixture.policy.policy.credential.lock().unwrap() =
+            crate::claude_spawn_gate::ClaudeGateCredential::Present {
+                has_refresh_token: true,
+                access_expires_at: Some(OffsetDateTime::now_utc() - time::Duration::hours(1)),
+            };
+        std::thread::sleep(Duration::from_millis(550));
+        assert!(ProbeFixture::alive(fixture.pid("direct")));
+        assert_eq!(crate::claude_spawn_gate::probe::active_count(), 1);
         fixture.release();
         fixture.wait_settled();
         assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
