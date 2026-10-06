@@ -194,15 +194,18 @@ impl LiveRetryOwner {
     ) -> bool {
         if !self.enabled
             || source != SnapshotSource::Pi
+            || working.legacy_settlement_ledger_needs_migration()
+            || committed.legacy_settlement_ledger_needs_migration()
             || live.destination() != progress.destination_namespace_hash
             || live.validate_capture(home, items).is_err()
         {
             return false;
         }
-        let Some(live_bound) = crate::heap_layout_bound::bound(&live, self.allowance()) else {
+        let cap = self.allowance().min(1024 * 1024);
+        let Some(live_bound) = crate::heap_layout_bound::bound(&live, cap) else {
             return false;
         };
-        let Some(allowance) = self.allowance().checked_sub(live_bound) else {
+        let Some(allowance) = cap.checked_sub(live_bound) else {
             return false;
         };
         // Only a successfully returned native checkpoint reaches this call.
@@ -221,11 +224,11 @@ impl LiveRetryOwner {
             progress_path,
             first_shed,
             delay,
-            allowance.min(1024 * 1024),
+            allowance,
         ) else {
             return false;
         };
-        page.attach_live_authority(live, self.allowance()) && self.admit(page)
+        page.attach_live_authority(live, cap) && self.admit(page)
     }
     pub(super) fn admit(&mut self, page: PreparedRetry) -> bool {
         self.enabled && self.retry.admit(page)

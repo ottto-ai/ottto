@@ -66,7 +66,10 @@ Manual one-shot collection keeps a closed, disposable owner.
 
 The initial live admission is deliberately narrow: Pi with attribution disabled,
 no workspace or repository identity derived from external Git metadata, and no
-required head CAS. Other graphs remain ordinary collection. Before the native
+required head CAS. Other graphs remain ordinary collection. Legacy-settlement
+migration and leased legacy reconciliation also decline
+retention; their native CAS partition and exact entity ACK requirements remain
+in ordinary delivery. Before the native
 scan, a bounded input closure freezes the whole Pi transcript tree: at most 128
 paths, 32 KiB of path bytes and 8 MiB of source file lengths. It refuses symlinks,
 special objects and non-JSONL leaves. Native opened-file fingerprints and directory

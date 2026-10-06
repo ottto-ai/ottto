@@ -3317,7 +3317,11 @@ fn prepare_sync_source(
     }
     // The initial hint/status relay token dies here; sends acquire fresh tokens.
     drop(relay_token);
-    let retry_authority = if retry_enabled {
+    let retry_authority = if retry_enabled
+        && !index.legacy_settlement_ledger_needs_migration()
+        && legacy_reconciliation_pending.is_empty()
+        && active_legacy_reconciliation.is_empty()
+    {
         live_snapshot_retry::LiveAuthority::capture(
             source,
             home,
@@ -3874,7 +3878,12 @@ fn finish_sync_source(
                     committed_index.clone()
                 }
             };
-            if retry.enabled() && checkpoint_succeeded && locally_held_fingerprints.is_empty() {
+            if retry.enabled()
+                && checkpoint_succeeded
+                && locally_held_fingerprints.is_empty()
+                && legacy_reconciliation_pending.is_empty()
+                && active_legacy_reconciliation.is_empty()
+            {
                 if let Some(live) = retry_authority {
                     retry.capture_after_shed(
                         live,

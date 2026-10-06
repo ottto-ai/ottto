@@ -249,6 +249,7 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
                 assert_eq!(*anchored.get_or_insert(ordinary), ordinary);
                 owner.isolated_boundary(|page| {
                     turns += 1;
+                    assert!(page.bound() <= 1024 * 1024);
                     page.budget.force_gzip_for_test();
                     let expected_account = page.authority();
                     let live = page.take_live_authority()?;
@@ -414,6 +415,86 @@ fn bounded_retry_live_policy_and_stop_fences_prevent_batch_and_publication() {
             assert!(matches!(listener.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
         }
     }
+}
+
+#[test]
+fn bounded_retry_live_legacy_reconciliation_declines_without_count_only_settlement() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut f = PiLiveFixture::new();
+    // Reopen an actual native index in the pre-settlement-ledger shape.
+    let mut value = serde_json::to_value(&f.working).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("accepted_snapshot_fingerprint_ledger_version");
+    object.remove("accepted_snapshot_fingerprints");
+    f.working = serde_json::from_value(value).unwrap();
+    let (pending, changed) = f
+        .working
+        .prepare_legacy_settlement_reconciliation(SnapshotSource::Pi, 50);
+    assert!(changed && pending.contains(&f.items[0].snapshot_fingerprint));
+    assert!(f.working.legacy_settlement_ledger_needs_migration());
+    f.working.save(&f.index_path).unwrap();
+    f.baseline = f.working.clone();
+    let checkpoint = checkpoint_partial_snapshot_index(
+        &f.working,
+        &f.baseline,
+        &f.progress,
+        &f.items,
+        &BTreeSet::new(),
+        &f.index_path,
+        &f.progress_path,
+        || Ok(()),
+    )
+    .unwrap();
+    let before = std::fs::read(&f.index_path).unwrap();
+    let mut owner = live_snapshot_retry::LiveRetryOwner::isolated();
+    assert!(!owner.capture_after_shed(
+        f.live.take().unwrap(),
+        &f.home.0,
+        SnapshotSource::Pi,
+        &"a".repeat(64),
+        SnapshotUploadPolicy::default(),
+        f.daemon.snapshot_scan_account_witness().unwrap(),
+        &f.items,
+        &mut f.working,
+        &checkpoint,
+        &f.progress,
+        &f.index_path,
+        &f.progress_path,
+        Instant::now(),
+        Duration::ZERO
+    ));
+    let mut turns = 0;
+    owner.isolated_boundary(|_| {
+        turns += 1;
+        unreachable!("legacy reconciliation cannot reach a retained token or POST")
+    });
+    assert_eq!(turns, 0);
+    assert_eq!(std::fs::read(&f.index_path).unwrap(), before);
+    // Existing ordinary delivery still refuses a count-only ACK for these
+    // native legacy fingerprints. No alternative classifier is introduced.
+    assert!(require_normal_write_ack_for_legacy_reconciliation(
+        &accepted_batch(1),
+        &pending,
+        &pending
+    )
+    .is_err());
+    let durable = SnapshotUploadProgress::load(
+        &f.progress_path,
+        &f.progress.destination_namespace_hash,
+        test_quarantine_witness(),
+    )
+    .unwrap();
+    assert!(!durable.contains_body(
+        &f.items[0].snapshot_fingerprint,
+        &snapshot_upload_body_witness(&f.items[0])
+    ));
+    eprintln!("native_live_legacy_refusal turns=0 no_token_or_post=true count_only_ack_rejected=true no_index_publish=true");
 }
 
 #[test]
