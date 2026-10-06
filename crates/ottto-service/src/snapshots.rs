@@ -11376,7 +11376,14 @@ impl OwnedSourceScan {
                 let mut grouped_paths = BTreeSet::new();
                 let mut used = 0usize;
                 for group in inventory.groups().into_values() {
+                    let previously_joined = group.members.iter().any(|member| {
+                        index
+                            .files
+                            .get(&local_index_key(&member.path))
+                            .is_some_and(|entry| entry.codex_joined_member_set.is_some())
+                    });
                     if (group.members.len() < 2
+                        && !previously_joined
                         && owners
                             .get(&group.owner)
                             .map_or(true, |homes| homes.len() <= 1))
@@ -11398,6 +11405,7 @@ impl OwnedSourceScan {
                             .get(&group.owner)
                             .is_some_and(|homes| homes.len() > 1)
                         || group.members.len() > codex_file_join::MAX_MEMBERS
+                        || group.members.len() < 2
                         || group.members.len() > file_limit
                     {
                         census.ownership_incomplete_file_count += group.members.len();
@@ -11670,6 +11678,22 @@ impl OwnedSourceScan {
             );
             codex_parent_resolution_retry_required |= parsed_file.codex_parent_resolution_pending;
             let parse_complete = parsed_file.complete();
+            if !aliases.is_empty() && !parse_complete {
+                // Joining authorizes a complete replacement only. Native
+                // ownership/parser loss cannot publish a partial union body.
+                census.ownership_incomplete_file_count += aliases.len();
+                census.unreadable_path_count += 1;
+                residue_index_keys
+                    .extend(aliases.iter().map(|member| local_index_key(&member.path)));
+                let owners = parsed_file
+                    .snapshots
+                    .iter()
+                    .map(|item| resolve_codex_identity(&item.source_session_id));
+                codex_state_only_blocked_session_ids.extend(owners);
+                codex_state_only_blocked_session_ids
+                    .extend(parsed_file.state_only_blocked_session_ids.iter().cloned());
+                pending!();
+            }
             let diagnostic_reason = if parse_complete {
                 FileReason::Complete
             } else if parsed_file.codex_parent_resolution_pending {

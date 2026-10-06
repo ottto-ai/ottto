@@ -21,8 +21,8 @@ fresh census.
 One proof pass establishes unique native response identities, a contiguous
 thread-token counter chain across files, and coverage of exact UI usage events.
 Whole-record digests collapse complete copies into one canonical input.
-Conflicting overlap, gaps, resets, ordinal/fork boundaries and incomplete proof
-hold the group. They do not declare it empty or advance its previous checkpoint.
+Conflicting overlap, gaps, resets, ordinal/fork boundaries, incomplete native
+replay and loss of a previously joined member hold the group. They do not declare it empty or advance its previous checkpoint.
 Healthy groups remain eligible. Existing bounded traversal retry and counts
 expose these holds; there is no additional scheduler.
 

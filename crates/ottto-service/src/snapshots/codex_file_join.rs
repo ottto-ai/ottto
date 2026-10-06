@@ -1573,6 +1573,65 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn incomplete_native_replay_cannot_publish_a_partial_joined_replacement() {
+        let (root, _) = fixture();
+        let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let previous = index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+        let bad = json!({"type":"event_msg","payload":{"type":"token_count","info":{
+            "total_token_usage":{"input_tokens":"not-a-number","output_tokens":"not-a-number"}}}});
+        assert!(codex_total_usage(&bad).is_none());
+        let path = root.join("sessions/b.jsonl");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str(&(serde_json::to_string(&bad).unwrap() + "\n"));
+        fs::write(&path, text).unwrap();
+        let (after, held) = scan(&root, previous.clone(), 2);
+        assert!(held.snapshots.is_empty());
+        assert!(!held.census_complete);
+        assert_eq!(held.ownership_incomplete_file_count, 2);
+        assert_eq!(
+            serde_json::to_value(&after.files).unwrap(),
+            serde_json::to_value(&previous.files).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn losing_a_joined_member_cannot_replace_history_with_the_remaining_tail() {
+        let (root, _) = fixture();
+        let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let previous = index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+        fs::remove_file(root.join("sessions/a.jsonl")).unwrap();
+        let path = root.join("sessions/b.jsonl");
+        let mut text = fs::read_to_string(&path).unwrap();
+        for row in member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-c", 200, 500)
+            .into_iter()
+            .skip(1)
+        {
+            text.push_str(&(serde_json::to_string(&row).unwrap() + "\n"));
+        }
+        fs::write(path, text).unwrap();
+        let (after, held) = scan(&root, previous.clone(), 2);
+        assert!(held.snapshots.is_empty());
+        assert!(!held.census_complete);
+        assert_eq!(held.ownership_incomplete_file_count, 1);
+        assert_eq!(
+            serde_json::to_value(&after.files).unwrap(),
+            serde_json::to_value(&previous.files).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn missing_protected_receipt_rewrite_scope_change_or_cap_holds_correction() {
         let rows = member("owner", "r", 100, 100);
         let mut replay = TierReplay::new(None, false, "scope".into());
