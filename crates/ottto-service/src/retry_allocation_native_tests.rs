@@ -60,6 +60,35 @@ fn bounded_retry_envelope_auxiliary_shape_refuses_before_native_decode() {
 }
 
 #[test]
+fn bounded_retry_envelope_receipt_node_pressure_evicts_oldest_and_keeps_recording() {
+    let root = RotationRoot(test_dir("retry-envelope-receipt-nodes"));
+    std::fs::create_dir_all(&root.0).unwrap();
+    crate::upload_receipts::append_transport_error(&root.0, SourceKind::Pi, 1).unwrap();
+    let path = crate::upload_receipts::upload_receipts_path(&root.0);
+    let seed: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let row = seed["receipts"][0].clone();
+    let nodes = crate::snapshot_retry::state_nodes(&serde_json::to_vec(&row).unwrap()).unwrap();
+    let count = (crate::snapshot_retry::STATE_NODES - 5) / nodes;
+    let seeded = serde_json::to_vec(&serde_json::json!({"schema_version":1,"receipts":vec![row;count]})).unwrap();
+    assert!(seeded.len() < crate::snapshot_retry::RESPONSE_BYTES);
+    crate::snapshot_retry::state_shape(&seeded).unwrap();
+    std::fs::write(&path, seeded).unwrap();
+    let context = crate::upload_receipts::UploadReceiptContext::default();
+    crate::upload_receipts::append_http_failure_with_context_bounded(&root.0, SourceKind::Pi, 1,
+        ottto_protocol::UploadReceiptOutcomeV1::AuthRejected, 401, None, None, &context).unwrap();
+    let receipts = crate::upload_receipts::read(&root.0, 500, None, None).unwrap().receipts;
+    assert_eq!(receipts.len(), count);
+    assert_eq!(receipts[0].http_status, Some(401));
+    // A second append must advance history again, instead of freezing the ring.
+    crate::upload_receipts::append_transport_error_with_context_bounded(&root.0, SourceKind::Pi, 2, &context).unwrap();
+    let receipts = crate::upload_receipts::read(&root.0, 500, None, None).unwrap().receipts;
+    assert_eq!(receipts.len(), count);
+    assert_eq!(receipts[0].batch_item_count, 2);
+    assert_eq!(receipts[1].http_status, Some(401));
+    crate::snapshot_retry::state_shape(&std::fs::read(path).unwrap()).unwrap();
+}
+
+#[test]
 fn bounded_retry_envelope_competing_state_refusal_preserves_native_files() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -277,7 +306,7 @@ fn bounded_retry_envelope_native_tls_refuses_aggregate_headers_and_decoded_body(
         return;
     }
     let tls = EnvelopeTls::new();
-    for mode in ["accepted", "headers", "gzip"] {
+    for mode in ["accepted", "headers", "malformed_headers", "gzip", "chunk"] {
         use std::io::Write;
         let (body, extra) = match mode {
             "headers" => (
@@ -288,6 +317,8 @@ fn bounded_retry_envelope_native_tls_refuses_aggregate_headers_and_decoded_body(
                     "y".repeat(9000)
                 ),
             ),
+            "malformed_headers" => (b"{\"token\":\"fresh\"}".to_vec(), format!("\r\r\nX-One: {}\r\n", "x".repeat(18_000))),
+            "chunk" => (format!("{}11\r\n{{\"token\":\"fresh\"}}\r\n0\r\n\r\n", "0".repeat(1024 * 1024)).into_bytes(), "Transfer-Encoding: chunked\r\n".into()),
             "gzip" => {
                 let body = format!(
                     "{{\"token\":\"{}\"}}",

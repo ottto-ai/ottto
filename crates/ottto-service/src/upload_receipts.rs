@@ -764,6 +764,27 @@ fn append_with_evidence(
         payload = serde_json::to_vec(&ring).context("serialize bounded upload receipt ring")?;
     }
     if read_limit.is_some() {
+        let mut nodes = crate::snapshot_retry::state_nodes(&payload)?;
+        if nodes > crate::snapshot_retry::STATE_NODES {
+            let mut evict = 0;
+            for row in ring
+                .receipts
+                .iter()
+                .take(ring.receipts.len().saturating_sub(1))
+            {
+                nodes -= crate::snapshot_retry::state_nodes(&serde_json::to_vec(row)?)?;
+                evict += 1;
+                if nodes <= crate::snapshot_retry::STATE_NODES {
+                    break;
+                }
+            }
+            anyhow::ensure!(
+                nodes <= crate::snapshot_retry::STATE_NODES,
+                "single upload receipt exceeds private state shape bound"
+            );
+            ring.receipts.drain(..evict);
+            payload = serde_json::to_vec(&ring).context("serialize shape-bounded receipt ring")?;
+        }
         crate::snapshot_retry::state_shape(&payload)?;
     }
     write_owner_only_file_atomic(&path, &payload).context("persist upload receipt ring")

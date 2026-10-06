@@ -10,11 +10,12 @@ allowance: a synthetic 2,700,354-byte receipt file caused 36,256,067 requested a
 36,259,104 usable peak heap bytes while decoding an unknown extension. Wire bytes
 alone do not bound decoded container storage.
 
-The optional path now applies three additional guards:
+The optional path now applies additional guards:
 
 - Receipt input and output use the existing 128 KiB auxiliary-state limit.
   Oversized or invalid existing receipt state is preserved. Best-effort receipt
   recording may skip; remote exact ACK and native progress remain authoritative.
+  Node pressure evicts oldest rows so admitted rings continue recording.
   Ordinary receipt recording retains its existing 4 MiB/500-row contract.
 - Optional progress, index and receipt readers preflight at most 8,192 JSON
   key/value/container nodes and 64 nesting levels before typed decoding.
@@ -23,12 +24,19 @@ The optional path now applies three additional guards:
 - After normal authenticated TLS, aggregate status/header bytes are limited to
   16 KiB before ureq retains headers. The pinned transport previously limited
   individual lines without an aggregate limit. Body decoding keeps its existing
-  limits and the absolute TLS I/O deadline.
+  limits and the absolute TLS I/O deadline. Header termination matches the
+  pinned parser, including malformed CR sequences.
+- Total encoded status/header/body/framing bytes are capped at 272 KiB beneath
+  HTTP chunk decoding and gzip. A long chunk-size line can otherwise allocate
+  without producing any decoded bytes. Unusually excessive HTTP framing is
+  refused by this optional turn; ordinary transport remains available.
 
 ## Native evidence
 
-On 64-bit macOS with Rust 1.88.0, 19 selected bounded-path checks passed, followed
-by three isolated process allocation audits. The maximum fixture used the native
+On 64-bit macOS with Rust 1.88.0, 20 selected bounded-path checks and four fast
+header/framing regressions passed, followed by three isolated process allocation
+audits. Each toolchain uses separate task-local Cargo outputs; actual source and
+binary hashes were frozen during the owned build/test slot. The maximum fixture used the native
 Pi parser, 100 model rows and escaped model labels: 317 label bytes were admitted,
 318 refused, and the admitted item JSON was 130,910 bytes. This is the boundary of
 one finite fixture family, not a maximum over every legal admitted shape.
@@ -45,10 +53,12 @@ checkpoint race, authority, legacy refusal and absolute deadline tests also pass
 | Original receipt counterexample | 36,256,067 B | 36,259,104 B |
 | Refused 72,355-byte amplified receipt | 131,440 B | 131,488 B |
 | Refused 2,700,355-byte receipt | 262,470 B | 262,512 B |
-| Completed TLS with accepted large headers | 111,945 B | 117,664 B |
-| Refused aggregate headers | 78,106 B | 79,728 B |
-| Refused decoded gzip token body | 129,894 B | 136,032 B |
-| Maximum-family native ACK and restart | 4,932,719 B | 5,004,496 B |
+| Completed TLS with accepted large headers | 111,961 B | 117,680 B |
+| Refused aggregate headers | 78,122 B | 79,744 B |
+| Refused malformed-CR headers | 78,113 B | 79,200 B |
+| Refused 1 MiB leading-zero chunk-size line | 928,705 B | 945,888 B |
+| Refused decoded gzip token body | 130,294 B | 136,480 B |
+| Maximum-family native ACK and restart | 4,932,723 B | 5,004,496 B |
 | Same family with gzip/auth replay | 5,420,102 B | 5,486,784 B |
 
 The all-thread audit forwards unchanged allocations to System and uses a fixed
@@ -60,7 +70,7 @@ is outside the scope; native parser/capture, client, production default trust
 configuration, server connections, fixture responses and native restart
 allocations created inside the scope are charged.
 
-Whole-test-process maximum RSS for the maximum-family case was 42,074,112 bytes.
+Whole-test-process maximum RSS for the maximum-family case was 44,351,488 bytes.
 RSS includes the harness, static audit table, fixture setup, allocator arenas,
 thread stacks and native libraries. It is neither incremental requested heap nor
 a daemon physical-memory bound. The shared 8 MiB parked +4 MiB retained +20 MiB

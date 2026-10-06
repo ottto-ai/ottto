@@ -57,7 +57,9 @@ impl TlsConnector for DeadlineTls {
         Ok(Box::new(ResponseHeaders {
             inner: tls,
             bytes: 0,
-            line_has_content: false,
+            wire_bytes: 0,
+            line_bytes: 0,
+            line_last_cr: false,
             complete: false,
         }))
     }
@@ -67,23 +69,37 @@ impl TlsConnector for DeadlineTls {
 /// headers after the normal authenticated TLS handshake, before its parser can
 /// retain many large lines. Each optional request uses a fresh, nonpooled agent.
 const RESPONSE_HEADER_BYTES: usize = 16 * 1024;
+// Bound encoded HTTP framing and compressed bytes before ureq's chunk-size
+// decoder or gzip reader can allocate. Decoded bodies keep their smaller cap.
+const RESPONSE_WIRE_BYTES: usize =
+    crate::snapshot_retry::RESPONSE_BYTES * 2 + RESPONSE_HEADER_BYTES;
 #[derive(Debug)]
 struct ResponseHeaders {
     inner: Box<dyn ReadWrite>,
     bytes: usize,
-    line_has_content: bool,
+    wire_bytes: usize,
+    line_bytes: usize,
+    line_last_cr: bool,
     complete: bool,
 }
 impl Read for ResponseHeaders {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let limit = if self.complete {
+        let header_limit = if self.complete {
             bytes.len()
         } else {
             bytes
                 .len()
                 .min(RESPONSE_HEADER_BYTES.saturating_sub(self.bytes) + 1)
         };
+        let limit = header_limit.min(RESPONSE_WIRE_BYTES.saturating_sub(self.wire_bytes) + 1);
         let read = self.inner.read(&mut bytes[..limit])?;
+        self.wire_bytes += read;
+        if self.wire_bytes > RESPONSE_WIRE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "optional snapshot encoded response exceeds admission limit",
+            ));
+        }
         for byte in &bytes[..read] {
             if self.complete {
                 break;
@@ -96,10 +112,14 @@ impl Read for ResponseHeaders {
                 ));
             }
             if *byte == b'\n' {
-                self.complete = !self.line_has_content;
-                self.line_has_content = false;
-            } else if *byte != b'\r' {
-                self.line_has_content = true;
+                // Pinned ureq strips exactly one trailing CR. Multiple CRs
+                // are a malformed nonempty header, not the header terminator.
+                self.complete = self.line_bytes == 0 || (self.line_bytes == 1 && self.line_last_cr);
+                self.line_bytes = 0;
+                self.line_last_cr = false;
+            } else {
+                self.line_bytes += 1;
+                self.line_last_cr = *byte == b'\r';
             }
         }
         Ok(read)
@@ -234,7 +254,9 @@ mod tests {
         ResponseHeaders {
             inner: Box::new(Bytes(std::io::Cursor::new(bytes))),
             bytes: 0,
-            line_has_content: false,
+            wire_bytes: 0,
+            line_bytes: 0,
+            line_last_cr: false,
             complete: false,
         }
     }
@@ -260,6 +282,30 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nX: {}\r\nY: {}\r\n\r\n",
                 "x".repeat(9000),
                 "y".repeat(9000)
+            )
+            .into_bytes(),
+        );
+        assert_eq!(
+            stream.read_to_end(&mut Vec::new()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+    #[test]
+    fn malformed_cr_header_does_not_disable_aggregate_limit() {
+        let mut stream = headers(
+            format!("HTTP/1.1 200 OK\r\n\r\r\nX: {}\r\n\r\n", "x".repeat(18_000)).into_bytes(),
+        );
+        assert_eq!(
+            stream.read_to_end(&mut Vec::new()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+    #[test]
+    fn encoded_body_framing_is_capped_before_decode() {
+        let mut stream = headers(
+            format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{}1\r\nx\r\n0\r\n\r\n",
+                "0".repeat(RESPONSE_WIRE_BYTES)
             )
             .into_bytes(),
         );
