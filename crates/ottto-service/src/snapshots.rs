@@ -25,6 +25,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
 pub(crate) mod cache_observations;
+mod codex_file_join;
 mod context_curve;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
@@ -18746,6 +18747,23 @@ impl ScanIndex {
             match source {
                 SnapshotSource::Codex => {
                     if !codex_rows_prove_oauth(item) {
+                        set_session_account_hash(item, None);
+                        continue;
+                    }
+                    // An explicit creator-negative is a source decision, not
+                    // the legacy absence of an optional witness. Neither a
+                    // cached owner nor today's home login can override it.
+                    if item
+                        .session_account_evidence
+                        .as_ref()
+                        .is_some_and(|evidence| {
+                            evidence.evidence_source == "codex_creator_header:v1"
+                                && matches!(
+                                    evidence.identity_disposition,
+                                    Some("missing" | "conflict")
+                                )
+                        })
+                    {
                         set_session_account_hash(item, None);
                         continue;
                     }
@@ -47385,6 +47403,68 @@ mod tests {
         let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
 
         assert!(error.contains("model rows do not match"), "{error}");
+    }
+
+    #[test]
+    fn codex_explicit_creator_negative_does_not_inherit_home_or_cached_owner() {
+        let home = PathBuf::from("/synthetic/codex-negative");
+        let binding = crate::agent_status::CodexHomeBinding {
+            home: home.clone(),
+            account_identifier_hash: "current-owner".into(),
+            workspace_identifier_hash: "current-workspace".into(),
+            auth_modified_at: UNIX_EPOCH,
+        };
+        for disposition in ["missing", "conflict"] {
+            for cached in [false, true] {
+                let mut index = ScanIndex::default();
+                let mut item = valid_v6_batch_request().snapshots.remove(0);
+                item.model_usage[0].auth_mode = Some("oauth".into());
+                item.usage_buckets[0].model_usage[0].auth_mode = Some("oauth".into());
+                item.source_session_id = "negative-session".into();
+                item.source_started_at = Some("2026-10-05T00:00:00Z".into());
+                item.source_file_fingerprint = Some("negative-file".into());
+                let mut entry = manifest_index_entry(None);
+                entry.source_file_fingerprint = "negative-file".into();
+                index
+                    .files
+                    .insert(local_index_key(&home.join("sessions/rollout.jsonl")), entry);
+                let key = sha256_hex(&["session_owner:v1", "machine", &item.source_session_id]);
+                if cached {
+                    index.session_account_bindings.insert(
+                        key.clone(),
+                        SessionAccountBinding {
+                            account_identifier_hash: "cached-owner".into(),
+                            workspace_identifier_hash: None,
+                        },
+                    );
+                }
+                item.session_account_evidence = Some(SessionAccountEvidence {
+                    provider: "openai",
+                    account_identifier_hash: None,
+                    provider_workspace_hash: None,
+                    identity_hash_scheme: "provider-sha256:v1",
+                    evidence_source: "codex_creator_header:v1",
+                    identity_disposition: Some(disposition),
+                    source_created_at: None,
+                });
+                set_session_account_hash(&mut item, Some("stale-row-owner"));
+                index.bind_session_accounts(
+                    SnapshotSource::Codex,
+                    "machine",
+                    std::slice::from_mut(&mut item),
+                    std::slice::from_ref(&binding),
+                );
+                assert!(exact_session_account_hash(&item).is_none());
+                assert_eq!(
+                    item.session_account_evidence
+                        .as_ref()
+                        .unwrap()
+                        .identity_disposition,
+                    Some(disposition)
+                );
+                assert_eq!(index.session_account_bindings.contains_key(&key), cached);
+            }
+        }
     }
 
     #[test]
