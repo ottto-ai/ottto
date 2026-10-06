@@ -56,6 +56,47 @@ fn bounded_native_read(stream: &mut std::net::TcpStream) -> Vec<u8> {
     }
     bytes
 }
+
+#[test]
+fn bounded_retry_plain_http_is_declined_before_token_or_batch_io() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    // Default construction has the production HTTPS requirement even in tests.
+    // With no connection, a slow-reading plaintext peer cannot extend a write.
+    let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+    let mut budget = crate::snapshot_retry::RetryBudget::after_shed(
+        Instant::now(),
+        Duration::ZERO,
+    )
+    .unwrap();
+    budget.enter(Instant::now()).unwrap();
+    let request = SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: SnapshotSource::Codex.api_slug().into(),
+        machine_id: "a".repeat(64),
+        collector_version: Some(collector_version()),
+        snapshots: Vec::new(),
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    };
+    let token_error = client
+        .issue_relay_token_bounded(
+            &bounded_native_device(),
+            "synthetic-secret",
+            SnapshotSource::Codex,
+            &budget,
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+    let batch_error = client
+        .upload_batch_bounded("synthetic-token", &request, false, &mut budget, &mut || Ok(()))
+        .unwrap_err();
+    assert_eq!(token_error.to_string(), "optional snapshot retry requires HTTPS");
+    assert_eq!(batch_error.to_string(), "optional snapshot retry requires HTTPS");
+    assert_eq!(budget.posts_left(), 3);
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+}
+
 #[test]
 fn bounded_retry_native_transport_fallback_auth_exact_ack_checkpoint_and_recovery() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -94,7 +135,7 @@ fn bounded_retry_native_transport_fallback_auth_exact_ack_checkpoint_and_recover
         }
         trace
     });
-    let client = SnapshotApiClient::new(format!("http://{address}"));
+    let client = SnapshotApiClient::new(format!("http://{address}")).with_bounded_retry_loopback_http_for_test();
     let current = f.items.clone();
     assert!(page.bound() <= 4 * 1024 * 1024);
     let outcome = page
@@ -171,7 +212,7 @@ fn bounded_retry_native_response_cap_and_post_ack_cancellation_preserve_durable_
                 bounded_native_response(&mut stream, "200 OK", &ack);
             }
         });
-        let client = SnapshotApiClient::new(format!("http://{address}"));
+        let client = SnapshotApiClient::new(format!("http://{address}")).with_bounded_retry_loopback_http_for_test();
         let result = page.turn(
             &client,
             &bounded_native_device(),
@@ -325,7 +366,7 @@ fn bounded_retry_actual_owner_boundary_fairness_same_source_block_and_recovery()
             let mut owner = NativeRetryRotation {
                 scan,
                 retry,
-                client: SnapshotApiClient::new(format!("http://{address}")),
+                client: SnapshotApiClient::new(format!("http://{address}")).with_bounded_retry_loopback_http_for_test(),
                 turns: 0,
                 expected_account: expected,
             };
@@ -421,7 +462,7 @@ fn bounded_retry_native_stale_authority_body_and_checkpoint_stop_before_token() 
         let progress = std::fs::read(&f.progress_path).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap())).with_bounded_retry_loopback_http_for_test();
         let result = page.turn(
             &client,
             &device,
@@ -497,7 +538,7 @@ fn bounded_retry_native_absolute_deadline_covers_token_and_trickling_ack() {
         });
         let started = Instant::now();
         let result = page.turn(
-            &SnapshotApiClient::new(format!("http://{address}")),
+            &SnapshotApiClient::new(format!("http://{address}")).with_bounded_retry_loopback_http_for_test(),
             &bounded_native_device(),
             "synthetic-secret",
             &current,
@@ -559,7 +600,7 @@ fn bounded_retry_native_reshed_keeps_original_expiry_and_shared_posts() {
             }
         }
     });
-    let client = SnapshotApiClient::new(format!("http://{address}"));
+    let client = SnapshotApiClient::new(format!("http://{address}")).with_bounded_retry_loopback_http_for_test();
     let mut turns = 0;
     for expected_posts in [3, 2] {
         retry.boundary(std::iter::empty(), Instant::now(), |page| {

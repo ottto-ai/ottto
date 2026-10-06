@@ -15,6 +15,14 @@ package-version change. It limits successful token
 and batch response bodies before JSON decoding. The ordinary transport and
 checkpoint callers retain their existing behavior.
 
+Optional production retries require an HTTPS destination before token or batch
+I/O. Pinned ureq's plaintext request writes do not pass through the absolute
+TLS wrapper, so HTTP destinations decline retention delivery and recover through
+the ordinary path. Synthetic loopback HTTP cases use an explicit test-only
+opt-in restricted to a literal loopback socket address; it is absent from
+production builds. Default-client regression checks prove zero token/batch
+connections and unchanged POST allowance for a plaintext destination.
+
 The body allowance is three additional physical batch POSTs across all turns;
 fallbacks and replay consume it before sending. Retention lasts 300 seconds from
 first shed, each network turn ends within the remaining lifetime or 60 seconds,

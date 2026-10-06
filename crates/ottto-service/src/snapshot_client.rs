@@ -1434,6 +1434,8 @@ fn require_cloud_session_success(
 #[derive(Debug, Clone)]
 pub struct SnapshotApiClient {
     api_base_url: String,
+    #[cfg(test)]
+    bounded_retry_loopback_http_for_test: bool,
     agent: ureq::Agent,
     batch_agent: ureq::Agent,
     receipt_state_dir: Option<PathBuf>,
@@ -1462,12 +1464,44 @@ impl SnapshotApiClient {
         let (agent, batch_agent) = crate::net_resilience::shared_agents();
         Self {
             api_base_url: api_base_url.into(),
+            #[cfg(test)]
+            bounded_retry_loopback_http_for_test: false,
             agent,
             batch_agent,
             receipt_state_dir: None,
             receipt_destination_namespace: None,
             receipt_context: crate::upload_receipts::UploadReceiptContext::default(),
         }
+    }
+
+    fn require_bounded_snapshot_https(&self) -> Result<()> {
+        if self
+            .api_base_url
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if self.bounded_retry_loopback_http_for_test {
+            return Ok(());
+        }
+        // Pinned ureq bounds plain HTTP response reads, but successive body
+        // writes can each use a fresh socket timeout. Only HTTPS passes through
+        // our absolute DeadlineIo wrapper, so optional production retries must
+        // decline plaintext before acquiring a token or consuming a batch POST.
+        Err(anyhow!("optional snapshot retry requires HTTPS"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_bounded_retry_loopback_http_for_test(mut self) -> Self {
+        assert!(self
+            .api_base_url
+            .strip_prefix("http://")
+            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+            .is_some_and(|address| address.ip().is_loopback()));
+        self.bounded_retry_loopback_http_for_test = true;
+        self
     }
 
     /// Enable privacy-safe local receipts for snapshot batch attempts.
@@ -1574,6 +1608,7 @@ impl SnapshotApiClient {
         validate: &mut dyn FnMut() -> Result<()>,
     ) -> Result<String> {
         validate()?;
+        self.require_bounded_snapshot_https()?;
         if budget.posts_left() == 0 {
             return Err(anyhow!(
                 "optional snapshot retry POST allowance exhausted before token"
@@ -1665,6 +1700,7 @@ impl SnapshotApiClient {
     ) -> Result<SnapshotBatchResponse> {
         budget.remaining(Instant::now())?;
         validate()?;
+        self.require_bounded_snapshot_https()?;
         self.upload_batch_inner(
             relay_token,
             request,
@@ -4278,6 +4314,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         let Self {
             api_base_url,
+            #[cfg(test)]
+                bounded_retry_loopback_http_for_test: _,
             agent: _,
             batch_agent: _,
             receipt_state_dir,

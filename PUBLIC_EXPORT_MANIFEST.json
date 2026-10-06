@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 461,
-  "content_sha256": "341722e43b24dd574ac730d5c0a940d16ff4a4047a85090072b5b281d1e85dfc",
+  "content_sha256": "c7a5e7833e48741e3fb294884d275efe64829ab867469217da5e9da93bef532c",
   "files": [
     {
       "executable": false,
@@ -944,8 +944,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_bounded_native_tests.rs",
-      "sha256": "d3e64f662e856f6b23e25cf405c3ff3c00cd455f729bbcfd8dfbf3f0348ed871",
-      "size_bytes": 26824
+      "sha256": "d8b9cbd90f4c95165d49bec4b7e615b3337be6a93bdd0ab6ff6f4cb9d63db7e5",
+      "size_bytes": 28822
     },
     {
       "executable": false,
@@ -993,8 +993,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "3f80843ecaa05661718372c5ad5f2a14e788bb51d711fc005056d50ad2a35f9b",
-      "size_bytes": 175735
+      "sha256": "e4aeb76ff0d9247913b497e4a07bedf0b0f9b382b6738e17bae89c839e2d675e",
+      "size_bytes": 177211
     },
     {
       "executable": false,
@@ -2120,8 +2120,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-06-bounded-snapshot-retry-preparation.md",
-      "sha256": "9ee6da7b61cea07cdee7ec9279a3320468169783dc0ef042511c87261f434808",
-      "size_bytes": 4106
+      "sha256": "a07eed6e82dfbea9f954dc2d9861839fb950dc4c4dd2deee38bdd9c23f5e6599",
+      "size_bytes": 4638
     },
     {
       "executable": false,
