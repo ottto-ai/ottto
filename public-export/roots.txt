@@ -15,6 +15,7 @@ README.md
 SECURITY.md
 SUPPORT.md
 TRADEMARKS.md
+agent-adapters/autoreview/
 agent-adapters/claude-code-skill/
 agent-adapters/codex-skill/
 connectors/

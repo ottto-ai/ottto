@@ -3,5 +3,8 @@ Copyright 2026 Ottto contributors
 
 This product includes software developed by Ottto contributors.
 
+The local AutoReview helper includes portions of openclaw/agent-skills under the
+MIT License. See agent-adapters/autoreview/LICENSE for the copyright and license.
+
 Ottto and the Ottto logo are trademarks or registered trademarks of Ottto.
 Use of the Ottto name and marks is governed by TRADEMARKS.md.
