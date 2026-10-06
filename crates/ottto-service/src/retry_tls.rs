@@ -27,6 +27,10 @@ pub(crate) fn connector(deadline: Instant) -> Arc<DeadlineTls> {
             .with_no_client_auth(),
         )
     });
+    #[cfg(test)]
+    let config = TEST_CONFIG
+        .with(|c| c.borrow().clone())
+        .unwrap_or_else(|| config.clone());
     Arc::new(DeadlineTls {
         config: config.clone(),
         deadline,
@@ -49,8 +53,115 @@ impl TlsConnector for DeadlineTls {
             inner: io,
             deadline: self.deadline,
         };
-        TlsConnector::connect(&self.config, dns_name, Box::new(io))
+        let tls = TlsConnector::connect(&self.config, dns_name, Box::new(io))?;
+        Ok(Box::new(ResponseHeaders {
+            inner: tls,
+            bytes: 0,
+            wire_bytes: 0,
+            line_bytes: 0,
+            line_last_cr: false,
+            complete: false,
+        }))
     }
+}
+
+/// ureq bounds individual header lines, not their aggregate. Limit plaintext
+/// headers after the normal authenticated TLS handshake, before its parser can
+/// retain many large lines. Each optional request uses a fresh, nonpooled agent.
+const RESPONSE_HEADER_BYTES: usize = 16 * 1024;
+// Bound encoded HTTP framing and compressed bytes before ureq's chunk-size
+// decoder or gzip reader can allocate. Decoded bodies keep their smaller cap.
+const RESPONSE_WIRE_BYTES: usize =
+    crate::snapshot_retry::RESPONSE_BYTES * 2 + RESPONSE_HEADER_BYTES;
+#[derive(Debug)]
+struct ResponseHeaders {
+    inner: Box<dyn ReadWrite>,
+    bytes: usize,
+    wire_bytes: usize,
+    line_bytes: usize,
+    line_last_cr: bool,
+    complete: bool,
+}
+impl Read for ResponseHeaders {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let header_limit = if self.complete {
+            bytes.len()
+        } else {
+            bytes
+                .len()
+                .min(RESPONSE_HEADER_BYTES.saturating_sub(self.bytes) + 1)
+        };
+        let limit = header_limit.min(RESPONSE_WIRE_BYTES.saturating_sub(self.wire_bytes) + 1);
+        let read = self.inner.read(&mut bytes[..limit])?;
+        self.wire_bytes += read;
+        if self.wire_bytes > RESPONSE_WIRE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "optional snapshot encoded response exceeds admission limit",
+            ));
+        }
+        for byte in &bytes[..read] {
+            if self.complete {
+                break;
+            }
+            self.bytes += 1;
+            if self.bytes > RESPONSE_HEADER_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "optional snapshot response headers exceed admission limit",
+                ));
+            }
+            if *byte == b'\n' {
+                // Pinned ureq strips exactly one trailing CR. Multiple CRs
+                // are a malformed nonempty header, not the header terminator.
+                self.complete = self.line_bytes == 0 || (self.line_bytes == 1 && self.line_last_cr);
+                self.line_bytes = 0;
+                self.line_last_cr = false;
+            } else {
+                self.line_bytes += 1;
+                self.line_last_cr = *byte == b'\r';
+            }
+        }
+        Ok(read)
+    }
+}
+impl Write for ResponseHeaders {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.inner.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+impl ReadWrite for ResponseHeaders {
+    fn socket(&self) -> Option<&std::net::TcpStream> {
+        self.inner.socket()
+    }
+}
+
+// Synthetic native TLS fixtures change only their own thread's trust roots.
+// Production still uses the unchanged pinned WebPKI/ring policy above.
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG: std::cell::RefCell<Option<Arc<ureq::rustls::ClientConfig>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+#[cfg(test)]
+pub(crate) fn with_test_config<T>(
+    config: Arc<ureq::rustls::ClientConfig>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Arc<ureq::rustls::ClientConfig>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_CONFIG.with(|c| {
+                c.replace(self.0.take());
+            });
+        }
+    }
+    let _restore = Restore(TEST_CONFIG.with(|c| c.replace(Some(config))));
+    f()
 }
 #[derive(Debug)]
 struct DeadlineIo {
@@ -111,5 +222,96 @@ impl Write for DeadlineIo {
 impl ReadWrite for DeadlineIo {
     fn socket(&self) -> Option<&std::net::TcpStream> {
         self.inner.socket()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[derive(Debug)]
+    struct Bytes(std::io::Cursor<Vec<u8>>);
+    impl Read for Bytes {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            // Exercise header boundaries split over many native reads.
+            let limit = bytes.len().min(31);
+            self.0.read(&mut bytes[..limit])
+        }
+    }
+    impl Write for Bytes {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl ReadWrite for Bytes {
+        fn socket(&self) -> Option<&std::net::TcpStream> {
+            None
+        }
+    }
+    fn headers(bytes: Vec<u8>) -> ResponseHeaders {
+        ResponseHeaders {
+            inner: Box::new(Bytes(std::io::Cursor::new(bytes))),
+            bytes: 0,
+            wire_bytes: 0,
+            line_bytes: 0,
+            line_last_cr: false,
+            complete: false,
+        }
+    }
+    #[test]
+    fn aggregate_header_cap_accepts_boundary_and_does_not_charge_body() {
+        let prefix = "HTTP/1.1 200 OK\r\nX: ";
+        let mut input = format!(
+            "{prefix}{}\r\n\r\n",
+            "x".repeat(RESPONSE_HEADER_BYTES - prefix.len() - 4)
+        )
+        .into_bytes();
+        input.extend_from_slice(&vec![b'b'; RESPONSE_HEADER_BYTES * 3]);
+        let mut stream = headers(input.clone());
+        let mut output = Vec::new();
+        stream.read_to_end(&mut output).unwrap();
+        assert_eq!(output, input);
+        assert_eq!(stream.bytes, RESPONSE_HEADER_BYTES);
+    }
+    #[test]
+    fn aggregate_header_cap_refuses_many_individually_legal_lines() {
+        let mut stream = headers(
+            format!(
+                "HTTP/1.1 200 OK\r\nX: {}\r\nY: {}\r\n\r\n",
+                "x".repeat(9000),
+                "y".repeat(9000)
+            )
+            .into_bytes(),
+        );
+        assert_eq!(
+            stream.read_to_end(&mut Vec::new()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+    #[test]
+    fn malformed_cr_header_does_not_disable_aggregate_limit() {
+        let mut stream = headers(
+            format!("HTTP/1.1 200 OK\r\n\r\r\nX: {}\r\n\r\n", "x".repeat(18_000)).into_bytes(),
+        );
+        assert_eq!(
+            stream.read_to_end(&mut Vec::new()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+    #[test]
+    fn encoded_body_framing_is_capped_before_decode() {
+        let mut stream = headers(
+            format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{}1\r\nx\r\n0\r\n\r\n",
+                "0".repeat(RESPONSE_WIRE_BYTES)
+            )
+            .into_bytes(),
+        );
+        assert_eq!(
+            stream.read_to_end(&mut Vec::new()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

@@ -20421,13 +20421,14 @@ impl ScanIndex {
         let _lock = CheckpointLock::acquire(path)?;
         if path.exists() {
             let current: Self = match read_limit {
-                Some(cap) => serde_json::from_slice(
+                Some(cap) => crate::snapshot_retry::decode_state(
                     &crate::snapshot_retry::read_state(path, cap)
                         .context("read bounded current local snapshot scan index")?,
                 ),
                 None => serde_json::from_reader(
                     File::open(path).context("open current local snapshot scan index")?,
-                ),
+                )
+                .map_err(anyhow::Error::from),
             }
             .context("parse current local snapshot scan index for compare-and-swap")?;
             if current.schema_version != SCAN_INDEX_SCHEMA_VERSION

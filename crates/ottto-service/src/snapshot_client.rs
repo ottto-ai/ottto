@@ -1827,6 +1827,7 @@ impl SnapshotApiClient {
                             server_request_id.as_deref(),
                             &response,
                             enforce_head_cas,
+                            retry.is_some(),
                         );
                         Ok(response)
                     }
@@ -1837,6 +1838,7 @@ impl SnapshotApiClient {
                             status,
                             server_request_id.as_deref(),
                             None,
+                            retry.is_some(),
                         );
                         Err(anyhow!("parse snapshot batch response failed: {error}"))
                     }
@@ -1853,6 +1855,7 @@ impl SnapshotApiClient {
                     code,
                     response.header("X-Request-ID"),
                     shed.retry_after.map(|retry_after| retry_after.as_secs()),
+                    retry.is_some(),
                 );
                 Err(anyhow::Error::new(shed))
             }
@@ -1866,6 +1869,7 @@ impl SnapshotApiClient {
                     code,
                     response.header("X-Request-ID"),
                     None,
+                    retry.is_some(),
                 );
                 Err(anyhow::Error::new(BatchAuthorizationRejected {
                     status: code,
@@ -1882,6 +1886,7 @@ impl SnapshotApiClient {
                     code,
                     response.header("X-Request-ID"),
                     None,
+                    retry.is_some(),
                 );
                 Err(anyhow::Error::new(BatchRejected {
                     status: code,
@@ -1895,6 +1900,7 @@ impl SnapshotApiClient {
                     code,
                     response.header("X-Request-ID"),
                     None,
+                    retry.is_some(),
                 );
                 Err(anyhow::Error::new(UploadFailureDiagnostics::http(
                     "local snapshot upload",
@@ -1904,7 +1910,7 @@ impl SnapshotApiClient {
                 )))
             }
             Err(error) => {
-                self.record_batch_transport_error(request);
+                self.record_batch_transport_error(request, retry.is_some());
                 Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
                     "local snapshot upload",
                     "snapshot_batch",
@@ -1914,6 +1920,7 @@ impl SnapshotApiClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_batch_success(
         &self,
         request: &SnapshotBatchRequest,
@@ -1921,6 +1928,7 @@ impl SnapshotApiClient {
         server_request_id: Option<&str>,
         response: &SnapshotBatchResponse,
         enforce_head_cas: bool,
+        bounded: bool,
     ) {
         let Some(state_dir) = self.receipt_state_dir.as_deref() else {
             return;
@@ -1929,7 +1937,12 @@ impl SnapshotApiClient {
             b"ottto.validated_receipt.api_destination:v1",
             &self.api_base_url,
         );
-        if crate::upload_receipts::append_success_with_evidence_context(
+        let append = if bounded {
+            crate::upload_receipts::append_success_with_evidence_context_bounded
+        } else {
+            crate::upload_receipts::append_success_with_evidence_context
+        };
+        if append(
             state_dir,
             receipt_source(&request.source),
             request.snapshots.len(),
@@ -1954,6 +1967,7 @@ impl SnapshotApiClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_batch_http_failure(
         &self,
         request: &SnapshotBatchRequest,
@@ -1961,11 +1975,17 @@ impl SnapshotApiClient {
         status: u16,
         server_request_id: Option<&str>,
         retry_after_seconds: Option<u64>,
+        bounded: bool,
     ) {
         let Some(state_dir) = self.receipt_state_dir.as_deref() else {
             return;
         };
-        if crate::upload_receipts::append_http_failure_with_context(
+        let append = if bounded {
+            crate::upload_receipts::append_http_failure_with_context_bounded
+        } else {
+            crate::upload_receipts::append_http_failure_with_context
+        };
+        if append(
             state_dir,
             receipt_source(&request.source),
             request.snapshots.len(),
@@ -1981,11 +2001,16 @@ impl SnapshotApiClient {
         }
     }
 
-    fn record_batch_transport_error(&self, request: &SnapshotBatchRequest) {
+    fn record_batch_transport_error(&self, request: &SnapshotBatchRequest, bounded: bool) {
         let Some(state_dir) = self.receipt_state_dir.as_deref() else {
             return;
         };
-        if crate::upload_receipts::append_transport_error_with_context(
+        let append = if bounded {
+            crate::upload_receipts::append_transport_error_with_context_bounded
+        } else {
+            crate::upload_receipts::append_transport_error_with_context
+        };
+        if append(
             state_dir,
             receipt_source(&request.source),
             request.snapshots.len(),

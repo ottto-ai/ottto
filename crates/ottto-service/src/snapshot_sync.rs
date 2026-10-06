@@ -754,13 +754,16 @@ impl SnapshotUploadProgress {
         }
         let _lock = SnapshotProgressLock::acquire(path)?;
         if path.exists() {
-            let current: Self = serde_json::from_slice(
-                &match read_limit {
-                    Some(cap) => crate::snapshot_retry::read_state(path, cap),
-                    None => std::fs::read(path),
-                }
-                .context("read current snapshot upload progress")?,
-            )
+            let bytes = match read_limit {
+                Some(cap) => crate::snapshot_retry::read_state(path, cap),
+                None => std::fs::read(path),
+            }
+            .context("read current snapshot upload progress")?;
+            let current: Self = if read_limit.is_some() {
+                crate::snapshot_retry::decode_state(&bytes)
+            } else {
+                serde_json::from_slice(&bytes).map_err(anyhow::Error::from)
+            }
             .context("parse current snapshot upload progress for compare-and-swap")?;
             if current.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
                 || current.generation != self.generation
@@ -1278,8 +1281,12 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
         Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
         None => std::fs::read(progress_path),
     } {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .context("parse snapshot progress for partial checkpoint")?,
+        Ok(bytes) => (if read_limit.is_some() {
+            crate::snapshot_retry::decode_state(&bytes)
+        } else {
+            serde_json::from_slice(&bytes).map_err(anyhow::Error::from)
+        })
+        .context("parse snapshot progress for partial checkpoint")?,
         Err(error) if error.kind() == ErrorKind::NotFound && progress.generation == 0 => {
             SnapshotUploadProgress::new(
                 progress.destination_namespace_hash.clone(),
