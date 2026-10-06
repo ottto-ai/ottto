@@ -1097,29 +1097,45 @@ fn discovery_before_deadline(deadline: Instant) -> std::io::Result<()> {
     }
 }
 
-fn same_discovery_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
-    if before.len() != after.len()
-        || before
-            .modified()
-            .ok()
-            .zip(after.modified().ok())
-            .map(|(a, b)| a == b)
-            != Some(true)
-    {
-        return false;
-    }
+/// The same metadata witness used by discovery and composition's local cache.
+/// No transcript bytes are read. Unix ctime detects same-size rewrites even
+/// when mtime is restored; device/inode detect replacement at the same path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TranscriptFileMetadata {
+    len: u64,
+    modified: SystemTime,
+    object_identity: Option<(u64, u64)>,
+    change_time: Option<(i64, i64)>,
+}
+
+pub(crate) fn transcript_file_metadata(
+    metadata: &fs::Metadata,
+) -> std::io::Result<TranscriptFileMetadata> {
+    let modified = metadata.modified()?;
     #[cfg(unix)]
-    {
+    let (object_identity, change_time) = {
         use std::os::unix::fs::MetadataExt;
-        if before.dev() != after.dev()
-            || before.ino() != after.ino()
-            || before.ctime() != after.ctime()
-            || before.ctime_nsec() != after.ctime_nsec()
-        {
-            return false;
-        }
-    }
-    true
+        (
+            Some((metadata.dev(), metadata.ino())),
+            Some((metadata.ctime(), metadata.ctime_nsec())),
+        )
+    };
+    #[cfg(not(unix))]
+    let (object_identity, change_time) = (None, None);
+    Ok(TranscriptFileMetadata {
+        len: metadata.len(),
+        modified,
+        object_identity,
+        change_time,
+    })
+}
+
+fn same_discovery_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    transcript_file_metadata(before)
+        .ok()
+        .zip(transcript_file_metadata(after).ok())
+        .map(|(a, b)| a == b)
+        .unwrap_or(false)
 }
 
 fn first_existing_cwd_in_reader(

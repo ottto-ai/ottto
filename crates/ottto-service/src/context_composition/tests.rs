@@ -11,7 +11,426 @@ use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use time::Month;
 
+fn cache_scan(path: &Path) -> WorkspaceScan {
+    let mtime = fs::metadata(path).unwrap().modified().unwrap();
+    WorkspaceScan {
+        workspace: path.parent().unwrap().to_path_buf(),
+        files: vec![(path.to_path_buf(), mtime)],
+        last_seen: mtime,
+    }
+}
+
+fn test_signature(scan: &WorkspaceScan) -> CompositionFilesSignature {
+    workspace_files_signature(&scan.files, Instant::now() + Duration::from_secs(30)).unwrap()
+}
+
+fn test_cache(scan: &WorkspaceScan, window: DateWindow) -> CompositionCacheEntry {
+    CompositionCacheEntry {
+        identity: "synthetic-destination".into(),
+        agent_source: "claude-code".into(),
+        files: test_signature(scan),
+        scan_identity: composition_scan_identity("claude-code", window, false),
+        payload_sha256: "last-good-payload".into(),
+        posted_at: iso_utc(OffsetDateTime::now_utc()),
+    }
+}
+
+fn cache_needs_scan(cache: &CompositionCacheEntry, scan: &WorkspaceScan) -> bool {
+    should_rescan(
+        Some(cache),
+        &cache.identity,
+        &cache.agent_source,
+        &test_signature(scan),
+        &cache.scan_identity,
+        OffsetDateTime::now_utc(),
+    )
+}
+
+fn set_mtime(path: &Path, mtime: SystemTime) {
+    fs::File::open(path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(mtime))
+        .unwrap();
+}
+
+#[test]
+fn cache_invalidates_same_second_growth_and_nanosecond_edits() {
+    let path = write_jsonl("cache-same-second", &sess_c());
+    let first_mtime = SystemTime::UNIX_EPOCH + Duration::new(100, 100_000_000);
+    set_mtime(&path, first_mtime);
+    let scan = cache_scan(&path);
+    let cache = test_cache(&scan, wide_window());
+    assert!(!cache_needs_scan(&cache, &scan));
+    set_mtime(
+        &path,
+        SystemTime::UNIX_EPOCH + Duration::new(100, 900_000_000),
+    );
+    assert!(cache_needs_scan(&cache, &cache_scan(&path)));
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"attachment","attachment":{"content":"extra"}})
+    )
+    .unwrap();
+    drop(file);
+    set_mtime(
+        &path,
+        SystemTime::UNIX_EPOCH + Duration::new(100, 900_000_000),
+    );
+    assert!(cache_needs_scan(&cache, &cache_scan(&path)));
+    // Size alone is also a mutation witness, even if full mtime is restored.
+    set_mtime(&path, first_mtime);
+    assert!(cache_needs_scan(&cache, &cache_scan(&path)));
+    fs::remove_file(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_invalidates_same_size_restored_mtime_and_replacement() {
+    let path = write_jsonl("cache-object", &sess_c());
+    let scan = cache_scan(&path);
+    let cache = test_cache(&scan, wide_window());
+    let old_bytes = fs::read(&path).unwrap();
+    let mut changed = old_bytes.clone();
+    let pos = changed.iter().position(|b| *b == b'A').unwrap();
+    changed[pos] = b'B';
+    fs::write(&path, changed).unwrap();
+    set_mtime(&path, scan.files[0].1);
+    assert!(cache_needs_scan(&cache, &cache_scan(&path)));
+
+    let replacement = temp_path("replacement");
+    fs::write(&replacement, old_bytes).unwrap();
+    set_mtime(&replacement, scan.files[0].1);
+    fs::rename(&replacement, &path).unwrap();
+    assert!(cache_needs_scan(&cache, &cache_scan(&path)));
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn cache_invalidates_window_parser_methodology_labels_and_destination() {
+    let path = write_jsonl("cache-policy", &sess_c());
+    let scan = cache_scan(&path);
+    let cache = test_cache(&scan, wide_window());
+    let now = OffsetDateTime::now_utc();
+    let check = |identity: &str, source: &str, policy: &CompositionScanIdentity, time| {
+        should_rescan(Some(&cache), identity, source, &cache.files, policy, time)
+    };
+    assert!(!check(
+        &cache.identity,
+        &cache.agent_source,
+        &cache.scan_identity,
+        now
+    ));
+    assert!(check(
+        "new-destination",
+        &cache.agent_source,
+        &cache.scan_identity,
+        now
+    ));
+    assert!(check(&cache.identity, "codex", &cache.scan_identity, now));
+    assert!(check(
+        &cache.identity,
+        &cache.agent_source,
+        &cache.scan_identity,
+        now + time::Duration::days(7)
+    ));
+    for policy in [
+        CompositionScanIdentity {
+            parser_version: "next-parser".into(),
+            ..cache.scan_identity.clone()
+        },
+        CompositionScanIdentity {
+            methodology_hash: "changed-methodology".into(),
+            ..cache.scan_identity.clone()
+        },
+        CompositionScanIdentity {
+            labels_enabled: true,
+            ..cache.scan_identity.clone()
+        },
+        composition_scan_identity(
+            "claude-code",
+            DateWindow {
+                floor: wide_window().floor + time::Duration::days(1),
+                today: wide_window().today + time::Duration::days(1),
+            },
+            false,
+        ),
+    ] {
+        assert!(check(&cache.identity, &cache.agent_source, &policy, now));
+    }
+    assert!(should_rescan(
+        None,
+        &cache.identity,
+        &cache.agent_source,
+        &cache.files,
+        &cache.scan_identity,
+        now
+    ));
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn cache_day_rollover_rebuilds_expired_and_newly_eligible_events() {
+    let today = Date::from_calendar_date(2026, Month::October, 5).unwrap();
+    let window = DateWindow {
+        floor: today - time::Duration::days(91),
+        today,
+    };
+    let next_window = DateWindow {
+        floor: window.floor + time::Duration::days(1),
+        today: today + time::Duration::days(1),
+    };
+    let path = write_jsonl(
+        "cache-window",
+        &[
+            json!({"type":"attachment","timestamp":format!("{}T12:00:00Z",date_ymd(window.floor)),"attachment":{"content":"aaaa"}}),
+            json!({"type":"attachment","timestamp":format!("{}T12:00:00Z",date_ymd(today)),"attachment":{"content":"bbbbbbbb"}}),
+            json!({"type":"attachment","timestamp":format!("{}T12:00:00Z",date_ymd(next_window.today)),"attachment":{"content":"cccccccccccc"}}),
+        ],
+    );
+    let scan = cache_scan(&path);
+    let cache = test_cache(&scan, window);
+    assert!(should_rescan(
+        Some(&cache),
+        &cache.identity,
+        &cache.agent_source,
+        &cache.files,
+        &composition_scan_identity("claude-code", next_window, false),
+        OffsetDateTime::now_utc()
+    ));
+    let report = |w| {
+        build_report_for_scan(
+            &scan,
+            &cache.files,
+            SnapshotSource::ClaudeCode,
+            w,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        report(window)
+            .category_totals(Category::HarnessAttachments)
+            .1,
+        3
+    );
+    assert_eq!(
+        report(next_window)
+            .category_totals(Category::HarnessAttachments)
+            .1,
+        5
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn cache_legacy_rebuilds_once_then_suppresses_unchanged() {
+    let path = write_jsonl("cache-migration", &sess_c());
+    let scan = cache_scan(&path);
+    let cache_file = temp_path("local-cache");
+    let legacy = json!({"identity":"synthetic-destination","agent_source":"claude-code","files":{path.to_string_lossy().to_string():100},"payload_sha256":"old","posted_at":iso_utc(OffsetDateTime::now_utc())});
+    fs::write(&cache_file, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert!(read_cache(&cache_file).is_none());
+    let cache = test_cache(&scan, wide_window());
+    write_cache(&cache_file, &cache);
+    let roundtrip = read_cache(&cache_file).unwrap();
+    assert!(!cache_needs_scan(&roundtrip, &scan));
+    fs::remove_file(path).unwrap();
+    fs::remove_file(cache_file).unwrap();
+}
+
+#[test]
+fn cache_incomplete_or_changed_source_retains_last_good_cache() {
+    let path = write_jsonl("cache-incomplete", &sess_c());
+    let scan = cache_scan(&path);
+    let cache_file = temp_path("last-good-cache");
+    let cache = test_cache(&scan, wide_window());
+    write_cache(&cache_file, &cache);
+    let old_cache = fs::read(&cache_file).unwrap();
+    let report = |s: &WorkspaceScan, sig: &CompositionFilesSignature| {
+        build_report_for_scan(
+            s,
+            sig,
+            SnapshotSource::ClaudeCode,
+            wide_window(),
+            Instant::now() + Duration::from_secs(30),
+        )
+    };
+    fs::write(&path, b"\xff\n").unwrap();
+    assert!(report(&scan, &cache.files).is_none()); // Changed since signature.
+    let current = cache_scan(&path);
+    assert!(report(&current, &test_signature(&current)).is_none()); // Full UTF-8 read fails.
+    fs::remove_file(path).unwrap();
+    assert!(
+        workspace_files_signature(&current.files, Instant::now() + Duration::from_secs(30))
+            .is_err()
+    );
+    assert!(report(&current, &cache.files).is_none());
+    assert_eq!(fs::read(&cache_file).unwrap(), old_cache);
+    assert_eq!(
+        read_cache(&cache_file).unwrap().payload_sha256,
+        "last-good-payload"
+    );
+    fs::remove_file(cache_file).unwrap();
+}
+
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    let root = crate::test_scratch::private_dir("composition-workspace-isolation");
+    let home = root.join("home");
+    let transcripts = home.join(".claude/projects");
+    let support = root.join("support");
+    let healthy = root.join("healthy-workspace");
+    let damaged = root.join("damaged-workspace");
+    for dir in [&transcripts, &support, &healthy, &damaged] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let now = OffsetDateTime::now_utc();
+    let record = |cwd: &Path| {
+        serde_json::to_vec(&json!({"type":"attachment","cwd":cwd,
+            "timestamp":iso_utc(now),"attachment":{"content":"healthy evidence"}}))
+        .unwrap()
+    };
+    let good_file = transcripts.join("healthy.jsonl");
+    fs::write(&good_file, record(&healthy)).unwrap();
+    let bad_file = transcripts.join("damaged.jsonl");
+    let mut bytes = record(&damaged);
+    bytes.extend_from_slice(b"\n\xff\n");
+    fs::write(&bad_file, bytes).unwrap();
+    // Discovery resolves the valid first cwd; the newest report then fails.
+    set_mtime(&bad_file, SystemTime::now() + Duration::from_secs(1));
+    let source = SnapshotSource::ClaudeCode;
+    let source_label = agent_source_label(source);
+    let bad_cache_file = cache_path(
+        &support,
+        source_label,
+        &sha256_hex(&[damaged.to_string_lossy().as_ref()]),
+    );
+    write_cache(
+        &bad_cache_file,
+        &test_cache(&cache_scan(&bad_file), wide_window()),
+    );
+    let last_good = fs::read(&bad_cache_file).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let end = Instant::now() + Duration::from_secs(10);
+        let mut uploads = Vec::new();
+        let mut requests = 0;
+        while requests < 8 && Instant::now() < end {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("synthetic fixture accept: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+                assert!(header.len() <= 16 * 1024);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let length = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            let response = if header.contains("/relay-token ") {
+                json!({"token":"synthetic-relay"})
+            } else if header.contains("/activity-hints ") {
+                json!({"source":"claude-code","server_time":iso_utc(now),
+                    "record_count_15m":0,"record_count_24h":0,
+                    "local_usage_reconciliation_enabled":false,"backfill_window_days":14,
+                    "workspace_labels_enabled":false,"recommended_scan_after":iso_utc(now)})
+            } else {
+                assert!(header.contains("/context-composition/snapshot "));
+                uploads.push(serde_json::from_slice::<Value>(&body).unwrap());
+                json!({"accepted":true})
+            }
+            .to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+            requests += 1;
+        }
+        assert_eq!(requests, 8);
+        uploads
+    });
+    let client = SnapshotApiClient::new(&api);
+    let device = LocalDeviceBinding {
+        device_id: "synthetic-device".into(),
+        machine_id: Some("synthetic-machine".into()),
+        sources: vec![source_label.into()],
+    };
+    let healthy_cache_file = cache_path(
+        &support,
+        source_label,
+        &sha256_hex(&[healthy.to_string_lossy().as_ref()]),
+    );
+    let harvest = || {
+        harvest_source(
+            &client,
+            &device,
+            "synthetic-secret",
+            "synthetic-machine",
+            &api,
+            &home,
+            &support,
+            source,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&bad_cache_file).unwrap(), last_good);
+    };
+    harvest();
+
+    // Force a daily rebuild whose payload is identical, with a real post three
+    // days ago. Cache bookkeeping must not acknowledge a skipped upload.
+    let mut cache = read_cache(&healthy_cache_file).unwrap();
+    let original_post = iso_utc(now - time::Duration::days(3));
+    cache.posted_at = original_post.clone();
+    cache.scan_identity.window_today = date_ymd(now.date() - time::Duration::days(1));
+    write_cache(&healthy_cache_file, &cache);
+    harvest();
+    let mut cache = read_cache(&healthy_cache_file).unwrap();
+    assert_eq!(cache.posted_at, original_post);
+    assert_eq!(cache.scan_identity.window_today, date_ymd(now.date()));
+
+    // Once the last actual upload is stale, the unchanged payload must refresh.
+    let stale_post = iso_utc(now - time::Duration::days(8));
+    cache.posted_at = stale_post.clone();
+    write_cache(&healthy_cache_file, &cache);
+    harvest();
+    let cache = read_cache(&healthy_cache_file).unwrap();
+    assert_ne!(cache.posted_at, stale_post);
+    assert!(!cache_is_stale(&cache, OffsetDateTime::now_utc()));
+    let uploads = server.join().unwrap();
+    assert_eq!(uploads.len(), 2);
+    for upload in uploads {
+        assert_eq!(
+            upload["workspace_hash"],
+            sha256_hex(&[healthy.to_string_lossy().as_ref()])
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
 
 fn temp_path(name: &str) -> PathBuf {
     let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -100,6 +519,15 @@ fn measure_synthetic_workspace() {
         _ => panic!("unsupported composition fixture source"),
     };
     let source_label = agent_source_label(source);
+    let day_offset = std::env::var("OTTTO_COMPOSITION_FIXTURE_DAY_OFFSET")
+        .unwrap_or_else(|_| "0".into())
+        .parse::<i64>()
+        .unwrap();
+    assert!((0..=1).contains(&day_offset));
+    let window = DateWindow {
+        floor: wide_window().floor + time::Duration::days(day_offset),
+        today: wide_window().today + time::Duration::days(day_offset),
+    };
     let start = Instant::now();
     let scans = discover_workspaces(
         &root.join("transcripts"),
@@ -115,11 +543,21 @@ fn measure_synthetic_workspace() {
     let mut logical_parse_bytes = 0u64;
     let mut cache_hits = 0;
     for scan in &scans {
-        let signature = workspace_files_signature(&scan.files);
+        let signature =
+            workspace_files_signature(&scan.files, Instant::now() + Duration::from_secs(300))
+                .unwrap();
+        let scan_identity = composition_scan_identity(source_label, window, false);
         let cache_file = root.join("composition-cache.json");
         let cached = read_cache(&cache_file);
         let now = OffsetDateTime::now_utc();
-        if !should_rescan(cached.as_ref(), "synthetic", source_label, &signature, now) {
+        if !should_rescan(
+            cached.as_ref(),
+            "synthetic",
+            source_label,
+            &signature,
+            &scan_identity,
+            now,
+        ) {
             cache_hits += 1;
             continue;
         }
@@ -133,7 +571,7 @@ fn measure_synthetic_workspace() {
             }
         }
         let deadline = Instant::now() + Duration::from_secs(300);
-        let report = build_report_for_scan(scan, source, wide_window(), deadline)
+        let report = build_report_for_scan(scan, &signature, source, window, deadline)
             .expect("measurement report deadline expired");
         // The stat-derived counters assume the bounded loop reached every file.
         // Fail the sample instead of publishing those counters after a timeout.
@@ -157,6 +595,7 @@ fn measure_synthetic_workspace() {
                     identity: "synthetic".into(),
                     agent_source: source_label.into(),
                     files: signature,
+                    scan_identity,
                     payload_sha256: request_content_hash(&request).unwrap(),
                     posted_at: iso_utc(now),
                 },
@@ -270,7 +709,7 @@ fn build_claude_report() -> WorkspaceReport {
     let fallback = Date::from_calendar_date(2026, Month::July, 19).unwrap();
     for (name, recs) in [("a", sess_a()), ("b", sess_b()), ("c", sess_c())] {
         let path = write_jsonl(name, &recs);
-        parse_claude_session(&path, &mut report, fallback, false);
+        parse_claude_session(&path, &mut report, fallback, false).unwrap();
         let _ = fs::remove_file(&path);
     }
     report
@@ -353,7 +792,7 @@ fn streaming_fragments_collapse_by_message_id() {
     let mut report = WorkspaceReport::new(wide_window());
     let fallback = Date::from_calendar_date(2026, Month::July, 19).unwrap();
     let path = write_jsonl("stream", &recs);
-    parse_claude_session(&path, &mut report, fallback, false);
+    parse_claude_session(&path, &mut report, fallback, false).unwrap();
     let _ = fs::remove_file(&path);
     let code = report.category_totals(Category::CodeReads);
     let shell = report.category_totals(Category::ShellOutput);
@@ -374,8 +813,8 @@ fn subagent_transcripts_stay_distinct() {
     let fallback = Date::from_calendar_date(2026, Month::July, 19).unwrap();
     let p1 = write_jsonl("sub1", &sub);
     let p2 = write_jsonl("sub2", &sub);
-    parse_claude_session(&p1, &mut report, fallback, true);
-    parse_claude_session(&p2, &mut report, fallback, true);
+    parse_claude_session(&p1, &mut report, fallback, true).unwrap();
+    parse_claude_session(&p2, &mut report, fallback, true).unwrap();
     let _ = fs::remove_file(&p1);
     let _ = fs::remove_file(&p2);
     assert_eq!(report.sessions.len(), 2);
@@ -408,7 +847,7 @@ fn codex_categories_exact() {
     let mut report = WorkspaceReport::new(wide_window());
     let fallback = Date::from_calendar_date(2026, Month::July, 19).unwrap();
     let path = write_jsonl("codex", &codex_sess());
-    parse_codex_session(&path, &mut report, fallback);
+    parse_codex_session(&path, &mut report, fallback).unwrap();
     let _ = fs::remove_file(&path);
     assert_eq!(
         report.category_totals(Category::HarnessAttachments),
@@ -445,7 +884,7 @@ fn codex_mcp_categorization() {
     let mut report = WorkspaceReport::new(wide_window());
     let fallback = Date::from_calendar_date(2026, Month::July, 19).unwrap();
     let path = write_jsonl("codexmcp", &recs);
-    parse_codex_session(&path, &mut report, fallback);
+    parse_codex_session(&path, &mut report, fallback).unwrap();
     let _ = fs::remove_file(&path);
     let browser = report.category_totals(Category::BrowserAndImages);
     let shell = report.category_totals(Category::ShellOutput);
@@ -471,7 +910,7 @@ fn codex_user_message_image_counted_text_skipped() {
     let mut report = WorkspaceReport::new(wide_window());
     let fallback = Date::from_calendar_date(2026, Month::July, 19).unwrap();
     let path = write_jsonl("codeximg", &recs);
-    parse_codex_session(&path, &mut report, fallback);
+    parse_codex_session(&path, &mut report, fallback).unwrap();
     let _ = fs::remove_file(&path);
     let browser = report.category_totals(Category::BrowserAndImages);
     assert_eq!(browser, (1, 1300, 1300, 1));
@@ -539,65 +978,6 @@ fn codex_tool_and_mcp_categories() {
 // -------------------------------------------------------------------------
 // Incremental watermark.
 // -------------------------------------------------------------------------
-#[test]
-fn incremental_watermark_reparses_only_on_change() {
-    let files = vec![
-        (
-            PathBuf::from("/w/a.jsonl"),
-            SystemTime::UNIX_EPOCH + Duration::from_secs(100),
-        ),
-        (
-            PathBuf::from("/w/b.jsonl"),
-            SystemTime::UNIX_EPOCH + Duration::from_secs(200),
-        ),
-    ];
-    let sig = workspace_files_signature(&files);
-    let now = OffsetDateTime::now_utc();
-
-    // No cache -> must rescan.
-    assert!(should_rescan(None, "id", "claude-code", &sig, now));
-
-    // Cache with matching signature and fresh post -> skip.
-    let fresh = CompositionCacheEntry {
-        identity: "id".to_string(),
-        agent_source: "claude-code".to_string(),
-        files: sig.clone(),
-        payload_sha256: "abc".to_string(),
-        posted_at: now.format(&Rfc3339).unwrap(),
-    };
-    assert!(!should_rescan(Some(&fresh), "id", "claude-code", &sig, now));
-
-    // A changed mtime -> signature differs -> rescan.
-    let mut changed_files = files.clone();
-    changed_files[0].1 = SystemTime::UNIX_EPOCH + Duration::from_secs(999);
-    let changed_sig = workspace_files_signature(&changed_files);
-    assert!(should_rescan(
-        Some(&fresh),
-        "id",
-        "claude-code",
-        &changed_sig,
-        now
-    ));
-
-    // A different destination identity -> rescan.
-    assert!(should_rescan(
-        Some(&fresh),
-        "other",
-        "claude-code",
-        &sig,
-        now
-    ));
-
-    // Stale post -> rescan even when unchanged.
-    let stale = CompositionCacheEntry {
-        posted_at: (now - time::Duration::seconds(CONTEXT_MAX_STALENESS_SECS))
-            .format(&Rfc3339)
-            .unwrap(),
-        ..fresh.clone()
-    };
-    assert!(should_rescan(Some(&stale), "id", "claude-code", &sig, now));
-}
-
 // -------------------------------------------------------------------------
 // Payload serialization against the ingest contract.
 // -------------------------------------------------------------------------
@@ -606,7 +986,7 @@ fn payload_matches_contract() {
     let mut report = WorkspaceReport::new(DateWindow::current());
     let fallback = OffsetDateTime::now_utc().date();
     let path = write_jsonl("payload", &sess_c());
-    parse_claude_session(&path, &mut report, fallback, false);
+    parse_claude_session(&path, &mut report, fallback, false).unwrap();
     let _ = fs::remove_file(&path);
 
     let workspace = Path::new("/proj");
@@ -752,9 +1132,9 @@ fn real_workspace_parity_dump() {
 
     let parse = |file: &Path, report: &mut WorkspaceReport, d: Date| {
         if codex {
-            parse_codex_session(file, report, d);
+            parse_codex_session(file, report, d).unwrap();
         } else {
-            parse_claude_session(file, report, d, true);
+            parse_claude_session(file, report, d, true).unwrap();
         }
     };
 
@@ -764,7 +1144,7 @@ fn real_workspace_parity_dump() {
                 .and_then(|m| m.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
             let mut r = WorkspaceReport::new(wide_window());
-            let lines = read_jsonl(file).len();
+            let lines = read_jsonl(file).unwrap().len();
             parse(file, &mut r, file_date(mtime));
             let shell = r.category_totals(Category::ShellOutput);
             let harness = r.category_totals(Category::HarnessAttachments);
@@ -863,6 +1243,7 @@ fn report_expired_budget_does_not_return_empty_or_partial_replacement() {
     };
     assert!(build_report_for_scan(
         &scan,
+        &CompositionFilesSignature::new(),
         SnapshotSource::ClaudeCode,
         wide_window(),
         Instant::now()
@@ -872,9 +1253,13 @@ fn report_expired_budget_does_not_return_empty_or_partial_replacement() {
         files: Vec::new(),
         ..scan
     };
-    assert!(
-        build_report_for_scan(&empty, SnapshotSource::Codex, wide_window(), Instant::now())
-            .is_none()
-    );
+    assert!(build_report_for_scan(
+        &empty,
+        &CompositionFilesSignature::new(),
+        SnapshotSource::Codex,
+        wide_window(),
+        Instant::now()
+    )
+    .is_none());
     fs::remove_file(path).unwrap();
 }
