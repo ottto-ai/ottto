@@ -33,9 +33,11 @@ pub(crate) mod net_resilience;
 pub mod net_transition;
 pub mod otlp_relay;
 pub mod provider_daily_reference;
+mod retry_tls;
 pub mod session_attribution;
 pub mod snapshot_audit;
 pub mod snapshot_client;
+pub(crate) mod snapshot_retry;
 pub mod snapshot_sync;
 pub mod snapshot_watcher;
 pub mod snapshots;
@@ -8692,5 +8694,4 @@ mod heap_layout_bound;
 
 #[cfg(test)]
 mod retry_allocation_probe;
-#[cfg(test)]
 mod retry_retention_bound;
