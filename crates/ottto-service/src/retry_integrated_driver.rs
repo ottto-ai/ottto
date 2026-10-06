@@ -379,7 +379,7 @@ fn integrated_claude(hours: usize) -> SameSourceAckFixture {
     working.activate_effective_upload_body_witness_revision(1);
     let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
         SnapshotSource::ClaudeCode,
-        &[root.clone()],
+        std::slice::from_ref(&root),
         &mut working,
         "2026-10-05T00:00:00Z",
         crate::snapshots::BACKFILL_WINDOW_DAYS,

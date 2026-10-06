@@ -53,7 +53,7 @@ impl OwnedRotationProof {
             let mut index = index;
             let scan = crate::snapshots::scan_source_roots_with_test_limit(
                 source,
-                &[root.clone()],
+                std::slice::from_ref(root),
                 &mut index,
                 "2026-10-05T00:00:00Z",
                 crate::snapshots::BACKFILL_WINDOW_DAYS,
@@ -157,7 +157,7 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
         let status = test_agent_status(source_kind(source));
         let scan = crate::snapshots::OwnedSourceScan::new(
             source,
-            &[root.clone()],
+            std::slice::from_ref(root),
             ScanIndex::default(),
             "2026-10-05T00:00:00Z",
             crate::snapshots::BACKFILL_WINDOW_DAYS,
@@ -212,8 +212,10 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
         }))
     }
     fn validate(&mut self, frame: &SourcePreparation) -> Result<()> {
-        if frame.source == SnapshotSource::Pi && self.line_count >= 20 && self.cancel.is_some() {
-            match self.cancel.unwrap() {
+        if let (SnapshotSource::Pi, true, Some(cancel)) =
+            (frame.source, self.line_count >= 20, self.cancel)
+        {
+            match cancel {
                 "account" => self.authority.account += 1,
                 "destination" => self.authority.destination += 1,
                 _ => self

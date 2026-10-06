@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 445,
-  "content_sha256": "3f592f721c44109d537cf754c7569817c104dd44e15a08698eddbb66d8f6aafe",
+  "content_sha256": "4fabc0e208a155267d0dfc391ac51ac216a6be62ccaf59a774cbbd4fc5fcadef",
   "files": [
     {
       "executable": false,
@@ -902,15 +902,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_integrated_driver.rs",
-      "sha256": "cedb033d03bdbc875a8b86f5490c20be47c75ce076babbef817260dad2ddc41a",
-      "size_bytes": 18387
+      "sha256": "b00063422bc158e7b0c4fe6b4dff4f7946d82058de53ecdee43a930a7f7ae8bc",
+      "size_bytes": 18399
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_owned_rotation.rs",
-      "sha256": "be6912991e2c43a8884fea1d96407d211581073485ff15444e4d19d619d7af79",
-      "size_bytes": 18894
+      "sha256": "8bd7dad220957014812a9fff2676de5629ed00203e55ff41e4eb8960f736e5ca",
+      "size_bytes": 18935
     },
     {
       "executable": false,
