@@ -24,6 +24,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+#[cfg(unix)]
+pub(crate) mod support_health;
+
 const STORE_DIR: &str = "local-otel/claude-code-effort";
 const TRACE_STORE_DIR: &str = "local-otel/claude-code-trace-ownership";
 const MAX_EVIDENCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
