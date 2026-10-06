@@ -1,4 +1,5 @@
 // Native capture/wait/policy/ACK execution; credentials are synthetic adapters.
+include!("retry_allocation_native_tests.rs");
 struct PiLiveFixture {
     home: RotationRoot,
     daemon: LocalDaemon,
@@ -15,6 +16,10 @@ struct PiLiveFixture {
 }
 impl PiLiveFixture {
     fn new() -> Self {
+        Self::with_models(1)
+    }
+    fn with_models(models: usize) -> Self { Self::with_shape(models, 0) }
+    fn with_shape(models: usize, label_bytes: usize) -> Self {
         assert!(
             std::env::var_os("PI_CODING_AGENT_DIR").is_none(),
             "synthetic live retry tests require an isolated Pi root"
@@ -25,7 +30,20 @@ impl PiLiveFixture {
         let roots = SnapshotSource::Pi.default_roots(&home.0);
         std::fs::create_dir_all(&roots[0]).unwrap();
         let row = r#"{"type":"message_end","message":{"model":"gpt-5.4","timestamp":1791280801000,"usage":{"input":100,"output":1}}}"#;
-        std::fs::write(roots[0].join("one.jsonl"), format!("{row}\n")).unwrap();
+        let bytes = if models == 1 && label_bytes == 0 {
+            format!("{row}\n")
+        } else {
+            (0..models).map(|i| {
+                let label = (0..label_bytes).map(|j| match j % 23 {
+                    0 => '\\', 1 => '\"', 2 => '\u{1}',
+                    _ => char::from(b'a' + ((i * 17 + j * 31) % 26) as u8),
+                }).collect::<String>();
+                serde_json::json!({"type":"message_end","message":{
+                    "model":format!("synthetic-{i:04}-{label}"),"timestamp":1791280801000i64,
+                    "usage":{"input":100,"output":1}}}).to_string() + "\n"
+            }).collect::<String>()
+        };
+        std::fs::write(roots[0].join("one.jsonl"), bytes).unwrap();
         let support = home.0.join("support");
         std::fs::create_dir_all(&support).unwrap();
         let hint = Self::hint();
@@ -90,6 +108,9 @@ impl PiLiveFixture {
         .unwrap()
     }
     fn capture(&mut self, delay: Duration) -> live_snapshot_retry::LiveRetryOwner {
+        self.try_capture(delay).expect("supported native fixture")
+    }
+    fn try_capture(&mut self, delay: Duration) -> Option<live_snapshot_retry::LiveRetryOwner> {
         self.baseline = checkpoint_partial_snapshot_index(
             &self.working,
             &self.baseline,
@@ -102,7 +123,7 @@ impl PiLiveFixture {
         )
         .unwrap();
         let mut owner = live_snapshot_retry::LiveRetryOwner::isolated();
-        assert!(owner.capture_after_shed(
+        let admitted = owner.capture_after_shed(
             self.live.take().unwrap(),
             &self.home.0,
             SnapshotSource::Pi,
@@ -116,9 +137,9 @@ impl PiLiveFixture {
             &self.index_path,
             &self.progress_path,
             Instant::now(),
-            delay
-        ));
-        owner
+            delay,
+        );
+        admitted.then_some(owner)
     }
 }
 

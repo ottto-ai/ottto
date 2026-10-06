@@ -379,6 +379,55 @@ pub(crate) fn append_success_with_evidence_context(
     context: &UploadReceiptContext,
     evidence_request: Option<(&SnapshotBatchRequest, &str, &str, bool)>,
 ) -> Result<()> {
+    append_success_with_evidence_context_limit(
+        state_dir,
+        source,
+        batch_item_count,
+        http_status,
+        server_request_id,
+        response,
+        context,
+        evidence_request,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_success_with_evidence_context_bounded(
+    state_dir: &Path,
+    source: SourceKind,
+    batch_item_count: usize,
+    http_status: u16,
+    server_request_id: Option<&str>,
+    response: &SnapshotBatchResponse,
+    context: &UploadReceiptContext,
+    evidence_request: Option<(&SnapshotBatchRequest, &str, &str, bool)>,
+) -> Result<()> {
+    append_success_with_evidence_context_limit(
+        state_dir,
+        source,
+        batch_item_count,
+        http_status,
+        server_request_id,
+        response,
+        context,
+        evidence_request,
+        Some(crate::snapshot_retry::RESPONSE_BYTES),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_success_with_evidence_context_limit(
+    state_dir: &Path,
+    source: SourceKind,
+    batch_item_count: usize,
+    http_status: u16,
+    server_request_id: Option<&str>,
+    response: &SnapshotBatchResponse,
+    context: &UploadReceiptContext,
+    evidence_request: Option<(&SnapshotBatchRequest, &str, &str, bool)>,
+    read_limit: Option<usize>,
+) -> Result<()> {
     let outcome = if response.disabled {
         UploadReceiptOutcomeV1::Rejected
     } else if response.rejected_entities.is_empty() && response.conflict_entities.is_empty() {
@@ -450,6 +499,7 @@ pub(crate) fn append_success_with_evidence_context(
             rejected_entities,
         },
         evidence,
+        read_limit,
     )
 }
 
@@ -496,6 +546,33 @@ pub fn append_http_failure_with_context(
             retry_after_seconds,
             context,
         ),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_http_failure_with_context_bounded(
+    state_dir: &Path,
+    source: SourceKind,
+    batch_item_count: usize,
+    outcome: UploadReceiptOutcomeV1,
+    http_status: u16,
+    server_request_id: Option<&str>,
+    retry_after_seconds: Option<u64>,
+    context: &UploadReceiptContext,
+) -> Result<()> {
+    append(
+        state_dir,
+        empty_receipt(
+            source,
+            batch_item_count,
+            outcome,
+            Some(http_status),
+            sanitize_server_request_id(server_request_id),
+            retry_after_seconds,
+            context,
+        ),
+        Some(crate::snapshot_retry::RESPONSE_BYTES),
     )
 }
 
@@ -529,6 +606,29 @@ pub fn append_transport_error_with_context(
             None,
             context,
         ),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_transport_error_with_context_bounded(
+    state_dir: &Path,
+    source: SourceKind,
+    batch_item_count: usize,
+    context: &UploadReceiptContext,
+) -> Result<()> {
+    append(
+        state_dir,
+        empty_receipt(
+            source,
+            batch_item_count,
+            UploadReceiptOutcomeV1::TransportError,
+            None,
+            None,
+            None,
+            context,
+        ),
+        Some(crate::snapshot_retry::RESPONSE_BYTES),
     )
 }
 
@@ -603,20 +703,32 @@ fn empty_receipt(
     }
 }
 
-fn append(state_dir: &Path, receipt: UploadReceiptV1) -> Result<()> {
-    append_with_evidence(state_dir, receipt, None)
+fn append(state_dir: &Path, receipt: UploadReceiptV1, read_limit: Option<usize>) -> Result<()> {
+    append_with_evidence(state_dir, receipt, None, read_limit)
 }
 
 fn append_with_evidence(
     state_dir: &Path,
     receipt: UploadReceiptV1,
     evidence: Option<ValidatedReceiptEvidence>,
+    read_limit: Option<usize>,
 ) -> Result<()> {
     let _guard = RECEIPT_FILE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = upload_receipts_path(state_dir);
-    let mut ring = load_locked(&path)?;
+    let mut ring = match read_limit {
+        Some(cap) if path.exists() => {
+            let bytes = crate::snapshot_retry::read_state(&path, cap)?;
+            let ring: PersistedReceiptRing = crate::snapshot_retry::decode_state(&bytes)?;
+            anyhow::ensure!(
+                ring.schema_version == UPLOAD_RECEIPTS_DISK_SCHEMA_VERSION,
+                "optional receipt schema changed"
+            );
+            ring
+        }
+        _ => load_locked(&path)?,
+    };
     ring.receipts.push(PersistedReceipt {
         public: receipt,
         validated_evidence: evidence,
@@ -625,8 +737,11 @@ fn append_with_evidence(
         let overflow = ring.receipts.len() - UPLOAD_RECEIPT_RING_CAPACITY;
         ring.receipts.drain(..overflow);
     }
+    let file_limit = read_limit
+        .map(|n| n as u64)
+        .unwrap_or(MAX_RECEIPT_FILE_BYTES);
     let mut payload = serde_json::to_vec(&ring).context("serialize upload receipt ring")?;
-    if payload.len() as u64 > MAX_RECEIPT_FILE_BYTES {
+    if payload.len() as u64 > file_limit {
         let mut remaining_bytes = payload.len();
         let mut evict = 0;
         // Each removed row also removes one comma while at least one row remains.
@@ -638,15 +753,18 @@ fn append_with_evidence(
         {
             remaining_bytes -= serde_json::to_vec(row)?.len() + 1;
             evict += 1;
-            if remaining_bytes as u64 <= MAX_RECEIPT_FILE_BYTES {
+            if remaining_bytes as u64 <= file_limit {
                 break;
             }
         }
-        if remaining_bytes as u64 > MAX_RECEIPT_FILE_BYTES {
+        if remaining_bytes as u64 > file_limit {
             anyhow::bail!("single upload receipt exceeds private state bound");
         }
         ring.receipts.drain(..evict);
         payload = serde_json::to_vec(&ring).context("serialize bounded upload receipt ring")?;
+    }
+    if read_limit.is_some() {
+        crate::snapshot_retry::state_shape(&payload)?;
     }
     write_owner_only_file_atomic(&path, &payload).context("persist upload receipt ring")
 }

@@ -202,7 +202,7 @@ impl PreparedRetry {
             &self.progress_path,
             crate::snapshot_retry::RESPONSE_BYTES,
         )?;
-        let mut durable: SnapshotUploadProgress = serde_json::from_slice(&bytes)?;
+        let mut durable: SnapshotUploadProgress = crate::snapshot_retry::decode_state(&bytes)?;
         durable.active_quarantine_witness = self.progress.active_quarantine_witness.clone();
         durable.active_quarantine_retries = self.progress.active_quarantine_retries.clone();
         if crate::heap_layout_bound::bound(&durable, RETAINED_BUDGET).is_none()
@@ -216,7 +216,7 @@ impl PreparedRetry {
             &self.index_path,
             crate::snapshot_retry::RESPONSE_BYTES,
         )?;
-        let current: ScanIndex = serde_json::from_slice(&bytes)?;
+        let current: ScanIndex = crate::snapshot_retry::decode_state(&bytes)?;
         if crate::heap_layout_bound::bound(&current, RETAINED_BUDGET).is_none()
             || serde_json::to_vec(&current)? != serde_json::to_vec(&self.baseline)?
         {
