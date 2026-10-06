@@ -159,6 +159,7 @@ run_step() {
 run_step "validate public schemas and generated registry" \
   bash -c 'jq empty connectors/registry.generated.json schemas/*.schema.json'
 run_step "shellcheck public scripts" bash -c 'shellcheck scripts/*.sh'
+run_step "test local autoreview helper" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_autoreview.py
 
 run_step "test public export check" bash scripts/test_public_repo_export_check.sh
 run_step "run public export check" bash scripts/public_repo_export_check.sh

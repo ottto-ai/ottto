@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 451,
-  "content_sha256": "71d8ef95319f0e9c4d81ce34df40aa10c8a0b0eddee18756ce34b2ca9fdf6096",
+  "candidate_file_count": 455,
+  "content_sha256": "4ddc176a30356d6184f8728efc9917ef53af8f89e5f0311b97f534b801abaed8",
   "files": [
     {
       "executable": false,
@@ -34,8 +34,8 @@
       "executable": false,
       "mode": "0644",
       "path": "AGENTS.md",
-      "sha256": "c8a5b8a2bb9671ee6d2ae524fe24719c63575a41a643d1f252792f4cd9580698",
-      "size_bytes": 2497
+      "sha256": "a6d20cc05a79d43c158207a0f9f34a606ef49b9e93ae6f088fcafe550821280d",
+      "size_bytes": 2899
     },
     {
       "executable": false,
@@ -55,8 +55,8 @@
       "executable": false,
       "mode": "0644",
       "path": "CONTRIBUTING.md",
-      "sha256": "3c0d2fccd30fd415b806c3dce8e3183153301d54f010e9384e7d751d0d895c1c",
-      "size_bytes": 1896
+      "sha256": "b0211be248275fe031ef5f4d391ce73ac2d81757e1d03c352b085f194588e368",
+      "size_bytes": 2517
     },
     {
       "executable": false,
@@ -83,8 +83,8 @@
       "executable": false,
       "mode": "0644",
       "path": "NOTICE",
-      "sha256": "8a8078fa7af5d9f0b276600ce2f5c6ef3a4ad07d925f24133d201c2e88673e84",
-      "size_bytes": 243
+      "sha256": "c4f0505f332a63024eb1f6d989b1fe8efbd4f08ef94d27da36dca1598a00f6a4",
+      "size_bytes": 407
     },
     {
       "executable": false,
@@ -113,6 +113,20 @@
       "path": "TRADEMARKS.md",
       "sha256": "2e10dc0a462e4bb4786d43ca41cdaf7468499980cba84289276e207432b4ca86",
       "size_bytes": 1241
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "agent-adapters/autoreview/LICENSE",
+      "sha256": "e8ef8cec18c5b0ef48754f39a8c4cdbe86d6658f2a7dcf440969355e4770ef70",
+      "size_bytes": 1250
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "agent-adapters/autoreview/SKILL.md",
+      "sha256": "ecadcb1bcc6866217861a03fa8003666b396f46df2b08012942d659ecb2fddb8",
+      "size_bytes": 5703
     },
     {
       "executable": false,
@@ -2694,8 +2708,8 @@
       "executable": false,
       "mode": "0644",
       "path": "public-export/path-map.tsv",
-      "sha256": "5f952a7a72b29285238b1ccff78eecc55ef893195a5cdca4d6d191501f95e988",
-      "size_bytes": 2506
+      "sha256": "6bf77d380881c07f2da4f65286efa79e84caf7910d04e9660ec37ade5cb7e9fa",
+      "size_bytes": 2611
     },
     {
       "executable": false,
@@ -2708,8 +2722,8 @@
       "executable": false,
       "mode": "0644",
       "path": "public-export/roots.txt",
-      "sha256": "42a1bdda5fff6257b7470869962769fe3316d0448e7d59355a7dadd176addfd4",
-      "size_bytes": 536
+      "sha256": "87e758f22f0adc5da55a30cba94aa5779569e6e258910bfd54f01c19a657311f",
+      "size_bytes": 563
     },
     {
       "executable": false,
@@ -2752,6 +2766,13 @@
       "path": "schemas/source-manifest.schema.json",
       "sha256": "bca564f1121ddb28654f1287f70bb15bd0609ae734eef7ea6c083329663384f4",
       "size_bytes": 1819
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/autoreview",
+      "sha256": "46485c97f8d927f737798cff033b2f5a7ae5024365c96725517279b29faed59b",
+      "size_bytes": 26834
     },
     {
       "executable": true,
@@ -2960,8 +2981,15 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_surface_ci.sh",
-      "sha256": "1aec056d5336d718dd3370d5921c4fb660e417fe4d8e66ccb640babb09649387",
-      "size_bytes": 7470
+      "sha256": "f932fc5c00d5f1b3e720dd8d45174ed43d1a86c1de26b9f435f36929028fc69c",
+      "size_bytes": 7575
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "scripts/test_autoreview.py",
+      "sha256": "e5d5bc1ef724a8f1f14ed286c27d481a71a9cc01cc81bb4225142d7b94cba6fc",
+      "size_bytes": 14220
     },
     {
       "executable": true,
@@ -3160,9 +3188,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-06T16:39:45+00:00",
+  "generated_at": "2026-10-06T16:59:54+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 452,
+  "output_file_count": 456,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3180,6 +3208,7 @@
     "SECURITY.md",
     "SUPPORT.md",
     "TRADEMARKS.md",
+    "agent-adapters/autoreview/",
     "agent-adapters/claude-code-skill/",
     "agent-adapters/codex-skill/",
     "connectors/",
@@ -3198,5 +3227,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "7d1cfefa98e56dbc2b8e3ee31696a241d35ad828"
+  "source_commit": "d04d7882321e1dfc11fd03179c9ba99025d84358"
 }

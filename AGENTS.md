@@ -29,6 +29,11 @@
   rather than live credentials or provider accounts.
 - No additional skill, dependency, coverage quota, report, or validation gate is
   required merely for refactoring. Use extra tooling only for a concrete need.
+- Before handing off or merging substantive changes, the implementing agent runs
+  the local [AutoReview workflow](agent-adapters/autoreview/SKILL.md) after relevant
+  tests. Use one stable PR/task identity, standard review for ordinary behavior and
+  strict for sensitive invariants. Cosmetic or purely mechanical changes may skip
+  with a concrete reason; report skipped/unavailable review honestly.
 
 # Public export
 

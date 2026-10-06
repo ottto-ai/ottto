@@ -29,6 +29,15 @@ bash scripts/public_repo_export_check.sh
 Release, installer, and supply-chain changes must also run their targeted
 script tests and dry-run gates before review.
 
+For substantive PRs, the implementing agent runs the local
+[AutoReview workflow](agent-adapters/autoreview/SKILL.md) after relevant tests:
+`scripts/autoreview --change-id pr-123`. Before a PR exists, use the feature branch
+name and keep that identity through closeout. Review is invoked by the agent;
+it is not scheduled or enforced by GitHub. The default is one discovery review
+and, after accepted fixes, one focused verification within 24 hours. Existing
+Cargo, native and public-surface checks remain required; review does not replace
+them. Small prose, cosmetic or purely mechanical changes may skip with a reason.
+
 ## CLI And Protocol Contracts
 
 The visible CLI help, JSON output, NDJSON watch output, stable exit codes, and
