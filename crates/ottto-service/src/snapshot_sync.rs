@@ -5,6 +5,7 @@ use crate::backfill::{
     mark_backfill_complete_for_destination, pending_backfill_sources_for_destination,
     save_backfill_state,
 };
+use crate::codex_scan_diagnostics::{self, CodexScanDiagnostics, MAX_LOCAL_DIAGNOSTIC_BYTES};
 use crate::detected_uses::{
     aggregate_detected_uses, merge_detected_uses, DETECTED_USE_RETENTION_DAYS,
 };
@@ -19,13 +20,14 @@ use crate::snapshot_client::{
 };
 use crate::snapshots::{
     apply_upload_policy, collector_version, context_curve_derivation_revision,
-    finalize_scan_after_policy_with_body_witness, snapshot_quarantine_deadline_is_bounded,
-    snapshot_quarantine_witness, snapshot_upload_body_witness, validate_snapshot_batch_request,
-    ScanIndex, SnapshotBatchRequest, SnapshotItem, SnapshotQuarantineDisposition,
-    SnapshotQuarantineRecord, SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest,
-    SnapshotUploadPolicy, SourceScanResult, CONTEXT_CURVE_CONTRACT_VERSION,
-    MAX_BACKFILL_FILES_PER_SOURCE, MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
-    SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
+    finalize_scan_after_policy_with_body_witness, prepare_codex_recovery_diagnostics,
+    snapshot_quarantine_deadline_is_bounded, snapshot_quarantine_witness,
+    snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
+    SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
+    SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
+    SourceScanResult, CONTEXT_CURVE_CONTRACT_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
+    MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
+    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -706,6 +708,26 @@ impl SnapshotUploadProgress {
         self.accepted_fingerprints.remove(fingerprint);
         self.accepted_body_witnesses.remove(fingerprint);
         self.active_quarantine_retries.remove(fingerprint);
+    }
+
+    fn retain_current_quarantines_with_diagnostics(
+        &mut self,
+        current: &BTreeSet<String>,
+        diagnostic: Option<&mut CodexScanDiagnostics>,
+    ) -> bool {
+        let changed = self.retain_current_quarantines(current);
+        if let Some(diagnostic) = diagnostic {
+            for (fingerprint, record) in &self.quarantined_fingerprints {
+                let fingerprint_digest = codex_scan_diagnostics::digest(fingerprint);
+                for sample in diagnostic.lineage.iter_mut().flatten() {
+                    if sample.fingerprint_digest == fingerprint_digest {
+                        sample.after_current = current.contains(fingerprint);
+                        sample.after_disposition = record.disposition;
+                    }
+                }
+            }
+        }
+        changed
     }
 
     fn retain_current_quarantines(&mut self, current: &BTreeSet<String>) -> bool {
@@ -1599,6 +1621,7 @@ fn counted_poison_fingerprints_for_test(scope: &str) -> BTreeSet<String> {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SyncCounts {
+    local_codex_diagnostics: Option<CodexScanDiagnostics>,
     backfill_window_days: u64,
     backfill_file_limit: u64,
     discovered_file_count: u64,
@@ -1729,6 +1752,7 @@ impl SyncCounts {
             scanned_session_count: scan_result.scanned_session_count as u64,
             semantic_noop_count: scan_result.semantic_noop_count as u64,
             census_complete: scan_result.census_complete,
+            local_codex_diagnostics: scan_result.local_codex_diagnostics,
             symlink_rejected_count: scan_result.symlink_rejected_count as u64,
             unreadable_path_count: scan_result.unreadable_path_count as u64,
             oversized_file_count: scan_result.oversized_file_count as u64,
@@ -3263,6 +3287,11 @@ fn finish_sync_source(
         &scan_result.snapshots,
         &claude_authority_disposition,
     );
+    prepare_codex_recovery_diagnostics(
+        &mut scan_result,
+        &index,
+        &upload_progress.quarantined_fingerprints,
+    );
     finalize_scan_after_policy_with_body_witness(
         source,
         &mut scan_result,
@@ -3289,7 +3318,11 @@ fn finish_sync_source(
     // files continue changing. Drop quarantine revisions no longer represented
     // by the authoritative current index before any early upload error can
     // preserve them forever.
-    if upload_progress.retain_current_quarantines(&index.current_snapshot_fingerprints()) {
+    let current_fingerprints = index.current_snapshot_fingerprints();
+    if upload_progress.retain_current_quarantines_with_diagnostics(
+        &current_fingerprints,
+        scan_result.local_codex_diagnostics.as_mut(),
+    ) {
         upload_progress.save(&upload_progress_path)?;
     }
     let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
@@ -5250,7 +5283,33 @@ fn terminal_status_journal_path(
         .join(format!("{}-terminal-status-v1.json", source.api_slug()))
 }
 
+#[cfg(test)]
 fn save_terminal_status_journal(path: &Path, request: &SnapshotStatusRequest) -> Result<()> {
+    save_terminal_status_journal_with_diagnostics(path, request, None)
+}
+
+fn save_terminal_status_journal_with_diagnostics(
+    path: &Path,
+    request: &SnapshotStatusRequest,
+    diagnostic: Option<&CodexScanDiagnostics>,
+) -> Result<()> {
+    #[derive(Serialize)]
+    struct LocalJournal<'a> {
+        #[serde(flatten)]
+        receipt: &'a SnapshotStatusRequest,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_codex_diagnostics: Option<&'a CodexScanDiagnostics>,
+    }
+    // One latest receipt already has stricter retention than the four-record
+    // ceiling. Enforce the extension's byte cap before touching its journal.
+    let diagnostic = diagnostic.filter(|diagnostic| {
+        serde_json::to_vec_pretty(diagnostic)
+            .is_ok_and(|bytes| bytes.len() <= MAX_LOCAL_DIAGNOSTIC_BYTES)
+    });
+    let journal = LocalJournal {
+        receipt: request,
+        local_codex_diagnostics: diagnostic,
+    };
     if request.last_scan_finished_at.is_none() {
         return Err(anyhow!("terminal status journal requires a finished scan"));
     }
@@ -5261,7 +5320,7 @@ fn save_terminal_status_journal(path: &Path, request: &SnapshotStatusRequest) ->
     let temp_path = unique_progress_sibling(path, "tmp");
     let mut file = std::fs::File::create(&temp_path).context("create terminal status journal")?;
     let result = (|| -> Result<()> {
-        serde_json::to_writer_pretty(&mut file, request)
+        serde_json::to_writer_pretty(&mut file, &journal)
             .context("write terminal status journal")?;
         file.sync_all().context("sync terminal status journal")?;
         std::fs::rename(&temp_path, path).context("replace terminal status journal")?;
@@ -5323,6 +5382,7 @@ fn report_status_with_fresh_relay_token(
         receipt_window_days,
         manifest_source,
     )?;
+    let diagnostic = status.counts.local_codex_diagnostics;
     let request = collector_status_request(
         &destination_namespace,
         status,
@@ -5338,7 +5398,9 @@ fn report_status_with_fresh_relay_token(
     // full disk or an unwritable support dir must not suppress the terminal
     // report itself. Remote truth never waits on local disk; the failure is
     // disclosed on the daemon's error log instead.
-    if let Err(error) = save_terminal_status_journal(&journal_path, &request) {
+    if let Err(error) =
+        save_terminal_status_journal_with_diagnostics(&journal_path, &request, diagnostic.as_ref())
+    {
         eprintln!(
             "local snapshot terminal status journal write failed for {}: {}",
             source.api_slug(),
@@ -13576,6 +13638,132 @@ mod tests {
         }
     }
 
+    #[test]
+    fn codex_local_diagnostics_observe_the_actual_supersession_transition() {
+        use crate::codex_scan_diagnostics::RecoveryLineage;
+        let old = "a".repeat(64);
+        let retained = "b".repeat(64);
+        let historical = "c".repeat(64);
+        let mut progress = test_upload_progress();
+        for fingerprint in [&old, &retained, &historical] {
+            progress.quarantined_fingerprints.insert(
+                fingerprint.clone(),
+                crate::snapshots::snapshot_quarantine_record(SnapshotSource::Codex),
+            );
+        }
+        progress
+            .quarantined_fingerprints
+            .get_mut(&historical)
+            .unwrap()
+            .disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+        let mut diagnostic = CodexScanDiagnostics::default();
+        for (slot, fingerprint) in [&old, &retained, &historical].iter().enumerate() {
+            diagnostic.lineage[slot] = Some(RecoveryLineage::new(
+                fingerprint,
+                progress.quarantined_fingerprints[*fingerprint].disposition,
+            ));
+        }
+        let current = BTreeSet::from([retained.clone(), historical.clone()]);
+        assert!(
+            progress.retain_current_quarantines_with_diagnostics(&current, Some(&mut diagnostic))
+        );
+        let superseded = diagnostic.lineage[0].unwrap();
+        assert!(!superseded.after_current);
+        assert_eq!(
+            superseded.before_disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        assert_eq!(
+            superseded.after_disposition,
+            SnapshotQuarantineDisposition::SupersededTerminal
+        );
+        assert_eq!(
+            progress.quarantined_fingerprints[&old].retry_after_unix_seconds,
+            0
+        );
+        assert!(diagnostic.lineage[1].unwrap().after_current);
+        assert_eq!(
+            diagnostic.lineage[1].unwrap().after_disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        // A historical terminal record can coexist with restored current membership.
+        assert!(diagnostic.lineage[2].unwrap().after_current);
+        assert_eq!(
+            diagnostic.lineage[2].unwrap().after_disposition,
+            SnapshotQuarantineDisposition::SupersededTerminal
+        );
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn codex_local_diagnostics_stay_in_latest_journal_and_off_the_wire() {
+        let _guard = SourceManifestTestGuard::new();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server_with_hints(
+            captured.clone(),
+            vec![30, 30],
+        ));
+        let device = LocalDeviceBinding {
+            device_id: "device_test".into(),
+            machine_id: Some("otm_test".into()),
+            sources: vec!["codex".into()],
+        };
+        let destination = snapshot_upload_destination_namespace(&device, "device-secret");
+        let path = terminal_status_journal_path(
+            test_terminal_status_support_dir(),
+            &destination,
+            SnapshotSource::Codex,
+        );
+        for generation in [1, 2] {
+            let counts = SyncCounts {
+                local_codex_diagnostics: Some(CodexScanDiagnostics {
+                    version: 1,
+                    generation,
+                    ..Default::default()
+                }),
+                ..SyncCounts::for_policy(30)
+            };
+            report_status_with_fresh_relay_token(
+                &client,
+                &device,
+                "device-secret",
+                test_terminal_status_support_dir(),
+                SnapshotSource::Codex,
+                TerminalManifestSource::Withdraw,
+                CollectorStatus {
+                    source: SnapshotSource::Codex,
+                    machine_id: "otm_test",
+                    scan_started_at: "2026-09-01T07:44:00Z",
+                    counts,
+                    state: CollectorState::Success,
+                },
+            )
+            .unwrap();
+            let journal: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(journal["local_codex_diagnostics"]["generation"], generation);
+            let requests = captured.lock().unwrap();
+            let terminal = http_request_json(requests.last().unwrap());
+            assert!(terminal.get("local_codex_diagnostics").is_none());
+            assert_eq!(
+                serde_json::to_value(load_terminal_status_journal(&path).unwrap().unwrap())
+                    .unwrap(),
+                terminal
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with("terminal-status-v1.json"))
+                .count(),
+            1
+        );
+    }
+
     /// The journal commits the exact receipt about to go on the wire, residue
     /// fields included, and reloads it byte-for-byte.
     #[test]
@@ -13773,6 +13961,10 @@ mod tests {
         let mut counts = SyncCounts::for_policy(30);
         counts.scan_cap_hit = false;
         counts.census_complete = true;
+        counts.local_codex_diagnostics = Some(CodexScanDiagnostics {
+            version: 1,
+            ..Default::default()
+        });
         counts.recognized_usage_drop_count = 1_105;
         counts.dropped_usage_record_count = 1_105;
         counts.ownership_incomplete_file_count = 1;

@@ -1,3 +1,7 @@
+use crate::codex_scan_diagnostics::{
+    self, CensusGates, CodexScanDiagnostics, FileReason, IncompleteShape, RecoveryLineage,
+    LINEAGE_SAMPLES,
+};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::ser::SerializeStruct;
@@ -2460,6 +2464,7 @@ pub struct SourceScanResult {
     pub census_residue_blocked_session_count: usize,
     pub snapshots: Vec<SnapshotItem>,
     pending_finalization: Vec<PendingIndexFinalization>,
+    pub(crate) local_codex_diagnostics: Option<CodexScanDiagnostics>,
 }
 
 #[derive(Debug, Clone)]
@@ -2469,6 +2474,7 @@ struct PendingIndexFinalization {
     previous_snapshot_fingerprint: Option<String>,
     previous_upload_body_witness: Option<String>,
     parse_complete: bool,
+    diagnostic_reason: FileReason,
     parsed_snapshot_count: usize,
     effective_upload_body_witness_revision: u64,
 }
@@ -2641,6 +2647,78 @@ pub fn finalize_scan_after_policy(
     );
 }
 
+/// Sample existing quarantine metadata only. These are working-index witnesses
+/// at finalization, not a claim about later partial-checkpoint persistence.
+pub(crate) fn prepare_codex_recovery_diagnostics(
+    result: &mut SourceScanResult,
+    index: &ScanIndex,
+    quarantines: &BTreeMap<String, SnapshotQuarantineRecord>,
+) {
+    let Some(diagnostic) = result.local_codex_diagnostics.as_mut() else {
+        return;
+    };
+    diagnostic.lineage = [None; LINEAGE_SAMPLES];
+    diagnostic.sample_offset = 0;
+    diagnostic.quarantine_count = quarantines.len() as u64;
+    if quarantines.is_empty() {
+        return;
+    }
+    let offset = (diagnostic.generation % quarantines.len() as u64) as usize;
+    diagnostic.sample_offset = offset as u64;
+    for (slot, (fingerprint, quarantine)) in quarantines
+        .iter()
+        .cycle()
+        .skip(offset)
+        .take(quarantines.len().min(LINEAGE_SAMPLES))
+        .enumerate()
+    {
+        let mut sample = RecoveryLineage::new(fingerprint, quarantine.disposition);
+        for (key, fingerprints) in &index.file_snapshot_fingerprints {
+            if fingerprints.contains(fingerprint) {
+                sample.before_current = true;
+                sample.associated_file_count = sample.associated_file_count.saturating_add(1);
+                if sample.file_key_digest.is_none() {
+                    sample.file_key_digest = Some(codex_scan_diagnostics::digest(key));
+                    sample.previous_body_digest = result
+                        .pending_finalization
+                        .iter()
+                        .find(|pending| &pending.index_key == key)
+                        .and_then(|pending| pending.previous_upload_body_witness.as_deref())
+                        .or_else(|| {
+                            index
+                                .files
+                                .get(key)
+                                .and_then(|entry| entry.last_upload_body_witness.as_deref())
+                        })
+                        .map(codex_scan_diagnostics::digest);
+                }
+            }
+        }
+        // Preserve the canonical current-set fallback for pre-entity-map indexes.
+        for (key, entry) in &index.files {
+            if !index.file_snapshot_fingerprints.contains_key(key)
+                && entry.last_snapshot_fingerprint.as_ref() == Some(fingerprint)
+            {
+                sample.before_current = true;
+                sample.associated_file_count = sample.associated_file_count.saturating_add(1);
+                if sample.file_key_digest.is_none() {
+                    sample.file_key_digest = Some(codex_scan_diagnostics::digest(key));
+                    sample.legacy_file_association = true;
+                    sample.previous_body_digest = entry
+                        .last_upload_body_witness
+                        .as_deref()
+                        .map(codex_scan_diagnostics::digest);
+                }
+            }
+        }
+        sample.before_current |= index
+            .codex_state_only_snapshot_fingerprints
+            .values()
+            .any(|current| current == fingerprint);
+        diagnostic.lineage[slot] = Some(sample);
+    }
+}
+
 /// Finalize using the additive body witness of the effective upload projection.
 /// The witness function sees recomputed semantic fingerprints and must return
 /// a stable witness for both file no-op suppression and quarantine retries.
@@ -2676,6 +2754,15 @@ pub fn finalize_scan_after_policy_with_body_witness(
 
     let mut noop_source_files = BTreeSet::new();
     for pending in &result.pending_finalization {
+        if let Some(diagnostic) = result.local_codex_diagnostics.as_mut() {
+            let key_digest = codex_scan_diagnostics::digest(&pending.index_key);
+            for sample in diagnostic.lineage.iter_mut().flatten() {
+                if sample.file_key_digest == Some(key_digest) {
+                    sample.file_reason = pending.diagnostic_reason;
+                    sample.parsed_count = pending.parsed_snapshot_count as u64;
+                }
+            }
+        }
         if !pending.parse_complete {
             continue;
         }
@@ -2720,6 +2807,29 @@ pub fn finalize_scan_after_policy_with_body_witness(
             {
                 entry.effective_upload_body_witness_revision =
                     pending.effective_upload_body_witness_revision;
+            }
+        }
+        if let Some(diagnostic) = result.local_codex_diagnostics.as_mut() {
+            let key_digest = codex_scan_diagnostics::digest(&pending.index_key);
+            for sample in diagnostic.lineage.iter_mut().flatten() {
+                if sample.file_key_digest == Some(key_digest) {
+                    sample.finalized = true;
+                    sample.finalized_entity_count = final_fingerprints.len() as u64;
+                    for (slot, fingerprint) in
+                        final_fingerprints.iter().take(LINEAGE_SAMPLES).enumerate()
+                    {
+                        sample.successor_digests[slot] =
+                            codex_scan_diagnostics::digest(fingerprint);
+                    }
+                    sample.final_body_digest = final_upload_body_witness
+                        .as_deref()
+                        .map(codex_scan_diagnostics::digest);
+                    sample.final_body_revision = index
+                        .files
+                        .get(&pending.index_key)
+                        .map(|entry| entry.effective_upload_body_witness_revision)
+                        .unwrap_or_default();
+                }
             }
         }
         if final_fingerprints.is_empty() {
@@ -6774,6 +6884,7 @@ fn claude_usage_is_progressive_after(current: &UsageTotals, previous: &UsageTota
 
 #[derive(Debug, Clone, Default)]
 struct CodexTitleMetadata {
+    local_diagnostics: CodexScanDiagnostics,
     titles: BTreeMap<String, CodexTitleCandidate>,
     state_threads: BTreeMap<String, CodexStateThread>,
     rollout_extents: BTreeMap<String, CodexRolloutExtent>,
@@ -11022,6 +11133,18 @@ impl OwnedSourceScan {
             );
             codex_parent_resolution_retry_required |= parsed_file.codex_parent_resolution_pending;
             let parse_complete = parsed_file.complete();
+            let diagnostic_reason = if parse_complete {
+                FileReason::Complete
+            } else if parsed_file.codex_parent_resolution_pending {
+                FileReason::ParentPending
+            } else if parsed_file.ownership_incomplete_file_count > 0 {
+                FileReason::OwnershipIncomplete
+            } else if parsed_file.recognized_usage_drop_count > parsed_file.terminal_line_loss_count
+            {
+                FileReason::RecognizedUsageDropped
+            } else {
+                FileReason::ReadOrLineLoss
+            };
             let terminal_loss = parsed_file.terminal_loss();
             if let Some(parent_session_ref) = parsed_file.codex_parent_session_ref.as_ref() {
                 let parent_session_ref = resolve_codex_identity(parent_session_ref.as_str());
@@ -11141,6 +11264,7 @@ impl OwnedSourceScan {
                     .then_some(previous_upload_body_witness)
                     .flatten(),
                 parse_complete,
+                diagnostic_reason,
                 parsed_snapshot_count,
                 effective_upload_body_witness_revision: index
                     .active_effective_upload_body_witness_revision,
@@ -11463,6 +11587,24 @@ impl OwnedSourceScan {
                 census_residue_blocked_session_count,
                 snapshots,
                 pending_finalization,
+                local_codex_diagnostics: (source == SnapshotSource::Codex).then_some(
+                    CodexScanDiagnostics {
+                        version: 1,
+                        generation: index.generation,
+                        gates: CensusGates {
+                            discovery_done: traversal_discovery_done,
+                            traversal_healthy,
+                            frozen_generation: clean_frozen_generation,
+                            state_complete: state_census_complete,
+                            sidecar_complete: sidecar_census_complete,
+                            reconciliation_complete,
+                            parent_restart: parent_resolution_restart,
+                            clean_followup: needs_clean_followup,
+                            census_complete,
+                        },
+                        ..codex_title_metadata.local_diagnostics
+                    },
+                ),
             };
             return OwnedSourceScanStep::Complete {
                 index: index_storage,
@@ -16288,17 +16430,31 @@ impl CodexTitleMetadata {
                 &mut metadata.titles,
                 &mut metadata.identity_conflicts,
             );
+            metadata.local_diagnostics.state_titles.observe(
+                &title_census,
+                metadata.identity_conflicts.len() != state_conflicts_before,
+            );
+            let thread_conflicts_before = metadata.identity_conflicts.len();
             let state_census = load_codex_sqlite_state_threads(
                 &state_path,
                 &mut metadata.state_threads,
                 &mut metadata.identity_conflicts,
             );
+            metadata.local_diagnostics.state_threads.observe(
+                &state_census,
+                metadata.identity_conflicts.len() != thread_conflicts_before,
+            );
+            let spawn_conflicts_before = metadata.identity_conflicts.len();
             let spawn_census = load_codex_sqlite_spawn_edges(
                 &state_path,
                 &mut metadata.state_created_threads,
                 &mut metadata.spawn_parents,
                 &mut metadata.spawn_parent_conflicts,
                 &mut metadata.identity_conflicts,
+            );
+            metadata.local_diagnostics.spawn_edges.observe(
+                &spawn_census,
+                metadata.identity_conflicts.len() != spawn_conflicts_before,
             );
             let title_census_incomplete = title_census.is_err();
             let state_census_incomplete = state_census.is_err();
@@ -16320,13 +16476,16 @@ impl CodexTitleMetadata {
             let history_path = codex_dir.join("thread_history_1.sqlite");
             legacy_sidecar_parts.push(sidecar_stat_fingerprint(&history_path));
             let history_conflicts_before = metadata.identity_conflicts.len();
-            if load_codex_rollout_extents(
+            let history_census = load_codex_rollout_extents(
                 &history_path,
                 &mut metadata.rollout_extents,
                 &mut metadata.identity_conflicts,
-            )
-            .is_err()
-            {
+            );
+            metadata.local_diagnostics.rollout_extents.observe(
+                &history_census,
+                metadata.identity_conflicts.len() != history_conflicts_before,
+            );
+            if history_census.is_err() {
                 metadata.sidecar_census_incomplete = true;
                 metadata.sidecar_census_unscoped_incomplete = true;
             }
@@ -16337,13 +16496,16 @@ impl CodexTitleMetadata {
             let index_path = codex_dir.join("session_index.jsonl");
             legacy_sidecar_parts.push(sidecar_stat_fingerprint(&index_path));
             let index_conflicts_before = metadata.identity_conflicts.len();
-            if load_codex_session_index_titles(
+            let index_census = load_codex_session_index_titles(
                 &index_path,
                 &mut metadata.titles,
                 &mut metadata.identity_conflicts,
-            )
-            .is_err()
-            {
+            );
+            metadata.local_diagnostics.session_index.observe(
+                &index_census,
+                metadata.identity_conflicts.len() != index_conflicts_before,
+            );
+            if index_census.is_err() {
                 metadata.sidecar_census_incomplete = true;
                 metadata.sidecar_census_unscoped_incomplete = true;
             }
@@ -16533,7 +16695,8 @@ fn load_codex_session_index_titles(
     })
     .context("read Codex session index")?;
     if !report.complete() || invalid_shape {
-        return Err(anyhow::anyhow!("Codex session index census was incomplete"));
+        return Err(anyhow::Error::new(IncompleteShape)
+            .context("Codex session index census was incomplete"));
     }
     titles.extend(parsed);
     Ok(())
@@ -16584,9 +16747,8 @@ fn load_codex_sqlite_state_threads(
         .context("open Codex state database")?;
     let columns = sqlite_table_columns(&connection, "threads")?;
     if !columns.contains("id") || !columns.contains("tokens_used") {
-        return Err(anyhow::anyhow!(
-            "Codex state database is missing required thread census columns"
-        ));
+        return Err(anyhow::Error::new(IncompleteShape)
+            .context("Codex state database is missing required thread census columns"));
     }
 
     let sql = format!(
@@ -16676,9 +16838,8 @@ fn load_codex_rollout_extents(
         || !columns.contains("next_rollout_byte_offset")
         || !columns.contains("next_rollout_ordinal")
     {
-        return Err(anyhow::anyhow!(
-            "Codex thread-history database has an incomplete projection schema"
-        ));
+        return Err(anyhow::Error::new(IncompleteShape)
+            .context("Codex thread-history database has an incomplete projection schema"));
     }
     let mut statement = connection
         .prepare(
@@ -16755,9 +16916,9 @@ fn load_codex_sqlite_spawn_edges(
     let thread_columns = sqlite_table_columns(&connection, "threads")?;
     for required in ["id", "thread_source", "first_user_message"] {
         if !thread_columns.contains(required) {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow::Error::new(IncompleteShape).context(format!(
                 "Codex state database is missing required created-thread census column {required}"
-            ));
+            )));
         }
     }
     let mut statement = connection
@@ -28386,6 +28547,19 @@ mod tests {
         .expect("malformed sidecar is quarantined without fencing usage");
         assert!(!scan.sidecar_census_complete);
         assert!(!scan.census_complete);
+        let diagnostic = scan.local_codex_diagnostics.unwrap();
+        assert_eq!(
+            diagnostic.session_index.reason,
+            crate::codex_scan_diagnostics::LoaderReason::IncompleteShape
+        );
+        assert_eq!(diagnostic.session_index.failed_roots, 1);
+        assert!(
+            diagnostic.gates.discovery_done
+                && diagnostic.gates.traversal_healthy
+                && diagnostic.gates.frozen_generation
+        );
+        assert!(diagnostic.gates.state_complete);
+        assert!(!diagnostic.gates.sidecar_complete && !diagnostic.gates.census_complete);
         assert_eq!(scan.snapshots.len(), 1);
         assert_eq!(scan.snapshots[0].input_tokens, 20);
         assert_ne!(
@@ -39392,6 +39566,187 @@ mod tests {
         (home, root, loaded)
     }
 
+    #[test]
+    fn codex_local_diagnostics_distinguish_loader_faults_and_identity_conflicts() {
+        use crate::codex_scan_diagnostics::LoaderReason;
+        let home = temp_dir("codex-local-loader-diagnostics");
+        let root = home.join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        let roots = std::slice::from_ref(&root);
+        let empty = CodexTitleMetadata::load_from_roots(roots);
+        assert!(!empty.state_census_incomplete && !empty.sidecar_census_incomplete);
+        assert_eq!(
+            empty.local_diagnostics.state_titles.reason,
+            LoaderReason::Complete
+        );
+        assert_eq!(empty.local_diagnostics.session_index.completed_roots, 1);
+        let db = Connection::open(home.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT, title, tokens_used INTEGER, thread_source TEXT, first_user_message TEXT); INSERT INTO threads VALUES ('session', X'01', 1, 'user', NULL);").unwrap();
+        drop(db);
+        let malformed_row = CodexTitleMetadata::load_from_roots(roots);
+        assert_eq!(
+            malformed_row.local_diagnostics.state_titles.reason,
+            LoaderReason::SqliteRowDecode
+        );
+        assert_eq!(
+            malformed_row.local_diagnostics.state_threads.reason,
+            LoaderReason::SqliteRowDecode
+        );
+        assert_eq!(
+            malformed_row.local_diagnostics.spawn_edges.reason,
+            LoaderReason::Complete
+        );
+        assert!(malformed_row.state_census_incomplete);
+        fs::remove_file(home.join("state_5.sqlite")).unwrap();
+        let db = Connection::open(home.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT, title TEXT);")
+            .unwrap();
+        drop(db);
+        let schema = CodexTitleMetadata::load_from_roots(roots);
+        assert_eq!(
+            schema.local_diagnostics.state_threads.reason,
+            LoaderReason::IncompleteShape
+        );
+        assert_eq!(
+            schema.local_diagnostics.spawn_edges.reason,
+            LoaderReason::IncompleteShape
+        );
+        fs::remove_file(home.join("state_5.sqlite")).unwrap();
+        // Differently cased UUIDs collapse to the same comparison key.
+        fs::write(
+            home.join("session_index.jsonl"),
+            concat!(
+                "{\"id\":\"ABCDEF00-0000-7000-8000-000000000001\",\"title\":\"old\"}\n",
+                "{\"id\":\"abcdef00-0000-7000-8000-000000000001\",\"title\":\"new\"}\n"
+            ),
+        )
+        .unwrap();
+        let conflict = CodexTitleMetadata::load_from_roots(roots);
+        assert!(conflict.local_diagnostics.session_index.identity_conflict);
+        assert_eq!(
+            conflict.local_diagnostics.session_index.reason,
+            LoaderReason::Complete
+        );
+        assert!(!conflict.state_census_incomplete && conflict.sidecar_census_incomplete);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn codex_local_diagnostics_trace_successors_empty_and_incomplete_finalization() {
+        for disposition in [FileReason::Complete, FileReason::ReadOrLineLoss] {
+            for empty in [false, true] {
+                let (home, root, mut index) = projection_adoption_fixture("codex-local-lineage", 1);
+                let old_fingerprint = index
+                    .file_snapshot_fingerprints
+                    .values()
+                    .next()
+                    .unwrap()
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .clone();
+                let quarantines = BTreeMap::from([(
+                    old_fingerprint.clone(),
+                    snapshot_quarantine_record(SnapshotSource::Codex),
+                )]);
+                if disposition == FileReason::ReadOrLineLoss {
+                    let path = PathBuf::from(index.files.keys().next().unwrap());
+                    let mut bytes = fs::read(&path).unwrap();
+                    bytes.extend_from_slice(b"not valid json\n");
+                    fs::write(&path, bytes).unwrap();
+                }
+                index.activate_effective_upload_body_witness_revision(1);
+                let mut scan =
+                    projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+                prepare_codex_recovery_diagnostics(&mut scan, &index, &quarantines);
+                assert_eq!(
+                    scan.pending_finalization[0].parse_complete,
+                    disposition == FileReason::Complete
+                );
+                let parsed_count = scan.pending_finalization[0].parsed_snapshot_count as u64;
+                if empty {
+                    crate::backfill::apply_backfill_cutoff(
+                        &mut scan.snapshots,
+                        &crate::backfill::BackfillState {
+                            backfill_cutoff_at: Some("2026-07-23T00:00:00Z".into()),
+                            ..Default::default()
+                        },
+                    );
+                } else if let Some(snapshot) = scan.snapshots.first_mut() {
+                    snapshot.output_tokens += 1;
+                }
+                let mut control = scan.clone();
+                control.local_codex_diagnostics = None;
+                let mut control_index = index.clone();
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut control, &mut control_index);
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+                assert_eq!(
+                    serde_json::to_value(&index).unwrap(),
+                    serde_json::to_value(&control_index).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(&scan.snapshots).unwrap(),
+                    serde_json::to_value(&control.snapshots).unwrap()
+                );
+                let sample = scan.local_codex_diagnostics.unwrap().lineage[0].unwrap();
+                assert!(sample.before_current);
+                assert_eq!(sample.parsed_count, parsed_count);
+                assert_eq!(sample.file_reason, disposition);
+                assert_eq!(sample.finalized, disposition == FileReason::Complete);
+                if sample.finalized {
+                    assert_eq!(sample.finalized_entity_count, u64::from(!empty));
+                    assert!(!index
+                        .current_snapshot_fingerprints()
+                        .contains(&old_fingerprint));
+                    assert_eq!(sample.final_body_revision, 1);
+                    if !empty {
+                        assert_ne!(sample.successor_digests[0], sample.fingerprint_digest);
+                        assert!(sample.final_body_digest.is_some());
+                    }
+                } else {
+                    assert!(index
+                        .current_snapshot_fingerprints()
+                        .contains(&old_fingerprint));
+                }
+                fs::remove_dir_all(home).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn codex_local_diagnostics_rotate_only_four_quarantines() {
+        let (home, root, mut index) = projection_adoption_fixture("codex-local-rotation", 7);
+        let quarantines: BTreeMap<_, _> = index
+            .current_snapshot_fingerprints()
+            .iter()
+            .map(|fingerprint| {
+                (
+                    fingerprint.clone(),
+                    snapshot_quarantine_record(SnapshotSource::Codex),
+                )
+            })
+            .collect();
+        index.activate_effective_upload_body_witness_revision(1);
+        let mut scan = projection_adoption_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        let mut observed = BTreeSet::new();
+        for generation in 0..7 {
+            scan.local_codex_diagnostics.as_mut().unwrap().generation = generation;
+            prepare_codex_recovery_diagnostics(&mut scan, &index, &quarantines);
+            let diagnostic = scan.local_codex_diagnostics.unwrap();
+            assert_eq!(diagnostic.quarantine_count, 7);
+            assert_eq!(diagnostic.lineage.iter().flatten().count(), 4);
+            observed.extend(
+                diagnostic
+                    .lineage
+                    .iter()
+                    .flatten()
+                    .map(|sample| sample.fingerprint_digest),
+            );
+        }
+        assert_eq!(observed.len(), 7);
+        fs::remove_dir_all(home).unwrap();
+    }
+
     fn projection_adoption_scan(
         root: &Path,
         index: &mut ScanIndex,
@@ -49808,12 +50163,12 @@ crate::heap_layout_bound::fields!(CodexPathSidecarCandidate; identity, recorded_
 crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ordinal);
 crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
-crate::heap_layout_bound::fields!(CodexTitleMetadata; titles, state_threads, rollout_extents, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
+crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns);
 crate::heap_layout_bound::fields!(OwnedActiveFile; candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
 crate::heap_layout_bound::fields!(OwnedSourceScan; source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file);
-crate::heap_layout_bound::fields!(PendingIndexFinalization; index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, parsed_snapshot_count, effective_upload_body_witness_revision);
+crate::heap_layout_bound::fields!(PendingIndexFinalization; index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys);
