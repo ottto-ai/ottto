@@ -964,8 +964,19 @@ pub(crate) fn bounded_command_stdout(
     arguments: &[&str],
     maximum: usize,
 ) -> Option<Vec<u8>> {
+    bounded_command_stdout_with_env(program, arguments, maximum, &[])
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn bounded_command_stdout_with_env(
+    program: &str,
+    arguments: &[&str],
+    maximum: usize,
+    environment: &[(&str, &str)],
+) -> Option<Vec<u8>> {
     let mut child = Command::new(program)
         .args(arguments)
+        .envs(environment.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -16059,6 +16059,17 @@ pub(crate) fn home_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
+/// Local display supplement only: never contributes billing/account evidence.
+pub(crate) fn claude_session_registrations() -> crate::claude_session_registrations::Registrations {
+    #[cfg(not(test))]
+    {
+        crate::claude_session_registrations::collect(&home_path(".claude/sessions"))
+    }
+    // Ordinary unit tests must not acquire the operator's provider state.
+    #[cfg(test)]
+    crate::claude_session_registrations::Registrations::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
