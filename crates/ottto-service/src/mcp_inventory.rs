@@ -29,7 +29,10 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+#[cfg(any(not(unix), test))]
+use std::process::{Child, Stdio};
+#[cfg(not(unix))]
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -42,9 +45,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many servers are harvested concurrently. Bounds parallel subprocess
-/// fan-out (one stdio child + one reader thread each) while keeping a slow/cold
+/// fan-out (one stdio child per existing server worker) while keeping a slow/cold
 /// server from serializing the whole cycle: wall-clock ≈ ⌈servers/K⌉ × timeout.
-const MCP_HARVEST_MAX_CONCURRENCY: usize = 4;
+pub(crate) const MCP_HARVEST_MAX_CONCURRENCY: usize = 4;
 
 /// Soft per-cycle wall-clock budget. Once a cycle exceeds it the harvest stops
 /// launching new server probes and reports `throttled` (and skips the upload of a
@@ -646,9 +649,9 @@ impl SpawnEnv {
 }
 
 /// Run `initialize` + `tools/list` against a stdio MCP server and return its
-/// tool definitions. A handshake-thread + channel keeps the bounded wait off
-/// the sync thread; the child is always killed on timeout or error so no
-/// process is leaked.
+/// tool definitions. The non-Unix fallback retains the threaded handshake.
+/// Unix uses the existing server worker and explicit child/pipe ownership below.
+#[cfg(not(unix))]
 fn harvest_stdio(
     command: &str,
     args: &[String],
@@ -685,7 +688,9 @@ fn harvest_stdio(
     std::thread::Builder::new()
         .name("ottto-mcp-handshake".to_string())
         .spawn(move || {
-            let _ = tx.send(run_stdio_handshake(stdin, stdout));
+            let mut stdin = stdin;
+            let mut reader = BufReader::new(stdout);
+            let _ = tx.send(run_stdio_handshake(&mut stdin, &mut reader));
         })
         .map_err(|error| anyhow!("spawn mcp handshake thread failed: {error}"))?;
 
@@ -707,6 +712,79 @@ fn harvest_stdio(
     }
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct McpProbeDeferred(crate::claude_spawn_gate::ClaudeSpawnRefusal);
+
+#[cfg(unix)]
+impl std::fmt::Display for McpProbeDeferred {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "mcp probe deferred: {}", self.0.code())
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for McpProbeDeferred {}
+
+#[cfg(unix)]
+fn harvest_stdio(
+    command: &str,
+    args: &[String],
+    env: &SpawnEnv,
+    cwd: Option<&str>,
+    config_dir: Option<&Path>,
+    server_env: &BTreeMap<String, String>,
+    claude_login: Option<&ottto_core::ClaudeConfigDirSlot>,
+) -> Result<Vec<McpToolInput>> {
+    harvest_stdio_bounded(
+        command,
+        args,
+        env,
+        cwd,
+        config_dir,
+        server_env,
+        claude_login,
+        HANDSHAKE_TIMEOUT,
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn harvest_stdio_bounded(
+    command: &str,
+    args: &[String],
+    env: &SpawnEnv,
+    cwd: Option<&str>,
+    config_dir: Option<&Path>,
+    server_env: &BTreeMap<String, String>,
+    claude_login: Option<&ottto_core::ClaudeConfigDirSlot>,
+    timeout: Duration,
+) -> Result<Vec<McpToolInput>> {
+    use crate::claude_spawn_gate::probe::{ChildProbe, Origin, Reader, StartError, Writer};
+    let deadline = Instant::now() + timeout.min(HANDSHAKE_TIMEOUT);
+    let command = env.command_in(command, args, cwd, config_dir, server_env);
+    let mut child = ChildProbe::spawn(command, claude_login, Origin::McpInventory, deadline)
+        .map_err(|error| match error {
+            StartError::Refused(refusal) => anyhow::Error::new(McpProbeDeferred(refusal)),
+            StartError::Io(error) => anyhow!("spawn mcp server failed: {error}"),
+        })?;
+    // Borrow both endpoints from the guard. On every failure the same child
+    // and pipes remain available to the prestarted refresh-safe cleanup owner.
+    let (stdin, stdout) = child.stdin_stdout();
+    let result = run_stdio_handshake(
+        &mut Writer(stdin, deadline),
+        &mut BufReader::new(Reader(stdout, deadline)),
+    );
+    let timed_out = Instant::now() >= deadline;
+    child.finish(deadline);
+    if timed_out {
+        Err(anyhow!("mcp handshake timed out"))
+    } else {
+        result
+    }
+}
+
+#[cfg(any(not(unix), test))]
 fn reap_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -715,6 +793,7 @@ fn reap_child(child: &mut Child) {
 /// Stop a probed server. A Claude Code server is stopped through the shared
 /// `claude_spawn_gate::stop_claude_child`, which never kills it while that
 /// could cut its login's token refresh short.
+#[cfg(any(not(unix), test))]
 fn reap_unless_refreshing(
     mut child: Child,
     claude_login: Option<&ottto_core::ClaudeConfigDirSlot>,
@@ -772,17 +851,15 @@ fn claude_login_of_server(
 /// `tools/list`, reading newline-delimited JSON-RPC responses and matching them
 /// by request id. Tolerates interleaved server-initiated messages.
 fn run_stdio_handshake(
-    mut stdin: std::process::ChildStdin,
-    stdout: std::process::ChildStdout,
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
 ) -> Result<Vec<McpToolInput>> {
-    let mut reader = BufReader::new(stdout);
+    write_message(stdin, &initialize_request())?;
+    let _ = read_response(reader, 1)?;
 
-    write_message(&mut stdin, &initialize_request())?;
-    let _ = read_response(&mut reader, 1)?;
-
-    write_message(&mut stdin, &initialized_notification())?;
-    write_message(&mut stdin, &tools_list_request())?;
-    let response = read_response(&mut reader, 2)?;
+    write_message(stdin, &initialized_notification())?;
+    write_message(stdin, &tools_list_request())?;
+    let response = read_response(reader, 2)?;
 
     Ok(parse_tools(&response))
 }
@@ -826,10 +903,9 @@ fn write_message(stdin: &mut impl Write, message: &Value) -> Result<()> {
 /// matched id surfaces as an error.
 //
 // TODO(mcp-line-cap): `read_line` is unbounded, so a pathological server could
-// buffer one giant line into the heap. It is bounded in time by HANDSHAKE_TIMEOUT
-// (the handshake thread is abandoned and the child killed) and observable via the
-// `mcp_harvest_metrics` peak-RSS field; a byte cap is a safe follow-up, not done
-// here to avoid mid-stream truncation risk under release pressure.
+// buffer one giant line into the heap. Unix pipe reads/writes obey the handshake
+// deadline, but active response allocation and parsing cost remain unbounded.
+// A raw-byte policy is a separate decision; do not silently truncate a response.
 fn read_response(reader: &mut impl BufRead, expected_id: i64) -> Result<Value> {
     let mut line = String::new();
     loop {
@@ -933,7 +1009,7 @@ fn harvest_server(
                         Some(slot)
                     }
                 };
-            harvest_stdio(
+            let result = harvest_stdio(
                 command,
                 args,
                 env,
@@ -941,8 +1017,16 @@ fn harvest_server(
                 server.config_dir.as_deref(),
                 server_env,
                 claude_login.as_ref(),
-            )
-            .ok()
+            );
+            #[cfg(unix)]
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.downcast_ref::<McpProbeDeferred>().is_some())
+            {
+                return (unreachable_server(server, loading_mode), true);
+            }
+            result.ok()
         }
         // TODO(mcp-http-transport): implement Streamable HTTP + SSE handshakes.
         // Until then network servers are reported unreachable (cost zero) rather
@@ -1578,11 +1662,227 @@ fn harvest_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::claude_spawn_gate::test_support::{set_probe_fault, ProbeFault, ProbeFixture};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    fn probe_mcp(
+        fixture: &ProbeFixture,
+        protected: bool,
+        timeout: Duration,
+    ) -> Result<Vec<McpToolInput>> {
+        let login = ottto_core::ClaudeConfigDirSlot::Default;
+        harvest_stdio_bounded(
+            fixture.script.to_str().unwrap(),
+            &[],
+            &SpawnEnv {
+                path: None,
+                provider: BTreeMap::new(),
+            },
+            None,
+            None,
+            &BTreeMap::new(),
+            protected.then_some(&login),
+            timeout,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn probe_mcp_preserves_large_schema_interleaving_and_eof_framing() {
+        let schema = json!({"type":"object", "properties":{"text":{"type":"string", "description":"λ".repeat(600_000)}}});
+        let response = json!({"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"fixture","description":"complete","inputSchema":schema}]}}).to_string();
+        let fixture = ProbeFixture::new("probe-mcp-fidelity", "mcp", response.as_bytes(), 0);
+        fs::write(fixture.fake.root.join("initialize"), "banner\r\n\n{\"jsonrpc\":\"2.0\",\"method\":\"notice\"}\n{\"id\":99,\"result\":{}}\n{\"id\":1,\"result\":{}}\n").unwrap();
+        let tools = probe_mcp(&fixture, true, Duration::from_secs(3)).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "fixture");
+        assert_eq!(tools[0].description, "complete");
+        assert_eq!(tools[0].input_schema, schema);
+        let requests: Vec<Value> = fs::read_to_string(fixture.fake.root.join("requests"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            requests,
+            [
+                initialize_request(),
+                initialized_notification(),
+                tools_list_request()
+            ]
+        );
+        fixture.wait_settled();
+        assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn probe_mcp_prelaunch_failures_create_no_child_or_reservation() {
+        for fault in [ProbeFault::Prepare, ProbeFault::WorkerStart] {
+            let fixture = ProbeFixture::new("probe-mcp-no-launch", "protected", &[], 0);
+            set_probe_fault(fault);
+            assert!(probe_mcp(&fixture, true, Duration::from_secs(1)).is_err());
+            assert!(!fixture.fake.root.join("direct").exists());
+            assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
+        }
+        let fixture = ProbeFixture::new("probe-mcp-spawn-error", "protected", &[], 0);
+        fs::remove_file(&fixture.script).unwrap();
+        assert!(probe_mcp(&fixture, true, Duration::from_secs(1)).is_err());
+        assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn probe_mcp_io_errors_retain_protected_child_and_pipes() {
+        for fault in [ProbeFault::Read, ProbeFault::Write] {
+            let fixture = ProbeFixture::new("probe-mcp-io-error", "protected", &[], 0);
+            set_probe_fault(fault);
+            let started = Instant::now();
+            assert!(probe_mcp(&fixture, true, Duration::from_secs(1)).is_err());
+            assert!(started.elapsed() < Duration::from_secs(2));
+            fixture.wait_started();
+            assert!(ProbeFixture::alive(fixture.pid("direct")));
+            assert_eq!(crate::claude_spawn_gate::probe::active_count(), 1);
+            for _ in 0..10 {
+                let error = probe_mcp(&fixture, true, Duration::from_secs(1))
+                    .err()
+                    .unwrap();
+                assert!(error.downcast_ref::<McpProbeDeferred>().is_some());
+            }
+            fixture.release();
+            fixture.wait_settled();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn probe_mcp_deadline_covers_blocked_write_and_inherited_stdout() {
+        for (mode, fill) in [("sleep", true), ("hold-exit", false)] {
+            let fixture = ProbeFixture::new("probe-mcp-deadline", mode, &[], 0);
+            if fill {
+                set_probe_fault(ProbeFault::FillStdin);
+            }
+            let started = Instant::now();
+            assert!(probe_mcp(&fixture, false, Duration::from_millis(500))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("timed out"));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            fixture.wait_started();
+            assert!(!ProbeFixture::alive(fixture.pid("direct")));
+            if fill {
+                assert!(crate::claude_spawn_gate::test_support::probe_write_waits() > 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn probe_mcp_protected_deadline_defers_busy_inventory_until_safe() {
+        let fixture = ProbeFixture::new("probe-mcp-lock", "protected", &[], 0);
+        let started = Instant::now();
+        assert!(probe_mcp(&fixture, true, Duration::from_millis(500))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        fixture.wait_started();
+        assert!(ProbeFixture::alive(fixture.pid("direct")));
+        // Admission ignores an old lock, while stop protection still honors it.
+        fs::File::options()
+            .write(true)
+            .open(
+                fixture
+                    .fake
+                    .root
+                    .join(crate::claude_spawn_gate::REFRESH_LOCK_FILE),
+            )
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        let server = ConfiguredServer {
+            name: "synthetic".to_string(),
+            disabled: false,
+            config_dir: None,
+            transport: Transport::Stdio {
+                command: fixture.script.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: [("CLAUDE_CONFIG_DIR".to_string(), String::new())].into(),
+            },
+        };
+        for _ in 0..20 {
+            let (input, deferred) = harvest_server(
+                &server,
+                "unknown",
+                &SpawnEnv {
+                    path: None,
+                    provider: BTreeMap::new(),
+                },
+            );
+            assert!(deferred);
+            assert!(!input.reachable);
+            assert_eq!(crate::claude_spawn_gate::probe::active_count(), 1);
+        }
+        *fixture.policy.policy.credential.lock().unwrap() =
+            crate::claude_spawn_gate::ClaudeGateCredential::ReadFailed;
+        fs::remove_file(
+            fixture
+                .fake
+                .root
+                .join(crate::claude_spawn_gate::REFRESH_LOCK_FILE),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(550));
+        assert!(ProbeFixture::alive(fixture.pid("direct")));
+        assert_eq!(crate::claude_spawn_gate::probe::active_count(), 1);
+        fixture.release();
+        fixture.wait_settled();
+        assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "OS FD/thread measurements require an isolated test process"]
+    #[serial_test::serial]
+    fn probe_mcp_resource_measurement() {
+        use crate::claude_spawn_gate::test_support::probe_resources;
+        for mode in ["protected", "escaped"] {
+            let before = probe_resources();
+            {
+                let fixture = ProbeFixture::new("probe-mcp-resource", mode, &[], 0);
+                let budget = if mode == "escaped" {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_millis(500)
+                };
+                assert!(probe_mcp(&fixture, true, budget).is_err());
+                assert_eq!(crate::claude_spawn_gate::probe::active_count(), 1);
+                fixture.release();
+                fixture.wait_settled();
+            }
+            let end = Instant::now() + Duration::from_secs(2);
+            while probe_resources() != before && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let after = probe_resources();
+            println!("MCP_RESOURCE mode={mode} fds_before={} fds_after={} threads_before={} threads_after={} admitted=0", before.0,after.0,before.1,after.1);
+            assert_eq!(after, before);
+        }
+    }
 
     fn test_home(name: &str) -> PathBuf {
         let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
