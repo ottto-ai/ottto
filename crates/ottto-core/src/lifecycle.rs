@@ -3,7 +3,10 @@ use crate::local_service::{
     OTTTO_LEGACY_SERVICE_BINARY_NAME, OTTTO_SERVICE_BINARY_NAME,
 };
 #[cfg(target_os = "macos")]
-use crate::token_store::{ControlTokenStore, KeychainSecretStore};
+use crate::token_store::{
+    classify_security_cli_delete_output, ControlTokenStore, KeychainSecretStore,
+    SecurityCliDeleteOutcome,
+};
 use crate::{
     OTTTO_KEYCHAIN_ACCOUNT, OTTTO_KEYCHAIN_SERVICE, OTTTO_LEGACY_KEYCHAIN_SERVICE,
     OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
@@ -583,19 +586,10 @@ fn delete_legacy_keychain_item(account: &'static str) -> Result<(), String> {
         ])
         .output()
         .map_err(|error| error.to_string())?;
-    if output.status.success()
-        || keychain_delete_reports_missing(output.status.code(), &output.stderr)
-    {
-        return Ok(());
+    match classify_security_cli_delete_output(&output) {
+        SecurityCliDeleteOutcome::Removed | SecurityCliDeleteOutcome::Missing => Ok(()),
+        SecurityCliDeleteOutcome::Failed(message) => Err(message),
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let message = if stderr.is_empty() { stdout } else { stderr };
-    Err(if message.is_empty() {
-        format!("security exited with status {}", output.status)
-    } else {
-        message
-    })
 }
 
 /// Deletes every generic-password item under `service`, regardless of account.
@@ -614,39 +608,22 @@ fn purge_keychain_service(service: &str) -> Result<usize, String> {
             .args(["delete-generic-password", "-s", service])
             .output()
             .map_err(|error| error.to_string())?;
-        if output.status.success() {
-            removed += 1;
-            // Defensive cap: a single service should never hold this many items.
-            // Bail rather than spin forever if `security` ever reports success
-            // without actually removing an item.
-            if removed >= 1024 {
-                return Err(format!(
-                    "stopped after removing {removed} items from {service} (possible runaway)"
-                ));
+        match classify_security_cli_delete_output(&output) {
+            SecurityCliDeleteOutcome::Removed => {
+                removed += 1;
+                // Defensive cap: a single service should never hold this many items.
+                // Bail rather than spin forever if `security` ever reports success
+                // without actually removing an item.
+                if removed >= 1024 {
+                    return Err(format!(
+                        "stopped after removing {removed} items from {service} (possible runaway)"
+                    ));
+                }
             }
-            continue;
+            SecurityCliDeleteOutcome::Missing => return Ok(removed),
+            SecurityCliDeleteOutcome::Failed(message) => return Err(message),
         }
-        if keychain_delete_reports_missing(output.status.code(), &output.stderr) {
-            return Ok(removed);
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let message = if stderr.is_empty() { stdout } else { stderr };
-        return Err(if message.is_empty() {
-            format!("security exited with status {}", output.status)
-        } else {
-            message
-        });
     }
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_delete_reports_missing(exit_code: Option<i32>, stderr: &[u8]) -> bool {
-    if exit_code == Some(44) {
-        return true;
-    }
-    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
-    stderr.contains("could not be found") || stderr.contains("item not found")
 }
 
 #[cfg(not(target_os = "macos"))]

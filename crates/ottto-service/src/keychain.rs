@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use ottto_core::token_store::{classify_security_cli_delete_output, SecurityCliDeleteOutcome};
 use ottto_protocol::SourceKind;
 use std::fmt;
 use std::fs;
@@ -507,29 +509,11 @@ fn keychain_delete_with_security_cli(service: &str, key_id: &str) -> Result<bool
         .args(["delete-generic-password", "-s", service, "-a", key_id])
         .output()
         .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        return Ok(true);
+    match classify_security_cli_delete_output(&output) {
+        SecurityCliDeleteOutcome::Removed => Ok(true),
+        SecurityCliDeleteOutcome::Missing => Ok(false),
+        SecurityCliDeleteOutcome::Failed(message) => Err(message),
     }
-    if security_cli_delete_reports_missing(output.status.code(), &output.stderr) {
-        return Ok(false);
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let message = if stderr.is_empty() { stdout } else { stderr };
-    Err(if message.is_empty() {
-        format!("security exited with status {}", output.status)
-    } else {
-        message
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn security_cli_delete_reports_missing(exit_code: Option<i32>, stderr: &[u8]) -> bool {
-    if exit_code == Some(44) {
-        return true;
-    }
-    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
-    stderr.contains("could not be found") || stderr.contains("item not found")
 }
 
 #[cfg(target_os = "macos")]
@@ -540,26 +524,18 @@ fn delete_all_keychain_secrets_for_service(service: &str) -> Result<usize, Strin
             .args(["delete-generic-password", "-s", service])
             .output()
             .map_err(|error| error.to_string())?;
-        if output.status.success() {
-            removed += 1;
-            if removed >= KEYCHAIN_SERVICE_SWEEP_LIMIT {
-                return Err(format!(
-                    "stopped after {removed} deletes; service still has matching items"
-                ));
+        match classify_security_cli_delete_output(&output) {
+            SecurityCliDeleteOutcome::Removed => {
+                removed += 1;
+                if removed >= KEYCHAIN_SERVICE_SWEEP_LIMIT {
+                    return Err(format!(
+                        "stopped after {removed} deletes; service still has matching items"
+                    ));
+                }
             }
-            continue;
+            SecurityCliDeleteOutcome::Missing => return Ok(removed),
+            SecurityCliDeleteOutcome::Failed(message) => return Err(message),
         }
-        if security_cli_delete_reports_missing(output.status.code(), &output.stderr) {
-            return Ok(removed);
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let message = if stderr.is_empty() { stdout } else { stderr };
-        return Err(if message.is_empty() {
-            format!("security exited with status {}", output.status)
-        } else {
-            message
-        });
     }
 }
 
