@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 467,
-  "content_sha256": "e12bef055a307a482a5a3e8e22a864f7f94cdcb9b5f424e305248c6305f3701e",
+  "candidate_file_count": 469,
+  "content_sha256": "ed8e4783f6f938bb6b3e364b8b40b9bdaf34a101800363dad8d1675e8660b7b2",
   "files": [
     {
       "executable": false,
@@ -720,8 +720,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_local_otel.rs",
-      "sha256": "3f27df0c7fca93cebddcaef06dca379b71b8a349b9ebe25a16c05a32b882ae97",
-      "size_bytes": 96729
+      "sha256": "74e72ab760c5eada0fca641244f00f17c4a0dfb604c78e61c88133bc3c75366a",
+      "size_bytes": 96774
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/claude_local_otel/support_health.rs",
+      "sha256": "e01883ccc924e29c447083fa5c5010cc1823794591812983c3c8ea56fbe3e1c0",
+      "size_bytes": 29629
     },
     {
       "executable": false,
@@ -888,8 +895,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "7f1c65200a6615ee5bc60534a95237bc565f516ad83b8030d350fb7f145209d9",
-      "size_bytes": 343225
+      "sha256": "bdbc93ccc959c7694b531d0c2002d8397ff7cb07536630bf00dd7b51bc81a91d",
+      "size_bytes": 344485
     },
     {
       "executable": false,
@@ -1189,8 +1196,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/diagnostics.md",
-      "sha256": "9d8ec479bdd46f2f9594864387b7d5506463147f17244092bc8806694bd663fb",
-      "size_bytes": 4830
+      "sha256": "2661289708e524736bf7bb2587151010ef6942ff16247cfb9e2566b123317b74",
+      "size_bytes": 6095
     },
     {
       "executable": false,
@@ -2185,6 +2192,13 @@
       "path": "docs/session-2026-10-06-owned-source-rotation.md",
       "sha256": "fc07a1d81b7fd726107d4a1c13cb94b557f10c8ef17181b2c56c687c8d9fd359",
       "size_bytes": 3208
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-07-claude-evidence-support-health.md",
+      "sha256": "fd3c1f0a1eba991615a7ff13c87d43c4f0a01e116296c5b03a8bfa617ef6ca46",
+      "size_bytes": 1934
     },
     {
       "executable": false,
@@ -3272,9 +3286,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-06T22:40:10+00:00",
+  "generated_at": "2026-10-06T22:57:02+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 468,
+  "output_file_count": 470,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3311,5 +3325,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "17da5611340c8629249836ec493e3d9bd7a2aa9e"
+  "source_commit": "c7027afc409c219996a619c7d70feb06ddf2aa6a"
 }
