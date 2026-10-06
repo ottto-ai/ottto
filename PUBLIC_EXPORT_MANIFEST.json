@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 445,
-  "content_sha256": "4fabc0e208a155267d0dfc391ac51ac216a6be62ccaf59a774cbbd4fc5fcadef",
+  "candidate_file_count": 447,
+  "content_sha256": "0b0c692384dacf23d85dd31d36683f3df83bf06fdf88ba58d94d5b83686da1ee",
   "files": [
     {
       "executable": false,
@@ -733,6 +733,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/codex_scan_diagnostics.rs",
+      "sha256": "0f50bf5541fe89bab55b0e48d17ac39be8684f581fc62572c927846540a98c9c",
+      "size_bytes": 9704
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/command_env.rs",
       "sha256": "36becb714c0fd5c145ed3a2a64f8e423947d849e72a175752a62af2b7df61f00",
       "size_bytes": 24727
@@ -839,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "51c4dcd03890c8297ef1ed216927bb9a295cb992af65bea76c7130498d51f814",
-      "size_bytes": 342937
+      "sha256": "73ecad886c6bd2a362d420d279e05962f07c0c0a5dfc82756f3bb96a731cf69b",
+      "size_bytes": 342965
     },
     {
       "executable": false,
@@ -944,8 +951,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "250a9ab57fdb40fbe55853975542a4d0cb30301621a111fcc81c13b9179a1624",
-      "size_bytes": 661733
+      "sha256": "1dbd433a9279e15f19c5291349e900e6848c631165ae350f77496eb28d63db08",
+      "size_bytes": 669372
     },
     {
       "executable": false,
@@ -958,8 +965,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "c6cc35629ea36e3a3cd315fc684152724ee9dfcfc0d4f7c3f61f2eeb6d150585",
-      "size_bytes": 2167280
+      "sha256": "404c95d3ad63c60ebef0ff282323daab2947802940e0905e572c8ab62751438e",
+      "size_bytes": 2184372
     },
     {
       "executable": false,
@@ -2042,6 +2049,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-06-codex-recovery-diagnostics.md",
+      "sha256": "d566e943046fa278f36843ca4d431a5ba28263cac835693ef5250fabf0e0dba3",
+      "size_bytes": 4217
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-06-owned-source-rotation.md",
       "sha256": "fc07a1d81b7fd726107d4a1c13cb94b557f10c8ef17181b2c56c687c8d9fd359",
       "size_bytes": 3208
@@ -3120,7 +3134,7 @@
   ],
   "generated_at": "2026-10-05T20:51:12+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 446,
+  "output_file_count": 448,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
