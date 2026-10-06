@@ -21354,6 +21354,10 @@ fn normalize_display_title(value: String, source: &str) -> Option<String> {
     }
 }
 
+pub(crate) fn claude_registration_display_title(value: String) -> Option<String> {
+    normalize_display_title(value, "custom_title")
+}
+
 fn first_prompt_display_title(source: SnapshotSource, value: String) -> Option<String> {
     let raw = value.trim();
     if raw.is_empty()

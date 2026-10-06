@@ -33,6 +33,10 @@ struct ActiveSessionCache {
     watermarks: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reconciliation: Option<ActiveSessionReconciliation>,
+    /// Allowlisted provenance for a display supplement; not part of the wire.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    registration_evidence:
+        BTreeMap<String, crate::claude_session_registrations::RegistrationEvidence>,
 }
 
 pub fn active_session_cache_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
@@ -55,6 +59,24 @@ pub fn reconcile_active_sessions(
     agent_status: Option<&AgentStatusSnapshot>,
     reconciled_at: &str,
 ) -> Result<ActiveSessionReconciliation> {
+    reconcile_with_registrations(
+        support_dir,
+        source,
+        snapshots,
+        agent_status,
+        reconciled_at,
+        crate::agent_status::claude_session_registrations,
+    )
+}
+
+fn reconcile_with_registrations(
+    support_dir: &Path,
+    source: SnapshotSource,
+    snapshots: &[SnapshotItem],
+    agent_status: Option<&AgentStatusSnapshot>,
+    reconciled_at: &str,
+    registrations: impl FnOnce() -> crate::claude_session_registrations::Registrations,
+) -> Result<ActiveSessionReconciliation> {
     let path = active_session_cache_path(support_dir, source);
     let mut cache = read_cache(&path);
     let now = OffsetDateTime::parse(reconciled_at, &Rfc3339)
@@ -63,6 +85,7 @@ pub fn reconcile_active_sessions(
     let watermark_cutoff = now - Duration::days(WATERMARK_RETENTION_DAYS);
 
     let mut changed = BTreeMap::<String, ActiveSession>::new();
+    let mut selected_snapshots = BTreeMap::new();
     for snapshot in snapshots {
         let Some(last_activity) = snapshot.source_last_activity_at.as_deref() else {
             continue;
@@ -84,6 +107,7 @@ pub fn reconcile_active_sessions(
                 snapshot.source_session_id.clone(),
                 active_session_from_snapshot(source, snapshot, agent_status),
             );
+            selected_snapshots.insert(snapshot.source_session_id.clone(), snapshot);
         }
         if advanced {
             cache.watermarks.insert(
@@ -124,6 +148,71 @@ pub fn reconcile_active_sessions(
             .then_with(|| left.source_session_id.cmp(&right.source_session_id))
     });
     sessions.truncate(MAX_ACTIVE_SESSIONS);
+    cache.registration_evidence.clear();
+    if source == SnapshotSource::ClaudeCode && !sessions.is_empty() {
+        let registrations = registrations();
+        for session in &mut sessions {
+            let Some(snapshot) = selected_snapshots.get(&session.source_session_id) else {
+                continue;
+            };
+            // Parent-stamped subagents must retain their independent labels.
+            if session.session_kind.as_deref() == Some("subagent")
+                || snapshot
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.is_sidechain == Some(true))
+            {
+                continue;
+            }
+            let Some(registration) = registrations.get(&session.source_session_id) else {
+                continue;
+            };
+            let mut evidence = crate::claude_session_registrations::RegistrationEvidence {
+                name_source: None,
+                entrypoint: None,
+                process_witness: "pid_start_match".to_string(),
+            };
+            // A policy-cleared title has no consent witness. Intentional or
+            // provenance-unknown existing names always win; never compare
+            // unrelated rename/process clocks to manufacture precedence.
+            let generated = matches!(
+                snapshot.session_display_name_source.as_deref(),
+                Some("first_prompt" | "ai_title" | "summary")
+            );
+            if snapshot.session_display_name.is_some()
+                && generated
+                && matches!(
+                    registration.name_source.as_deref(),
+                    Some("user" | "auto" | "derived")
+                )
+            {
+                if let Some(name) = &registration.name {
+                    session.session_display_name = Some(name.clone());
+                    evidence.name_source = registration.name_source.clone();
+                }
+            }
+            if session.provider_surface.is_none() {
+                session.provider_surface = registration
+                    .entrypoint
+                    .as_deref()
+                    .and_then(|value| match value {
+                        "claude-desktop" => Some("claude_desktop"),
+                        "cli" => Some("claude_cli"),
+                        "sdk-cli" => Some("claude_sdk"),
+                        _ => None,
+                    })
+                    .map(str::to_string);
+                if session.provider_surface.is_some() {
+                    evidence.entrypoint = registration.entrypoint.clone();
+                }
+            }
+            if evidence.name_source.is_some() || evidence.entrypoint.is_some() {
+                cache
+                    .registration_evidence
+                    .insert(session.source_session_id.clone(), evidence);
+            }
+        }
+    }
     let reconciliation = ActiveSessionReconciliation {
         reconciled_at: reconciled_at.to_string(),
         changed_session_count,
@@ -146,7 +235,24 @@ fn active_session_from_snapshot(
     ActiveSession {
         source_session_id: snapshot.source_session_id.clone(),
         session_display_name: snapshot.session_display_name.clone(),
-        source_started_at: snapshot.source_started_at.clone(),
+        source_started_at: snapshot
+            .source_started_at
+            .as_deref()
+            .filter(|started| {
+                if source != SnapshotSource::ClaudeCode {
+                    return true;
+                }
+                let Ok(started) = OffsetDateTime::parse(started, &Rfc3339) else {
+                    return false;
+                };
+                started >= OffsetDateTime::UNIX_EPOCH
+                    && snapshot
+                        .source_last_activity_at
+                        .as_deref()
+                        .and_then(|last| OffsetDateTime::parse(last, &Rfc3339).ok())
+                        .is_some_and(|last| started <= last)
+            })
+            .map(str::to_string),
         source_last_activity_at: snapshot
             .source_last_activity_at
             .clone()
@@ -796,6 +902,256 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn native_transcript_dates_remain_activity_span_across_timezone_and_resume() {
+        let dir = temp_dir("registration-native-dates");
+        let path = dir.join("registered-session.jsonl");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rows = [
+            serde_json::json!({"timestamp":"2026-07-18T12:00:00+03:00","sessionId":"registered-session","type":"user","message":{"role":"user","content":"Repair startup"}}),
+            serde_json::json!({"timestamp":"2026-07-19T10:04:00Z","sessionId":"registered-session","type":"assistant","requestId":"fixture-request","message":{"id":"fixture-message","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":2}}}),
+        ];
+        std::fs::write(
+            &path,
+            rows.iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let snapshots = crate::snapshots::parse_claude_code_jsonl_file(
+            &path,
+            "2026-07-19T10:05:00Z",
+            "fixture-fingerprint".into(),
+        )
+        .unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0].source_started_at.as_deref(),
+            Some("2026-07-18T12:00:00+03:00")
+        );
+        assert_eq!(
+            snapshots[0].source_last_activity_at.as_deref(),
+            Some("2026-07-19T10:04:00Z")
+        );
+        assert!(snapshots[0].source_ended_at.is_none());
+        let result = reconcile_with_registrations(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            &snapshots,
+            None,
+            "2026-07-19T10:05:00Z",
+            registrations,
+        )
+        .unwrap();
+        assert_eq!(
+            result.sessions[0].source_started_at,
+            snapshots[0].source_started_at
+        );
+        assert_eq!(
+            result.sessions[0].source_last_activity_at,
+            "2026-07-19T10:04:00Z"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn local_activity_start_rejects_invalid_negative_and_inverted_dates() {
+        let mut snapshot = test_snapshot("date-session", "2026-07-19T10:04:00Z");
+        for value in ["not-a-date", "1969-12-31T23:59:59Z", "2026-07-20T10:00:00Z"] {
+            snapshot.source_started_at = Some(value.to_string());
+            assert!(
+                active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, None)
+                    .source_started_at
+                    .is_none()
+            );
+        }
+        snapshot.source_started_at = Some("2026-07-19T13:03:00+03:00".into());
+        assert_eq!(
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, None)
+                .source_started_at,
+            snapshot.source_started_at
+        );
+    }
+
+    fn registrations() -> crate::claude_session_registrations::Registrations {
+        BTreeMap::from([(
+            "registered-session".to_string(),
+            crate::claude_session_registrations::Registration {
+                name: Some("Repair process registration".to_string()),
+                name_source: Some("user".to_string()),
+                entrypoint: Some("claude-desktop".to_string()),
+            },
+        )])
+    }
+
+    #[test]
+    fn registrations_enrich_local_rows_without_changing_snapshots_dates_or_accounting() {
+        let dir = temp_dir("registration-local");
+        let mut snapshot = test_snapshot("registered-session", "2026-07-19T10:04:00Z");
+        snapshot.session_display_name_source = Some("first_prompt".to_string());
+        snapshot.origin = None;
+        let original = serde_json::to_value(&snapshot).unwrap();
+        let result = reconcile_with_registrations(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&snapshot),
+            None,
+            "2026-07-19T10:05:00Z",
+            registrations,
+        )
+        .unwrap();
+        let row = &result.sessions[0];
+        assert_eq!(
+            row.session_display_name.as_deref(),
+            Some("Repair process registration")
+        );
+        assert_eq!(row.provider_surface.as_deref(), Some("claude_desktop"));
+        assert_eq!(row.source_started_at, snapshot.source_started_at);
+        assert_eq!(
+            row.source_last_activity_at,
+            snapshot.source_last_activity_at.clone().unwrap()
+        );
+        assert_eq!(row.input_tokens, Some(snapshot.input_tokens));
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), original);
+        let cache = read_cache(&active_session_cache_path(&dir, SnapshotSource::ClaudeCode));
+        assert_eq!(
+            cache.registration_evidence["registered-session"]
+                .name_source
+                .as_deref(),
+            Some("user")
+        );
+        assert!(serde_json::to_value(result)
+            .unwrap()
+            .get("registration_evidence")
+            .is_none());
+        let unchanged = reconcile_with_registrations(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            &[snapshot],
+            None,
+            "2026-07-19T10:10:00Z",
+            || panic!("no registration acquisition without new activity"),
+        )
+        .unwrap();
+        assert_eq!(unchanged.changed_session_count, 0);
+        assert!(
+            read_cache(&active_session_cache_path(&dir, SnapshotSource::ClaudeCode))
+                .registration_evidence
+                .is_empty()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_snapshots_use_the_selected_rows_title_provenance() {
+        let dir = temp_dir("registration-selected-title");
+        let mut older = test_snapshot("registered-session", "2026-07-19T10:03:00Z");
+        older.session_display_name_source = Some("first_prompt".into());
+        let mut newer = test_snapshot("registered-session", "2026-07-19T10:04:00Z");
+        newer.session_display_name = Some("Intentional native title".into());
+        newer.session_display_name_source = Some("transcript_title".into());
+        let result = reconcile_with_registrations(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            &[older, newer],
+            None,
+            "2026-07-19T10:05:00Z",
+            registrations,
+        )
+        .unwrap();
+        assert_eq!(
+            result.sessions[0].session_display_name.as_deref(),
+            Some("Intentional native title")
+        );
+        assert_eq!(
+            result.sessions[0].source_last_activity_at,
+            "2026-07-19T10:04:00Z"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn registrations_preserve_intentional_names_policy_and_children() {
+        for title_source in [
+            Some("transcript_title"),
+            Some("desktop_title"),
+            Some("agent_label"),
+            None,
+        ] {
+            let dir = temp_dir("registration-precedence");
+            let mut snapshot = test_snapshot("registered-session", "2026-07-19T10:04:00Z");
+            snapshot.session_display_name_source = title_source.map(str::to_string);
+            if title_source.is_none() {
+                snapshot.session_display_name = None;
+            }
+            let result = reconcile_with_registrations(
+                &dir,
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&snapshot),
+                None,
+                "2026-07-19T10:05:00Z",
+                registrations,
+            )
+            .unwrap();
+            assert_eq!(
+                result.sessions[0].session_display_name,
+                snapshot.session_display_name
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        let dir = temp_dir("registration-child");
+        let mut snapshot = test_snapshot("registered-session", "2026-07-19T10:04:00Z");
+        snapshot.session_display_name_source = Some("first_prompt".into());
+        snapshot.origin = Some(crate::snapshots::SnapshotOrigin {
+            is_sidechain: Some(true),
+            ..Default::default()
+        });
+        let result = reconcile_with_registrations(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&snapshot),
+            None,
+            "2026-07-19T10:05:00Z",
+            registrations,
+        )
+        .unwrap();
+        assert_eq!(
+            result.sessions[0].session_display_name,
+            snapshot.session_display_name
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_registrations_preserve_transcript_fallback_and_never_create_active_rows() {
+        let dir = temp_dir("registration-missing");
+        let snapshot = test_snapshot("registered-session", "2026-07-19T10:04:00Z");
+        let result = reconcile_with_registrations(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&snapshot),
+            None,
+            "2026-07-19T10:05:00Z",
+            BTreeMap::new,
+        )
+        .unwrap();
+        assert_eq!(
+            result.sessions[0].session_display_name,
+            snapshot.session_display_name
+        );
+        let empty = reconcile_with_registrations(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            &[],
+            None,
+            "2026-07-19T10:10:00Z",
+            || panic!("no registry scan for empty source"),
+        )
+        .unwrap();
+        assert!(empty.sessions.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn temp_dir(name: &str) -> PathBuf {
