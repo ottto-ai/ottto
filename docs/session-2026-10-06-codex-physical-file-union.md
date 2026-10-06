@@ -66,6 +66,28 @@ captured facts: promotion requires that the accepted derivation covers those
 facts. The driver rechecks the current member objects
 and directory membership before send and checkpoint.
 
+All outgoing joined aliases also capture a versioned hash of the current
+physical member set, including standard-priced groups. This closes the crash
+between durable server ACK and local index promotion: losing a member after
+that crash holds a replacement rather than shrinking accepted usage. Pending
+membership is separate from applied membership and has no account authority.
+Fresh proof must include every previously protected physical path before
+superseding a pending set; expansion/rejection cannot forget an older member.
+Only the matching current common ACK and validated checkpoint clear it, so an
+older body's acknowledgement cannot clear newer pending membership.
+
+Pending membership is limited to the existing 32,768-file census bound per
+index, with owner-atomic refusal and no eviction. Each fixed marker contains
+one version prefix and 64 hex characters (87 bytes), below 2.8 MiB of marker
+values at that bound, plus existing file entry and hash-only owner metadata.
+Unknown versions or malformed markers preserve the index and hold the affected
+owner. There is no timeout that deletes protection. Missing required evidence
+must be restored with compatible source files and reader. All known members
+present with an independently valid native contribution chain can demonstrate
+a legitimate correction, including a lower total. If a member cannot return,
+recovery requires explicit review of complete replacement source evidence and
+a scoped index migration; this patch supplies no automatic reset or backfill.
+
 Each file retains at most 512 priority contributions. Applied and captured
 receipt serialization together is capped at 2 MiB per index. Replacement is
 file-owned; there is no age-based selector eviction or silent downgrade to
@@ -111,7 +133,8 @@ Synthetic native tests cover disjoint/copy decisions, overlap/gap/reset/ownershi
 holds, source mutation, legacy first-import reconciliation, exact tier replay,
 metadata loss and caps, capture disk/CAS/authority failures, the real loopback
 HTTP client and typed common ACK, crashes before POST and after durable ACK,
-trace expiry, lost responses and ordinary restart. Synthetic transport evidence
+trace expiry, lost responses and ordinary restart, pending membership expansion, stale ACKs and valid lower-total
+corrections. Synthetic transport evidence
 does not prove historical provider billing truth or installed backend behavior.
 This implementation does not dispatch a release, change a Druid cluster, replay
 historical data or introduce backend wire fields.

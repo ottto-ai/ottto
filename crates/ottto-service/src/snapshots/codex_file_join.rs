@@ -6,7 +6,7 @@ pub(super) const MAX_MEMBERS: usize = 32;
 pub(super) const MAX_RECORDS: usize = 50_000;
 pub(super) const MAX_HEADER_BYTES: usize = 64 * 1024;
 
-const MAX_HEADER_FILES: usize = 32_768;
+pub(super) const MAX_HEADER_FILES: usize = 32_768;
 const MAX_HEADER_READ_BYTES: usize = 32 * 1024 * 1024;
 pub(super) const MAX_GROUP_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -349,6 +349,14 @@ impl Validation {
 crate::heap_layout_bound::fields!(Group; owner, home, members);
 crate::heap_layout_bound::fields!(Validation; inventory, groups);
 
+pub(super) fn captured_join(witness: &str) -> String {
+    format!("codex_captured_join:v1:{witness}")
+}
+pub(super) fn valid_captured_join(value: &str) -> bool {
+    value
+        .strip_prefix("codex_captured_join:v1:")
+        .is_some_and(valid_codex_protected_owner)
+}
 pub(super) fn member_set_witness(members: &[CandidateFile]) -> String {
     let sorted = members
         .iter()
@@ -452,7 +460,9 @@ pub(super) fn receipt_state(entry: Option<&ScanIndexEntry>) -> (Option<AppliedTi
         && entry.codex_captured_tier_receipt.is_none())
         || (entry.codex_applied_tier_receipt_required
             && entry.codex_applied_tier_receipt.is_none())
-        || (entry.codex_captured_uncommitted && entry.codex_captured_tier_receipt.is_none());
+        || (entry.codex_captured_uncommitted
+            && entry.codex_captured_tier_receipt.is_none()
+            && entry.codex_captured_joined_member_set.is_none());
     let required = missing
         || entry.codex_captured_tier_receipt_required
         || entry.codex_applied_tier_receipt_required;
@@ -686,6 +696,7 @@ impl GroupReader {
             let key = local_index_key(&member.path);
             if let Some(entry) = index.files.get(&key) {
                 if entry.codex_joined_member_set.is_none()
+                    && entry.codex_captured_joined_member_set.is_none()
                     && entry.codex_applied_tier_receipt.is_none()
                     && entry.codex_captured_tier_receipt.is_none()
                 {
@@ -1435,6 +1446,7 @@ pub(super) mod tests {
             .validate(&result.snapshots)
             .unwrap();
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        result.finish_codex_capture_boundary(&mut index);
         let accepted = result
             .snapshots
             .iter()
@@ -1618,6 +1630,7 @@ pub(super) mod tests {
         let (root, _) = fixture();
         let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        result.finish_codex_capture_boundary(&mut index);
         let accepted = result
             .snapshots
             .iter()
@@ -1646,6 +1659,7 @@ pub(super) mod tests {
         let (root, _) = fixture();
         let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        result.finish_codex_capture_boundary(&mut index);
         let accepted = result
             .snapshots
             .iter()
@@ -1692,6 +1706,7 @@ pub(super) mod tests {
         let (mut index, mut result) = scan(&root, ScanIndex::default(), 4);
         assert!(result.snapshots.iter().all(|item| item.input_tokens == 400));
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        result.finish_codex_capture_boundary(&mut index);
         let accepted = result
             .snapshots
             .iter()
@@ -1882,6 +1897,7 @@ pub(super) mod tests {
         let (root, _) = fixture();
         let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        result.finish_codex_capture_boundary(&mut index);
         let accepted = result
             .snapshots
             .iter()
@@ -1916,6 +1932,7 @@ pub(super) mod tests {
         let (root, _) = fixture();
         let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        result.finish_codex_capture_boundary(&mut index);
         let accepted = result
             .snapshots
             .iter()
@@ -2135,6 +2152,7 @@ pub(super) mod tests {
         let root = native_join_fixture_root(true);
         let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        result.finish_codex_capture_boundary(&mut index);
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let healthy = "ffffffff-1111-4111-8111-ffffffffffff";
         let mut metadata = CodexTitleMetadata::default();
@@ -2218,19 +2236,25 @@ pub(super) mod tests {
             let (mut working, mut result) = scan(&root, ScanIndex::default(), 2);
             finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
             let (mut captured, changed, held) =
-                working.stage_codex_tier_capture(&ScanIndex::default(), &result.snapshots);
+                working.stage_codex_recovery_capture(&ScanIndex::default(), &result.snapshots);
             assert_eq!(changed.len(), 1);
             assert!(held.is_empty());
             let path = root.join("capture.json");
             captured.save(&path).unwrap();
-            let key = captured.files.keys().next().unwrap().clone();
+            let key = captured
+                .files
+                .iter()
+                .find(|(_, entry)| entry.codex_captured_tier_receipt_required)
+                .unwrap()
+                .0
+                .clone();
             let mut value = serde_json::to_value(&captured).unwrap();
             value["files"][&key]["codex_captured_tier_receipt"] = malformed;
             fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
             let loaded = ScanIndex::load(&path).unwrap();
             assert_eq!(
                 loaded.files.len(),
-                1,
+                2,
                 "receipt damage must not reset protected state"
             );
             fs::remove_file(root.join("logs_2.sqlite")).unwrap();
@@ -2273,7 +2297,7 @@ pub(super) mod tests {
         }
         let before = serde_json::to_vec(&previous).unwrap();
         let (captured, changed, held) =
-            working.stage_codex_tier_capture(&previous, &result.snapshots);
+            working.stage_codex_recovery_capture(&previous, &result.snapshots);
         assert!(changed.is_empty());
         assert_eq!(held.len(), 1);
         assert_eq!(serde_json::to_vec(&captured).unwrap(), before);
@@ -2304,7 +2328,7 @@ pub(super) mod tests {
         let (mut working, mut result) = scan(&root, previous.clone(), 2);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
         let (captured, changed, held) =
-            working.stage_codex_tier_capture(&previous, &result.snapshots);
+            working.stage_codex_recovery_capture(&previous, &result.snapshots);
         assert_eq!(changed.len(), 1);
         assert!(held.is_empty());
         let key = local_index_key(&path);
@@ -2319,7 +2343,7 @@ pub(super) mod tests {
         );
         for accepted in [&old_accepted, &BTreeSet::new()] {
             let mut rollback = captured.clone();
-            rollback.reconcile_codex_tier_settlement(&captured, accepted);
+            rollback.reconcile_codex_recovery_settlement(&captured, accepted);
             assert_eq!(
                 rollback.files[&key].codex_captured_tier_receipt,
                 captured.files[&key].codex_captured_tier_receipt
@@ -2335,7 +2359,7 @@ pub(super) mod tests {
                 .unwrap()
                 .codex_captured_tier_receipt = None;
             let mut rollback = damaged.clone();
-            rollback.reconcile_codex_tier_settlement(&damaged, accepted);
+            rollback.reconcile_codex_recovery_settlement(&damaged, accepted);
             assert!(rollback.files[&key].codex_captured_tier_receipt_required);
             assert!(rollback.files[&key].codex_captured_tier_receipt.is_none());
         }
@@ -2344,7 +2368,7 @@ pub(super) mod tests {
             .iter()
             .map(|item| item.snapshot_fingerprint.clone())
             .collect();
-        working.reconcile_codex_tier_settlement(&captured, &accepted);
+        working.reconcile_codex_recovery_settlement(&captured, &accepted);
         assert!(!working.files[&key].codex_captured_tier_receipt_required);
         assert_eq!(
             working.files[&key]
@@ -2355,6 +2379,125 @@ pub(super) mod tests {
                 .len(),
             2
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn pending_membership_expansion_loss_stale_ack_and_supported_correction() {
+        let root = native_join_fixture_root(false);
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let (mut first, mut result) = scan(&root, ScanIndex::default(), 3);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut first);
+        let old_accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let (pending, _, _) =
+            first.stage_codex_recovery_capture(&ScanIndex::default(), &result.snapshots);
+        assert_eq!(pending.files.len(), 2);
+        assert!(pending.current_snapshot_fingerprints().is_empty());
+        let text = member(owner, "r-c", 100, 400)
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap() + "\n")
+            .collect::<String>();
+        fs::write(root.join("sessions/c.jsonl"), text).unwrap();
+        let (mut expanded, mut result) = scan(&root, pending.clone(), 3);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut expanded);
+        assert_eq!(result.snapshots.len(), 3);
+        let (new_pending, changed, held) =
+            expanded.stage_codex_recovery_capture(&pending, &result.snapshots);
+        assert_eq!(changed.len(), 1);
+        assert!(held.is_empty());
+        assert_eq!(new_pending.files.len(), 3);
+        let mut stale = first.clone();
+        stale.reconcile_codex_recovery_settlement(&new_pending, &old_accepted);
+        for (key, entry) in &stale.files {
+            assert_eq!(
+                entry.codex_captured_joined_member_set,
+                new_pending.files[key].codex_captured_joined_member_set
+            );
+        }
+        fs::remove_file(root.join("sessions/b.jsonl")).unwrap();
+        let (held_index, held) = scan(&root, new_pending.clone(), 3);
+        assert!(held.snapshots.is_empty());
+        assert!(!held.census_complete);
+        assert_eq!(held_index.files.len(), 3);
+        // All known physical members present and independently proved: a real
+        // correction may replace usage, rather than waiting for a timeout.
+        let rows = member(owner, "r-b", 50, 150);
+        fs::write(
+            root.join("sessions/b.jsonl"),
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let rows = member(owner, "r-c", 100, 250);
+        fs::write(
+            root.join("sessions/c.jsonl"),
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let (mut corrected, mut result) = scan(&root, new_pending.clone(), 3);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut corrected);
+        assert_eq!(result.snapshots.len(), 3);
+        assert!(result.snapshots.iter().all(|item| item.input_tokens == 250));
+        let (capture, _, held) =
+            corrected.stage_codex_recovery_capture(&new_pending, &result.snapshots);
+        assert!(held.is_empty());
+        result.finish_codex_capture_boundary(&mut corrected);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let settled = corrected.committable_subset(&capture, &accepted, &BTreeMap::new());
+        assert!(settled.files.values().all(|entry| entry
+            .codex_captured_joined_member_set
+            .is_none()
+            && !entry.codex_captured_uncommitted
+            && entry.codex_joined_member_set.is_some()));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn pending_membership_cap_and_unknown_version_preserve_protected_state() {
+        let root = native_join_fixture_root(false);
+        let (mut working, mut result) = scan(&root, ScanIndex::default(), 2);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
+        let (captured, _, _) =
+            working.stage_codex_recovery_capture(&ScanIndex::default(), &result.snapshots);
+        let mut full = ScanIndex::default();
+        let sample = captured.files.values().next().unwrap();
+        for n in 0..MAX_HEADER_FILES {
+            full.files
+                .insert(format!("synthetic-pending-{n}"), sample.clone());
+        }
+        let (after, changed, held) = working.stage_codex_recovery_capture(&full, &result.snapshots);
+        assert!(changed.is_empty());
+        assert_eq!(held.len(), 1);
+        assert_eq!(after.files.len(), MAX_HEADER_FILES);
+        assert_eq!(
+            serde_json::to_vec(&after).unwrap(),
+            serde_json::to_vec(&full).unwrap()
+        );
+        for malformed in [
+            json!("codex_captured_join:v2:future"),
+            json!({"opaque":true}),
+            Value::Null,
+        ] {
+            let mut value = serde_json::to_value(&captured).unwrap();
+            let key = captured.files.keys().next().unwrap();
+            value["files"][key]["codex_captured_joined_member_set"] = malformed;
+            let path = root.join("malformed.json");
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let loaded = ScanIndex::load(&path).unwrap();
+            assert_eq!(loaded.files.len(), 2);
+            let (_, result) = scan(&root, loaded, 2);
+            assert!(result.snapshots.is_empty());
+            assert!(!result.census_complete);
+        }
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -2371,8 +2514,9 @@ pub(super) mod tests {
             .inventory
             .read_bytes;
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        result.finish_codex_capture_boundary(&mut index);
         let (capture, _, _) =
-            index.stage_codex_tier_capture(&ScanIndex::default(), &result.snapshots);
+            index.stage_codex_recovery_capture(&ScanIndex::default(), &result.snapshots);
         result.finish_codex_capture_boundary(&mut index);
         let capture_bytes = serde_json::to_vec(&capture).unwrap().len();
         let accepted = result

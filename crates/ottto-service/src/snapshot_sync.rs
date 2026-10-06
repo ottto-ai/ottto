@@ -3376,7 +3376,7 @@ fn prepare_sync_source(
         scan: Some(scan),
     }))
 }
-fn capture_codex_tier_evidence(
+fn capture_codex_recovery_evidence(
     index: &mut ScanIndex,
     committed_index: &mut ScanIndex,
     scan_result: &mut SourceScanResult,
@@ -3385,12 +3385,12 @@ fn capture_codex_tier_evidence(
     validate_authority: impl Fn() -> Result<()>,
 ) {
     let (mut captured, changed, held) =
-        index.stage_codex_tier_capture(committed_index, &scan_result.snapshots);
+        index.stage_codex_recovery_capture(committed_index, &scan_result.snapshots);
     scan_result.hold_codex_groups(
         index,
         committed_index,
         &held,
-        "selector capture exceeds retained receipt cap",
+        "recovery capture exceeds retained evidence cap",
     );
     if !changed.is_empty() {
         let protected = scan_result
@@ -3404,7 +3404,7 @@ fn capture_codex_tier_evidence(
             validate_authority()?;
             let validator = scan_result
                 .codex_joining_validator()
-                .context("Codex selector capture lacks a source witness")?;
+                .context("Codex recovery capture lacks a source witness")?;
             validator.validate(&protected)?;
             captured.save(index_path)
         })();
@@ -3417,7 +3417,7 @@ fn capture_codex_tier_evidence(
                 index,
                 committed_index,
                 &changed,
-                "selector capture could not durably publish",
+                "recovery capture could not durably publish",
             ),
         }
     }
@@ -3584,7 +3584,7 @@ fn finish_sync_source(
         },
     );
     if source == SnapshotSource::Codex {
-        capture_codex_tier_evidence(
+        capture_codex_recovery_evidence(
             &mut index,
             &mut committed_index,
             &mut scan_result,
@@ -4204,7 +4204,10 @@ fn finish_sync_source(
         }
     }
 
-    index.reconcile_codex_tier_settlement(&committed_index, &upload_progress.accepted_fingerprints);
+    index.reconcile_codex_recovery_settlement(
+        &committed_index,
+        &upload_progress.accepted_fingerprints,
+    );
     index.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
     index.record_accepted_snapshot_fingerprints(&upload_progress.accepted_fingerprints);
     index.finish_legacy_settlement_reconciliation();
@@ -6435,6 +6438,7 @@ mod tests {
                 last_upload_body_witness: Some("b".repeat(64)),
                 scan_identity_version: None,
                 codex_joined_member_set: None,
+                codex_captured_joined_member_set: None,
                 codex_protected_owner: None,
                 codex_applied_tier_receipt: None,
                 codex_applied_tier_receipt_required: false,
@@ -15647,268 +15651,283 @@ mod tests {
     include!("retry_live_native_tests.rs");
     #[test]
     fn codex_union_native_transport_common_ack_crash_checkpoint_and_restart() {
-        codex_union_native_transport_restart(false);
+        codex_union_native_transport_restart(false, false);
     }
     #[test]
     fn codex_union_native_transport_priority_capture_survives_pre_post_and_ack_crashes() {
-        codex_union_native_transport_restart(true);
+        codex_union_native_transport_restart(true, false);
+    }
+    #[test]
+    fn codex_union_native_transport_standard_ack_crash_member_loss_holds() {
+        codex_union_native_transport_restart(false, true);
     }
     #[test]
     fn codex_union_capture_failure_holds_only_protected_group_and_preserves_cas() {
-        for failure in ["io", "cas", "authority", "source"] {
-            let root = crate::snapshots::native_join_fixture_root(true);
-            let healthy = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-            let text = std::fs::read_to_string(root.join("sessions/a.jsonl"))
-                .unwrap()
-                .replace("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", healthy);
-            std::fs::write(root.join("sessions/c.jsonl"), text).unwrap();
+        for priority in [false, true] {
+            for failure in ["io", "cas", "authority", "source"] {
+                let root = crate::snapshots::native_join_fixture_root(priority);
+                let healthy = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+                let text = std::fs::read_to_string(root.join("sessions/a.jsonl"))
+                    .unwrap()
+                    .replace("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", healthy);
+                std::fs::write(root.join("sessions/c.jsonl"), text).unwrap();
+                let index_path = root.join("index.json");
+                let progress_path = root.join("progress.json");
+                let mut committed = ScanIndex::default();
+                committed.save(&index_path).unwrap();
+                let mut working = committed.clone();
+                let mut result = prepare_codex_union_fixture(&root, &mut working);
+                assert_eq!(result.snapshots.len(), 3);
+                let before = std::fs::read(&index_path).unwrap();
+                let mut save_path = index_path.clone();
+                match failure {
+                    "io" => {
+                        save_path = root.join("directory.json");
+                        std::fs::create_dir(&save_path).unwrap();
+                    }
+                    "cas" => {
+                        let mut concurrent = committed.clone();
+                        concurrent.save(&index_path).unwrap();
+                    }
+                    "source" => std::fs::write(root.join("sessions/b.jsonl"), "changed\n").unwrap(),
+                    _ => {}
+                }
+                let exact_disk = std::fs::read(&index_path).unwrap();
+                capture_codex_recovery_evidence(
+                    &mut working,
+                    &mut committed,
+                    &mut result,
+                    &save_path,
+                    &progress_path,
+                    || {
+                        anyhow::ensure!(failure != "authority", "synthetic authority changed");
+                        Ok(())
+                    },
+                );
+                assert_eq!(result.snapshots.len(), 1);
+                assert_eq!(result.snapshots[0].source_session_id, healthy);
+                assert!(!result.census_complete);
+                assert_eq!(result.ownership_incomplete_file_count, 2);
+                assert!(serde_json::to_value(&working).unwrap()["traversal"]
+                    ["unhealthy_retry_not_before_unix_seconds"]
+                    .is_number());
+                assert!(committed.files.is_empty());
+                assert_eq!(
+                    working.files.len(),
+                    1,
+                    "only healthy member can be checkpointed"
+                );
+                assert_eq!(std::fs::read(&index_path).unwrap(), exact_disk);
+                if failure != "cas" {
+                    assert_eq!(exact_disk, before);
+                }
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn codex_union_capture_rejection_keeps_recovery_facts_without_acceptance() {
+        for priority in [false, true] {
+            let root = crate::snapshots::native_join_fixture_root(priority);
             let index_path = root.join("index.json");
             let progress_path = root.join("progress.json");
             let mut committed = ScanIndex::default();
             committed.save(&index_path).unwrap();
             let mut working = committed.clone();
             let mut result = prepare_codex_union_fixture(&root, &mut working);
-            assert_eq!(result.snapshots.len(), 3);
-            let before = std::fs::read(&index_path).unwrap();
-            let mut save_path = index_path.clone();
-            match failure {
-                "io" => {
-                    save_path = root.join("directory.json");
-                    std::fs::create_dir(&save_path).unwrap();
-                }
-                "cas" => {
-                    let mut concurrent = committed.clone();
-                    concurrent.save(&index_path).unwrap();
-                }
-                "source" => std::fs::write(root.join("sessions/b.jsonl"), "changed\n").unwrap(),
-                _ => {}
-            }
-            let exact_disk = std::fs::read(&index_path).unwrap();
-            capture_codex_tier_evidence(
+            capture_codex_recovery_evidence(
                 &mut working,
                 &mut committed,
                 &mut result,
-                &save_path,
+                &index_path,
                 &progress_path,
-                || {
-                    anyhow::ensure!(failure != "authority", "synthetic authority changed");
-                    Ok(())
+                || Ok(()),
+            );
+            let captured = std::fs::read(&index_path).unwrap();
+            let mut progress = test_upload_progress();
+            let outcome = upload_resumable_batches_with_body_witness(
+                &result.snapshots,
+                &unique_poison_scope(),
+                &mut progress,
+                &mut 0,
+                |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |_| {
+                    Err(anyhow::anyhow!(
+                        "synthetic lost response after server acceptance"
+                    ))
                 },
+                |progress| progress.save(&progress_path),
             );
-            assert_eq!(result.snapshots.len(), 1);
-            assert_eq!(result.snapshots[0].source_session_id, healthy);
-            assert!(!result.census_complete);
-            assert_eq!(result.ownership_incomplete_file_count, 2);
-            assert!(serde_json::to_value(&working).unwrap()["traversal"]
-                ["unhealthy_retry_not_before_unix_seconds"]
-                .is_number());
-            assert!(committed.files.is_empty());
-            assert_eq!(
-                working.files.len(),
-                1,
-                "only healthy member can be checkpointed"
-            );
-            assert_eq!(std::fs::read(&index_path).unwrap(), exact_disk);
-            if failure != "cas" {
-                assert_eq!(exact_disk, before);
+            assert!(outcome.is_err());
+            assert!(progress.accepted_fingerprints.is_empty());
+            assert_eq!(std::fs::read(&index_path).unwrap(), captured);
+            let safe = working.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
+            assert_eq!(safe.files.len(), 2);
+            assert!(safe
+                .files
+                .values()
+                .all(|entry| entry.codex_captured_uncommitted
+                    && entry.codex_captured_joined_member_set.is_some()
+                    && entry.codex_applied_tier_receipt.is_none()));
+            assert!(safe.current_snapshot_fingerprints().is_empty());
+            if priority {
+                std::fs::remove_file(root.join("logs_2.sqlite")).unwrap();
             }
+            let mut restarted = ScanIndex::load(&index_path).unwrap();
+            let restored = prepare_codex_union_fixture(&root, &mut restarted);
+            assert_eq!(
+                restored
+                    .snapshots
+                    .iter()
+                    .map(|item| &item.snapshot_fingerprint)
+                    .collect::<BTreeSet<_>>(),
+                result
+                    .snapshots
+                    .iter()
+                    .map(|item| &item.snapshot_fingerprint)
+                    .collect::<BTreeSet<_>>()
+            );
             std::fs::remove_dir_all(root).unwrap();
         }
     }
     #[test]
-    fn codex_union_capture_rejection_keeps_recovery_facts_without_acceptance() {
-        let root = crate::snapshots::native_join_fixture_root(true);
-        let index_path = root.join("index.json");
-        let progress_path = root.join("progress.json");
-        let mut committed = ScanIndex::default();
-        committed.save(&index_path).unwrap();
-        let mut working = committed.clone();
-        let mut result = prepare_codex_union_fixture(&root, &mut working);
-        capture_codex_tier_evidence(
-            &mut working,
-            &mut committed,
-            &mut result,
-            &index_path,
-            &progress_path,
-            || Ok(()),
-        );
-        let captured = std::fs::read(&index_path).unwrap();
-        let mut progress = test_upload_progress();
-        let outcome = upload_resumable_batches_with_body_witness(
-            &result.snapshots,
-            &unique_poison_scope(),
-            &mut progress,
-            &mut 0,
-            |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |_| {
-                Err(anyhow::anyhow!(
-                    "synthetic lost response after server acceptance"
-                ))
-            },
-            |progress| progress.save(&progress_path),
-        );
-        assert!(outcome.is_err());
-        assert!(progress.accepted_fingerprints.is_empty());
-        assert_eq!(std::fs::read(&index_path).unwrap(), captured);
-        let safe = working.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
-        assert_eq!(safe.files.len(), 1);
-        assert!(safe
-            .files
-            .values()
-            .all(|entry| entry.codex_captured_uncommitted
-                && entry.codex_captured_tier_receipt_required
-                && entry.codex_applied_tier_receipt.is_none()));
-        assert!(safe.current_snapshot_fingerprints().is_empty());
-        std::fs::remove_file(root.join("logs_2.sqlite")).unwrap();
-        let mut restarted = ScanIndex::load(&index_path).unwrap();
-        let restored = prepare_codex_union_fixture(&root, &mut restarted);
-        assert_eq!(
-            restored
-                .snapshots
-                .iter()
-                .map(|item| &item.snapshot_fingerprint)
-                .collect::<BTreeSet<_>>(),
-            result
-                .snapshots
-                .iter()
-                .map(|item| &item.snapshot_fingerprint)
-                .collect::<BTreeSet<_>>()
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
     fn codex_union_native_transport_partial_rejection_keeps_capture_and_quarantine_gate() {
-        let root = crate::snapshots::native_join_fixture_root(true);
-        let healthy_owner = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let text = std::fs::read_to_string(root.join("sessions/a.jsonl"))
-            .unwrap()
-            .replace("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", healthy_owner);
-        std::fs::write(root.join("sessions/c.jsonl"), text).unwrap();
-        let index_path = root.join("index.json");
-        let progress_path = root.join("progress.json");
-        let mut baseline = ScanIndex::default();
-        baseline.save(&index_path).unwrap();
-        let mut working = baseline.clone();
-        let mut result = prepare_codex_union_fixture(&root, &mut working);
-        capture_codex_tier_evidence(
-            &mut working,
-            &mut baseline,
-            &mut result,
-            &index_path,
-            &progress_path,
-            || Ok(()),
-        );
-        assert_eq!(result.snapshots.len(), 3);
-        let rejected = result
-            .snapshots
-            .iter()
-            .find(|item| item.source_session_id != healthy_owner)
-            .unwrap();
-        let healthy = result
-            .snapshots
-            .iter()
-            .find(|item| item.source_session_id == healthy_owner)
-            .unwrap();
-        let accepted = same_source_fixture_ack(vec![healthy.clone()]).unwrap();
-        let entity = &accepted.accepted_entities[0];
-        let ack = serde_json::json!({"accepted":1,"sessions_reconciled":1,"session_ids":[],
+        for priority in [false, true] {
+            let root = crate::snapshots::native_join_fixture_root(priority);
+            let healthy_owner = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+            let text = std::fs::read_to_string(root.join("sessions/a.jsonl"))
+                .unwrap()
+                .replace("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", healthy_owner);
+            std::fs::write(root.join("sessions/c.jsonl"), text).unwrap();
+            let index_path = root.join("index.json");
+            let progress_path = root.join("progress.json");
+            let mut baseline = ScanIndex::default();
+            baseline.save(&index_path).unwrap();
+            let mut working = baseline.clone();
+            let mut result = prepare_codex_union_fixture(&root, &mut working);
+            capture_codex_recovery_evidence(
+                &mut working,
+                &mut baseline,
+                &mut result,
+                &index_path,
+                &progress_path,
+                || Ok(()),
+            );
+            assert_eq!(result.snapshots.len(), 3);
+            let rejected = result
+                .snapshots
+                .iter()
+                .find(|item| item.source_session_id != healthy_owner)
+                .unwrap();
+            let healthy = result
+                .snapshots
+                .iter()
+                .find(|item| item.source_session_id == healthy_owner)
+                .unwrap();
+            let accepted = same_source_fixture_ack(vec![healthy.clone()]).unwrap();
+            let entity = &accepted.accepted_entities[0];
+            let ack = serde_json::json!({"accepted":1,"sessions_reconciled":1,"session_ids":[],
             "disabled":false,"disabled_reason":null,"entity_ack_contract":"snapshot_entity_ack:v1",
             "accepted_entities":[{"source_session_id":entity.source_session_id,"snapshot_fingerprint":entity.snapshot_fingerprint,
                 "occurrence_count":1,"body_witness_version":entity.body_witness_version,"body_witness_digest":entity.body_witness_digest}],
             "unchanged_entities":[],"conflict_entities":[],"rejected_entities":[{
                 "source_session_id":rejected.source_session_id,"snapshot_fingerprint":rejected.snapshot_fingerprint,
                 "reason":"invalid","detail":"synthetic rejection","permanent":true,"occurrence_count":1}]}).to_string();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_complete_http_request(&mut stream);
-            let payload: serde_json::Value =
-                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-            assert_eq!(payload["snapshots"].as_array().unwrap().len(), 2);
-            bounded_native_response(&mut stream, "200 OK", &ack);
-        });
-        let mut progress = test_upload_progress();
-        let mut accepted_count = 0;
-        let outcome = upload_resumable_batches_with_body_witness(
-            &result.snapshots,
-            &unique_poison_scope(),
-            &mut progress,
-            &mut accepted_count,
-            |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |snapshots| {
-                client.upload_batch(
-                    "synthetic-relay",
-                    &SnapshotBatchRequest {
-                        schema_version: SNAPSHOT_SCHEMA_VERSION,
-                        source: "codex".into(),
-                        machine_id: "machine".into(),
-                        collector_version: Some(collector_version()),
-                        snapshots,
-                        upload_policy: SnapshotUploadPolicy::default(),
-                        client_report: crate::client_report::ClientReport::empty(),
-                    },
-                    false,
-                )
-            },
-            |progress| progress.save(&progress_path),
-        )
-        .unwrap();
-        assert!(matches!(outcome, ResumableUploadResult::Completed));
-        server.join().unwrap();
-        assert_eq!(accepted_count, 1);
-        assert_eq!(progress.accepted_fingerprints.len(), 1);
-        assert_eq!(progress.quarantined_fingerprints.len(), 1);
-        let committed = checkpoint_partial_snapshot_index(
-            &working,
-            &baseline,
-            &progress,
-            &result.snapshots,
-            &BTreeSet::new(),
-            &index_path,
-            &progress_path,
-            || {
-                result
-                    .codex_joining_validator()
-                    .unwrap()
-                    .validate(&result.snapshots)
-            },
-        )
-        .unwrap();
-        assert_eq!(committed.files.len(), 3);
-        assert_eq!(
-            committed
-                .files
-                .values()
-                .filter(|entry| entry.codex_captured_tier_receipt_required
-                    && entry.codex_captured_uncommitted
-                    && entry.codex_applied_tier_receipt.is_none())
-                .count(),
-            1
-        );
-        std::fs::remove_file(root.join("logs_2.sqlite")).unwrap();
-        let mut loaded = ScanIndex::load(&index_path).unwrap();
-        let quiet = prepare_codex_union_fixture(&root, &mut loaded);
-        assert!(quiet.snapshots.is_empty());
-        assert!(
-            quiet.semantic_noop_count >= 2,
-            "native quarantine holds both aliases"
-        );
-        assert!(
-            quiet.scanned_session_count <= 1,
-            "quarantined group must not be replayed"
-        );
-        assert_eq!(
-            loaded
-                .files
-                .values()
-                .filter(|entry| entry.codex_captured_uncommitted)
-                .count(),
-            1
-        );
-        std::fs::remove_dir_all(root).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let client =
+                SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_complete_http_request(&mut stream);
+                let payload: serde_json::Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                assert_eq!(payload["snapshots"].as_array().unwrap().len(), 2);
+                bounded_native_response(&mut stream, "200 OK", &ack);
+            });
+            let mut progress = test_upload_progress();
+            let mut accepted_count = 0;
+            let outcome = upload_resumable_batches_with_body_witness(
+                &result.snapshots,
+                &unique_poison_scope(),
+                &mut progress,
+                &mut accepted_count,
+                |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |snapshots| {
+                    client.upload_batch(
+                        "synthetic-relay",
+                        &SnapshotBatchRequest {
+                            schema_version: SNAPSHOT_SCHEMA_VERSION,
+                            source: "codex".into(),
+                            machine_id: "machine".into(),
+                            collector_version: Some(collector_version()),
+                            snapshots,
+                            upload_policy: SnapshotUploadPolicy::default(),
+                            client_report: crate::client_report::ClientReport::empty(),
+                        },
+                        false,
+                    )
+                },
+                |progress| progress.save(&progress_path),
+            )
+            .unwrap();
+            assert!(matches!(outcome, ResumableUploadResult::Completed));
+            server.join().unwrap();
+            assert_eq!(accepted_count, 1);
+            assert_eq!(progress.accepted_fingerprints.len(), 1);
+            assert_eq!(progress.quarantined_fingerprints.len(), 1);
+            let committed = checkpoint_partial_snapshot_index(
+                &working,
+                &baseline,
+                &progress,
+                &result.snapshots,
+                &BTreeSet::new(),
+                &index_path,
+                &progress_path,
+                || {
+                    result
+                        .codex_joining_validator()
+                        .unwrap()
+                        .validate(&result.snapshots)
+                },
+            )
+            .unwrap();
+            assert_eq!(committed.files.len(), 3);
+            assert_eq!(
+                committed
+                    .files
+                    .values()
+                    .filter(|entry| entry.codex_captured_tier_receipt_required
+                        && entry.codex_captured_uncommitted
+                        && entry.codex_applied_tier_receipt.is_none())
+                    .count(),
+                usize::from(priority)
+            );
+            if priority {
+                std::fs::remove_file(root.join("logs_2.sqlite")).unwrap();
+            }
+            let mut loaded = ScanIndex::load(&index_path).unwrap();
+            let quiet = prepare_codex_union_fixture(&root, &mut loaded);
+            assert!(quiet.snapshots.is_empty());
+            assert!(
+                quiet.semantic_noop_count >= 2,
+                "native quarantine holds both aliases"
+            );
+            assert!(
+                quiet.scanned_session_count <= 1,
+                "quarantined group must not be replayed"
+            );
+            assert_eq!(
+                loaded
+                    .files
+                    .values()
+                    .filter(|entry| entry.codex_captured_uncommitted)
+                    .count(),
+                2
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
     fn prepare_codex_union_fixture(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
         let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
@@ -15939,7 +15958,7 @@ mod tests {
         finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, index);
         scan
     }
-    fn codex_union_native_transport_restart(priority: bool) {
+    fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: bool) {
         let root = crate::snapshots::native_join_fixture_root(priority);
         let index_path = root.join("index.json");
         let progress_path = root.join("progress.json");
@@ -15966,7 +15985,7 @@ mod tests {
                 .map(|row| row.input_tokens)
                 .sum::<u64>()
                 == 200));
-            capture_codex_tier_evidence(
+            capture_codex_recovery_evidence(
                 &mut working,
                 &mut baseline,
                 &mut result,
@@ -15977,14 +15996,14 @@ mod tests {
             let captured = ScanIndex::load(&index_path).unwrap();
             assert_eq!(
                 captured.files.len(),
-                1,
-                "only the protected physical member is captured"
+                2,
+                "all joined aliases must be captured before POST"
             );
             assert!(captured
                 .files
                 .values()
                 .all(|entry| entry.codex_captured_uncommitted
-                    && entry.codex_captured_tier_receipt_required
+                    && entry.codex_captured_joined_member_set.is_some()
                     && entry.last_snapshot_fingerprint.is_none()
                     && entry.last_upload_body_witness.is_none()
                     && entry.codex_joined_member_set.is_none()
@@ -16004,7 +16023,17 @@ mod tests {
                     .collect::<BTreeSet<_>>(),
                 fingerprints
             );
-            capture_codex_tier_evidence(
+            capture_codex_recovery_evidence(
+                &mut working,
+                &mut baseline,
+                &mut result,
+                &index_path,
+                &progress_path,
+                || Ok(()),
+            );
+        }
+        if !priority {
+            capture_codex_recovery_evidence(
                 &mut working,
                 &mut baseline,
                 &mut result,
@@ -16078,16 +16107,39 @@ mod tests {
         )
         .unwrap();
         assert!(!receipts["receipts"].as_array().unwrap().is_empty());
+        if lose_member_after_ack {
+            std::fs::remove_file(root.join("sessions/b.jsonl")).unwrap();
+            let usage = serde_json::json!({"input_tokens":100,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":100});
+            let after = serde_json::json!({"input_tokens":400,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":400});
+            let rows = [
+                serde_json::json!({"type":"token_usage_record","timestamp":"2026-10-01T10:04:00Z","payload":{"thread_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","response_id":"after-ack-late","usage":usage,"thread_token_usage":after}}),
+                serde_json::json!({"type":"event_msg","timestamp":"2026-10-01T10:04:01Z","payload":{"type":"token_count","info":{"last_token_usage":usage,"total_token_usage":after}}}),
+            ];
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(root.join("sessions/a.jsonl"))
+                .unwrap();
+            for row in rows {
+                writeln!(file, "{}", serde_json::to_string(&row).unwrap()).unwrap();
+            }
+            drop(file);
+            let mut loaded = ScanIndex::load(&index_path).unwrap();
+            let held = prepare(&mut loaded);
+            assert!(held.snapshots.is_empty(), "durable standard-tier ACK must not permit a smaller replacement after loss before index promotion: {:?}", held.snapshots.iter().map(|item| item.input_tokens).collect::<Vec<_>>());
+            assert!(!held.census_complete);
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
         let before_promotion = ScanIndex::load(&index_path).unwrap();
         assert_eq!(
             before_promotion.files.len(),
-            usize::from(priority),
+            2,
             "ACK never promotes the index on its own"
         );
         assert!(before_promotion.current_snapshot_fingerprints().is_empty());
         let mut restarted_index = ScanIndex::load(&index_path).unwrap();
         let mut restarted = prepare(&mut restarted_index);
-        capture_codex_tier_evidence(
+        capture_codex_recovery_evidence(
             &mut restarted_index,
             &mut baseline,
             &mut restarted,
@@ -16142,6 +16194,7 @@ mod tests {
             .files
             .values()
             .all(|entry| !entry.codex_captured_uncommitted
+                && entry.codex_captured_joined_member_set.is_none()
                 && !entry.codex_captured_tier_receipt_required
                 && entry.codex_captured_tier_receipt.is_none()));
         assert_eq!(
