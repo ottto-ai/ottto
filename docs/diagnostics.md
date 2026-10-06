@@ -14,6 +14,26 @@ ottto diagnostics collect --json
 The response includes sectioned runtime, install, account, source, repair,
 update, and security facts plus a redaction report.
 
+## Claude Local Evidence Health
+
+Local collection includes a `claude_local_evidence` section with separate API
+and trace counters for available canonical rows, duplicate/conflicting requests,
+malformed or unframed rows, oversized files/lines, unavailable or changed files,
+and limited selection/reads. The inspection is on demand: at most four files per
+store, 64 directory entries per store, 64 KiB read per file (512 KiB total),
+16 KiB per line and 128 physical rows per file. Selection can be partial and is
+not a complete census or a retained-history replay. Symlinks and non-files are
+refused; no file is rewritten.
+
+These are support facts, not new session totals or account evidence. The section
+always reports `complete_capture_authority: false`. Available rows in a capped
+file remain incomplete; a partial line or JSON object missing its final newline
+is not counted as a validated framed row. Strict upload/account readers retain
+their existing refusal behavior. Counts do not detect every zero-byte capture
+failure, establish power-loss durability or solve capped-file growth. No request
+ids, paths, fingerprints, identity observations, token/cost values or row content
+appear in this section. Approved upload uses the existing disclosure and consent.
+
 ## Approved Upload
 
 Upload only when the user approves the upload and accepts the retention

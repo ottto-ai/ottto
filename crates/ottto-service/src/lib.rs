@@ -1768,6 +1768,11 @@ impl LocalDaemon {
                 diagnostics_section("installation", installation),
                 diagnostics_section("repair", repair),
                 diagnostics_section("security", security),
+                #[cfg(unix)]
+                diagnostics_section(
+                    "claude_local_evidence",
+                    claude_local_otel::support_health::diagnostics_items(&default_support_dir()),
+                ),
             ],
         })
     }
@@ -4751,6 +4756,33 @@ mod tests {
         assert_eq!(approval.surface, RepairApprovalSurface::Browser);
         assert!(approval.setup_safe);
         assert!(!approval.server_backed);
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn diagnostics_collect_includes_support_only_claude_evidence_health() {
+        let support = test_scratch::private_dir("claude-diagnostics-consumer");
+        let _support_guard = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let bundle = daemon().diagnostics_stub(TOKEN).unwrap();
+        assert_eq!(
+            diagnostic_item(
+                &bundle,
+                "claude_local_evidence",
+                "complete_capture_authority"
+            ),
+            Some(&RedactedValue::Bool(false))
+        );
+        assert_eq!(
+            diagnostic_item(&bundle, "claude_local_evidence", "purpose"),
+            Some(&RedactedValue::String(
+                "bounded_support_inspection_only".into()
+            ))
+        );
+        let encoded = serde_json::to_string(&bundle).unwrap();
+        assert!(!encoded.contains(support.to_str().unwrap()));
+        assert!(!bundle.upload.requested);
+        std::fs::remove_dir_all(support).unwrap();
     }
 
     #[test]
