@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 447,
-  "content_sha256": "0b0c692384dacf23d85dd31d36683f3df83bf06fdf88ba58d94d5b83686da1ee",
+  "candidate_file_count": 451,
+  "content_sha256": "d52a7a8a40bd5b207d3289c424b45a1c173a9080d111b6828a5d871d7e432569",
   "files": [
     {
       "executable": false,
@@ -29,6 +29,20 @@
       "path": ".github/workflows/macos-stable-release.yml",
       "sha256": "fe9872af624fe1f8e1ba8f2f1fa43b51d171b34acd8493adeef9271bd9b407df",
       "size_bytes": 19098
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "AGENTS.md",
+      "sha256": "c8a5b8a2bb9671ee6d2ae524fe24719c63575a41a643d1f252792f4cd9580698",
+      "size_bytes": 2497
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "CLAUDE.md",
+      "sha256": "336cc4fbf19beaada7ccf9986414fa91851a8d7a07dfb3ccbe800a69eed0ab49",
+      "size_bytes": 11
     },
     {
       "executable": false,
@@ -1135,6 +1149,20 @@
       "path": "docs/privacy.md",
       "sha256": "6c55a60521fb575f0ff154eac6b94c589f71b29ac1f10408736bcdae854aeaef",
       "size_bytes": 22443
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/refactor-readiness.md",
+      "sha256": "bef88134935faaaf591aeb979be2838af4d89e6bc86cc20b559dd48926493057",
+      "size_bytes": 26327
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/refactor-review-coverage.tsv",
+      "sha256": "ff2c2ed4de1a7d24588013fbeab2494eadd5e6c7942b75d8e3574cbf14929711",
+      "size_bytes": 48394
     },
     {
       "executable": false,
@@ -2666,8 +2694,8 @@
       "executable": false,
       "mode": "0644",
       "path": "public-export/path-map.tsv",
-      "sha256": "e9bd3ca628e9d5310a56582ec3f1f1644a1a0267e7b05dc95ae0800c241cf588",
-      "size_bytes": 2370
+      "sha256": "5f952a7a72b29285238b1ccff78eecc55ef893195a5cdca4d6d191501f95e988",
+      "size_bytes": 2506
     },
     {
       "executable": false,
@@ -2680,8 +2708,8 @@
       "executable": false,
       "mode": "0644",
       "path": "public-export/roots.txt",
-      "sha256": "206019b1ad3b3ca867ae5ee5d75eda5eff798f1d37872c861d15892beb6d6580",
-      "size_bytes": 516
+      "sha256": "42a1bdda5fff6257b7470869962769fe3316d0448e7d59355a7dadd176addfd4",
+      "size_bytes": 536
     },
     {
       "executable": false,
@@ -3132,14 +3160,16 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-05T20:51:12+00:00",
+  "generated_at": "2026-10-06T15:47:20+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 448,
+  "output_file_count": 452,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
     ".github/workflows/macos-stable-release.yml",
+    "AGENTS.md",
+    "CLAUDE.md",
     "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
     "Cargo.lock",
@@ -3168,5 +3198,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "16f6337399dce5bba99f70847ed75a8e92c391be"
+  "source_commit": "212ce76e5eddc2d8cda64201f149e0920fe927a9"
 }
