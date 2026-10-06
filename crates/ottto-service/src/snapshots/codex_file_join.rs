@@ -253,27 +253,40 @@ impl HeaderInventory {
         }
         groups
     }
+    #[cfg(test)]
     pub(super) fn validate_membership(&self, owner: &str, home: &Path) -> Result<()> {
+        self.validate_memberships(&BTreeMap::from([(
+            home.to_path_buf(),
+            BTreeSet::from([owner.to_owned()]),
+        )]))
+        .map(|_| ())
+    }
+    fn validate_memberships(&self, owners: &BTreeMap<PathBuf, BTreeSet<String>>) -> Result<usize> {
         anyhow::ensure!(
             self.complete,
             "Codex joining header inventory is incomplete"
         );
-        self.directories.validate(home)?;
+        for home in owners.keys() {
+            self.directories.validate(home)?;
+        }
+        let mut checked_headers = 0;
         for header in &self.headers {
-            if header.home != home {
+            let Some(selected) = owners.get(&header.home) else {
                 continue;
-            }
+            };
+            checked_headers += 1;
             let stat = fs::symlink_metadata(&header.candidate.path)?;
             if metadata_witness(&stat) == header.metadata {
                 continue;
             }
             let (current_owner, _, _) = read_header(&header.candidate)?;
             anyhow::ensure!(
-                current_owner == header.owner || (current_owner != owner && header.owner != owner),
+                current_owner == header.owner
+                    || (!selected.contains(&current_owner) && !selected.contains(&header.owner)),
                 "Codex joining header ownership changed"
             );
         }
-        Ok(())
+        Ok(checked_headers)
     }
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
@@ -292,13 +305,23 @@ pub(super) struct Validation {
     pub(super) groups: Vec<Group>,
 }
 impl Validation {
-    pub(super) fn validate(&self, owners: &BTreeSet<String>) -> Result<()> {
+    pub(super) fn validate(&self, owners: &BTreeSet<String>) -> Result<usize> {
+        let mut homes = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+        for group in &self.groups {
+            if owners.contains(&group.owner) {
+                homes
+                    .entry(group.home.clone())
+                    .or_default()
+                    .insert(group.owner.clone());
+            }
+        }
+        // One fresh roster check per home/boundary, independent of group count.
+        // Never cache this result across capture, network or checkpoint boundaries.
+        let checked_headers = self.inventory.validate_memberships(&homes)?;
         for group in &self.groups {
             if !owners.contains(&group.owner) {
                 continue;
             }
-            self.inventory
-                .validate_membership(&group.owner, &group.home)?;
             for member in &group.members {
                 let mut opened = member.clone();
                 let _file = open_candidate_file(SnapshotSource::Codex, &mut opened)?;
@@ -308,7 +331,7 @@ impl Validation {
                 );
             }
         }
-        Ok(())
+        Ok(checked_headers)
     }
 }
 crate::heap_layout_bound::fields!(Group; owner, home, members);
@@ -959,6 +982,12 @@ impl GroupReader {
             "Codex joining replay unfinished"
         );
         let parser = self.parser.take().context("Codex joining lacks a parser")?;
+        // The existing single-file optional witness can be cleared on conflict.
+        // A joined replacement must not reach account fallback through that None.
+        anyhow::ensure!(
+            !parser.accumulator.codex_creator_evidence_conflicted,
+            "Codex joining creator evidence conflicts"
+        );
         // The final reader descriptor owns the final canonical member, selected
         // by the same counter order used above (not physical path order).
         let order = &self.canonical_order;
@@ -1632,6 +1661,160 @@ pub(super) mod tests {
             serde_json::to_value(&after.files).unwrap(),
             serde_json::to_value(&previous.files).unwrap()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn losing_last_of_three_joined_members_holds_contiguous_prefix_and_allows_sibling() {
+        let (root, _) = fixture();
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let write = |name: &str, rows: Vec<Value>| {
+            fs::write(
+                root.join("sessions").join(name),
+                rows.iter()
+                    .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+        };
+        write("c.jsonl", member(owner, "r-c", 100, 400));
+        let (mut index, mut result) = scan(&root, ScanIndex::default(), 4);
+        assert!(result.snapshots.iter().all(|item| item.input_tokens == 400));
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let previous = index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+        fs::remove_file(root.join("sessions/c.jsonl")).unwrap();
+        let healthy = "ffffffff-1111-4111-8111-ffffffffffff";
+        write("d.jsonl", member(healthy, "healthy", 100, 100));
+        let (after, held) = scan(&root, previous.clone(), 4);
+        assert!(!held.census_complete);
+        assert_eq!(held.ownership_incomplete_file_count, 3);
+        assert_eq!(held.snapshots.len(), 1);
+        assert_eq!(held.snapshots[0].source_session_id, healthy);
+        for (key, entry) in &previous.files {
+            assert_eq!(
+                serde_json::to_value(&after.files[key]).unwrap(),
+                serde_json::to_value(entry).unwrap()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn contradictory_creator_pairs_hold_joined_body_before_account_fallback() {
+        let (root, _) = fixture();
+        for (name, creator) in [("a.jsonl", "first"), ("b.jsonl", "second")] {
+            let path = root.join("sessions").join(name);
+            let mut rows = fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            rows[0]["payload"]["creator_user_id"] = json!(creator);
+            rows[0]["payload"]["creator_account_id"] = json!("synthetic-workspace");
+            fs::write(
+                path,
+                rows.iter()
+                    .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+        }
+        let (index, held) = scan(&root, ScanIndex::default(), 2);
+        assert!(
+            held.snapshots.is_empty(),
+            "no conflicted item can reach cached or current-home binding"
+        );
+        assert_eq!(held.ownership_incomplete_file_count, 2);
+        assert!(!held.census_complete);
+        assert!(index.files.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn configured_root_symlink_uses_resolved_inventory_roots() {
+        let (root, _) = fixture();
+        let configured = root.join("configured-sessions");
+        std::os::unix::fs::symlink(root.join("sessions"), &configured).unwrap();
+        let mut owned = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[configured],
+            ScanIndex::default(),
+            "2026-10-06T23:00:00Z",
+            7,
+            2,
+            false,
+            None,
+            &[],
+            false,
+            false,
+        );
+        loop {
+            match owned.step(None) {
+                OwnedSourceScanStep::Pending(next) => owned = next,
+                OwnedSourceScanStep::Complete { scan, .. } => {
+                    assert!(scan.census_complete, "{scan:?}");
+                    assert_eq!(scan.snapshots.len(), 2);
+                    assert!(scan.snapshots.iter().all(|item| item.input_tokens == 300));
+                    scan.codex_joining_validator()
+                        .unwrap()
+                        .validate(&scan.snapshots)
+                        .unwrap();
+                    break;
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn shared_home_validation_checks_roster_once_and_rechecks_ownership_each_boundary() {
+        let (root, _) = fixture();
+        let first = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let mut owners = BTreeSet::from([first.to_owned()]);
+        for i in 1..=3 {
+            let owner = format!("{i:08x}-bbbb-4ccc-8ddd-{i:012x}");
+            owners.insert(owner.clone());
+            for (part, input, after) in [("a", 100, 100), ("b", 200, 300)] {
+                let rows = member(&owner, &format!("r-{i}-{part}"), input, after);
+                fs::write(
+                    root.join("sessions").join(format!("{i}-{part}.jsonl")),
+                    rows.iter()
+                        .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                        .collect::<String>(),
+                )
+                .unwrap();
+            }
+        }
+        let (_, result) = scan(&root, ScanIndex::default(), 8);
+        assert_eq!(result.snapshots.len(), 8);
+        let validation = result.codex_join_validation.as_ref().unwrap();
+        assert_eq!(validation.groups.len(), 4);
+        assert_eq!(
+            validation.validate(&owners).unwrap(),
+            8,
+            "eight roster stats, not eight per group"
+        );
+        let selected = BTreeSet::from([first.to_owned()]);
+        assert_eq!(validation.validate(&selected).unwrap(), 8);
+        // A previously unrelated file can enter the selected owner's group
+        // without changing directory membership. No boundary result is cached.
+        let path = root.join("sessions/1-a.jsonl");
+        let mut rows = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        rows[0]["payload"]["id"] = json!(first);
+        fs::write(
+            path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        assert!(validation.validate(&selected).is_err());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

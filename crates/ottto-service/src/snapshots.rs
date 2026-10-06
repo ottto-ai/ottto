@@ -2538,7 +2538,7 @@ impl CodexJoinValidator {
             .iter()
             .map(|item| resolve_codex_identity(&item.source_session_id))
             .collect();
-        self.0.validate(&owners)
+        self.0.validate(&owners).map(|_| ())
     }
 }
 impl SourceScanResult {
@@ -11240,7 +11240,7 @@ impl OwnedSourceScan {
                     .as_ref()
                     .expect("Codex traversal initialized");
                 let mut inventory = codex_file_join::HeaderInventory::new(
-                    roots,
+                    &traversal.scan_roots,
                     &traversal.codex_rollout_paths,
                     traversal.codex_join_directory_census.as_ref(),
                 );
@@ -11406,9 +11406,26 @@ impl OwnedSourceScan {
                         .or_default()
                         .insert(header.home.clone());
                 }
+                let mut missing_protected_owners = BTreeSet::new();
+                let mut missing_unknown_owner = false;
+                for (key, entry) in &index.files {
+                    if entry.codex_history_is_protected() && !inventoried.contains(key) {
+                        if let Some(owner) = entry
+                            .codex_protected_owner
+                            .as_ref()
+                            .filter(|owner| valid_codex_protected_owner(owner))
+                        {
+                            missing_protected_owners.insert(owner.clone());
+                        } else {
+                            missing_unknown_owner = true;
+                        }
+                    }
+                }
                 let mut grouped_paths = BTreeSet::new();
                 let mut used = 0usize;
                 for group in inventory.groups().into_values() {
+                    let protected_history_missing = missing_unknown_owner
+                        || missing_protected_owners.contains(&codex_protected_owner(&group.owner));
                     let previously_joined = group.members.iter().any(|member| {
                         index
                             .files
@@ -11417,6 +11434,7 @@ impl OwnedSourceScan {
                     });
                     if (group.members.len() < 2
                         && !previously_joined
+                        && !protected_history_missing
                         && owners
                             .get(&group.owner)
                             .map_or(true, |homes| homes.len() <= 1))
@@ -11434,6 +11452,7 @@ impl OwnedSourceScan {
                             .map(|member| local_index_key(&member.path)),
                     );
                     if !inventory.complete
+                        || protected_history_missing
                         || owners
                             .get(&group.owner)
                             .is_some_and(|homes| homes.len() > 1)
@@ -11543,15 +11562,9 @@ impl OwnedSourceScan {
                     match reader.finish() {
                         Ok((parser, candidate, members, applied_receipts)) => {
                             group.members = members.clone();
-                            if codex_join_inventory.as_ref().map_or(true, |inventory| {
-                                inventory
-                                    .validate_membership(&group.owner, &group.home)
-                                    .is_err()
-                            }) {
-                                census.disappeared_file_count += 1;
-                                codex_state_only_blocked_session_ids.insert(group.owner);
-                                pending!();
-                            }
+                            // Member content/object fences were checked at EOF.
+                            // The shared validator checks each home roster once
+                            // at capture/send/checkpoint, after all page replays.
                             let source_file_fingerprint = candidate.source_file_fingerprint.clone();
                             active_file = Some(OwnedActiveFile {
                                 previous_snapshot_fingerprint: index
@@ -11574,7 +11587,15 @@ impl OwnedSourceScan {
                             pending!();
                         }
                         Err(_) => {
+                            census.ownership_incomplete_file_count += group.members.len();
                             census.unreadable_path_count += 1;
+                            residue_index_keys.extend(
+                                group
+                                    .members
+                                    .iter()
+                                    .map(|member| local_index_key(&member.path)),
+                            );
+                            residue_blocked_session_ids.insert(group.owner.clone());
                             codex_state_only_blocked_session_ids.insert(group.owner);
                             pending!();
                         }

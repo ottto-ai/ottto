@@ -22,7 +22,8 @@ One proof pass establishes unique native response identities, a contiguous
 thread-token counter chain across files, and coverage of exact UI usage events.
 Whole-record digests collapse complete copies into one canonical input.
 Conflicting overlap, gaps, resets, ordinal/fork boundaries, incomplete native
-replay and loss of a previously joined member hold the group. They do not
+replay, contradictory creator headers and loss of any protected member hold the
+group, including a still-contiguous surviving prefix. They do not
 declare it empty or advance its previous checkpoint.
 Healthy groups remain eligible. Existing bounded traversal retry and counts
 expose these holds; there is no additional scheduler.
@@ -95,7 +96,11 @@ there is no raw transcript buffer or extra ledger. An unchanged acknowledged
 group checks headers and strong member identities, then skips full replay.
 Aliases associate the one common body with every physical member. The existing
 common ACK and safe file checkpoint settle all members together; capture alone
-cannot settle an alias.
+cannot settle an alias. Inventory uses the traversal's resolved secure roots,
+including supported configured root symlinks. Each publication boundary checks
+a home's roster once for all its selected owners and rechecks individual member
+objects. No roster validation result is cached across network or checkpoint
+boundaries.
 
 Synthetic native tests cover disjoint/copy decisions, overlap/gap/reset/ownership
 holds, source mutation, legacy first-import reconciliation, exact tier replay,
