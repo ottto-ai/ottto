@@ -2542,6 +2542,12 @@ impl CodexJoinValidator {
     }
 }
 impl SourceScanResult {
+    pub(crate) fn validate_codex_checkpoint(&self) -> Result<()> {
+        if let Some(validation) = &self.codex_join_validation {
+            validation.validate_all()?;
+        }
+        Ok(())
+    }
     pub(crate) fn reconcile_codex_legacy_joining(
         &mut self,
         index: &mut ScanIndex,
@@ -11244,7 +11250,7 @@ impl OwnedSourceScan {
                     &traversal.codex_rollout_paths,
                     traversal.codex_join_directory_census.as_ref(),
                 );
-                inventory.complete &= !codex_parent_frozen_census_paths.is_empty();
+                inventory.complete &= traversal.pending_directories.is_empty();
                 inventory
             });
         Self {
@@ -11406,10 +11412,35 @@ impl OwnedSourceScan {
                         .or_default()
                         .insert(header.home.clone());
                 }
+                let current_owners = inventory
+                    .headers
+                    .iter()
+                    .map(|header| {
+                        (
+                            local_index_key(&header.candidate.path),
+                            codex_protected_owner(&header.owner),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let mut repurposed_protected_paths = BTreeSet::new();
                 let mut missing_protected_owners = BTreeSet::new();
                 let mut missing_unknown_owner = false;
                 for (key, entry) in &index.files {
-                    if entry.codex_history_is_protected() && !inventoried.contains(key) {
+                    let repurposed = entry.codex_history_is_protected()
+                        && entry
+                            .codex_protected_owner
+                            .as_ref()
+                            .is_some_and(|previous| {
+                                current_owners
+                                    .get(key)
+                                    .is_some_and(|current| current != previous)
+                            });
+                    if repurposed {
+                        repurposed_protected_paths.insert(key.clone());
+                    }
+                    if entry.codex_history_is_protected()
+                        && (!inventoried.contains(key) || repurposed)
+                    {
                         if let Some(owner) = entry
                             .codex_protected_owner
                             .as_ref()
@@ -11453,6 +11484,9 @@ impl OwnedSourceScan {
                     );
                     if !inventory.complete
                         || protected_history_missing
+                        || group.members.iter().any(|member| {
+                            repurposed_protected_paths.contains(&local_index_key(&member.path))
+                        })
                         || owners
                             .get(&group.owner)
                             .is_some_and(|homes| homes.len() > 1)
@@ -11559,9 +11593,20 @@ impl OwnedSourceScan {
                 }
                 Ok(true) => {
                     let baselines = reader.take_legacy_baselines();
-                    match reader.finish() {
+                    match reader.finish().and_then(|replayed| {
+                        let actual_owner = replayed
+                            .0
+                            .accumulator
+                            .source_session_id
+                            .as_deref()
+                            .map(resolve_codex_identity);
+                        anyhow::ensure!(
+                            actual_owner.as_deref() == Some(group.owner.as_str()),
+                            "Codex replay owner changed after inventory"
+                        );
+                        Ok(replayed)
+                    }) {
                         Ok((parser, candidate, members, applied_receipts)) => {
-                            group.members = members.clone();
                             // Member content/object fences were checked at EOF.
                             // The shared validator checks each home roster once
                             // at capture/send/checkpoint, after all page replays.
@@ -11582,7 +11627,6 @@ impl OwnedSourceScan {
                                 aliases: members,
                                 applied_receipts,
                             });
-                            codex_join_completed.push(group);
                             codex_legacy_join_baselines.extend(baselines);
                             pending!();
                         }
@@ -11710,6 +11754,15 @@ impl OwnedSourceScan {
                 );
                 pending!();
             }
+            let joined_owner = if aliases.is_empty() {
+                None
+            } else {
+                parser
+                    .accumulator
+                    .source_session_id
+                    .as_deref()
+                    .map(resolve_codex_identity)
+            };
             let mut parsed_file = match parser.finish(
                 &candidate.opened_object_identity,
                 &candidate.path,
@@ -11747,6 +11800,14 @@ impl OwnedSourceScan {
                 codex_state_only_blocked_session_ids
                     .extend(parsed_file.state_only_blocked_session_ids.iter().cloned());
                 pending!();
+            }
+            if !aliases.is_empty() {
+                codex_join_completed.push(codex_file_join::Group {
+                    owner: joined_owner
+                        .expect("joined replay owner was bound before native finish"),
+                    home: codex_file_join::member_home(&candidate.scan_root),
+                    members: aliases.clone(),
+                });
             }
             let diagnostic_reason = if parse_complete {
                 FileReason::Complete
@@ -18746,6 +18807,15 @@ fn advance_bounded_directory_traversal_with_budget(
     backfill_window_days: u64,
     max_entries: usize,
 ) {
+    let walk_issues = |counts: &ScanTraversalCounts| {
+        (
+            counts.directory_entry_cap_exceeded_count,
+            counts.symlink_rejected_count,
+            counts.unreadable_path_count,
+            counts.disappeared_file_count,
+        )
+    };
+    let issues_before = walk_issues(&traversal.counts);
     // Eligibility belongs to the frozen census generation, not to whichever
     // later tick happens to reach a directory. Otherwise a multi-page walk can
     // silently age boundary files out while still publishing the earlier
@@ -18887,6 +18957,11 @@ fn advance_bounded_directory_traversal_with_budget(
                     watcher_hint: false,
                 });
             }
+        }
+    }
+    if walk_issues(&traversal.counts) != issues_before {
+        if let Some(census) = traversal.codex_join_directory_census.as_mut() {
+            census.invalidate_walk();
         }
     }
 }

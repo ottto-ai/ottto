@@ -45,6 +45,9 @@ impl DirectoryCensus {
             ..Self::default()
         }
     }
+    pub(super) fn invalidate_walk(&mut self) {
+        self.stable = false;
+    }
     pub(super) fn observe(&mut self, path: &Path, before: &fs::Metadata) {
         let witness = metadata_witness(before);
         if self.directories.len() >= MAX_HEADER_FILES
@@ -305,6 +308,15 @@ pub(super) struct Validation {
     pub(super) groups: Vec<Group>,
 }
 impl Validation {
+    pub(super) fn validate_all(&self) -> Result<usize> {
+        self.validate(
+            &self
+                .groups
+                .iter()
+                .map(|group| group.owner.clone())
+                .collect(),
+        )
+    }
     pub(super) fn validate(&self, owners: &BTreeSet<String>) -> Result<usize> {
         let mut homes = BTreeMap::<PathBuf, BTreeSet<String>>::new();
         for group in &self.groups {
@@ -1815,6 +1827,191 @@ pub(super) mod tests {
         )
         .unwrap();
         assert!(validation.validate(&selected).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn replay_owner_rewrite_after_inventory_cannot_escape_validation() {
+        let (root, _) = fixture();
+        let mut owned = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[root.join("sessions")],
+            ScanIndex::default(),
+            "2026-10-06T23:00:00Z",
+            7,
+            2,
+            false,
+            None,
+            &[],
+            false,
+            false,
+        );
+        let changed = "ffffffff-1111-4111-8111-ffffffffffff";
+        let mut rewritten = false;
+        loop {
+            if owned.codex_join_prepared && !owned.codex_join_groups.is_empty() && !rewritten {
+                for (name, response, input, after) in [
+                    ("a.jsonl", "a-new", 100, 100),
+                    ("b.jsonl", "b-new", 200, 300),
+                ] {
+                    let rows = member(changed, response, input, after);
+                    fs::write(
+                        root.join("sessions").join(name),
+                        rows.iter()
+                            .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                            .collect::<String>(),
+                    )
+                    .unwrap();
+                }
+                rewritten = true;
+            }
+            match owned.step(None) {
+                OwnedSourceScanStep::Pending(next) => owned = next,
+                OwnedSourceScanStep::Complete { index, scan } => {
+                    assert!(rewritten);
+                    assert!(scan.snapshots.is_empty());
+                    assert_eq!(scan.ownership_incomplete_file_count, 2);
+                    assert!(index.files.is_empty());
+                    break;
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn protected_files_cannot_be_repurposed_under_a_new_inventoried_owner() {
+        let (root, _) = fixture();
+        let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let previous = index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+        let changed = "ffffffff-1111-4111-8111-ffffffffffff";
+        for (name, response, input, after) in [
+            ("a.jsonl", "a-new", 100, 100),
+            ("b.jsonl", "b-new", 200, 300),
+        ] {
+            let rows = member(changed, response, input, after);
+            fs::write(
+                root.join("sessions").join(name),
+                rows.iter()
+                    .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+        }
+        let (after, held) = scan(&root, previous.clone(), 2);
+        assert!(held.snapshots.is_empty());
+        assert!(!held.census_complete);
+        assert_eq!(
+            serde_json::to_value(&after.files).unwrap(),
+            serde_json::to_value(&previous.files).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn semantic_noop_checkpoint_still_checks_late_member_roster() {
+        let (root, _) = fixture();
+        let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let previous = index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+        let path = root.join("sessions/a.jsonl");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push('\n');
+        fs::write(path, text).unwrap();
+        let mut owned = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[root.join("sessions")],
+            previous,
+            "2026-10-06T23:00:00Z",
+            7,
+            2,
+            false,
+            None,
+            &[],
+            false,
+            false,
+        );
+        let mut added = false;
+        loop {
+            if !added
+                && owned
+                    .codex_join_active
+                    .as_ref()
+                    .is_some_and(|(_, reader)| reader.replay_member.is_some())
+            {
+                let rows = member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "late", 100, 400);
+                fs::write(
+                    root.join("sessions/c.jsonl"),
+                    rows.iter()
+                        .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                        .collect::<String>(),
+                )
+                .unwrap();
+                added = true;
+            }
+            match owned.step(None) {
+                OwnedSourceScanStep::Pending(next) => owned = next,
+                OwnedSourceScanStep::Complete {
+                    mut index,
+                    mut scan,
+                } => {
+                    assert!(added);
+                    finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+                    assert!(scan.snapshots.is_empty());
+                    scan.codex_joining_validator()
+                        .unwrap()
+                        .validate(&scan.snapshots)
+                        .unwrap();
+                    assert!(
+                        scan.validate_codex_checkpoint().is_err(),
+                        "no-op suppression cannot make a stale checkpoint eligible"
+                    );
+                    break;
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn held_group_does_not_poison_known_healthy_owner_on_the_next_page() {
+        let (root, _) = fixture();
+        let bad = member(
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "bad-overlap",
+            200,
+            250,
+        );
+        fs::write(
+            root.join("sessions/b.jsonl"),
+            bad.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let healthy = "ffffffff-1111-4111-8111-ffffffffffff";
+        let rows = member(healthy, "healthy", 100, 100);
+        fs::write(
+            root.join("sessions/c.jsonl"),
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let (index, first) = scan(&root, ScanIndex::default(), 2);
+        assert!(first.snapshots.is_empty());
+        assert!(!first.census_complete);
+        let (_, next) = scan(&root, index, 2);
+        assert!(!next.census_complete);
+        assert_eq!(next.snapshots.len(), 1);
+        assert_eq!(next.snapshots[0].source_session_id, healthy);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

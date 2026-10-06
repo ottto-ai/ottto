@@ -97,10 +97,15 @@ group checks headers and strong member identities, then skips full replay.
 Aliases associate the one common body with every physical member. The existing
 common ACK and safe file checkpoint settle all members together; capture alone
 cannot settle an alias. Inventory uses the traversal's resolved secure roots,
-including supported configured root symlinks. Each publication boundary checks
+including supported configured root symlinks. Replayed owners must match their
+inventoried group; protected physical paths cannot be repurposed for another
+owner. A file-group hold does not invalidate an otherwise complete directory
+walk, so known healthy owners remain eligible on later pages. Each publication
+boundary checks
 a home's roster once for all its selected owners and rechecks individual member
 objects. No roster validation result is cached across network or checkpoint
-boundaries.
+boundaries. Checkpoint validation covers all completed groups whose state can
+be saved, including groups whose unchanged bodies were suppressed as no-ops.
 
 Synthetic native tests cover disjoint/copy decisions, overlap/gap/reset/ownership
 holds, source mutation, legacy first-import reconciliation, exact tier replay,

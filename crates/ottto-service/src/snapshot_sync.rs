@@ -3946,7 +3946,7 @@ fn finish_sync_source(
                 &upload_progress_path,
                 || {
                     ensure_authority()?;
-                    validate_joined(&scan_result.snapshots)
+                    scan_result.validate_codex_checkpoint()
                 },
             ) {
                 Ok(committable) => committable,
@@ -4054,7 +4054,7 @@ fn finish_sync_source(
                     &upload_progress_path,
                     || {
                         ensure_authority()?;
-                        validate_joined(&scan_result.snapshots)
+                        scan_result.validate_codex_checkpoint()
                     },
                 ) {
                     Ok(committable) => index = committable,
@@ -4215,7 +4215,7 @@ fn finish_sync_source(
         &replay_generation,
     );
     ensure_authority()?;
-    validate_joined(&scan_result.snapshots)?;
+    scan_result.validate_codex_checkpoint()?;
     save_index_and_publish_manifest(
         &mut index,
         &index_path,
