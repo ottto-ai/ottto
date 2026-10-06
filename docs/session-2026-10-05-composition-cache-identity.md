@@ -13,7 +13,9 @@ unchanged. Parser changes must advance the local parser revision when they do
 not change the methodology or collector version.
 
 An unchanged same-day workspace still avoids transcript parsing. The first scan
-on a new UTC day rebuilds the window once. Metadata checks before and after
+on a new UTC day rebuilds the window once. When that rebuild produces an
+unchanged payload, the cache retains the last successful upload timestamp so
+the existing seven-day refresh remains effective. Metadata checks before and after
 parsing, plus a final metadata pass, reject changed or unreadable sources before
 upload or cache replacement. An incomplete workspace retains its last good
 cache and allows other workspaces to continue; only deadline exhaustion aborts
@@ -26,7 +28,9 @@ Synthetic native regressions cover nanosecond edits, growth with restored mtime,
 same-size rewrites, inode replacement, day rollover, parser/methodology/label
 identity, destination/source changes, seven-day staleness, legacy-cache rebuild,
 unchanged suppression, and preservation of the last good cache on incomplete
-reads. Normal malformed-line handling and report values remain unchanged.
+reads. A three-cycle loopback harvest verifies unchanged rollover suppression
+preserves the previous post time, then an overdue upload refreshes successfully
+while the damaged workspace retains its cache. Normal malformed-line handling and report values remain unchanged.
 
 Validation: 25 composition tests and 20 shared footprint/discovery tests passed
 (two composition measurements and one discovery measurement remain opt-in).

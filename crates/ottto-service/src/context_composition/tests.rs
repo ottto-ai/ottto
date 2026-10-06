@@ -325,7 +325,7 @@ fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
         let end = Instant::now() + Duration::from_secs(10);
         let mut uploads = Vec::new();
         let mut requests = 0;
-        while requests < 5 && Instant::now() < end {
+        while requests < 8 && Instant::now() < end {
             let (mut stream, _) = match listener.accept() {
                 Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -371,7 +371,7 @@ fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
             requests += 1;
         }
-        assert_eq!(requests, 5);
+        assert_eq!(requests, 8);
         uploads
     });
     let client = SnapshotApiClient::new(&api);
@@ -380,7 +380,12 @@ fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
         machine_id: Some("synthetic-machine".into()),
         sources: vec![source_label.into()],
     };
-    for _ in 0..2 {
+    let healthy_cache_file = cache_path(
+        &support,
+        source_label,
+        &sha256_hex(&[healthy.to_string_lossy().as_ref()]),
+    );
+    let harvest = || {
         harvest_source(
             &client,
             &device,
@@ -393,19 +398,37 @@ fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
         )
         .unwrap();
         assert_eq!(fs::read(&bad_cache_file).unwrap(), last_good);
-    }
+    };
+    harvest();
+
+    // Force a daily rebuild whose payload is identical, with a real post three
+    // days ago. Cache bookkeeping must not acknowledge a skipped upload.
+    let mut cache = read_cache(&healthy_cache_file).unwrap();
+    let original_post = iso_utc(now - time::Duration::days(3));
+    cache.posted_at = original_post.clone();
+    cache.scan_identity.window_today = date_ymd(now.date() - time::Duration::days(1));
+    write_cache(&healthy_cache_file, &cache);
+    harvest();
+    let mut cache = read_cache(&healthy_cache_file).unwrap();
+    assert_eq!(cache.posted_at, original_post);
+    assert_eq!(cache.scan_identity.window_today, date_ymd(now.date()));
+
+    // Once the last actual upload is stale, the unchanged payload must refresh.
+    let stale_post = iso_utc(now - time::Duration::days(8));
+    cache.posted_at = stale_post.clone();
+    write_cache(&healthy_cache_file, &cache);
+    harvest();
+    let cache = read_cache(&healthy_cache_file).unwrap();
+    assert_ne!(cache.posted_at, stale_post);
+    assert!(!cache_is_stale(&cache, OffsetDateTime::now_utc()));
     let uploads = server.join().unwrap();
-    assert_eq!(uploads.len(), 1); // The healthy workspace's second pass is cached.
-    assert_eq!(
-        uploads[0]["workspace_hash"],
-        sha256_hex(&[healthy.to_string_lossy().as_ref()])
-    );
-    assert!(read_cache(&cache_path(
-        &support,
-        source_label,
-        &sha256_hex(&[healthy.to_string_lossy().as_ref()])
-    ))
-    .is_some());
+    assert_eq!(uploads.len(), 2);
+    for upload in uploads {
+        assert_eq!(
+            upload["workspace_hash"],
+            sha256_hex(&[healthy.to_string_lossy().as_ref()])
+        );
+    }
     fs::remove_dir_all(root).unwrap();
 }
 

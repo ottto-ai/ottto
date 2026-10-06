@@ -1837,7 +1837,13 @@ fn harvest_source(
                 files: signature,
                 scan_identity: scan_identity.clone(),
                 payload_sha256: payload_sha,
-                posted_at: now_dt.format(&Rfc3339).unwrap_or_default(),
+                // A rebuild is not an upload acknowledgment. Preserve the last
+                // successful post so daily rollover cannot defer weekly refresh.
+                posted_at: cache
+                    .as_ref()
+                    .filter(|_| unchanged_payload)
+                    .map(|entry| entry.posted_at.clone())
+                    .unwrap_or_else(|| now_dt.format(&Rfc3339).unwrap_or_default()),
             },
         );
     }
