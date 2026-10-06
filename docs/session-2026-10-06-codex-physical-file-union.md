@@ -22,7 +22,8 @@ One proof pass establishes unique native response identities, a contiguous
 thread-token counter chain across files, and coverage of exact UI usage events.
 Whole-record digests collapse complete copies into one canonical input.
 Conflicting overlap, gaps, resets, ordinal/fork boundaries, incomplete native
-replay and loss of a previously joined member hold the group. They do not declare it empty or advance its previous checkpoint.
+replay and loss of a previously joined member hold the group. They do not
+declare it empty or advance its previous checkpoint.
 Healthy groups remain eligible. Existing bounded traversal retry and counts
 expose these holds; there is no additional scheduler.
 
@@ -59,7 +60,9 @@ eligible until a validated common ACK and safe checkpoint settle it. No lock is
 held across the network. A failed capture, stale generation or changed source
 holds the protected group before POST. Capture survives a lost response,
 rejection, partial checkpoint and restart; only normal accepted settlement
-promotes it to applied evidence. The driver rechecks the current member objects
+promotes it to applied evidence. Accepting an older body cannot discard newer
+captured facts: promotion requires that the accepted derivation covers those
+facts. The driver rechecks the current member objects
 and directory membership before send and checkpoint.
 
 Each file retains at most 512 priority contributions. Applied and captured
@@ -68,6 +71,13 @@ file-owned; there is no age-based selector eviction or silent downgrade to
 standard to satisfy a cap. Missing required, malformed, unknown-version,
 changed-prefix or changed-context evidence holds its correction. A valid future
 or malformed receipt preserves the surrounding index and becomes a scoped hold.
+A hash-only logical-owner marker in each protected file entry prevents a
+state-database total from replacing its joined or priced history after physical
+source retirement. It grants no account authority. Missing sources retain their
+file-owned metadata and the existing bounded retry witness; quiet ticks neither
+rescan headers nor inflate counts. Unrelated physical owners remain eligible.
+Age/missing-source reconciliation cannot evict protected entries. Malformed
+owner metadata preserves the index and conservatively holds state-only fallback.
 An operator must restore compatible evidence or perform an explicitly reviewed
 recovery; automatic scans do not erase the protected state.
 

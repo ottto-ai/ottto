@@ -6435,6 +6435,7 @@ mod tests {
                 last_upload_body_witness: Some("b".repeat(64)),
                 scan_identity_version: None,
                 codex_joined_member_set: None,
+                codex_protected_owner: None,
                 codex_applied_tier_receipt: None,
                 codex_applied_tier_receipt_required: false,
                 codex_captured_tier_receipt: None,

@@ -2057,6 +2057,14 @@ pub struct ScanIndexEntry {
     /// Applied only through the existing common file/body acknowledgement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_joined_member_set: Option<String>,
+    /// Hash-only logical owner for protecting joined/priced history from a
+    /// state-only replacement after physical source retirement. No attribution.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_codex_protected_owner"
+    )]
+    pub codex_protected_owner: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -2076,6 +2084,32 @@ pub struct ScanIndexEntry {
     pub codex_captured_tier_receipt_required: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub codex_captured_uncommitted: bool,
+}
+impl ScanIndexEntry {
+    fn codex_history_is_protected(&self) -> bool {
+        self.codex_protected_owner.is_some()
+            || self.codex_joined_member_set.is_some()
+            || self.codex_applied_tier_receipt.is_some()
+            || self.codex_applied_tier_receipt_required
+            || self.codex_captured_tier_receipt.is_some()
+            || self.codex_captured_tier_receipt_required
+            || self.codex_captured_uncommitted
+    }
+}
+fn deserialize_codex_protected_owner<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| value.as_str().unwrap_or("").to_owned()))
+}
+fn valid_codex_protected_owner(owner: &str) -> bool {
+    owner.len() == 64
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+fn codex_protected_owner(session: &str) -> String {
+    sha256_hex(&["codex_protected_owner:v1", &resolve_codex_identity(session)])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -11199,21 +11233,20 @@ impl OwnedSourceScan {
             }
         }
 
-        let codex_join_inventory = (source == SnapshotSource::Codex
-            && (!codex_parent_frozen_census_paths.is_empty() || !identified_candidates.is_empty()))
-        .then(|| {
-            let traversal = index
-                .traversal
-                .as_ref()
-                .expect("Codex traversal initialized");
-            let mut inventory = codex_file_join::HeaderInventory::new(
-                roots,
-                &traversal.codex_rollout_paths,
-                traversal.codex_join_directory_census.as_ref(),
-            );
-            inventory.complete &= !codex_parent_frozen_census_paths.is_empty();
-            inventory
-        });
+        let codex_join_inventory =
+            (source == SnapshotSource::Codex && !identified_candidates.is_empty()).then(|| {
+                let traversal = index
+                    .traversal
+                    .as_ref()
+                    .expect("Codex traversal initialized");
+                let mut inventory = codex_file_join::HeaderInventory::new(
+                    roots,
+                    &traversal.codex_rollout_paths,
+                    traversal.codex_join_directory_census.as_ref(),
+                );
+                inventory.complete &= !codex_parent_frozen_census_paths.is_empty();
+                inventory
+            });
         Self {
             source,
             index: owned_index,
@@ -11884,6 +11917,14 @@ impl OwnedSourceScan {
             }
             let joined_marker =
                 (!aliases.is_empty()).then(|| codex_file_join::member_set_witness(&aliases));
+            let protected_owner = (!aliases.is_empty()
+                || applied_receipts.values().any(Option::is_some))
+            .then(|| {
+                parsed
+                    .first()
+                    .map(|item| codex_protected_owner(&item.source_session_id))
+            })
+            .flatten();
             let joined_keys = aliases
                 .iter()
                 .map(|member| local_index_key(&member.path))
@@ -11899,12 +11940,16 @@ impl OwnedSourceScan {
                 for key in joined_keys {
                     if let Some(entry) = index.files.get_mut(&key) {
                         entry.codex_joined_member_set = joined_marker.clone();
+                        entry.codex_protected_owner = protected_owner.clone();
                     }
                 }
             }
             if parse_complete {
                 for (key, receipt) in applied_receipts {
                     if let Some(entry) = index.files.get_mut(&key) {
+                        if receipt.is_some() {
+                            entry.codex_protected_owner = protected_owner.clone();
+                        }
                         entry.codex_applied_tier_receipt_required = receipt.is_some();
                         entry.codex_applied_tier_receipt = receipt;
                     }
@@ -11945,10 +11990,14 @@ impl OwnedSourceScan {
                 // A residue file that this page parsed to completion, or that a
                 // watcher hint proved absent, leaves the generation's residue set; a
                 // file that reproduced its residue (re)enters it.
-                for index_key in settled_residue_index_keys
-                    .iter()
-                    .chain(census.removed_index_keys.iter())
-                {
+                for index_key in settled_residue_index_keys.iter().chain(
+                    census.removed_index_keys.iter().filter(|key| {
+                        !index
+                            .files
+                            .get(*key)
+                            .is_some_and(ScanIndexEntry::codex_history_is_protected)
+                    }),
+                ) {
                     traversal.residue.index_keys.remove(index_key);
                 }
                 traversal.residue.index_keys.extend(residue_index_keys);
@@ -12004,12 +12053,45 @@ impl OwnedSourceScan {
             // derived index state directly. Any recreation after this absence witness
             // belongs to the next generation.
             for index_key in &census.removed_index_keys {
-                index.remove_file_entry(index_key);
+                if !index
+                    .files
+                    .get(index_key)
+                    .is_some_and(ScanIndexEntry::codex_history_is_protected)
+                {
+                    index.remove_file_entry(index_key);
+                }
             }
             let traversal_discovery_done = index.traversal.as_ref().is_some_and(|traversal| {
                 traversal.pending_directories.is_empty() && traversal.pending_candidates.is_empty()
             });
             if traversal_discovery_done {
+                if source == SnapshotSource::Codex {
+                    let missing = index
+                        .files
+                        .iter()
+                        .filter(|(key, entry)| {
+                            entry.codex_history_is_protected()
+                                && !index
+                                    .traversal
+                                    .as_ref()
+                                    .expect("traversal")
+                                    .codex_rollout_paths
+                                    .contains(*key)
+                        })
+                        .map(|(key, _)| key.clone())
+                        .collect::<BTreeSet<_>>();
+                    if !missing.is_empty() {
+                        let traversal = index.traversal.as_mut().expect("traversal");
+                        // Quiet ticks reuse this generation's red witness. Count
+                        // each absent protected source once, without rearming the
+                        // retry latch or rescanning headers before its deadline.
+                        let newly_missing =
+                            missing.difference(&traversal.residue.index_keys).count();
+                        traversal.counts.ownership_incomplete_file_count += newly_missing;
+                        traversal.counts.unreadable_path_count += usize::from(newly_missing > 0);
+                        traversal.residue.index_keys.extend(missing);
+                    }
+                }
                 // Discovery has visited every directory and parsed every candidate,
                 // so the counts are the complete re-derivation for this generation.
                 // Loss that only a change to the corpus can move is settled now, so a
@@ -12459,8 +12541,25 @@ fn append_codex_state_only_snapshots(
         .filter_map(|(path, _)| metadata.identity_from_path_evidence(Path::new(path)))
         .collect();
     let mut scanned_session_count = 0;
+    let protected = index
+        .files
+        .values()
+        .filter(|entry| entry.codex_history_is_protected())
+        .collect::<Vec<_>>();
+    let unknown_protected_owner = protected.iter().any(|entry| {
+        entry
+            .codex_protected_owner
+            .as_ref()
+            .map_or(true, |owner| !valid_codex_protected_owner(owner))
+    });
+    let protected_owners = protected
+        .iter()
+        .filter_map(|entry| entry.codex_protected_owner.as_ref())
+        .collect::<BTreeSet<_>>();
     for (source_session_id, thread) in &metadata.state_threads {
         if thread.tokens_used == 0
+            || unknown_protected_owner
+            || protected_owners.contains(&codex_protected_owner(source_session_id))
             || covered_session_ids.contains(source_session_id)
             || covered_in_prior_runs.contains(source_session_id)
             || blocked_session_ids.contains(source_session_id)
@@ -18881,7 +18980,12 @@ fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usiz
             .traversal
             .as_ref()
             .is_some_and(|traversal| traversal.observed_index_keys.contains(key));
-        if !observed {
+        if !observed
+            && !index
+                .files
+                .get(key)
+                .is_some_and(ScanIndexEntry::codex_history_is_protected)
+        {
             index.files.remove(key);
             index.confirmed_empty_files.remove(key);
             index.file_snapshot_fingerprints.remove(key);
@@ -20501,25 +20605,45 @@ impl ScanIndex {
                             .all(|fingerprint| accepted.contains(fingerprint))
                 });
             let old = previous.files.get(key);
-            if settled {
+            let pending_capture = old.is_some_and(|old| {
+                old.codex_captured_tier_receipt_required
+                    || old.codex_captured_uncommitted
+                    || old.codex_captured_tier_receipt.is_some()
+            });
+            let capture_covered = !pending_capture
+                || old
+                    .and_then(|old| old.codex_captured_tier_receipt.as_ref())
+                    .is_some_and(|captured| {
+                        entry
+                            .codex_applied_tier_receipt
+                            .as_ref()
+                            .is_some_and(|applied| captured.covered_by(applied))
+                    });
+            if settled && capture_covered {
                 entry.codex_captured_tier_receipt = None;
                 entry.codex_captured_tier_receipt_required = false;
                 entry.codex_captured_uncommitted = false;
-            } else if old.is_some_and(|entry| entry.codex_captured_tier_receipt_required) {
-                // A rejection may settle the existing invalid-body retry contract;
-                // it does not promote selector capture into accepted output.
-                entry.codex_captured_tier_receipt = entry
-                    .codex_applied_tier_receipt
-                    .take()
-                    .or_else(|| old.and_then(|entry| entry.codex_captured_tier_receipt.clone()));
-                entry.codex_captured_tier_receipt_required =
-                    entry.codex_captured_tier_receipt.is_some();
+            } else if pending_capture {
+                // Acceptance of an older body cannot settle newly captured facts.
+                // A rollback/quarantine must never replace them with an older,
+                // smaller applied receipt, or repair missing facts by guessing.
+                entry.codex_captured_tier_receipt = old
+                    .and_then(|old| old.codex_captured_tier_receipt.as_ref())
+                    .map(|captured| {
+                        entry
+                            .codex_applied_tier_receipt
+                            .as_ref()
+                            .filter(|applied| captured.covered_by(applied))
+                            .unwrap_or(captured)
+                            .clone()
+                    });
+                entry.codex_captured_tier_receipt_required = true;
                 entry.codex_captured_uncommitted =
-                    old.is_some_and(|entry| entry.codex_captured_uncommitted);
+                    old.is_some_and(|old| old.codex_captured_uncommitted);
                 entry.codex_applied_tier_receipt =
-                    old.and_then(|entry| entry.codex_applied_tier_receipt.clone());
+                    old.and_then(|old| old.codex_applied_tier_receipt.clone());
                 entry.codex_applied_tier_receipt_required =
-                    old.is_some_and(|entry| entry.codex_applied_tier_receipt_required);
+                    old.is_some_and(|old| old.codex_applied_tier_receipt_required);
             }
         }
     }
@@ -21042,6 +21166,7 @@ impl ScanIndex {
                 effective_upload_body_witness_revision,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 codex_joined_member_set: None,
+                codex_protected_owner: None,
                 codex_applied_tier_receipt: None,
                 codex_applied_tier_receipt_required: false,
                 codex_captured_tier_receipt: None,
@@ -21078,6 +21203,7 @@ impl ScanIndex {
                 effective_upload_body_witness_revision,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 codex_joined_member_set: None,
+                codex_protected_owner: None,
                 codex_applied_tier_receipt: None,
                 codex_applied_tier_receipt_required: false,
                 codex_captured_tier_receipt: None,
@@ -23342,6 +23468,7 @@ mod tests {
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                     codex_joined_member_set: None,
+                    codex_protected_owner: None,
                     codex_applied_tier_receipt: None,
                     codex_applied_tier_receipt_required: false,
                     codex_captured_tier_receipt: None,
@@ -24603,6 +24730,7 @@ mod tests {
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                     codex_joined_member_set: None,
+                    codex_protected_owner: None,
                     codex_applied_tier_receipt: None,
                     codex_applied_tier_receipt_required: false,
                     codex_captured_tier_receipt: None,
@@ -25042,6 +25170,7 @@ mod tests {
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: None,
                     codex_joined_member_set: None,
+                    codex_protected_owner: None,
                     codex_applied_tier_receipt: None,
                     codex_applied_tier_receipt_required: false,
                     codex_captured_tier_receipt: None,
@@ -25133,6 +25262,7 @@ mod tests {
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: None,
                     codex_joined_member_set: None,
+                    codex_protected_owner: None,
                     codex_applied_tier_receipt: None,
                     codex_applied_tier_receipt_required: false,
                     codex_captured_tier_receipt: None,
@@ -25191,6 +25321,7 @@ mod tests {
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                     codex_joined_member_set: None,
+                    codex_protected_owner: None,
                     codex_applied_tier_receipt: None,
                     codex_applied_tier_receipt_required: false,
                     codex_captured_tier_receipt: None,
@@ -25236,6 +25367,7 @@ mod tests {
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: None,
                     codex_joined_member_set: None,
+                    codex_protected_owner: None,
                     codex_applied_tier_receipt: None,
                     codex_applied_tier_receipt_required: false,
                     codex_captured_tier_receipt: None,
@@ -25278,6 +25410,7 @@ mod tests {
                     effective_upload_body_witness_revision: 0,
                     scan_identity_version: None,
                     codex_joined_member_set: None,
+                    codex_protected_owner: None,
                     codex_applied_tier_receipt: None,
                     codex_applied_tier_receipt_required: false,
                     codex_captured_tier_receipt: None,
@@ -30860,6 +30993,7 @@ mod tests {
             effective_upload_body_witness_revision: 0,
             scan_identity_version: None,
             codex_joined_member_set: None,
+            codex_protected_owner: None,
             codex_applied_tier_receipt: None,
             codex_applied_tier_receipt_required: false,
             codex_captured_tier_receipt: None,
@@ -47414,6 +47548,7 @@ mod tests {
                 effective_upload_body_witness_revision: 0,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 codex_joined_member_set: None,
+                codex_protected_owner: None,
                 codex_applied_tier_receipt: None,
                 codex_applied_tier_receipt_required: false,
                 codex_captured_tier_receipt: None,
@@ -48443,6 +48578,7 @@ mod tests {
                 effective_upload_body_witness_revision: 0,
                 scan_identity_version: None,
                 codex_joined_member_set: None,
+                codex_protected_owner: None,
                 codex_applied_tier_receipt: None,
                 codex_applied_tier_receipt_required: false,
                 codex_captured_tier_receipt: None,
@@ -49924,6 +50060,7 @@ mod tests {
             effective_upload_body_witness_revision: 0,
             scan_identity_version: Some("semantic_sync:v1".to_string()),
             codex_joined_member_set: None,
+            codex_protected_owner: None,
             codex_applied_tier_receipt: None,
             codex_applied_tier_receipt_required: false,
             codex_captured_tier_receipt: None,
@@ -50337,6 +50474,7 @@ mod tests {
                 effective_upload_body_witness_revision: 0,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 codex_joined_member_set: None,
+                codex_protected_owner: None,
                 codex_applied_tier_receipt: None,
                 codex_applied_tier_receipt_required: false,
                 codex_captured_tier_receipt: None,
@@ -51327,7 +51465,7 @@ crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paire
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys);
 crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
-crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted);
+crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);

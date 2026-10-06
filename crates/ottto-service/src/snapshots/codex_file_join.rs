@@ -1624,11 +1624,180 @@ pub(super) mod tests {
         let (after, held) = scan(&root, previous.clone(), 2);
         assert!(held.snapshots.is_empty());
         assert!(!held.census_complete);
-        assert_eq!(held.ownership_incomplete_file_count, 1);
+        assert_eq!(
+            held.ownership_incomplete_file_count, 2,
+            "both the absent member and the remaining tail are held"
+        );
         assert_eq!(
             serde_json::to_value(&after.files).unwrap(),
             serde_json::to_value(&previous.files).unwrap()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn retired_sources_keep_protected_history_and_quiet_retry_is_idempotent() {
+        let root = native_join_fixture_root(true);
+        let (mut working, mut result) = scan(&root, ScanIndex::default(), 3);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
+        result.finish_codex_capture_boundary(&mut working);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let previous =
+            working.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+        assert_eq!(previous.files.len(), 2);
+        assert!(previous
+            .files
+            .values()
+            .all(|entry| entry.codex_protected_owner.is_some()));
+        let originals = ["a.jsonl", "b.jsonl"].map(|name| {
+            (
+                name,
+                fs::read_to_string(root.join("sessions").join(name)).unwrap(),
+            )
+        });
+        for name in ["a.jsonl", "b.jsonl"] {
+            fs::remove_file(root.join("sessions").join(name)).unwrap();
+        }
+        let healthy_owner = "ffffffff-1111-4111-8111-ffffffffffff";
+        let body = member(healthy_owner, "healthy", 100, 100)
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap() + "\n")
+            .collect::<String>();
+        fs::write(root.join("sessions/c.jsonl"), body).unwrap();
+        let (after, held) = scan(&root, previous.clone(), 3);
+        assert!(!held.census_complete);
+        assert_eq!(held.ownership_incomplete_file_count, 2);
+        assert!(held
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id == healthy_owner));
+        assert_eq!(
+            held.snapshots.len(),
+            1,
+            "healthy physical owner remains uploadable"
+        );
+        for (key, entry) in &previous.files {
+            assert_eq!(
+                serde_json::to_value(&after.files[key]).unwrap(),
+                serde_json::to_value(entry).unwrap()
+            );
+        }
+        let counts = after.traversal.as_ref().unwrap().counts.clone();
+        let deadline = after
+            .traversal
+            .as_ref()
+            .unwrap()
+            .unhealthy_retry_not_before_unix_seconds;
+        let quiet = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[root.join("sessions")],
+            after.clone(),
+            "2026-10-06T23:00:00Z",
+            7,
+            3,
+            false,
+            None,
+            &[],
+            false,
+            false,
+        );
+        assert!(
+            quiet.codex_join_inventory.is_none(),
+            "quiet red tick must not rescan headers"
+        );
+        let (quiet_index, quiet_result) = scan(&root, after.clone(), 3);
+        assert_eq!(quiet_result.scanned_file_count, 0);
+        assert_eq!(
+            serde_json::to_value(&quiet_index.traversal.as_ref().unwrap().counts).unwrap(),
+            serde_json::to_value(&counts).unwrap()
+        );
+        assert_eq!(
+            quiet_index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .unhealthy_retry_not_before_unix_seconds,
+            deadline
+        );
+        // The existing age/missing-source reconciler cannot evict file-owned
+        // selectors even when its observation set no longer includes the files.
+        let mut aged = after;
+        aged.traversal.as_mut().unwrap().observed_index_keys.clear();
+        assert!(reconcile_missing_index_entries_with_limit(&mut aged, 10));
+        for key in previous.files.keys() {
+            assert!(aged.files.contains_key(key));
+        }
+        for (name, text) in originals {
+            fs::write(root.join("sessions").join(name), text).unwrap();
+        }
+        fs::remove_file(root.join("logs_2.sqlite")).unwrap();
+        aged.traversal
+            .as_mut()
+            .unwrap()
+            .unhealthy_retry_not_before_unix_seconds = Some(0);
+        let (recovered, restored) = scan(&root, aged, 3);
+        assert!(
+            restored.census_complete,
+            "a due fresh census can clear the source-loss hold"
+        );
+        let priced_key = local_index_key(&root.join("sessions/b.jsonl"));
+        assert_eq!(
+            recovered.files[&priced_key].codex_applied_tier_receipt,
+            previous.files[&priced_key].codex_applied_tier_receipt
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn protected_owner_blocks_state_only_replacement_without_claiming_other_owners() {
+        let root = native_join_fixture_root(true);
+        let (mut index, mut result) = scan(&root, ScanIndex::default(), 2);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let healthy = "ffffffff-1111-4111-8111-ffffffffffff";
+        let mut metadata = CodexTitleMetadata::default();
+        for id in [owner, healthy] {
+            metadata.state_threads.insert(
+                id.to_owned(),
+                CodexStateThread {
+                    tokens_used: 300,
+                    ..CodexStateThread::default()
+                },
+            );
+        }
+        let mut items = Vec::new();
+        assert_eq!(
+            append_codex_state_only_snapshots(
+                &mut items,
+                &metadata,
+                "2026-10-06T23:00:00Z",
+                &mut index,
+                &BTreeSet::new()
+            ),
+            (1, 0)
+        );
+        assert_eq!(items[0].source_session_id, healthy);
+        // Malformed/future owner metadata cannot reset the surrounding index
+        // and expose a previously protected owner to the fallback.
+        let mut value = serde_json::to_value(&index).unwrap();
+        let key = local_index_key(&root.join("sessions/b.jsonl"));
+        value["files"][&key]["codex_protected_owner"] = json!({"future": true});
+        let mut malformed: ScanIndex = serde_json::from_value(value).unwrap();
+        assert_eq!(malformed.files.len(), index.files.len());
+        let mut items = Vec::new();
+        assert_eq!(
+            append_codex_state_only_snapshots(
+                &mut items,
+                &metadata,
+                "2026-10-06T23:00:00Z",
+                &mut malformed,
+                &BTreeSet::new()
+            ),
+            (0, 0)
+        );
+        assert!(items.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1728,6 +1897,84 @@ pub(super) mod tests {
         assert!(changed.is_empty());
         assert_eq!(held.len(), 1);
         assert_eq!(serde_json::to_vec(&captured).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn older_body_acceptance_or_rollback_cannot_discard_new_captured_facts() {
+        let root = native_join_fixture_root(true);
+        let (mut old_index, mut old_result) = scan(&root, ScanIndex::default(), 2);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut old_result, &mut old_index);
+        old_result.finish_codex_capture_boundary(&mut old_index);
+        let old_accepted = old_result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let previous =
+            old_index.committable_subset(&ScanIndex::default(), &old_accepted, &BTreeMap::new());
+        let path = root.join("sessions/b.jsonl");
+        let mut text = fs::read_to_string(&path).unwrap();
+        for row in member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-c", 200, 500)
+            .into_iter()
+            .skip(1)
+        {
+            text.push_str(&(serde_json::to_string(&row).unwrap() + "\n"));
+        }
+        fs::write(&path, text).unwrap();
+        let (mut working, mut result) = scan(&root, previous.clone(), 2);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
+        let (captured, changed, held) =
+            working.stage_codex_tier_capture(&previous, &result.snapshots);
+        assert_eq!(changed.len(), 1);
+        assert!(held.is_empty());
+        let key = local_index_key(&path);
+        assert_eq!(
+            captured.files[&key]
+                .codex_captured_tier_receipt
+                .as_ref()
+                .unwrap()
+                .tiers
+                .len(),
+            2
+        );
+        for accepted in [&old_accepted, &BTreeSet::new()] {
+            let mut rollback = captured.clone();
+            rollback.reconcile_codex_tier_settlement(&captured, accepted);
+            assert_eq!(
+                rollback.files[&key].codex_captured_tier_receipt,
+                captured.files[&key].codex_captured_tier_receipt
+            );
+            assert_eq!(
+                rollback.files[&key].codex_applied_tier_receipt,
+                previous.files[&key].codex_applied_tier_receipt
+            );
+            let mut damaged = captured.clone();
+            damaged
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .codex_captured_tier_receipt = None;
+            let mut rollback = damaged.clone();
+            rollback.reconcile_codex_tier_settlement(&damaged, accepted);
+            assert!(rollback.files[&key].codex_captured_tier_receipt_required);
+            assert!(rollback.files[&key].codex_captured_tier_receipt.is_none());
+        }
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        working.reconcile_codex_tier_settlement(&captured, &accepted);
+        assert!(!working.files[&key].codex_captured_tier_receipt_required);
+        assert_eq!(
+            working.files[&key]
+                .codex_applied_tier_receipt
+                .as_ref()
+                .unwrap()
+                .tiers
+                .len(),
+            2
+        );
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
