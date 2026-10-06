@@ -67,6 +67,7 @@ unsafe impl GlobalAlloc for Probe {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc(layout);
         if !ptr.is_null() {
+            process::allocated(ptr, layout.size(), usable(ptr.cast(), layout.size()));
             record(
                 layout.size() as isize,
                 usable(ptr.cast(), layout.size()) as isize,
@@ -76,6 +77,7 @@ unsafe impl GlobalAlloc for Probe {
         ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        process::deallocated(ptr);
         record(
             -(layout.size() as isize),
             -(usable(ptr.cast(), layout.size()) as isize),
@@ -85,7 +87,7 @@ unsafe impl GlobalAlloc for Probe {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let old_usable = usable(ptr.cast(), layout.size());
-        let result = System.realloc(ptr, layout, size);
+        let result = process::reallocate(ptr, layout, size);
         if !result.is_null() {
             record(
                 size as isize - layout.size() as isize,
@@ -120,4 +122,171 @@ pub(crate) fn phase_begin() {
 }
 pub(crate) fn phase_peak() -> usize {
     PHASE_PEAK.with(Cell::get)
+}
+
+// Independent all-thread audit. The fixed table allocates no Rust heap and
+// leaves System/Layouts untouched. Only pointers born inside this scope are
+// charged: freeing a pre-existing allocation cannot hide a later peak. Charge
+// realloc's old+new overlap conservatively even when System grows in place.
+mod process {
+    use super::Stats;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    const SLOTS: usize = 65_536;
+    #[derive(Clone, Copy)]
+    struct Entry {
+        pointer: usize,
+        requested: usize,
+        usable: usize,
+    }
+    const EMPTY: Entry = Entry {
+        pointer: 0,
+        requested: 0,
+        usable: 0,
+    };
+    struct Audit {
+        active: bool,
+        overflow: bool,
+        stats: Stats,
+        entries: [Entry; SLOTS],
+    }
+    static AUDIT: Mutex<Audit> = Mutex::new(Audit {
+        active: false,
+        overflow: false,
+        stats: Stats {
+            requested_live: 0,
+            usable_live: 0,
+            requested_peak: 0,
+            usable_peak: 0,
+            allocations: 0,
+        },
+        entries: [EMPTY; SLOTS],
+    });
+    impl Audit {
+        fn lookup(&self, pointer: usize) -> Option<usize> {
+            let first = (pointer >> 4).wrapping_mul(0x9e3779b1) % SLOTS;
+            for i in 0..SLOTS {
+                let slot = (first + i) % SLOTS;
+                if self.entries[slot].pointer == 0 {
+                    return None;
+                }
+                if self.entries[slot].pointer == pointer {
+                    return Some(slot);
+                }
+            }
+            None
+        }
+        fn insert(&mut self, pointer: usize, requested: usize, usable: usize) {
+            self.stats.requested_live += requested as isize;
+            self.stats.usable_live += usable as isize;
+            self.stats.requested_peak = self
+                .stats
+                .requested_peak
+                .max(self.stats.requested_live as usize);
+            self.stats.usable_peak = self.stats.usable_peak.max(self.stats.usable_live as usize);
+            self.stats.allocations += 1;
+            let first = (pointer >> 4).wrapping_mul(0x9e3779b1) % SLOTS;
+            for i in 0..SLOTS {
+                let slot = (first + i) % SLOTS;
+                if self.entries[slot].pointer <= 1 {
+                    self.entries[slot] = Entry {
+                        pointer,
+                        requested,
+                        usable,
+                    };
+                    return;
+                }
+            }
+            self.overflow = true;
+        }
+        fn remove(&mut self, pointer: usize) {
+            if let Some(slot) = self.lookup(pointer) {
+                let entry = self.entries[slot];
+                self.stats.requested_live -= entry.requested as isize;
+                self.stats.usable_live -= entry.usable as isize;
+                self.entries[slot].pointer = 1;
+            }
+        }
+    }
+    pub(super) fn allocated(pointer: *mut u8, requested: usize, usable: usize) {
+        if !ACTIVE.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut audit = AUDIT.lock().unwrap_or_else(|p| p.into_inner());
+        if audit.active {
+            audit.insert(pointer as usize, requested, usable);
+        }
+    }
+    pub(super) fn deallocated(pointer: *mut u8) {
+        if !ACTIVE.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut audit = AUDIT.lock().unwrap_or_else(|p| p.into_inner());
+        if audit.active {
+            audit.remove(pointer as usize);
+        }
+    }
+    pub(super) unsafe fn reallocate(
+        old: *mut u8,
+        layout: std::alloc::Layout,
+        requested: usize,
+    ) -> *mut u8 {
+        use std::alloc::{GlobalAlloc, System};
+        if !ACTIVE.load(Ordering::Relaxed) {
+            return System.realloc(old, layout, requested);
+        }
+        // Keep the table lock across System's native realloc: another thread
+        // may immediately reuse the old address after System frees it.
+        let mut audit = AUDIT.lock().unwrap_or_else(|p| p.into_inner());
+        let new = System.realloc(old, layout, requested);
+        if audit.active && !new.is_null() {
+            let usable = super::usable(new.cast(), requested);
+            audit.stats.requested_peak = audit
+                .stats
+                .requested_peak
+                .max(audit.stats.requested_live as usize + requested);
+            audit.stats.usable_peak = audit
+                .stats
+                .usable_peak
+                .max(audit.stats.usable_live as usize + usable);
+            audit.remove(old as usize);
+            audit.insert(new as usize, requested, usable);
+        }
+        new
+    }
+    pub(super) fn measure<T>(f: impl FnOnce() -> T) -> (T, Stats) {
+        {
+            let mut audit = AUDIT.lock().unwrap_or_else(|p| p.into_inner());
+            if audit.active {
+                drop(audit);
+                panic!("native allocation audit already active");
+            }
+            audit.entries.fill(EMPTY);
+            audit.stats = Stats::default();
+            audit.overflow = false;
+            audit.active = true;
+            ACTIVE.store(true, Ordering::Release);
+        }
+        struct Stop;
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                ACTIVE.store(false, Ordering::Release);
+                AUDIT.lock().unwrap_or_else(|p| p.into_inner()).active = false;
+            }
+        }
+        let stop = Stop;
+        let result = f();
+        drop(stop);
+        let (overflow, stats) = {
+            let audit = AUDIT.lock().unwrap_or_else(|p| p.into_inner());
+            (audit.overflow, audit.stats)
+        };
+        assert!(!overflow, "native allocation audit table overflow");
+        (result, stats)
+    }
+}
+
+pub(crate) fn measure_process<T>(f: impl FnOnce() -> T) -> (T, Stats) {
+    process::measure(f)
 }

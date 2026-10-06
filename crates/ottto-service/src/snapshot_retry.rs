@@ -9,6 +9,109 @@ pub(crate) const ADDITIONAL_BATCH_POSTS: usize = 3;
 pub(crate) const RESPONSE_BYTES: usize = 128 * 1024;
 pub(crate) const TOKEN_RESPONSE_BYTES: usize = 16 * 1024;
 pub(crate) const REQUEST_BYTES: usize = 256 * 1024;
+pub(crate) const STATE_NODES: usize = 8192;
+
+/// Reject decoded auxiliary-state amplification before constructing Values or
+/// native containers. This visitor borrows unescaped strings; serde's escape
+/// scratch is bounded by the already capped input. Ordinary readers are unchanged.
+pub(crate) fn state_shape(bytes: &[u8]) -> Result<()> {
+    shape_nodes(bytes, STATE_NODES).map(|_| ())
+}
+/// Count outgoing nodes once for oldest-row eviction. No decoded container is
+/// constructed; the serialized byte limit already bounds this traversal.
+pub(crate) fn state_nodes(bytes: &[u8]) -> Result<usize> {
+    shape_nodes(bytes, bytes.len())
+}
+fn shape_nodes(bytes: &[u8], node_limit: usize) -> Result<usize> {
+    use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+    struct Shape<'a> {
+        nodes: &'a mut usize,
+        depth: usize,
+        node_limit: usize,
+    }
+    impl<'de> DeserializeSeed<'de> for Shape<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            d: D,
+        ) -> std::result::Result<(), D::Error> {
+            *self.nodes += 1;
+            if *self.nodes > self.node_limit || self.depth > 64 {
+                return Err(serde::de::Error::custom(
+                    "optional snapshot state shape cap",
+                ));
+            }
+            d.deserialize_any(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Shape<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("bounded optional snapshot state")
+        }
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> std::result::Result<(), E> {
+            Ok(())
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<(), E> {
+            Ok(())
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<(), E> {
+            Ok(())
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<(), E> {
+            Ok(())
+        }
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> std::result::Result<(), E> {
+            Ok(())
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<(), E> {
+            Ok(())
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<(), A::Error> {
+            while seq
+                .next_element_seed(Shape {
+                    nodes: &mut *self.nodes,
+                    depth: self.depth + 1,
+                    node_limit: self.node_limit,
+                })?
+                .is_some()
+            {}
+            Ok(())
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<(), A::Error> {
+            while map
+                .next_key_seed(Shape {
+                    nodes: &mut *self.nodes,
+                    depth: self.depth + 1,
+                    node_limit: self.node_limit,
+                })?
+                .is_some()
+            {
+                map.next_value_seed(Shape {
+                    nodes: &mut *self.nodes,
+                    depth: self.depth + 1,
+                    node_limit: self.node_limit,
+                })?;
+            }
+            Ok(())
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let mut nodes = 0;
+    Shape {
+        nodes: &mut nodes,
+        depth: 0,
+        node_limit,
+    }
+    .deserialize(&mut decoder)?;
+    decoder.end()?;
+    Ok(nodes)
+}
+
+pub(crate) fn decode_state<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    state_shape(bytes)?;
+    serde_json::from_slice(bytes).map_err(anyhow::Error::from)
+}
 
 struct CountJson {
     bytes: usize,
