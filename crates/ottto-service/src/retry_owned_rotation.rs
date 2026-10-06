@@ -182,6 +182,7 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
                 .insert("opaque".into(), serde_json::json!({"opaque":true}));
         }
         Ok(Some(SourcePreparation {
+            retry_authority: None,
             source,
             account_witness: [0; 32],
             scan_started_at: "2026-10-05T00:00:00Z".into(),

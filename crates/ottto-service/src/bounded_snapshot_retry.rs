@@ -34,6 +34,7 @@ pub(super) struct PreparedRetry {
     progress_path: PathBuf,
     pub(super) budget: RetryBudget,
     bound: usize,
+    live: Option<super::live_snapshot_retry::LiveAuthority>,
 }
 impl PreparedRetry {
     /// Admission precedes every deep copy. All native ledger/index/context
@@ -68,6 +69,15 @@ impl PreparedRetry {
             .min(RETAINED_BUDGET)
             .min(crate::retry_retention_bound::HEAP_CAP);
         let page = crate::retry_retention_bound::page_bound(items, cap)?;
+        // Count escaped JSON before any retained-body deep copy. The actual
+        // wire serializer has its own cap including semantic envelopes.
+        if !crate::snapshot_retry::json_fits(items, crate::snapshot_retry::REQUEST_BYTES / 2)
+            || !crate::snapshot_retry::json_fits(working, crate::snapshot_retry::RESPONSE_BYTES)
+            || !crate::snapshot_retry::json_fits(baseline, crate::snapshot_retry::RESPONSE_BYTES)
+            || !crate::snapshot_retry::json_fits(progress, crate::snapshot_retry::RESPONSE_BYTES)
+        {
+            return None;
+        }
         let mut counter = Counter::new(cap);
         counter.add(page)?;
         counter.add(std::mem::size_of::<Self>())?;
@@ -110,7 +120,55 @@ impl PreparedRetry {
             progress_path: progress_path.to_owned(),
             budget,
             bound: counter.bytes,
+            live: None,
         })
+    }
+
+    pub(super) fn attach_live_authority(
+        &mut self,
+        live: super::live_snapshot_retry::LiveAuthority,
+        allowance: usize,
+    ) -> bool {
+        let mut counter = Counter::new(allowance.min(RETAINED_BUDGET));
+        if counter.add(self.bound).is_none() || live.heap_bound(&mut counter).is_none() {
+            return false;
+        }
+        self.bound = counter.bytes;
+        self.live = Some(live);
+        true
+    }
+    pub(super) fn source(&self) -> SnapshotSource {
+        self.source
+    }
+    pub(super) fn authority(&self) -> [u8; 32] {
+        self.authority
+    }
+    pub(super) fn take_live_authority(
+        &mut self,
+    ) -> Result<super::live_snapshot_retry::LiveAuthority> {
+        self.live
+            .take()
+            .ok_or_else(|| anyhow!("optional snapshot retry lacks live authority"))
+    }
+    pub(super) fn restore_live_authority(
+        &mut self,
+        live: super::live_snapshot_retry::LiveAuthority,
+    ) {
+        self.live = Some(live);
+    }
+
+    pub(super) fn turn_live(
+        &mut self,
+        client: &SnapshotApiClient,
+        device: &LocalDeviceBinding,
+        secret: &str,
+        policy: &[u8; 32],
+        validate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<SnapshotPageOutcome> {
+        // The complete live input seal authorizes these unchanged owned bodies.
+        // No parse or second body copy is needed to establish a retry turn.
+        self.validate_body(&self.items, &self.authority)?;
+        self.turn_inner(client, device, secret, Some(policy), validate)
     }
 
     #[cfg(test)]
@@ -183,6 +241,17 @@ impl PreparedRetry {
         validate: &mut dyn FnMut() -> Result<()>,
     ) -> Result<SnapshotPageOutcome> {
         self.validate_body(current_items, authority)?;
+        self.turn_inner(client, device, device_secret, None, validate)
+    }
+
+    fn turn_inner(
+        &mut self,
+        client: &SnapshotApiClient,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        live_policy: Option<&[u8; 32]>,
+        validate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<SnapshotPageOutcome> {
         self.validate_native_checkpoint().map_err(|_| {
             anyhow::Error::new(SnapshotLocalStateRejected {
                 operation: "validate optional snapshot checkpoint",
@@ -236,6 +305,13 @@ impl PreparedRetry {
                     validate_snapshot_batch_request(&request).map_err(|reason| {
                         anyhow::Error::new(SnapshotBatchPreflightRejected { reason })
                     })?;
+                    anyhow::ensure!(
+                        crate::snapshot_retry::json_fits(
+                            &request,
+                            crate::snapshot_retry::REQUEST_BYTES
+                        ),
+                        "optional snapshot wire request exceeds admission limit"
+                    );
                     let mut token = client.issue_relay_token_bounded(
                         device,
                         device_secret,
@@ -243,6 +319,15 @@ impl PreparedRetry {
                         budget,
                         validate,
                     )?;
+                    if let Some(expected) = live_policy {
+                        let mut hint =
+                            client.get_activity_hint_bounded(&token, budget, validate)?;
+                        anyhow::ensure!(
+                            super::live_snapshot_retry::fresh_policy_seal(&mut hint).as_ref()
+                                == Some(expected),
+                            "optional snapshot policy changed"
+                        );
+                    }
                     let response = match client
                         .upload_batch_bounded(&token, &request, false, budget, validate)
                     {
@@ -258,6 +343,16 @@ impl PreparedRetry {
                                 budget,
                                 validate,
                             )?;
+                            if let Some(expected) = live_policy {
+                                let mut hint =
+                                    client.get_activity_hint_bounded(&token, budget, validate)?;
+                                anyhow::ensure!(
+                                    super::live_snapshot_retry::fresh_policy_seal(&mut hint)
+                                        .as_ref()
+                                        == Some(expected),
+                                    "optional snapshot policy changed"
+                                );
+                            }
                             client
                                 .upload_batch_bounded(&token, &request, false, budget, validate)?
                         }
@@ -301,9 +396,8 @@ impl PreparedRetry {
     }
 }
 
-/// Review status of this preparation. No production caller captures or sends
-/// a retained body. Activation requires a separate reviewed live owner/wake
-/// integration; changing this marker alone cannot activate the preparation.
+/// Activation review is intentionally still closed. The daemon now owns the
+/// live plumbing, but its production constructor cannot capture or send.
 pub(super) fn production_activation_reviewed() -> bool {
     ACTIVATED
 }

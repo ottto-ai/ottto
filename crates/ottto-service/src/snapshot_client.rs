@@ -1652,6 +1652,29 @@ impl SnapshotApiClient {
         Ok(token.token)
     }
 
+    pub(crate) fn get_activity_hint_bounded(
+        &self,
+        relay_token: &str,
+        budget: &crate::snapshot_retry::RetryBudget,
+        validate: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<ActivityHintResponse> {
+        validate()?;
+        self.require_bounded_snapshot_https()?;
+        let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
+        let response = agent
+            .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
+            .timeout(timeout)
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .call()?;
+        // A policy response never needs a body-sized allowance or raw key
+        // retention. Decode only after this cap and drop the fresh hint in-turn.
+        let hint = bounded_response_json(response, crate::snapshot_retry::TOKEN_RESPONSE_BYTES)?;
+        budget.remaining(Instant::now())?;
+        validate()?;
+        Ok(hint)
+    }
+
     pub fn get_activity_hint(&self, relay_token: &str) -> Result<ActivityHintResponse> {
         self.agent
             .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
@@ -1724,10 +1747,17 @@ impl SnapshotApiClient {
                 .snapshots
                 .iter()
                 .any(|item| item.cache_observations.is_some());
-        let body = if enforce_head_cas {
-            serde_json::to_vec(&request.wire_with_head_cas())
+        let body = if retry.is_some() && enforce_head_cas {
+            crate::snapshot_retry::encode_json(
+                &request.wire_with_head_cas(),
+                crate::snapshot_retry::REQUEST_BYTES,
+            )
+        } else if retry.is_some() {
+            crate::snapshot_retry::encode_json(request, crate::snapshot_retry::REQUEST_BYTES)
+        } else if enforce_head_cas {
+            serde_json::to_vec(&request.wire_with_head_cas()).map_err(anyhow::Error::from)
         } else {
-            serde_json::to_vec(request)
+            serde_json::to_vec(request).map_err(anyhow::Error::from)
         }
         .map_err(|error| anyhow!("serialize snapshot batch failed: {error}"))?;
         let default_gzip = snapshot_upload_gzip_enabled();

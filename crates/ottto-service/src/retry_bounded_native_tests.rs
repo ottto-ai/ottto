@@ -36,7 +36,7 @@ fn bounded_native_ack(item: &SnapshotItem) -> String {
     serde_json::json!({"accepted":1,"sessions_reconciled":1,"session_ids":[],"disabled":false,
         "entity_ack_contract":crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT,
         "accepted_entities":[{"source_session_id":item.source_session_id,"snapshot_fingerprint":item.snapshot_fingerprint,
-        "occurrence_count":1,"body_witness_version":version,"body_witness_digest":snapshot_upload_body_witness(item)}]}).to_string()
+        "occurrence_count":1,"body_witness_version":version,"body_witness_digest":version.map(|_|snapshot_upload_body_witness(item))}]}).to_string()
 }
 fn bounded_native_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
     use std::io::Write;

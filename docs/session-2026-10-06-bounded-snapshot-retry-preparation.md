@@ -1,8 +1,9 @@
 # Bounded snapshot retry preparation
 
 This source preparation follows the owned-source rotation change. Production
-still uses ordinary snapshot delivery. No production caller captures or sends
-retained pages, no setting enables them, and no release is requested here.
+still uses ordinary snapshot delivery. The long-lived daemon owns gated capture and delivery-only wake plumbing, but
+its production constructor declines retention. No setting enables it and no
+release is requested here.
 
 The compiled preparation combines a retained native page with the existing
 entity ACK, durable progress, partial-index checkpoint and index CAS. A bounded
@@ -54,17 +55,60 @@ clock deadlines use real monotonic time; simulated parser time remains a
 separate deterministic adapter. Positive retained-layout tests require the
 pinned Rust 1.88/macOS layout and decline on unsupported toolchains.
 
+## Gated live owner integration
+
+The existing snapshot thread owns the retry queue across collection cycles and
+waits. Native shed handling captures only after the canonical partial checkpoint
+returns successfully, adopting that exact generation. Collection boundaries
+exclude all parked sources. Delivery-only wakes take the same cycle mutex,
+retain the original absolute ordinary deadline, and do not start a provider scan.
+Manual one-shot collection keeps a closed, disposable owner.
+
+The initial live admission is deliberately narrow: Pi with attribution disabled,
+no workspace or repository identity derived from external Git metadata, and no
+required head CAS. Other graphs remain ordinary collection. Before the native
+scan, a bounded input closure freezes the whole Pi transcript tree: at most 128
+paths, 32 KiB of path bytes and 8 MiB of source file lengths. It refuses symlinks,
+special objects and non-JSONL leaves. Native opened-file fingerprints and directory
+mutation stamps are rechecked before capture and each network/publication guard;
+retry turns inspect known paths without enumeration or provider parsing. Every
+retained item must be covered by that exact pre-scan native file evidence.
+
+The owner freshly loads device credentials for a turn and checks device/source
+permission, machine/account binding, endpoint, secret-bound destination and daemon
+stop state. A hash of the bounded backfill state fences cutoff changes. A fresh
+activity-hint GET follows each new relay token within the same absolute network
+turn and checks enabled policy, evidence window, titles, workspace/artifact privacy,
+attribution-off and CAS admission. Fresh key material is zeroized and dropped in
+the turn. The GET establishes current policy at that request; the server still
+owns authorization for subsequent physical POSTs. No instantaneous remote policy
+change fence is claimed. Local input/authority guards remain at each network phase
+and publication. Exact ACK persistence precedes post-response authority checks.
+
+Live native context is admitted within 1 MiB of the shared retained reservation.
+Allocation-free JSON counting refuses escaped item bodies over 128 KiB before a
+retained copy, and index/progress inputs over 128 KiB. Full wire encoding, including
+native semantic envelopes, is checked before token acquisition and capped at
+256 KiB during serialization. Token/policy responses are capped at 16 KiB and
+batch/competing-state reads at 128 KiB before decoding. These byte caps complement
+the typed requested-layout accounting; they do not equate encoded size with
+allocated size.
+
+Native synthetic cases exercise the real capture helper, frozen input guards,
+wait body, gzip batch serializer, token/policy client, exact ACK/progress writer,
+partial checkpoint and ordinary restart. They cover file rewrites/replacements,
+new paths, cutoff, account, stop and privacy changes, unsupported dependencies,
+JSON escaping and legal response allocation amplification. Account-switch reads
+and credentials use isolated adapters; no live provider account is inspected.
+
 ## Activation review boundary
 
-This is preparation for review, not completed production Retry-After delivery.
-Activation must wire initial shed capture, retained state and delivery-only
-wakeups into the existing long-lived owner. Wakeups must preserve the ordinary
-absolute cycle deadline and must not launch a scan per retry. The live authority
-hook must revalidate complete file, parent, sidecar and provider/account
-relationships, current device/destination and stop state, current activity-hint
-policy and attribution-key epoch before every network phase and publication.
-Current tests supply controlled authority and current native bodies; they do
-not establish that live dependency/policy closure. The 20 MiB send/checkpoint
-reservation also needs an activation-level allocation audit including transport,
-receipts and bounded competing-state reads. Production wiring and that review
-must be one explicit change; editing a marker cannot activate this preparation.
+Production activation remains closed. Codex/Claude parent/sidecar/account and
+attribution/key/scheduler graphs, and Pi external workspace identity, need their
+own complete live dependency closures before admission. Source body limits and
+finite native allocation measurements strengthen the send audit; they do not
+prove a universal 20 MiB allocator/RSS envelope for opaque HTTP/TLS/DNS graphs,
+receipts and every competing persisted shape. That activation-level audit and
+explicit activation review remain required. Filesystem reads and locks retain
+their native blocking semantics. There is no new timer, worker, persisted body,
+scheduler setting, census/replay/backfill completion receipt or release here.
