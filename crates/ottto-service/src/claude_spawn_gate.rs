@@ -335,7 +335,7 @@ pub(crate) mod probe {
         ADMITTED.get_or_init(|| Mutex::new(BTreeMap::new()))
     }
 
-    fn login_key(slot: &ClaudeConfigDirSlot) -> String {
+    pub(crate) fn login_key(slot: &ClaudeConfigDirSlot) -> String {
         // Coordinate the exact credential selected by the child, without
         // changing its raw config-dir string or credential lookup paths.
         #[cfg(target_os = "macos")]
@@ -1094,10 +1094,15 @@ pub(crate) mod test_support {
             let policy = ProbePolicyGuard::new(&ClaudeConfigDirSlot::Default, root);
             let quote =
                 |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+            let initialize_pause = if mode == "mcp-delayed" {
+                "/bin/sleep 0.1;"
+            } else {
+                ""
+            };
             let body = match mode {
                 "output" => format!("/bin/cat {}\nexit {exit}\n", quote(&root.join("output"))),
-                "mcp" => format!(
-                    "while IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> {}\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) /bin/cat {} ;;\n*'\"method\":\"tools/list\"'*) /bin/cat {}; exit {exit} ;;\nesac\ndone\n",
+                "mcp" | "mcp-delayed" => format!(
+                    "while IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> {}\ncase \"$line\" in\n*'\"method\":\"initialize\"'*) {initialize_pause} /bin/cat {} ;;\n*'\"method\":\"tools/list\"'*) /bin/cat {}; exit {exit} ;;\nesac\ndone\n",
                     quote(&root.join("requests")), quote(&root.join("initialize")), quote(&root.join("output")),
                 ),
                 "hold-exit" => format!("/bin/sleep 4 &\necho $! > {}\nexit 0\n", quote(&root.join("descendant"))),
@@ -1133,6 +1138,7 @@ pub(crate) mod test_support {
             unsafe { libc::kill(pid, 0) == 0 }
         }
 
+        #[track_caller]
         pub(crate) fn wait_started(&self) {
             self.wait_until(|| {
                 std::fs::read_to_string(self.fake.root.join("direct"))
@@ -1142,6 +1148,7 @@ pub(crate) mod test_support {
             });
         }
 
+        #[track_caller]
         pub(crate) fn wait_until(&self, mut predicate: impl FnMut() -> bool) {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while !predicate() {
@@ -1158,6 +1165,7 @@ pub(crate) mod test_support {
             let _ = std::fs::remove_file(self.fake.root.join(super::REFRESH_LOCK_FILE));
         }
 
+        #[track_caller]
         pub(crate) fn wait_settled(&self) {
             self.wait_until(|| !super::probe::is_active(&ClaudeConfigDirSlot::Default));
             if self.fake.root.join("direct").exists() {

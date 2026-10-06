@@ -1065,6 +1065,33 @@ struct BuildResult {
     metrics: HarvestMetrics,
 }
 
+#[cfg(unix)]
+fn probe_chunk_len(configured: &[ConfiguredServer], env: &SpawnEnv) -> usize {
+    let mut logins = std::collections::BTreeSet::new();
+    for (index, server) in configured
+        .iter()
+        .take(MCP_HARVEST_MAX_CONCURRENCY)
+        .enumerate()
+    {
+        if let Transport::Stdio {
+            command,
+            args,
+            env: server_env,
+            ..
+        } = &server.transport
+        {
+            if let Some(Ok(login)) =
+                claude_login_of_server(command, args, server_env, &env.provider)
+            {
+                if !logins.insert(crate::claude_spawn_gate::probe::login_key(&login)) {
+                    return index;
+                }
+            }
+        }
+    }
+    configured.len().min(MCP_HARVEST_MAX_CONCURRENCY)
+}
+
 /// Harvest the configured servers concurrently, at most
 /// [`MCP_HARVEST_MAX_CONCURRENCY`] at a time, stopping before a chunk once
 /// `deadline` passes. Returns the harvested servers (in discovery order, minus
@@ -1079,7 +1106,8 @@ fn harvest_servers(
     let mut out: Vec<McpServerInput> = Vec::with_capacity(configured.len());
     let mut throttled = false;
     let mut deferred = 0;
-    for chunk in configured.chunks(MCP_HARVEST_MAX_CONCURRENCY) {
+    let mut pending = configured;
+    while !pending.is_empty() {
         // The deadline is checked between chunks (not mid-probe), so a cycle can
         // overrun by at most one chunk's handshake timeout — acceptable for a
         // soft budget, and it keeps every launched probe's result.
@@ -1087,6 +1115,15 @@ fn harvest_servers(
             throttled = true;
             break;
         }
+        // A selected Claude credential has one admitted owner. Put repeated
+        // logins in the next existing batch, after active probes settle, rather
+        // than treating healthy parallel entries as deferred cleanup.
+        #[cfg(unix)]
+        let count = probe_chunk_len(pending, env);
+        #[cfg(not(unix))]
+        let count = pending.len().min(MCP_HARVEST_MAX_CONCURRENCY);
+        let (chunk, rest) = pending.split_at(count);
+        pending = rest;
         let handles: Vec<_> = chunk
             .iter()
             .cloned()
@@ -1739,6 +1776,63 @@ mod tests {
         fs::remove_file(&fixture.script).unwrap();
         assert!(probe_mcp(&fixture, true, Duration::from_secs(1)).is_err());
         assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn probe_mcp_same_login_servers_both_reach_inventory() {
+        let response =
+            br#"{"id":2,"result":{"tools":[{"name":"complete","inputSchema":{"type":"object"}}]}}"#;
+        let fixture = ProbeFixture::new("probe-mcp-same-login", "mcp-delayed", response, 0);
+        fs::write(
+            fixture.fake.root.join("initialize"),
+            "{\"id\":1,\"result\":{}}\n",
+        )
+        .unwrap();
+        let configured: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|name| ConfiguredServer {
+                name: name.to_string(),
+                disabled: false,
+                config_dir: None,
+                transport: Transport::Stdio {
+                    command: fixture.script.to_string_lossy().into_owned(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: [("CLAUDE_CONFIG_DIR".to_string(), String::new())].into(),
+                },
+            })
+            .collect();
+        let (servers, throttled, deferred) = harvest_servers(
+            &configured,
+            "unknown",
+            Instant::now() + Duration::from_secs(6),
+            &SpawnEnv {
+                path: None,
+                provider: BTreeMap::new(),
+            },
+        );
+        assert!(!throttled);
+        assert_eq!(deferred, 0);
+        assert_eq!(
+            servers
+                .iter()
+                .map(|server| server.server.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(servers.iter().all(|server| server.reachable
+            && server.tools.len() == 1
+            && server.tools[0].name == "complete"));
+        assert_eq!(
+            fs::read_to_string(fixture.fake.root.join("requests"))
+                .unwrap()
+                .lines()
+                .count(),
+            6
+        );
+        fixture.wait_settled();
     }
 
     #[cfg(unix)]
