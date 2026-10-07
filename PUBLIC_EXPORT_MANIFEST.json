@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 478,
-  "content_sha256": "cd610bc2b83e4cad6ec03adfc70ca2d83db1ff9f1d1c098aec88be881eb82fdf",
+  "content_sha256": "9143a8726d5354367e9fcf295f85f2a16a095b1eef94e94db070833e1023c416",
   "files": [
     {
       "executable": false,
@@ -902,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/live_snapshot_retry.rs",
-      "sha256": "4a9d8bf5bf1d45f080e93022a0c462d25aaf7eec5684aae8af819396c63fbc46",
-      "size_bytes": 9579
+      "sha256": "50f9543a9c67a96612565f0a492bdde5be9bb7b54ce3cd38250fc12c412a3877",
+      "size_bytes": 9592
     },
     {
       "executable": false,
@@ -993,8 +993,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_live_native_tests.rs",
-      "sha256": "a48288ad5fa1e4f25cb272780fff9c83503b4c3970d5de127570b36a83daf761",
-      "size_bytes": 21845
+      "sha256": "99017c853195d94e31eb26c6da14fe8a1db554cf6b334409780ddc3317fd6fcc",
+      "size_bytes": 24839
     },
     {
       "executable": false,
@@ -2253,8 +2253,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-07-pi-retry-allocation-envelope.md",
-      "sha256": "f60c6a074f8b4cc549a1b3d9d04bf02b76dacb410e55ea935e3fc7a453cdaeef",
-      "size_bytes": 7939
+      "sha256": "effff1501675f560a158c41096cd3dcbe881d970d62712f57793f90da325a940",
+      "size_bytes": 7955
     },
     {
       "executable": false,
@@ -3349,7 +3349,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-07T01:30:30+00:00",
+  "generated_at": "2026-10-07T05:05:14+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 479,
   "public_roots": [
@@ -3388,5 +3388,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "51cfbe37f183fece27476dcaf19a84d5d51bc4ab"
+  "source_commit": "c87b36eb4c591824a15682e26052d51e80e9099e"
 }
