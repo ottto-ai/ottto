@@ -176,6 +176,15 @@ impl HeaderInventory {
             read_bytes: 0,
         }
     }
+    pub(super) fn owner_for_path(&self, path: &Path) -> Option<&str> {
+        // Headers append in the pending BTreeSet<String> path order. Compare
+        // whole path strings, not Path's component order (a.jsonl vs a/b.jsonl).
+        self.headers
+            .binary_search_by(|header| header.candidate.path.as_os_str().cmp(path.as_os_str()))
+            .ok()
+            .map(|index| self.headers[index].owner.as_str())
+    }
+
     pub(super) fn step(&mut self, metadata: &CodexTitleMetadata) -> bool {
         let Some(path) = self.pending.pop_front() else {
             return true;
@@ -650,6 +659,7 @@ type ReplayedGroup = (
     BTreeMap<String, Option<AppliedTierReceipt>>,
 );
 pub(super) struct GroupReader {
+    launch_owner: Option<String>,
     pub(super) members: Vec<CandidateFile>,
     proofs: Vec<MemberProof>,
     identified: usize,
@@ -683,6 +693,7 @@ impl GroupReader {
             "Codex joining byte cap"
         );
         Ok(Self {
+            launch_owner: None,
             members,
             proofs: Vec::new(),
             identified: 0,
@@ -725,6 +736,10 @@ impl GroupReader {
             }
         }
     }
+    pub(super) fn configure_launch_owner(&mut self, owner: &str) {
+        self.launch_owner = Some(owner.to_owned());
+    }
+
     pub(super) fn unchanged_joined(&self, index: &ScanIndex) -> bool {
         if self.identified != self.members.len() || !self.proofs.is_empty() {
             return false;
@@ -755,10 +770,32 @@ impl GroupReader {
     ) -> Result<bool> {
         if self.identified < self.members.len() {
             let i = self.identified;
+            let mut candidate = self.members[i].clone();
+            if let Some(context) = attribution_context {
+                let workers = self
+                    .launch_owner
+                    .as_ref()
+                    .map(|owner| vec![owner.clone()])
+                    .unwrap_or_else(|| {
+                        launch_workers_for_path(SnapshotSource::Codex, &candidate.path)
+                    });
+                match context.prepare_launch_step(&workers) {
+                    Ok(false) => return Ok(false),
+                    Err(()) => anyhow::bail!("Codex joined launch evidence incomplete"),
+                    Ok(true) => {}
+                }
+                if let Some(witness) = context.launch_witness(&workers) {
+                    candidate.source_file_fingerprint = sha256_hex(&[
+                        "launcher_worker_context:v1",
+                        &candidate.source_file_fingerprint,
+                        &witness,
+                    ]);
+                }
+            }
             let mut census = ScanCensus::default();
             let (opened, _file) = open_and_identify_scan_candidate(
                 SnapshotSource::Codex,
-                self.members[i].clone(),
+                candidate,
                 &mut census,
                 None,
                 0,
@@ -843,6 +880,28 @@ impl GroupReader {
                 self.proof_prefix_matched,
                 "Codex protected copy prefix changed"
             );
+            if self
+                .legacy_expected
+                .contains_key(&local_index_key(&self.members[i].path))
+            {
+                if let Some(context) = attribution_context {
+                    let workers = reader
+                        .accumulator
+                        .source_session_id
+                        .as_ref()
+                        .map(|id| vec![resolve_codex_identity(id)])
+                        .unwrap_or_else(|| {
+                            launch_workers_for_path(SnapshotSource::Codex, &self.members[i].path)
+                        });
+                    // A proof can outlive the lookup TTL. Park its completed
+                    // parser before taking either proof or legacy baseline.
+                    match context.prepare_launch_step(&workers) {
+                        Ok(false) => return Ok(false),
+                        Err(()) => anyhow::bail!("Codex legacy launch evidence incomplete"),
+                        Ok(true) => {}
+                    }
+                }
+            }
             self.proofs.push(
                 std::mem::take(&mut self.proof)
                     .finish()
@@ -1064,7 +1123,7 @@ impl GroupReader {
         Ok((parser, last, self.members, self.applied_receipts))
     }
 }
-crate::heap_layout_bound::fields!(GroupReader; members, proofs, identified, proof_reader, proof, records, replay_order, canonical_order, proof_prefix_matched, replay_member, parser, replay_digest, report, applied_receipts, previous_receipts, receipt_scope, legacy_expected, legacy_baselines);
+crate::heap_layout_bound::fields!(GroupReader; launch_owner, members, proofs, identified, proof_reader, proof, records, replay_order, canonical_order, proof_prefix_matched, replay_member, parser, replay_digest, report, applied_receipts, previous_receipts, receipt_scope, legacy_expected, legacy_baselines);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct Tokens([u64; 6]);
@@ -1347,6 +1406,48 @@ pub(super) mod tests {
         while !inventory.step(&CodexTitleMetadata::default()) {}
         (root, inventory)
     }
+    #[test]
+    fn header_owner_lookup_uses_complete_path_order() {
+        let (root, inventory) = fixture();
+        let template = inventory.headers[0].clone();
+        let sessions = root.join("sessions");
+        fs::create_dir_all(sessions.join("a")).unwrap();
+        let mut paths = BTreeSet::new();
+        for (name, owner) in [
+            ("a.jsonl", "11111111-2222-4333-8444-555555555555"),
+            ("a/b.jsonl", "22222222-2222-4333-8444-555555555555"),
+            ("b.jsonl", "33333333-2222-4333-8444-555555555555"),
+        ] {
+            let path = sessions.join(name);
+            fs::write(
+                &path,
+                format!(
+                    "{}\n",
+                    json!({"type":"session_meta","payload":{"id":owner}})
+                ),
+            )
+            .unwrap();
+            paths.insert(local_index_key(&path));
+        }
+        let mut actual = HeaderInventory::new(&[sessions], &paths, Some(&inventory.directories));
+        while !actual.step(&CodexTitleMetadata::default()) {}
+        assert_eq!(actual.headers.len(), 3);
+        for header in &actual.headers {
+            assert_eq!(
+                actual.owner_for_path(&header.candidate.path),
+                Some(header.owner.as_str())
+            );
+        }
+        assert!(actual
+            .owner_for_path(&root.join("sessions/missing.jsonl"))
+            .is_none());
+        assert_eq!(
+            inventory.owner_for_path(&template.candidate.path),
+            Some(template.owner.as_str())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn header_inventory_detects_late_members_and_owner_changes() {
         let (root, inventory) = fixture();
@@ -2758,6 +2859,82 @@ pub(super) mod tests {
         }
         index
     }
+    #[test]
+    fn legacy_proof_refreshes_expired_launch_lookup_without_consuming_completed_proof() {
+        let (root, inventory) = fixture();
+        let previous = legacy_index(&inventory, None);
+        let group = inventory.groups().into_values().next().unwrap();
+        let workers = vec![group.owner.clone()];
+        let mut reader = GroupReader::new(group.members).unwrap();
+        reader.configure_launch_owner(&group.owner);
+        reader.configure_receipts(&previous);
+        let key = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            [13_u8; 32],
+        );
+        let context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
+            SnapshotSource::Codex,
+            &root,
+            true,
+            Some(&key),
+            Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+        )
+        .unwrap();
+        let metadata = CodexTitleMetadata::default();
+        while reader.proof_reader.is_none() {
+            assert!(!reader
+                .step(&metadata, None, None, false, false, Some(&context))
+                .unwrap());
+        }
+        assert!(context.launches_prepared(&workers));
+        context.expire_launch_lookup_for_test();
+        assert!(!context.launches_prepared(&workers));
+        let events = root.join(".ottto/launch-events/processed");
+        fs::create_dir_all(&events).unwrap();
+        for n in 1..=600 {
+            let raw = json!({"schema":"agent_launch.v1",
+                "controller_session_ref":"11111111-2222-4333-8444-555555555555",
+                "worker_session_ref":format!("{n:08x}-2222-4333-8444-555555555555"),
+                "relationship_kind":"launched", "workflow_ref":null, "pr_ref":null,
+                "launch_ts":"2026-10-01T10:00:00Z",
+                "capture_source":"launcher_event:opus_cli_agent", "evidence":"direct"})
+            .to_string();
+            let event = crate::launch_events::validate_event(&raw).unwrap();
+            fs::write(
+                events.join(format!(
+                    "{}.json",
+                    crate::launch_events::event_digest(&event)
+                )),
+                raw,
+            )
+            .unwrap();
+        }
+        let mut steps = 0;
+        while !reader.proof_reader.as_ref().unwrap().reader.finished {
+            assert!(!reader
+                .step(&metadata, None, None, false, false, Some(&context))
+                .unwrap());
+            steps += 1;
+            assert!(steps < 100);
+        }
+        assert!(!context.launches_prepared(&workers));
+        assert!(reader.proofs.is_empty());
+        assert!(reader.legacy_baselines.is_empty());
+        while !reader
+            .step(&metadata, None, None, false, false, Some(&context))
+            .unwrap()
+        {
+            steps += 1;
+            assert!(steps < 100);
+        }
+        assert!(steps > 2, "lookup must yield across the retained backlog");
+        assert_eq!(reader.records, 6, "completed proofs must not be read twice");
+        assert_eq!(reader.legacy_baselines.len(), 2);
+        assert!(context.launches_prepared(&workers));
+        reader.finish().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn legacy_first_import_requires_actual_old_output_match_and_allows_healthy_sibling() {
         let (root, inventory) = fixture();

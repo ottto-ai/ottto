@@ -99,13 +99,10 @@ belong in daemon memory.
 Facts carry `evidence.kind = "launcher_event"` and
 `evidence.source_version = "launcher_event:v1"`.
 
-`launcher_event` is a **new** vocabulary token, and that is deliberate. None of
-the kinds the backend lists today is honest here: this is not provider-native,
-not a provider-owned artifact, not a scheduler-definition match, and not a live
-process check. The ingest path tolerates an unknown evidence kind by dropping
-that one fact, counting it, and storing the session, so the truthful token costs
-nothing today and starts working the moment the backend enum lists it — with no
-backfill, because these facts re-emit on every scan of the worker session.
+This token identifies a local launcher assertion. Provider-native and
+provider-artifact evidence keep precedence. Consumers must explicitly support
+this evidence kind; an unsupported consumer may drop the facts while accepting
+the session. A launcher event never authenticates the provider, account or payer.
 
 The launcher family rides as `agent_kind`, not in `source_version`: the backend
 hard-validates `source_version` against a bounded parser-version shape and
@@ -114,22 +111,45 @@ dropped fact.
 
 ## Lifecycle
 
-`pending/` is an inbox and drains on every refresh. Accepted events move to
-`processed/` and stay joinable for thirty days; rejected ones move to
-`rejected/` for seven, with a reason **code** in the log and never the file's
-contents.
+`pending/` is an inbox. Lookup advances through bounded intake and read-only
+claim passes, moving valid events to `processed/`. Accepted events stay joinable
+for thirty days by file modification time; rejected files are retained for seven.
+Only fixed reason codes and bounded hash prefixes appear in rejection logs.
 
-The inventory is built from `processed/`, not from `pending/`, and that ordering
-is the whole trick. The event is written at spawn — before the worker has
-written its first transcript line — so an intake that consumed the file on first
-read would routinely discard the edge before the transcript it belongs to was
-ever parsed. Keeping the accepted event readable for the retention window also
-covers a stalled upload, a checkpoint reset, an explicit replay, and a machine
-that was simply off.
+There is no hash-prefix admission limit on the retained launch store. Each
+transcript page demands up to 512 worker references; later pages demand the
+remaining workers through the same path. A continuation visits at most 256
+directory entries and reads at most 4 KiB plus one oversize-detection byte per
+event. The complete pending and processed claim sweep must finish before any
+edge in that demand batch becomes available. Different claims for one worker
+withhold its edge even when separated across pages. Negative hits are retained
+only for the current demand batch. Directory I/O loss or a changed directory
+fence discloses incomplete work and leaves the native file uncheckpointed.
 
-Every mutation is a rename or an expiry delete, so repeating a refresh — from
-another source's context in the same cycle, from the audit tool, or after a
-crash mid-drain — converges on the same state.
+Intake renames and uniqueness checks are separate passes. This prevents a
+platform directory iterator from skipping a conflicting pending file while
+other files move. Queries retain no whole-directory path list or full event
+inventory. Total work is linear in retained directory entries per demand batch;
+this is not constant CPU for an arbitrarily large store. Expiry cleanup is also
+streamed. An opaque directory iterator conservatively declines optional source
+parking under the existing heap validator; the same native frame continues
+serially rather than restarting. No new scheduling queue or persistent cache
+is introduced.
+
+A fresh source context validates same-name edits, removal and expiry. A completed
+batch may be reused within that context for at most sixty seconds. The lookup
+is a bounded local observation, not an atomic filesystem transaction; events
+must be emitted atomically and retained while ordinary collection/import uses
+them. Continuous mutation or unreadable evidence is disclosed as incomplete
+work rather than a unique controller claim.
+
+`launcher_event:opus_cli_agent` derives `opus-cli-agent`. Its controller and
+worker must be UUIDs, workflow may be a UUID or null, and PR may be a positive
+integer or null. The exact nine-key schema, timestamp, filename hash and
+self-launch checks remain required. The two legacy families retain their exact
+labels and required/null fields; composite controllers remain relay-only.
+Arbitrary and reserved-looking capture-source slugs are refused. A strict slug
+syntax alone would not authenticate the launcher that wrote it.
 
 ## Gating
 
@@ -140,21 +160,23 @@ backend-issued key epoch. With attribution off, the drop directory is not even
 listed. There is no separate switch and no way to reach this path around the
 existing consent.
 
-Scan identity is deliberately untouched. Launch events are semantic input for
-sessions parsed after they arrive, exactly like the scheduler inventory, and an
-unrelated launch must not invalidate every transcript checkpoint and replay
-local history. No parser-version bump is warranted: the transcript parsers'
-file-to-session mapping is unchanged.
+The checkpoint namespace and parser mapping stay unchanged. A path-scoped
+launcher witness selects its worker transcript when an edge arrives, changes,
+conflicts or disappears, even if transcript bytes are unchanged. An unrelated
+launch does not invalidate every transcript checkpoint. The same forward path
+handles ordinary collection and a new user's first historical import; it adds
+no account-specific rescue or backfill operation.
 
 ## Cross-user safety
 
-The daemon is per-user and the drop root is inside the user's own home, so both
-sessions belong to the same user by construction. The plausibility check the
-code can actually make is the reference shape, and it makes it strictly: plain
-UUIDs only, which is what both worker paths produce (Claude workers get their id
-pre-assigned by the launcher; Codex workers' ids are parsed from the run header).
+The drop root belongs to the local user. A writable launch event is that user's
+assertion of exact references; UUID shape does not prove session ownership,
+launcher authentication, provider authority, organization or account/payer
+identity. Provider-native fields keep precedence. Launch facts never supply
+account evidence. Workers remain UUID-only; the reviewed relay family alone
+may name a composite Claude controller reference.
 
-## Validation
+## Original intake validation
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` — all clean; 1,365 `ottto-service` tests pass.
 - 11 intake tests cover every fail-closed row above, atomic lifecycle, replay
@@ -173,8 +195,7 @@ pre-assigned by the launcher; Codex workers' ids are parsed from the run header)
   two ship independently and both are inert alone: events accumulate with no
   reader until this lands, and this reads an empty directory until the emitter
   does.
-- **The backend evidence-kind widening.** Until `launcher_event` joins the
-  enum, these facts are dropped and counted at ingest. That is the designed
-  ordering, not a gap.
-- **A second launcher family.** Adding one is a one-line widening of
-  `CAPTURE_SOURCES` on both sides.
+- **Backend contract changes.** Facts retain the existing evidence kind,
+  source version and fields. The additional launcher role uses `agent_kind`.
+- **Arbitrary launcher families.** Additional capture sources require their own
+  explicit contract and reviewed mapping.

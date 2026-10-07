@@ -29,6 +29,8 @@ mod codex_file_join;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
 mod context_curve;
+#[cfg(test)]
+mod launcher_recognition_tests;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
 mod sampled_audit;
@@ -11374,6 +11376,61 @@ impl OwnedSourceScan {
         self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     ) -> OwnedSourceScanStep {
+        // Prepare one demand batch through bounded native continuations. Group
+        // owners come from the completed header census, never arbitrary names.
+        if self.active_file.is_none()
+            && self.codex_join_active.is_none()
+            && (self.source != SnapshotSource::Codex || self.codex_join_prepared)
+        {
+            if let Some(context) = attribution_context {
+                let first = self
+                    .codex_join_groups
+                    .front()
+                    .map(|group| vec![group.owner.clone()])
+                    .or_else(|| {
+                        self.identified_candidates.front().map(|candidate| {
+                            launch_workers_for_candidate(
+                                self.source,
+                                candidate,
+                                self.codex_join_inventory.as_ref(),
+                            )
+                        })
+                    })
+                    .unwrap_or_default();
+                // A completed batch covers its remaining members. Looking at
+                // a sliding window here would add one new worker after every
+                // file and repeat the complete retained-store sweep per file.
+                if !context.launches_prepared(&first) {
+                    let mut workers = BTreeSet::new();
+                    for worker in self
+                        .codex_join_groups
+                        .iter()
+                        .map(|group| group.owner.clone())
+                        .chain(self.identified_candidates.iter().flat_map(|candidate| {
+                            launch_workers_for_candidate(
+                                self.source,
+                                candidate,
+                                self.codex_join_inventory.as_ref(),
+                            )
+                        }))
+                        .take(crate::launch_events::MAX_DEMANDED_WORKERS)
+                    {
+                        if crate::launch_events::valid_worker(&worker) {
+                            workers.insert(worker.to_ascii_lowercase());
+                        }
+                        if workers.len() == crate::launch_events::MAX_DEMANDED_WORKERS {
+                            break;
+                        }
+                    }
+                    let workers = workers.into_iter().collect::<Vec<_>>();
+                    match context.prepare_launch_step(&workers) {
+                        Ok(false) => return OwnedSourceScanStep::Pending(self),
+                        Err(()) => {} // Candidate handling keeps unreadable evidence owed.
+                        Ok(true) => {}
+                    }
+                }
+            }
+        }
         let copy_budget = self.sampled_copy_budget();
         if copy_budget == 0 {
             self.clear_sampled_cache();
@@ -11412,7 +11469,7 @@ impl OwnedSourceScan {
             mut residue_blocked_session_ids,
             mut pending_finalization,
             claude_authority_preflight,
-            forced_claude_family_reparses,
+            mut forced_claude_family_reparses,
             mut identified_candidates,
             mut active_file,
             mut codex_join_inventory,
@@ -11424,175 +11481,292 @@ impl OwnedSourceScan {
         } = self;
         let index = &mut index_storage;
         let claude_effort_support_dir_ref = claude_effort_support_dir.as_deref();
-        macro_rules! pending {
-            () => {
-                return OwnedSourceScanStep::Pending(Self {
-                    resource_probe,
-                    sampling,
-                    source,
-                    index: index_storage,
-                    collected_at,
-                    backfill_window_days,
-                    file_limit,
-                    artifacts_enabled,
-                    context_curve_enabled,
-                    claude_effort_support_dir,
-                    codex_title_metadata,
-                    claude_title_metadata,
-                    state_census_complete,
-                    sidecar_census_complete,
-                    codex_turn_traces,
-                    codex_parent_validation_roots,
-                    codex_parent_frozen_census_paths,
-                    codex_parent_ownership_ledgers,
-                    census_window_end,
-                    discovered_file_count,
-                    census_unix_seconds,
-                    census,
-                    snapshots,
-                    scanned_file_count,
-                    scanned_session_count,
-                    semantic_noop_count,
-                    codex_state_only_blocked_session_ids,
-                    codex_parent_resolution_retry_required,
-                    residue_index_keys,
-                    settled_residue_index_keys,
-                    residue_blocked_session_ids,
-                    pending_finalization,
-                    claude_authority_preflight,
-                    forced_claude_family_reparses,
-                    identified_candidates,
-                    active_file,
-                    codex_join_inventory,
-                    codex_join_prepared,
-                    codex_join_groups,
-                    codex_join_active,
-                    codex_join_completed,
-                    codex_legacy_join_baselines,
-                })
-            };
-        }
-        if source == SnapshotSource::Codex && !codex_join_prepared {
-            if let Some(inventory) = codex_join_inventory.as_mut() {
-                if !inventory.step(&codex_title_metadata) {
-                    pending!();
-                }
-                let selected = identified_candidates
-                    .iter()
-                    .map(|candidate| local_index_key(&candidate.path))
-                    .collect::<BTreeSet<_>>();
-                let inventoried = inventory
-                    .headers
-                    .iter()
-                    .map(|header| local_index_key(&header.candidate.path))
-                    .collect::<BTreeSet<_>>();
-                inventory.complete &= selected.is_subset(&inventoried);
-                let mut owners = BTreeMap::<String, BTreeSet<PathBuf>>::new();
-                for header in &inventory.headers {
-                    owners
-                        .entry(header.owner.clone())
-                        .or_default()
-                        .insert(header.home.clone());
-                }
-                let current_owners = inventory
-                    .headers
-                    .iter()
-                    .map(|header| {
-                        (
-                            local_index_key(&header.candidate.path),
-                            codex_protected_owner(&header.owner),
-                        )
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                let mut repurposed_protected_paths = BTreeSet::new();
-                let mut missing_protected_owners = BTreeSet::new();
-                let mut missing_unknown_owner = false;
-                for (key, entry) in &index.files {
-                    let repurposed = entry.codex_history_is_protected()
-                        && entry
-                            .codex_protected_owner
-                            .as_ref()
-                            .is_some_and(|previous| {
-                                current_owners
-                                    .get(key)
-                                    .is_some_and(|current| current != previous)
-                            });
-                    if repurposed {
-                        repurposed_protected_paths.insert(key.clone());
+        // Construct the large continuation once. Repeating it in every yield
+        // branch multiplies debug-build stack slots and can overflow native
+        // callers even though the retained scanner state is unchanged.
+        'scan_step: {
+            macro_rules! pending {
+                () => {
+                    break 'scan_step
+                };
+            }
+            if source == SnapshotSource::Codex && !codex_join_prepared {
+                if let Some(inventory) = codex_join_inventory.as_mut() {
+                    if !inventory.step(&codex_title_metadata) {
+                        pending!();
                     }
-                    if entry.codex_history_is_protected()
-                        && (!inventoried.contains(key) || repurposed)
-                    {
-                        if let Some(owner) = entry
-                            .codex_protected_owner
-                            .as_ref()
-                            .filter(|owner| valid_codex_protected_owner(owner))
+                    let selected = identified_candidates
+                        .iter()
+                        .map(|candidate| local_index_key(&candidate.path))
+                        .collect::<BTreeSet<_>>();
+                    let inventoried = inventory
+                        .headers
+                        .iter()
+                        .map(|header| local_index_key(&header.candidate.path))
+                        .collect::<BTreeSet<_>>();
+                    inventory.complete &= selected.is_subset(&inventoried);
+                    let mut owners = BTreeMap::<String, BTreeSet<PathBuf>>::new();
+                    for header in &inventory.headers {
+                        owners
+                            .entry(header.owner.clone())
+                            .or_default()
+                            .insert(header.home.clone());
+                    }
+                    let current_owners = inventory
+                        .headers
+                        .iter()
+                        .map(|header| {
+                            (
+                                local_index_key(&header.candidate.path),
+                                codex_protected_owner(&header.owner),
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    let mut repurposed_protected_paths = BTreeSet::new();
+                    let mut missing_protected_owners = BTreeSet::new();
+                    let mut missing_unknown_owner = false;
+                    for (key, entry) in &index.files {
+                        let repurposed = entry.codex_history_is_protected()
+                            && entry
+                                .codex_protected_owner
+                                .as_ref()
+                                .is_some_and(|previous| {
+                                    current_owners
+                                        .get(key)
+                                        .is_some_and(|current| current != previous)
+                                });
+                        if repurposed {
+                            repurposed_protected_paths.insert(key.clone());
+                        }
+                        if entry.codex_history_is_protected()
+                            && (!inventoried.contains(key) || repurposed)
                         {
-                            missing_protected_owners.insert(owner.clone());
-                        } else {
-                            missing_unknown_owner = true;
+                            if let Some(owner) = entry
+                                .codex_protected_owner
+                                .as_ref()
+                                .filter(|owner| valid_codex_protected_owner(owner))
+                            {
+                                missing_protected_owners.insert(owner.clone());
+                            } else {
+                                missing_unknown_owner = true;
+                            }
+                        }
+                    }
+                    let mut grouped_paths = BTreeSet::new();
+                    let mut used = 0usize;
+                    for group in inventory.groups().into_values() {
+                        let protected_history_missing = missing_unknown_owner
+                            || missing_protected_owners
+                                .contains(&codex_protected_owner(&group.owner));
+                        let previously_joined = group.members.iter().any(|member| {
+                            index
+                                .files
+                                .get(&local_index_key(&member.path))
+                                .is_some_and(|entry| {
+                                    entry.codex_joined_member_set.is_some()
+                                        || entry.codex_captured_joined_member_set.is_some()
+                                })
+                        });
+                        if (group.members.len() < 2
+                            && !previously_joined
+                            && !protected_history_missing
+                            && owners
+                                .get(&group.owner)
+                                .map_or(true, |homes| homes.len() <= 1))
+                            || !group
+                                .members
+                                .iter()
+                                .any(|member| selected.contains(&local_index_key(&member.path)))
+                        {
+                            continue;
+                        }
+                        grouped_paths.extend(
+                            group
+                                .members
+                                .iter()
+                                .map(|member| local_index_key(&member.path)),
+                        );
+                        let malformed_pending = group.members.iter().any(|member| {
+                            index
+                                .files
+                                .get(&local_index_key(&member.path))
+                                .is_some_and(|entry| {
+                                    entry
+                                        .codex_captured_joined_member_set
+                                        .as_deref()
+                                        .is_some_and(|marker| {
+                                            !codex_file_join::valid_captured_join(marker)
+                                        })
+                                })
+                        });
+                        if !inventory.complete
+                            || malformed_pending
+                            || protected_history_missing
+                            || group.members.iter().any(|member| {
+                                repurposed_protected_paths.contains(&local_index_key(&member.path))
+                            })
+                            || owners
+                                .get(&group.owner)
+                                .is_some_and(|homes| homes.len() > 1)
+                            || group.members.len() > codex_file_join::MAX_MEMBERS
+                            || group.members.len() < 2
+                            || group.members.len() > file_limit
+                        {
+                            census.ownership_incomplete_file_count += group.members.len();
+                            census.unreadable_path_count += 1;
+                            residue_index_keys.extend(
+                                group
+                                    .members
+                                    .iter()
+                                    .map(|member| local_index_key(&member.path)),
+                            );
+                            residue_blocked_session_ids.insert(group.owner.clone());
+                            codex_state_only_blocked_session_ids.insert(group.owner.clone());
+                            continue;
+                        }
+                        if used + group.members.len() > file_limit {
+                            // Keep the existing traversal as the only queue. A whole
+                            // group is selected on a subsequent ordinary page.
+                            if let Some(traversal) = index.traversal.as_mut() {
+                                for member in &group.members {
+                                    if selected.contains(&local_index_key(&member.path)) {
+                                        traversal.pending_candidates.push_back(ScanTraversalPath {
+                                            scan_root: member.scan_root.clone(),
+                                            path: member.path.clone(),
+                                            census_member: true,
+                                            watcher_hint: false,
+                                        });
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        used += group.members.len();
+                        if let Some(traversal) = index.traversal.as_mut() {
+                            traversal.pending_candidates.retain(|pending| {
+                                !group
+                                    .members
+                                    .iter()
+                                    .any(|member| member.path == pending.path)
+                            });
+                        }
+                        codex_join_groups.push_back(group);
+                    }
+                    identified_candidates.retain(|candidate| {
+                        !grouped_paths.contains(&local_index_key(&candidate.path))
+                    });
+                    if !inventory.complete {
+                        census.unreadable_path_count += 1;
+                        census.ownership_incomplete_file_count += identified_candidates.len();
+                        residue_index_keys.extend(
+                            identified_candidates
+                                .iter()
+                                .map(|candidate| local_index_key(&candidate.path)),
+                        );
+                        let held_owners = inventory
+                            .headers
+                            .iter()
+                            .filter(|header| {
+                                selected.contains(&local_index_key(&header.candidate.path))
+                            })
+                            .map(|header| header.owner.clone())
+                            .collect::<BTreeSet<_>>();
+                        residue_blocked_session_ids.extend(held_owners.iter().cloned());
+                        codex_state_only_blocked_session_ids.extend(held_owners);
+                        identified_candidates.clear();
+                    }
+                    while used + identified_candidates.len() > file_limit {
+                        if let Some(candidate) = identified_candidates.pop_back() {
+                            if let Some(traversal) = index.traversal.as_mut() {
+                                traversal.pending_candidates.push_front(ScanTraversalPath {
+                                    scan_root: candidate.scan_root,
+                                    path: candidate.path,
+                                    census_member: true,
+                                    watcher_hint: false,
+                                });
+                            }
                         }
                     }
                 }
-                let mut grouped_paths = BTreeSet::new();
-                let mut used = 0usize;
-                for group in inventory.groups().into_values() {
-                    let protected_history_missing = missing_unknown_owner
-                        || missing_protected_owners.contains(&codex_protected_owner(&group.owner));
-                    let previously_joined = group.members.iter().any(|member| {
-                        index
-                            .files
-                            .get(&local_index_key(&member.path))
-                            .is_some_and(|entry| {
-                                entry.codex_joined_member_set.is_some()
-                                    || entry.codex_captured_joined_member_set.is_some()
-                            })
-                    });
-                    if (group.members.len() < 2
-                        && !previously_joined
-                        && !protected_history_missing
-                        && owners
-                            .get(&group.owner)
-                            .map_or(true, |homes| homes.len() <= 1))
-                        || !group
-                            .members
-                            .iter()
-                            .any(|member| selected.contains(&local_index_key(&member.path)))
-                    {
-                        continue;
+                codex_join_prepared = true;
+                pending!();
+            }
+            if let Some((mut group, mut reader)) = codex_join_active.take() {
+                if reader.unchanged_joined(index) {
+                    semantic_noop_count += reader.members.len();
+                    group.members = reader.members;
+                    codex_join_completed.push(group);
+                    pending!();
+                }
+                match reader.step(
+                    &codex_title_metadata,
+                    codex_turn_traces.clone(),
+                    codex_parent_ownership_ledgers.clone(),
+                    artifacts_enabled,
+                    context_curve_enabled,
+                    attribution_context,
+                ) {
+                    Ok(false) => {
+                        codex_join_active = Some((group, reader));
+                        pending!();
                     }
-                    grouped_paths.extend(
-                        group
-                            .members
-                            .iter()
-                            .map(|member| local_index_key(&member.path)),
-                    );
-                    let malformed_pending = group.members.iter().any(|member| {
-                        index
-                            .files
-                            .get(&local_index_key(&member.path))
-                            .is_some_and(|entry| {
-                                entry
-                                    .codex_captured_joined_member_set
-                                    .as_deref()
-                                    .is_some_and(|marker| {
-                                        !codex_file_join::valid_captured_join(marker)
-                                    })
-                            })
-                    });
-                    if !inventory.complete
-                        || malformed_pending
-                        || protected_history_missing
-                        || group.members.iter().any(|member| {
-                            repurposed_protected_paths.contains(&local_index_key(&member.path))
-                        })
-                        || owners
-                            .get(&group.owner)
-                            .is_some_and(|homes| homes.len() > 1)
-                        || group.members.len() > codex_file_join::MAX_MEMBERS
-                        || group.members.len() < 2
-                        || group.members.len() > file_limit
-                    {
+                    Ok(true) => {
+                        let baselines = reader.take_legacy_baselines();
+                        match reader.finish().and_then(|replayed| {
+                            let actual_owner = replayed
+                                .0
+                                .accumulator
+                                .source_session_id
+                                .as_deref()
+                                .map(resolve_codex_identity);
+                            anyhow::ensure!(
+                                actual_owner.as_deref() == Some(group.owner.as_str()),
+                                "Codex replay owner changed after inventory"
+                            );
+                            Ok(replayed)
+                        }) {
+                            Ok((parser, candidate, members, applied_receipts)) => {
+                                // Member content/object fences were checked at EOF.
+                                // The shared validator checks each home roster once
+                                // at capture/send/checkpoint, after all page replays.
+                                let source_file_fingerprint =
+                                    candidate.source_file_fingerprint.clone();
+                                active_file = Some(OwnedActiveFile {
+                                    sampling: None,
+                                    previous_snapshot_fingerprint: index
+                                        .last_snapshot_fingerprint(&candidate),
+                                    previous_upload_body_witness: index
+                                        .last_upload_body_witness(&candidate),
+                                    projection_adoption_required: index
+                                        .effective_upload_body_witness_revision_requires_adoption(
+                                            &local_index_key(&candidate.path),
+                                        ),
+                                    candidate,
+                                    decision: CandidateDecision::Parse,
+                                    source_file_fingerprint,
+                                    parser,
+                                    aliases: members,
+                                    applied_receipts,
+                                });
+                                codex_legacy_join_baselines.extend(baselines);
+                                pending!();
+                            }
+                            Err(_) => {
+                                census.ownership_incomplete_file_count += group.members.len();
+                                census.unreadable_path_count += 1;
+                                residue_index_keys.extend(
+                                    group
+                                        .members
+                                        .iter()
+                                        .map(|member| local_index_key(&member.path)),
+                                );
+                                residue_blocked_session_ids.insert(group.owner.clone());
+                                codex_state_only_blocked_session_ids.insert(group.owner);
+                                pending!();
+                            }
+                        }
+                    }
+                    Err(_) => {
                         census.ownership_incomplete_file_count += group.members.len();
                         census.unreadable_path_count += 1;
                         residue_index_keys.extend(
@@ -11602,133 +11776,19 @@ impl OwnedSourceScan {
                                 .map(|member| local_index_key(&member.path)),
                         );
                         residue_blocked_session_ids.insert(group.owner.clone());
-                        codex_state_only_blocked_session_ids.insert(group.owner.clone());
-                        continue;
-                    }
-                    if used + group.members.len() > file_limit {
-                        // Keep the existing traversal as the only queue. A whole
-                        // group is selected on a subsequent ordinary page.
-                        if let Some(traversal) = index.traversal.as_mut() {
-                            for member in &group.members {
-                                if selected.contains(&local_index_key(&member.path)) {
-                                    traversal.pending_candidates.push_back(ScanTraversalPath {
-                                        scan_root: member.scan_root.clone(),
-                                        path: member.path.clone(),
-                                        census_member: true,
-                                        watcher_hint: false,
-                                    });
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    used += group.members.len();
-                    if let Some(traversal) = index.traversal.as_mut() {
-                        traversal.pending_candidates.retain(|pending| {
-                            !group
-                                .members
-                                .iter()
-                                .any(|member| member.path == pending.path)
-                        });
-                    }
-                    codex_join_groups.push_back(group);
-                }
-                identified_candidates
-                    .retain(|candidate| !grouped_paths.contains(&local_index_key(&candidate.path)));
-                if !inventory.complete {
-                    census.unreadable_path_count += 1;
-                    census.ownership_incomplete_file_count += identified_candidates.len();
-                    residue_index_keys.extend(
-                        identified_candidates
-                            .iter()
-                            .map(|candidate| local_index_key(&candidate.path)),
-                    );
-                    let held_owners = inventory
-                        .headers
-                        .iter()
-                        .filter(|header| {
-                            selected.contains(&local_index_key(&header.candidate.path))
-                        })
-                        .map(|header| header.owner.clone())
-                        .collect::<BTreeSet<_>>();
-                    residue_blocked_session_ids.extend(held_owners.iter().cloned());
-                    codex_state_only_blocked_session_ids.extend(held_owners);
-                    identified_candidates.clear();
-                }
-                while used + identified_candidates.len() > file_limit {
-                    if let Some(candidate) = identified_candidates.pop_back() {
-                        if let Some(traversal) = index.traversal.as_mut() {
-                            traversal.pending_candidates.push_front(ScanTraversalPath {
-                                scan_root: candidate.scan_root,
-                                path: candidate.path,
-                                census_member: true,
-                                watcher_hint: false,
-                            });
-                        }
+                        codex_state_only_blocked_session_ids.insert(group.owner);
+                        pending!();
                     }
                 }
             }
-            codex_join_prepared = true;
-            pending!();
-        }
-        if let Some((mut group, mut reader)) = codex_join_active.take() {
-            if reader.unchanged_joined(index) {
-                semantic_noop_count += reader.members.len();
-                group.members = reader.members;
-                codex_join_completed.push(group);
-                pending!();
-            }
-            match reader.step(
-                &codex_title_metadata,
-                codex_turn_traces.clone(),
-                codex_parent_ownership_ledgers.clone(),
-                artifacts_enabled,
-                context_curve_enabled,
-                attribution_context,
-            ) {
-                Ok(false) => {
-                    codex_join_active = Some((group, reader));
-                    pending!();
-                }
-                Ok(true) => {
-                    let baselines = reader.take_legacy_baselines();
-                    match reader.finish().and_then(|replayed| {
-                        let actual_owner = replayed
-                            .0
-                            .accumulator
-                            .source_session_id
-                            .as_deref()
-                            .map(resolve_codex_identity);
-                        anyhow::ensure!(
-                            actual_owner.as_deref() == Some(group.owner.as_str()),
-                            "Codex replay owner changed after inventory"
-                        );
-                        Ok(replayed)
-                    }) {
-                        Ok((parser, candidate, members, applied_receipts)) => {
-                            // Member content/object fences were checked at EOF.
-                            // The shared validator checks each home roster once
-                            // at capture/send/checkpoint, after all page replays.
-                            let source_file_fingerprint = candidate.source_file_fingerprint.clone();
-                            active_file = Some(OwnedActiveFile {
-                                sampling: None,
-                                previous_snapshot_fingerprint: index
-                                    .last_snapshot_fingerprint(&candidate),
-                                previous_upload_body_witness: index
-                                    .last_upload_body_witness(&candidate),
-                                projection_adoption_required: index
-                                    .effective_upload_body_witness_revision_requires_adoption(
-                                        &local_index_key(&candidate.path),
-                                    ),
-                                candidate,
-                                decision: CandidateDecision::Parse,
-                                source_file_fingerprint,
-                                parser,
-                                aliases: members,
-                                applied_receipts,
-                            });
-                            codex_legacy_join_baselines.extend(baselines);
-                            pending!();
+            if active_file.is_none() {
+                if let Some(group) = codex_join_groups.pop_front() {
+                    scanned_file_count += group.members.len();
+                    match codex_file_join::GroupReader::new(group.members.clone()) {
+                        Ok(mut reader) => {
+                            reader.configure_launch_owner(&group.owner);
+                            reader.configure_receipts(index);
+                            codex_join_active = Some((group, reader));
                         }
                         Err(_) => {
                             census.ownership_incomplete_file_count += group.members.len();
@@ -11739,1060 +11799,1116 @@ impl OwnedSourceScan {
                                     .iter()
                                     .map(|member| local_index_key(&member.path)),
                             );
-                            residue_blocked_session_ids.insert(group.owner.clone());
                             codex_state_only_blocked_session_ids.insert(group.owner);
+                        }
+                    }
+                    pending!();
+                }
+            }
+            if let Some(mut active) = active_file.take() {
+                match active.parser.step() {
+                    Ok(false) => {
+                        active_file = Some(active);
+                        pending!();
+                    }
+                    Err(_) => {
+                        census.unreadable_path_count += 1;
+                        pending!();
+                    }
+                    Ok(true) => {}
+                }
+                if let Some(context) = attribution_context {
+                    let workers = active
+                        .parser
+                        .accumulator
+                        .source_session_id
+                        .as_ref()
+                        .map(|id| {
+                            vec![if source == SnapshotSource::Codex {
+                                resolve_codex_identity(id)
+                            } else {
+                                id.clone()
+                            }]
+                        })
+                        .unwrap_or_else(|| launch_workers_for_path(source, &active.candidate.path));
+                    match context.prepare_launch_step(&workers) {
+                        Ok(false) => {
+                            active_file = Some(active);
+                            pending!();
+                        }
+                        Err(()) => {
+                            census.unreadable_path_count += 1;
+                            pending!();
+                        }
+                        Ok(true) => {}
+                    }
+                }
+                if let Some(context) = sampling.as_mut() {
+                    if let Some(plan) = active.parser.reader.acquisition.as_ref() {
+                        context.record_input(plan.metrics());
+                    }
+                }
+                if active.sampling.as_ref().is_some_and(|acquisition| {
+                    !matches!(
+                        acquisition.mode,
+                        crate::transcript_acquisition::ReadMode::Full(_)
+                    ) && active
+                        .parser
+                        .accumulator
+                        .codex_tier_replay
+                        .as_ref()
+                        .is_some_and(codex_file_join::TierReplay::has_protected_tiers)
+                }) {
+                    // Native finish compares the reopened descriptor to the captured
+                    // identity, so replacement during fallback cannot publish.
+                    let reopened = open_candidate_file(source, &mut active.candidate.clone());
+                    let Ok(file) = reopened else {
+                        census.unreadable_path_count += 1;
+                        pending!();
+                    };
+                    let Ok(mut parser) = sampled_scan::new_source_parser(
+                        file,
+                        &active.candidate,
+                        source,
+                        &codex_title_metadata,
+                        codex_turn_traces.clone(),
+                        codex_parent_ownership_ledgers.clone(),
+                        source != SnapshotSource::ClaudeCode || artifacts_enabled,
+                        context_curve_enabled,
+                        index,
+                    ) else {
+                        census.unreadable_path_count += 1;
+                        pending!();
+                    };
+                    let acquisition = active.sampling.as_mut().expect("sampled acquisition");
+                    let debt = index
+                        .files
+                        .get(&acquisition.key)
+                        .and_then(|entry| entry.audit_obligation(sampled_scan::now_seconds()));
+                    let Ok(mode) = parser.prepare_acquisition(
+                        None,
+                        &acquisition.scope,
+                        debt,
+                        sampled_scan::now_seconds(),
+                    ) else {
+                        census.unreadable_path_count += 1;
+                        pending!();
+                    };
+                    acquisition.mode = mode;
+                    if let Some(context) = sampling.as_mut() {
+                        context.priority_replays += 1;
+                        context.record_mode(mode, acquisition.audit_due);
+                    }
+                    active.parser = parser;
+                    active_file = Some(active);
+                    pending!();
+                }
+                let OwnedActiveFile {
+                    sampling: file_sampling,
+                    candidate,
+                    decision,
+                    previous_snapshot_fingerprint,
+                    previous_upload_body_witness,
+                    projection_adoption_required,
+                    source_file_fingerprint,
+                    parser,
+                    aliases,
+                    mut applied_receipts,
+                } = active;
+                let mut parser = parser;
+                if let Some(replay) = parser.accumulator.codex_tier_replay.take() {
+                    match replay.finish() {
+                        Ok(receipt) => {
+                            applied_receipts.insert(local_index_key(&candidate.path), receipt);
+                        }
+                        Err(_) => {
+                            census.ownership_incomplete_file_count += 1;
+                            census.unreadable_path_count += 1;
+                            residue_index_keys.insert(local_index_key(&candidate.path));
+                            if let Some(owner) = parser.accumulator.source_session_id.as_ref() {
+                                residue_blocked_session_ids.insert(resolve_codex_identity(owner));
+                                codex_state_only_blocked_session_ids
+                                    .insert(resolve_codex_identity(owner));
+                            }
                             pending!();
                         }
                     }
                 }
-                Err(_) => {
-                    census.ownership_incomplete_file_count += group.members.len();
-                    census.unreadable_path_count += 1;
-                    residue_index_keys.extend(
-                        group
-                            .members
-                            .iter()
-                            .map(|member| local_index_key(&member.path)),
-                    );
-                    residue_blocked_session_ids.insert(group.owner.clone());
-                    codex_state_only_blocked_session_ids.insert(group.owner);
-                    pending!();
-                }
-            }
-        }
-        if active_file.is_none() {
-            if let Some(group) = codex_join_groups.pop_front() {
-                scanned_file_count += group.members.len();
-                match codex_file_join::GroupReader::new(group.members.clone()) {
-                    Ok(mut reader) => {
-                        reader.configure_receipts(index);
-                        codex_join_active = Some((group, reader));
-                    }
-                    Err(_) => {
-                        census.ownership_incomplete_file_count += group.members.len();
-                        census.unreadable_path_count += 1;
-                        residue_index_keys.extend(
-                            group
-                                .members
-                                .iter()
-                                .map(|member| local_index_key(&member.path)),
-                        );
-                        codex_state_only_blocked_session_ids.insert(group.owner);
-                    }
-                }
-                pending!();
-            }
-        }
-        if let Some(mut active) = active_file.take() {
-            match active.parser.step() {
-                Ok(false) => {
-                    active_file = Some(active);
-                    pending!();
-                }
-                Err(_) => {
-                    census.unreadable_path_count += 1;
-                    pending!();
-                }
-                Ok(true) => {}
-            }
-            if let Some(context) = sampling.as_mut() {
-                if let Some(plan) = active.parser.reader.acquisition.as_ref() {
-                    context.record_input(plan.metrics());
-                }
-            }
-            if active.sampling.as_ref().is_some_and(|acquisition| {
-                !matches!(
-                    acquisition.mode,
-                    crate::transcript_acquisition::ReadMode::Full(_)
-                ) && active
-                    .parser
-                    .accumulator
-                    .codex_tier_replay
-                    .as_ref()
-                    .is_some_and(codex_file_join::TierReplay::has_protected_tiers)
-            }) {
-                // Native finish compares the reopened descriptor to the captured
-                // identity, so replacement during fallback cannot publish.
-                let reopened = open_candidate_file(source, &mut active.candidate.clone());
-                let Ok(file) = reopened else {
-                    census.unreadable_path_count += 1;
-                    pending!();
-                };
-                let Ok(mut parser) = sampled_scan::new_source_parser(
-                    file,
-                    &active.candidate,
-                    source,
-                    &codex_title_metadata,
-                    codex_turn_traces.clone(),
-                    codex_parent_ownership_ledgers.clone(),
-                    source != SnapshotSource::ClaudeCode || artifacts_enabled,
-                    context_curve_enabled,
-                    index,
-                ) else {
-                    census.unreadable_path_count += 1;
-                    pending!();
-                };
-                let acquisition = active.sampling.as_mut().expect("sampled acquisition");
-                let debt = index
+                let retained_bytes = index
                     .files
-                    .get(&acquisition.key)
-                    .and_then(|entry| entry.audit_obligation(sampled_scan::now_seconds()));
-                let Ok(mode) = parser.prepare_acquisition(
-                    None,
-                    &acquisition.scope,
-                    debt,
-                    sampled_scan::now_seconds(),
-                ) else {
+                    .iter()
+                    .filter(|(key, _)| !applied_receipts.contains_key(*key))
+                    .filter_map(|(_, entry)| entry.codex_applied_tier_receipt.as_ref())
+                    .map(|receipt| receipt.retained_bytes())
+                    .sum::<usize>();
+                let incoming_bytes = applied_receipts
+                    .values()
+                    .flatten()
+                    .map(|receipt| receipt.retained_bytes())
+                    .sum::<usize>();
+                if retained_bytes.saturating_add(incoming_bytes)
+                    > codex_file_join::MAX_RECEIPT_BYTES
+                {
+                    census.ownership_incomplete_file_count += aliases.len().max(1);
                     census.unreadable_path_count += 1;
+                    residue_index_keys.insert(local_index_key(&candidate.path));
+                    residue_index_keys
+                        .extend(aliases.iter().map(|member| local_index_key(&member.path)));
+                    if let Some(owner) = parser.accumulator.source_session_id.as_ref() {
+                        residue_blocked_session_ids.insert(resolve_codex_identity(owner));
+                        codex_state_only_blocked_session_ids.insert(resolve_codex_identity(owner));
+                    }
+                    codex_state_only_blocked_session_ids.extend(
+                        aliases
+                            .iter()
+                            .flat_map(|member| codex_session_id_candidates_from_path(&member.path)),
+                    );
                     pending!();
-                };
-                acquisition.mode = mode;
-                if let Some(context) = sampling.as_mut() {
-                    context.priority_replays += 1;
-                    context.record_mode(mode, acquisition.audit_due);
                 }
-                active.parser = parser;
-                active_file = Some(active);
-                pending!();
-            }
-            let OwnedActiveFile {
-                sampling: file_sampling,
-                candidate,
-                decision,
-                previous_snapshot_fingerprint,
-                previous_upload_body_witness,
-                projection_adoption_required,
-                source_file_fingerprint,
-                parser,
-                aliases,
-                mut applied_receipts,
-            } = active;
-            let mut parser = parser;
-            if let Some(replay) = parser.accumulator.codex_tier_replay.take() {
-                match replay.finish() {
-                    Ok(receipt) => {
-                        applied_receipts.insert(local_index_key(&candidate.path), receipt);
-                    }
-                    Err(_) => {
-                        census.ownership_incomplete_file_count += 1;
-                        census.unreadable_path_count += 1;
-                        residue_index_keys.insert(local_index_key(&candidate.path));
-                        if let Some(owner) = parser.accumulator.source_session_id.as_ref() {
-                            residue_blocked_session_ids.insert(resolve_codex_identity(owner));
-                            codex_state_only_blocked_session_ids
-                                .insert(resolve_codex_identity(owner));
-                        }
-                        pending!();
-                    }
-                }
-            }
-            let retained_bytes = index
-                .files
-                .iter()
-                .filter(|(key, _)| !applied_receipts.contains_key(*key))
-                .filter_map(|(_, entry)| entry.codex_applied_tier_receipt.as_ref())
-                .map(|receipt| receipt.retained_bytes())
-                .sum::<usize>();
-            let incoming_bytes = applied_receipts
-                .values()
-                .flatten()
-                .map(|receipt| receipt.retained_bytes())
-                .sum::<usize>();
-            if retained_bytes.saturating_add(incoming_bytes) > codex_file_join::MAX_RECEIPT_BYTES {
-                census.ownership_incomplete_file_count += aliases.len().max(1);
-                census.unreadable_path_count += 1;
-                residue_index_keys.insert(local_index_key(&candidate.path));
-                residue_index_keys
-                    .extend(aliases.iter().map(|member| local_index_key(&member.path)));
-                if let Some(owner) = parser.accumulator.source_session_id.as_ref() {
-                    residue_blocked_session_ids.insert(resolve_codex_identity(owner));
-                    codex_state_only_blocked_session_ids.insert(resolve_codex_identity(owner));
-                }
-                codex_state_only_blocked_session_ids.extend(
-                    aliases
-                        .iter()
-                        .flat_map(|member| codex_session_id_candidates_from_path(&member.path)),
-                );
-                pending!();
-            }
-            let cache_compatible = sampled_scan::compatible_reduction(&parser.accumulator)
-                && aliases.is_empty()
-                && applied_receipts.values().all(Option::is_none);
-            let mut completed_acquisition = if let Some(acquisition) = file_sampling.as_ref() {
-                // Known dependencies and the current path are separate from the
-                // sampled prefix promise. Neither may be stale at completion.
-                let current_scope = sampled_scan::reduction_dependencies(
-                    source,
-                    &candidate,
-                    &codex_title_metadata,
-                    &claude_title_metadata,
-                    claude_effort_support_dir_ref,
-                )
-                .zip(sampling.as_ref())
-                .map(|(dependency, context)| {
-                    context.file_scope(
+                let cache_compatible = sampled_scan::compatible_reduction(&parser.accumulator)
+                    && aliases.is_empty()
+                    && applied_receipts.values().all(Option::is_none);
+                let mut completed_acquisition = if let Some(acquisition) = file_sampling.as_ref() {
+                    // Known dependencies and the current path are separate from the
+                    // sampled prefix promise. Neither may be stale at completion.
+                    let current_scope = sampled_scan::reduction_dependencies(
                         source,
                         &candidate,
-                        &dependency,
-                        source != SnapshotSource::ClaudeCode || artifacts_enabled,
-                        context_curve_enabled,
-                        index,
+                        &codex_title_metadata,
+                        &claude_title_metadata,
+                        claude_effort_support_dir_ref,
                     )
-                });
-                let mut current_path = candidate.clone();
-                if current_scope.as_ref() != Some(&acquisition.scope)
-                    || open_candidate_file(source, &mut current_path).is_err()
-                    || current_path.opened_object_identity != candidate.opened_object_identity
-                {
-                    census.unreadable_path_count += 1;
-                    pending!();
-                }
-                match parser.retain_reduction(
-                    &acquisition.scope,
-                    sampled_scan::now_seconds(),
-                    if cache_compatible { copy_budget } else { 0 },
+                    .zip(sampling.as_ref())
+                    .map(|(dependency, context)| {
+                        context.file_scope(
+                            source,
+                            &candidate,
+                            &dependency,
+                            source != SnapshotSource::ClaudeCode || artifacts_enabled,
+                            context_curve_enabled,
+                            index,
+                        )
+                    });
+                    let mut current_path = candidate.clone();
+                    if current_scope.as_ref() != Some(&acquisition.scope)
+                        || open_candidate_file(source, &mut current_path).is_err()
+                        || current_path.opened_object_identity != candidate.opened_object_identity
+                    {
+                        census.unreadable_path_count += 1;
+                        pending!();
+                    }
+                    match parser.retain_reduction(
+                        &acquisition.scope,
+                        sampled_scan::now_seconds(),
+                        if cache_compatible { copy_budget } else { 0 },
+                    ) {
+                        Ok(completed) => completed,
+                        Err(_) => {
+                            census.unreadable_path_count += 1;
+                            pending!();
+                        }
+                    }
+                } else {
+                    None
+                };
+                let joined_owner = if aliases.is_empty() {
+                    None
+                } else {
+                    parser
+                        .accumulator
+                        .source_session_id
+                        .as_deref()
+                        .map(resolve_codex_identity)
+                };
+                let mut parsed_file = match parser.finish(
+                    &candidate.opened_object_identity,
+                    &candidate.path,
+                    collected_at.as_str(),
+                    source_file_fingerprint.clone(),
+                    (source == SnapshotSource::Codex).then_some(&codex_title_metadata),
+                    (source == SnapshotSource::ClaudeCode).then_some(&claude_title_metadata),
+                    attribution_context,
                 ) {
-                    Ok(completed) => completed,
+                    Ok(parsed) => parsed,
                     Err(_) => {
                         census.unreadable_path_count += 1;
                         pending!();
                     }
+                };
+                let finalization_charge =
+                    crate::heap_layout_bound::bound(&parsed_file, copy_budget);
+                if finalization_charge.is_none() {
+                    if let Some(completed) = completed_acquisition.as_mut() {
+                        completed.reduction = None;
+                    }
                 }
-            } else {
-                None
-            };
-            let joined_owner = if aliases.is_empty() {
-                None
-            } else {
-                parser
-                    .accumulator
-                    .source_session_id
-                    .as_deref()
-                    .map(resolve_codex_identity)
-            };
-            let mut parsed_file = match parser.finish(
-                &candidate.opened_object_identity,
-                &candidate.path,
-                collected_at.as_str(),
-                source_file_fingerprint.clone(),
-                (source == SnapshotSource::Codex).then_some(&codex_title_metadata),
-                (source == SnapshotSource::ClaudeCode).then_some(&claude_title_metadata),
-                attribution_context,
-            ) {
-                Ok(parsed) => parsed,
-                Err(_) => {
+                invalidate_stale_codex_parent_resolution(
+                    &mut parsed_file,
+                    &codex_parent_validation_roots,
+                    &codex_parent_frozen_census_paths,
+                );
+                codex_parent_resolution_retry_required |=
+                    parsed_file.codex_parent_resolution_pending;
+                let parse_complete = parsed_file.complete();
+                if !aliases.is_empty() && !parse_complete {
+                    // Joining authorizes a complete replacement only. Native
+                    // ownership/parser loss cannot publish a partial union body.
+                    census.ownership_incomplete_file_count += aliases.len();
                     census.unreadable_path_count += 1;
+                    residue_index_keys
+                        .extend(aliases.iter().map(|member| local_index_key(&member.path)));
+                    let owners = parsed_file
+                        .snapshots
+                        .iter()
+                        .map(|item| resolve_codex_identity(&item.source_session_id));
+                    codex_state_only_blocked_session_ids.extend(owners);
+                    codex_state_only_blocked_session_ids
+                        .extend(parsed_file.state_only_blocked_session_ids.iter().cloned());
                     pending!();
                 }
-            };
-            let finalization_charge = crate::heap_layout_bound::bound(&parsed_file, copy_budget);
-            if finalization_charge.is_none() {
-                if let Some(completed) = completed_acquisition.as_mut() {
-                    completed.reduction = None;
-                }
-            }
-            invalidate_stale_codex_parent_resolution(
-                &mut parsed_file,
-                &codex_parent_validation_roots,
-                &codex_parent_frozen_census_paths,
-            );
-            codex_parent_resolution_retry_required |= parsed_file.codex_parent_resolution_pending;
-            let parse_complete = parsed_file.complete();
-            if !aliases.is_empty() && !parse_complete {
-                // Joining authorizes a complete replacement only. Native
-                // ownership/parser loss cannot publish a partial union body.
-                census.ownership_incomplete_file_count += aliases.len();
-                census.unreadable_path_count += 1;
-                residue_index_keys
-                    .extend(aliases.iter().map(|member| local_index_key(&member.path)));
-                let owners = parsed_file
-                    .snapshots
-                    .iter()
-                    .map(|item| resolve_codex_identity(&item.source_session_id));
-                codex_state_only_blocked_session_ids.extend(owners);
-                codex_state_only_blocked_session_ids
-                    .extend(parsed_file.state_only_blocked_session_ids.iter().cloned());
-                pending!();
-            }
-            if !aliases.is_empty() {
-                codex_join_completed.push(codex_file_join::Group {
-                    owner: joined_owner
-                        .expect("joined replay owner was bound before native finish"),
-                    home: codex_file_join::member_home(&candidate.scan_root),
-                    members: aliases.clone(),
-                });
-            }
-            let diagnostic_reason = if parse_complete {
-                FileReason::Complete
-            } else if parsed_file.codex_parent_resolution_pending {
-                FileReason::ParentPending
-            } else if parsed_file.ownership_incomplete_file_count > 0 {
-                FileReason::OwnershipIncomplete
-            } else if parsed_file.recognized_usage_drop_count > parsed_file.terminal_line_loss_count
-            {
-                FileReason::RecognizedUsageDropped
-            } else {
-                FileReason::ReadOrLineLoss
-            };
-            let terminal_loss = parsed_file.terminal_loss();
-            if let Some(parent_session_ref) = parsed_file.codex_parent_session_ref.as_ref() {
-                let parent_session_ref = resolve_codex_identity(parent_session_ref.as_str());
-                if index.codex_parent_ownership_refs.len() < MAX_CODEX_PARENT_LEDGER_REFS
-                    || index
-                        .codex_parent_ownership_refs
-                        .contains(parent_session_ref.as_str())
-                {
-                    index.codex_parent_ownership_refs.insert(parent_session_ref);
-                }
-            }
-            if let Some((session_id, ledger)) = parsed_file.codex_parent_ownership_ledger.as_ref() {
-                let session_id = resolve_codex_identity(session_id.as_str());
-                let ledger_is_unique_current_parent = ledger.scan_complete
-                    && current_codex_parent_opened_identity(
-                        &codex_parent_validation_roots,
-                        &codex_parent_frozen_census_paths,
-                        session_id.as_str(),
-                    )
-                    .as_deref()
-                        == Some(ledger.opened_object_identity.as_str());
-                if index
-                    .codex_parent_ownership_refs
-                    .contains(session_id.as_str())
-                    && ledger_is_unique_current_parent
-                {
-                    index
-                        .codex_parent_ownership_ledgers
-                        .insert(session_id.clone(), ledger.clone());
-                    if let Some(shared) = codex_parent_ownership_ledgers.as_ref() {
-                        if let Ok(mut shared) = shared.lock() {
-                            shared.insert(session_id.clone(), ledger.clone());
-                        }
-                    }
-                }
-            }
-            let index_key = local_index_key(&candidate.path);
-            let non_progressing_residue = parsed_file.non_progressing_residue();
-            if non_progressing_residue {
-                residue_index_keys.insert(index_key.clone());
-            } else {
-                settled_residue_index_keys.insert(index_key.clone());
-            }
-            for session_id in &parsed_file.state_only_blocked_session_ids {
-                let session_id = resolve_codex_identity(session_id.as_str());
-                if non_progressing_residue {
-                    residue_blocked_session_ids.insert(session_id.clone());
-                }
-                codex_state_only_blocked_session_ids.insert(session_id.clone());
-                index
-                    .codex_state_only_blocked_session_ids
-                    .insert(session_id);
-            }
-            let report = parsed_file.report;
-            let recognized_usage_drop_count = parsed_file.recognized_usage_drop_count;
-            let ownership_incomplete_file_count = parsed_file.ownership_incomplete_file_count;
-            let zero_snapshot_usage_evidence = parsed_file.zero_snapshot_usage_evidence;
-            let dropped_usage_record_count = parsed_file.dropped_usage_record_count;
-            let source_verified = completed_acquisition
-                .as_ref()
-                .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
-                || (file_sampling.is_none()
-                    && state_census_complete
-                    && sidecar_census_complete
-                    && sampled_jsonl::loss_free_source_report(
-                        &report,
-                        recognized_usage_drop_count,
-                        dropped_usage_record_count,
-                    ));
-            let mut parsed = parsed_file.snapshots;
-            if source == SnapshotSource::ClaudeCode && parse_complete {
-                if let Some((_, source_session_id)) =
-                    claude_index_path_family_member(&candidate.path)
-                {
-                    let marker_present = parsed.iter().any(|snapshot| {
-                        snapshot.source_session_id == source_session_id
-                            && snapshot.claude_context_curve_owned_start_proven
+                if !aliases.is_empty() {
+                    codex_join_completed.push(codex_file_join::Group {
+                        owner: joined_owner
+                            .expect("joined replay owner was bound before native finish"),
+                        home: codex_file_join::member_home(&candidate.scan_root),
+                        members: aliases.clone(),
                     });
-                    if !marker_present {
-                        index.claude_owned_start_census.remove(&source_session_id);
-                    } else {
-                        let witness = index
-                            .claude_owned_start_census
-                            .entry(source_session_id)
-                            .or_insert_with(|| ClaudeOwnedStartCensusWitness {
-                                marker_source_file_fingerprint: source_file_fingerprint.clone(),
-                                verified_source_file_fingerprint: None,
-                                emitted_source_file_fingerprint: None,
-                            });
-                        if witness.marker_source_file_fingerprint != source_file_fingerprint {
-                            *witness = ClaudeOwnedStartCensusWitness {
-                                marker_source_file_fingerprint: source_file_fingerprint.clone(),
-                                verified_source_file_fingerprint: None,
-                                emitted_source_file_fingerprint: None,
-                            };
-                        }
-                    }
                 }
-            }
-            if source == SnapshotSource::Codex {
-                for snapshot in parsed.iter_mut() {
-                    apply_codex_state_evidence(snapshot, &codex_title_metadata);
-                }
-                for snapshot in &parsed {
-                    if snapshot.usage_accounting_contract.as_deref()
-                        == Some("session_exclusive_reported_usage:v1")
+                let diagnostic_reason = if parse_complete {
+                    FileReason::Complete
+                } else if parsed_file.codex_parent_resolution_pending {
+                    FileReason::ParentPending
+                } else if parsed_file.ownership_incomplete_file_count > 0 {
+                    FileReason::OwnershipIncomplete
+                } else if parsed_file.recognized_usage_drop_count
+                    > parsed_file.terminal_line_loss_count
+                {
+                    FileReason::RecognizedUsageDropped
+                } else {
+                    FileReason::ReadOrLineLoss
+                };
+                let terminal_loss = parsed_file.terminal_loss();
+                if let Some(parent_session_ref) = parsed_file.codex_parent_session_ref.as_ref() {
+                    let parent_session_ref = resolve_codex_identity(parent_session_ref.as_str());
+                    if index.codex_parent_ownership_refs.len() < MAX_CODEX_PARENT_LEDGER_REFS
+                        || index
+                            .codex_parent_ownership_refs
+                            .contains(parent_session_ref.as_str())
                     {
-                        index.codex_state_only_blocked_session_ids.remove(
-                            resolve_codex_identity(snapshot.source_session_id.as_str()).as_str(),
-                        );
+                        index.codex_parent_ownership_refs.insert(parent_session_ref);
                     }
                 }
-            }
-            if parse_complete && !aliases.is_empty() {
-                for alias in &aliases {
-                    if alias.path == candidate.path {
-                        continue;
+                if let Some((session_id, ledger)) =
+                    parsed_file.codex_parent_ownership_ledger.as_ref()
+                {
+                    let session_id = resolve_codex_identity(session_id.as_str());
+                    let ledger_is_unique_current_parent = ledger.scan_complete
+                        && current_codex_parent_opened_identity(
+                            &codex_parent_validation_roots,
+                            &codex_parent_frozen_census_paths,
+                            session_id.as_str(),
+                        )
+                        .as_deref()
+                            == Some(ledger.opened_object_identity.as_str());
+                    if index
+                        .codex_parent_ownership_refs
+                        .contains(session_id.as_str())
+                        && ledger_is_unique_current_parent
+                    {
+                        index
+                            .codex_parent_ownership_ledgers
+                            .insert(session_id.clone(), ledger.clone());
+                        if let Some(shared) = codex_parent_ownership_ledgers.as_ref() {
+                            if let Ok(mut shared) = shared.lock() {
+                                shared.insert(session_id.clone(), ledger.clone());
+                            }
+                        }
                     }
-                    let alias_fingerprint = alias.source_file_fingerprint.clone();
-                    pending_finalization.push(PendingIndexFinalization {
-                        sampled_audit_verified: false,
-                        codex_pending_recovery: index
-                            .files
-                            .get(&local_index_key(&alias.path))
-                            .is_some_and(ScanIndexEntry::codex_recovery_is_pending),
-                        index_key: local_index_key(&alias.path),
-                        source_file_fingerprint: alias_fingerprint.clone(),
-                        previous_snapshot_fingerprint: index.last_snapshot_fingerprint(alias),
-                        previous_upload_body_witness: index.last_upload_body_witness(alias),
-                        parse_complete,
-                        diagnostic_reason,
-                        parsed_snapshot_count: parsed.len(),
-                        effective_upload_body_witness_revision: index
-                            .active_effective_upload_body_witness_revision,
-                    });
-                    let alias_items = parsed
-                        .iter()
-                        .cloned()
-                        .map(|mut item| {
-                            item.source_file_fingerprint = Some(alias_fingerprint.clone());
-                            item.snapshot_fingerprint = snapshot_fingerprint(source, &item);
-                            item
-                        })
-                        .collect::<Vec<_>>();
-                    index.record(
-                        alias.clone(),
-                        alias_items
-                            .last()
-                            .map(|item| item.snapshot_fingerprint.clone()),
-                        ScanParseOutcome::Snapshot,
-                    );
-                    census
-                        .observed_index_keys
-                        .insert(local_index_key(&alias.path));
-                    snapshots.extend(alias_items);
                 }
-            }
-            scanned_session_count += parsed.len();
-            let last_snapshot_fingerprint = parsed
-                .last()
-                .map(|snapshot| snapshot.snapshot_fingerprint.clone());
-            let parsed_snapshot_count = parsed.len();
-            let sampled_audit_verified = parse_complete
-                && completed_acquisition
+                let index_key = local_index_key(&candidate.path);
+                let non_progressing_residue = parsed_file.non_progressing_residue();
+                if non_progressing_residue {
+                    residue_index_keys.insert(index_key.clone());
+                } else {
+                    settled_residue_index_keys.insert(index_key.clone());
+                }
+                for session_id in &parsed_file.state_only_blocked_session_ids {
+                    let session_id = resolve_codex_identity(session_id.as_str());
+                    if non_progressing_residue {
+                        residue_blocked_session_ids.insert(session_id.clone());
+                    }
+                    codex_state_only_blocked_session_ids.insert(session_id.clone());
+                    index
+                        .codex_state_only_blocked_session_ids
+                        .insert(session_id);
+                }
+                let report = parsed_file.report;
+                let recognized_usage_drop_count = parsed_file.recognized_usage_drop_count;
+                let ownership_incomplete_file_count = parsed_file.ownership_incomplete_file_count;
+                let zero_snapshot_usage_evidence = parsed_file.zero_snapshot_usage_evidence;
+                let dropped_usage_record_count = parsed_file.dropped_usage_record_count;
+                let source_verified = completed_acquisition
                     .as_ref()
                     .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
-                && file_sampling
-                    .as_ref()
-                    .is_some_and(|active| active.audit_due.is_some());
-            if sampled_audit_verified {
-                if let Some(context) = sampling.as_mut() {
-                    context.complete_audit(
-                        file_sampling
-                            .as_ref()
-                            .and_then(|active| active.audit_due)
-                            .expect("verified audit due"),
-                    );
-                }
-            }
-            pending_finalization.push(PendingIndexFinalization {
-                sampled_audit_verified,
-                codex_pending_recovery: index
-                    .files
-                    .get(&index_key)
-                    .is_some_and(ScanIndexEntry::codex_recovery_is_pending),
-                index_key: index_key.clone(),
-                source_file_fingerprint: source_file_fingerprint.clone(),
-                previous_snapshot_fingerprint: (decision != CandidateDecision::ReconcileLegacy
-                    && !projection_adoption_required)
-                    .then_some(previous_snapshot_fingerprint)
-                    .flatten(),
-                previous_upload_body_witness: (decision != CandidateDecision::ReconcileLegacy
-                    && !projection_adoption_required)
-                    .then_some(previous_upload_body_witness)
-                    .flatten(),
-                parse_complete,
-                diagnostic_reason,
-                parsed_snapshot_count,
-                effective_upload_body_witness_revision: index
-                    .active_effective_upload_body_witness_revision,
-            });
-            if source == SnapshotSource::Codex
-                && parse_complete
-                && aliases.is_empty()
-                && applied_receipts.values().any(Option::is_some)
-            {
-                if let Some(item) = parsed.first() {
-                    codex_join_completed.push(codex_file_join::Group {
-                        owner: resolve_codex_identity(&item.source_session_id),
-                        home: codex_file_join::member_home(&candidate.scan_root),
-                        members: vec![candidate.clone()],
-                    });
-                }
-            }
-            let joined_marker =
-                (!aliases.is_empty()).then(|| codex_file_join::member_set_witness(&aliases));
-            let protected_owner = (!aliases.is_empty()
-                || applied_receipts.values().any(Option::is_some))
-            .then(|| {
-                parsed
-                    .first()
-                    .map(|item| codex_protected_owner(&item.source_session_id))
-            })
-            .flatten();
-            let joined_keys = aliases
-                .iter()
-                .map(|member| local_index_key(&member.path))
-                .collect::<Vec<_>>();
-            if parse_complete {
-                index.record_terminal_jsonl_disposition(&candidate, terminal_loss.clone());
-                let outcome = if last_snapshot_fingerprint.is_some() {
-                    ScanParseOutcome::Snapshot
-                } else {
-                    ScanParseOutcome::ConfirmedEmpty
-                };
-                index.record(candidate, last_snapshot_fingerprint, outcome);
-                // Native settlement accepts disclosed terminal row loss, even
-                // though that acquisition cannot certify a verified prefix.
-                // Its sampled publication still owes the prepared deadline;
-                // losing a completion certificate must never erase that debt.
-                let obligation = match completed_acquisition.as_ref() {
-                    Some(completed) => completed.checkpoint.audit_debt(),
-                    None => file_sampling
-                        .as_ref()
-                        .and_then(|active| active.audit_due)
-                        .map(
-                            |due_unix_seconds| crate::transcript_acquisition::AuditDebt {
-                                due_unix_seconds,
-                            },
-                        ),
-                };
-                if let Some(debt) = obligation {
-                    let was_pending = index
-                        .files
-                        .get(&index_key)
-                        .is_some_and(ScanIndexEntry::has_unverified_source);
-                    if index.stage_sampled_audit(&index_key, &source_file_fingerprint, debt)
-                        && !was_pending
+                    || (file_sampling.is_none()
+                        && state_census_complete
+                        && sidecar_census_complete
+                        && sampled_jsonl::loss_free_source_report(
+                            &report,
+                            recognized_usage_drop_count,
+                            dropped_usage_record_count,
+                        ));
+                let mut parsed = parsed_file.snapshots;
+                if source == SnapshotSource::ClaudeCode && parse_complete {
+                    if let Some((_, source_session_id)) =
+                        claude_index_path_family_member(&candidate.path)
                     {
-                        if let Some(context) = sampling.as_mut() {
-                            context.audit_slots = context.audit_slots.saturating_sub(1);
+                        let marker_present = parsed.iter().any(|snapshot| {
+                            snapshot.source_session_id == source_session_id
+                                && snapshot.claude_context_curve_owned_start_proven
+                        });
+                        if !marker_present {
+                            index.claude_owned_start_census.remove(&source_session_id);
+                        } else {
+                            let witness = index
+                                .claude_owned_start_census
+                                .entry(source_session_id)
+                                .or_insert_with(|| ClaudeOwnedStartCensusWitness {
+                                    marker_source_file_fingerprint: source_file_fingerprint.clone(),
+                                    verified_source_file_fingerprint: None,
+                                    emitted_source_file_fingerprint: None,
+                                });
+                            if witness.marker_source_file_fingerprint != source_file_fingerprint {
+                                *witness = ClaudeOwnedStartCensusWitness {
+                                    marker_source_file_fingerprint: source_file_fingerprint.clone(),
+                                    verified_source_file_fingerprint: None,
+                                    emitted_source_file_fingerprint: None,
+                                };
+                            }
                         }
                     }
-                } else if source_verified {
-                    index.complete_full_audit(&index_key, &source_file_fingerprint);
                 }
-                if let Some(completed) = completed_acquisition {
-                    if let Some(context) = sampling.as_ref() {
-                        context.cache.insert(
-                            index_key.clone(),
-                            completed,
-                            finalization_charge.unwrap_or(0),
+                if source == SnapshotSource::Codex {
+                    for snapshot in parsed.iter_mut() {
+                        apply_codex_state_evidence(snapshot, &codex_title_metadata);
+                    }
+                    for snapshot in &parsed {
+                        if snapshot.usage_accounting_contract.as_deref()
+                            == Some("session_exclusive_reported_usage:v1")
+                        {
+                            index.codex_state_only_blocked_session_ids.remove(
+                                resolve_codex_identity(snapshot.source_session_id.as_str())
+                                    .as_str(),
+                            );
+                        }
+                    }
+                }
+                if parse_complete && !aliases.is_empty() {
+                    for alias in &aliases {
+                        if alias.path == candidate.path {
+                            continue;
+                        }
+                        let alias_fingerprint = alias.source_file_fingerprint.clone();
+                        pending_finalization.push(PendingIndexFinalization {
+                            sampled_audit_verified: false,
+                            codex_pending_recovery: index
+                                .files
+                                .get(&local_index_key(&alias.path))
+                                .is_some_and(ScanIndexEntry::codex_recovery_is_pending),
+                            index_key: local_index_key(&alias.path),
+                            source_file_fingerprint: alias_fingerprint.clone(),
+                            previous_snapshot_fingerprint: index.last_snapshot_fingerprint(alias),
+                            previous_upload_body_witness: index.last_upload_body_witness(alias),
+                            parse_complete,
+                            diagnostic_reason,
+                            parsed_snapshot_count: parsed.len(),
+                            effective_upload_body_witness_revision: index
+                                .active_effective_upload_body_witness_revision,
+                        });
+                        let alias_items = parsed
+                            .iter()
+                            .cloned()
+                            .map(|mut item| {
+                                item.source_file_fingerprint = Some(alias_fingerprint.clone());
+                                item.snapshot_fingerprint = snapshot_fingerprint(source, &item);
+                                item
+                            })
+                            .collect::<Vec<_>>();
+                        index.record(
+                            alias.clone(),
+                            alias_items
+                                .last()
+                                .map(|item| item.snapshot_fingerprint.clone()),
+                            ScanParseOutcome::Snapshot,
+                        );
+                        census
+                            .observed_index_keys
+                            .insert(local_index_key(&alias.path));
+                        snapshots.extend(alias_items);
+                    }
+                }
+                scanned_session_count += parsed.len();
+                let last_snapshot_fingerprint = parsed
+                    .last()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone());
+                let parsed_snapshot_count = parsed.len();
+                let sampled_audit_verified = parse_complete
+                    && completed_acquisition
+                        .as_ref()
+                        .is_some_and(|completed| completed.checkpoint.audit_debt().is_none())
+                    && file_sampling
+                        .as_ref()
+                        .is_some_and(|active| active.audit_due.is_some());
+                if sampled_audit_verified {
+                    if let Some(context) = sampling.as_mut() {
+                        context.complete_audit(
+                            file_sampling
+                                .as_ref()
+                                .and_then(|active| active.audit_due)
+                                .expect("verified audit due"),
                         );
                     }
                 }
-                for key in joined_keys {
-                    if let Some(entry) = index.files.get_mut(&key) {
-                        if source_verified {
-                            entry.scan_identity_version =
-                                Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
-                        }
-                        entry.codex_joined_member_set = joined_marker.clone();
-                        entry.codex_protected_owner = protected_owner.clone();
+                pending_finalization.push(PendingIndexFinalization {
+                    sampled_audit_verified,
+                    codex_pending_recovery: index
+                        .files
+                        .get(&index_key)
+                        .is_some_and(ScanIndexEntry::codex_recovery_is_pending),
+                    index_key: index_key.clone(),
+                    source_file_fingerprint: source_file_fingerprint.clone(),
+                    previous_snapshot_fingerprint: (decision != CandidateDecision::ReconcileLegacy
+                        && !projection_adoption_required)
+                        .then_some(previous_snapshot_fingerprint)
+                        .flatten(),
+                    previous_upload_body_witness: (decision != CandidateDecision::ReconcileLegacy
+                        && !projection_adoption_required)
+                        .then_some(previous_upload_body_witness)
+                        .flatten(),
+                    parse_complete,
+                    diagnostic_reason,
+                    parsed_snapshot_count,
+                    effective_upload_body_witness_revision: index
+                        .active_effective_upload_body_witness_revision,
+                });
+                if source == SnapshotSource::Codex
+                    && parse_complete
+                    && aliases.is_empty()
+                    && applied_receipts.values().any(Option::is_some)
+                {
+                    if let Some(item) = parsed.first() {
+                        codex_join_completed.push(codex_file_join::Group {
+                            owner: resolve_codex_identity(&item.source_session_id),
+                            home: codex_file_join::member_home(&candidate.scan_root),
+                            members: vec![candidate.clone()],
+                        });
                     }
                 }
-            }
-            if parse_complete {
-                for (key, receipt) in applied_receipts {
-                    if let Some(entry) = index.files.get_mut(&key) {
-                        if receipt.is_some() {
+                let joined_marker =
+                    (!aliases.is_empty()).then(|| codex_file_join::member_set_witness(&aliases));
+                let protected_owner = (!aliases.is_empty()
+                    || applied_receipts.values().any(Option::is_some))
+                .then(|| {
+                    parsed
+                        .first()
+                        .map(|item| codex_protected_owner(&item.source_session_id))
+                })
+                .flatten();
+                let joined_keys = aliases
+                    .iter()
+                    .map(|member| local_index_key(&member.path))
+                    .collect::<Vec<_>>();
+                if parse_complete {
+                    index.record_terminal_jsonl_disposition(&candidate, terminal_loss.clone());
+                    let outcome = if last_snapshot_fingerprint.is_some() {
+                        ScanParseOutcome::Snapshot
+                    } else {
+                        ScanParseOutcome::ConfirmedEmpty
+                    };
+                    index.record(candidate, last_snapshot_fingerprint, outcome);
+                    // Native settlement accepts disclosed terminal row loss, even
+                    // though that acquisition cannot certify a verified prefix.
+                    // Its sampled publication still owes the prepared deadline;
+                    // losing a completion certificate must never erase that debt.
+                    let obligation = match completed_acquisition.as_ref() {
+                        Some(completed) => completed.checkpoint.audit_debt(),
+                        None => file_sampling
+                            .as_ref()
+                            .and_then(|active| active.audit_due)
+                            .map(
+                                |due_unix_seconds| crate::transcript_acquisition::AuditDebt {
+                                    due_unix_seconds,
+                                },
+                            ),
+                    };
+                    if let Some(debt) = obligation {
+                        let was_pending = index
+                            .files
+                            .get(&index_key)
+                            .is_some_and(ScanIndexEntry::has_unverified_source);
+                        if index.stage_sampled_audit(&index_key, &source_file_fingerprint, debt)
+                            && !was_pending
+                        {
+                            if let Some(context) = sampling.as_mut() {
+                                context.audit_slots = context.audit_slots.saturating_sub(1);
+                            }
+                        }
+                    } else if source_verified {
+                        index.complete_full_audit(&index_key, &source_file_fingerprint);
+                    }
+                    if let Some(completed) = completed_acquisition {
+                        if let Some(context) = sampling.as_ref() {
+                            context.cache.insert(
+                                index_key.clone(),
+                                completed,
+                                finalization_charge.unwrap_or(0),
+                            );
+                        }
+                    }
+                    for key in joined_keys {
+                        if let Some(entry) = index.files.get_mut(&key) {
+                            if source_verified {
+                                entry.scan_identity_version =
+                                    Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+                            }
+                            entry.codex_joined_member_set = joined_marker.clone();
                             entry.codex_protected_owner = protected_owner.clone();
                         }
-                        entry.codex_applied_tier_receipt_required = receipt.is_some();
-                        entry.codex_applied_tier_receipt = receipt;
                     }
                 }
-            }
-            census.malformed_json_line_count += report.malformed_json_line_count;
-            census.invalid_utf8_line_count += report.invalid_utf8_line_count;
-            census.over_line_cap_count += report.over_line_cap_count;
-            census.recognized_usage_drop_count += recognized_usage_drop_count;
-            census.ownership_incomplete_file_count += ownership_incomplete_file_count;
-            census.zero_snapshot_usage_evidence_count += usize::from(zero_snapshot_usage_evidence);
-            census.dropped_usage_record_count = census
-                .dropped_usage_record_count
-                .saturating_add(dropped_usage_record_count);
-            if let Some(loss) = terminal_loss {
-                census.terminal_over_line_cap_count = census
-                    .terminal_over_line_cap_count
-                    .saturating_add(loss.over_line_cap_count);
-                census.terminal_recognized_usage_drop_count = census
-                    .terminal_recognized_usage_drop_count
-                    .saturating_add(loss.recognized_usage_drop_count);
-                census.terminal_dropped_usage_record_count = census
-                    .terminal_dropped_usage_record_count
-                    .saturating_add(loss.dropped_usage_record_count);
-            }
-            // Retryable parse loss still quarantines the whole derived entity.
-            // A bounded oversized line is different: its loss is terminal and
-            // disclosed, so independently parsed sibling records remain usable.
-            if parse_complete {
-                snapshots.extend(parsed);
-            }
-            pending!();
-        }
-        let Some(mut candidate) = identified_candidates.pop_front() else {
-            if let Some(traversal) = index.traversal.as_mut() {
-                traversal.codex_parent_resolution_retry_required |=
-                    codex_parent_resolution_retry_required;
-                // A residue file that this page parsed to completion, or that a
-                // watcher hint proved absent, leaves the generation's residue set; a
-                // file that reproduced its residue (re)enters it.
-                for index_key in settled_residue_index_keys.iter().chain(
-                    census.removed_index_keys.iter().filter(|key| {
-                        !index
-                            .files
-                            .get(*key)
-                            .is_some_and(ScanIndexEntry::codex_history_is_protected)
-                    }),
-                ) {
-                    traversal.residue.index_keys.remove(index_key);
+                if parse_complete {
+                    for (key, receipt) in applied_receipts {
+                        if let Some(entry) = index.files.get_mut(&key) {
+                            if receipt.is_some() {
+                                entry.codex_protected_owner = protected_owner.clone();
+                            }
+                            entry.codex_applied_tier_receipt_required = receipt.is_some();
+                            entry.codex_applied_tier_receipt = receipt;
+                        }
+                    }
                 }
-                traversal.residue.index_keys.extend(residue_index_keys);
-                traversal
-                    .residue
-                    .blocked_session_ids
-                    .extend(residue_blocked_session_ids);
-                // Exact watcher remove/rename hints must amend the same durable
-                // observation set used by directory census reconciliation. Apply
-                // removals first so a valid observation later in this page wins.
-                for index_key in &census.removed_index_keys {
-                    traversal.observed_index_keys.remove(index_key);
-                }
-                traversal
-                    .observed_index_keys
-                    .extend(census.observed_index_keys.iter().cloned());
-                traversal.counts.directory_entry_cap_exceeded_count +=
-                    census.directory_entry_cap_exceeded_count;
-                traversal.counts.symlink_rejected_count += census.symlink_rejected_count;
-                traversal.counts.unreadable_path_count += census.unreadable_path_count;
-                traversal.counts.oversized_file_count += census.oversized_file_count;
-                traversal.counts.disappeared_file_count += census.disappeared_file_count;
-                traversal.counts.malformed_json_line_count += census.malformed_json_line_count;
-                traversal.counts.invalid_utf8_line_count += census.invalid_utf8_line_count;
-                traversal.counts.over_line_cap_count += census.over_line_cap_count;
-                traversal.counts.recognized_usage_drop_count += census.recognized_usage_drop_count;
-                traversal.counts.ownership_incomplete_file_count +=
-                    census.ownership_incomplete_file_count;
-                traversal.counts.zero_snapshot_usage_evidence_count +=
-                    census.zero_snapshot_usage_evidence_count;
-                traversal.counts.dropped_usage_record_count = traversal
-                    .counts
+                census.malformed_json_line_count += report.malformed_json_line_count;
+                census.invalid_utf8_line_count += report.invalid_utf8_line_count;
+                census.over_line_cap_count += report.over_line_cap_count;
+                census.recognized_usage_drop_count += recognized_usage_drop_count;
+                census.ownership_incomplete_file_count += ownership_incomplete_file_count;
+                census.zero_snapshot_usage_evidence_count +=
+                    usize::from(zero_snapshot_usage_evidence);
+                census.dropped_usage_record_count = census
                     .dropped_usage_record_count
-                    .saturating_add(census.dropped_usage_record_count);
-                traversal.counts.terminal_over_line_cap_count = traversal
-                    .counts
-                    .terminal_over_line_cap_count
-                    .saturating_add(census.terminal_over_line_cap_count);
-                traversal.counts.terminal_recognized_usage_drop_count = traversal
-                    .counts
-                    .terminal_recognized_usage_drop_count
-                    .saturating_add(census.terminal_recognized_usage_drop_count);
-                traversal.counts.terminal_dropped_usage_record_count = traversal
-                    .counts
-                    .terminal_dropped_usage_record_count
-                    .saturating_add(census.terminal_dropped_usage_record_count);
-            }
-            // A remove/rename hint can arrive after bounded reconciliation has already
-            // passed this key. Removing it only from `observed_index_keys` is then too
-            // late: the reconciliation cursor will never revisit the stale entry and a
-            // terminal manifest can still publish it. The hint was revalidated as
-            // absent beneath the configured root above, so retire the corresponding
-            // derived index state directly. Any recreation after this absence witness
-            // belongs to the next generation.
-            for index_key in &census.removed_index_keys {
-                if !index
-                    .files
-                    .get(index_key)
-                    .is_some_and(ScanIndexEntry::codex_history_is_protected)
-                {
-                    index.remove_file_entry(index_key);
+                    .saturating_add(dropped_usage_record_count);
+                if let Some(loss) = terminal_loss {
+                    census.terminal_over_line_cap_count = census
+                        .terminal_over_line_cap_count
+                        .saturating_add(loss.over_line_cap_count);
+                    census.terminal_recognized_usage_drop_count = census
+                        .terminal_recognized_usage_drop_count
+                        .saturating_add(loss.recognized_usage_drop_count);
+                    census.terminal_dropped_usage_record_count = census
+                        .terminal_dropped_usage_record_count
+                        .saturating_add(loss.dropped_usage_record_count);
                 }
+                // Retryable parse loss still quarantines the whole derived entity.
+                // A bounded oversized line is different: its loss is terminal and
+                // disclosed, so independently parsed sibling records remain usable.
+                if parse_complete {
+                    snapshots.extend(parsed);
+                }
+                pending!();
             }
-            let traversal_discovery_done = index.traversal.as_ref().is_some_and(|traversal| {
-                traversal.pending_directories.is_empty() && traversal.pending_candidates.is_empty()
-            });
-            if traversal_discovery_done {
-                if source == SnapshotSource::Codex {
-                    let missing = index
+            let Some(mut candidate) = identified_candidates.pop_front() else {
+                if let Some(traversal) = index.traversal.as_mut() {
+                    traversal.codex_parent_resolution_retry_required |=
+                        codex_parent_resolution_retry_required;
+                    // A residue file that this page parsed to completion, or that a
+                    // watcher hint proved absent, leaves the generation's residue set; a
+                    // file that reproduced its residue (re)enters it.
+                    for index_key in settled_residue_index_keys.iter().chain(
+                        census.removed_index_keys.iter().filter(|key| {
+                            !index
+                                .files
+                                .get(*key)
+                                .is_some_and(ScanIndexEntry::codex_history_is_protected)
+                        }),
+                    ) {
+                        traversal.residue.index_keys.remove(index_key);
+                    }
+                    traversal.residue.index_keys.extend(residue_index_keys);
+                    traversal
+                        .residue
+                        .blocked_session_ids
+                        .extend(residue_blocked_session_ids);
+                    // Exact watcher remove/rename hints must amend the same durable
+                    // observation set used by directory census reconciliation. Apply
+                    // removals first so a valid observation later in this page wins.
+                    for index_key in &census.removed_index_keys {
+                        traversal.observed_index_keys.remove(index_key);
+                    }
+                    traversal
+                        .observed_index_keys
+                        .extend(census.observed_index_keys.iter().cloned());
+                    traversal.counts.directory_entry_cap_exceeded_count +=
+                        census.directory_entry_cap_exceeded_count;
+                    traversal.counts.symlink_rejected_count += census.symlink_rejected_count;
+                    traversal.counts.unreadable_path_count += census.unreadable_path_count;
+                    traversal.counts.oversized_file_count += census.oversized_file_count;
+                    traversal.counts.disappeared_file_count += census.disappeared_file_count;
+                    traversal.counts.malformed_json_line_count += census.malformed_json_line_count;
+                    traversal.counts.invalid_utf8_line_count += census.invalid_utf8_line_count;
+                    traversal.counts.over_line_cap_count += census.over_line_cap_count;
+                    traversal.counts.recognized_usage_drop_count +=
+                        census.recognized_usage_drop_count;
+                    traversal.counts.ownership_incomplete_file_count +=
+                        census.ownership_incomplete_file_count;
+                    traversal.counts.zero_snapshot_usage_evidence_count +=
+                        census.zero_snapshot_usage_evidence_count;
+                    traversal.counts.dropped_usage_record_count = traversal
+                        .counts
+                        .dropped_usage_record_count
+                        .saturating_add(census.dropped_usage_record_count);
+                    traversal.counts.terminal_over_line_cap_count = traversal
+                        .counts
+                        .terminal_over_line_cap_count
+                        .saturating_add(census.terminal_over_line_cap_count);
+                    traversal.counts.terminal_recognized_usage_drop_count = traversal
+                        .counts
+                        .terminal_recognized_usage_drop_count
+                        .saturating_add(census.terminal_recognized_usage_drop_count);
+                    traversal.counts.terminal_dropped_usage_record_count = traversal
+                        .counts
+                        .terminal_dropped_usage_record_count
+                        .saturating_add(census.terminal_dropped_usage_record_count);
+                }
+                // A remove/rename hint can arrive after bounded reconciliation has already
+                // passed this key. Removing it only from `observed_index_keys` is then too
+                // late: the reconciliation cursor will never revisit the stale entry and a
+                // terminal manifest can still publish it. The hint was revalidated as
+                // absent beneath the configured root above, so retire the corresponding
+                // derived index state directly. Any recreation after this absence witness
+                // belongs to the next generation.
+                for index_key in &census.removed_index_keys {
+                    if !index
                         .files
-                        .iter()
-                        .filter(|(key, entry)| {
-                            entry.codex_history_is_protected()
-                                && !index
-                                    .traversal
-                                    .as_ref()
-                                    .expect("traversal")
-                                    .codex_rollout_paths
-                                    .contains(*key)
-                        })
-                        .map(|(key, _)| key.clone())
-                        .collect::<BTreeSet<_>>();
-                    if !missing.is_empty() {
-                        let traversal = index.traversal.as_mut().expect("traversal");
-                        // Quiet ticks reuse this generation's red witness. Count
-                        // each absent protected source once, without rearming the
-                        // retry latch or rescanning headers before its deadline.
-                        let newly_missing =
-                            missing.difference(&traversal.residue.index_keys).count();
-                        traversal.counts.ownership_incomplete_file_count += newly_missing;
-                        traversal.counts.unreadable_path_count += usize::from(newly_missing > 0);
-                        traversal.residue.index_keys.extend(missing);
+                        .get(index_key)
+                        .is_some_and(ScanIndexEntry::codex_history_is_protected)
+                    {
+                        index.remove_file_entry(index_key);
                     }
                 }
-                // Discovery has visited every directory and parsed every candidate,
-                // so the counts are the complete re-derivation for this generation.
-                // Loss that only a change to the corpus can move is settled now, so a
-                // machine whose only problem is an unresolvable rollout still reaches
-                // a terminal census instead of retrying the same bytes forever with
-                // every downstream gate (historical backfill, the legacy settlement
-                // sweep, the terminal manifest) held behind it. Retryable problems
-                // veto the settlement inside the helper.
-                if let Some(traversal) = index.traversal.as_mut() {
-                    traversal.counts.settle_non_progressing_residue();
+                let traversal_discovery_done = index.traversal.as_ref().is_some_and(|traversal| {
+                    traversal.pending_directories.is_empty()
+                        && traversal.pending_candidates.is_empty()
+                });
+                if traversal_discovery_done {
+                    if source == SnapshotSource::Codex {
+                        let missing = index
+                            .files
+                            .iter()
+                            .filter(|(key, entry)| {
+                                entry.codex_history_is_protected()
+                                    && !index
+                                        .traversal
+                                        .as_ref()
+                                        .expect("traversal")
+                                        .codex_rollout_paths
+                                        .contains(*key)
+                            })
+                            .map(|(key, _)| key.clone())
+                            .collect::<BTreeSet<_>>();
+                        if !missing.is_empty() {
+                            let traversal = index.traversal.as_mut().expect("traversal");
+                            // Quiet ticks reuse this generation's red witness. Count
+                            // each absent protected source once, without rearming the
+                            // retry latch or rescanning headers before its deadline.
+                            let newly_missing =
+                                missing.difference(&traversal.residue.index_keys).count();
+                            traversal.counts.ownership_incomplete_file_count += newly_missing;
+                            traversal.counts.unreadable_path_count +=
+                                usize::from(newly_missing > 0);
+                            traversal.residue.index_keys.extend(missing);
+                        }
+                    }
+                    // Discovery has visited every directory and parsed every candidate,
+                    // so the counts are the complete re-derivation for this generation.
+                    // Loss that only a change to the corpus can move is settled now, so a
+                    // machine whose only problem is an unresolvable rollout still reaches
+                    // a terminal census instead of retrying the same bytes forever with
+                    // every downstream gate (historical backfill, the legacy settlement
+                    // sweep, the terminal manifest) held behind it. Retryable problems
+                    // veto the settlement inside the helper.
+                    if let Some(traversal) = index.traversal.as_mut() {
+                        traversal.counts.settle_non_progressing_residue();
+                    }
                 }
-            }
-            let traversal_snapshot = index
-                .traversal
-                .as_ref()
-                .cloned()
-                .expect("traversal remains active");
-            let traversal_healthy = !traversal_snapshot.counts.has_errors();
-            let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
-            let reconciliation_complete = if traversal_discovery_done
-                && traversal_healthy
-                && clean_frozen_generation
-                && state_census_complete
-                && sidecar_census_complete
-            {
-                reconcile_missing_index_entries_bounded(index)
-            } else {
-                false
-            };
-            // Vanished paths are retired from `files` just above - by exact watcher
-            // remove/rename hints and by bounded census reconciliation. Terminal
-            // dispositions are keyed identically, so retire their orphans in the same
-            // place instead of carrying a renamed or deleted file's record forever.
-            // This keeps the map a subset of `files`, which is the whole bound it
-            // needs.
-            index.prune_terminal_jsonl_dispositions();
-            if source == SnapshotSource::Codex
-                && traversal_discovery_done
-                && traversal_healthy
-                && clean_frozen_generation
-                && state_census_complete
-                && sidecar_census_complete
-                && reconciliation_complete
-            {
-                // Reconcile authoritative transcript deletions before deciding which
-                // state-database threads are file-backed. Otherwise a vanished rollout
-                // remains "covered" for this whole generation, the state-only fallback
-                // is delayed one cycle, and a complete terminal manifest can briefly
-                // omit a thread the local state database still proves exists.
-                let (state_only_scanned, state_only_noops) = append_codex_state_only_snapshots(
-                    &mut snapshots,
-                    &codex_title_metadata,
-                    collected_at.as_str(),
-                    index,
-                    &codex_state_only_blocked_session_ids,
-                );
-                scanned_session_count += state_only_scanned;
-                semantic_noop_count += state_only_noops;
-            }
-            let parent_resolution_restart = traversal_discovery_done
-                && traversal_snapshot.pending_candidates.is_empty()
-                && traversal_snapshot.codex_parent_resolution_retry_required;
-            let raw_census_complete = traversal_discovery_done
-                && traversal_healthy
-                && clean_frozen_generation
-                && state_census_complete
-                && sidecar_census_complete
-                && reconciliation_complete
-                && !parent_resolution_restart;
-            let needs_clean_followup =
-                raw_census_complete && index.bounded_sweep_had_unsettled_upload;
-            let census_complete = raw_census_complete && !needs_clean_followup;
-            let reconciliation_pending = traversal_discovery_done
-                && traversal_healthy
-                && clean_frozen_generation
-                && state_census_complete
-                && sidecar_census_complete
-                && !reconciliation_complete;
-            let pending_work_count = index
-                .traversal
-                .as_ref()
-                .map(|traversal| {
-                    traversal
-                        .pending_candidates
-                        .len()
-                        .saturating_add(traversal.pending_directories.len())
-                        .saturating_add(usize::from(reconciliation_pending))
-                })
-                .unwrap_or_default();
-            let skipped_file_count_due_to_limit = index
-                .traversal
-                .as_ref()
-                .map(|traversal| traversal.pending_candidates.len())
-                .unwrap_or_default();
-            let restart_after_hints =
-                traversal_discovery_done && traversal_healthy && !clean_frozen_generation;
-            let terminal_unhealthy = traversal_discovery_done && !traversal_healthy;
-            if terminal_unhealthy {
-                let now = rfc3339_unix_seconds(collected_at.as_str()).unwrap_or_default();
-                let traversal = index.traversal.as_mut().expect("traversal remains active");
-                if traversal.unhealthy_retry_not_before_unix_seconds.is_none() {
-                    let previous_attempt = traversal.unhealthy_retry_attempt;
-                    // The counter saturates at the attempt whose delay is already the
-                    // hourly ceiling. A persistent problem therefore costs at most one
-                    // bounded re-walk per hour and the persisted witness stays small.
-                    traversal.unhealthy_retry_attempt = previous_attempt
-                        .saturating_add(1)
-                        .min(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS);
-                    traversal.unhealthy_retry_not_before_unix_seconds = Some(now.saturating_add(
-                        unhealthy_scan_retry_delay_seconds(traversal.unhealthy_retry_attempt),
-                    ));
-                    if previous_attempt < UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS
-                        && traversal.unhealthy_retry_attempt == UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS
-                    {
-                        eprintln!(
+                let traversal_snapshot = index
+                    .traversal
+                    .as_ref()
+                    .cloned()
+                    .expect("traversal remains active");
+                let traversal_healthy = !traversal_snapshot.counts.has_errors();
+                let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
+                let reconciliation_complete = if traversal_discovery_done
+                    && traversal_healthy
+                    && clean_frozen_generation
+                    && state_census_complete
+                    && sidecar_census_complete
+                {
+                    reconcile_missing_index_entries_bounded(index)
+                } else {
+                    false
+                };
+                // Vanished paths are retired from `files` just above - by exact watcher
+                // remove/rename hints and by bounded census reconciliation. Terminal
+                // dispositions are keyed identically, so retire their orphans in the same
+                // place instead of carrying a renamed or deleted file's record forever.
+                // This keeps the map a subset of `files`, which is the whole bound it
+                // needs.
+                index.prune_terminal_jsonl_dispositions();
+                if source == SnapshotSource::Codex
+                    && traversal_discovery_done
+                    && traversal_healthy
+                    && clean_frozen_generation
+                    && state_census_complete
+                    && sidecar_census_complete
+                    && reconciliation_complete
+                {
+                    // Reconcile authoritative transcript deletions before deciding which
+                    // state-database threads are file-backed. Otherwise a vanished rollout
+                    // remains "covered" for this whole generation, the state-only fallback
+                    // is delayed one cycle, and a complete terminal manifest can briefly
+                    // omit a thread the local state database still proves exists.
+                    let (state_only_scanned, state_only_noops) = append_codex_state_only_snapshots(
+                        &mut snapshots,
+                        &codex_title_metadata,
+                        collected_at.as_str(),
+                        index,
+                        &codex_state_only_blocked_session_ids,
+                    );
+                    scanned_session_count += state_only_scanned;
+                    semantic_noop_count += state_only_noops;
+                }
+                let parent_resolution_restart = traversal_discovery_done
+                    && traversal_snapshot.pending_candidates.is_empty()
+                    && traversal_snapshot.codex_parent_resolution_retry_required;
+                let raw_census_complete = traversal_discovery_done
+                    && traversal_healthy
+                    && clean_frozen_generation
+                    && state_census_complete
+                    && sidecar_census_complete
+                    && reconciliation_complete
+                    && !parent_resolution_restart;
+                let needs_clean_followup =
+                    raw_census_complete && index.bounded_sweep_had_unsettled_upload;
+                let census_complete = raw_census_complete && !needs_clean_followup;
+                let reconciliation_pending = traversal_discovery_done
+                    && traversal_healthy
+                    && clean_frozen_generation
+                    && state_census_complete
+                    && sidecar_census_complete
+                    && !reconciliation_complete;
+                let pending_work_count = index
+                    .traversal
+                    .as_ref()
+                    .map(|traversal| {
+                        traversal
+                            .pending_candidates
+                            .len()
+                            .saturating_add(traversal.pending_directories.len())
+                            .saturating_add(usize::from(reconciliation_pending))
+                    })
+                    .unwrap_or_default();
+                let skipped_file_count_due_to_limit = index
+                    .traversal
+                    .as_ref()
+                    .map(|traversal| traversal.pending_candidates.len())
+                    .unwrap_or_default();
+                let restart_after_hints =
+                    traversal_discovery_done && traversal_healthy && !clean_frozen_generation;
+                let terminal_unhealthy = traversal_discovery_done && !traversal_healthy;
+                if terminal_unhealthy {
+                    let now = rfc3339_unix_seconds(collected_at.as_str()).unwrap_or_default();
+                    let traversal = index.traversal.as_mut().expect("traversal remains active");
+                    if traversal.unhealthy_retry_not_before_unix_seconds.is_none() {
+                        let previous_attempt = traversal.unhealthy_retry_attempt;
+                        // The counter saturates at the attempt whose delay is already the
+                        // hourly ceiling. A persistent problem therefore costs at most one
+                        // bounded re-walk per hour and the persisted witness stays small.
+                        traversal.unhealthy_retry_attempt = previous_attempt
+                            .saturating_add(1)
+                            .min(UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS);
+                        traversal.unhealthy_retry_not_before_unix_seconds =
+                            Some(now.saturating_add(unhealthy_scan_retry_delay_seconds(
+                                traversal.unhealthy_retry_attempt,
+                            )));
+                        if previous_attempt < UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS
+                            && traversal.unhealthy_retry_attempt
+                                == UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS
+                        {
+                            eprintln!(
                     "ottto-service: bounded scan retry for {} reached attempt {}; the traversal \
                      stays a durable red witness and is re-walked at most hourly until the \
                      problem clears or the scan context changes",
                     source.api_slug(),
                     UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS
                 );
+                        }
                     }
                 }
-            }
-            let pending_work_count = pending_work_count
-                .saturating_add(usize::from(restart_after_hints))
-                .saturating_add(usize::from(terminal_unhealthy))
-                .saturating_add(usize::from(needs_clean_followup))
-                .saturating_add(usize::from(parent_resolution_restart));
-            if raw_census_complete {
-                index.record_scan_residue_witness(source, &traversal_snapshot);
-            }
-            if (raw_census_complete
-                && codex_legacy_join_baselines.is_empty()
-                && !pending_finalization.iter().any(|pending| {
-                    index.files.get(&pending.index_key).is_some_and(|entry| {
-                        entry.codex_applied_tier_receipt.is_some()
-                            || entry.codex_joined_member_set.is_some()
-                    })
-                }))
-                || restart_after_hints
-                || parent_resolution_restart
-            {
-                index.traversal = None;
-                index.resume_after_path = None;
-                index.resume_upper_bound_path = None;
-                index.resume_census_window_end = None;
-            }
-            let counts = traversal_snapshot.counts;
-            let zero_snapshot_confirmed_count = index.confirmed_empty_files.len();
-            let zero_snapshot_usage_evidence_count = counts.zero_snapshot_usage_evidence_count;
-            let dropped_usage_record_count = counts.dropped_usage_record_count;
-            // The witness just recorded above describes THIS generation only when the
-            // generation completed; otherwise the durable one is an earlier census's
-            // and must not be reported as this scan's evidence. Counts only: the
-            // witness's index keys and session ids never leave the local index.
-            let (
-                census_residue_index_key_count,
-                census_residue_archived_rollout_count,
-                census_residue_blocked_session_count,
-            ) = if raw_census_complete {
-                index
-                    .scan_residue_witness
-                    .as_ref()
-                    .map(|witness| {
-                        (
-                            witness.index_keys.len(),
-                            witness.archived_residue_file_count(),
-                            witness.codex_state_only_blocked_session_ids.len(),
-                        )
-                    })
-                    .unwrap_or_default()
-            } else {
-                (0, 0, 0)
-            };
-            if !context_curve_enabled {
-                for snapshot in &mut snapshots {
-                    snapshot.context_curve = None;
+                let pending_work_count = pending_work_count
+                    .saturating_add(usize::from(restart_after_hints))
+                    .saturating_add(usize::from(terminal_unhealthy))
+                    .saturating_add(usize::from(needs_clean_followup))
+                    .saturating_add(usize::from(parent_resolution_restart));
+                if raw_census_complete {
+                    index.record_scan_residue_witness(source, &traversal_snapshot);
                 }
-            }
-            let scan = SourceScanResult {
-                source,
-                backfill_window_days,
-                backfill_file_limit: file_limit,
-                discovered_file_count,
-                skipped_file_count_due_to_limit,
-                scan_cap_hit: pending_work_count > 0,
-                scanned_file_count,
-                scanned_session_count,
-                semantic_noop_count,
-                census_complete,
-                census_window_end,
-                state_census_complete,
-                sidecar_census_complete,
-                symlink_rejected_count: counts.symlink_rejected_count,
-                directory_entry_cap_exceeded_count: counts.directory_entry_cap_exceeded_count,
-                unreadable_path_count: counts.unreadable_path_count,
-                oversized_file_count: counts.oversized_file_count,
-                disappeared_file_count: counts.disappeared_file_count,
-                malformed_json_line_count: counts.malformed_json_line_count,
-                invalid_utf8_line_count: counts.invalid_utf8_line_count,
-                over_line_cap_count: counts.over_line_cap_count,
-                recognized_usage_drop_count: counts.recognized_usage_drop_count,
-                ownership_incomplete_file_count: counts.ownership_incomplete_file_count,
-                zero_snapshot_confirmed_count,
-                zero_snapshot_usage_evidence_count,
-                dropped_usage_record_count,
-                terminal_ownership_incomplete_file_count: counts
-                    .terminal_ownership_incomplete_file_count,
-                terminal_zero_snapshot_usage_evidence_count: counts
-                    .terminal_zero_snapshot_usage_evidence_count,
-                terminal_recognized_usage_drop_count: counts.terminal_recognized_usage_drop_count,
-                terminal_dropped_usage_record_count: counts.terminal_dropped_usage_record_count,
-                terminal_over_line_cap_count: counts.terminal_over_line_cap_count,
-                census_residue_index_key_count,
-                census_residue_archived_rollout_count,
-                census_residue_blocked_session_count,
-                snapshots,
-                pending_finalization,
-                codex_legacy_join_baselines,
-                codex_join_validation: codex_join_inventory
-                    .filter(|_| !codex_join_completed.is_empty())
-                    .map(|inventory| codex_file_join::Validation {
-                        inventory,
-                        groups: codex_join_completed,
-                    }),
-                local_codex_diagnostics: (source == SnapshotSource::Codex).then_some(
-                    CodexScanDiagnostics {
-                        version: 1,
-                        generation: index.generation,
-                        gates: CensusGates {
-                            discovery_done: traversal_discovery_done,
-                            traversal_healthy,
-                            frozen_generation: clean_frozen_generation,
-                            state_complete: state_census_complete,
-                            sidecar_complete: sidecar_census_complete,
-                            reconciliation_complete,
-                            parent_restart: parent_resolution_restart,
-                            clean_followup: needs_clean_followup,
-                            census_complete,
+                if (raw_census_complete
+                    && codex_legacy_join_baselines.is_empty()
+                    && !pending_finalization.iter().any(|pending| {
+                        index.files.get(&pending.index_key).is_some_and(|entry| {
+                            entry.codex_applied_tier_receipt.is_some()
+                                || entry.codex_joined_member_set.is_some()
+                        })
+                    }))
+                    || restart_after_hints
+                    || parent_resolution_restart
+                {
+                    index.traversal = None;
+                    index.resume_after_path = None;
+                    index.resume_upper_bound_path = None;
+                    index.resume_census_window_end = None;
+                }
+                let counts = traversal_snapshot.counts;
+                let zero_snapshot_confirmed_count = index.confirmed_empty_files.len();
+                let zero_snapshot_usage_evidence_count = counts.zero_snapshot_usage_evidence_count;
+                let dropped_usage_record_count = counts.dropped_usage_record_count;
+                // The witness just recorded above describes THIS generation only when the
+                // generation completed; otherwise the durable one is an earlier census's
+                // and must not be reported as this scan's evidence. Counts only: the
+                // witness's index keys and session ids never leave the local index.
+                let (
+                    census_residue_index_key_count,
+                    census_residue_archived_rollout_count,
+                    census_residue_blocked_session_count,
+                ) = if raw_census_complete {
+                    index
+                        .scan_residue_witness
+                        .as_ref()
+                        .map(|witness| {
+                            (
+                                witness.index_keys.len(),
+                                witness.archived_residue_file_count(),
+                                witness.codex_state_only_blocked_session_ids.len(),
+                            )
+                        })
+                        .unwrap_or_default()
+                } else {
+                    (0, 0, 0)
+                };
+                if !context_curve_enabled {
+                    for snapshot in &mut snapshots {
+                        snapshot.context_curve = None;
+                    }
+                }
+                let scan = SourceScanResult {
+                    source,
+                    backfill_window_days,
+                    backfill_file_limit: file_limit,
+                    discovered_file_count,
+                    skipped_file_count_due_to_limit,
+                    scan_cap_hit: pending_work_count > 0,
+                    scanned_file_count,
+                    scanned_session_count,
+                    semantic_noop_count,
+                    census_complete,
+                    census_window_end,
+                    state_census_complete,
+                    sidecar_census_complete,
+                    symlink_rejected_count: counts.symlink_rejected_count,
+                    directory_entry_cap_exceeded_count: counts.directory_entry_cap_exceeded_count,
+                    unreadable_path_count: counts.unreadable_path_count,
+                    oversized_file_count: counts.oversized_file_count,
+                    disappeared_file_count: counts.disappeared_file_count,
+                    malformed_json_line_count: counts.malformed_json_line_count,
+                    invalid_utf8_line_count: counts.invalid_utf8_line_count,
+                    over_line_cap_count: counts.over_line_cap_count,
+                    recognized_usage_drop_count: counts.recognized_usage_drop_count,
+                    ownership_incomplete_file_count: counts.ownership_incomplete_file_count,
+                    zero_snapshot_confirmed_count,
+                    zero_snapshot_usage_evidence_count,
+                    dropped_usage_record_count,
+                    terminal_ownership_incomplete_file_count: counts
+                        .terminal_ownership_incomplete_file_count,
+                    terminal_zero_snapshot_usage_evidence_count: counts
+                        .terminal_zero_snapshot_usage_evidence_count,
+                    terminal_recognized_usage_drop_count: counts
+                        .terminal_recognized_usage_drop_count,
+                    terminal_dropped_usage_record_count: counts.terminal_dropped_usage_record_count,
+                    terminal_over_line_cap_count: counts.terminal_over_line_cap_count,
+                    census_residue_index_key_count,
+                    census_residue_archived_rollout_count,
+                    census_residue_blocked_session_count,
+                    snapshots,
+                    pending_finalization,
+                    codex_legacy_join_baselines,
+                    codex_join_validation: codex_join_inventory
+                        .filter(|_| !codex_join_completed.is_empty())
+                        .map(|inventory| codex_file_join::Validation {
+                            inventory,
+                            groups: codex_join_completed,
+                        }),
+                    local_codex_diagnostics: (source == SnapshotSource::Codex).then_some(
+                        CodexScanDiagnostics {
+                            version: 1,
+                            generation: index.generation,
+                            gates: CensusGates {
+                                discovery_done: traversal_discovery_done,
+                                traversal_healthy,
+                                frozen_generation: clean_frozen_generation,
+                                state_complete: state_census_complete,
+                                sidecar_complete: sidecar_census_complete,
+                                reconciliation_complete,
+                                parent_restart: parent_resolution_restart,
+                                clean_followup: needs_clean_followup,
+                                census_complete,
+                            },
+                            ..codex_title_metadata.local_diagnostics
                         },
-                        ..codex_title_metadata.local_diagnostics
-                    },
-                ),
-            };
-            if let Some(context) = sampling.as_ref() {
-                let audit_now = sampled_scan::now_seconds();
-                let pending = index
-                    .files
-                    .values()
-                    .filter(|entry| entry.has_unverified_source())
-                    .count();
-                let overdue = index
-                    .files
-                    .values()
-                    .filter(|entry| entry.audit_requires_full(audit_now))
-                    .count();
-                let oldest_due_age = index
-                    .files
-                    .values()
-                    .filter_map(|entry| entry.audit_obligation(audit_now))
-                    .map(|debt| audit_now.saturating_sub(debt.due_unix_seconds))
-                    .max()
-                    .unwrap_or(0);
-                eprintln!("ottto-service: sampled acquisition {}: full={} tail={} unchanged={} native_bytes={} sample_bytes={} priority_full_replays={} full_reasons=[missing,due,clock,scope,invalid,replaced,shrank,same_size,head,boundary,unsupported]:{:?} pending_audits={} overdue_audits={} oldest_due_age_seconds={} audits_started={} audits_completed={} start_overdue_seconds={} completion_overdue_seconds={}; byte counts exclude discovery/header/sidecar/independent identity reads; overdue work remains owed until full verification",
+                    ),
+                };
+                if let Some(context) = sampling.as_ref() {
+                    let audit_now = sampled_scan::now_seconds();
+                    let pending = index
+                        .files
+                        .values()
+                        .filter(|entry| entry.has_unverified_source())
+                        .count();
+                    let overdue = index
+                        .files
+                        .values()
+                        .filter(|entry| entry.audit_requires_full(audit_now))
+                        .count();
+                    let oldest_due_age = index
+                        .files
+                        .values()
+                        .filter_map(|entry| entry.audit_obligation(audit_now))
+                        .map(|debt| audit_now.saturating_sub(debt.due_unix_seconds))
+                        .max()
+                        .unwrap_or(0);
+                    eprintln!("ottto-service: sampled acquisition {}: full={} tail={} unchanged={} native_bytes={} sample_bytes={} priority_full_replays={} full_reasons=[missing,due,clock,scope,invalid,replaced,shrank,same_size,head,boundary,unsupported]:{:?} pending_audits={} overdue_audits={} oldest_due_age_seconds={} audits_started={} audits_completed={} start_overdue_seconds={} completion_overdue_seconds={}; byte counts exclude discovery/header/sidecar/independent identity reads; overdue work remains owed until full verification",
                     source.api_slug(), context.full_files, context.tail_files, context.unchanged_files,
                     context.native_bytes, context.sample_bytes, context.priority_replays, context.full_reasons,
                     pending, overdue, oldest_due_age, context.audits_started, context.audits_completed,
                     context.start_overdue_seconds, context.completion_overdue_seconds);
-            }
-            resource_probe.collection(
-                source.api_slug(),
-                crate::local_resource_diagnostics::CollectionCounts {
-                    scanned_files: scanned_file_count,
-                    semantic_noops: semantic_noop_count,
-                    sampled_acquisition: sampling.as_ref().map(|context| {
-                        crate::local_resource_diagnostics::ReadCounts {
-                            full_selections: context.full_files,
-                            tail_selections: context.tail_files,
-                            unchanged_selections: context.unchanged_files,
-                            completed_native_bytes: context.native_bytes,
-                            completed_guard_bytes: context.sample_bytes,
-                        }
-                    }),
-                },
-            );
-            return OwnedSourceScanStep::Complete {
-                index: index_storage,
-                scan,
+                }
+                resource_probe.collection(
+                    source.api_slug(),
+                    crate::local_resource_diagnostics::CollectionCounts {
+                        scanned_files: scanned_file_count,
+                        semantic_noops: semantic_noop_count,
+                        sampled_acquisition: sampling.as_ref().map(|context| {
+                            crate::local_resource_diagnostics::ReadCounts {
+                                full_selections: context.full_files,
+                                tail_selections: context.tail_files,
+                                unchanged_selections: context.unchanged_files,
+                                completed_native_bytes: context.native_bytes,
+                                completed_guard_bytes: context.sample_bytes,
+                            }
+                        }),
+                    },
+                );
+                return OwnedSourceScanStep::Complete {
+                    index: index_storage,
+                    scan,
+                };
             };
-        };
-        let preflight_source_file_fingerprint =
-            claude_authority_preflight_fingerprint(index, &candidate);
-        prepare_owned_scan_candidate(
-            source,
-            &mut candidate,
-            &codex_title_metadata,
-            &claude_title_metadata,
-            claude_effort_support_dir_ref,
-        );
-        let Some((candidate, opened_file)) = open_and_identify_scan_candidate(
-            source,
-            candidate,
-            &mut census,
-            census_unix_seconds,
-            backfill_window_days,
-            &index.files,
-        ) else {
-            pending!();
-        };
-        if preflight_source_file_fingerprint
-            .as_ref()
-            .is_some_and(|fingerprint| fingerprint != &candidate.source_file_fingerprint)
-        {
-            // A quarantined candidate changed after the family prepass. Do not
-            // parse a mixed family or refresh its retry record; keep this
-            // generation non-terminal and retry the new exact object together.
-            census.disappeared_file_count += 1;
-            pending!();
-        }
-        let mut decision = claude_index_path_family_member(&candidate.path)
-            .filter(|(root_session_id, _)| forced_claude_family_reparses.contains(root_session_id))
-            .map(|_| CandidateDecision::Parse)
-            .unwrap_or_else(|| index.candidate_decision(&candidate));
-        if source == SnapshotSource::Codex
+            let preflight_source_file_fingerprint =
+                claude_authority_preflight_fingerprint(index, &candidate);
+            if let Some(context) = attribution_context {
+                let workers =
+                    launch_workers_for_candidate(source, &candidate, codex_join_inventory.as_ref());
+                match context.prepare_launch_step(&workers) {
+                    Ok(false) => {
+                        identified_candidates.push_front(candidate);
+                        pending!();
+                    }
+                    Err(()) => {
+                        census.unreadable_path_count += 1;
+                        pending!();
+                    }
+                    Ok(true) => {}
+                }
+            }
+            // Keep the prepass physical identity intact while lookup yields. Only
+            // replace it with sidecar inputs immediately before the second open.
+            prepare_owned_scan_candidate(
+                source,
+                &mut candidate,
+                &codex_title_metadata,
+                &claude_title_metadata,
+                claude_effort_support_dir_ref,
+            );
+            let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate(
+                source,
+                candidate,
+                &mut census,
+                census_unix_seconds,
+                backfill_window_days,
+                &index.files,
+            ) else {
+                pending!();
+            };
+            if preflight_source_file_fingerprint
+                .as_ref()
+                .is_some_and(|fingerprint| fingerprint != &candidate.source_file_fingerprint)
+            {
+                // A quarantined candidate changed after the family prepass. Do not
+                // parse a mixed family or refresh its retry record; keep this
+                // generation non-terminal and retry the new exact object together.
+                census.disappeared_file_count += 1;
+                pending!();
+            }
+            // The preflight fences physical/sidecar identity. Local launcher facts
+            // are semantic context and must not contaminate that two-open witness.
+            if let Some(context) = attribution_context {
+                let workers =
+                    launch_workers_for_candidate(source, &candidate, codex_join_inventory.as_ref());
+                if let Some(witness) = context.launch_witness(&workers) {
+                    candidate.source_file_fingerprint = sha256_hex(&[
+                        "launcher_worker_context:v1",
+                        &candidate.source_file_fingerprint,
+                        &witness,
+                    ]);
+                }
+            }
+            // Constructor preflight has only physical identities. Reconcile its
+            // family retry decision once launcher context is prepared, while keeping
+            // the two-open equality check above physical. Every family member must
+            // match the retained revision before withdrawing a forced retry.
+            if source == SnapshotSource::ClaudeCode {
+                if let Some(context) = attribution_context {
+                    if let Some((root, _)) = claude_index_path_family_member(&candidate.path) {
+                        if forced_claude_family_reparses.contains(&root)
+                            && claude_held_family_matches_launch_context(
+                                index,
+                                &root,
+                                &candidate,
+                                &identified_candidates,
+                                context,
+                            )
+                        {
+                            forced_claude_family_reparses.remove(&root);
+                        }
+                    }
+                }
+            }
+            let mut decision = claude_index_path_family_member(&candidate.path)
+                .filter(|(root_session_id, _)| {
+                    forced_claude_family_reparses.contains(root_session_id)
+                })
+                .map(|_| CandidateDecision::Parse)
+                .unwrap_or_else(|| index.candidate_decision(&candidate));
+            if source == SnapshotSource::Codex
             && decision == CandidateDecision::Skip
             // A terminal disposition at this exact file fingerprint and parser
             // generation means the previous traversal already parsed this
@@ -12813,89 +12929,89 @@ impl OwnedSourceScan {
                             .get(session_id)
                             .is_some_and(|ledger| ledger.scan_complete)
                 })
-        {
-            // An unresolved child requested this unchanged parent after its
-            // earlier page had already passed. Reparse only that parent to
-            // populate bounded structural evidence.
-            decision = CandidateDecision::Parse;
-        }
-        match decision {
-            CandidateDecision::Skip => {
-                if let Some(loss) = index.terminal_jsonl_loss(&candidate) {
-                    census.add_terminal_jsonl_loss(loss);
+            {
+                // An unresolved child requested this unchanged parent after its
+                // earlier page had already passed. Reparse only that parent to
+                // populate bounded structural evidence.
+                decision = CandidateDecision::Parse;
+            }
+            match decision {
+                CandidateDecision::Skip => {
+                    if let Some(loss) = index.terminal_jsonl_loss(&candidate) {
+                        census.add_terminal_jsonl_loss(loss);
+                    }
+                    pending!();
                 }
-                pending!();
+                CandidateDecision::Migrate => {
+                    index.migrate(candidate);
+                    pending!();
+                }
+                CandidateDecision::ReconcileLegacy | CandidateDecision::Parse => {}
             }
-            CandidateDecision::Migrate => {
-                index.migrate(candidate);
-                pending!();
-            }
-            CandidateDecision::ReconcileLegacy | CandidateDecision::Parse => {}
-        }
-        scanned_file_count += 1;
-        let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
-        let previous_upload_body_witness = index.last_upload_body_witness(&candidate);
-        let projection_adoption_required = index
-            .effective_upload_body_witness_revision_requires_adoption(&local_index_key(
-                &candidate.path,
-            ));
-        let source_file_fingerprint = candidate.source_file_fingerprint.clone();
+            scanned_file_count += 1;
+            let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
+            let previous_upload_body_witness = index.last_upload_body_witness(&candidate);
+            let projection_adoption_required = index
+                .effective_upload_body_witness_revision_requires_adoption(&local_index_key(
+                    &candidate.path,
+                ));
+            let source_file_fingerprint = candidate.source_file_fingerprint.clone();
 
-        let mut parser = match sampled_scan::new_source_parser(
-            opened_file,
-            &candidate,
-            source,
-            &codex_title_metadata,
-            codex_turn_traces.clone(),
-            codex_parent_ownership_ledgers.clone(),
-            source != SnapshotSource::ClaudeCode || artifacts_enabled,
-            context_curve_enabled,
-            index,
-        ) {
-            Ok(parser) => parser,
-            Err(_) => {
-                census.unreadable_path_count += 1;
-                pending!();
-            }
-        };
-        let mut file_sampling = None;
-        if let Some(context) = sampling.as_mut() {
-            let key = local_index_key(&candidate.path);
-            let retained = context.cache.take(&key);
-            let owning_header_is_current = source != SnapshotSource::Codex
-                || codex_join_inventory.as_ref().is_some_and(|inventory| {
-                    inventory.complete
-                        && inventory
-                            .headers
-                            .iter()
-                            .any(|header| header.candidate.path == candidate.path)
-                });
-            if owning_header_is_current && state_census_complete && sidecar_census_complete {
-                if let Some(reduction_sidecar) = sampled_scan::reduction_dependencies(
-                    source,
-                    &candidate,
-                    &codex_title_metadata,
-                    &claude_title_metadata,
-                    claude_effort_support_dir_ref,
-                ) {
-                    let debt = index
-                        .files
-                        .get(&key)
-                        .and_then(|entry| entry.audit_obligation(sampled_scan::now_seconds()));
-                    let protected = index
-                        .files
-                        .get(&key)
-                        .is_some_and(ScanIndexEntry::codex_history_is_protected);
-                    let forced_family = claude_index_path_family_member(&candidate.path)
-                        .is_some_and(|(root, _)| {
-                            forced_claude_family_reparses.contains(&root)
-                                || index.claude_usage_authority_quarantine.contains_key(&root)
-                        });
-                    let parent_proof_required = source == SnapshotSource::Codex
-                        && codex_session_id_candidates_from_path(&candidate.path)
-                            .iter()
-                            .any(|id| index.codex_parent_ownership_refs.contains(id));
-                    let allow_sample = context.audit_metadata_supported
+            let mut parser = match sampled_scan::new_source_parser(
+                opened_file,
+                &candidate,
+                source,
+                &codex_title_metadata,
+                codex_turn_traces.clone(),
+                codex_parent_ownership_ledgers.clone(),
+                source != SnapshotSource::ClaudeCode || artifacts_enabled,
+                context_curve_enabled,
+                index,
+            ) {
+                Ok(parser) => parser,
+                Err(_) => {
+                    census.unreadable_path_count += 1;
+                    pending!();
+                }
+            };
+            let mut file_sampling = None;
+            if let Some(context) = sampling.as_mut() {
+                let key = local_index_key(&candidate.path);
+                let retained = context.cache.take(&key);
+                let owning_header_is_current = source != SnapshotSource::Codex
+                    || codex_join_inventory.as_ref().is_some_and(|inventory| {
+                        inventory.complete
+                            && inventory
+                                .headers
+                                .iter()
+                                .any(|header| header.candidate.path == candidate.path)
+                    });
+                if owning_header_is_current && state_census_complete && sidecar_census_complete {
+                    if let Some(reduction_sidecar) = sampled_scan::reduction_dependencies(
+                        source,
+                        &candidate,
+                        &codex_title_metadata,
+                        &claude_title_metadata,
+                        claude_effort_support_dir_ref,
+                    ) {
+                        let debt = index
+                            .files
+                            .get(&key)
+                            .and_then(|entry| entry.audit_obligation(sampled_scan::now_seconds()));
+                        let protected = index
+                            .files
+                            .get(&key)
+                            .is_some_and(ScanIndexEntry::codex_history_is_protected);
+                        let forced_family = claude_index_path_family_member(&candidate.path)
+                            .is_some_and(|(root, _)| {
+                                forced_claude_family_reparses.contains(&root)
+                                    || index.claude_usage_authority_quarantine.contains_key(&root)
+                            });
+                        let parent_proof_required = source == SnapshotSource::Codex
+                            && codex_session_id_candidates_from_path(&candidate.path)
+                                .iter()
+                                .any(|id| index.codex_parent_ownership_refs.contains(id));
+                        let allow_sample = context.audit_metadata_supported
                         // A RAM certificate cannot replace missing durable
                         // first-import/recovery authority.
                         && index.files.contains_key(&key)
@@ -12903,61 +13019,181 @@ impl OwnedSourceScan {
                         && !forced_family
                         && !parent_proof_required
                         && (debt.is_some() || context.audit_slots > 0);
-                    let scope = context.file_scope(
-                        source,
-                        &candidate,
-                        &reduction_sidecar,
-                        source != SnapshotSource::ClaudeCode || artifacts_enabled,
-                        context_curve_enabled,
-                        index,
-                    );
-                    let old = retained.filter(|_| allow_sample);
-                    let mode = match parser.prepare_acquisition(
-                        old,
-                        &scope,
-                        debt,
-                        sampled_scan::now_seconds(),
-                    ) {
-                        Ok(mode) => mode,
-                        Err(_) => {
-                            census.unreadable_path_count += 1;
-                            pending!();
+                        let scope = context.file_scope(
+                            source,
+                            &candidate,
+                            &reduction_sidecar,
+                            source != SnapshotSource::ClaudeCode || artifacts_enabled,
+                            context_curve_enabled,
+                            index,
+                        );
+                        let old = retained.filter(|_| allow_sample);
+                        let mode = match parser.prepare_acquisition(
+                            old,
+                            &scope,
+                            debt,
+                            sampled_scan::now_seconds(),
+                        ) {
+                            Ok(mode) => mode,
+                            Err(_) => {
+                                census.unreadable_path_count += 1;
+                                pending!();
+                            }
+                        };
+                        // Restore does not restore/extend an exact-prefix pricing receipt.
+                        // Any new priority contribution below forces a real full replay.
+                        if source == SnapshotSource::Codex {
+                            sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
                         }
-                    };
-                    // Restore does not restore/extend an exact-prefix pricing receipt.
-                    // Any new priority contribution below forces a real full replay.
-                    if source == SnapshotSource::Codex {
-                        sampled_scan::configure_tier_replay(&mut parser, &candidate, index);
+                        let audit_due = parser
+                            .reader
+                            .acquisition
+                            .as_ref()
+                            .and_then(|plan| plan.metrics().audit_due);
+                        context.record_mode(mode, audit_due);
+                        file_sampling = Some(sampled_scan::Active {
+                            key,
+                            scope,
+                            mode,
+                            audit_due,
+                        });
                     }
-                    let audit_due = parser
-                        .reader
-                        .acquisition
-                        .as_ref()
-                        .and_then(|plan| plan.metrics().audit_due);
-                    context.record_mode(mode, audit_due);
-                    file_sampling = Some(sampled_scan::Active {
-                        key,
-                        scope,
-                        mode,
-                        audit_due,
-                    });
                 }
             }
+            active_file = Some(OwnedActiveFile {
+                sampling: file_sampling,
+                candidate,
+                decision,
+                previous_snapshot_fingerprint,
+                previous_upload_body_witness,
+                projection_adoption_required,
+                source_file_fingerprint,
+                parser,
+                aliases: Vec::new(),
+                applied_receipts: BTreeMap::new(),
+            });
+            pending!();
         }
-        active_file = Some(OwnedActiveFile {
-            sampling: file_sampling,
-            candidate,
-            decision,
-            previous_snapshot_fingerprint,
-            previous_upload_body_witness,
-            projection_adoption_required,
-            source_file_fingerprint,
-            parser,
-            aliases: Vec::new(),
-            applied_receipts: BTreeMap::new(),
-        });
-        pending!();
+        OwnedSourceScanStep::Pending(Self {
+            resource_probe,
+            sampling,
+            source,
+            index: index_storage,
+            collected_at,
+            backfill_window_days,
+            file_limit,
+            artifacts_enabled,
+            context_curve_enabled,
+            claude_effort_support_dir,
+            codex_title_metadata,
+            claude_title_metadata,
+            state_census_complete,
+            sidecar_census_complete,
+            codex_turn_traces,
+            codex_parent_validation_roots,
+            codex_parent_frozen_census_paths,
+            codex_parent_ownership_ledgers,
+            census_window_end,
+            discovered_file_count,
+            census_unix_seconds,
+            census,
+            snapshots,
+            scanned_file_count,
+            scanned_session_count,
+            semantic_noop_count,
+            codex_state_only_blocked_session_ids,
+            codex_parent_resolution_retry_required,
+            residue_index_keys,
+            settled_residue_index_keys,
+            residue_blocked_session_ids,
+            pending_finalization,
+            claude_authority_preflight,
+            forced_claude_family_reparses,
+            identified_candidates,
+            active_file,
+            codex_join_inventory,
+            codex_join_prepared,
+            codex_join_groups,
+            codex_join_active,
+            codex_join_completed,
+            codex_legacy_join_baselines,
+        })
     }
+}
+
+fn launch_workers_for_candidate(
+    source: SnapshotSource,
+    candidate: &CandidateFile,
+    inventory: Option<&codex_file_join::HeaderInventory>,
+) -> Vec<String> {
+    if source == SnapshotSource::Codex {
+        if let Some(owner) =
+            inventory.and_then(|inventory| inventory.owner_for_path(&candidate.path))
+        {
+            return vec![owner.to_owned()];
+        }
+    }
+    launch_workers_for_path(source, &candidate.path)
+}
+
+// Path hints authorize only lookup demand, never transcript ownership or facts.
+fn launch_workers_for_path(source: SnapshotSource, path: &Path) -> Vec<String> {
+    match source {
+        SnapshotSource::Codex => codex_session_id_candidates_from_path(path),
+        SnapshotSource::ClaudeCode | SnapshotSource::Pi => path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| vec![stem.to_string()])
+            .unwrap_or_default(),
+    }
+}
+
+fn claude_held_family_matches_launch_context(
+    index: &ScanIndex,
+    root: &str,
+    current: &CandidateFile,
+    remaining: &VecDeque<CandidateFile>,
+    context: &crate::session_attribution::SessionAttributionContext,
+) -> bool {
+    let Some(record) = index.claude_usage_authority_quarantine.get(root) else {
+        return false;
+    };
+    let mut members = BTreeSet::new();
+    for member in std::iter::once(current).chain(remaining.iter()) {
+        let Some((family, id)) = claude_index_path_family_member(&member.path) else {
+            continue;
+        };
+        if family != root {
+            continue;
+        }
+        members.insert(id);
+        let mut semantic = member.clone();
+        if member.path != current.path {
+            let workers = launch_workers_for_path(SnapshotSource::ClaudeCode, &member.path);
+            if !context.launches_prepared(&workers) {
+                return false;
+            }
+            if let Some(witness) = context.launch_witness(&workers) {
+                semantic.source_file_fingerprint = sha256_hex(&[
+                    "launcher_worker_context:v1",
+                    &semantic.source_file_fingerprint,
+                    &witness,
+                ]);
+            }
+        }
+        if index
+            .claude_usage_authority_candidate_requires_family_reparse(&semantic)
+            .is_some()
+        {
+            return false;
+        }
+    }
+    members
+        == record
+            .member_source_file_fingerprints
+            .keys()
+            .cloned()
+            .collect()
 }
 
 /// Preserve the two-open identity fence only for the Claude family whose
@@ -13622,6 +13858,24 @@ impl OwnedJsonlParser {
             self.reader.finished && self.reader.failure.is_none(),
             "incomplete parser cannot finalize a file"
         );
+        if let Some(context) = attribution_context {
+            let workers = self
+                .accumulator
+                .source_session_id
+                .as_ref()
+                .map(|id| {
+                    vec![if self.source == SnapshotSource::Codex {
+                        resolve_codex_identity(id)
+                    } else {
+                        id.clone()
+                    }]
+                })
+                .unwrap_or_else(|| launch_workers_for_path(self.source, path));
+            anyhow::ensure!(
+                context.launches_prepared(&workers),
+                "launch evidence lookup incomplete"
+            );
+        }
         let Self {
             reader: bounded,
             mut accumulator,
@@ -13811,6 +14065,26 @@ fn parse_opened_jsonl_file(
         .step()
         .with_context(|| format!("read JSONL {}", path.display()))?
     {}
+    if let Some(context) = attribution_context {
+        let workers = parser
+            .accumulator
+            .source_session_id
+            .as_ref()
+            .map(|id| {
+                vec![if source == SnapshotSource::Codex {
+                    resolve_codex_identity(id)
+                } else {
+                    id.clone()
+                }]
+            })
+            .unwrap_or_else(|| launch_workers_for_path(source, path));
+        // This compatibility reader already synchronously drains the transcript.
+        // Production OwnedSourceScan prepares in its resumable step before finish.
+        while !context
+            .prepare_launch_step(&workers)
+            .map_err(|()| anyhow::anyhow!("launch evidence lookup incomplete"))?
+        {}
+    }
     parser.finish(
         expected_opened_object_identity,
         path,
