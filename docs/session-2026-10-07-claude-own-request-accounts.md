@@ -32,7 +32,12 @@ accounts, mismatched trace ownership/client IDs, malformed hashes and conflictin
 known row identity remain unknown. Independent API/cloud destinations retain
 all their facts and money without acquiring subscription identity. Unrelated
 root requests cannot veto a completely covered child. A lost proof withdraws the
-qualifier; a later genuine proof can restore it. Original creator evidence is
+evaluated candidate's qualifier; a later genuine proof can restore it. Delivery
+still honors the retained account guard. A fresh reparse without request evidence
+cannot restore earlier proved row hashes from a cached login and is deferred
+when a retained owner exists. Its last accepted body remains historical proof;
+this is no claim of current evidence health. An initial unknown historical import
+has no retained owner and does not acquire that refusal. Original creator evidence is
 never rewritten, including genuine missing/conflict/complete evaluations.
 
 Imported sessions and registered-home sessions follow the same exact request

@@ -36650,6 +36650,84 @@ mod tests {
     }
 
     #[test]
+    fn claude_d1_fresh_reparse_retains_binding_refusal_until_exact_proof_returns() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let child_path = dir
+            .join(&root)
+            .join("subagents/agent-a4d1585d310070d0f.jsonl");
+        let parse = || {
+            parse_claude_code_jsonl_file(&child_path, "2026-08-02T07:01:00Z", "d".repeat(64))
+                .unwrap()
+                .remove(0)
+        };
+        let api = vec![complete_api_row(&root, "req_5", 5, 10, 1, 0)];
+        let trace = vec![complete_trace_row(&root, "req_5", "a4d1585d310070d0f")];
+        let mut proved = items[1].clone();
+        assert!(d1_subagent_account_specimen(&mut proved, &api, &trace));
+        let mut index = ScanIndex::default();
+        assert!(index
+            .bind_session_accounts(
+                SnapshotSource::ClaudeCode,
+                "machine-a",
+                std::slice::from_mut(&mut proved),
+                &[]
+            )
+            .is_empty());
+        let index_path = dir.join("account-index.json");
+        index.save(&index_path).unwrap();
+        let mut restarted = ScanIndex::load(&index_path).unwrap();
+        let before_bindings = restarted.session_account_bindings.clone();
+        let mut fresh = parse();
+        assert!(!d1_subagent_account_specimen(&mut fresh, &[], &[]));
+        assert!(exact_session_account_hash(&fresh).is_none());
+        assert_eq!(fresh.input_tokens, proved.input_tokens);
+        assert_eq!(fresh.output_tokens, proved.output_tokens);
+        let deferred = restarted.bind_session_accounts(
+            SnapshotSource::ClaudeCode,
+            "machine-a",
+            std::slice::from_mut(&mut fresh),
+            &[],
+        );
+        assert_eq!(deferred, BTreeSet::from([proved.source_session_id.clone()]));
+        assert_eq!(restarted.session_account_bindings, before_bindings);
+        let mut authority = ClaudeUsageAuthorityDisposition::default();
+        authority.defer_sessions(deferred);
+        let mut uploadable = vec![fresh.clone()];
+        authority.retain_uploadable(&mut uploadable);
+        assert!(
+            uploadable.is_empty(),
+            "unproved fresh usage cannot inherit a cached account"
+        );
+        let mut import_index = ScanIndex::default();
+        assert!(
+            import_index
+                .bind_session_accounts(
+                    SnapshotSource::ClaudeCode,
+                    "fresh-machine",
+                    std::slice::from_mut(&mut fresh),
+                    &[]
+                )
+                .is_empty(),
+            "fresh-user unknown import has no retained-owner refusal"
+        );
+        let mut recovered = parse();
+        assert!(d1_subagent_account_specimen(&mut recovered, &api, &trace));
+        assert!(restarted
+            .bind_session_accounts(
+                SnapshotSource::ClaudeCode,
+                "machine-a",
+                std::slice::from_mut(&mut recovered),
+                &[]
+            )
+            .is_empty());
+        assert_eq!(restarted.session_account_bindings, before_bindings);
+        if let Some(out) = std::env::var_os("OTTTO_D1_TEST_OUTPUT_DIR") {
+            fs::write(PathBuf::from(out).join("native-fresh-reparse-boundary.json"), serde_json::to_vec_pretty(&json!({"fresh_unknown_with_prior_owner":"deferred_without_restamping_or_loss","restart_preserves_owner":true,"fresh_user_unknown_import":"not_deferred","later_exact_proof":"binding_guard_releases","root_wide_clear":false})).unwrap()).unwrap();
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn claude_account_hash_stamps_request_complete_parent_subagent_family() {
         let (root, parent, mut items) = claude_account_family_fixture();
         let account_hash = "a".repeat(64);
