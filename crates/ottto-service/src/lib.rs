@@ -45,6 +45,8 @@ pub mod snapshots;
 mod source_rotation;
 #[cfg(test)]
 mod test_scratch;
+mod transcript_acquisition;
+mod transcript_cache;
 #[cfg(unix)]
 pub mod unix_socket;
 pub mod upload_receipts;
@@ -215,6 +217,7 @@ impl ControlToken {
 
 #[derive(Debug, Clone)]
 pub struct LocalDaemon {
+    transcript_cache: Arc<snapshots::sampled_scan::SharedCache>,
     inner: Arc<Mutex<DaemonState>>,
     control_token: ControlToken,
 }
@@ -422,6 +425,7 @@ impl LocalDaemon {
     ) -> Self {
         let now = now.into();
         Self {
+            transcript_cache: Arc::new(snapshots::sampled_scan::SharedCache::default()),
             inner: Arc::new(Mutex::new(DaemonState {
                 machine,
                 relay: RelayState {
