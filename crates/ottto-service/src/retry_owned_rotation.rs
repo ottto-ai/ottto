@@ -184,6 +184,7 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
         Ok(Some(SourcePreparation {
             retry_authority: None,
             source,
+            claude_scan_roots: None,
             account_witness: [0; 32],
             scan_started_at: "2026-10-05T00:00:00Z".into(),
             activity_hint: hint,

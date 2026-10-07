@@ -40,6 +40,7 @@ pub mod session_attribution;
 pub mod snapshot_audit;
 pub mod snapshot_client;
 pub(crate) mod snapshot_retry;
+mod snapshot_roots;
 pub mod snapshot_sync;
 pub mod snapshot_watcher;
 pub mod snapshots;
