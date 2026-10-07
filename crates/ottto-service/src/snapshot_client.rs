@@ -1742,6 +1742,7 @@ impl SnapshotApiClient {
             &mut dyn FnMut() -> Result<()>,
         )>,
     ) -> Result<SnapshotBatchResponse> {
+        let mut resources = crate::local_resource_diagnostics::UploadCall::start(&request.source);
         let enforce_head_cas = enforce_head_cas
             || request
                 .snapshots
@@ -1760,6 +1761,7 @@ impl SnapshotApiClient {
             serde_json::to_vec(request).map_err(anyhow::Error::from)
         }
         .map_err(|error| anyhow!("serialize snapshot batch failed: {error}"))?;
+        resources.serialized(body.len());
         let default_gzip = snapshot_upload_gzip_enabled();
         let gzip_enabled = retry
             .as_ref()
@@ -1789,10 +1791,16 @@ impl SnapshotApiClient {
         // `ureq::Error` trips `clippy::result_large_err` on newer toolchains, and
         // the duplication here is two lines.
         let mut outcome = match compressed.as_ref() {
-            Some(encoded) => request_builder()?
-                .set("Content-Encoding", "gzip")
-                .send_bytes(encoded),
-            None => request_builder()?.send_bytes(&body),
+            Some(encoded) => {
+                let post = request_builder()?.set("Content-Encoding", "gzip");
+                resources.attempt(encoded.len(), true);
+                post.send_bytes(encoded)
+            }
+            None => {
+                let post = request_builder()?;
+                resources.attempt(body.len(), false);
+                post.send_bytes(&body)
+            }
         };
         // A server that does not decompress request bodies cannot tell us so in
         // advance; it just fails to parse. Fall back to identity encoding once,
@@ -1801,7 +1809,9 @@ impl SnapshotApiClient {
         let refused_gzip = compressed.is_some() && encoding_was_refused(&outcome);
         if refused_gzip {
             disable_snapshot_upload_gzip();
-            outcome = request_builder()?.send_bytes(&body);
+            let post = request_builder()?;
+            resources.attempt(body.len(), false);
+            outcome = post.send_bytes(&body);
         }
         if refused_gzip {
             if let Some((budget, _)) = retry.as_mut() {
@@ -3964,6 +3974,127 @@ mod tests {
         assert_eq!(response.accepted, 1);
         server.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resource_diagnostics_count_actual_batch_buffers_and_gzip_fallback() {
+        use std::net::TcpListener;
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "never-log-machine".into(),
+            collector_version: None,
+            snapshots: Vec::new(),
+            upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let serialized = serde_json::to_vec(&request).unwrap().len() as u64;
+        for (gzip, refused, refuse_send) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let mut attempts = Vec::new();
+                for attempt in 0..if refused && !refuse_send { 2 } else { 1 } {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let wire = read_complete_http_request(&mut stream);
+                    let headers = wire.split("\r\n\r\n").next().unwrap();
+                    assert!(!headers.contains("local_resources"));
+                    let bytes = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("Content-Length")
+                                .then(|| value.trim().parse::<u64>().unwrap())
+                        })
+                        .unwrap();
+                    let encoded = headers
+                        .to_ascii_lowercase()
+                        .contains("content-encoding: gzip");
+                    attempts.push((bytes, encoded));
+                    let (status, body) = if refused && attempt == 0 {
+                        ("415 Unsupported Media Type", "{}")
+                    } else {
+                        (
+                            "200 OK",
+                            r#"{"accepted":0,"sessions_reconciled":0,"session_ids":[],"disabled":false,"disabled_reason":null,"entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":[],"unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]}"#,
+                        )
+                    };
+                    write!(stream,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+                attempts
+            });
+            let client = SnapshotApiClient::new(format!("http://{address}"));
+            let mut budget =
+                crate::snapshot_retry::RetryBudget::after_shed(Instant::now(), Duration::ZERO)
+                    .unwrap();
+            budget.enter(Instant::now()).unwrap();
+            if gzip {
+                budget.force_gzip_for_test();
+            }
+            let mut validations = 0;
+            let mut validate = || {
+                validations += 1;
+                if refuse_send && validations == 2 {
+                    Err(anyhow!("synthetic authority changed"))
+                } else {
+                    Ok(())
+                }
+            };
+            let (result, records) = crate::local_resource_diagnostics::capture(|| {
+                client.upload_batch_inner(
+                    "never-log-token",
+                    &request,
+                    false,
+                    Some((&mut budget, &mut validate)),
+                )
+            });
+            assert_eq!(result.is_err(), refuse_send);
+            let attempts = server.join().unwrap();
+            assert_eq!(records.len(), 1);
+            let counts = &records[0]["counts"];
+            assert_eq!(counts["serialized_body_bytes"], serialized);
+            assert_eq!(
+                counts["attempted_encoded_body_bytes"],
+                attempts.iter().map(|a| a.0).sum::<u64>()
+            );
+            assert_eq!(
+                counts["attempted_decoded_body_bytes"],
+                serialized * attempts.len() as u64
+            );
+            assert_eq!(
+                counts["gzip_attempts"],
+                attempts.iter().filter(|a| a.1).count()
+            );
+            assert_eq!(
+                counts["identity_attempts"],
+                attempts.iter().filter(|a| !a.1).count()
+            );
+            let record = records[0].to_string();
+            assert!(!record.contains("never-log") && !record.contains("127.0.0.1"));
+        }
+        let client = SnapshotApiClient::new("http://127.0.0.1:1");
+        let mut budget =
+            crate::snapshot_retry::RetryBudget::after_shed(Instant::now(), Duration::ZERO).unwrap();
+        budget.enter(Instant::now()).unwrap();
+        let (result, records) = crate::local_resource_diagnostics::capture(|| {
+            client.upload_batch_inner(
+                "never-log-token",
+                &request,
+                false,
+                Some((&mut budget, &mut || {
+                    Err(anyhow!("synthetic presend refusal"))
+                })),
+            )
+        });
+        assert!(result.is_err());
+        assert_eq!(records[0]["counts"]["attempted_encoded_body_bytes"], 0);
+        assert_eq!(records[0]["counts"]["gzip_attempts"], 0);
+        assert_eq!(records[0]["counts"]["identity_attempts"], 0);
     }
 
     #[test]

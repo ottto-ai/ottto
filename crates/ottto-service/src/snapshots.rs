@@ -10880,6 +10880,7 @@ fn prepare_owned_scan_candidate(
 }
 
 pub(crate) struct OwnedSourceScan {
+    resource_probe: crate::local_resource_diagnostics::Probe,
     sampling: Option<sampled_scan::Context>,
     source: SnapshotSource,
     index: ScanIndex,
@@ -10966,6 +10967,7 @@ impl OwnedSourceScan {
         watcher_overflowed: bool,
         context_curve_enabled: bool,
     ) -> Self {
+        let resource_probe = crate::local_resource_diagnostics::Probe::start();
         let index = &mut owned_index;
         index.activate_quarantine_witness(source);
         let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
@@ -11324,6 +11326,7 @@ impl OwnedSourceScan {
                 inventory
             });
         Self {
+            resource_probe,
             sampling: None,
             source,
             index: owned_index,
@@ -11376,6 +11379,7 @@ impl OwnedSourceScan {
             self.clear_sampled_cache();
         }
         let Self {
+            resource_probe,
             mut sampling,
             index: mut index_storage,
             source,
@@ -11423,6 +11427,7 @@ impl OwnedSourceScan {
         macro_rules! pending {
             () => {
                 return OwnedSourceScanStep::Pending(Self {
+                    resource_probe,
                     sampling,
                     source,
                     index: index_storage,
@@ -12733,6 +12738,22 @@ impl OwnedSourceScan {
                     pending, overdue, oldest_due_age, context.audits_started, context.audits_completed,
                     context.start_overdue_seconds, context.completion_overdue_seconds);
             }
+            resource_probe.collection(
+                source.api_slug(),
+                crate::local_resource_diagnostics::CollectionCounts {
+                    scanned_files: scanned_file_count,
+                    semantic_noops: semantic_noop_count,
+                    sampled_acquisition: sampling.as_ref().map(|context| {
+                        crate::local_resource_diagnostics::ReadCounts {
+                            full_selections: context.full_files,
+                            tail_selections: context.tail_files,
+                            unchanged_selections: context.unchanged_files,
+                            completed_native_bytes: context.native_bytes,
+                            completed_guard_bytes: context.sample_bytes,
+                        }
+                    }),
+                },
+            );
             return OwnedSourceScanStep::Complete {
                 index: index_storage,
                 scan,
@@ -52117,7 +52138,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger);
 crate::heap_layout_bound::fields!(OwnedActiveFile; sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
-crate::heap_layout_bound::fields!(OwnedSourceScan; sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines);
+crate::heap_layout_bound::fields!(OwnedSourceScan; resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);

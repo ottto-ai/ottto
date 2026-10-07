@@ -1216,3 +1216,71 @@ fn sampled_native_priority_witness_refusal_keeps_native_output_and_certificate()
         );
     }
 }
+
+#[test]
+fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let f = ScanFixture::new(source);
+        f.file
+            .append(&json!({"type":"ignored", "padding":"x".repeat(16 * 1024)}));
+        f.file.append(&usage(source, 100, 0, "fixture-model"));
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let mut index = ScanIndex::default();
+        for pass in 0..3 {
+            let before = fs::metadata(&f.file.0).unwrap().len();
+            if pass == 1 {
+                f.file.append(&usage(source, 150, 1, "fixture-model"));
+            }
+            let after = fs::metadata(&f.file.0).unwrap().len();
+            let ((next, scan, modes, bytes), records) =
+                crate::local_resource_diagnostics::capture(|| {
+                    production_scan_with_metrics(
+                        &f,
+                        source,
+                        index,
+                        Some(cache.clone()),
+                        "resource-fixture",
+                    )
+                });
+            assert_eq!(records.len(), 1, "one completed collection page");
+            let record = &records[0];
+            assert_eq!(record["stage"], "native_collection_page");
+            assert_eq!(record["source"], source.api_slug());
+            let counters = &record["counts"]["sampled_acquisition"];
+            assert_eq!(counters["full_selections"], modes.0);
+            assert_eq!(counters["tail_selections"], modes.1);
+            assert_eq!(counters["unchanged_selections"], modes.2);
+            assert_eq!(counters["completed_native_bytes"], bytes.0);
+            assert_eq!(counters["completed_guard_bytes"], bytes.1);
+            assert_eq!(
+                bytes.0,
+                match pass {
+                    0 => after,
+                    1 => after - before,
+                    _ => 0,
+                }
+            );
+            let text = serde_json::to_string(record).unwrap();
+            assert!(text.len() < 2048);
+            assert!(!text.contains("fixture-model") && !text.contains("padding"));
+            let (_, full, _) =
+                production_scan(&f, source, ScanIndex::default(), None, "resource-fixture");
+            if pass < 2 {
+                assert_eq!(production_body(source, scan), production_body(source, full));
+            } else {
+                assert!(scan.snapshots.is_empty());
+            }
+            index = next;
+        }
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            production_scan(&f, source, ScanIndex::default(), None, "resource-fixture")
+        });
+        assert!(
+            records[0]["counts"]["sampled_acquisition"].is_null(),
+            "uncovered read counts are unknown"
+        );
+    }
+}
