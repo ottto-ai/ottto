@@ -1,4 +1,4 @@
-fn output(name: &str, item: &SnapshotItem) {
+pub(crate) fn output(name: &str, item: &SnapshotItem) {
     if let Some(dir) = std::env::var_os("OTTTO_REQUEST_ACCOUNT_TEST_OUTPUT") {
         let dir = PathBuf::from(dir);
         fs::create_dir_all(&dir).unwrap();
@@ -70,9 +70,19 @@ fn claude_p92_clock_qualification_and_all_bucket_coverage() {
         "auxiliary_zero",
         "missing_occurrence",
         "cached_deserialized",
+        "multiple_iterations",
     ] {
         let mut item = original.clone();
         match case {
+            "multiple_iterations" => {
+                let mut collapsed = record.clone();
+                collapsed["message"]["usage"]["iterations"] = json!([
+                    {"input_tokens":10,"output_tokens":1},
+                    {"input_tokens":10,"output_tokens":1}
+                ]);
+                item = parse(&[collapsed]);
+                assert!(!item.claude_context_curve_request_index_complete);
+            }
             "missing" => {
                 let user = json!({"type":"user","timestamp":"2026-10-08T09:20:00Z","sessionId":root,"agentId":"a4d1585d310070d0f","isSidechain":true,"message":{"role":"user","content":"synthetic"}});
                 let mut no_clock = record.clone();
@@ -220,6 +230,26 @@ pub(crate) fn claude_request_account_mixed_fixture(
         .map(|i| {
             let mut row = complete_api_row(&root, &format!("req_{i}"), i as u64, 10, 10, 0);
             row.account_identifier_hash = Some(if i <= 2 { a.clone() } else { b.clone() });
+            row.request_identity = Some(crate::claude_local_otel::ClaudeRequestIdentityEvidence {
+                identity_hash_scheme: "provider-sha256:v1".into(),
+                account: crate::claude_local_otel::ClaudeIdentityAttributeEvidence {
+                    origin: crate::claude_local_otel::ClaudeIdentityAttributeOrigin::LogRecord,
+                    disposition: crate::claude_local_otel::ClaudeIdentityDisposition::Complete,
+                    resource_hash: None,
+                    log_record_hash: row.account_identifier_hash.clone(),
+                },
+                organization: crate::claude_local_otel::ClaudeIdentityAttributeEvidence {
+                    origin: crate::claude_local_otel::ClaudeIdentityAttributeOrigin::LogRecord,
+                    disposition: crate::claude_local_otel::ClaudeIdentityDisposition::Complete,
+                    resource_hash: None,
+                    log_record_hash: Some(if i <= 2 {
+                        "c".repeat(64)
+                    } else {
+                        "d".repeat(64)
+                    }),
+                },
+                disposition: crate::claude_local_otel::ClaudeIdentityDisposition::Complete,
+            });
             row.cost_usd_micros = Some(1_000_000);
             row.fingerprint.clear();
             row.fingerprint = format!(
@@ -512,6 +542,11 @@ fn claude_p92_mixed_body_capability_and_restart_refusals() {
         .as_mut()
         .unwrap()
         .account_identifier_hash = Some("b".repeat(64));
+    multihour[0]
+        .session_account_evidence
+        .as_mut()
+        .unwrap()
+        .provider_workspace_hash = Some("d".repeat(64));
     let proof = claude_request_accounts::apply(&mut multihour, &api, &trace);
     assert!(proof.mixed.permits(&multihour[0]));
     assert!(restarted

@@ -20,8 +20,10 @@ D1 complete checks original clocks before response folding can hide missing or
 malformed timestamps. Every counted request must reproduce the complete
 original min/max and count in every represented hour. Session activity fallback,
 OTLP observer time, auxiliary-only requests and an unstamped progressive partial
-cannot certify this clock proof. Counted zero-token rows are included. Valid
-lifecycle timestamps use UTC spelling while retaining their original instants.
+cannot certify this clock proof. Counted zero-token rows are included.
+Collapsed multi-iteration responses retain the parser's explicit incomplete
+request-index refusal: one terminal request ID cannot cover several API calls.
+Valid lifecycle timestamps use UTC spelling while retaining their original instants.
 A bucket-wide minimum may conservatively precede a destination's own first
 request; terminal usage-event time does not prove request initiation or an
 entitlement interval. Missing time proof withdraws complete without deleting an
@@ -38,6 +40,13 @@ contract is fabricated, and no money is split by login. Missing/invalid API or
 trace evidence, conflicting creator, known-row accounts, independent API/cloud
 routes, incomplete accounting and changed candidate bodies keep the existing
 refusal. A restart must reconstruct the genuine proof before release.
+
+The legacy enrichment veto treats later typed request logins as contradictory
+creator observations. A fully qualified mixed root retains this scan's unchanged
+original carrier when that veto is solely a proved login switch. Malformed or
+conflicting typed identity, contradictions about the creator's own organization,
+an already conflicted original carrier, and incomplete accounting/request/trace
+proof cannot recover creator completeness. No cached owner creates identity.
 
 Each recognized collector adds its exact value as `request_account_coverage`
 in the existing attribution component. Legacy collectors omit that leaf. A

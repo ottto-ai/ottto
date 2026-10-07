@@ -58,10 +58,20 @@ pub(crate) struct Qualification {
 /// Reuse the scan's strict reports and index each request once. Account proof
 /// and original clock qualification remain separate facts: a missing clock
 /// withdraws COMPLETE without deleting an independently proved row account.
+#[cfg(test)]
 pub(crate) fn apply(
     snapshots: &mut [SnapshotItem],
     api: &ClaudeLocalOtelLoadReport,
     trace: &ClaudeTraceOwnershipLoadReport,
+) -> Qualification {
+    apply_with_originals(snapshots, api, trace, &BTreeMap::new())
+}
+
+pub(crate) fn apply_with_originals(
+    snapshots: &mut [SnapshotItem],
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    originals: &BTreeMap<String, super::SessionAccountEvidence>,
 ) -> Qualification {
     let mut requests = BTreeMap::new();
     for (root, rows) in &api.evidence {
@@ -126,7 +136,26 @@ pub(crate) fn apply(
         } else {
             // Only genuine existing reported accounting may remove the old
             // current-owner upload veto. Never clear accounts to fit this shape.
-            let qualified = healthy && qualify_mixed(item, &requests, &owners);
+            // Request identity is not creator identity. The preceding legacy
+            // veto conflates a later login switch with a creator contradiction.
+            // Recover ONLY this scan's unchanged original carrier after the
+            // complete mixed proof, never a cached owner or malformed identity.
+            let original = originals.get(&item.source_session_id).filter(|before| {
+                item.session_account_evidence.as_ref().is_some_and(|after| {
+                    let mut comparable = after.clone();
+                    comparable.identity_disposition = before.identity_disposition;
+                    before.identity_disposition == Some("complete")
+                        && after.identity_disposition == Some("conflict")
+                        && comparable == **before
+                })
+            });
+            let qualified = healthy && qualify_mixed(item, &requests, &owners, original);
+            if qualified {
+                if let Some(original) = original {
+                    item.session_account_evidence = Some(original.clone());
+                    changed = true;
+                }
+            }
             let collector = if qualified {
                 MIXED
             } else if item.provenance.collector == MIXED {
@@ -238,9 +267,11 @@ fn qualify_mixed(
     item: &SnapshotItem,
     requests: &BTreeMap<(&str, &str), Option<&ClaudeLocalOtelEvidence>>,
     owners: &BTreeMap<(&str, &str), Option<&ClaudeTraceOwnershipEvidence>>,
+    original_before_enrichment: Option<&super::SessionAccountEvidence>,
 ) -> bool {
     let root = item.source_session_id.as_str();
-    let Some(original) = item.session_account_evidence.as_ref() else {
+    let Some(original) = original_before_enrichment.or(item.session_account_evidence.as_ref())
+    else {
         return false;
     };
     if !super::codex_identity_is_uuid_shaped(root)
@@ -277,7 +308,29 @@ fn qualify_mixed(
     let Ok(accounts) = request_accounts(item, root, requests, owners) else {
         return false;
     };
-    accounts.len() >= 2 && accounts.contains(original.account_identifier_hash.as_deref().unwrap())
+    let creator = original.account_identifier_hash.as_deref().unwrap();
+    accounts.len() >= 2
+        && accounts.contains(creator)
+        && item.claude_usage_request_ids.iter().all(|request| {
+            let row = requests[&(root, request.as_str())].unwrap();
+            row.request_identity.as_ref().map_or(true, |identity| {
+                !matches!(
+                    identity.disposition,
+                    ClaudeIdentityDisposition::Conflict | ClaudeIdentityDisposition::Invalid
+                ) && !matches!(
+                    identity.organization.disposition,
+                    ClaudeIdentityDisposition::Conflict | ClaudeIdentityDisposition::Invalid
+                ) && (row.account_identifier_hash.as_deref() != Some(creator)
+                    || identity
+                        .organization
+                        .resource_hash
+                        .iter()
+                        .chain(identity.organization.log_record_hash.iter())
+                        .all(|hash| {
+                            Some(hash.as_str()) == original.provider_workspace_hash.as_deref()
+                        }))
+            })
+        })
 }
 
 fn hash_is_valid(hash: &str) -> bool {
@@ -334,7 +387,10 @@ fn request_accounts<'a>(
     requests: &BTreeMap<(&str, &str), Option<&'a ClaudeLocalOtelEvidence>>,
     owners: &BTreeMap<(&str, &str), Option<&ClaudeTraceOwnershipEvidence>>,
 ) -> Result<BTreeSet<&'a str>, Coverage> {
-    if item.unattributed_total_tokens != 0 || claude_snapshot_request_id_hashes(item).is_none() {
+    if !item.claude_context_curve_request_index_complete
+        || item.unattributed_total_tokens != 0
+        || claude_snapshot_request_id_hashes(item).is_none()
+    {
         return Err(Coverage::MissingRequests);
     }
     if item

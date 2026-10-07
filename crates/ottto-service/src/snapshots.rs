@@ -28,6 +28,8 @@ pub(crate) mod cache_observations;
 pub(crate) mod claude_request_accounts;
 #[cfg(test)]
 pub(crate) use tests::claude_request_account_mixed_fixture;
+#[cfg(test)]
+pub(crate) use tests::output as claude_request_account_output;
 mod codex_file_join;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
@@ -35022,7 +35024,11 @@ mod tests {
     }
 
     fn claude_account_family_fixture() -> (PathBuf, String, Vec<SnapshotItem>) {
-        let root = temp_dir("claude-account-family");
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = temp_dir(&format!(
+            "claude-account-family-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let parent = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5".to_string();
         let parent_path = root.join(format!("{parent}.jsonl"));
         fs::write(
