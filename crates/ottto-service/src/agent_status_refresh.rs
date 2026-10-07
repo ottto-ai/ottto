@@ -157,6 +157,18 @@ impl StatusLane {
                 "agent status refresh stopped".into(),
             ));
         }
+        // Automatic scans must not promote a failed scheduled acquisition to
+        // a manual refresh that bypasses its failure delay. An explicit manual
+        // caller can still request recovery, and callers share an active pass.
+        if !manual
+            && state.collection_failed
+            && !state.collecting
+            && now < state.schedule.retry_not_before
+        {
+            return Err(LocalApiError::LocalOperationFailed(
+                "agent status acquisition failed".into(),
+            ));
+        }
         let age = state.schedule.last_started.map(|at| now.saturating_sub(at));
         if !state.collecting
             && !state.collection_failed
@@ -1012,6 +1024,12 @@ mod tests {
             assert!(!state.running && !state.collecting);
             assert!(Arc::ptr_eq(state.collection.as_ref().unwrap(), &last_good));
         }
+        assert!(lane.collection_at(seconds(308), false).is_err());
+        assert!(
+            !lane.state.lock().unwrap().manual,
+            "automatic caller must preserve backoff"
+        );
+        assert!(!pass(&lane, 308, 308, true));
         assert!(!pass(&lane, 366, 366, true));
         let mut acquisitions = 0;
         assert!(lane.pass(
@@ -1077,5 +1095,36 @@ mod tests {
         ));
         assert_eq!(lane.state.lock().unwrap().generation, 1);
         assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(300));
+    }
+    #[test]
+    fn explicit_manual_refresh_can_recover_acquisition_during_backoff() {
+        let lane = Arc::new(StatusLane::new());
+        assert!(lane.pass(
+            Duration::ZERO,
+            true,
+            || panic!("synthetic acquisition panic"),
+            |_| false,
+            || seconds(7)
+        ));
+        assert!(lane.collection_at(seconds(8), false).is_err());
+        let requester = lane.clone();
+        let (tx, rx) = mpsc::channel();
+        let waiter =
+            std::thread::spawn(move || tx.send(requester.collection_at(seconds(8), true)).unwrap());
+        let state = lane.state.lock().unwrap();
+        let (state, timeout) = lane
+            .changed
+            .wait_timeout_while(state, seconds(2), |state| !state.manual)
+            .unwrap();
+        assert!(!timeout.timed_out());
+        drop(state);
+        assert!(pass(&lane, 8, 15, true));
+        let result = rx.recv_timeout(seconds(2));
+        if result.is_err() {
+            lane.stop();
+        }
+        waiter.join().unwrap();
+        assert!(result.unwrap().is_ok());
+        assert_eq!(lane.state.lock().unwrap().generation, 2);
     }
 }
