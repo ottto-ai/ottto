@@ -52,23 +52,23 @@
 //!
 //! # Lifecycle
 //!
-//! `pending/` is an inbox and drains on every refresh. A valid event moves to
+//! `pending/` is an inbox, drained in bounded lookup continuations. A valid event moves to
 //! `processed/` and stays readable there for [`PROCESSED_RETENTION`]; a rejected
 //! one moves to `rejected/` for [`REJECTED_RETENTION`] with a reason CODE in the
-//! log and never its contents. The inventory is built from `processed/`, not
-//! from `pending/`, because an event is written at spawn -- before the worker
-//! has written its first transcript line -- and the fact has to still be
-//! available whenever that transcript is finally scanned, re-scanned, or
-//! replayed. Filenames are the SHA-256 of the triple, so re-emitting the same
+//! log and never its contents. After intake, a read-only sweep checks both
+//! pending and processed claims: directory mutation during draining must never
+//! hide a pending conflict. Only a complete demanded sweep supplies facts.
+//! Retained events remain available when a transcript is first imported,
+//! re-scanned, or replayed; they are not consumed with its first observation. Filenames are the SHA-256 of the triple, so re-emitting the same
 //! launch resolves to the same path and can never produce a second edge.
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 /// The only schema this intake understands. A file naming any other version is
@@ -85,19 +85,10 @@ const EVIDENCE_STRENGTH: &str = "direct";
 /// -- it rides as `agent_kind`, which is an allowlisted attribution field.
 pub(crate) const LAUNCH_EVENT_SOURCE_VERSION: &str = "launcher_event:v1";
 
-/// Evidence kind for launch-derived facts.
-///
-/// Deliberately a NEW vocabulary token rather than a reused existing one. None
-/// of the deployed kinds is honest here: the event is not provider-native, not a
-/// provider-owned artifact, not a scheduler-definition match, and not a live
-/// process check. The backend tolerates an unknown evidence kind by DROPPING
-/// that one fact, counting it, and storing the session
-/// (`_quarantine_unrecognized_attribution_facts`), so emitting the truthful
-/// token costs nothing today and starts working the moment the backend enum
-/// lists it -- with no backfill, because these facts re-emit on every scan of
-/// the worker session. Mislabelling the edge to make it land sooner would put a
-/// false provenance string in front of a customer, which is the one thing this
-/// whole capture path exists to avoid.
+/// Evidence kind for launch-derived facts. This identifies a local launcher
+/// assertion, with provider evidence taking precedence. It supplies no provider,
+/// account or payer authentication. Unsupported consumers may drop these facts
+/// while retaining the session, so the truthful token must remain unchanged.
 pub(crate) const LAUNCH_EVENT_EVIDENCE_KIND: &str = "launcher_event";
 
 const DROP_ROOT_DIR: &str = ".ottto/launch-events";
@@ -108,14 +99,12 @@ const REJECTED_SUBDIR: &str = "rejected";
 /// A well-formed event is ~360 bytes. The cap exists so a truncated, appended,
 /// or hostile file is refused by `stat` before it is ever read into memory.
 const MAX_EVENT_FILE_BYTES: u64 = 4 * 1_024;
-/// Per-refresh work ceilings. The drop root is a low-volume inbox; these bound
-/// the cost of a directory that somehow is not.
-const MAX_PENDING_FILES_PER_REFRESH: usize = 256;
-const MAX_PROCESSED_FILES_PER_REFRESH: usize = 1_024;
-const MAX_REJECTED_FILES_PER_REFRESH: usize = 1_024;
-/// Inventory ceiling. Retention is what normally bounds this; the cap is the
-/// backstop that keeps a runaway launcher from growing daemon memory.
-const MAX_RETAINED_EVENTS: usize = 512;
+/// Bound a continuation, not the retained store's completeness. Every entry
+/// participates before a demanded worker can receive a unique edge.
+const LOOKUP_ENTRIES_PER_STEP: usize = 256;
+/// Only the current transcript demand batch is retained; later batches use the
+/// same complete store walk, so this is never a global worker admission cap.
+pub(crate) const MAX_DEMANDED_WORKERS: usize = 512;
 
 /// How long an accepted event stays joinable.
 ///
@@ -126,9 +115,8 @@ const MAX_RETAINED_EVENTS: usize = 512;
 const PROCESSED_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Rejected files are kept only long enough to be diagnosed by hand.
 const REJECTED_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// Refresh ceiling. The transcript scan itself runs on a negotiated cadence of
-/// minutes, so this only stops the three per-cycle source contexts from each
-/// re-listing the same directory.
+/// Reuse a completed demanded batch within one source context for at most a
+/// minute. Fresh contexts always revalidate files, including same-name edits.
 const INVENTORY_TTL: Duration = Duration::from_secs(60);
 
 /// Instrumented launcher families, and the worker role each one starts.
@@ -138,9 +126,11 @@ const INVENTORY_TTL: Duration = Duration::from_secs(60);
 /// rather than read from the file, so the event can never supply its own label.
 const CAPTURE_SOURCE_LANDING_REPAIR: &str = "launcher_event:landing_repair";
 const CAPTURE_SOURCE_GPT_SOL_RELAY: &str = "launcher_event:gpt_sol_relay";
+const CAPTURE_SOURCE_OPUS_CLI_AGENT: &str = "launcher_event:opus_cli_agent";
 const CAPTURE_SOURCES: &[(&str, &str)] = &[
     (CAPTURE_SOURCE_LANDING_REPAIR, "pr-fixer"),
     (CAPTURE_SOURCE_GPT_SOL_RELAY, "gpt-sol"),
+    (CAPTURE_SOURCE_OPUS_CLI_AGENT, "opus-cli-agent"),
 ];
 
 /// One accepted launch event, reduced to what a fact may carry.
@@ -161,172 +151,303 @@ pub(crate) struct LaunchEvent {
     pub(crate) agent_kind: &'static str,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(crate) struct LaunchEventInventory {
-    events: BTreeMap<String, LaunchEvent>,
+    root: Option<PathBuf>,
+    lookup: Mutex<Lookup>,
 }
 
-struct CachedInventory {
-    loaded_at: Instant,
-    home: PathBuf,
-    inventory: LaunchEventInventory,
+#[derive(Default)]
+struct Lookup {
+    workers: BTreeMap<String, Option<LaunchEvent>>,
+    ambiguous: BTreeSet<String>,
+    phase: usize,
+    entries: Option<fs::ReadDir>,
+    complete: bool,
+    failed: bool,
+    loaded_at: Option<Instant>,
+    pending_stamp: Option<SystemTime>,
+    processed_stamp: Option<SystemTime>,
 }
 
 impl LaunchEventInventory {
-    /// Refresh at most once per [`INVENTORY_TTL`], draining `pending/` as a side
-    /// effect. Every mutation is a rename or an expiry delete, so repeating it
-    /// -- from another source's context in the same cycle, from the audit tool,
-    /// or after a crash mid-drain -- converges on the same state.
+    // The old process-wide full-inventory cache hid every worker outside its
+    // retained prefix. A context now retains only its current demand batch.
     pub(crate) fn cached(home: &Path) -> Self {
-        static CACHE: OnceLock<Mutex<Option<CachedInventory>>> = OnceLock::new();
-        let cache = CACHE.get_or_init(|| Mutex::new(None));
-        if let Ok(guard) = cache.lock() {
-            if let Some(cached) = guard.as_ref() {
-                if cached.home == home && cached.loaded_at.elapsed() < INVENTORY_TTL {
-                    return cached.inventory.clone();
+        Self::refresh(home)
+    }
+
+    pub(crate) fn refresh(home: &Path) -> Self {
+        Self {
+            root: Some(home.join(DROP_ROOT_DIR)),
+            lookup: Mutex::new(Lookup::default()),
+        }
+    }
+
+    /// One bounded continuation. false means that uniqueness remains unproved;
+    /// intake and read-only claim passes are separate so moving an inbox entry
+    /// cannot hide a claim skipped by the platform's directory iterator.
+    /// errors must remain owed by the native scanner, never become a negative hit.
+    pub(crate) fn prepared(&self, workers: &[String]) -> bool {
+        let Ok(lookup) = self.lookup.lock() else {
+            return false;
+        };
+        if self.root.is_none() || !workers.iter().any(|worker| is_uuid(worker)) {
+            return true;
+        }
+        lookup.complete
+            && !lookup.failed
+            && lookup
+                .loaded_at
+                .is_some_and(|at| at.elapsed() < INVENTORY_TTL)
+            && workers
+                .iter()
+                .filter(|worker| is_uuid(worker))
+                .all(|worker| lookup.workers.contains_key(&worker.to_ascii_lowercase()))
+    }
+
+    pub(crate) fn prepare_step(&self, workers: &[String]) -> Result<bool, ()> {
+        let mut lookup = self.lookup.lock().map_err(|_| ())?;
+        let Some(root) = self.root.as_deref() else {
+            return Ok(true);
+        };
+        let mut wanted = BTreeSet::new();
+        for worker in workers.iter().filter(|worker| is_uuid(worker)) {
+            wanted.insert(worker.to_ascii_lowercase());
+            if wanted.len() > MAX_DEMANDED_WORKERS {
+                eprintln!("ottto-service: launch lookup demand exceeds bounded batch: limit={MAX_DEMANDED_WORKERS}; split demand before retry");
+                return Err(());
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(true);
+        }
+        let fresh = lookup
+            .loaded_at
+            .is_some_and(|at| at.elapsed() < INVENTORY_TTL)
+            && lookup.pending_stamp == directory_stamp(&root.join(PENDING_SUBDIR))
+            && lookup.processed_stamp == directory_stamp(&root.join(PROCESSED_SUBDIR));
+        if lookup.complete
+            && fresh
+            && wanted
+                .iter()
+                .all(|worker| lookup.workers.contains_key(worker))
+        {
+            return if lookup.failed { Err(()) } else { Ok(true) };
+        }
+        if lookup.complete || lookup.workers.is_empty() {
+            *lookup = Lookup {
+                workers: wanted
+                    .iter()
+                    .cloned()
+                    .map(|worker| (worker, None))
+                    .collect(),
+                ..Lookup::default()
+            };
+        }
+        // A header-owned worker can arrive while a different batch is sweeping.
+        // Finish the current sweep, but yield before certifying that new demand.
+        let demand_matches = wanted
+            .iter()
+            .all(|worker| lookup.workers.contains_key(worker));
+        for _ in 0..LOOKUP_ENTRIES_PER_STEP {
+            if lookup.entries.is_none() {
+                let subdir = match lookup.phase {
+                    0 | 1 => PENDING_SUBDIR,
+                    2 | 3 => PROCESSED_SUBDIR,
+                    _ => REJECTED_SUBDIR,
+                };
+                match fs::read_dir(root.join(subdir)) {
+                    Ok(entries) => lookup.entries = Some(entries),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if advance_phase(root, &mut lookup) {
+                            return finish_lookup(root, &mut lookup).map(|_| demand_matches);
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        lookup.failed = true;
+                        return finish_lookup(root, &mut lookup).map(|_| demand_matches);
+                    }
+                }
+            }
+            match lookup.entries.as_mut().and_then(Iterator::next) {
+                Some(Ok(entry)) => {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                        continue;
+                    }
+                    match entry.file_type() {
+                        Ok(kind) if kind.is_file() => {}
+                        Ok(kind) if kind.is_symlink() => {
+                            if lookup.phase == 0 {
+                                reject(&path, &root.join(REJECTED_SUBDIR), "not_regular");
+                            }
+                            continue;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => {
+                            lookup.failed = true;
+                            continue;
+                        }
+                    }
+                    let retention = if lookup.phase == 4 {
+                        REJECTED_RETENTION
+                    } else {
+                        PROCESSED_RETENTION
+                    };
+                    if is_expired(&path, retention) {
+                        if lookup.phase == 0 || lookup.phase >= 3 {
+                            let _ = fs::remove_file(&path);
+                        }
+                        continue;
+                    }
+                    if lookup.phase >= 3 {
+                        continue;
+                    }
+                    match read_and_validate(&path) {
+                        Ok(_) if lookup.phase == 0 => {
+                            if !relocate(&path, &root.join(PROCESSED_SUBDIR)) {
+                                lookup.failed = true;
+                            }
+                        }
+                        Ok(event) => {
+                            if let Some(slot) = lookup.workers.get_mut(&event.worker_session_ref) {
+                                if slot.as_ref().is_some_and(|existing| existing != &event) {
+                                    lookup.ambiguous.insert(event.worker_session_ref.clone());
+                                } else {
+                                    *slot = Some(event);
+                                }
+                            }
+                        }
+                        Err(reason) => {
+                            if reason == "unreadable" {
+                                lookup.failed = true;
+                            } else if lookup.phase == 0 {
+                                reject(&path, &root.join(REJECTED_SUBDIR), reason);
+                            } else {
+                                // Quarantine changes the directory fence. This
+                                // batch stays owed until a fresh stable sweep.
+                                reject(&path, &root.join(REJECTED_SUBDIR), reason);
+                                lookup.failed = true;
+                            }
+                        }
+                    }
+                }
+                Some(Err(_)) => lookup.failed = true,
+                None => {
+                    lookup.entries = None;
+                    if advance_phase(root, &mut lookup) {
+                        return finish_lookup(root, &mut lookup).map(|_| demand_matches);
+                    }
                 }
             }
         }
-        let inventory = Self::refresh(home);
-        if let Ok(mut guard) = cache.lock() {
-            *guard = Some(CachedInventory {
-                loaded_at: Instant::now(),
-                home: home.to_path_buf(),
-                inventory: inventory.clone(),
-            });
-        }
-        inventory
+        Ok(false)
     }
 
-    /// Drain, retire, and load in one pass. Public for tests, which need a
-    /// deterministic refresh rather than a TTL-cached one.
-    pub(crate) fn refresh(home: &Path) -> Self {
-        let root = home.join(DROP_ROOT_DIR);
-        if !root.is_dir() {
-            return Self::default();
+    /// Only a completed demanded sweep can supply a fact. Native collection
+    /// and synchronous audit callers prepare explicitly before finalization.
+    pub(crate) fn matching(&self, worker: &str) -> Option<LaunchEvent> {
+        let lookup = self.lookup.lock().ok()?;
+        if !lookup.complete || lookup.failed {
+            return None;
         }
-        let pending = root.join(PENDING_SUBDIR);
-        let processed = root.join(PROCESSED_SUBDIR);
-        let rejected = root.join(REJECTED_SUBDIR);
-
-        drain_pending(&pending, &processed, &rejected);
-        let events = load_processed(&processed, &rejected);
-        prune_expired(
-            &rejected,
-            REJECTED_RETENTION,
-            MAX_REJECTED_FILES_PER_REFRESH,
-        );
-        Self { events }
-    }
-
-    /// The launch that started `worker_session_ref`, when exactly one is known.
-    pub(crate) fn matching(&self, worker_session_ref: &str) -> Option<&LaunchEvent> {
-        self.events.get(worker_session_ref)
+        lookup
+            .workers
+            .get(&worker.to_ascii_lowercase())
+            .cloned()
+            .flatten()
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.events.len()
+        self.lookup
+            .lock()
+            .unwrap()
+            .workers
+            .values()
+            .flatten()
+            .count()
     }
 
     #[cfg(test)]
     pub(crate) fn from_events(events: Vec<LaunchEvent>) -> Self {
         Self {
-            events: events
-                .into_iter()
-                .map(|event| (event.worker_session_ref.clone(), event))
-                .collect(),
+            root: None,
+            lookup: Mutex::new(Lookup {
+                workers: events
+                    .into_iter()
+                    .map(|event| (event.worker_session_ref.clone(), Some(event)))
+                    .collect(),
+                complete: true,
+                ..Lookup::default()
+            }),
         }
     }
 }
 
-/// Validate every file in `pending/` and move it out: accepted events to
-/// `processed/`, everything else to `rejected/`.
-fn drain_pending(pending: &Path, processed: &Path, rejected: &Path) {
-    for path in bounded_entries(pending, MAX_PENDING_FILES_PER_REFRESH) {
-        match read_and_validate(&path) {
-            Ok(_) => relocate(&path, processed),
-            Err(reason) => reject(&path, rejected, reason),
-        }
-    }
+pub(crate) fn valid_worker(worker: &str) -> bool {
+    is_uuid(worker)
 }
 
-/// Build the inventory from the retained store, expiring what is too old.
-///
-/// Re-validating here is not paranoia for its own sake: `processed/` is an
-/// ordinary user-writable directory, and the facts it produces are Direct
-/// evidence. A file that decayed, was edited, or was dropped in by hand gets the
-/// same treatment a bad `pending/` file gets.
-fn load_processed(processed: &Path, rejected: &Path) -> BTreeMap<String, LaunchEvent> {
-    let mut events: BTreeMap<String, LaunchEvent> = BTreeMap::new();
-    let mut ambiguous: BTreeSet<String> = BTreeSet::new();
-    for path in bounded_entries(processed, MAX_PROCESSED_FILES_PER_REFRESH) {
-        if is_expired(&path, PROCESSED_RETENTION) {
-            let _ = fs::remove_file(&path);
-            continue;
-        }
-        let event = match read_and_validate(&path) {
-            Ok(event) => event,
-            Err(reason) => {
-                reject(&path, rejected, reason);
-                continue;
-            }
-        };
-        if events.len() >= MAX_RETAINED_EVENTS && !events.contains_key(&event.worker_session_ref) {
-            continue;
-        }
-        match events.get(&event.worker_session_ref) {
-            // Same worker, different controller: one of the two bindings is
-            // wrong and nothing here can tell which. Both lose.
-            Some(existing) if existing != &event => {
-                ambiguous.insert(event.worker_session_ref.clone());
-            }
-            _ => {
-                events.insert(event.worker_session_ref.clone(), event);
-            }
-        }
+fn directory_stamp(dir: &Path) -> Option<SystemTime> {
+    fs::metadata(dir)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+fn advance_phase(root: &Path, lookup: &mut Lookup) -> bool {
+    lookup.phase += 1;
+    if lookup.phase == 1 {
+        lookup.pending_stamp = directory_stamp(&root.join(PENDING_SUBDIR));
+        lookup.processed_stamp = directory_stamp(&root.join(PROCESSED_SUBDIR));
     }
-    for worker_session_ref in ambiguous {
-        events.remove(&worker_session_ref);
+    lookup.phase > 4
+}
+
+fn finish_lookup(root: &Path, lookup: &mut Lookup) -> Result<bool, ()> {
+    lookup.entries = None;
+    if lookup.phase != 0
+        && (lookup.pending_stamp != directory_stamp(&root.join(PENDING_SUBDIR))
+            || lookup.processed_stamp != directory_stamp(&root.join(PROCESSED_SUBDIR)))
+    {
+        lookup.failed = true;
+    }
+    for worker in &lookup.ambiguous {
+        lookup.workers.insert(worker.clone(), None);
+    }
+    if !lookup.ambiguous.is_empty() {
         eprintln!(
-            "ottto-service: withheld a launch edge: two launch events name the same worker session \
-             with different controllers"
+            "ottto-service: launch lookup withheld ambiguous worker claims: count={}",
+            lookup.ambiguous.len()
         );
     }
-    events
-}
-
-fn prune_expired(dir: &Path, retention: Duration, limit: usize) {
-    for path in bounded_entries(dir, limit) {
-        if is_expired(&path, retention) {
-            let _ = fs::remove_file(&path);
-        }
+    if lookup.failed {
+        eprintln!("ottto-service: launch lookup incomplete: local evidence changed or was unreadable; work remains owed");
+    }
+    lookup.complete = true;
+    lookup.loaded_at = Some(Instant::now());
+    if lookup.failed {
+        Err(())
+    } else {
+        Ok(true)
     }
 }
 
-/// Deterministic, bounded listing of the JSON files directly inside `dir`.
-///
-/// Sorted so a truncated refresh is reproducible rather than arbitrary, and
-/// non-recursive so a directory planted inside the drop root cannot enlarge the
-/// scan.
+/// Small maintenance/test listing only; no whole-directory vector or sorting.
+#[cfg(test)]
 fn bounded_entries(dir: &Path, limit: usize) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut paths: Vec<PathBuf> = entries
+    entries
+        .take(limit)
         .flatten()
-        .filter(|entry| {
-            entry
-                .file_type()
-                .map(|kind| kind.is_file())
-                .unwrap_or(false)
-        })
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
-        .collect();
-    paths.sort();
-    paths.truncate(limit);
-    paths
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect()
 }
 
 fn is_expired(path: &Path, retention: Duration) -> bool {
@@ -343,14 +464,14 @@ fn is_expired(path: &Path, retention: Duration) -> bool {
 ///
 /// A same-named file already there is the SAME launch by construction (the name
 /// is the triple hash), so the overwrite is what makes replay idempotent.
-fn relocate(path: &Path, destination: &Path) {
+fn relocate(path: &Path, destination: &Path) -> bool {
     let Some(name) = path.file_name() else {
-        return;
+        return false;
     };
     if fs::create_dir_all(destination).is_err() {
-        return;
+        return false;
     }
-    let _ = fs::rename(path, destination.join(name));
+    fs::rename(path, destination.join(name)).is_ok()
 }
 
 /// Quarantine a file and say why in a CODE, never in its contents.
@@ -364,7 +485,7 @@ fn reject(path: &Path, rejected: &Path, reason: &'static str) {
         "ottto-service: rejected a launch event ({}): {reason}",
         redacted_label(path)
     );
-    relocate(path, rejected);
+    let _ = relocate(path, rejected);
 }
 
 fn redacted_label(path: &Path) -> String {
@@ -378,14 +499,43 @@ fn redacted_label(path: &Path) -> String {
 }
 
 fn read_and_validate(path: &Path) -> Result<LaunchEvent, &'static str> {
-    let metadata = fs::metadata(path).map_err(|_| "unreadable")?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| "unreadable")?;
+    if !metadata.is_file() {
+        return Err("not_regular");
+    }
     if metadata.len() > MAX_EVENT_FILE_BYTES {
         return Err("oversize");
     }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|_| "unreadable")?;
+    let opened = file.metadata().map_err(|_| "unreadable")?;
+    if !opened.is_file() || opened.len() > MAX_EVENT_FILE_BYTES {
+        return Err("oversize");
+    }
     let mut raw = String::new();
-    File::open(path)
-        .and_then(|mut file| file.read_to_string(&mut raw))
-        .map_err(|_| "unreadable")?;
+    (&file)
+        .take(MAX_EVENT_FILE_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                "not_utf8"
+            } else {
+                "unreadable"
+            }
+        })?;
+    if raw.len() as u64 > MAX_EVENT_FILE_BYTES {
+        return Err("oversize");
+    }
+    let after = file.metadata().map_err(|_| "unreadable")?;
+    if opened.len() != after.len() || opened.modified().ok() != after.modified().ok() {
+        return Err("unreadable");
+    }
     let event = validate_event(&raw)?;
     let expected = path
         .file_stem()
@@ -454,6 +604,12 @@ pub(crate) fn validate_event(raw: &str) -> Result<LaunchEvent, &'static str> {
             None
         }
         CAPTURE_SOURCE_GPT_SOL_RELAY => return Err("bad_workflow_ref"),
+        CAPTURE_SOURCE_OPUS_CLI_AGENT if object.get("workflow_ref").is_some_and(Value::is_null) => {
+            None
+        }
+        CAPTURE_SOURCE_OPUS_CLI_AGENT => {
+            Some(session_ref_field(object, "workflow_ref").ok_or("bad_workflow_ref")?)
+        }
         _ => return Err("unknown_capture_source"),
     };
     // A session cannot launch itself. Reaching here means one of the two
@@ -469,6 +625,11 @@ pub(crate) fn validate_event(raw: &str) -> Result<LaunchEvent, &'static str> {
         },
         CAPTURE_SOURCE_GPT_SOL_RELAY if object.get("pr_ref").is_some_and(Value::is_null) => {}
         CAPTURE_SOURCE_GPT_SOL_RELAY => return Err("bad_pr_ref"),
+        CAPTURE_SOURCE_OPUS_CLI_AGENT if object.get("pr_ref").is_some_and(Value::is_null) => {}
+        CAPTURE_SOURCE_OPUS_CLI_AGENT => match object.get("pr_ref").and_then(Value::as_i64) {
+            Some(pr_ref) if pr_ref > 0 => {}
+            _ => return Err("bad_pr_ref"),
+        },
         _ => return Err("unknown_capture_source"),
     }
     if !is_utc_second_timestamp(string_field(object, "launch_ts").unwrap_or_default()) {
@@ -631,6 +792,18 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         format!("{{{body}}}")
+    }
+
+    fn refresh_fixture(home: &Path) -> LaunchEventInventory {
+        let inventory = LaunchEventInventory::refresh(home);
+        for _ in 0..100 {
+            match inventory.prepare_step(&[WORKER.to_string()]) {
+                Ok(false) => continue,
+                Ok(true) => return inventory,
+                Err(()) => panic!("fixture lookup incomplete"),
+            }
+        }
+        panic!("fixture lookup never completed");
     }
 
     fn drop_event(home: &Path, raw: &str, name: Option<&str>) -> PathBuf {
@@ -817,7 +990,7 @@ mod tests {
             Some(&format!("{}.json", event_digest(&event))),
         );
 
-        let inventory = LaunchEventInventory::refresh(&home);
+        let inventory = refresh_fixture(&home);
 
         assert_eq!(inventory.len(), 0);
         let rejected = home.join(DROP_ROOT_DIR).join(REJECTED_SUBDIR);
@@ -834,7 +1007,7 @@ mod tests {
             Some(&format!("{}.json", "0".repeat(64))),
         );
 
-        let inventory = LaunchEventInventory::refresh(&home);
+        let inventory = refresh_fixture(&home);
 
         assert_eq!(inventory.len(), 0);
         assert_eq!(
@@ -849,7 +1022,7 @@ mod tests {
         let home = temp_dir("launch-lifecycle");
         drop_event(&home, &event_json(&[]), None);
 
-        let inventory = LaunchEventInventory::refresh(&home);
+        let inventory = refresh_fixture(&home);
 
         assert_eq!(
             inventory.matching(WORKER).map(|event| event.agent_kind),
@@ -862,7 +1035,7 @@ mod tests {
         // A later scan of the same worker -- the normal case, since the event is
         // written at spawn and the transcript is parsed repeatedly afterwards --
         // still finds the edge.
-        let replayed = LaunchEventInventory::refresh(&home);
+        let replayed = refresh_fixture(&home);
         assert_eq!(replayed.matching(WORKER), inventory.matching(WORKER));
         let _ = fs::remove_dir_all(&home);
     }
@@ -871,11 +1044,11 @@ mod tests {
     fn replaying_the_same_launch_keeps_exactly_one_event() {
         let home = temp_dir("launch-replay");
         drop_event(&home, &event_json(&[]), None);
-        LaunchEventInventory::refresh(&home);
+        refresh_fixture(&home);
         // The launcher re-emits after a retry: same triple, same filename.
         drop_event(&home, &event_json(&[]), None);
 
-        let inventory = LaunchEventInventory::refresh(&home);
+        let inventory = refresh_fixture(&home);
 
         assert_eq!(inventory.len(), 1);
         assert_eq!(
@@ -898,7 +1071,7 @@ mod tests {
             None,
         );
 
-        let inventory = LaunchEventInventory::refresh(&home);
+        let inventory = refresh_fixture(&home);
 
         assert!(inventory.matching(WORKER).is_none());
         let _ = fs::remove_dir_all(&home);
@@ -910,7 +1083,7 @@ mod tests {
         let raw = event_json(&[("prompt", "\"secret prompt text\"")]);
         drop_event(&home, &raw, Some(&format!("{}.json", "a".repeat(64))));
 
-        let inventory = LaunchEventInventory::refresh(&home);
+        let inventory = refresh_fixture(&home);
 
         assert_eq!(inventory.len(), 0);
         let root = home.join(DROP_ROOT_DIR);
@@ -922,7 +1095,300 @@ mod tests {
     #[test]
     fn absent_drop_root_is_an_empty_inventory() {
         let home = temp_dir("launch-absent");
-        assert_eq!(LaunchEventInventory::refresh(&home).len(), 0);
+        assert_eq!(refresh_fixture(&home).len(), 0);
+    }
+
+    struct TestHome(PathBuf);
+    impl TestHome {
+        fn new() -> Self {
+            let root = temp_dir("launch-complete");
+            fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn worker(n: usize) -> String {
+        format!("{n:08x}-2222-3333-4444-555555555555")
+    }
+    fn retained(home: &Path, n: usize) -> (String, PathBuf) {
+        let id = worker(n);
+        let raw = event_json(&[
+            ("worker_session_ref", &format!("\"{id}\"")),
+            ("capture_source", "\"launcher_event:opus_cli_agent\""),
+            ("workflow_ref", "null"),
+            ("pr_ref", "null"),
+        ]);
+        let event = validate_event(&raw).unwrap();
+        let dir = home.join(DROP_ROOT_DIR).join(PROCESSED_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.json", event_digest(&event)));
+        fs::write(&path, raw).unwrap();
+        (id, path)
+    }
+    fn complete(inventory: &LaunchEventInventory, workers: &[String]) -> usize {
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            assert!(steps < 1000);
+            match inventory.prepare_step(workers) {
+                Ok(false) => {}
+                Ok(true) => return steps,
+                Err(()) => panic!("lookup incomplete"),
+            }
+        }
+    }
+
+    #[test]
+    fn opus_contract_preserves_legacy_and_refuses_arbitrary_or_reserved_families() {
+        for workflow in ["null".to_string(), format!("\"{ATTEMPT}\"")] {
+            for pr in ["null", "7"] {
+                let event = validate_event(&event_json(&[
+                    ("capture_source", "\"launcher_event:opus_cli_agent\""),
+                    ("workflow_ref", &workflow),
+                    ("pr_ref", pr),
+                ]))
+                .unwrap();
+                assert_eq!(event.agent_kind, "opus-cli-agent");
+            }
+        }
+        for source in [
+            "launcher_event:pr_fixer",
+            "launcher_event:gpt_sol",
+            "launcher_event:codex_subagent",
+            "launcher_event:workflow_subagent",
+            "launcher_event:other_slug",
+            "launcher_event:",
+            "launcher_event:Opus",
+            "launcher_event:x/y",
+        ] {
+            assert_eq!(
+                validate_event(&event_json(&[("capture_source", &format!("\"{source}\""))])),
+                Err("unknown_capture_source")
+            );
+        }
+        for value in ["0", "-1", "1.5", "\"7\""] {
+            assert_eq!(
+                validate_event(&event_json(&[
+                    ("capture_source", "\"launcher_event:opus_cli_agent\""),
+                    ("pr_ref", value)
+                ])),
+                Err("bad_pr_ref")
+            );
+        }
+        assert_eq!(
+            validate_event(&event_json(&[
+                ("capture_source", "\"launcher_event:opus_cli_agent\""),
+                ("controller_session_ref", &format!("\"{RELAY_CONTROLLER}\""))
+            ])),
+            Err("bad_controller_ref")
+        );
+    }
+
+    #[test]
+    fn every_retained_worker_is_joinable_across_batches_above_the_old_caps() {
+        let home = TestHome::new();
+        let workers: Vec<_> = (1..=5400).map(|n| retained(&home.0, n).0).collect();
+        let inventory = LaunchEventInventory::refresh(&home.0);
+        for batch in workers.chunks(MAX_DEMANDED_WORKERS) {
+            assert!(complete(&inventory, batch) > 1);
+            assert!(inventory.lookup.lock().unwrap().workers.len() <= MAX_DEMANDED_WORKERS);
+            for id in batch {
+                assert_eq!(inventory.matching(id).unwrap().worker_session_ref, *id);
+            }
+        }
+        // A fresh process/context has no cursor or cache dependency for import.
+        let restarted = LaunchEventInventory::refresh(&home.0);
+        complete(&restarted, &[workers[5399].clone()]);
+        assert!(restarted.matching(&workers[5399]).is_some());
+    }
+
+    #[test]
+    fn partial_pages_never_certify_uniqueness_and_late_conflicts_withhold_every_claim() {
+        let home = TestHome::new();
+        for n in 1..=1100 {
+            retained(&home.0, n);
+        }
+        let id = worker(1100);
+        let raw = event_json(&[
+            ("worker_session_ref", &format!("\"{id}\"")),
+            (
+                "controller_session_ref",
+                "\"11111111-2222-3333-4444-555555555555\"",
+            ),
+        ]);
+        drop_event(&home.0, &raw, None);
+        let inventory = LaunchEventInventory::refresh(&home.0);
+        assert_eq!(inventory.prepare_step(&[id.clone()]), Ok(false));
+        assert!(inventory.matching(&id).is_none());
+        assert!(complete(&inventory, &[id.clone()]) > 1);
+        assert!(inventory.matching(&id).is_none());
+        assert_eq!(inventory.lookup.lock().unwrap().ambiguous.len(), 1);
+    }
+
+    #[test]
+    fn non_uuid_transcripts_need_no_launch_lookup_or_drop_directory() {
+        let home = TestHome::new();
+        let inventory = LaunchEventInventory::refresh(&home.0);
+        let workers = vec!["opaque-provider-session".to_string()];
+        assert!(inventory.prepared(&workers));
+        assert_eq!(inventory.prepare_step(&workers), Ok(true));
+        assert!(inventory.matching(&workers[0]).is_none());
+        assert!(!home.0.join(DROP_ROOT_DIR).exists());
+    }
+
+    #[test]
+    fn duplicate_demands_do_not_consume_slots_and_changed_demands_yield_until_prepared() {
+        let home = TestHome::new();
+        for n in 1..=600 {
+            retained(&home.0, n);
+        }
+        let first = worker(1);
+        let second = worker(600);
+        let inventory = LaunchEventInventory::refresh(&home.0);
+        let duplicates = vec![first.clone(); MAX_DEMANDED_WORKERS + 1];
+        assert_eq!(inventory.prepare_step(&duplicates), Ok(false));
+        // Finish the original cursor without pretending the newly demanded
+        // worker was included in its complete retained-store pass.
+        while !inventory.lookup.lock().unwrap().complete {
+            assert_eq!(inventory.prepare_step(&[second.clone()]), Ok(false));
+        }
+        assert!(!inventory.prepared(&[second.clone()]));
+        assert!(inventory.matching(&second).is_none());
+        complete(&inventory, &[second.clone()]);
+        assert!(inventory.prepared(&[second.clone()]));
+        assert!(inventory.matching(&second).is_some());
+        complete(&inventory, &duplicates);
+        assert_eq!(inventory.lookup.lock().unwrap().workers.len(), 1);
+    }
+
+    #[test]
+    fn excess_demand_is_disclosed_instead_of_certifying_a_truncated_batch() {
+        let home = TestHome::new();
+        let demanded: Vec<_> = (1..=MAX_DEMANDED_WORKERS + 1).map(worker).collect();
+        let inventory = LaunchEventInventory::refresh(&home.0);
+        assert_eq!(inventory.prepare_step(&demanded), Err(()));
+        assert!(inventory
+            .matching(&demanded[MAX_DEMANDED_WORKERS])
+            .is_none());
+        for batch in demanded.chunks(MAX_DEMANDED_WORKERS) {
+            complete(&inventory, batch);
+        }
+    }
+
+    #[test]
+    fn edit_removal_expiry_and_pending_backlog_recheck_the_same_forward_path() {
+        let home = TestHome::new();
+        let (id, path) = retained(&home.0, 1);
+        let inventory = LaunchEventInventory::refresh(&home.0);
+        complete(&inventory, &[id.clone()]);
+        assert!(inventory.matching(&id).is_some());
+        // Same-name changes are revalidated by a fresh ordinary context, not a migration.
+        let raw = event_json(&[
+            ("worker_session_ref", &format!("\"{id}\"")),
+            ("capture_source", "\"launcher_event:opus_cli_agent\""),
+            ("workflow_ref", "null"),
+            ("pr_ref", "null"),
+            ("prompt", "\"invalid\""),
+        ]);
+        fs::write(&path, raw).unwrap();
+        let edited = LaunchEventInventory::refresh(&home.0);
+        let mut result = edited.prepare_step(&[id.clone()]);
+        while result == Ok(false) {
+            result = edited.prepare_step(&[id.clone()]);
+        }
+        assert_eq!(result, Err(()));
+        assert!(edited.matching(&id).is_none());
+        assert!(!path.exists());
+        let removed = LaunchEventInventory::refresh(&home.0);
+        complete(&removed, &[id.clone()]);
+        assert!(removed.matching(&id).is_none());
+        for n in 2..=600 {
+            let (_, path) = retained(&home.0, n);
+            let pending = home.0.join(DROP_ROOT_DIR).join(PENDING_SUBDIR);
+            fs::create_dir_all(&pending).unwrap();
+            fs::rename(&path, pending.join(path.file_name().unwrap())).unwrap();
+        }
+        let backlog = LaunchEventInventory::refresh(&home.0);
+        let last = worker(600);
+        assert!(complete(&backlog, &[last.clone()]) > 1);
+        assert!(backlog.matching(&last).is_some());
+        let (_, path) = retained(&home.0, 1);
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(
+            fs::FileTimes::new()
+                .set_modified(SystemTime::now() - PROCESSED_RETENTION - Duration::from_secs(1)),
+        )
+        .unwrap();
+        let expired = LaunchEventInventory::refresh(&home.0);
+        // Cleanup may change the directory fence once; the next context converges.
+        while expired.prepare_step(&[id.clone()]) == Ok(false) {}
+        let after_cleanup = LaunchEventInventory::refresh(&home.0);
+        complete(&after_cleanup, &[id.clone()]);
+        assert!(after_cleanup.matching(&id).is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    #[ignore = "bounded synthetic resource measurement; run natively in serial isolation"]
+    fn measure_demanded_launch_lookup_resources() {
+        let home = TestHome::new();
+        for count in [2700usize, 5400] {
+            for n in if count == 2700 { 1..=2700 } else { 2701..=5400 } {
+                retained(&home.0, n);
+            }
+            // Demand size, not retained volume, owns the map ceiling.
+            let demanded: Vec<_> = (1..=MAX_DEMANDED_WORKERS)
+                .map(|n| worker(n + count - MAX_DEMANDED_WORKERS))
+                .collect();
+            let inventory = LaunchEventInventory::refresh(&home.0);
+            let probe = crate::local_resource_diagnostics::Probe::start();
+            let started = Instant::now();
+            let mut max_step_us = 0u128;
+            let ((steps, _), allocation) = crate::retry_allocation_probe::measure_process(|| {
+                let mut steps = 0;
+                loop {
+                    steps += 1;
+                    let at = Instant::now();
+                    let result = inventory.prepare_step(&demanded).unwrap();
+                    max_step_us = max_step_us.max(at.elapsed().as_micros());
+                    if result {
+                        break;
+                    }
+                }
+                (steps, inventory.len())
+            });
+            for id in &demanded {
+                assert!(inventory.matching(id).is_some());
+            }
+            assert!(
+                allocation.requested_peak < 512 * 1024,
+                "demand map and Rust scratch budget"
+            );
+            probe.collection(
+                "unknown",
+                crate::local_resource_diagnostics::CollectionCounts {
+                    scanned_files: 0,
+                    semantic_noops: 0,
+                    sampled_acquisition: None,
+                },
+            );
+            println!(
+                "LAUNCH_LOOKUP_RESOURCES {}",
+                serde_json::json!({
+                    "retained_files":count, "demanded_workers":demanded.len(), "steps":steps,
+                    "wall_us":started.elapsed().as_micros(), "max_step_wall_us":max_step_us,
+                    "directory_entries_per_step":LOOKUP_ENTRIES_PER_STEP,
+                    "event_bytes_per_step_max":LOOKUP_ENTRIES_PER_STEP as u64 * (MAX_EVENT_FILE_BYTES + 1),
+                    "requested_scope_peak_bytes":allocation.requested_peak,
+                    "requested_scope_live_bytes":allocation.requested_live,
+                    "opaque_directory_os_allocation_not_in_requested_rust_scope":true
+                })
+            );
+        }
     }
 
     #[test]
@@ -938,6 +1404,33 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(LaunchEventInventory; events);
+crate::heap_layout_bound::fields!(LaunchEventInventory; root, lookup);
+impl crate::heap_layout_bound::HeapLayoutBound for Lookup {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            workers,
+            ambiguous,
+            phase,
+            entries,
+            complete,
+            failed,
+            loaded_at,
+            pending_stamp,
+            processed_stamp,
+        } = self;
+        // std's directory iterator owns opaque platform allocation. Refuse
+        // optional overlap rather than inventing a bound while it is parked.
+        if entries.is_some() {
+            return None;
+        }
+        workers.heap_bound(c)?;
+        ambiguous.heap_bound(c)?;
+        phase.heap_bound(c)?;
+        complete.heap_bound(c)?;
+        failed.heap_bound(c)?;
+        let _ = (loaded_at, pending_stamp, processed_stamp);
+        c.add(0)
+    }
+}
 
 crate::heap_layout_bound::fields!(LaunchEvent; controller_session_ref, worker_session_ref, workflow_ref, agent_kind);

@@ -29,6 +29,8 @@ mod codex_file_join;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
 mod context_curve;
+#[cfg(test)]
+mod launcher_recognition_tests;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
 mod sampled_audit;
@@ -11374,6 +11376,61 @@ impl OwnedSourceScan {
         self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     ) -> OwnedSourceScanStep {
+        // Prepare one demand batch through bounded native continuations. Group
+        // owners come from the completed header census, never arbitrary names.
+        if self.active_file.is_none()
+            && self.codex_join_active.is_none()
+            && (self.source != SnapshotSource::Codex || self.codex_join_prepared)
+        {
+            if let Some(context) = attribution_context {
+                let first = self
+                    .codex_join_groups
+                    .front()
+                    .map(|group| vec![group.owner.clone()])
+                    .or_else(|| {
+                        self.identified_candidates.front().map(|candidate| {
+                            launch_workers_for_candidate(
+                                self.source,
+                                candidate,
+                                self.codex_join_inventory.as_ref(),
+                            )
+                        })
+                    })
+                    .unwrap_or_default();
+                // A completed batch covers its remaining members. Looking at
+                // a sliding window here would add one new worker after every
+                // file and repeat the complete retained-store sweep per file.
+                if !context.launches_prepared(&first) {
+                    let mut workers = BTreeSet::new();
+                    for worker in self
+                        .codex_join_groups
+                        .iter()
+                        .map(|group| group.owner.clone())
+                        .chain(self.identified_candidates.iter().flat_map(|candidate| {
+                            launch_workers_for_candidate(
+                                self.source,
+                                candidate,
+                                self.codex_join_inventory.as_ref(),
+                            )
+                        }))
+                        .take(crate::launch_events::MAX_DEMANDED_WORKERS)
+                    {
+                        if crate::launch_events::valid_worker(&worker) {
+                            workers.insert(worker.to_ascii_lowercase());
+                        }
+                        if workers.len() == crate::launch_events::MAX_DEMANDED_WORKERS {
+                            break;
+                        }
+                    }
+                    let workers = workers.into_iter().collect::<Vec<_>>();
+                    match context.prepare_launch_step(&workers) {
+                        Ok(false) => return OwnedSourceScanStep::Pending(self),
+                        Err(()) => {} // Candidate handling keeps unreadable evidence owed.
+                        Ok(true) => {}
+                    }
+                }
+            }
+        }
         let copy_budget = self.sampled_copy_budget();
         if copy_budget == 0 {
             self.clear_sampled_cache();
@@ -11412,7 +11469,7 @@ impl OwnedSourceScan {
             mut residue_blocked_session_ids,
             mut pending_finalization,
             claude_authority_preflight,
-            forced_claude_family_reparses,
+            mut forced_claude_family_reparses,
             mut identified_candidates,
             mut active_file,
             mut codex_join_inventory,
@@ -11765,6 +11822,7 @@ impl OwnedSourceScan {
                 scanned_file_count += group.members.len();
                 match codex_file_join::GroupReader::new(group.members.clone()) {
                     Ok(mut reader) => {
+                        reader.configure_launch_owner(&group.owner);
                         reader.configure_receipts(index);
                         codex_join_active = Some((group, reader));
                     }
@@ -11794,6 +11852,32 @@ impl OwnedSourceScan {
                     pending!();
                 }
                 Ok(true) => {}
+            }
+            if let Some(context) = attribution_context {
+                let workers = active
+                    .parser
+                    .accumulator
+                    .source_session_id
+                    .as_ref()
+                    .map(|id| {
+                        vec![if source == SnapshotSource::Codex {
+                            resolve_codex_identity(id)
+                        } else {
+                            id.clone()
+                        }]
+                    })
+                    .unwrap_or_else(|| launch_workers_for_path(source, &active.candidate.path));
+                match context.prepare_launch_step(&workers) {
+                    Ok(false) => {
+                        active_file = Some(active);
+                        pending!();
+                    }
+                    Err(()) => {
+                        census.unreadable_path_count += 1;
+                        pending!();
+                    }
+                    Ok(true) => {}
+                }
             }
             if let Some(context) = sampling.as_mut() {
                 if let Some(plan) = active.parser.reader.acquisition.as_ref() {
@@ -12761,6 +12845,23 @@ impl OwnedSourceScan {
         };
         let preflight_source_file_fingerprint =
             claude_authority_preflight_fingerprint(index, &candidate);
+        if let Some(context) = attribution_context {
+            let workers =
+                launch_workers_for_candidate(source, &candidate, codex_join_inventory.as_ref());
+            match context.prepare_launch_step(&workers) {
+                Ok(false) => {
+                    identified_candidates.push_front(candidate);
+                    pending!();
+                }
+                Err(()) => {
+                    census.unreadable_path_count += 1;
+                    pending!();
+                }
+                Ok(true) => {}
+            }
+        }
+        // Keep the prepass physical identity intact while lookup yields. Only
+        // replace it with sidecar inputs immediately before the second open.
         prepare_owned_scan_candidate(
             source,
             &mut candidate,
@@ -12768,7 +12869,7 @@ impl OwnedSourceScan {
             &claude_title_metadata,
             claude_effort_support_dir_ref,
         );
-        let Some((candidate, opened_file)) = open_and_identify_scan_candidate(
+        let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate(
             source,
             candidate,
             &mut census,
@@ -12787,6 +12888,40 @@ impl OwnedSourceScan {
             // generation non-terminal and retry the new exact object together.
             census.disappeared_file_count += 1;
             pending!();
+        }
+        // The preflight fences physical/sidecar identity. Local launcher facts
+        // are semantic context and must not contaminate that two-open witness.
+        if let Some(context) = attribution_context {
+            let workers =
+                launch_workers_for_candidate(source, &candidate, codex_join_inventory.as_ref());
+            if let Some(witness) = context.launch_witness(&workers) {
+                candidate.source_file_fingerprint = sha256_hex(&[
+                    "launcher_worker_context:v1",
+                    &candidate.source_file_fingerprint,
+                    &witness,
+                ]);
+            }
+        }
+        // Constructor preflight has only physical identities. Reconcile its
+        // family retry decision once launcher context is prepared, while keeping
+        // the two-open equality check above physical. Every family member must
+        // match the retained revision before withdrawing a forced retry.
+        if source == SnapshotSource::ClaudeCode {
+            if let Some(context) = attribution_context {
+                if let Some((root, _)) = claude_index_path_family_member(&candidate.path) {
+                    if forced_claude_family_reparses.contains(&root)
+                        && claude_held_family_matches_launch_context(
+                            index,
+                            &root,
+                            &candidate,
+                            &identified_candidates,
+                            context,
+                        )
+                    {
+                        forced_claude_family_reparses.remove(&root);
+                    }
+                }
+            }
         }
         let mut decision = claude_index_path_family_member(&candidate.path)
             .filter(|(root_session_id, _)| forced_claude_family_reparses.contains(root_session_id))
@@ -12958,6 +13093,81 @@ impl OwnedSourceScan {
         });
         pending!();
     }
+}
+
+fn launch_workers_for_candidate(
+    source: SnapshotSource,
+    candidate: &CandidateFile,
+    inventory: Option<&codex_file_join::HeaderInventory>,
+) -> Vec<String> {
+    if source == SnapshotSource::Codex {
+        if let Some(owner) =
+            inventory.and_then(|inventory| inventory.owner_for_path(&candidate.path))
+        {
+            return vec![owner.to_owned()];
+        }
+    }
+    launch_workers_for_path(source, &candidate.path)
+}
+
+// Path hints authorize only lookup demand, never transcript ownership or facts.
+fn launch_workers_for_path(source: SnapshotSource, path: &Path) -> Vec<String> {
+    match source {
+        SnapshotSource::Codex => codex_session_id_candidates_from_path(path),
+        SnapshotSource::ClaudeCode | SnapshotSource::Pi => path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| vec![stem.to_string()])
+            .unwrap_or_default(),
+    }
+}
+
+fn claude_held_family_matches_launch_context(
+    index: &ScanIndex,
+    root: &str,
+    current: &CandidateFile,
+    remaining: &VecDeque<CandidateFile>,
+    context: &crate::session_attribution::SessionAttributionContext,
+) -> bool {
+    let Some(record) = index.claude_usage_authority_quarantine.get(root) else {
+        return false;
+    };
+    let mut members = BTreeSet::new();
+    for member in std::iter::once(current).chain(remaining.iter()) {
+        let Some((family, id)) = claude_index_path_family_member(&member.path) else {
+            continue;
+        };
+        if family != root {
+            continue;
+        }
+        members.insert(id);
+        let mut semantic = member.clone();
+        if member.path != current.path {
+            let workers = launch_workers_for_path(SnapshotSource::ClaudeCode, &member.path);
+            if !context.launches_prepared(&workers) {
+                return false;
+            }
+            if let Some(witness) = context.launch_witness(&workers) {
+                semantic.source_file_fingerprint = sha256_hex(&[
+                    "launcher_worker_context:v1",
+                    &semantic.source_file_fingerprint,
+                    &witness,
+                ]);
+            }
+        }
+        if index
+            .claude_usage_authority_candidate_requires_family_reparse(&semantic)
+            .is_some()
+        {
+            return false;
+        }
+    }
+    members
+        == record
+            .member_source_file_fingerprints
+            .keys()
+            .cloned()
+            .collect()
 }
 
 /// Preserve the two-open identity fence only for the Claude family whose
@@ -13622,6 +13832,24 @@ impl OwnedJsonlParser {
             self.reader.finished && self.reader.failure.is_none(),
             "incomplete parser cannot finalize a file"
         );
+        if let Some(context) = attribution_context {
+            let workers = self
+                .accumulator
+                .source_session_id
+                .as_ref()
+                .map(|id| {
+                    vec![if self.source == SnapshotSource::Codex {
+                        resolve_codex_identity(id)
+                    } else {
+                        id.clone()
+                    }]
+                })
+                .unwrap_or_else(|| launch_workers_for_path(self.source, path));
+            anyhow::ensure!(
+                context.launches_prepared(&workers),
+                "launch evidence lookup incomplete"
+            );
+        }
         let Self {
             reader: bounded,
             mut accumulator,
@@ -13811,6 +14039,26 @@ fn parse_opened_jsonl_file(
         .step()
         .with_context(|| format!("read JSONL {}", path.display()))?
     {}
+    if let Some(context) = attribution_context {
+        let workers = parser
+            .accumulator
+            .source_session_id
+            .as_ref()
+            .map(|id| {
+                vec![if source == SnapshotSource::Codex {
+                    resolve_codex_identity(id)
+                } else {
+                    id.clone()
+                }]
+            })
+            .unwrap_or_else(|| launch_workers_for_path(source, path));
+        // This compatibility reader already synchronously drains the transcript.
+        // Production OwnedSourceScan prepares in its resumable step before finish.
+        while !context
+            .prepare_launch_step(&workers)
+            .map_err(|()| anyhow::anyhow!("launch evidence lookup incomplete"))?
+        {}
+    }
     parser.finish(
         expected_opened_object_identity,
         path,

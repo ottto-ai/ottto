@@ -204,6 +204,33 @@ impl SessionAttributionContext {
         })
     }
 
+    pub(crate) fn launches_prepared(&self, workers: &[String]) -> bool {
+        self.launch_events.prepared(workers)
+    }
+
+    pub(crate) fn prepare_launch_step(&self, workers: &[String]) -> Result<bool, ()> {
+        self.launch_events.prepare_step(workers)
+    }
+
+    pub(crate) fn launch_witness(&self, workers: &[String]) -> Option<String> {
+        let mut hasher = Sha256::new();
+        let mut any = false;
+        for worker in workers {
+            if let Some(event) = self.launch_events.matching(worker) {
+                any = true;
+                hasher.update(event.controller_session_ref.as_bytes());
+                hasher.update([0]);
+                hasher.update(event.worker_session_ref.as_bytes());
+                hasher.update([0]);
+                hasher.update(event.workflow_ref.as_deref().unwrap_or("").as_bytes());
+                hasher.update([0]);
+                hasher.update(event.agent_kind.as_bytes());
+                hasher.update([0]);
+            }
+        }
+        any.then(|| format!("{:x}", hasher.finalize()))
+    }
+
     /// Direct lineage facts for a worker session an instrumented launcher
     /// started, or nothing at all.
     ///
