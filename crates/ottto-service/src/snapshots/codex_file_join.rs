@@ -2909,13 +2909,17 @@ pub(super) mod tests {
             )
             .unwrap();
         }
-        assert!(!reader
-            .step(&metadata, None, None, false, false, Some(&context))
-            .unwrap());
-        assert!(reader.proof_reader.as_ref().unwrap().reader.finished);
+        let mut steps = 0;
+        while !reader.proof_reader.as_ref().unwrap().reader.finished {
+            assert!(!reader
+                .step(&metadata, None, None, false, false, Some(&context))
+                .unwrap());
+            steps += 1;
+            assert!(steps < 100);
+        }
+        assert!(!context.launches_prepared(&workers));
         assert!(reader.proofs.is_empty());
         assert!(reader.legacy_baselines.is_empty());
-        let mut steps = 1;
         while !reader
             .step(&metadata, None, None, false, false, Some(&context))
             .unwrap()
