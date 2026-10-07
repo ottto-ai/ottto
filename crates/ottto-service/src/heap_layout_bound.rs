@@ -45,7 +45,12 @@ pub(crate) fn bound<T: HeapLayoutBound>(value: &T, limit: usize) -> Option<usize
 pub(crate) fn layout_supported() -> bool {
     cfg!(target_os = "macos")
         && cfg!(target_pointer_width = "64")
-        && env!("OTTTO_SCAN_LAYOUT_RUSTC").starts_with("rustc 1.88.0 ")
+        && compiler_layout_supported(env!("OTTTO_SCAN_LAYOUT_RUSTC"))
+}
+fn compiler_layout_supported(compiler: &str) -> bool {
+    // These exact versions have source-layout and native allocation coverage.
+    // Refuse future compilers until their container assumptions are validated.
+    compiler.starts_with("rustc 1.88.0 ") || compiler.starts_with("rustc 1.95.0 ")
 }
 macro_rules! scalar { ($($t:ty),*) => { $(impl HeapLayoutBound for $t {
     const INLINE_ONLY: bool = true;
@@ -111,7 +116,7 @@ impl<T: HeapLayoutBound> HeapLayoutBound for VecDeque<T> {
     }
 }
 fn tree_nodes<K, V>(len: usize, c: &mut Counter) -> Option<()> {
-    // Rust1.88 B=6:11 key/value slots and12 edges. Charging one full node per
+    // Rust1.88/1.95 B=6:11 key/value slots and12 edges. Charging one full node per
     // entry plus one root overcounts unused slots and internal/leaf grouping.
     // A zero-length map may retain its empty allocated root after removal.
     let node = 256usize
@@ -447,6 +452,55 @@ impl HeapLayoutBound for ottto_protocol::LocalAccountState {
 #[cfg(test)]
 mod sampled_scalar_buffer_tests {
     use super::*;
+    #[test]
+    fn sampled_release_compiler_allowlist_refuses_unvalidated_versions() {
+        assert!(compiler_layout_supported(
+            "rustc 1.88.0 (6b00bc388 2025-06-23)"
+        ));
+        assert!(compiler_layout_supported(
+            "rustc 1.95.0 (59807616e 2026-04-14)"
+        ));
+        for compiler in [
+            "",
+            "rustc 1.95.1 (unknown)",
+            "rustc 1.195.0 (unknown)",
+            "rustc 1.95.0-nightly (unknown)",
+            "rustc 1.97.0 (unknown)",
+        ] {
+            assert!(!compiler_layout_supported(compiler));
+        }
+    }
+    #[test]
+    fn sampled_release_layout_bounds_nested_requested_allocations() {
+        if !layout_supported() {
+            return;
+        }
+        for count in [0, 1, 12, 64, 256] {
+            let (map, allocations) = crate::retry_allocation_probe::measure(|| {
+                let mut map = BTreeMap::new();
+                for i in 0..count {
+                    let mut value = Vec::with_capacity(257);
+                    value.extend_from_slice(&[0_u8; 129]);
+                    let mut deque = VecDeque::with_capacity(4);
+                    deque.push_back(Arc::new(Mutex::new(value)));
+                    map.insert(format!("entry-{i}"), deque);
+                }
+                map
+            });
+            let measured = usize::try_from(allocations.requested_live).unwrap();
+            let charged = bound(&map, 8 * 1024 * 1024).unwrap();
+            assert!(
+                charged >= measured,
+                "count={count}, charged={charged}, requested={measured}"
+            );
+            assert!(bound(&map, charged - 1).is_none());
+            let (mut cleared, allocations) = crate::retry_allocation_probe::measure(|| map.clone());
+            let before = bound(&cleared, 8 * 1024 * 1024).unwrap();
+            assert!(before >= usize::try_from(allocations.requested_live).unwrap());
+            cleared.clear();
+            assert!(bound(&cleared, 8 * 1024 * 1024).is_some());
+        }
+    }
     #[test]
     fn sampled_scalar_buffers_charge_capacity_without_per_byte_traversal() {
         if !layout_supported() {
