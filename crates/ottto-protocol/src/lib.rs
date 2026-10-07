@@ -1852,6 +1852,11 @@ pub struct AgentStatusDiagnostic {
     /// Time this collector outcome occurred, not a quota observation time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<Rfc3339Timestamp>,
+    /// Earliest eligible provider retry after an evidenced rate-limit hold.
+    /// Not a scheduled attempt or a quota observation time. Older diagnostics
+    /// omit this; consumers must not infer a hold from stale readings alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<Rfc3339Timestamp>,
     /// Exact quota binding; display labels remain local-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_identifier_hash: Option<String>,
@@ -1884,6 +1889,7 @@ impl AgentStatusDiagnostic {
             severity,
             message: message.into(),
             observed_at: None,
+            retry_after: None,
             account_identifier_hash: None,
             organization_identifier_hash: None,
             account_label: None,
@@ -1905,6 +1911,7 @@ impl AgentStatusDiagnostic {
             severity,
             message: message.into(),
             observed_at: None,
+            retry_after: None,
             account_identifier_hash: None,
             organization_identifier_hash: None,
             account_label: Some(account_label.into()),
@@ -5029,6 +5036,34 @@ mod tests {
             ))
             .expect("manifest fixture")
         );
+    }
+
+    #[test]
+    fn quota_retry_deadline_is_optional_and_preserved_by_backend_redaction() {
+        let old = serde_json::json!({"code": "claude_oauth_usage_cache_reused", "severity": "info", "message": "Cached quota"});
+        let diagnostic: AgentStatusDiagnostic =
+            serde_json::from_value(old.clone()).expect("old wire");
+        assert!(diagnostic.retry_after.is_none());
+        assert_eq!(serde_json::to_value(&diagnostic).unwrap(), old);
+        let mut null = old.clone();
+        null["retry_after"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<AgentStatusDiagnostic>(null)
+            .unwrap()
+            .retry_after
+            .is_none());
+        let mut current = diagnostic
+            .with_observed_at(Some("2026-10-07T15:30:00Z".to_string()))
+            .with_quota_binding(
+                Some("account".to_string()),
+                Some("organization".to_string()),
+            );
+        current.retry_after = Some("2026-10-07T16:02:21Z".to_string());
+        let upload = redact_diagnostic_for_backend(current.clone());
+        assert_eq!(upload.retry_after, current.retry_after);
+        assert_eq!(upload.observed_at, current.observed_at);
+        let decoded: AgentStatusDiagnostic =
+            serde_json::from_value(serde_json::to_value(upload).unwrap()).unwrap();
+        assert_eq!(decoded, current);
     }
 
     #[test]
