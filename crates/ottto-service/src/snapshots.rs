@@ -49720,7 +49720,9 @@ mod tests {
     }
 
     fn codex_creator_item(headers: &[Value], path_session_id: &str) -> SnapshotItem {
-        let root = temp_dir("codex-creator");
+        // Parallel creator cases share the same session filename. Clock-only
+        // directories can collide and mutate another case's opened fixture.
+        let root = crate::test_scratch::ScratchDir::new("codex-creator");
         let path = root.join(format!(
             "rollout-2026-09-30T10-00-00-{path_session_id}.jsonl"
         ));
@@ -49733,13 +49735,44 @@ mod tests {
         let body = records.iter().map(|v| format!("{v}\n")).collect::<String>();
         fs::write(&path, &body).expect("write creator fixture");
         let source_file_fingerprint = sha256_hex(&["codex_creator_fixture_source:v1"]);
-        let item = parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", source_file_fingerprint)
+        parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", source_file_fingerprint)
             .expect("parse creator fixture")
             .into_iter()
             .next()
-            .expect("usage snapshot");
-        fs::remove_dir_all(root).expect("remove creator fixture");
-        item
+            .expect("usage snapshot")
+    }
+
+    #[test]
+    fn codex_creator_parallel_fixtures_keep_their_own_identity() {
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|worker| {
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        for iteration in 0..64 {
+                            let creator = format!("synthetic-worker-{worker}-{iteration}");
+                            let mut header = codex_creator_header();
+                            header["payload"]["creator_user_id"] = json!(creator);
+                            let id = header["payload"]["id"].as_str().unwrap();
+                            let item = codex_creator_item(std::slice::from_ref(&header), id);
+                            assert_eq!(item.source_session_id, id);
+                            assert_eq!(
+                                item.session_account_evidence
+                                    .as_ref()
+                                    .expect("isolated creator evidence")
+                                    .account_identifier_hash,
+                                ottto_core::billing_identity_hash("openai", "account", &creator)
+                            );
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().expect("parallel creator fixture");
+            }
+        });
     }
 
     fn codex_child_creator_header() -> Value {

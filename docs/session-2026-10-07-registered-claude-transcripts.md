@@ -38,3 +38,11 @@ data, unreadable roots, exact duplicate roots, existing same-ID wire behavior, a
 watch-target creation/removal. Tests use temporary directories and deny network
 and sensitive local stores. Validation results are recorded in the source PR;
 source checks do not establish containing-release or installed acceptance.
+
+Public CI exposed a pre-existing parallel Codex creator-fixture race: clock-only
+scratch directory names can collide, letting one test overwrite or remove another
+test's same-session file. Focused native tests reproduced the parser's existing
+opened-object identity refusal. The shared creator fixture now uses the existing
+unique, owner-only scratch-directory helper; a parallel regression checks each
+synthetic creator retains its own identity. Production parser and identity guards
+remain unchanged.
