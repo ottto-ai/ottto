@@ -212,7 +212,7 @@ crate::heap_layout_bound::fields!(ottto_protocol::AgentStatusSnapshot; source, s
 
 crate::heap_layout_bound::fields!(ottto_protocol::AgentRuntimeDefaults; captured_at, provenance, machine_id, model, service_tier, speed_mode, fast_mode_enabled, priority_enabled, reasoning_effort, approval_policy, sandbox_mode, selector_context, selector_sources);
 
-crate::heap_layout_bound::fields!(ottto_protocol::AgentStatusDiagnostic; code, severity, message, observed_at, account_identifier_hash, organization_identifier_hash, account_label, scope);
+crate::heap_layout_bound::fields!(ottto_protocol::AgentStatusDiagnostic; code, severity, message, observed_at, retry_after, account_identifier_hash, organization_identifier_hash, account_label, scope);
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentDiagnosticScope {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
