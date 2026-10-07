@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 480,
-  "content_sha256": "52c8da9d5df11eb136767980e7d029273377ad0c8e01ae0e36ada5d353dccd7c",
+  "candidate_file_count": 481,
+  "content_sha256": "cbf20df44aa431dc5412c193f979613be08a7bf0f46e79ac29831ae4ee879f8d",
   "files": [
     {
       "executable": false,
@@ -860,8 +860,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/heap_layout_bound.rs",
-      "sha256": "ab114255610e1c41b616bd4c976b574c4a288ec575a6565e9eed74b015488699",
-      "size_bytes": 19718
+      "sha256": "7ebdf5d88213babca602e2c5053138de003332fc6785163dacde48fe553f1028",
+      "size_bytes": 22037
     },
     {
       "executable": false,
@@ -1133,8 +1133,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests.rs",
-      "sha256": "7403672252a293c8a64aeb40d9c064bd81f942648c8ab1c1dc6ff038c2bac6d7",
-      "size_bytes": 51703
+      "sha256": "5dcbc57948647e101ae30791c33aeb7f4218e1b5c2d978659882ff3f9f77d78f",
+      "size_bytes": 53439
     },
     {
       "executable": false,
@@ -2273,6 +2273,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-07-sampled-release-toolchain.md",
+      "sha256": "7f1427ed003b5ca6e4aaff9b99d67c467e40d6073328e333b824a22068be8552",
+      "size_bytes": 1723
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-07-sampled-transcript-acquisition.md",
       "sha256": "33c6039be6f796a3cdbd8b191379744dcbdf8e5456ccfa7afc262073edea4942",
       "size_bytes": 9331
@@ -3363,9 +3370,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-07T20:14:11+00:00",
+  "generated_at": "2026-10-07T20:43:19+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 481,
+  "output_file_count": 482,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3402,5 +3409,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "a6f1fadfd7d55a04d55d09a46798c1eb14d8a33e"
+  "source_commit": "51da2f0887cf8e4bf4ed92859450517ca8b25319"
 }

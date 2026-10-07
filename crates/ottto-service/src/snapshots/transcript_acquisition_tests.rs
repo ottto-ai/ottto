@@ -552,6 +552,48 @@ fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value 
     serde_json::to_value(scan.snapshots).unwrap()
 }
 
+/// The shipped release compiler must exercise this path rather than silently
+/// passing the rest of the sampled suite through unsupported-layout skips.
+#[test]
+#[cfg(all(target_os = "macos", target_pointer_width = "64"))]
+fn sampled_release_compiler_enables_native_tails_for_both_providers() {
+    let compiler = env!("OTTTO_SCAN_LAYOUT_RUSTC");
+    if !(compiler.starts_with("rustc 1.88.0 ") || compiler.starts_with("rustc 1.95.0 ")) {
+        return;
+    }
+    assert!(
+        crate::heap_layout_bound::layout_supported(),
+        "validated release compiler must admit bounded native cache: {compiler}"
+    );
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (index, _, modes) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "release-compiler",
+        );
+        assert_eq!(modes, (1, 0, 0));
+        fixture.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (_, tail, modes, metrics) =
+            production_scan_with_metrics(&fixture, source, index, Some(cache), "release-compiler");
+        assert_eq!(modes, (0, 1, 0));
+        assert!(metrics.0 < fixture.file.0.metadata().unwrap().len());
+        assert!(metrics.1 > 0);
+        let (_, full, _) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            None,
+            "release-compiler",
+        );
+        assert_eq!(production_body(source, tail), production_body(source, full));
+    }
+}
+
 #[test]
 fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_restart() {
     if !crate::heap_layout_bound::layout_supported() {
