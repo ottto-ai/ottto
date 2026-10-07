@@ -110,6 +110,21 @@ behavior during module extraction. Most shell scripts, historical docs, unread
 Rust sections, fixtures, dependency/MSRV behavior, and real native lifecycle
 integration remain outside a detailed correctness audit.
 
+## Status lifecycle follow-up — 7 October 2026
+
+Synthetic failures reproduced the status-owner concern above: failed thread
+startup left a stopped global owner installed, and acquisition/upload unwinds
+left a lane busy. The status owner now gates acquisition until all three workers
+spawn, joins partial workers on failure and leaves failed startup retryable.
+Concurrent starts install one worker per source. Acquisition unwind releases
+waiters with an error and retains last-good data without rewriting its timestamps;
+upload unwind retains the exact body for the existing transport retry. Focused
+regressions cover these paths alongside the original schedule/freshness tests.
+Five-minute cadence, minute failure delay, manual coalescing and shutdown remain
+unchanged. This repairs caught Rust unwinds, not aborts or indefinitely blocked
+provider calls. It adds no scheduler or retry activation change. The audit
+references elsewhere in this report describe the earlier baseline.
+
 ## Work priority and sequencing
 
 This ranking is a proposed engineering order, not a claim that conditional

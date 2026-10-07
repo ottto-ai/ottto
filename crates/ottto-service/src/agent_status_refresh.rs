@@ -5,7 +5,8 @@ use crate::agent_status::{
 };
 use crate::{LocalApiError, LocalDaemon};
 use ottto_protocol::SourceKind;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
@@ -13,7 +14,7 @@ const INTERVAL: Duration = Duration::from_secs(300);
 const RETRY_DELAY: Duration = Duration::from_secs(60);
 const EVENT_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const MANUAL_COALESCE: Duration = Duration::from_secs(1);
-static OWNER: OnceLock<Owner> = OnceLock::new();
+static OWNER: Mutex<Option<Arc<Owner>>> = Mutex::new(None);
 
 struct Owner {
     lanes: [Arc<StatusLane>; 3],
@@ -61,8 +62,10 @@ impl StatusSchedule {
 #[derive(Default)]
 struct LaneState {
     schedule: StatusSchedule,
+    started: bool,
     running: bool,
     collecting: bool,
+    collection_failed: bool,
     manual: bool,
     stopped: bool,
     generation: u64,
@@ -80,6 +83,18 @@ impl StatusLane {
             state: Mutex::new(LaneState::default()),
             changed: Condvar::new(),
         }
+    }
+    // Workers cannot acquire or publish until every source has spawned.
+    fn wait_started(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .changed
+            .wait_while(state, |state| !state.started && !state.stopped)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !state.stopped
     }
     fn request(&self) {
         let mut state = self
@@ -144,6 +159,7 @@ impl StatusLane {
         }
         let age = state.schedule.last_started.map(|at| now.saturating_sub(at));
         if !state.collecting
+            && !state.collection_failed
             && (state.running && !manual
                 || age.is_some_and(|age| age < if manual { MANUAL_COALESCE } else { INTERVAL }))
         {
@@ -167,6 +183,11 @@ impl StatusLane {
         if state.stopped {
             return Err(LocalApiError::LocalOperationFailed(
                 "agent status refresh stopped".into(),
+            ));
+        }
+        if state.collection_failed {
+            return Err(LocalApiError::LocalOperationFailed(
+                "agent status acquisition failed".into(),
             ));
         }
         Ok(state.collection.as_ref().unwrap().clone())
@@ -195,7 +216,8 @@ impl StatusLane {
             // Transport retries reuse the exact collected body until the next
             // normal acquisition. A lost response cannot multiply provider
             // reads or change observed_at/captured_at on the retried body.
-            let reuse = !state.manual
+            let reuse = !state.collection_failed
+                && !state.manual
                 && !state.schedule.pending
                 && state.schedule.retry_not_before != Duration::ZERO
                 && state
@@ -221,12 +243,32 @@ impl StatusLane {
         let collection = if let Some(collection) = reused {
             collection
         } else {
-            let collection = Arc::new(collect());
+            let collection = match catch_unwind(AssertUnwindSafe(collect)) {
+                Ok(collection) => Arc::new(collection),
+                Err(_) => {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.running = false;
+                    state.collecting = false;
+                    state.collection_failed = true;
+                    // Release this acquisition's waiters without replacing or
+                    // re-dating the last good collection. The existing worker
+                    // reacquires after the ordinary failure delay.
+                    state.generation += 1;
+                    state.schedule.finish(finished_at(), false);
+                    self.changed.notify_all();
+                    eprintln!("agent status acquisition panicked; retry deferred");
+                    return true;
+                }
+            };
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.collection = Some(collection.clone());
+            state.collection_failed = false;
             state.generation += 1;
             state.collecting = false;
             self.changed.notify_all();
@@ -237,7 +279,10 @@ impl StatusLane {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .stopped;
-        let success = !stopped && publish(&collection);
+        // A publication unwind has the same uncertain outcome as a lost
+        // response: retain this exact body and use the existing transport retry.
+        let success =
+            !stopped && catch_unwind(AssertUnwindSafe(|| publish(&collection))).unwrap_or(false);
         let mut state = self
             .state
             .lock()
@@ -257,26 +302,68 @@ fn index(source: &SourceKind) -> usize {
 }
 
 pub fn start(daemon: LocalDaemon) -> anyhow::Result<()> {
-    let owner = Owner {
-        lanes: std::array::from_fn(|_| Arc::new(StatusLane::new())),
-    };
-    if OWNER.set(owner).is_err() {
-        return Ok(());
-    }
-    for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
-        let lane = OWNER.get().unwrap().lanes[index(&source)].clone();
+    start_with(&OWNER, |lane, source| {
         let daemon = daemon.clone();
-        if let Err(error) = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name(format!("ottto-status-{}", index(&source)))
             .spawn(move || run(lane, source, daemon))
-        {
-            stop();
-            return Err(error.into());
+    })
+}
+fn start_with(
+    slot: &Mutex<Option<Arc<Owner>>>,
+    mut spawn: impl FnMut(Arc<StatusLane>, SourceKind) -> std::io::Result<std::thread::JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    // Serialize concurrent startup and publish only a fully started owner.
+    // A failed attempt leaves standalone callers and a later start available.
+    let mut installed = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if installed.is_some() {
+        return Ok(());
+    }
+    let owner = Arc::new(Owner {
+        lanes: std::array::from_fn(|_| Arc::new(StatusLane::new())),
+    });
+    let mut workers = Vec::new();
+    for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
+        let lane = owner.lanes[index(&source)].clone();
+        match spawn(lane, source) {
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                for lane in &owner.lanes {
+                    lane.stop();
+                }
+                // Started threads are still at their startup gate. Reap them
+                // before permitting a retry to create any replacement worker.
+                for worker in workers {
+                    let _ = worker.join();
+                }
+                return Err(error.into());
+            }
         }
+    }
+    *installed = Some(owner.clone());
+    for lane in &owner.lanes {
+        let mut state = lane
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.started = true;
+        lane.changed.notify_all();
     }
     Ok(())
 }
+fn owner() -> Option<Arc<Owner>> {
+    OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 fn run(lane: Arc<StatusLane>, source: SourceKind, daemon: LocalDaemon) {
+    if !lane.wait_started() {
+        return;
+    }
     loop {
         // Re-read ordinary device grants each pass; a disabled source is not
         // polled automatically. Manual diagnostics retain their old behavior.
@@ -344,7 +431,7 @@ pub(crate) fn collection(
     expires_at: String,
     manual: bool,
 ) -> Result<Arc<AgentStatusCollection>, LocalApiError> {
-    match OWNER.get() {
+    match owner() {
         Some(owner) => owner.lanes[index(source)].collection(manual),
         None => Ok(Arc::new(collect_agent_status_collection(
             source,
@@ -400,22 +487,22 @@ pub(crate) fn status_for_reconciliation(
 }
 
 pub(crate) fn active() -> bool {
-    OWNER.get().is_some()
+    owner().is_some()
 }
 pub fn request(source: &SourceKind) {
-    if let Some(owner) = OWNER.get() {
+    if let Some(owner) = owner() {
         owner.lanes[index(source)].request();
     }
 }
 pub fn request_all() {
-    if let Some(owner) = OWNER.get() {
+    if let Some(owner) = owner() {
         for lane in &owner.lanes {
             lane.wake_if_stale(lane.origin.elapsed(), OffsetDateTime::now_utc());
         }
     }
 }
 pub(crate) fn stop() {
-    if let Some(owner) = OWNER.get() {
+    if let Some(owner) = owner() {
         for lane in &owner.lanes {
             lane.stop();
         }
@@ -676,6 +763,8 @@ mod tests {
         let lane = Arc::new(StatusLane::new());
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        let publications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let published = publications.clone();
         let worker = lane.clone();
         let handle = std::thread::spawn(move || {
             worker.pass(
@@ -686,7 +775,10 @@ mod tests {
                     release_rx.recv().unwrap();
                     specimen(SourceKind::Pi)
                 },
-                |_| panic!("shutdown must prevent a new upload"),
+                |_| {
+                    published.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    true
+                },
                 || seconds(5),
             )
         });
@@ -694,6 +786,7 @@ mod tests {
         lane.stop();
         release_tx.send(()).unwrap();
         assert!(handle.join().unwrap());
+        assert_eq!(publications.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(lane.collection(true).is_err());
     }
 
@@ -795,5 +888,194 @@ mod tests {
         );
         assert_eq!(lane.state.lock().unwrap().generation, 2);
         assert!(!pass(&lane, 16, 16, true));
+    }
+    #[test]
+    fn failed_start_reaps_partial_workers_and_allows_retry() {
+        for fail_at in 0..3 {
+            let slot = Mutex::new(None);
+            let (tx, rx) = mpsc::channel();
+            let mut attempts = 0;
+            assert!(start_with(&slot, |lane, _| {
+                let at = attempts;
+                attempts += 1;
+                if at == fail_at {
+                    return Err(std::io::Error::other("synthetic spawn failure"));
+                }
+                let tx = tx.clone();
+                Ok(std::thread::spawn(move || {
+                    tx.send(lane.wait_started()).unwrap()
+                }))
+            })
+            .is_err());
+            assert!(slot.lock().unwrap().is_none());
+            assert_eq!(attempts, fail_at + 1);
+            for _ in 0..fail_at {
+                assert!(
+                    !rx.recv_timeout(seconds(2)).unwrap(),
+                    "partial worker must not acquire"
+                );
+            }
+            let mut retry_spawns = 0;
+            start_with(&slot, |lane, _| {
+                retry_spawns += 1;
+                let tx = tx.clone();
+                Ok(std::thread::spawn(move || {
+                    tx.send(lane.wait_started()).unwrap()
+                }))
+            })
+            .unwrap();
+            assert_eq!(retry_spawns, 3);
+            for _ in 0..3 {
+                assert!(rx.recv_timeout(seconds(2)).unwrap());
+            }
+            start_with(&slot, |_, _| panic!("installed owner must not spawn again")).unwrap();
+            for lane in &slot.lock().unwrap().as_ref().unwrap().lanes {
+                assert!(lane.state.lock().unwrap().started);
+                lane.stop();
+            }
+        }
+    }
+    #[test]
+    fn concurrent_starts_install_exactly_one_worker_per_source() {
+        let slot = Arc::new(Mutex::new(None));
+        let (tx, rx) = mpsc::channel();
+        let mut starts = Vec::new();
+        for _ in 0..2 {
+            let slot = slot.clone();
+            let tx = tx.clone();
+            starts.push(std::thread::spawn(move || {
+                start_with(&slot, |lane, source| {
+                    let tx = tx.clone();
+                    Ok(std::thread::spawn(move || {
+                        if lane.wait_started() {
+                            tx.send(index(&source)).unwrap();
+                        }
+                    }))
+                })
+                .unwrap()
+            }));
+        }
+        for start in starts {
+            start.join().unwrap();
+        }
+        drop(tx);
+        let mut sources = (0..3)
+            .map(|_| rx.recv_timeout(seconds(2)).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            rx.recv_timeout(seconds(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        sources.sort_unstable();
+        assert_eq!(sources, vec![0, 1, 2]);
+    }
+    #[test]
+    fn acquisition_panic_releases_waiter_and_reacquires_preserving_last_good() {
+        let lane = Arc::new(StatusLane::new());
+        assert!(pass(&lane, 0, 7, true));
+        let last_good = lane.state.lock().unwrap().collection.clone().unwrap();
+        let requester = lane.clone();
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            tx.send(requester.collection_at(seconds(300), true))
+                .unwrap()
+        });
+        let state = lane.state.lock().unwrap();
+        let (state, timeout) = lane
+            .changed
+            .wait_timeout_while(state, seconds(2), |state| !state.manual)
+            .unwrap();
+        assert!(!timeout.timed_out());
+        drop(state);
+        let mut publications = 0;
+        assert!(lane.pass(
+            seconds(300),
+            true,
+            || panic!("synthetic acquisition panic"),
+            |_| {
+                publications += 1;
+                true
+            },
+            || seconds(307)
+        ));
+        // Stop even if the regression returns, so a broken waiter never leaks
+        // into later tests or leaves this synthetic test process hanging.
+        let result = rx.recv_timeout(seconds(2));
+        if result.is_err() {
+            lane.stop();
+        }
+        waiter.join().unwrap();
+        assert!(result.unwrap().is_err());
+        assert_eq!(publications, 0);
+        {
+            let state = lane.state.lock().unwrap();
+            assert!(!state.running && !state.collecting);
+            assert!(Arc::ptr_eq(state.collection.as_ref().unwrap(), &last_good));
+        }
+        assert!(!pass(&lane, 366, 366, true));
+        let mut acquisitions = 0;
+        assert!(lane.pass(
+            seconds(367),
+            true,
+            || {
+                acquisitions += 1;
+                specimen(SourceKind::Codex)
+            },
+            |_| true,
+            || seconds(374)
+        ));
+        assert_eq!(
+            acquisitions, 1,
+            "acquisition failure cannot reuse stale last-good as a transport retry"
+        );
+        assert_eq!(lane.state.lock().unwrap().generation, 3);
+        assert!(!Arc::ptr_eq(
+            &lane.collection_at(seconds(375), false).unwrap(),
+            &last_good
+        ));
+        assert_eq!(
+            last_good.source_health_snapshot.captured_at,
+            "2026-10-05T00:00:00Z"
+        );
+    }
+    #[test]
+    fn upload_panic_releases_lane_and_retries_the_exact_collection() {
+        let lane = StatusLane::new();
+        assert!(lane.pass(
+            Duration::ZERO,
+            true,
+            || specimen(SourceKind::Pi),
+            |_| panic!("synthetic upload panic"),
+            || seconds(7)
+        ));
+        let original = lane.collection_at(seconds(8), false).unwrap();
+        assert!(!lane.state.lock().unwrap().running);
+        assert!(!pass(&lane, 66, 66, true));
+        let mut acquisitions = 0;
+        let mut retried = None;
+        assert!(lane.pass(
+            seconds(67),
+            true,
+            || {
+                acquisitions += 1;
+                specimen(SourceKind::Pi)
+            },
+            |collection| {
+                retried = Some(serde_json::to_value(&collection.snapshots).unwrap());
+                true
+            },
+            || seconds(74)
+        ));
+        assert_eq!(acquisitions, 0);
+        assert_eq!(
+            retried.unwrap(),
+            serde_json::to_value(&original.snapshots).unwrap()
+        );
+        assert!(Arc::ptr_eq(
+            &lane.collection_at(seconds(75), false).unwrap(),
+            &original
+        ));
+        assert_eq!(lane.state.lock().unwrap().generation, 1);
+        assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(300));
     }
 }
