@@ -1158,19 +1158,19 @@ mod tests {
         // A regular file cannot be enumerated as a directory on any platform.
         fs::write(root.join(REJECTED_SUBDIR), b"maintenance unavailable").unwrap();
         let inventory = LaunchEventInventory::refresh(&home.0);
-        complete(&inventory, &[id.clone()]);
-        assert!(inventory.prepared(&[id.clone()]));
+        complete(&inventory, std::slice::from_ref(&id));
+        assert!(inventory.prepared(std::slice::from_ref(&id)));
         assert!(inventory.matching(&id).is_some());
 
         fs::rename(root.join(PROCESSED_SUBDIR), root.join("retained-fixture")).unwrap();
         fs::write(root.join(PROCESSED_SUBDIR), b"claims unavailable").unwrap();
         let unavailable = LaunchEventInventory::refresh(&home.0);
-        let mut result = unavailable.prepare_step(&[id.clone()]);
+        let mut result = unavailable.prepare_step(std::slice::from_ref(&id));
         while result == Ok(false) {
-            result = unavailable.prepare_step(&[id.clone()]);
+            result = unavailable.prepare_step(std::slice::from_ref(&id));
         }
         assert_eq!(result, Err(()));
-        assert!(!unavailable.prepared(&[id.clone()]));
+        assert!(!unavailable.prepared(std::slice::from_ref(&id)));
         assert!(unavailable.matching(&id).is_none());
     }
 
@@ -1254,9 +1254,9 @@ mod tests {
         ]);
         drop_event(&home.0, &raw, None);
         let inventory = LaunchEventInventory::refresh(&home.0);
-        assert_eq!(inventory.prepare_step(&[id.clone()]), Ok(false));
+        assert_eq!(inventory.prepare_step(std::slice::from_ref(&id)), Ok(false));
         assert!(inventory.matching(&id).is_none());
-        assert!(complete(&inventory, &[id.clone()]) > 1);
+        assert!(complete(&inventory, std::slice::from_ref(&id)) > 1);
         assert!(inventory.matching(&id).is_none());
         assert_eq!(inventory.lookup.lock().unwrap().ambiguous.len(), 1);
     }
@@ -1286,12 +1286,15 @@ mod tests {
         // Finish the original cursor without pretending the newly demanded
         // worker was included in its complete retained-store pass.
         while !inventory.lookup.lock().unwrap().complete {
-            assert_eq!(inventory.prepare_step(&[second.clone()]), Ok(false));
+            assert_eq!(
+                inventory.prepare_step(std::slice::from_ref(&second)),
+                Ok(false)
+            );
         }
-        assert!(!inventory.prepared(&[second.clone()]));
+        assert!(!inventory.prepared(std::slice::from_ref(&second)));
         assert!(inventory.matching(&second).is_none());
-        complete(&inventory, &[second.clone()]);
-        assert!(inventory.prepared(&[second.clone()]));
+        complete(&inventory, std::slice::from_ref(&second));
+        assert!(inventory.prepared(std::slice::from_ref(&second)));
         assert!(inventory.matching(&second).is_some());
         complete(&inventory, &duplicates);
         assert_eq!(inventory.lookup.lock().unwrap().workers.len(), 1);
@@ -1316,7 +1319,7 @@ mod tests {
         let home = TestHome::new();
         let (id, path) = retained(&home.0, 1);
         let inventory = LaunchEventInventory::refresh(&home.0);
-        complete(&inventory, &[id.clone()]);
+        complete(&inventory, std::slice::from_ref(&id));
         assert!(inventory.matching(&id).is_some());
         // Same-name changes are revalidated by a fresh ordinary context, not a migration.
         let raw = event_json(&[
@@ -1328,15 +1331,15 @@ mod tests {
         ]);
         fs::write(&path, raw).unwrap();
         let edited = LaunchEventInventory::refresh(&home.0);
-        let mut result = edited.prepare_step(&[id.clone()]);
+        let mut result = edited.prepare_step(std::slice::from_ref(&id));
         while result == Ok(false) {
-            result = edited.prepare_step(&[id.clone()]);
+            result = edited.prepare_step(std::slice::from_ref(&id));
         }
         assert_eq!(result, Err(()));
         assert!(edited.matching(&id).is_none());
         assert!(!path.exists());
         let removed = LaunchEventInventory::refresh(&home.0);
-        complete(&removed, &[id.clone()]);
+        complete(&removed, std::slice::from_ref(&id));
         assert!(removed.matching(&id).is_none());
         for n in 2..=600 {
             let (_, path) = retained(&home.0, n);
@@ -1346,7 +1349,7 @@ mod tests {
         }
         let backlog = LaunchEventInventory::refresh(&home.0);
         let last = worker(600);
-        assert!(complete(&backlog, &[last.clone()]) > 1);
+        assert!(complete(&backlog, std::slice::from_ref(&last)) > 1);
         assert!(backlog.matching(&last).is_some());
         let (_, path) = retained(&home.0, 1);
         let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -1357,9 +1360,9 @@ mod tests {
         .unwrap();
         let expired = LaunchEventInventory::refresh(&home.0);
         // Cleanup may change the directory fence once; the next context converges.
-        while expired.prepare_step(&[id.clone()]) == Ok(false) {}
+        while expired.prepare_step(std::slice::from_ref(&id)) == Ok(false) {}
         let after_cleanup = LaunchEventInventory::refresh(&home.0);
-        complete(&after_cleanup, &[id.clone()]);
+        complete(&after_cleanup, std::slice::from_ref(&id));
         assert!(after_cleanup.matching(&id).is_none());
         assert!(!path.exists());
     }
