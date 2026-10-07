@@ -46,3 +46,12 @@ opened-object identity refusal. The shared creator fixture now uses the existing
 unique, owner-only scratch-directory helper; a parallel regression checks each
 synthetic creator retains its own identity. Production parser and identity guards
 remain unchanged.
+
+A later hosted run passed the creator controls but exposed another existing
+fixture timing defect: the cloud-cleanup test's mock backend stopped after
+750 milliseconds, potentially before the operation reached it. A controlled
+one-second setup delay reproduced the assertion with connection refusal. The
+mock now observes until the operation finishes; its watchdog fails rather than
+certifying absence. A delayed synthetic request verifies late registration
+remains observable. Production cloud-cleanup and identity-reservation guards
+are unchanged.

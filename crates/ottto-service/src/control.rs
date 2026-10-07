@@ -22816,7 +22816,8 @@ mod tests {
             )
             .unwrap();
         let grant_before = grants.load().unwrap().unwrap();
-        let (api_base, register_observed) = observed_install_registration_server();
+        let (api_base, register_observed, operation_finished) =
+            observed_install_registration_server();
         let connection = LocalConnectionBinding {
             setup_run_id: "setup_install_blocked".to_string(),
             setup_run_token_expires_at: "2030-01-01T00:00:00Z".to_string(),
@@ -22837,16 +22838,19 @@ mod tests {
             source: Some("pi".to_string()),
         };
 
-        assert!(matches!(
-            run_install_source_action(
-                &daemon,
-                &api_base,
-                &mut credentials,
-                &action,
-                &test_machine(),
-            ),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        let result = run_install_source_action(
+            &daemon,
+            &api_base,
+            &mut credentials,
+            &action,
+            &test_machine(),
+        );
+        // Observe until the operation completes, even when setup is slow.
+        let _ = operation_finished.send(());
+        assert!(
+            matches!(result, Err(LocalApiError::CloudSessionCleanupRequired)),
+            "actual install result: {result:?}"
+        );
         assert!(
             !register_observed
                 .recv_timeout(Duration::from_secs(2))
@@ -29044,13 +29048,14 @@ X-API-Key = "otel_redacted"
         )
     }
 
-    fn observed_install_registration_server() -> (String, mpsc::Receiver<bool>) {
+    fn observed_install_registration_server() -> (String, mpsc::Receiver<bool>, mpsc::Sender<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind install backend");
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().expect("install backend address");
         let (observed_tx, observed_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
         thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_millis(750);
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -29078,17 +29083,48 @@ X-API-Key = "otel_redacted"
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
-                            observed_tx.send(false).unwrap();
-                            return;
+                        match finished_rx.try_recv() {
+                            Ok(()) => {
+                                observed_tx.send(false).unwrap();
+                                return;
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => return,
+                            Err(mpsc::TryRecvError::Empty) => {}
                         }
+                        // A watchdog failure must not certify that no request
+                        // occurred while the operation was still in progress.
+                        assert!(
+                            Instant::now() < deadline,
+                            "install operation did not finish"
+                        );
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(error) => panic!("accept install registration: {error}"),
                 }
             }
         });
-        (format!("http://{address}"), observed_rx)
+        (format!("http://{address}"), observed_rx, finished_tx)
+    }
+
+    #[test]
+    fn observed_install_registration_remains_live_until_operation_finishes() {
+        let (api_base, observed, operation_finished) = observed_install_registration_server();
+        // Deliberately exceed the former 750ms mock lifetime. Slow setup must
+        // not turn an unobserved registration into a false cleanup success.
+        thread::sleep(Duration::from_secs(1));
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let response: serde_json::Value = backend_post_json(
+            &format!("{api_base}/api/v1/telemetry/devices/registration-preparations"),
+            &json!({}),
+            &[],
+        )
+        .expect("late synthetic registration reaches observer");
+        assert_eq!(response["preparation_id"], "preparation_should_not_rotate");
+        assert!(observed.recv_timeout(Duration::from_secs(2)).unwrap());
+        let _ = operation_finished.send(());
     }
 
     fn cloud_control_validation_rejection_server(action: &str) -> String {
