@@ -78,7 +78,7 @@ impl LiveAuthority {
         let seal = backfill_seal(&backfill_path)?;
         // Do not bless a state file changed since the canonical reader ran.
         let current = if seal.is_some() {
-            serde_json::from_slice(
+            crate::snapshot_retry::decode_state(
                 &crate::snapshot_retry::read_state(
                     &backfill_path,
                     crate::snapshot_retry::RESPONSE_BYTES,
