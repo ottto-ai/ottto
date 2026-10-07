@@ -4603,6 +4603,11 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         census_complete,
         &census_window_end,
     );
+    let _account_coverage = crate::snapshots::claude_request_accounts::apply(
+        &mut scan_result.snapshots,
+        &api_report,
+        &trace_report,
+    );
     stats.identity_complete_session_count = scan_result
         .snapshots
         .iter()

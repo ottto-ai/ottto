@@ -25,6 +25,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
 pub(crate) mod cache_observations;
+pub(crate) mod claude_request_accounts;
 mod codex_file_join;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
@@ -298,7 +299,9 @@ const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // canonical fold accepts monotonic population of every usage counter while
 // retaining fail-closed handling for chronological regressions and incomparable
 // states at the same provider instant.
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v36";
+// v37 qualifies subagent own-request account coverage in existing provenance.
+// It revisits ordinary cached parses without changing scan identity or usage authority.
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v37";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -5883,6 +5886,18 @@ fn semantic_attribution(item: &SnapshotItem) -> Value {
         "origin": &item.origin,
         "facts": semantic_attribution_facts(item),
     });
+    if matches!(
+        item.provenance.collector.as_str(),
+        claude_request_accounts::COMPLETE | claude_request_accounts::UNKNOWN
+    ) {
+        value
+            .as_object_mut()
+            .expect("semantic attribution is an object")
+            .insert(
+                "request_account_coverage".to_string(),
+                json!(item.provenance.collector),
+            );
+    }
     if !account_identifier_hashes.is_empty() {
         value
             .as_object_mut()
@@ -36235,6 +36250,403 @@ mod tests {
                 .excluded_request_id_hashes,
             BTreeSet::from([hash("req_a"), hash("req_b")])
         );
+    }
+
+    fn d1_subagent_account_specimen(
+        item: &mut SnapshotItem,
+        api: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+        trace: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
+    ) -> bool {
+        let root = claude_snapshot_family_root(item);
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(root.clone(), api.to_vec())]),
+            ..Default::default()
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(root, trace.to_vec())]),
+            ..Default::default()
+        };
+        claude_request_accounts::apply(std::slice::from_mut(item), &api_report, &trace_report)
+            == [claude_request_accounts::Coverage::Complete]
+    }
+
+    #[test]
+    fn claude_d1_subagent_own_request_qualification() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let child = items[1].clone();
+        let make_api = |request: &str, seq: u64, account: &str| {
+            let mut row = complete_api_row(&root, request, seq, 10, 1, 0);
+            row.account_identifier_hash = Some(account.to_string());
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+            row
+        };
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let c = "c".repeat(64);
+        let api = vec![
+            make_api("req_1", 1, &a),
+            make_api("req_2", 2, &a),
+            make_api("req_3", 3, &a),
+            make_api("req_4", 4, &a),
+            make_api("req_5", 5, &b),
+            make_api("aux", 6, &c),
+        ];
+        let trace = vec![complete_trace_row(&root, "req_5", "a4d1585d310070d0f")];
+        let evidence = BTreeMap::from([(root.clone(), api.clone())]);
+        let mut current = vec![child.clone()];
+        let mut index = ScanIndex::default();
+        apply_claude_effort_evidence_with_index(
+            &mut current,
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:01:00Z",
+        );
+        assert!(current[0]
+            .model_usage
+            .iter()
+            .all(|r| r.account_identifier_hash.is_none()));
+        assert!(index.claude_account_family_witnesses.is_empty());
+        let out = std::env::var_os("OTTTO_D1_TEST_OUTPUT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dir.join("native-proof"));
+        fs::create_dir_all(&out).unwrap();
+        let mut before = child.clone();
+        before.source_file_fingerprint = Some("c".repeat(64));
+        for row in before.model_usage.iter_mut().chain(
+            before
+                .usage_buckets
+                .iter_mut()
+                .flat_map(|b| b.model_usage.iter_mut()),
+        ) {
+            row.cost_usd = Some("2.00".into());
+        }
+        before.cost = Some(SnapshotCost {
+            total_cost_usd: Some("2.00".into()),
+            input_cost_usd: None,
+            output_cost_usd: None,
+            cache_read_cost_usd: None,
+            cache_creation_cost_usd: None,
+            evidence_source: "synthetic_reported".into(),
+        });
+        before.session_account_evidence = Some(SessionAccountEvidence {
+            provider: "anthropic",
+            account_identifier_hash: None,
+            provider_workspace_hash: None,
+            identity_hash_scheme: "provider-sha256:v1",
+            evidence_source: "claude_desktop_original:v1",
+            identity_disposition: Some("missing"),
+            source_created_at: None,
+        });
+        before.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &before);
+        let before_wire = serde_json::to_value(&before).unwrap();
+        let mut after = before.clone();
+
+        assert!(d1_subagent_account_specimen(&mut after, &api, &trace));
+        assert!(after
+            .model_usage
+            .iter()
+            .chain(
+                after
+                    .usage_buckets
+                    .iter()
+                    .flat_map(|b| b.model_usage.iter())
+            )
+            .all(|r| r.account_identifier_hash.as_deref() == Some(b.as_str())));
+        let mut comparison = after.clone();
+        set_session_account_hash(&mut comparison, None);
+        comparison.snapshot_fingerprint = before.snapshot_fingerprint.clone();
+        comparison.provenance.collector = before.provenance.collector.clone();
+        assert_eq!(
+            serde_json::to_value(&comparison).unwrap(),
+            before_wire,
+            "identity-only specimen preserves every other field"
+        );
+        assert!(after.usage_accounting_contract.is_none());
+        assert_eq!(
+            after.session_account_evidence,
+            before.session_account_evidence
+        );
+        let mut checks = vec![
+            json!({"case":"mixed_root_single_child","baseline_unknown":true,"candidate_account":"own_B","money_preserved":true,"no_family_witness":true}),
+        ];
+        for name in [
+            "missing_api",
+            "unchecked",
+            "missing_hash",
+            "duplicate_api",
+            "conflicting_api",
+            "wrong_api_root",
+            "invalid_fingerprint",
+            "missing_trace",
+            "wrong_trace_owner",
+            "trace_client_mismatch",
+            "known_account_conflict",
+            "cloud_destination",
+            "request_count_mismatch",
+            "malformed_account",
+        ] {
+            let mut candidate = before.clone();
+            let mut rows = api.clone();
+            let mut witnesses = trace.clone();
+            match name {
+                "missing_api" => {
+                    rows.retain(|r| r.request_id != "req_5");
+                }
+                "unchecked" => rows[4].account_identity_checked = false,
+                "missing_hash" => rows[4].account_identifier_hash = None,
+                "duplicate_api" => rows.push(rows[4].clone()),
+                "conflicting_api" => rows.push(make_api("req_5", 5, &c)),
+                "wrong_api_root" => rows[4].session_id = "foreign-root".into(),
+                "invalid_fingerprint" => rows[4].fingerprint = "bad".into(),
+                "missing_trace" => witnesses.clear(),
+                "wrong_trace_owner" => {
+                    witnesses[0] = complete_trace_row(&root, "req_5", "different-child")
+                }
+                "trace_client_mismatch" => witnesses[0].client_request_id = "other-client".into(),
+                "known_account_conflict" => set_session_account_hash(&mut candidate, Some(&a)),
+                "cloud_destination" => {
+                    candidate.usage_buckets[0].model_usage[0].gateway_provider =
+                        Some("vertex".into())
+                }
+                "request_count_mismatch" => candidate.request_count = 2,
+                "malformed_account" => rows[4].account_identifier_hash = Some("ABC".into()),
+                _ => unreachable!(),
+            }
+            if name != "invalid_fingerprint" {
+                for row in &mut rows {
+                    row.fingerprint.clear();
+                    row.fingerprint = format!(
+                        "sha256:{:x}",
+                        Sha256::digest(serde_json::to_vec(&row).unwrap())
+                    );
+                }
+            }
+            for witness in &mut witnesses {
+                witness.fingerprint.clear();
+                witness.fingerprint = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(&witness).unwrap())
+                );
+            }
+            let exact = serde_json::to_value(&candidate).unwrap();
+            assert!(
+                !d1_subagent_account_specimen(&mut candidate, &rows, &witnesses),
+                "{name}"
+            );
+            assert_eq!(
+                candidate.provenance.collector,
+                claude_request_accounts::UNKNOWN
+            );
+            candidate.provenance.collector = before.provenance.collector.clone();
+            candidate.snapshot_fingerprint = before.snapshot_fingerprint.clone();
+            assert_eq!(
+                serde_json::to_value(&candidate).unwrap(),
+                exact,
+                "{name} must not erase facts"
+            );
+            checks.push(json!({"case":name,"refused_without_mutation":true}));
+        }
+        let mut unknown = after.clone();
+        assert!(!d1_subagent_account_specimen(&mut unknown, &[], &[]));
+        for (name, item) in [
+            ("before", before),
+            ("positive", after),
+            ("unknown", unknown),
+        ] {
+            let mut request = valid_v6_batch_request();
+            request.source = "claude_code".into();
+            request.snapshots = vec![item];
+            fs::write(
+                out.join(format!("native-subagent-{name}.json")),
+                serde_json::to_vec_pretty(&request).unwrap(),
+            )
+            .unwrap();
+        }
+        fs::write(out.join("native-preparation.json"),serde_json::to_vec_pretty(&json!({"cases":checks,"actual_producer_guard":true,"no_family_accounting_promotion":true,"no_subscription_inferred":true})).unwrap()).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claude_d1_subagent_coverage_lifecycle_and_shapes() {
+        let (dir, root, items) = claude_account_family_fixture();
+        // Positive request evidence needs no parent transcript or family census.
+        fs::remove_file(dir.join(format!("{root}.jsonl"))).unwrap();
+        let mut child = items[1].clone();
+        let api = vec![complete_api_row(&root, "req_5", 5, 10, 1, 0)];
+        let trace = vec![complete_trace_row(&root, "req_5", "a4d1585d310070d0f")];
+        assert!(d1_subagent_account_specimen(&mut child, &api, &trace));
+        let accepted = serde_json::to_value(&child).unwrap();
+        assert!(d1_subagent_account_specimen(&mut child, &api, &trace));
+        assert_eq!(
+            serde_json::to_value(&child).unwrap(),
+            accepted,
+            "identical proof is an exact no-op"
+        );
+        // Losing coverage withdraws the qualifier without erasing any proved row.
+        let known = exact_session_account_hash(&child).unwrap().to_string();
+        assert!(!d1_subagent_account_specimen(&mut child, &[], &[]));
+        assert_eq!(child.provenance.collector, claude_request_accounts::UNKNOWN);
+        assert_ne!(
+            child.snapshot_fingerprint,
+            accepted["snapshot_fingerprint"].as_str().unwrap(),
+            "proof withdrawal cannot be suppressed as a semantic no-op"
+        );
+        assert_eq!(
+            exact_session_account_hash(&child).as_deref(),
+            Some(known.as_str())
+        );
+        assert!(d1_subagent_account_specimen(&mut child, &api, &trace));
+        assert_eq!(
+            serde_json::to_value(&child).unwrap(),
+            accepted,
+            "later proof restores the exact body"
+        );
+
+        let path = dir.join(&root).join("subagents/agent-nested.jsonl");
+        fs::write(&path, format!("{{\"timestamp\":\"2026-08-02T07:00:04Z\",\"type\":\"assistant\",\"sessionId\":\"{root}\",\"agentId\":\"nested\",\"parentAgentId\":\"a4d1585d310070d0f\",\"isSidechain\":true,\"requestId\":\"req_nested\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":1}}}}}}\n")).unwrap();
+        fs::write(
+            path.with_extension("meta.json"),
+            r#"{"agentType":"Explore","spawnDepth":2,"parentAgentId":"a4d1585d310070d0f"}"#,
+        )
+        .unwrap();
+        let mut nested =
+            parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "d".repeat(64))
+                .unwrap()
+                .remove(0);
+        assert!(nested
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "parent_session_ref" && fact.value != root));
+        let nested_api = vec![complete_api_row(&root, "req_nested", 6, 10, 1, 0)];
+        let nested_trace = vec![complete_trace_row(&root, "req_nested", "nested")];
+        assert!(d1_subagent_account_specimen(
+            &mut nested,
+            &nested_api,
+            &nested_trace
+        ));
+
+        for disposition in ["missing", "conflict", "complete"] {
+            let mut item = items[1].clone();
+            item.session_account_evidence = Some(SessionAccountEvidence {
+                provider: "anthropic",
+                account_identifier_hash: (disposition == "complete").then(|| "b".repeat(64)),
+                provider_workspace_hash: (disposition == "complete").then(|| "c".repeat(64)),
+                identity_hash_scheme: "provider-sha256:v1",
+                evidence_source: "claude_desktop_original:v1",
+                identity_disposition: Some(disposition),
+                source_created_at: Some("2026-08-02T06:00:00Z".into()),
+            });
+            let original = item.session_account_evidence.clone();
+            assert!(d1_subagent_account_specimen(&mut item, &api, &trace));
+            assert_eq!(
+                item.session_account_evidence, original,
+                "request proof never rewrites creator evidence"
+            );
+        }
+        // Already evaluated legacy/home hashes alone never qualify.
+        let mut legacy = items[1].clone();
+        set_session_account_hash(&mut legacy, Some(&known));
+        assert!(!d1_subagent_account_specimen(&mut legacy, &[], &[]));
+        assert_eq!(
+            exact_session_account_hash(&legacy).as_deref(),
+            Some(known.as_str())
+        );
+        let mut untouched_root = items[0].clone();
+        let original = serde_json::to_value(&untouched_root).unwrap();
+        assert!(claude_request_accounts::apply(
+            std::slice::from_mut(&mut untouched_root),
+            &Default::default(),
+            &Default::default()
+        )
+        .is_empty());
+        assert_eq!(serde_json::to_value(&untouched_root).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claude_d1_multiple_requests_typed_identity_and_unreadable_import() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let path = dir
+            .join(&root)
+            .join("subagents/agent-a4d1585d310070d0f.jsonl");
+        let first = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        fs::write(&path, format!("{first}{}", first.replace("req_5", "req_6"))).unwrap();
+        let child = parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "d".repeat(64))
+            .unwrap()
+            .remove(0);
+        assert_eq!(child.request_count, 2);
+        let mut api = vec![
+            complete_api_row(&root, "req_5", 5, 10, 1, 0),
+            complete_api_row(&root, "req_6", 6, 10, 1, 0),
+        ];
+        let trace = vec![
+            complete_trace_row(&root, "req_5", "a4d1585d310070d0f"),
+            complete_trace_row(&root, "req_6", "a4d1585d310070d0f"),
+        ];
+        api[0].request_identity = Some(serde_json::from_value(json!({
+            "identity_hash_scheme":"provider-sha256:v1",
+            "account":{"origin":"resource_and_log_record","disposition":"complete","resource_hash":"a".repeat(64),"log_record_hash":"a".repeat(64)},
+            "organization":{"origin":"missing","disposition":"missing"},"disposition":"missing"
+        })).unwrap());
+        let rehash = |row: &mut crate::claude_local_otel::ClaudeLocalOtelEvidence| {
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(row).unwrap())
+            );
+        };
+        rehash(&mut api[0]);
+        assert!(
+            d1_subagent_account_specimen(&mut child.clone(), &api, &trace),
+            "missing request organization does not invent or veto an account"
+        );
+        let mut mixed = api.clone();
+        mixed[1].account_identifier_hash = Some("b".repeat(64));
+        rehash(&mut mixed[1]);
+        assert!(!d1_subagent_account_specimen(
+            &mut child.clone(),
+            &mixed,
+            &trace
+        ));
+        api[0]
+            .request_identity
+            .as_mut()
+            .unwrap()
+            .account
+            .resource_hash = Some("b".repeat(64));
+        rehash(&mut api[0]);
+        assert!(
+            !d1_subagent_account_specimen(&mut child.clone(), &api, &trace),
+            "contradictory typed observations cannot qualify"
+        );
+        let mut imported = items[1].clone();
+        let before = imported.clone();
+        let mut report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+        report.health.unreadable_lines = 1;
+        assert_eq!(
+            claude_request_accounts::apply(
+                std::slice::from_mut(&mut imported),
+                &report,
+                &Default::default()
+            ),
+            [claude_request_accounts::Coverage::UnreadableEvidence]
+        );
+        assert_eq!(
+            imported.provenance.collector,
+            claude_request_accounts::UNKNOWN
+        );
+        imported.provenance.collector = before.provenance.collector.clone();
+        imported.snapshot_fingerprint = before.snapshot_fingerprint.clone();
+        assert_eq!(
+            serde_json::to_value(&imported).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
