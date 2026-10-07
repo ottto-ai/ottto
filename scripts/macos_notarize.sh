@@ -123,6 +123,24 @@ stapler_retry() {
   return 1
 }
 
+# A notarized bundle that has been launched (the packaged-app launch smoke does)
+# carries com.apple.macl, and App Management then refuses writes from processes
+# without that permission: the placeholder touch fails and stapler exits 73. A
+# copy made without extended attributes was never launched and stays writable;
+# the signature lives in the bundle's files, so the copy verifies unchanged.
+replace_with_unlaunched_copy() {
+  local app_bundle="$1"
+  local fresh="${app_bundle}.staple-fresh"
+  local launched="${app_bundle}.launched"
+
+  rm -rf "$fresh" "$launched"
+  ditto --noextattr --noacl "$app_bundle" "$fresh"
+  mv "$app_bundle" "$launched"
+  mv "$fresh" "$app_bundle"
+  rm -rf "$launched"
+  codesign --verify --strict --verbose=2 "$app_bundle" >/dev/null
+}
+
 prepare_app_staple_target() {
   local app_bundle="$1"
   local ticket_path="$app_bundle/Contents/CodeResources"
@@ -133,7 +151,11 @@ prepare_app_staple_target() {
         xattr -d com.apple.provenance "$app_bundle" 2>/dev/null || true
         xattr -d com.apple.provenance "$app_bundle/Contents" 2>/dev/null || true
       fi
-      touch "$ticket_path"
+      if ! touch "$ticket_path" 2>/dev/null; then
+        echo "App bundle refuses writes after launch; restaging an unlaunched copy for stapling." >&2
+        replace_with_unlaunched_copy "$app_bundle"
+        touch "$ticket_path"
+      fi
     fi
   fi
 }

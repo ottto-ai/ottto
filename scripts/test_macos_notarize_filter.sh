@@ -50,12 +50,24 @@ dest=""
 for arg in "$@"; do
   dest="$arg"
 done
+src=""
+prev=""
+for arg in "$@"; do
+  src="$prev"
+  prev="$arg"
+done
 case "$dest" in
   *.zip)
     printf 'fake zip\n' > "$dest"
     ;;
   *)
-    mkdir -p "$dest"
+    if [ -d "$src" ]; then
+      cp -R "$src" "$dest"
+      # A copy without extended attributes was never launched.
+      rm -f "$dest/.test-launched"
+    else
+      mkdir -p "$dest"
+    fi
     ;;
 esac
 exit 0
@@ -72,6 +84,17 @@ if [ "${OTTTO_NOTARIZE_TEST_TOUCH_PROVENANCE_FAIL:-}" = "1" ]; then
         state="${OTTTO_NOTARIZE_TEST_TOUCH_STATE:?touch state required}"
         if [ ! -f "$state" ]; then
           printf 'failed-once\n' > "$state"
+          exit 1
+        fi
+        ;;
+    esac
+  done
+fi
+if [ "${OTTTO_NOTARIZE_TEST_TOUCH_LAUNCHED_FAIL:-}" = "1" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      */Ottto.app/Contents/CodeResources)
+        if [ -f "${arg%/Contents/CodeResources}/.test-launched" ]; then
           exit 1
         fi
         ;;
@@ -278,6 +301,51 @@ if ! grep -q "touch .*Ottto.app/Contents/CodeResources" "$APP_LOG"; then
 fi
 if ! grep -q "xattr -d com.apple.provenance .*Ottto.app/Contents" "$APP_LOG"; then
   echo "Expected app staple preparation to clear provenance xattr after placeholder creation failure" >&2
+  exit 1
+fi
+if grep -q "noextattr" "$APP_LOG"; then
+  echo "Expected no unlaunched-copy restage when clearing provenance makes the app writable" >&2
+  exit 1
+fi
+
+LAUNCHED_DIR="$TMP_DIR/launched"
+LAUNCHED_BUNDLE="$LAUNCHED_DIR/Ottto.app"
+LAUNCHED_MANIFEST="$TMP_DIR/launched-manifest.json"
+LAUNCHED_LOG="$TMP_DIR/launched.log"
+mkdir -p "$LAUNCHED_BUNDLE/Contents"
+make_artifact "$LAUNCHED_BUNDLE/Ottto"
+make_artifact "$LAUNCHED_DIR/Ottto-macos-arm64.dmg"
+: > "$LAUNCHED_BUNDLE/.test-launched"
+jq --arg dir "$LAUNCHED_DIR" \
+  '.artifacts |= map(if .name == "Ottto.app" then .path = ($dir + "/Ottto-macos-arm64.dmg") | .verification_path = ($dir + "/Ottto.app") else . end)' \
+  "$APP_MANIFEST" > "$LAUNCHED_MANIFEST"
+OTTTO_NOTARIZE_TEST_TOUCH_LAUNCHED_FAIL=1 \
+  OTTTO_NOTARIZE_TEST_HDIUTIL_STATE="$TMP_DIR/launched-hdiutil-state" \
+  OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Test" \
+  OTTTO_NOTARY_PROCESS_TIMEOUT_SECONDS=30 \
+  OTTTO_NOTARIZE_TEST_LOG="$LAUNCHED_LOG" \
+  PATH="$FAKE_BIN:$PATH" \
+  "$NOTARIZE" \
+    --manifest "$LAUNCHED_MANIFEST" \
+    --keychain-profile TEST_PROFILE \
+    --timeout 1m \
+    --artifact-name Ottto.app >/dev/null
+if ! grep -q "ditto --noextattr --noacl .*launched/Ottto.app .*launched/Ottto.app.staple-fresh" "$LAUNCHED_LOG"; then
+  echo "Expected a launched app bundle to be restaged from an unlaunched copy before stapling" >&2
+  exit 1
+fi
+if [[ ! -f "$LAUNCHED_BUNDLE/Contents/CodeResources" || -e "$LAUNCHED_BUNDLE/.test-launched" ]]; then
+  echo "Expected the unlaunched copy to replace the launched bundle and receive the staple placeholder" >&2
+  exit 1
+fi
+if [[ -e "$LAUNCHED_DIR/Ottto.app.launched" || -e "$LAUNCHED_DIR/Ottto.app.staple-fresh" ]]; then
+  echo "Expected restage scratch bundles to be removed" >&2
+  exit 1
+fi
+restage_line="$(grep -n "ditto --noextattr" "$LAUNCHED_LOG" | head -1 | cut -d: -f1)"
+staple_line="$(grep -n "stapler staple .*launched/Ottto.app$" "$LAUNCHED_LOG" | head -1 | cut -d: -f1)"
+if [[ -z "$restage_line" || -z "$staple_line" || "$restage_line" -ge "$staple_line" ]]; then
+  echo "Expected the restage to happen before the app is stapled" >&2
   exit 1
 fi
 if ! grep -q "hdiutil create -volname Ottto -srcfolder .* -ov -format UDZO .*Ottto-macos-arm64.dmg" "$APP_LOG"; then
