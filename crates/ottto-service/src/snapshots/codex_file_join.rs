@@ -108,7 +108,9 @@ pub(super) fn member_home(root: &Path) -> PathBuf {
         .unwrap_or(root)
         .to_path_buf()
 }
-fn read_header(candidate: &CandidateFile) -> Result<(String, String, usize)> {
+// One bounded secure acquisition path; semantic inventory and sampled-scope
+// witnesses both use it. Only inventory performs native header decoding.
+fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usize)> {
     let file = open_candidate_beneath_root(candidate)?;
     let before = file.metadata()?;
     anyhow::ensure!(before.is_file(), "Codex header is not a regular file");
@@ -119,20 +121,28 @@ fn read_header(candidate: &CandidateFile) -> Result<(String, String, usize)> {
         bytes.len() <= MAX_HEADER_BYTES && bytes.last() == Some(&b'\n'),
         "Codex header exceeds its read bound"
     );
-    let value: Value = serde_json::from_slice(&bytes)?;
-    let meta =
-        codex_session_meta_payload(&value).context("Codex first record is not a owning header")?;
-    let owner = resolve_codex_identity_option(codex_identity_at(meta, &["id"]))
-        .context("Codex header lacks ownership")?;
     let after = reader.get_ref().get_ref().metadata()?;
     let witness = metadata_witness(&before);
     anyhow::ensure!(
         metadata_witness(&after) == witness,
         "Codex header changed while read"
     );
-    // Include the bounded read-ahead in accounting, not only the header length.
     let read_bytes = (MAX_HEADER_BYTES + 1) - reader.get_ref().limit() as usize;
+    Ok((bytes, witness, read_bytes))
+}
+fn read_header(candidate: &CandidateFile) -> Result<(String, String, usize)> {
+    let (bytes, witness, read_bytes) = read_header_bytes(candidate)?;
+    let value: Value = serde_json::from_slice(&bytes)?;
+    let meta =
+        codex_session_meta_payload(&value).context("Codex first record is not a owning header")?;
+    let owner = resolve_codex_identity_option(codex_identity_at(meta, &["id"]))
+        .context("Codex header lacks ownership")?;
     Ok((owner, witness, read_bytes))
+}
+/// Raw header digest for a file whose owning header the native inventory has
+/// already established. No extra decoded Value is retained or allocated.
+pub(super) fn header_reduction_witness(candidate: &CandidateFile) -> Result<String> {
+    read_header_bytes(candidate).map(|(bytes, _, _)| format!("{:x}", Sha256::digest(bytes)))
 }
 
 /// One small secure header read per existing native scan step. No transcript
@@ -477,6 +487,7 @@ pub(super) fn receipt_state(entry: Option<&ScanIndexEntry>) -> (Option<AppliedTi
         required,
     )
 }
+#[derive(Clone)]
 pub(super) struct TierReplay {
     previous: Option<AppliedTierReceipt>,
     digest: ContentDigest,
@@ -598,6 +609,11 @@ impl TierReplay {
             self.matched.insert(key.clone());
             self.tiers.insert(key, source);
         }
+    }
+    /// A sampled prefix cannot authorize a new protected receipt. The host
+    /// reopens and fully replays before calling finish when this is true.
+    pub(super) fn has_protected_tiers(&self) -> bool {
+        !self.tiers.is_empty()
     }
     pub(super) fn finish(self) -> Result<Option<AppliedTierReceipt>> {
         anyhow::ensure!(
@@ -746,6 +762,7 @@ impl GroupReader {
                 &mut census,
                 None,
                 0,
+                &BTreeMap::new(),
             )
             .context("Codex joining member could not open")?;
             self.members[i] = opened;
@@ -1073,6 +1090,7 @@ impl Tokens {
     }
 }
 
+#[derive(Clone)]
 struct ContentDigest(Sha256);
 impl Default for ContentDigest {
     fn default() -> Self {
@@ -2699,6 +2717,7 @@ pub(super) mod tests {
                 &mut census,
                 None,
                 0,
+                &BTreeMap::new(),
             )
             .unwrap();
             let parsed = parse_opened_jsonl_file(

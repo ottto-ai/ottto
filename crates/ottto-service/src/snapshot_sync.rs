@@ -3356,6 +3356,20 @@ fn prepare_sync_source(
         &watcher_hints.paths,
         watcher_hints.overflowed,
         context_curve_enabled,
+    )
+    .with_sampled_acquisition(
+        daemon.transcript_cache.clone(),
+        crate::transcript_acquisition::Scope(format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "sampled_scan:v1:{account_witness:?}:{upload_destination_namespace}:{}:{}",
+                    index_path.display(),
+                    context_curve_enabled
+                )
+                .as_bytes()
+            )
+        )),
     );
     Ok(Some(SourcePreparation {
         retry_authority,

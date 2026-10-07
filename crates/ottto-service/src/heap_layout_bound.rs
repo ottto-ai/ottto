@@ -28,6 +28,9 @@ impl Counter {
     }
 }
 pub(crate) trait HeapLayoutBound {
+    /// True only for types proved to own no heap allocation. Unknown/custom
+    /// types keep recursive traversal; never infer this from size or capacity.
+    const INLINE_ONLY: bool = false;
     fn heap_bound(&self, c: &mut Counter) -> Option<()>;
 }
 pub(crate) fn bound<T: HeapLayoutBound>(value: &T, limit: usize) -> Option<usize> {
@@ -45,6 +48,7 @@ pub(crate) fn layout_supported() -> bool {
         && env!("OTTTO_SCAN_LAYOUT_RUSTC").starts_with("rustc 1.88.0 ")
 }
 macro_rules! scalar { ($($t:ty),*) => { $(impl HeapLayoutBound for $t {
+    const INLINE_ONLY: bool = true;
     fn heap_bound(&self, c: &mut Counter) -> Option<()> { c.add(0) }
 })* }; }
 scalar!(
@@ -87,8 +91,10 @@ impl<T: HeapLayoutBound> HeapLayoutBound for Option<T> {
 impl<T: HeapLayoutBound> HeapLayoutBound for Vec<T> {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         c.add(self.capacity().checked_mul(size_of::<T>())?)?;
-        for x in self {
-            x.heap_bound(c)?;
+        if !T::INLINE_ONLY {
+            for x in self {
+                x.heap_bound(c)?;
+            }
         }
         Some(())
     }
@@ -96,8 +102,10 @@ impl<T: HeapLayoutBound> HeapLayoutBound for Vec<T> {
 impl<T: HeapLayoutBound> HeapLayoutBound for VecDeque<T> {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         c.add(self.capacity().checked_mul(size_of::<T>())?)?;
-        for x in self {
-            x.heap_bound(c)?;
+        if !T::INLINE_ONLY {
+            for x in self {
+                x.heap_bound(c)?;
+            }
         }
         Some(())
     }
@@ -433,5 +441,58 @@ impl HeapLayoutBound for ottto_protocol::LocalAccountState {
             | Self::ResetRequired
             | Self::Error => c.add(0),
         }
+    }
+}
+
+#[cfg(test)]
+mod sampled_scalar_buffer_tests {
+    use super::*;
+    #[test]
+    fn sampled_scalar_buffers_charge_capacity_without_per_byte_traversal() {
+        if !layout_supported() {
+            return;
+        }
+        let mut bytes = Vec::with_capacity(32 * 1024);
+        bytes.extend_from_slice(&[0_u8; 8192]);
+        assert_eq!(
+            bound(&bytes, 64 * 1024),
+            Some(size_of_val(&bytes) + bytes.capacity())
+        );
+        let exact_bytes = size_of_val(&bytes) + bytes.capacity();
+        assert_eq!(bound(&bytes, exact_bytes), Some(exact_bytes));
+        assert!(bound(&bytes, exact_bytes - 1).is_none());
+        let mut deque = VecDeque::from(vec![1_u64; 8192]);
+        for _ in 0..6000 {
+            let value = deque.pop_front().unwrap();
+            deque.push_back(value);
+        }
+        assert!(!deque.as_slices().1.is_empty());
+        assert_eq!(
+            bound(&deque, 128 * 1024),
+            Some(size_of_val(&deque) + deque.capacity() * size_of::<u64>())
+        );
+    }
+    #[test]
+    fn sampled_unknown_elements_keep_recursive_visit_and_heap_checks() {
+        if !layout_supported() {
+            return;
+        }
+        struct UnknownInline;
+        impl HeapLayoutBound for UnknownInline {
+            fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+                c.add(0)
+            }
+        }
+        let unknown = (0..4096).map(|_| UnknownInline).collect::<Vec<_>>();
+        assert!(bound(&unknown, 1024 * 1024).is_none());
+        assert!(bound(&serde_json::json!({"opaque": "raw"}), usize::MAX).is_none());
+        assert!(bound(&vec![serde_json::Value::Null], usize::MAX).is_none());
+        let nested = vec![String::from("owned"); 4096];
+        assert!(bound(&nested, 1024 * 1024).is_none());
+        let single = vec![String::with_capacity(8192)];
+        let expected =
+            size_of_val(&single) + single.capacity() * size_of::<String>() + single[0].capacity();
+        assert_eq!(bound(&single, expected), Some(expected));
+        assert!(bound(&single, expected - 1).is_none());
     }
 }
