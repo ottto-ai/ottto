@@ -1,5 +1,75 @@
 // Native capture/wait/policy/ACK execution; credentials are synthetic adapters.
 include!("retry_allocation_native_tests.rs");
+
+#[test]
+fn bounded_retry_cutoff_shape_refuses_before_typed_map_decode() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let f = PiLiveFixture::new();
+    let path = crate::backfill::backfill_state_path(&f.support);
+    let entries = (0..9000)
+        .map(|i| format!("\"{i:05}\":\"v\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let bytes = format!("{{\"completed_parser_versions\":{{{entries}}}}}");
+    assert!(bytes.len() < crate::snapshot_retry::RESPONSE_BYTES);
+    std::fs::write(&path, &bytes).unwrap();
+    let ordinary = crate::backfill::load_backfill_state(&f.support);
+    assert_eq!(ordinary.completed_parser_versions.len(), 9000);
+    let (live, allocation) = crate::retry_allocation_probe::measure(|| {
+        live_snapshot_retry::LiveAuthority::capture(
+            SnapshotSource::Pi,
+            &f.home.0,
+            &f.support,
+            &f.hint,
+            &f.progress.destination_namespace_hash,
+            &ordinary,
+        )
+    });
+    eprintln!(
+        "cutoff_preparation bytes={} requested_peak={} usable_peak={} optional_admitted={}",
+        bytes.len(), allocation.requested_peak, allocation.usable_peak, live.is_some()
+    );
+    assert!(live.is_none());
+    assert!(allocation.requested_peak < 256 * 1024);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
+    assert_eq!(crate::backfill::load_backfill_state(&f.support), ordinary);
+}
+
+#[test]
+fn bounded_retry_cutoff_node_boundary_preserves_ordinary_state() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let f = PiLiveFixture::new();
+    let path = crate::backfill::backfill_state_path(&f.support);
+    // One root, one key and one map, then a key/value pair per entry.
+    let admitted = (crate::snapshot_retry::STATE_NODES - 3) / 2;
+    for (count, expected) in [(admitted, true), (admitted + 1, false)] {
+        let entries = (0..count)
+            .map(|i| format!("\"{i:05}\":\"v\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let bytes = format!("{{\"completed_parser_versions\":{{{entries}}}}}");
+        assert!(bytes.len() < crate::snapshot_retry::RESPONSE_BYTES);
+        assert_eq!(crate::snapshot_retry::state_nodes(bytes.as_bytes()).unwrap(), 3 + count * 2);
+        std::fs::write(&path, &bytes).unwrap();
+        let ordinary = crate::backfill::load_backfill_state(&f.support);
+        assert_eq!(ordinary.completed_parser_versions.len(), count);
+        let live = live_snapshot_retry::LiveAuthority::capture(
+            SnapshotSource::Pi, &f.home.0, &f.support, &f.hint,
+            &f.progress.destination_namespace_hash, &ordinary,
+        );
+        assert_eq!(live.is_some(), expected);
+        if let Some(live) = live {
+            live.validate_capture(&f.home.0, &f.items).unwrap();
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes.as_bytes());
+        assert_eq!(crate::backfill::load_backfill_state(&f.support), ordinary);
+    }
+}
+
 struct PiLiveFixture {
     home: RotationRoot,
     daemon: LocalDaemon,

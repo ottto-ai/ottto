@@ -17,7 +17,7 @@ The optional path now applies additional guards:
   recording may skip; remote exact ACK and native progress remain authoritative.
   Node pressure evicts oldest rows so admitted rings continue recording.
   Ordinary receipt recording retains its existing 4 MiB/500-row contract.
-- Optional progress, index and receipt readers preflight at most 8,192 JSON
+- Optional cutoff capture, progress, index and receipt readers preflight at most 8,192 JSON
   key/value/container nodes and 64 nesting levels before typed decoding.
   Ordinary readers and persisted schemas are unchanged. Legal response arrays
   continue using their separate decoded-body byte limit.
