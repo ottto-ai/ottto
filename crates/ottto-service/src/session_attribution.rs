@@ -204,6 +204,11 @@ impl SessionAttributionContext {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn expire_launch_lookup_for_test(&self) {
+        self.launch_events.expire_for_test();
+    }
+
     pub(crate) fn launches_prepared(&self, workers: &[String]) -> bool {
         self.launch_events.prepared(workers)
     }

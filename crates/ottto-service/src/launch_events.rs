@@ -266,7 +266,10 @@ impl LaunchEventInventory {
                         continue;
                     }
                     Err(_) => {
-                        lookup.failed = true;
+                        // Rejected files are maintenance only, never claims.
+                        // Preserve a complete pending/processed proof when
+                        // rejected-directory cleanup is unavailable.
+                        lookup.failed |= lookup.phase != 4;
                         return finish_lookup(root, &mut lookup).map(|_| demand_matches);
                     }
                 }
@@ -287,7 +290,7 @@ impl LaunchEventInventory {
                         }
                         Ok(_) => continue,
                         Err(_) => {
-                            lookup.failed = true;
+                            lookup.failed |= lookup.phase != 4;
                             continue;
                         }
                     }
@@ -334,7 +337,7 @@ impl LaunchEventInventory {
                         }
                     }
                 }
-                Some(Err(_)) => lookup.failed = true,
+                Some(Err(_)) => lookup.failed |= lookup.phase != 4,
                 None => {
                     lookup.entries = None;
                     if advance_phase(root, &mut lookup) {
@@ -358,6 +361,11 @@ impl LaunchEventInventory {
             .get(&worker.to_ascii_lowercase())
             .cloned()
             .flatten()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_for_test(&self) {
+        self.lookup.lock().unwrap().loaded_at = Some(Instant::now() - INVENTORY_TTL);
     }
 
     #[cfg(test)]
@@ -1140,6 +1148,30 @@ mod tests {
                 Err(()) => panic!("lookup incomplete"),
             }
         }
+    }
+
+    #[test]
+    fn rejected_maintenance_failure_preserves_claims_but_claim_directory_failure_is_owed() {
+        let home = TestHome::new();
+        let (id, _) = retained(&home.0, 1);
+        let root = home.0.join(DROP_ROOT_DIR);
+        // A regular file cannot be enumerated as a directory on any platform.
+        fs::write(root.join(REJECTED_SUBDIR), b"maintenance unavailable").unwrap();
+        let inventory = LaunchEventInventory::refresh(&home.0);
+        complete(&inventory, &[id.clone()]);
+        assert!(inventory.prepared(&[id.clone()]));
+        assert!(inventory.matching(&id).is_some());
+
+        fs::rename(root.join(PROCESSED_SUBDIR), root.join("retained-fixture")).unwrap();
+        fs::write(root.join(PROCESSED_SUBDIR), b"claims unavailable").unwrap();
+        let unavailable = LaunchEventInventory::refresh(&home.0);
+        let mut result = unavailable.prepare_step(&[id.clone()]);
+        while result == Ok(false) {
+            result = unavailable.prepare_step(&[id.clone()]);
+        }
+        assert_eq!(result, Err(()));
+        assert!(!unavailable.prepared(&[id.clone()]));
+        assert!(unavailable.matching(&id).is_none());
     }
 
     #[test]

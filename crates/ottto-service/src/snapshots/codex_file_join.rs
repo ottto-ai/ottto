@@ -880,6 +880,28 @@ impl GroupReader {
                 self.proof_prefix_matched,
                 "Codex protected copy prefix changed"
             );
+            if self
+                .legacy_expected
+                .contains_key(&local_index_key(&self.members[i].path))
+            {
+                if let Some(context) = attribution_context {
+                    let workers = reader
+                        .accumulator
+                        .source_session_id
+                        .as_ref()
+                        .map(|id| vec![resolve_codex_identity(id)])
+                        .unwrap_or_else(|| {
+                            launch_workers_for_path(SnapshotSource::Codex, &self.members[i].path)
+                        });
+                    // A proof can outlive the lookup TTL. Park its completed
+                    // parser before taking either proof or legacy baseline.
+                    match context.prepare_launch_step(&workers) {
+                        Ok(false) => return Ok(false),
+                        Err(()) => anyhow::bail!("Codex legacy launch evidence incomplete"),
+                        Ok(true) => {}
+                    }
+                }
+            }
             self.proofs.push(
                 std::mem::take(&mut self.proof)
                     .finish()
@@ -2837,6 +2859,78 @@ pub(super) mod tests {
         }
         index
     }
+    #[test]
+    fn legacy_proof_refreshes_expired_launch_lookup_without_consuming_completed_proof() {
+        let (root, inventory) = fixture();
+        let previous = legacy_index(&inventory, None);
+        let group = inventory.groups().into_values().next().unwrap();
+        let workers = vec![group.owner.clone()];
+        let mut reader = GroupReader::new(group.members).unwrap();
+        reader.configure_launch_owner(&group.owner);
+        reader.configure_receipts(&previous);
+        let key = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            [13_u8; 32],
+        );
+        let context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
+            SnapshotSource::Codex,
+            &root,
+            true,
+            Some(&key),
+            Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+        )
+        .unwrap();
+        let metadata = CodexTitleMetadata::default();
+        while reader.proof_reader.is_none() {
+            assert!(!reader
+                .step(&metadata, None, None, false, false, Some(&context))
+                .unwrap());
+        }
+        assert!(context.launches_prepared(&workers));
+        context.expire_launch_lookup_for_test();
+        assert!(!context.launches_prepared(&workers));
+        let events = root.join(".ottto/launch-events/processed");
+        fs::create_dir_all(&events).unwrap();
+        for n in 1..=600 {
+            let raw = json!({"schema":"agent_launch.v1",
+                "controller_session_ref":"11111111-2222-4333-8444-555555555555",
+                "worker_session_ref":format!("{n:08x}-2222-4333-8444-555555555555"),
+                "relationship_kind":"launched", "workflow_ref":null, "pr_ref":null,
+                "launch_ts":"2026-10-01T10:00:00Z",
+                "capture_source":"launcher_event:opus_cli_agent", "evidence":"direct"})
+            .to_string();
+            let event = crate::launch_events::validate_event(&raw).unwrap();
+            fs::write(
+                events.join(format!(
+                    "{}.json",
+                    crate::launch_events::event_digest(&event)
+                )),
+                raw,
+            )
+            .unwrap();
+        }
+        assert!(!reader
+            .step(&metadata, None, None, false, false, Some(&context))
+            .unwrap());
+        assert!(reader.proof_reader.as_ref().unwrap().reader.finished);
+        assert!(reader.proofs.is_empty());
+        assert!(reader.legacy_baselines.is_empty());
+        let mut steps = 1;
+        while !reader
+            .step(&metadata, None, None, false, false, Some(&context))
+            .unwrap()
+        {
+            steps += 1;
+            assert!(steps < 100);
+        }
+        assert!(steps > 2, "lookup must yield across the retained backlog");
+        assert_eq!(reader.records, 6, "completed proofs must not be read twice");
+        assert_eq!(reader.legacy_baselines.len(), 2);
+        assert!(context.launches_prepared(&workers));
+        reader.finish().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn legacy_first_import_requires_actual_old_output_match_and_allows_healthy_sibling() {
         let (root, inventory) = fixture();
