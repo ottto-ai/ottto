@@ -81,3 +81,13 @@ Containing backend compatibility/deployment, then ordinary installed collection
 and served subscription membership, are separate acceptance steps. An independent
 release that omits this producer change is unaffected. Mixed-login root-session
 accounting and request-level organization emission remain separate scopes.
+
+## Hosted cache fixture follow-up
+
+Public CI exposed two cache-only fixtures omitted from the parser-v37 refresh.
+Regenerate the Claude cache wire fixture and provider-wire manifest through their
+existing native generators. Only parser-dependent revision hashes and fixture
+manifest metadata change; usage, cost, content hash, cache state, original
+identity and body witness remain unchanged. The original exact-byte assertions
+remain active after generation. No runtime behavior or backend compatibility
+rule changes in this follow-up.
