@@ -28,6 +28,7 @@ pub(crate) mod fd_guard;
 pub mod keychain;
 mod launch_events;
 pub mod legacy_service;
+mod local_resource_diagnostics;
 pub mod macos_service;
 pub mod mcp_inventory;
 pub(crate) mod net_resilience;

@@ -34,6 +34,54 @@ failure, establish power-loss durability or solve capped-file growth. No request
 ids, paths, fingerprints, identity observations, token/cost values or row content
 appear in this section. Approved upload uses the existing disclosure and consent.
 
+## Local Resource Measurements
+
+The existing service error log contains content-free JSON lines prefixed
+`ottto-service: local_resources`. The standard macOS installation writes this
+log in `~/Library/Logs/Ottto/ottto-service.err.log`. These records add no remote
+telemetry endpoint or CLI command. They contain counts, byte lengths, timing,
+process id and a fixed source label; no paths, account/session identifiers,
+payloads, credentials or backend response bodies.
+
+Each completed `native_collection_page` records existing scanned-file and
+semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
+full/tail/unchanged selection counts describe acquisition decisions, including
+repeated or subsequently failed plans; they are not distinct file counts.
+`completed_native_bytes` and `completed_guard_bytes` count only completed
+sampled JSONL read plans. Failed reads, joined-file replay, discovery, headers,
+sidecars and independent identity reads are excluded. Zero here does not prove
+zero filesystem work. Collection timing covers native initialization and steps,
+including time parked between steps, and ends before post-policy finalization
+and upload. A capped/partial page is still a completed page.
+
+Each `snapshot_batch_call` records the actual serialized body length and the
+encoded/decoded body lengths across attempts passed to HTTP. Gzip refusal adds
+both the compressed attempt and its identity fallback. A refusal before send
+adds no attempt; serialization failure leaves the body length `null`. These
+are **attempted body bytes**, excluding headers, TLS, responses and library-level
+transport activity; they do not prove successful delivery or ACK settlement.
+Encoding settings, packing and delivery semantics are unchanged. Upload timing
+covers serialization, compression, request/response handling and existing local
+receipt processing, including failures.
+
+`shared_process_cpu_delta_us` samples self-process CPU across the observation
+window, including concurrent stages; it excludes child processes. It must not
+be attributed to one provider. `process_lifetime_max_rss_bytes` is the process's
+lifetime memory high-water mark, not a collection/cycle peak or current RSS.
+Unavailable measurements and regressing CPU samples are `null`. Unix observation
+time and process id support comparison with an independently measured matching
+process. Do not add overlapping CPU deltas or infer per-stage memory use.
+
+There is one fixed-size observation per completed page/batch call and two OS
+resource samples per observation, with no per-row sampling, extra transcript
+reads or new diagnostic store. Log output uses existing service retention and
+may be unavailable; diagnostic write errors do not fail collection or upload.
+Status/quota refresh, OTLP reception and independent metadata/discovery work are
+outside this first measurement slice. Installed comparisons must use the same
+source/encoding settings and distinguish idle, ordinary changes, import and
+recovery. A containing release and matching installation are required before
+calling these measurements installed evidence.
+
 ## Approved Upload
 
 Upload only when the user approves the upload and accepts the retention
