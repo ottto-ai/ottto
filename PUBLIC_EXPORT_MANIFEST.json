@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 482,
-  "content_sha256": "06c05a03a6d2c50d0b6c561b02078ebe19a3a1b39933f1339ff624495692ed08",
+  "content_sha256": "3a187e31daad3bad1cc7e8e9ff085e2e690110a36af1d3a137474c635181f25c",
   "files": [
     {
       "executable": false,
@@ -1056,8 +1056,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "4d1a4a84b51b07279de78908c649a39222b6a37f0ee0339b1db17ed59a057ad7",
-      "size_bytes": 705219
+      "sha256": "5e30c3f5b17a49392cdd5a225120856590fc7b2053f6d3a9084892396ccc8056",
+      "size_bytes": 713559
     },
     {
       "executable": false,
@@ -1070,8 +1070,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "2844288ea0f7d6d205901771f1796b6b1dfd715ab135371943f017481e673eb1",
-      "size_bytes": 2293918
+      "sha256": "b8cb04a4e5d6c18f2b8d32684a27055f38270e49f3d8f07aa0ca11b73ec49828",
+      "size_bytes": 2317566
     },
     {
       "executable": false,
@@ -1086,6 +1086,20 @@
       "path": "crates/ottto-service/src/snapshots/cache_observations/tests.rs",
       "sha256": "620d46db86d32b35f3023fcaf950b79e3f9bf41d686b30cd8ecc3cf3d86b819e",
       "size_bytes": 6035
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_request_account_tests.rs",
+      "sha256": "f005e548686a73ff755671470a41ab241624ac609c556e8ff1c9122eb42c62a8",
+      "size_bytes": 19408
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_request_accounts.rs",
+      "sha256": "7bc20c239ad4a94f5c43df10c562c6258b650175fe428189a5e2a87e4bb8ae94",
+      "size_bytes": 15801
     },
     {
       "executable": false,
@@ -2266,6 +2280,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-07-claude-own-request-accounts.md",
+      "sha256": "d80667432d88be94bfaf7852a668b4eb722230b7f3f17fbd92124741a43addb0",
+      "size_bytes": 6322
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-07-claude-quota-retry-eligibility.md",
       "sha256": "633154ad9732180816c7a73fc774d151bd00a2f4d35bcb2dc3133b4f02eba318",
       "size_bytes": 1755
@@ -2743,21 +2764,21 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/body-witness-ack-normalization-v1.json",
-      "sha256": "84e609f774e3863597a8d2f9584fa2d29de2a8b56e6ed88816e04d530fddfcbb",
+      "sha256": "ca5b09fd30a55cd4ec91653739e94bc3124c7eec66b9535a488c736131231631",
       "size_bytes": 16342
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/cache-observations-v1-manifest.json",
-      "sha256": "0f9d34d3d7d1070621eb8491bf3488bd89f9c1d0d2234780b78406cf3cbce72b",
+      "sha256": "447c8e968031f97ac266040ce4a035fb2ab906e6513790f5476e3962544137e6",
       "size_bytes": 1623
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/cache_observation_claude_v1.json",
-      "sha256": "fd779bf1792c6c87ce8b77868cb984966c8e33b3819bfd29817df680c8991b7e",
+      "sha256": "9d6c55ece14ea76e43074f4ba092a9bc84b965d5435298f4686400f5228cc8e6",
       "size_bytes": 8860
     },
     {
@@ -2778,21 +2799,21 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/claude-original-source-corpus-v1.json",
-      "sha256": "bdc2ffb8d3e6ee6f7713d891f7fc45693269adf0716675ae5bab7af2f0fd6328",
+      "sha256": "d393b06d39be71e5fd3360d69db966f755055c57de3e4b198231753c928bbf12",
       "size_bytes": 179395
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-golden.json",
-      "sha256": "052278b2e46a81519eeda9dde8c2671769ed0306b22444acea1fec8c49965c5f",
+      "sha256": "e06d52c34239498044550178042f5a58548aa2842bf5628d9f09ccd2620506bb",
       "size_bytes": 3045
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-manifest.json",
-      "sha256": "5da5bd540ae56c124db32149f4c2af6302f0d188d884e170fbed4e79844b1891",
+      "sha256": "79123ef758d166eca52d3647cbb2003cac6c4fe5e6020f9846bdc6bdea8a33ed",
       "size_bytes": 1777
     },
     {
@@ -2820,7 +2841,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "b1204e0a555c31372733566386a63244537fc267b7d33cae46d003d73686b1af",
+      "sha256": "b50dfb9433bc9dea250b630e73fc08e0ac0d3be8b9d45e1afc4848fb23ecbb0c",
       "size_bytes": 218514
     },
     {
@@ -3379,7 +3400,7 @@
   ],
   "generated_at": "2026-10-07T22:03:43+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 483,
+  "output_file_count": 486,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

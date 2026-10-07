@@ -1,93 +1,91 @@
-# Claude subagent own-request account qualification
+# Claude own-request accounts and qualified mixed-session delivery
 
-Claude reports subagent API requests under the root session ID. Requiring one
-account across that root's entire history prevents an otherwise single-account
-child from carrying its own observed account. Family accounting and account
-coverage are separate proofs.
+Claude reports subagent API requests under the root session ID. The scan joins
+each child's own complete request-ID set to canonical checked API records and
+exact trace owners/client IDs. Root account unanimity, root transcript presence
+and a complete family census are unnecessary for that independent child proof.
+Nested children keep their original root namespace and own agent identity.
+Borrowed API/trace indexes are built once per scan; no new provider read,
+credential access, scheduler, source or persisted coverage index is introduced.
 
-The existing scan now qualifies each Claude subagent using its own complete
-transcript request-ID set, checked canonical API records and matching canonical
-trace owners/client request IDs. Root transcript presence, root account
-unanimity and a complete family census are unnecessary for this account proof.
-Nested children use their original root namespace and their own agent identity.
-No new source reads, provider calls, credential access, scheduler or persisted
-coverage index are introduced. Borrowed request indexes are built once per scan.
-
-The existing `provenance.collector` carrier has two closed values:
+The existing `provenance.collector` has three closed values:
 
 | Value | Meaning |
 | --- | --- |
-| `claude_code_jsonl:own_request_account:v1` | Every counted request is exactly covered by checked, canonical, single-account API evidence and its own trace owner. The same account is present in every aggregate and hourly row. |
-| `claude_code_jsonl:own_request_account_unknown:v1` | The scan evaluated this subagent but could not establish that complete own-request account proof. Existing independently known row hashes, usage and reported money are retained. |
+| `claude_code_jsonl:own_request_account:v1` | Every counted child request has complete, checked, canonical, single-account API/trace coverage AND its own original provider usage-event clock. That one account names every aggregate and hourly row. |
+| `claude_code_jsonl:own_request_account_unknown:v1` | The child was evaluated but account coverage or original event-clock coverage is incomplete. Independently proved account hashes, creator, usage and money remain factual. |
+| `claude_code_jsonl:own_request_account_mixed:v1` | A root has genuine complete reported accounting, a complete original Desktop creator, complete own-request API/trace coverage across at least two accounts including that creator, and naturally NULL accounts on every local subscription aggregate/hourly row. This marker certifies account coverage, not event clocks. |
 
-These values describe observed account coverage, not a subscription, paid route
-or provider entitlement. A bare legacy row hash, Desktop mapping or durable
-binding does not qualify. Typed request identity, when present, must use
-`provider-sha256:v1` with a complete consistent account observation. Checked
-legacy API-v2 records may supply their existing account hash; unchecked records
-cannot. Missing organization evidence is never invented or emitted.
+D1 complete checks original clocks before response folding can hide missing or
+malformed timestamps. Every counted request must reproduce the complete
+original min/max and count in every represented hour. Session activity fallback,
+OTLP observer time, auxiliary-only requests and an unstamped progressive partial
+cannot certify this clock proof. Counted zero-token rows are included. Valid
+lifecycle timestamps use UTC spelling while retaining their original instants.
+A bucket-wide minimum may conservatively precede a destination's own first
+request; terminal usage-event time does not prove request initiation or an
+entitlement interval. Missing time proof withdraws complete without deleting an
+independently proved account. Legacy persisted API-v2 evidence cannot recover
+event-versus-observer clock provenance.
 
-Missing/unreadable evidence, incomplete or duplicated own IDs, conflicting
-accounts, mismatched trace ownership/client IDs, malformed hashes and conflicting
-known row identity remain unknown. Independent API/cloud destinations retain
-all their facts and money without acquiring subscription identity. Unrelated
-root requests cannot veto a completely covered child. A lost proof withdraws the
-evaluated candidate's qualifier; a later genuine proof can restore it. Delivery
-still honors the retained account guard. A fresh reparse without request evidence
-cannot restore earlier proved row hashes from a cached login and is deferred
-when a retained owner exists. Its last accepted body remains historical proof;
-this is no claim of current evidence health. An initial unknown historical import
-has no retained owner and does not acquire that refusal. Original creator evidence is
-never rewritten, including genuine missing/conflict/complete evaluations.
+D2 uses an opaque scan-local capability bound to the freshly qualified semantic
+fingerprint and additive creator/body witness. Only that capability may release
+the old root account-switch upload veto, with the retained owner matching the
+original creator. A raw collector string, cached index or marker-only import
+cannot restore it. Original creator/owner, factual rows and whole reported money
+stay unchanged; no hash is cleared to manufacture a mixed body, no accounting
+contract is fabricated, and no money is split by login. Missing/invalid API or
+trace evidence, conflicting creator, known-row accounts, independent API/cloud
+routes, incomplete accounting and changed candidate bodies keep the existing
+refusal. A restart must reconstruct the genuine proof before release.
 
-Imported sessions and registered-home sessions follow the same exact request
-proof. Without matching local evidence, they remain unknown. A directory name,
-slot login, parent subscription or arbitrary OTEL environment is not a fallback.
-Home discovery and copied-transcript deduplication remain separate operations.
+Each recognized collector adds its exact value as `request_account_coverage`
+in the existing attribution component. Legacy collectors omit that leaf. A
+marker change therefore changes semantic fingerprint/revision-v2 material;
+marker-only changes leave policy-neutral content and creator/body witness
+unchanged. UTC spelling uses the existing component algorithms. Parser v38
+revisits ordinary cached parses; scan identity and hash epochs remain unchanged.
+Qualification still precedes privacy policy stripping, and the qualifier
+survives disabled attribution labels with matching canonical bytes.
 
-Parser v37 revisits ordinary cached parses through existing invalidation. Scan
-identity, usage-accounting authority, cached-owner refusal, body witness, CAS,
-ACK, retry and correction mechanisms are unchanged. The qualifier is covered by
-the existing attribution component as `request_account_coverage`, with its
-exact closed collector value. Legacy collectors omit that component leaf.
-This changes the semantic fingerprint and revision-v2 material so local no-op
-suppression cannot lose a proof change; it does not change the policy-neutral
-content hash or original identity body witness. Admission must require that exact revision and accepted
-body when settling a qualifier change; content-hash equality alone cannot settle
-proof loss or restoration. No history reset, demo-data repair or forced resend
-is part of this change.
+## Backend compatibility and delivery
 
-## Backend and release dependency
+The compatible receiver must reproduce the exact conditional attribution leaf
+in both raw and post-policy admission. D1 request-login resolution requires the
+complete qualifier, aggregate/hour account agreement, one scoped logical
+subscription and a supported original usage-time observation bound. Legacy or
+Unknown account rows cannot acquire that binding. Missing/ambiguous evidence is
+terminal Unknown; original creator evidence is a separate fact.
 
-Before an installed producer emits these qualifiers, the backend must reproduce
-that exact conditional attribution component leaf, accept the exact
-complete/unknown contract, check aggregate/hour account agreement,
-and resolve only one eligible logical subscription in the authenticated
-organization/user/source/Mac at supported session time. Complete own-request
-coverage is separate from original creator identity and does not authorize a
-conflicting or contradictory original pair. SOURCE must use explicit
-`request_login` provenance/material in existing session and paired control
-settlement, and return honest Unknown on absence or ambiguity. Successful ACK
-requires the normal exact body/predecessor settlement.
+A qualified mixed root settles current subscription membership Unresolved through
+the existing paired controls. Its whole reported money replaces the prior
+version once, preserving creator and factual rows. The receiver clears current
+membership and prevents legacy/backfill healing; no request-level allocation or
+new stored grain is introduced.
 
-Existing retained hourly authority remains protected. Attribution refinement
-or a changed account is not automatically a monotone extension of previously
-accepted grains. Only the existing supported correction authority may admit
-such a change; no manufactured proven contract or erased account grain is used.
-Forward operation and fresh-user historical import are the delivery targets;
-there is no special migration to repair previously stored demo data.
+Temporary SOURCE unreadiness returns retryable503 after its observation commit.
+The existing uploader retains the same candidate and retries it through normal
+checkpoint/recovery.503 never means acceptance or terminal Unknown. Lost ACK,
+restart and repeat keep semantic/body identity and preserve retained ownership;
+only an exact validated body/paired settlement ACK advances acceptance. Existing
+predecessor/CAS, correction authority, hourly/priced floors and refusal guards
+remain in force. No new timer, outbox, replay, history reset or forced resend is
+introduced. RD45 stays inactive until its separate durable cutoff and first
+canonical-admission proof exist; absence of a resident row is not freshness.
 
-Containing backend compatibility/deployment, then ordinary installed collection
-and served subscription membership, are separate acceptance steps. An independent
-release that omits this producer change is unaffected. Mixed-login root-session
-accounting and request-level organization emission remain separate scopes.
+Backend web AND worker compatibility/deployment must precede a containing
+producer release or emission. Native synthetic tests and receiver
+canonicalization checks do not establish deployed paired settlement or installed
+acceptance. Ordinary collection/status/served membership remains a separate
+acceptance step. Real roots with missing request witnesses remain unqualified.
 
-## Hosted cache fixture follow-up
+## Validation scope
 
-Public CI exposed two cache-only fixtures omitted from the parser-v37 refresh.
-Regenerate the Claude cache wire fixture and provider-wire manifest through their
-existing native generators. Only parser-dependent revision hashes and fixture
-manifest metadata change; usage, cost, content hash, cache state, original
-identity and body witness remain unchanged. The original exact-byte assertions
-remain active after generation. No runtime behavior or backend compatibility
-rule changes in this follow-up.
+Focused native cases cover original time versus fallback, pre-fold missing
+clocks, UTC/historical hours, every bucket, counted auxiliary zero-token events,
+proof loss/recovery, mixed-root exact-body eligibility/refusals, retained owner,
+503/lostACK/restart and settled no-op. Generated bodies are checked against the
+compatible receiver with privacy labels enabled and disabled. Existing native
+snapshot/synchronization checks, generated parser-dependent fixtures, export
+manifest/contracts, formatting, Clippy and strict review complete source
+validation; deployment and installed behavior are reported separately.

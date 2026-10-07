@@ -14,11 +14,11 @@
     "claude": {
       "body_witness_digest": "0f94a7ae8d064c5135fee319f27e494685a00d8ce5e11e3f7493c7f4e29f12d2",
       "body_witness_version": 15,
-      "fixture_canonical_sha256": "757ed0a90f6e91e14dbdabf7507581bbab6ed239a7cb49bd27f16b611b8380a6",
+      "fixture_canonical_sha256": "89dd163e9c4ec6a985766fb05549c73bc522bcc228e86cfc1b6b52b0ead0bb0c",
       "fixture_file": "cache_observation_claude_v1.json",
       "fixture_wire_bytes": 6442,
       "normalized_public_body_witness_version": 13,
-      "parser_revision": "claude_code_jsonl:v37",
+      "parser_revision": "claude_code_jsonl:v38",
       "scan_identity_revision": "claude_code_jsonl:v29"
     },
     "codex": {

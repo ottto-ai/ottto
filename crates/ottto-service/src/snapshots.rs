@@ -26,6 +26,8 @@ use toml_edit::{DocumentMut, Item};
 
 pub(crate) mod cache_observations;
 pub(crate) mod claude_request_accounts;
+#[cfg(test)]
+pub(crate) use tests::claude_request_account_mixed_fixture;
 mod codex_file_join;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
@@ -299,9 +301,9 @@ const CODEX_CREATED_THREAD_TIME_TOLERANCE_NANOS: i128 = 5_000_000_000;
 // canonical fold accepts monotonic population of every usage counter while
 // retaining fail-closed handling for chronological regressions and incomparable
 // states at the same provider instant.
-// v37 qualifies subagent own-request account coverage in existing provenance.
-// It revisits ordinary cached parses without changing scan identity or usage authority.
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v37";
+// v38 qualifies original usage-event clocks and complete mixed-root delivery.
+// Ordinary parser invalidation retains scan identity and accounting authority.
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v38";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -2243,6 +2245,7 @@ struct ClaudeUsageAuthorityQuarantineRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeUsageAuthorityDisposition {
     quarantined_source_session_ids: BTreeSet<String>,
+    pub(crate) mixed_uploads: claude_request_accounts::MixedUploads,
 }
 
 impl ClaudeUsageAuthorityDisposition {
@@ -5888,7 +5891,9 @@ fn semantic_attribution(item: &SnapshotItem) -> Value {
     });
     if matches!(
         item.provenance.collector.as_str(),
-        claude_request_accounts::COMPLETE | claude_request_accounts::UNKNOWN
+        claude_request_accounts::COMPLETE
+            | claude_request_accounts::UNKNOWN
+            | claude_request_accounts::MIXED
     ) {
         value
             .as_object_mut()
@@ -6886,6 +6891,7 @@ struct ResolvedClaudeResponse {
     request_id: Option<String>,
     first_timestamp: Option<String>,
     terminal_timestamp: Option<String>,
+    event_clock_complete: bool,
     preceding_user_timestamp: Option<String>,
     computed_effective_input_context: Option<u64>,
     tool_uses: BTreeMap<String, String>,
@@ -6899,6 +6905,8 @@ pub(crate) struct ClaudeTranscriptUsageOccurrence {
     selector: SelectorCapture,
     reasoning_effort: Option<String>,
     timestamp: Option<String>,
+    // Evaluated before response folding can retain a stamped partial. Local only.
+    event_clock_complete: bool,
     effective_input_context: u64,
 }
 
@@ -6977,11 +6985,11 @@ impl ClaudeResponseObservation {
         // for this response. Mixed valid/missing timestamps retain physical
         // append order, preserving the conservative legacy behavior instead
         // of moving a stamped terminal record ahead of an unstamped partial.
-        if self
+        let event_clock_complete = self
             .records
             .iter()
-            .all(|record| claude_response_provider_time(record).is_some())
-        {
+            .all(|record| claude_response_provider_time(record).is_some());
+        if event_clock_complete {
             self.records.sort_by(claude_response_record_order);
         } else {
             self.records.sort_by_key(|record| record.physical_sequence);
@@ -7023,6 +7031,7 @@ impl ClaudeResponseObservation {
             request_id: aggregate.request_id,
             first_timestamp,
             terminal_timestamp: aggregate.timestamp,
+            event_clock_complete,
             preceding_user_timestamp: self.preceding_user_timestamp,
             computed_effective_input_context: aggregate.computed_effective_input_context,
             tool_uses: aggregate.tool_uses,
@@ -9322,6 +9331,7 @@ impl SnapshotAccumulator {
                         selector: response.selector.clone(),
                         reasoning_effort: response.reasoning_effort.clone(),
                         timestamp: response.terminal_timestamp.clone(),
+                        event_clock_complete: response.event_clock_complete,
                         effective_input_context,
                     },
                 );
@@ -20365,6 +20375,23 @@ impl ScanIndex {
         snapshots: &mut [SnapshotItem],
         codex_homes: &[crate::agent_status::CodexHomeBinding],
     ) -> BTreeSet<String> {
+        self.bind_session_accounts_with_mixed(
+            source,
+            machine_id,
+            snapshots,
+            codex_homes,
+            &claude_request_accounts::MixedUploads::default(),
+        )
+    }
+
+    pub(crate) fn bind_session_accounts_with_mixed(
+        &mut self,
+        source: SnapshotSource,
+        machine_id: &str,
+        snapshots: &mut [SnapshotItem],
+        codex_homes: &[crate::agent_status::CodexHomeBinding],
+        mixed: &claude_request_accounts::MixedUploads,
+    ) -> BTreeSet<String> {
         let mut deferred = BTreeSet::new();
         for item in snapshots {
             let session_id = &item.source_session_id;
@@ -20407,6 +20434,17 @@ impl ScanIndex {
                     let observed = exact_session_account_hash(item);
                     match (existing, observed.as_deref()) {
                         (Some(owner), Some(hash)) if owner.account_identifier_hash == hash => {}
+                        (Some(owner), _)
+                            if mixed.permits(item)
+                                && item.session_account_evidence.as_ref().and_then(
+                                    |evidence| evidence.account_identifier_hash.as_deref(),
+                                ) == Some(owner.account_identifier_hash.as_str()) =>
+                        {
+                            // A genuine complete mixed body may replace current
+                            // usage without rewriting its retained creator/owner.
+                            // Eligibility is scan-local and exact-body-bound;
+                            // neither marker-only imports nor restart restore it.
+                        }
                         (Some(_), _) => {
                             deferred.insert(session_id.clone());
                         }
@@ -23179,6 +23217,7 @@ pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<P
 
 #[cfg(test)]
 mod tests {
+    include!("snapshots/claude_request_account_tests.rs");
     use super::*;
     use base64::Engine as _;
 
@@ -36267,6 +36306,7 @@ mod tests {
             ..Default::default()
         };
         claude_request_accounts::apply(std::slice::from_mut(item), &api_report, &trace_report)
+            .coverage
             == [claude_request_accounts::Coverage::Complete]
     }
 
@@ -36563,6 +36603,7 @@ mod tests {
             &Default::default(),
             &Default::default()
         )
+        .coverage
         .is_empty());
         assert_eq!(serde_json::to_value(&untouched_root).unwrap(), original);
         fs::remove_dir_all(dir).unwrap();
@@ -36633,7 +36674,8 @@ mod tests {
                 std::slice::from_mut(&mut imported),
                 &report,
                 &Default::default()
-            ),
+            )
+            .coverage,
             [claude_request_accounts::Coverage::UnreadableEvidence]
         );
         assert_eq!(
@@ -52655,13 +52697,13 @@ pub(crate) mod cache_adapter_tests {
             "../../../fixtures/snapshot-audit/cache_observation_claude_v1.json"
         ))
         .unwrap();
+        if let Ok(output) = std::env::var("OTTTO_CACHE_CLAUDE_FIXTURE_OUT") {
+            std::fs::write(output, serde_json::to_string_pretty(&fixture).unwrap()).unwrap();
+        }
         assert_eq!(
             fixture, golden,
             "production claude cache fixture must remain exact"
         );
-        if let Ok(output) = std::env::var("OTTTO_CACHE_CLAUDE_FIXTURE_OUT") {
-            std::fs::write(output, serde_json::to_string_pretty(&fixture).unwrap()).unwrap();
-        }
     }
     #[test]
     fn cache_generated_wire_fixture_and_witness() {
@@ -52884,7 +52926,7 @@ crate::heap_layout_bound::fields!(ClaudeResponseObservation; sequence, preceding
 crate::heap_layout_bound::fields!(ClaudeResponseRecord; cache_slot, physical_sequence, usage, model, selector, reasoning_effort, request_id, timestamp, computed_effective_input_context, tool_uses);
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
 crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
-crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, effective_input_context);
+crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, effective_input_context);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrenceWitness; sequence, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, model, speed_mode, reasoning_effort);
 crate::heap_layout_bound::fields!(ClaudeUsageAuthorityQuarantineRecord; contract, proven_witness_fingerprint, member_source_file_fingerprints, failed_reconstruction_count, disposition, retry_after_unix_seconds);
 crate::heap_layout_bound::fields!(ClaudeUsageFamilyPending; census_window_end, member_request_id_hashes, member_occurrences, invalid);

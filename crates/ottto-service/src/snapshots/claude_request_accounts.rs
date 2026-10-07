@@ -10,9 +10,10 @@ use crate::claude_local_otel::{
     ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition, ClaudeLocalOtelEvidence,
     ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipEvidence, ClaudeTraceOwnershipLoadReport,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) const COMPLETE: &str = "claude_code_jsonl:own_request_account:v1";
+pub(super) const MIXED: &str = "claude_code_jsonl:own_request_account_mixed:v1";
 pub(super) const UNKNOWN: &str = "claude_code_jsonl:own_request_account_unknown:v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,29 +26,43 @@ pub(crate) enum Coverage {
     UnprovedRequestOwner,
     KnownAccountConflict,
     UnsupportedDestination,
+    UnprovedEventClock,
 }
 
-/// Returned dispositions are in subagent order. Roots and unrelated collectors
-/// are unchanged. Both inputs are the scan's already-loaded strict reports.
+/// A scan-local capability bound to the freshly qualified semantic and creator
+/// body. Never serialized or restored from a collector string / cached index.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MixedUploads {
+    bodies: BTreeMap<String, (String, String)>,
+}
+
+impl MixedUploads {
+    pub(super) fn permits(&self, item: &SnapshotItem) -> bool {
+        self.bodies
+            .get(&item.source_session_id)
+            .is_some_and(|(semantic, body)| {
+                item.provenance.collector == MIXED
+                    && item.snapshot_fingerprint == *semantic
+                    && snapshot_fingerprint(SnapshotSource::ClaudeCode, item) == *semantic
+                    && super::snapshot_upload_body_witness(item) == *body
+            })
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Qualification {
+    pub(crate) coverage: Vec<Coverage>,
+    pub(crate) mixed: MixedUploads,
+}
+
+/// Reuse the scan's strict reports and index each request once. Account proof
+/// and original clock qualification remain separate facts: a missing clock
+/// withdraws COMPLETE without deleting an independently proved row account.
 pub(crate) fn apply(
     snapshots: &mut [SnapshotItem],
     api: &ClaudeLocalOtelLoadReport,
     trace: &ClaudeTraceOwnershipLoadReport,
-) -> Vec<Coverage> {
-    let is_child = |item: &SnapshotItem| {
-        matches!(
-            item.provenance.collector.as_str(),
-            "claude_code_jsonl" | COMPLETE | UNKNOWN
-        ) && item
-            .source_session_id
-            .split_once("_agent-")
-            .is_some_and(|(root, agent)| !root.is_empty() && !agent.is_empty())
-    };
-    if !snapshots.iter().any(is_child) {
-        return Vec::new();
-    }
-    // Borrow the rows; index once rather than scanning/cloning a growing root
-    // ledger separately for every child. A repeated request remains ambiguous.
+) -> Qualification {
     let mut requests = BTreeMap::new();
     for (root, rows) in &api.evidence {
         for row in rows {
@@ -66,36 +81,218 @@ pub(crate) fn apply(
                 .or_insert(Some(row));
         }
     }
-    let mut dispositions = Vec::new();
-    for item in snapshots.iter_mut().filter(|item| is_child(item)) {
-        let qualification = if api.health.is_complete() && trace.is_complete() {
-            qualify(item, &requests, &owners)
-        } else {
-            Err(Coverage::UnreadableEvidence)
-        };
+    let healthy = api.health.is_complete() && trace.is_complete();
+    let mut result = Qualification::default();
+    for item in snapshots {
+        if !matches!(
+            item.provenance.collector.as_str(),
+            "claude_code_jsonl" | COMPLETE | UNKNOWN | MIXED
+        ) {
+            continue;
+        }
+        let is_child = item
+            .source_session_id
+            .split_once("_agent-")
+            .is_some_and(|(root, agent)| !root.is_empty() && !agent.is_empty());
         let mut changed = false;
-        let disposition = match qualification {
-            Ok(account) => {
-                changed = set_claude_account_hash(item, Some(account.to_string()));
-                Coverage::Complete
+        if is_child {
+            let proof = if healthy {
+                qualify(item, &requests, &owners)
+            } else {
+                Err(Coverage::UnreadableEvidence)
+            };
+            let disposition = match proof {
+                Ok(account) => {
+                    changed = set_claude_account_hash(item, Some(account.to_string()));
+                    if original_event_clocks_complete(item) {
+                        Coverage::Complete
+                    } else {
+                        Coverage::UnprovedEventClock
+                    }
+                }
+                Err(reason) => reason,
+            };
+            let collector = if disposition == Coverage::Complete {
+                COMPLETE
+            } else {
+                UNKNOWN
+            };
+            if item.provenance.collector != collector {
+                item.provenance.collector = collector.to_string();
+                changed = true;
             }
-            Err(reason) => reason,
-        };
-        let collector = if disposition == Coverage::Complete {
-            COMPLETE
+            changed |= normalize_activity(item);
+            result.coverage.push(disposition);
         } else {
-            UNKNOWN
-        };
-        if item.provenance.collector != collector {
-            item.provenance.collector = collector.to_string();
-            changed = true;
+            // Only genuine existing reported accounting may remove the old
+            // current-owner upload veto. Never clear accounts to fit this shape.
+            let qualified = healthy && qualify_mixed(item, &requests, &owners);
+            let collector = if qualified {
+                MIXED
+            } else if item.provenance.collector == MIXED {
+                "claude_code_jsonl"
+            } else {
+                item.provenance.collector.as_str()
+            };
+            if item.provenance.collector != collector {
+                item.provenance.collector = collector.to_string();
+                changed = true;
+            }
+            if qualified || changed {
+                changed |= normalize_activity(item);
+            }
+            if changed {
+                item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+            }
+            if qualified {
+                result.mixed.bodies.insert(
+                    item.source_session_id.clone(),
+                    (
+                        item.snapshot_fingerprint.clone(),
+                        super::snapshot_upload_body_witness(item),
+                    ),
+                );
+            }
+            continue;
         }
         if changed {
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         }
-        dispositions.push(disposition);
     }
-    dispositions
+    result
+}
+
+// Preserve each original instant while using the backend's UTC wire spelling
+// for lifecycle fields. This changes no timestamp source or semantic hash epoch.
+fn normalize_activity(item: &mut SnapshotItem) -> bool {
+    let mut changed = false;
+    for value in [
+        &mut item.source_started_at,
+        &mut item.source_ended_at,
+        &mut item.source_last_activity_at,
+    ] {
+        if let Some((_, normalized)) = value
+            .as_deref()
+            .and_then(super::activity_bucket_from_timestamp)
+        {
+            if value.as_deref() != Some(normalized.as_str()) {
+                *value = Some(normalized);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// All counted requests must have genuine original terminal usage-event clocks
+/// before any fallback/fold, and must reproduce EVERY represented hourly min/max.
+/// Legacy OTLP v2 cannot prove event-vs-observer origin; auxiliary-only rows and
+/// timestamps carried across unstamped partials therefore cannot qualify D1.
+fn original_event_clocks_complete(item: &SnapshotItem) -> bool {
+    if item.request_count == 0
+        || item.claude_usage_occurrences.len() as u64 != item.request_count
+        || item.claude_usage_occurrences.len() != item.claude_usage_request_ids.len()
+    {
+        return false;
+    }
+    let mut expected: BTreeMap<String, (u64, String, String)> = BTreeMap::new();
+    for occurrence in item.claude_usage_occurrences.values() {
+        if !occurrence.event_clock_complete {
+            return false;
+        }
+        let Some((hour, time)) = occurrence
+            .timestamp
+            .as_deref()
+            .and_then(super::activity_bucket_from_timestamp)
+        else {
+            return false;
+        };
+        let entry = expected
+            .entry(hour)
+            .or_insert((0, time.clone(), time.clone()));
+        entry.0 += 1;
+        if super::timestamp_is_before(&time, &entry.1) {
+            entry.1 = time.clone();
+        }
+        if super::timestamp_is_after(&time, &entry.2) {
+            entry.2 = time;
+        }
+    }
+    item.usage_buckets.len() == expected.len()
+        && item.usage_buckets.iter().all(|bucket| {
+            expected
+                .get(&bucket.bucket_start)
+                .is_some_and(|(count, first, last)| {
+                    bucket
+                        .model_usage
+                        .iter()
+                        .try_fold(0_u64, |total, row| total.checked_add(row.request_count))
+                        == Some(*count)
+                        && bucket.first_activity_at.as_deref() == Some(first.as_str())
+                        && bucket.last_activity_at.as_deref() == Some(last.as_str())
+                })
+        })
+}
+
+fn qualify_mixed(
+    item: &SnapshotItem,
+    requests: &BTreeMap<(&str, &str), Option<&ClaudeLocalOtelEvidence>>,
+    owners: &BTreeMap<(&str, &str), Option<&ClaudeTraceOwnershipEvidence>>,
+) -> bool {
+    let root = item.source_session_id.as_str();
+    let Some(original) = item.session_account_evidence.as_ref() else {
+        return false;
+    };
+    if !super::codex_identity_is_uuid_shaped(root)
+        || root != root.to_ascii_lowercase()
+        || item.usage_accounting_contract.as_deref() != Some("session_exclusive_reported_usage:v1")
+        || super::validate_snapshot_item(0, item).is_err()
+        || original.provider != "anthropic"
+        || original.identity_hash_scheme != "provider-sha256:v1"
+        || original.evidence_source != "claude_desktop_original:v1"
+        || original.identity_disposition != Some("complete")
+        || !original
+            .account_identifier_hash
+            .as_deref()
+            .is_some_and(hash_is_valid)
+        || !original
+            .provider_workspace_hash
+            .as_deref()
+            .is_some_and(hash_is_valid)
+        || item.model_usage.is_empty()
+        || item.usage_buckets.is_empty()
+        || item
+            .cost
+            .as_ref()
+            .and_then(|cost| cost.total_cost_usd.as_ref())
+            .is_none()
+        || item
+            .model_usage
+            .iter()
+            .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
+            .any(|row| row.account_identifier_hash.is_some() || !local_subscription(row))
+    {
+        return false;
+    }
+    let Ok(accounts) = request_accounts(item, root, requests, owners) else {
+        return false;
+    };
+    accounts.len() >= 2 && accounts.contains(original.account_identifier_hash.as_deref().unwrap())
+}
+
+fn hash_is_valid(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn local_subscription(row: &super::SnapshotModelUsage) -> bool {
+    matches!(row.auth_mode.as_deref(), None | Some("oauth"))
+        && matches!(row.billing_channel.as_deref(), None | Some("subscription"))
+        && matches!(row.billing_provider.as_deref(), None | Some("anthropic"))
+        && matches!(row.model_provider.as_deref(), None | Some("anthropic"))
+        && matches!(row.gateway_provider.as_deref(), None | Some("anthropic"))
 }
 
 fn qualify<'a>(
@@ -107,6 +304,36 @@ fn qualify<'a>(
         .source_session_id
         .split_once("_agent-")
         .expect("checked child");
+    let accounts = request_accounts(item, root, requests, owners)?;
+    if accounts.len() != 1 {
+        return Err(Coverage::ConflictingAccounts);
+    }
+    let account = *accounts.first().ok_or(Coverage::MissingRequests)?;
+    for row in item
+        .model_usage
+        .iter()
+        .chain(item.usage_buckets.iter().flat_map(|b| b.model_usage.iter()))
+    {
+        if row
+            .account_identifier_hash
+            .as_deref()
+            .is_some_and(|known| known != account)
+        {
+            return Err(Coverage::KnownAccountConflict);
+        }
+        if !local_subscription(row) {
+            return Err(Coverage::UnsupportedDestination);
+        }
+    }
+    Ok(account)
+}
+
+fn request_accounts<'a>(
+    item: &SnapshotItem,
+    root: &str,
+    requests: &BTreeMap<(&str, &str), Option<&'a ClaudeLocalOtelEvidence>>,
+    owners: &BTreeMap<(&str, &str), Option<&ClaudeTraceOwnershipEvidence>>,
+) -> Result<BTreeSet<&'a str>, Coverage> {
     if item.unattributed_total_tokens != 0 || claude_snapshot_request_id_hashes(item).is_none() {
         return Err(Coverage::MissingRequests);
     }
@@ -117,7 +344,7 @@ fn qualify<'a>(
     {
         return Err(Coverage::UnprovedRequestOwner);
     }
-    let mut account = None;
+    let mut accounts = BTreeSet::new();
     for request in &item.claude_usage_request_ids {
         let row = requests
             .get(&(root, request.as_str()))
@@ -161,10 +388,7 @@ fn qualify<'a>(
         {
             return Err(Coverage::InvalidAccountEvidence);
         }
-        if account.is_some_and(|prior| prior != hash) {
-            return Err(Coverage::ConflictingAccounts);
-        }
-        account = Some(hash);
+        accounts.insert(hash);
         let owner = owners
             .get(&(root, request.as_str()))
             .and_then(|entry| *entry)
@@ -179,27 +403,8 @@ fn qualify<'a>(
             return Err(Coverage::UnprovedRequestOwner);
         }
     }
-    let account = account.ok_or(Coverage::MissingRequests)?;
-    for row in item
-        .model_usage
-        .iter()
-        .chain(item.usage_buckets.iter().flat_map(|b| b.model_usage.iter()))
-    {
-        if row
-            .account_identifier_hash
-            .as_deref()
-            .is_some_and(|known| known != account)
-        {
-            return Err(Coverage::KnownAccountConflict);
-        }
-        if !matches!(row.auth_mode.as_deref(), None | Some("oauth"))
-            || !matches!(row.billing_channel.as_deref(), None | Some("subscription"))
-            || !matches!(row.billing_provider.as_deref(), None | Some("anthropic"))
-            || !matches!(row.model_provider.as_deref(), None | Some("anthropic"))
-            || !matches!(row.gateway_provider.as_deref(), None | Some("anthropic"))
-        {
-            return Err(Coverage::UnsupportedDestination);
-        }
+    if accounts.is_empty() {
+        return Err(Coverage::MissingRequests);
     }
-    Ok(account)
+    Ok(accounts)
 }
