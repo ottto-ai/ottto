@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 478,
-  "content_sha256": "9143a8726d5354367e9fcf295f85f2a16a095b1eef94e94db070833e1023c416",
+  "content_sha256": "a24366e2ff0350fa41cbdffc80df09a01d6de3fb51cec566f157c12bbe3b88f6",
   "files": [
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status_refresh.rs",
-      "sha256": "9a1fe2d5af9346527da139f5a145d8d2592052fc7684b63909c6850c0497337a",
-      "size_bytes": 30167
+      "sha256": "46716c17a997632b77aae0fa300a830ba53163fd0d36671c215c4ed048fa04cb",
+      "size_bytes": 42492
     },
     {
       "executable": false,
@@ -1287,8 +1287,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/refactor-readiness.md",
-      "sha256": "bef88134935faaaf591aeb979be2838af4d89e6bc86cc20b559dd48926493057",
-      "size_bytes": 26327
+      "sha256": "2bd6c9aa582e750841c20c22d0b8fb7a04742724dcefcde449c865294dd2ec4d",
+      "size_bytes": 27311
     },
     {
       "executable": false,
@@ -3349,7 +3349,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-07T05:05:14+00:00",
+  "generated_at": "2026-10-07T08:37:55+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 479,
   "public_roots": [
@@ -3388,5 +3388,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c87b36eb4c591824a15682e26052d51e80e9099e"
+  "source_commit": "c015450940e9504d996d8a0757329a99a80219b8"
 }
