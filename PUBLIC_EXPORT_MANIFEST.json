@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 490,
-  "content_sha256": "f3795653628bdf5f016340c7311e0bfea342c81ba7a1a2496601e36b17f4c308",
+  "candidate_file_count": 491,
+  "content_sha256": "ad9b7ab2b6b5b1fe120328feaf38a236653dbc1258cc8b13ae89e626056d1411",
   "files": [
     {
       "executable": false,
@@ -720,8 +720,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_local_otel.rs",
-      "sha256": "74e72ab760c5eada0fca641244f00f17c4a0dfb604c78e61c88133bc3c75366a",
-      "size_bytes": 96774
+      "sha256": "a173ce430cfba7a227509e2530e2d75ff9cc810243b1293c8d2210571e17db6e",
+      "size_bytes": 102051
     },
     {
       "executable": false,
@@ -2350,6 +2350,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-09-claude-zero-event-clock.md",
+      "sha256": "eb0cc6f6aba32cb60bfa1dc1459f62b0e421b39f8ae16e19df8d2d6f268e7eaa",
+      "size_bytes": 1405
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -3435,7 +3442,7 @@
   ],
   "generated_at": "2026-10-08T20:13:40+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 491,
+  "output_file_count": 492,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

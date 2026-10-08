@@ -375,11 +375,10 @@ fn api_evidence_from_protobuf(body: &[u8]) -> Result<Vec<ClaudeLocalOtelEvidence
                 );
                 let mut attrs = resource_attrs.clone();
                 attrs.extend(record_attrs);
-                let observed_at = format_nanos(i128::from(if record.time_unix_nano > 0 {
-                    record.time_unix_nano
-                } else {
-                    record.observed_time_unix_nano
-                }));
+                let observed_at = log_timestamp(
+                    Some(record.time_unix_nano),
+                    Some(record.observed_time_unix_nano),
+                );
                 if let Some(item) = api_evidence_from_attrs(&attrs, observed_at, identity) {
                     evidence.push(item);
                 }
@@ -1086,17 +1085,24 @@ pub(crate) fn canonical_uuid(value: &str) -> Option<String> {
 }
 
 fn timestamp_at(record: &Value) -> Option<String> {
-    let raw = record
-        .get("timeUnixNano")
-        .or_else(|| record.get("observedTimeUnixNano"))?;
-    let nanos = raw
-        .as_str()
-        .and_then(|value| value.parse::<i128>().ok())
-        .or_else(|| raw.as_u64().map(i128::from))?;
-    OffsetDateTime::from_unix_timestamp_nanos(nanos)
-        .ok()?
-        .format(&Rfc3339)
-        .ok()
+    let nanos = |key| {
+        record.get(key).and_then(|raw| {
+            raw.as_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .or_else(|| raw.as_u64())
+        })
+    };
+    log_timestamp(nanos("timeUnixNano"), nanos("observedTimeUnixNano"))
+}
+
+// OTLP LogRecord defines zero as unknown for both fields. The existing v2
+// sidecar stores only the selected clock, so an observed fallback is not proof
+// of an original provider event clock. No usable clock means no reduced row.
+fn log_timestamp(event: Option<u64>, observed: Option<u64>) -> Option<String> {
+    event
+        .filter(|value| *value > 0)
+        .or_else(|| observed.filter(|value| *value > 0))
+        .and_then(|value| format_nanos(i128::from(value)))
 }
 
 fn json_nanos(value: &Value) -> Option<i128> {
@@ -1566,6 +1572,133 @@ mod tests {
                 "body":{"stringValue":"claude_code.api_request"},
                 "attributes":attributes(&record_values)}]}]}]}))
         .unwrap()
+    }
+
+    fn clock_test_protobuf(event: u64, observed: u64) -> Vec<ClaudeLocalOtelEvidence> {
+        let payload = otlp_proto::ExportLogsServiceRequest {
+            resource_logs: vec![otlp_proto::ResourceLogs {
+                resource: Some(otlp_proto::Resource { attributes: vec![] }),
+                scope_logs: vec![otlp_proto::ScopeLogs {
+                    log_records: vec![otlp_proto::LogRecord {
+                        time_unix_nano: event,
+                        observed_time_unix_nano: observed,
+                        body: proto_string("body", "claude_code.api_request").value,
+                        attributes: vec![
+                            proto_string("session.id", "identity-session"),
+                            proto_string("request_id", "identity-request"),
+                            proto_string("model", "claude-test"),
+                            proto_string("input_tokens", "12"),
+                            proto_string("output_tokens", "3"),
+                            proto_string("user.account_uuid", ACCOUNT),
+                            proto_string("organization.id", ORGANIZATION),
+                        ],
+                    }],
+                }],
+            }],
+        };
+        api_evidence_from_protobuf(&payload.encode_to_vec()).unwrap()
+    }
+
+    fn clock_test_json(
+        event: Option<Value>,
+        observed: Option<Value>,
+    ) -> Vec<ClaudeLocalOtelEvidence> {
+        let mut payload: Value = serde_json::from_slice(&identity_json(
+            &[],
+            &[
+                ("user.account_uuid", ACCOUNT),
+                ("organization.id", ORGANIZATION),
+            ],
+        ))
+        .unwrap();
+        let record = payload
+            .pointer_mut("/resourceLogs/0/scopeLogs/0/logRecords/0")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        record.remove("timeUnixNano");
+        if let Some(value) = event {
+            record.insert("timeUnixNano".into(), value);
+        }
+        if let Some(value) = observed {
+            record.insert("observedTimeUnixNano".into(), value);
+        }
+        api_evidence_from_json(&serde_json::to_vec(&payload).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn claude_api_log_clock_zero_uses_observed_for_both_encodings() {
+        let observed = 1_783_728_000_000_000_000_u64;
+        let expected = clock_test_protobuf(0, observed);
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].observed_at, "2026-07-11T00:00:00Z");
+        for event in [
+            None,
+            Some(serde_json::json!("0")),
+            Some(serde_json::json!(0)),
+            Some(Value::Null),
+            Some(serde_json::json!("invalid")),
+            Some(serde_json::json!("-1")),
+            Some(serde_json::json!("18446744073709551616")),
+        ] {
+            for observer in [
+                serde_json::json!(observed.to_string()),
+                serde_json::json!(observed),
+            ] {
+                let rows = clock_test_json(event.clone(), Some(observer));
+                assert_eq!(rows, expected, "event={event:?}: fallback must retain counters, identity and exact fingerprint parity");
+            }
+        }
+    }
+
+    #[test]
+    fn claude_api_log_clock_both_absent_never_create_epoch_evidence() {
+        assert!(
+            clock_test_protobuf(0, 0).is_empty(),
+            "protobuf zero is absent, not epoch"
+        );
+        for event in [
+            None,
+            Some(serde_json::json!("0")),
+            Some(serde_json::json!(0)),
+            Some(Value::Null),
+        ] {
+            for observed in [
+                None,
+                Some(serde_json::json!("0")),
+                Some(serde_json::json!(0)),
+                Some(Value::Null),
+            ] {
+                assert!(
+                    clock_test_json(event.clone(), observed.clone()).is_empty(),
+                    "event={event:?}, observed={observed:?}: no usable clock"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claude_api_log_clock_real_event_wins_even_next_to_epoch() {
+        let observed = 1_783_728_000_000_000_000_u64;
+        for event in [1_u64, observed - 1, u64::MAX] {
+            let expected = clock_test_protobuf(event, observed);
+            assert_eq!(expected.len(), 1);
+            for raw in [
+                serde_json::json!(event.to_string()),
+                serde_json::json!(event),
+            ] {
+                assert_eq!(
+                    clock_test_json(Some(raw), Some(serde_json::json!(observed.to_string()))),
+                    expected
+                );
+            }
+            assert_ne!(expected[0].observed_at, "2026-07-11T00:00:00Z");
+        }
+        assert_eq!(
+            clock_test_protobuf(1, observed)[0].observed_at,
+            "1970-01-01T00:00:00.000000001Z",
+            "only zero is absence; genuine positive instants are preserved"
+        );
     }
 
     #[test]
