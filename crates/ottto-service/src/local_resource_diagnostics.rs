@@ -576,9 +576,8 @@ mod tests {
                 lifetime_max_rss_bytes: 8192,
             }),
         );
-        assert!(
-            rising.process_lifetime_max_rss_before_bytes <= rising.process_lifetime_max_rss_bytes
-        );
+        assert_eq!(rising.process_lifetime_max_rss_before_bytes, Some(4096));
+        assert_eq!(rising.process_lifetime_max_rss_bytes, Some(8192));
     }
     #[test]
     fn resource_attempts_count_fallback_and_presend_refusal_without_content() {

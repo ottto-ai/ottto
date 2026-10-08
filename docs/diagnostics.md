@@ -80,8 +80,7 @@ called and returned normally, including an error return. It has `counts: {}`
 and no result field; outcome reporting and transport receipts remain the
 existing outcome owners. Prepare failures, prepare returning no frame,
 rotation validation failures before finish, panics, aborts and hard kills
-produce no finish record. The inactive retry rotation is outside this window;
-it needs the same wrapper if activated.
+produce no finish record.
 
 Each `snapshot_batch_call` records the actual serialized body length and the
 encoded/decoded body lengths across attempts passed to HTTP. Gzip refusal adds
