@@ -452,6 +452,42 @@ impl HeapLayoutBound for ottto_protocol::LocalAccountState {
 #[cfg(test)]
 mod sampled_scalar_buffer_tests {
     use super::*;
+    // Test-only enforcement: requiring coverage never changes runtime admission.
+    fn require_layout_coverage(
+        supported: bool,
+        requirement: Option<&str>,
+    ) -> Result<(), &'static str> {
+        if requirement == Some("1") && !supported {
+            Err("OTTTO_REQUIRE_LAYOUT=1 requires a validated native layout")
+        } else {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn layout_gate_coverage_receipt() {
+        let supported = layout_supported();
+        let requirement = std::env::var("OTTTO_REQUIRE_LAYOUT").ok();
+        println!(
+            "layout_gate_coverage_receipt: compiled_rustc={} layout_supported={} required_layout={}",
+            env!("OTTTO_SCAN_LAYOUT_RUSTC"),
+            supported,
+            requirement.as_deref() == Some("1"),
+        );
+        require_layout_coverage(supported, requirement.as_deref()).unwrap();
+    }
+
+    #[test]
+    fn required_layout_coverage_enforces_supported_and_unsupported_cases() {
+        for requirement in [None, Some("0"), Some("1")] {
+            assert!(require_layout_coverage(true, requirement).is_ok());
+            assert_eq!(
+                require_layout_coverage(false, requirement).is_err(),
+                requirement == Some("1"),
+            );
+        }
+    }
+
     #[test]
     fn sampled_release_compiler_allowlist_refuses_unvalidated_versions() {
         assert!(compiler_layout_supported(
