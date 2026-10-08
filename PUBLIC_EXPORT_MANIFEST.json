@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 488,
-  "content_sha256": "ab5218bebca92aabf40e90b4d988d7ccbcf3025f4e44907825f3b75b14a093f1",
+  "candidate_file_count": 489,
+  "content_sha256": "ccb5d1947a5bfec62e3db79b3699b74edf5c852645db6e2ea07601cbad217842",
   "files": [
     {
       "executable": false,
@@ -1133,8 +1133,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_jsonl.rs",
-      "sha256": "72d6c75fbc5997f2340ec7fcffcd95ba4f3b2025f00bcf2eed0c08c8339180d0",
-      "size_bytes": 9176
+      "sha256": "50ea4ba364e005adb59714649a8a4e2af90eb290915d1a05d3042d8f040fc7c7",
+      "size_bytes": 9586
     },
     {
       "executable": false,
@@ -1147,8 +1147,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests.rs",
-      "sha256": "a99aab1f6b8bc76199924bb813d16be33eda748e376c04bc5b10a9e813fb8906",
-      "size_bytes": 55447
+      "sha256": "3751d6a9d757bc634ff880c39f941d176c48187f233d3f59a63d658cf58f18dd",
+      "size_bytes": 58052
     },
     {
       "executable": false,
@@ -1168,15 +1168,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/transcript_acquisition.rs",
-      "sha256": "120392de278afb16c1f7a95e3df05025a4c205707e8a79d00f12ce4d85b7f677",
-      "size_bytes": 32696
+      "sha256": "b4b4cf7e0e83c590760873f4d63f85cf491b867021a00b329b136cfe89affb68",
+      "size_bytes": 33038
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/transcript_cache.rs",
-      "sha256": "c15dc1bdc3a4f631fad8f6692aaf18c372ca25601490d6fe97d3bf9dfa096779",
-      "size_bytes": 10463
+      "sha256": "a9ae44aec20403b161649519016f04241d8454f54e44c763fdeb737e7b7b11dc",
+      "size_bytes": 18157
     },
     {
       "executable": false,
@@ -2336,6 +2336,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-08-tail-cache-scan-pressure.md",
+      "sha256": "7582487e60bed7b2bc9eaaa13066a2eb4b96c8c3ab5cee5fb279dd772d4f6127",
+      "size_bytes": 3127
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -3419,9 +3426,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-08T09:02:43+00:00",
+  "generated_at": "2026-10-08T09:19:55+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 489,
+  "output_file_count": 490,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3458,5 +3465,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "879a0a3d149edf93e663e3c3092fe244d132948b"
+  "source_commit": "b1004459136e635ab6d88e6f3e11954cdb2ac50f"
 }

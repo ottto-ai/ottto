@@ -129,6 +129,18 @@ pub(crate) struct Checkpoint {
 }
 
 impl Checkpoint {
+    /// A cache admission hint only. Source validation still uses the complete
+    /// stamp, scope, samples and independent audit obligation.
+    pub(crate) fn modified_hint(&self) -> (i64, i64) {
+        #[cfg(unix)]
+        {
+            self.stamp.modified
+        }
+        #[cfg(not(unix))]
+        {
+            (0, 0)
+        }
+    }
     pub(crate) fn sealed_offset(&self) -> u64 {
         self.samples.sealed_offset
     }

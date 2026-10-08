@@ -1376,3 +1376,65 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
         );
     }
 }
+
+#[test]
+fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let live = ScanFixture::new(source);
+        live.file.append(&usage(source, 100, 0, "fixture-model"));
+        live.file
+            .append(&json!({"type":"synthetic-padding", "text":"x".repeat(64 * 1024)}));
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (index, _, _) = production_scan(
+            &live,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "scan-pressure",
+        );
+        // More cold admissions than the shared count cap. Their old source
+        // timestamps must not promote them over the recent active session.
+        for _ in 0..crate::transcript_cache::CACHE_ENTRIES + 16 {
+            let historical = ScanFixture::new(source);
+            historical
+                .file
+                .append(&usage(source, 100, 0, "fixture-model"));
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&historical.file.0)
+                .unwrap();
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1791370000)),
+            )
+            .unwrap();
+            let (_, scan, modes) = production_scan(
+                &historical,
+                source,
+                ScanIndex::default(),
+                Some(cache.clone()),
+                "scan-pressure",
+            );
+            assert_eq!(modes, (1, 0, 0));
+            assert!(!scan.snapshots.is_empty());
+        }
+        live.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (_, tail, modes, bytes) =
+            production_scan_with_metrics(&live, source, index, Some(cache), "scan-pressure");
+        assert_eq!(
+            modes,
+            (0, 1, 0),
+            "recent tail after old full admissions {source:?}"
+        );
+        let full_bytes = live.file.0.metadata().unwrap().len();
+        assert!(bytes.0 + bytes.1 < full_bytes);
+        assert!(bytes.1 > 0 && bytes.1 <= 8192);
+        eprintln!("SAMPLED_SCAN_PRESSURE source={source:?} full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
+        let (_, full, _) =
+            production_scan(&live, source, ScanIndex::default(), None, "scan-pressure");
+        assert_eq!(production_body(source, tail), production_body(source, full));
+    }
+}
