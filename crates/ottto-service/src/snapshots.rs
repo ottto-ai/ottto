@@ -11433,7 +11433,7 @@ impl OwnedSourceScan {
         }
         let copy_budget = self.sampled_copy_budget();
         if copy_budget == 0 {
-            self.clear_sampled_cache();
+            self.release_sampled_cache_for_copy_refusal();
         }
         let Self {
             resource_probe,

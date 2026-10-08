@@ -768,6 +768,56 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
 }
 
 #[test]
+fn sampled_production_unretainable_full_file_preserves_other_native_tails() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let small = ScanFixture::new(source);
+        let large = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        small.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (index, _, _) = production_scan(
+            &small,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "mixed-files",
+        );
+        for n in 0..150 {
+            large
+                .file
+                .append(&usage(source, 100 + n as u64, n, &format!("model-{n}")));
+        }
+        let (mut parser, _, _) = native_parser(&large.file, source);
+        while !parser.step().unwrap() {}
+        assert!(
+            crate::heap_layout_bound::bound(&parser, 31 * 1024 * 1024).is_none(),
+            "fixture must trigger per-file optional-layout refusal {source:?}"
+        );
+        let (_, large_scan, _) = production_scan(
+            &large,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "mixed-files",
+        );
+        let (_, large_full, _) =
+            production_scan(&large, source, ScanIndex::default(), None, "mixed-files");
+        assert_eq!(
+            production_body(source, large_scan),
+            production_body(source, large_full)
+        );
+        small.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (_, tail, modes) = production_scan(&small, source, index, Some(cache), "mixed-files");
+        assert_eq!(modes, (0, 1, 0), "unrelated full-file refusal {source:?}");
+        let (_, full, _) =
+            production_scan(&small, source, ScanIndex::default(), None, "mixed-files");
+        assert_eq!(production_body(source, tail), production_body(source, full));
+    }
+}
+
+#[test]
 fn sampled_production_large_baseline_index_does_not_disable_small_active_tail() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
