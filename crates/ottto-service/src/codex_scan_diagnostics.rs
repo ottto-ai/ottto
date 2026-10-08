@@ -20,6 +20,26 @@ pub(crate) enum LoaderReason {
     OtherFailure,
 }
 
+// Typed context tags identify the operation without inspecting error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LoaderStage {
+    Open,
+    Prepare,
+    Query,
+    Row,
+}
+impl std::fmt::Display for LoaderStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Open => "open",
+            Self::Prepare => "prepare",
+            Self::Query => "query",
+            Self::Row => "row",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct LoaderEvidence {
     pub completed_roots: u32,
@@ -27,8 +47,19 @@ pub(crate) struct LoaderEvidence {
     pub reason: LoaderReason,
     pub mixed_failure_reasons: bool,
     pub identity_conflict: bool,
+    pub first_failure_root_digest: Option<[u8; 32]>,
+    pub first_failure_stage: Option<LoaderStage>,
+    // Same first failure as the root and stage; later failures only aggregate.
+    pub sqlite_extended_code: Option<i32>,
 }
 impl LoaderEvidence {
+    pub fn observe_root(&mut self, result: &Result<()>, conflict: bool, root_key: &str) {
+        if self.failed_roots == 0 && result.is_err() {
+            self.first_failure_root_digest = Some(digest(root_key));
+        }
+        self.observe(result, conflict);
+    }
+
     pub fn observe(&mut self, result: &Result<()>, conflict: bool) {
         self.identity_conflict |= conflict;
         let Err(error) = result else {
@@ -61,6 +92,14 @@ impl LoaderEvidence {
         // Keep the first bounded reason and disclose aggregation, never error text.
         if self.failed_roots == 0 {
             self.reason = reason;
+            self.first_failure_stage = error.downcast_ref::<LoaderStage>().copied();
+            self.sqlite_extended_code = error.downcast_ref::<rusqlite::Error>().and_then(|error| {
+                if let rusqlite::Error::SqliteFailure(code, _) = error {
+                    Some(code.extended_code)
+                } else {
+                    None
+                }
+            });
         }
         self.failed_roots = self.failed_roots.saturating_add(1);
     }
@@ -169,7 +208,7 @@ pub(crate) struct CodexScanDiagnostics {
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
 crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, gates, quarantine_count, sample_offset, lineage);
-crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict);
+crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
 impl crate::heap_layout_bound::HeapLayoutBound for LoaderReason {
@@ -182,6 +221,13 @@ impl crate::heap_layout_bound::HeapLayoutBound for LoaderReason {
             | Self::SqliteRowDecode
             | Self::IncompleteShape
             | Self::OtherFailure => c.add(0),
+        }
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for LoaderStage {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Open | Self::Prepare | Self::Query | Self::Row => c.add(0),
         }
     }
 }
@@ -201,6 +247,33 @@ impl crate::heap_layout_bound::HeapLayoutBound for FileReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn first_root_stage_and_native_code_survive_later_failures_without_error_text() {
+        let fault = |code, stage| {
+            Err(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("private credential error text".to_owned()),
+            ))
+            .context(stage)
+            .context("private provider path"))
+        };
+        let mut evidence = LoaderEvidence::default();
+        evidence.observe_root(&Ok(()), false, "successful root");
+        evidence.observe_root(&fault(26, LoaderStage::Prepare), false, "failed root one");
+        evidence.observe_root(&fault(10, LoaderStage::Row), false, "failed root two");
+        assert_eq!(evidence.completed_roots, 1);
+        assert_eq!(evidence.failed_roots, 2);
+        assert_eq!(
+            evidence.first_failure_root_digest,
+            Some(digest("failed root one"))
+        );
+        assert_eq!(evidence.first_failure_stage, Some(LoaderStage::Prepare));
+        assert_eq!(evidence.sqlite_extended_code, Some(26));
+        let text = serde_json::to_string(&evidence).unwrap();
+        for forbidden in ["private", "credential", "successful root", "failed root"] {
+            assert!(!text.contains(forbidden));
+        }
+    }
     #[test]
     fn reason_classification_never_uses_error_text() {
         let mut evidence = LoaderEvidence::default();
@@ -229,6 +302,19 @@ mod tests {
             sample_offset: u64::MAX,
             ..Default::default()
         };
+        let evidence = LoaderEvidence {
+            completed_roots: u32::MAX,
+            failed_roots: u32::MAX,
+            first_failure_root_digest: Some([255; 32]),
+            first_failure_stage: Some(LoaderStage::Prepare),
+            sqlite_extended_code: Some(i32::MAX),
+            ..Default::default()
+        };
+        diagnostics.state_titles = evidence;
+        diagnostics.state_threads = evidence;
+        diagnostics.spawn_edges = evidence;
+        diagnostics.rollout_extents = evidence;
+        diagnostics.session_index = evidence;
         let mut lineage = RecoveryLineage::new(
             "raw session id /Users/private credential",
             SnapshotQuarantineDisposition::RetryPending,
