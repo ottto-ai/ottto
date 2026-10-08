@@ -23211,6 +23211,9 @@ pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<P
 
 #[cfg(test)]
 mod tests {
+    mod giant_row_measurement_tests {
+        include!("snapshots/giant_row_measurement_tests.rs");
+    }
     use super::*;
     use base64::Engine as _;
 
