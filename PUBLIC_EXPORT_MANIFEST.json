@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 490,
-  "content_sha256": "3be52e7648fd6fd4f3c225f8d3aa1e381339bacffd427804d04c16e64070f59e",
+  "content_sha256": "1dd45fa4b40db056453da8009c9bcd80e34ab48e34cc291af345940a3a36f106",
   "files": [
     {
       "executable": false,
@@ -20,8 +20,8 @@
       "executable": false,
       "mode": "0644",
       "path": ".github/workflows/ci.yml",
-      "sha256": "b45c36dbd71d2db26a8131005a9f3b956c838b149fb264bc3c08e05767566e27",
-      "size_bytes": 3149
+      "sha256": "0d81dba3f97a8e83c0f695769ce7465b7e8d627677e3ecdb8c94421cce62ffb2",
+      "size_bytes": 3690
     },
     {
       "executable": false,
@@ -860,8 +860,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/heap_layout_bound.rs",
-      "sha256": "7ebdf5d88213babca602e2c5053138de003332fc6785163dacde48fe553f1028",
-      "size_bytes": 22037
+      "sha256": "1f9243eae80f3a9f5faa21d3bb4ed155d2eb305d589dcb023e7e5af470768272",
+      "size_bytes": 23315
     },
     {
       "executable": false,
@@ -3433,7 +3433,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-08T16:25:18Z",
+  "generated_at": "2026-10-08T19:39:12+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 491,
   "public_roots": [
@@ -3472,5 +3472,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "35aa4dde0456e3be724f4ddfa8fb2a8049885424"
+  "source_commit": "24de1b98b8bb0d759c194e6be06e310b95aae8be"
 }
