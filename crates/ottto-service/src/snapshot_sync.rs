@@ -1961,7 +1961,7 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
             // shortens a wait. A machine that cannot watch its transcripts (no
             // permission, exhausted descriptors, a root that does not exist yet)
             // collects on exactly the schedule it does today.
-            let watcher = watch_snapshot_source_roots(&home);
+            let mut watcher = watch_snapshot_source_roots(&home);
             if watcher.is_none() {
                 eprintln!(
                     "local snapshot sync: filesystem watch unavailable; cadence follows the scan tiers only"
@@ -1970,6 +1970,11 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
             let mut account_switch = ClaudeAccountSwitchProbe::default();
             let mut retry = live_snapshot_retry::LiveRetryOwner::production();
             loop {
+                if let Ok(roots) = crate::snapshot_roots::watcher_roots(&home) {
+                    if watcher.as_ref().map_or(true, |current| !current.matches_roots(&roots)) {
+                        watcher = crate::snapshot_watcher::watch_snapshot_roots(roots).ok();
+                    }
+                }
                 match sync_once_with_retry(&home, &support_dir, &daemon, &mut retry) {
                     Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
                     Err(error) => {
@@ -2007,19 +2012,7 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
 
 /// Watch every enabled source's transcript roots, if the platform allows it.
 fn watch_snapshot_source_roots(home: &Path) -> Option<crate::snapshot_watcher::SnapshotWatcher> {
-    let roots = [
-        SnapshotSource::Codex,
-        SnapshotSource::ClaudeCode,
-        SnapshotSource::Pi,
-    ]
-    .into_iter()
-    .flat_map(|source| {
-        source
-            .default_roots(home)
-            .into_iter()
-            .map(move |root| (source, root))
-    })
-    .collect::<Vec<_>>();
+    let roots = crate::snapshot_roots::watcher_roots(home).ok()?;
     crate::snapshot_watcher::watch_snapshot_roots(roots).ok()
 }
 
@@ -2911,6 +2904,7 @@ fn persist_machine_icon(response: &AgentStatusSnapshotUploadResponse) {
 struct SourcePreparation {
     retry_authority: Option<live_snapshot_retry::LiveAuthority>,
     source: SnapshotSource,
+    claude_scan_roots: Option<Vec<PathBuf>>,
     account_witness: [u8; 32],
     scan_started_at: String,
     activity_hint: crate::snapshot_client::ActivityHintResponse,
@@ -3121,16 +3115,11 @@ fn prepare_sync_source(
         return Ok(None);
     }
 
-    let mut roots = source.default_roots(home);
-    if source == SnapshotSource::Codex {
-        for home in &scan_agent_status_collection.codex_scan_homes {
-            for root in [home.join("sessions"), home.join("archived_sessions")] {
-                if !roots.contains(&root) {
-                    roots.push(root);
-                }
-            }
-        }
-    }
+    let roots = crate::snapshot_roots::scan_roots(
+        source,
+        home,
+        &scan_agent_status_collection.codex_scan_homes,
+    )?;
     let mut encoded_attribution_key = activity_hint.session_attribution_hmac_key.take();
     let attribution_context = SessionAttributionContext::from_activity_hint(
         source,
@@ -3374,6 +3363,7 @@ fn prepare_sync_source(
     Ok(Some(SourcePreparation {
         retry_authority,
         source,
+        claude_scan_roots: (source == SnapshotSource::ClaudeCode).then_some(roots),
         account_witness,
         scan_started_at,
         activity_hint,
@@ -3464,6 +3454,7 @@ fn finish_sync_source(
     let SourcePreparation {
         retry_authority,
         source,
+        claude_scan_roots,
         account_witness,
         scan_started_at,
         activity_hint,
@@ -3496,7 +3487,11 @@ fn finish_sync_source(
     };
     let ensure_authority = || {
         ensure_snapshot_scan_authority(device, source, client, &account_witness, daemon)?;
-        ensure_snapshot_destination_current(&upload_destination_namespace)
+        ensure_snapshot_destination_current(&upload_destination_namespace)?;
+        if let Some(roots) = &claude_scan_roots {
+            crate::snapshot_roots::validate_claude_roots(_home, roots)?;
+        }
+        Ok(())
     };
     ensure_authority()?;
     let scan_agent_status = reconciliation_agent_status(&scan_agent_status_collection);
@@ -16716,7 +16711,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; retry_authority, source, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, active_quarantine_witness, active_quarantine_retries);
 

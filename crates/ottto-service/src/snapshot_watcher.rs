@@ -2,9 +2,9 @@ use crate::snapshots::{paths_from_events, SnapshotSource};
 use anyhow::Result;
 use notify::RecursiveMode;
 use notify_debouncer_full::{
-    new_debouncer, DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache,
+    new_debouncer_opt, DebounceEventResult, DebouncedEvent, Debouncer, NoCache,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, OnceLock};
@@ -99,13 +99,50 @@ pub struct SnapshotFileEvent {
 }
 
 pub struct SnapshotWatcher {
-    _debouncer: Debouncer<notify::RecommendedWatcher, RecommendedCache>,
+    _debouncer: Debouncer<notify::RecommendedWatcher, NoCache>,
+    roots: Vec<(SnapshotSource, PathBuf)>,
+    watch_paths: BTreeMap<PathBuf, RecursiveMode>,
     pub events: Receiver<SnapshotFileEvent>,
+}
+
+impl SnapshotWatcher {
+    pub(crate) fn matches_roots(&self, roots: &[(SnapshotSource, PathBuf)]) -> bool {
+        self.roots == roots && self.watch_paths == watch_paths(roots)
+    }
+}
+
+fn watch_paths(roots: &[(SnapshotSource, PathBuf)]) -> BTreeMap<PathBuf, RecursiveMode> {
+    let mut paths = BTreeMap::new();
+    for (source, root) in roots {
+        let target = if root.is_dir() {
+            Some((root.clone(), RecursiveMode::Recursive))
+        } else if *source == SnapshotSource::ClaudeCode {
+            root.parent()
+                .filter(|parent| parent.is_dir())
+                .map(|parent| (parent.to_path_buf(), RecursiveMode::NonRecursive))
+        } else {
+            None
+        };
+        if let Some((path, mode)) = target {
+            paths
+                .entry(path)
+                .and_modify(|current| {
+                    if mode == RecursiveMode::Recursive {
+                        *current = mode;
+                    }
+                })
+                .or_insert(mode);
+        }
+    }
+    paths
 }
 
 pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<SnapshotWatcher> {
     let (raw_tx, raw_rx) = mpsc::sync_channel::<DebounceEventResult>(SNAPSHOT_WATCH_RAW_CAPACITY);
-    let mut debouncer = new_debouncer(
+    // Watching promotes cadence; rename file-ID reconciliation is not scan
+    // authority. NoCache avoids the recommended macOS cache's synchronous,
+    // symlink-following filesystem walk during watch/refresh.
+    let mut debouncer = new_debouncer_opt(
         SNAPSHOT_WATCH_DEBOUNCE,
         None,
         move |result: DebounceEventResult| {
@@ -113,16 +150,20 @@ pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<Sna
                 record_raw_watcher_overflow();
             }
         },
+        NoCache::new(),
+        notify::Config::default(),
     )?;
 
-    for (_, root) in &roots {
-        if root.exists() {
-            debouncer.watch(root, RecursiveMode::Recursive)?;
-        }
+    // Missing projects directories use their config parent. Recompute these
+    // targets on refresh so creation/removal cannot leave a permanent no-watch.
+    let watch_paths = watch_paths(&roots);
+    for (path, mode) in &watch_paths {
+        debouncer.watch(path, *mode)?;
     }
 
     let (event_tx, event_rx) =
         mpsc::sync_channel::<SnapshotFileEvent>(SNAPSHOT_WATCH_SIGNAL_CAPACITY);
+    let configured_roots = roots.clone();
     std::thread::spawn(move || {
         while let Ok(result) = raw_rx.recv() {
             // A backend watcher error means the event stream is no longer a
@@ -154,6 +195,8 @@ pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<Sna
 
     Ok(SnapshotWatcher {
         _debouncer: debouncer,
+        roots: configured_roots,
+        watch_paths,
         events: event_rx,
     })
 }
@@ -183,6 +226,95 @@ mod tests {
         };
         assert_eq!(event.source, SnapshotSource::Codex);
         assert_eq!(event.paths.len(), 1);
+    }
+
+    #[test]
+    fn missing_registered_projects_refresh_when_created_removed_or_repointed() {
+        let scratch = crate::test_scratch::ScratchDir::new("claude-watch-targets");
+        let config = scratch.join("slot");
+        let projects = config.join("projects");
+        let roots = vec![(SnapshotSource::ClaudeCode, projects.clone())];
+        assert!(watch_paths(&roots).is_empty());
+        std::fs::create_dir(&config).unwrap();
+        assert_eq!(
+            watch_paths(&roots),
+            BTreeMap::from([(config.clone(), RecursiveMode::NonRecursive)])
+        );
+        std::fs::create_dir(&projects).unwrap();
+        assert_eq!(
+            watch_paths(&roots),
+            BTreeMap::from([(projects.clone(), RecursiveMode::Recursive)])
+        );
+        std::fs::remove_dir(&projects).unwrap();
+        assert_eq!(
+            watch_paths(&roots),
+            BTreeMap::from([(config.clone(), RecursiveMode::NonRecursive)])
+        );
+        let other = scratch.join("other");
+        std::fs::create_dir(&other).unwrap();
+        let repointed = vec![(SnapshotSource::ClaudeCode, other.join("projects"))];
+        assert_eq!(
+            watch_paths(&repointed),
+            BTreeMap::from([(other, RecursiveMode::NonRecursive)])
+        );
+    }
+
+    #[test]
+    fn native_watcher_selection_rechecks_missing_root_creation() {
+        let scratch = crate::test_scratch::ScratchDir::new("claude-watch-refresh");
+        let config = scratch.join("slot");
+        let projects = config.join("projects");
+        let roots = vec![(SnapshotSource::ClaudeCode, projects.clone())];
+        let empty = watch_snapshot_roots(roots.clone()).unwrap();
+        assert!(empty.matches_roots(&roots));
+        std::fs::create_dir(&config).unwrap();
+        assert!(!empty.matches_roots(&roots));
+        let parent = watch_snapshot_roots(roots.clone()).unwrap();
+        assert!(parent.matches_roots(&roots));
+        std::fs::create_dir(&projects).unwrap();
+        assert!(!parent.matches_roots(&roots));
+        let created = watch_snapshot_roots(roots.clone()).unwrap();
+        assert!(created.matches_roots(&roots));
+        assert!(!created.matches_roots(&[]));
+    }
+
+    #[test]
+    fn registered_transcript_events_survive_missing_root_refresh_without_file_id_cache() {
+        let _guard = pending_state_test_guard();
+        let scratch = crate::test_scratch::ScratchDir::new("claude-watch-events");
+        // FSEvents reports canonical paths, including /private for the macOS
+        // temporary-directory alias. Match the actual watched fixture path.
+        let config = std::fs::canonicalize(&scratch).unwrap().join("slot");
+        let root = config.join("projects");
+        let roots = vec![(SnapshotSource::ClaudeCode, root.clone())];
+        std::fs::create_dir(&config).unwrap();
+        let missing = watch_snapshot_roots(roots.clone()).unwrap();
+        assert_eq!(
+            missing.watch_paths.get(&config),
+            Some(&RecursiveMode::NonRecursive)
+        );
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        assert!(!missing.matches_roots(&roots));
+        drop(missing);
+        let created = watch_snapshot_roots(roots).unwrap();
+        let path = root.join("project/session.jsonl");
+        // Native watcher startup is asynchronous. Initial files are covered by
+        // the periodic scan; subsequent writes must still promote cadence.
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let event = loop {
+            assert!(std::time::Instant::now() < deadline, "no transcript event");
+            std::fs::write(&path, "{}\n").unwrap();
+            match created.events.recv_timeout(Duration::from_millis(250)) {
+                Ok(event) => break event,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => panic!("watch event channel: {error}"),
+            }
+        };
+        assert_eq!(event.source, SnapshotSource::ClaudeCode);
+        assert!(event.paths.contains(&path));
+        let pending = take_pending_snapshot_paths(SnapshotSource::ClaudeCode);
+        assert!(pending.paths.contains(&path));
+        assert!(!pending.overflowed);
     }
 
     #[test]
