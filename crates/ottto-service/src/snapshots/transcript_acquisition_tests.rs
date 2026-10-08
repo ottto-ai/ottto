@@ -1509,6 +1509,57 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
             assert_eq!(counters["unchanged_selections"], modes.2);
             assert_eq!(counters["completed_native_bytes"], bytes.0);
             assert_eq!(counters["completed_guard_bytes"], bytes.1);
+            assert_eq!(record["schema_version"], 2);
+            let events = &counters["page_events"];
+            let reasons = events["full_reasons"].as_object().unwrap();
+            assert_eq!(
+                reasons.values().map(|v| v.as_u64().unwrap()).sum::<u64>(),
+                modes.0 as u64
+            );
+            if pass == 0 {
+                assert_eq!(events["full_reasons"], json!({"state_missing": modes.0}));
+                println!("RESOURCE_V2_COLD_FIXTURE {}", record);
+            }
+            let gauges = &counters["index_state_at_page_end"];
+            assert_eq!(
+                gauges["pending_audits"],
+                next.files
+                    .values()
+                    .filter(|entry| entry.has_unverified_source())
+                    .count()
+            );
+            let now = sampled_scan::now_seconds();
+            assert_eq!(
+                gauges["overdue_audits"],
+                next.files
+                    .values()
+                    .filter(|entry| entry.audit_requires_full(now))
+                    .count()
+            );
+            assert_eq!(
+                gauges["oldest_due_age_seconds"],
+                next.files
+                    .values()
+                    .filter_map(|entry| entry.audit_obligation(now))
+                    .map(|debt| now.saturating_sub(debt.due_unix_seconds))
+                    .max()
+                    .unwrap_or(0)
+            );
+            for key in ["pending_audits", "overdue_audits", "oldest_due_age_seconds"] {
+                assert!(events.get(key).is_none());
+                assert!(counters.get(key).is_none());
+            }
+            for key in [
+                "priority_full_replays",
+                "audits_started",
+                "audits_completed",
+                "max_start_overdue_seconds",
+                "max_completion_overdue_seconds",
+            ] {
+                assert!(events[key].is_u64());
+                assert!(gauges.get(key).is_none());
+            }
+
             assert_eq!(
                 bytes.0,
                 match pass {
@@ -1536,6 +1587,12 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
             records[0]["counts"]["sampled_acquisition"].is_null(),
             "uncovered read counts are unknown"
         );
+        assert!(records[0]["counts"]["sampled_acquisition"]
+            .get("page_events")
+            .is_none());
+        assert!(records[0]["counts"]["sampled_acquisition"]
+            .get("index_state_at_page_end")
+            .is_none());
     }
 }
 

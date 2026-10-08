@@ -2625,25 +2625,28 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         crate::heap_layout_bound::bound(frame, limit)
     }
     fn finish(&mut self, completed: Self::Completed) -> Result<()> {
-        let (preparation, index, scan) = completed;
-        self.validate(&preparation)?;
-        ensure_snapshot_destination_current(&preparation.upload_destination_namespace)?;
-        let source = preparation.source;
-        finish_sync_source(
-            preparation,
-            index,
-            scan,
-            self.client,
-            self.device,
-            self.device_secret,
-            source,
-            self.machine_id,
-            self.home,
-            self.support_dir,
-            self.daemon,
-            self.transport_cycle,
-            self.retry,
-        )
+        let source = completed.0.source;
+        crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
+            let (preparation, index, scan) = completed;
+            self.validate(&preparation)?;
+            ensure_snapshot_destination_current(&preparation.upload_destination_namespace)?;
+            let source = preparation.source;
+            finish_sync_source(
+                preparation,
+                index,
+                scan,
+                self.client,
+                self.device,
+                self.device_secret,
+                source,
+                self.machine_id,
+                self.home,
+                self.support_dir,
+                self.daemon,
+                self.transport_cycle,
+                self.retry,
+            )
+        })
     }
     fn outcome(&mut self, source: SnapshotSource, result: Result<()>) {
         match result {

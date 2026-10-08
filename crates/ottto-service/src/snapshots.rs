@@ -12776,7 +12776,7 @@ impl OwnedSourceScan {
                         },
                     ),
                 };
-                if let Some(context) = sampling.as_ref() {
+                let sampled_acquisition = sampling.as_ref().map(|context| {
                     let audit_now = sampled_scan::now_seconds();
                     let pending = index
                         .files
@@ -12795,26 +12795,35 @@ impl OwnedSourceScan {
                         .map(|debt| audit_now.saturating_sub(debt.due_unix_seconds))
                         .max()
                         .unwrap_or(0);
-                    eprintln!("ottto-service: sampled acquisition {}: full={} tail={} unchanged={} native_bytes={} sample_bytes={} priority_full_replays={} full_reasons=[missing,due,clock,scope,invalid,replaced,shrank,same_size,head,boundary,unsupported]:{:?} pending_audits={} overdue_audits={} oldest_due_age_seconds={} audits_started={} audits_completed={} start_overdue_seconds={} completion_overdue_seconds={}; byte counts exclude discovery/header/sidecar/independent identity reads; overdue work remains owed until full verification",
-                    source.api_slug(), context.full_files, context.tail_files, context.unchanged_files,
-                    context.native_bytes, context.sample_bytes, context.priority_replays, context.full_reasons,
-                    pending, overdue, oldest_due_age, context.audits_started, context.audits_completed,
-                    context.start_overdue_seconds, context.completion_overdue_seconds);
-                }
+                    crate::local_resource_diagnostics::ReadCounts {
+                        full_selections: context.full_files,
+                        tail_selections: context.tail_files,
+                        unchanged_selections: context.unchanged_files,
+                        completed_native_bytes: context.native_bytes,
+                        completed_guard_bytes: context.sample_bytes,
+                        page_events: crate::local_resource_diagnostics::PageEvents {
+                            full_reasons: crate::local_resource_diagnostics::FullReasons(
+                                context.full_reasons,
+                            ),
+                            priority_full_replays: context.priority_replays,
+                            audits_started: context.audits_started,
+                            audits_completed: context.audits_completed,
+                            max_start_overdue_seconds: context.start_overdue_seconds,
+                            max_completion_overdue_seconds: context.completion_overdue_seconds,
+                        },
+                        index_state_at_page_end: crate::local_resource_diagnostics::IndexState {
+                            pending_audits: pending,
+                            overdue_audits: overdue,
+                            oldest_due_age_seconds: oldest_due_age,
+                        },
+                    }
+                });
                 resource_probe.collection(
                     source.api_slug(),
                     crate::local_resource_diagnostics::CollectionCounts {
                         scanned_files: scanned_file_count,
                         semantic_noops: semantic_noop_count,
-                        sampled_acquisition: sampling.as_ref().map(|context| {
-                            crate::local_resource_diagnostics::ReadCounts {
-                                full_selections: context.full_files,
-                                tail_selections: context.tail_files,
-                                unchanged_selections: context.unchanged_files,
-                                completed_native_bytes: context.native_bytes,
-                                completed_guard_bytes: context.sample_bytes,
-                            }
-                        }),
+                        sampled_acquisition,
                     },
                 );
                 return OwnedSourceScanStep::Complete {
