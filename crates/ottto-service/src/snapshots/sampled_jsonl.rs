@@ -30,6 +30,14 @@ pub(crate) struct CachedJsonlReduction {
 }
 crate::heap_layout_bound::fields!(CachedJsonlReduction; accumulator, report,
     recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
+impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
+    fn supports_frozen_charge(&self) -> bool {
+        // retain_reduction removes these live, shared inputs from the copy.
+        // Refuse frozen accounting if an adapter ever forgets that boundary.
+        self.accumulator.codex_turn_traces.is_none()
+            && self.accumulator.codex_parent_ownership_ledgers.is_none()
+    }
+}
 
 pub(super) struct CompletedNativeAcquisition {
     pub(super) checkpoint: Checkpoint,
