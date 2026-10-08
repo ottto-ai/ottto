@@ -11373,7 +11373,7 @@ impl OwnedSourceScan {
         }
     }
     pub(crate) fn step(
-        self,
+        mut self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     ) -> OwnedSourceScanStep {
         // Prepare one demand batch through bounded native continuations. Group

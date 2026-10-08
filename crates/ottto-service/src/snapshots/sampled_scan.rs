@@ -224,7 +224,7 @@ impl OwnedSourceScan {
     /// Charge only optimization-owned native state, samples/keys and copies.
     /// The unchanged serial index/metadata is baseline; parked/proof/send
     /// frames still use their existing aggregate 32MiB allocation/lifetime gate.
-    pub(super) fn sampled_copy_budget(&self) -> usize {
+    pub(super) fn sampled_copy_budget(&mut self) -> usize {
         let Some(context) = self
             .sampling
             .as_ref()
@@ -238,8 +238,14 @@ impl OwnedSourceScan {
         let Some(remaining) = STATE_BYTES.checked_sub(resident) else {
             return 0;
         };
-        let active = self.active_file.as_ref().map_or(Some(0), |active| {
-            crate::heap_layout_bound::bound(active, remaining)
+        let active = self.active_file.as_mut().map_or(Some(0), |active| {
+            // These native source-wide inputs predate the optimization, are
+            // refreshed on reuse, and are absent from every retained copy.
+            // All active owned parser/acquisition/path/receipt state stays charged.
+            let inputs = active.parser.take_live_reduction_inputs();
+            let bound = crate::heap_layout_bound::bound(active, remaining);
+            active.parser.restore_live_reduction_inputs(inputs);
+            bound
         });
         active
             .and_then(|used| remaining.checked_sub(used))
