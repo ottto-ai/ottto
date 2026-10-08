@@ -149,6 +149,11 @@ fn fixture(family: &'static str, row_bytes: usize, n: usize) -> Fixture {
             "a",
         ),
     };
+    let start = if family.starts_with("claude_") {
+        start.to_string()
+    } else {
+        start.replacen("{", r#"{"timestamp":"2026-08-02T08:20:01Z","#, 1)
+    };
     assert!(row_bytes > start.len() + end.len());
     let available = row_bytes - start.len() - end.len();
     let repeats = available / atom.len();

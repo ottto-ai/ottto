@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 491,
-  "content_sha256": "028abdc16080c760cb56ad613296242567d675f70335be676e1064ca3b603e35",
+  "content_sha256": "945e8f38a7ffc5229c51fa5d206fb7389ea2e8573b3339896ee92605db68ab80",
   "files": [
     {
       "executable": false,
@@ -1119,8 +1119,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/giant_row_measurement_tests.rs",
-      "sha256": "4634c3c601c9ba1e4147099300aa5a27f6653d01c10d6240de28fae4e9a8adfb",
-      "size_bytes": 17005
+      "sha256": "bb9a9ee91dafeeac2eabf3a0f0fb8f948bcd3da22c9ea3820c4974505d733a3b",
+      "size_bytes": 17176
     },
     {
       "executable": false,
@@ -3440,7 +3440,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-08T20:07:07+00:00",
+  "generated_at": "2026-10-08T20:08:08+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 492,
   "public_roots": [
@@ -3479,5 +3479,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c02001ea853b461cdf50890914a83f9a22b80d05"
+  "source_commit": "12ca071648535c3b1f50f7af1479299506e00992"
 }
