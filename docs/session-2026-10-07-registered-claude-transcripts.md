@@ -55,3 +55,13 @@ mock now observes until the operation finishes; its watchdog fails rather than
 certifying absence. A delayed synthetic request verifies late registration
 remains observable. Production cloud-cleanup and identity-reservation guards
 are unchanged.
+
+The following hosted run passed those controls but exposed a test-isolation
+issue in credential recovery. A fixture using custom device stores still
+invoked default pending setup-token cleanup without the shared serial guard
+or its own fallback directory, deleting a concurrent claim fixture's token.
+A paired native run reproduced the missing-token refusal while the claim
+fixture passed alone. The device fixture now uses the existing serial guard
+and temporary fallback store, checking retention on failed promotion and
+cleanup after successful retry. Temporary diagnostic labels were removed;
+production credential recovery and admission guards are unchanged.

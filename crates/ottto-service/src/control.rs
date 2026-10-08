@@ -16533,10 +16533,19 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn post_confirm_device_file_failure_keeps_candidate_restart_recoverable() {
         use ottto_core::token_store::MemoryTokenStore;
 
         let root = control_test_root("credential-promote-file-failure");
+        // Promotion cleanup also touches the default pending setup-token store,
+        // even when the device stores below are explicit in-memory fixtures.
+        let secret_root = root.join("secrets");
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let setup_token_store = KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT);
+        setup_token_store
+            .save("setup-file-failure")
+            .expect("stage setup token");
         let pending_store = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
         let pending_secret = MemoryTokenStore::new();
         let active_secret = MemoryTokenStore::new();
@@ -16583,6 +16592,10 @@ mod tests {
             candidate
         );
 
+        assert_eq!(
+            setup_token_store.load().expect("setup token survives"),
+            "setup-file-failure"
+        );
         fs::remove_file(&blocked_parent).expect("remove blocker");
         fs::create_dir(&blocked_parent).expect("create device parent");
         promote_pending_device_credential_with_stores(
@@ -16596,6 +16609,10 @@ mod tests {
         .expect("retry promotion");
 
         assert!(pending_store.load().expect("pending cleared").is_none());
+        assert!(matches!(
+            setup_token_store.load(),
+            Err(TokenStoreError::Missing)
+        ));
         assert!(matches!(
             pending_secret.load(),
             Err(TokenStoreError::Missing)
