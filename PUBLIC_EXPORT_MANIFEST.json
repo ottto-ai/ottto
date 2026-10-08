@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 482,
-  "content_sha256": "642c16269fbb8247e5b8f8b7e3ed4f6eeab374946d9128b74764ad80ab30f7c4",
+  "candidate_file_count": 483,
+  "content_sha256": "90bb6b71bc226ebeedc47ae50f51dc854d5df7e579302b30fe496eb3657c7cca",
   "files": [
     {
       "executable": false,
@@ -2294,6 +2294,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-08-notarize-staple-launched-bundle.md",
+      "sha256": "d452fb2ebb10afce97f56d69d3ca1a60d0f3052382e3c5fa7f61737d76285e56",
+      "size_bytes": 1193
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -3377,9 +3384,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-07T23:42:34+00:00",
+  "generated_at": "2026-10-08T00:02:03+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 483,
+  "output_file_count": 484,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3416,5 +3423,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "bf4c6ec09254cb30bf64af5d89de7113f17b7aff"
+  "source_commit": "067f7acb5bfa60402584d2e025bac07b7330e394"
 }
