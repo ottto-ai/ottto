@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 487,
-  "content_sha256": "f9b15f30ad2acff6d83ac0191dc93eab84ac8aebeed2a4e2f01b074e521db895",
+  "candidate_file_count": 488,
+  "content_sha256": "ab5218bebca92aabf40e90b4d988d7ccbcf3025f4e44907825f3b75b14a093f1",
   "files": [
     {
       "executable": false,
@@ -783,8 +783,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/codex_scan_diagnostics.rs",
-      "sha256": "0f50bf5541fe89bab55b0e48d17ac39be8684f581fc62572c927846540a98c9c",
-      "size_bytes": 9704
+      "sha256": "76b41d447586966f040fb3bc2b23e34b8add27c2e28a19aa2ccebc28c8027963",
+      "size_bytes": 13315
     },
     {
       "executable": false,
@@ -1077,8 +1077,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "a08e5b26f99ec6dba25687603547c5ab65d997a307b4f8e934a00686e9264c14",
-      "size_bytes": 2295564
+      "sha256": "bbe46ad9dd7c4771ab2694ac1da93f6c8733d92d9eb01c06edf759d82b743704",
+      "size_bytes": 2299887
     },
     {
       "executable": false,
@@ -2315,6 +2315,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-08-codex-loader-fault-evidence.md",
+      "sha256": "213e538828b1b255117908526b94c26053ad6591c85e5d67c28bde49b6fe7189",
+      "size_bytes": 2488
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-08-isolate-full-parser-cache-refusal.md",
       "sha256": "de7b0603bf5f1f7db81effb759643a87b7c82a0b47f6e31fa196f3f9994ba07e",
       "size_bytes": 1832
@@ -3412,9 +3419,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-08T05:22:37+00:00",
+  "generated_at": "2026-10-08T09:02:43+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 488,
+  "output_file_count": 489,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3451,5 +3458,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "8989a3ea4f6ba545912f076915d17b2d511d2b4a"
+  "source_commit": "879a0a3d149edf93e663e3c3092fe244d132948b"
 }
