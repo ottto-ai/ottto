@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 490,
-  "content_sha256": "1dd45fa4b40db056453da8009c9bcd80e34ab48e34cc291af345940a3a36f106",
+  "candidate_file_count": 491,
+  "content_sha256": "028abdc16080c760cb56ad613296242567d675f70335be676e1064ca3b603e35",
   "files": [
     {
       "executable": false,
@@ -979,8 +979,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_allocation_probe.rs",
-      "sha256": "3af608ea0aeaeab90b565aceaea35e5d2b952dbc16bea977662333b4d9a8c95f",
-      "size_bytes": 9748
+      "sha256": "2dd71f9dba1df6fd3661e50ec0e928155c2980d3d3fadb2c59ed92583ed519e1",
+      "size_bytes": 15108
     },
     {
       "executable": false,
@@ -1077,8 +1077,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "c615cf2554ead0e1227816d6a614f041cbad8163ae0277a2aaaf3bd03b5d4ceb",
-      "size_bytes": 2299891
+      "sha256": "6d4885a618e9692672a32fe4a4dbf05b2cffb8e56a77d3f7870c4a629f9a2193",
+      "size_bytes": 2299997
     },
     {
       "executable": false,
@@ -1114,6 +1114,13 @@
       "path": "crates/ottto-service/src/snapshots/context_curve/tests.rs",
       "sha256": "008e0cc76a4c7330bf058952373be31e86190803f3e1adfee754a903f9ff9678",
       "size_bytes": 2128
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/giant_row_measurement_tests.rs",
+      "sha256": "4634c3c601c9ba1e4147099300aa5a27f6653d01c10d6240de28fae4e9a8adfb",
+      "size_bytes": 17005
     },
     {
       "executable": false,
@@ -3433,9 +3440,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-08T19:39:12+00:00",
+  "generated_at": "2026-10-08T20:07:07+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 491,
+  "output_file_count": 492,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3472,5 +3479,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "24de1b98b8bb0d759c194e6be06e310b95aae8be"
+  "source_commit": "c02001ea853b461cdf50890914a83f9a22b80d05"
 }

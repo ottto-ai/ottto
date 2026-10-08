@@ -8,6 +8,10 @@ pub(crate) struct Stats {
     pub usable_live: isize,
     pub requested_peak: usize,
     pub usable_peak: usize,
+    pub requested_peak_with_overlap: usize,
+    pub usable_peak_with_overlap: usize,
+    // Successful allocation/retirement events; realloc counts once in each.
+    pub deallocations: usize,
     pub allocations: usize,
 }
 
@@ -49,6 +53,9 @@ fn record(requested: isize, usable: isize, alloc: bool) {
                 s.requested_peak = s.requested_peak.max(s.requested_live.max(0) as usize);
                 s.usable_peak = s.usable_peak.max(s.usable_live.max(0) as usize);
                 s.allocations += usize::from(alloc);
+                s.deallocations += usize::from(!alloc);
+                s.requested_peak_with_overlap = s.requested_peak_with_overlap.max(s.requested_peak);
+                s.usable_peak_with_overlap = s.usable_peak_with_overlap.max(s.usable_peak);
                 PHASE_BASE.with(|base| {
                     PHASE_PEAK.with(|peak| {
                         peak.set(
@@ -61,6 +68,34 @@ fn record(requested: isize, usable: isize, alloc: bool) {
             });
         }
     });
+}
+
+// A failed realloc leaves the old allocation alive and changes no counters.
+// Successful in-place realloc is conservatively charged as old + new too.
+fn record_reallocation(old: usize, old_usable: usize, new: Option<(usize, usize)>) {
+    let Some((requested, usable)) = new else {
+        return;
+    };
+    let _ = ACTIVE.try_with(|active| {
+        if active.get() {
+            let _ = STATS.try_with(|cell| {
+                let mut s = cell.get();
+                s.requested_peak_with_overlap = s
+                    .requested_peak_with_overlap
+                    .max((s.requested_live + requested as isize).max(0) as usize);
+                s.usable_peak_with_overlap = s
+                    .usable_peak_with_overlap
+                    .max((s.usable_live + usable as isize).max(0) as usize);
+                s.deallocations += 1;
+                cell.set(s);
+            });
+        }
+    });
+    record(
+        requested as isize - old as isize,
+        usable as isize - old_usable as isize,
+        true,
+    );
 }
 
 unsafe impl GlobalAlloc for Probe {
@@ -89,10 +124,10 @@ unsafe impl GlobalAlloc for Probe {
         let old_usable = usable(ptr.cast(), layout.size());
         let result = process::reallocate(ptr, layout, size);
         if !result.is_null() {
-            record(
-                size as isize - layout.size() as isize,
-                usable(result.cast(), size) as isize - old_usable as isize,
-                true,
+            record_reallocation(
+                layout.size(),
+                old_usable,
+                Some((size, usable(result.cast(), size))),
             );
         }
         result
@@ -160,6 +195,9 @@ mod process {
             requested_peak: 0,
             usable_peak: 0,
             allocations: 0,
+            deallocations: 0,
+            requested_peak_with_overlap: 0,
+            usable_peak_with_overlap: 0,
         },
         entries: [EMPTY; SLOTS],
     });
@@ -186,6 +224,8 @@ mod process {
                 .max(self.stats.requested_live as usize);
             self.stats.usable_peak = self.stats.usable_peak.max(self.stats.usable_live as usize);
             self.stats.allocations += 1;
+            self.stats.requested_peak_with_overlap = self.stats.requested_peak;
+            self.stats.usable_peak_with_overlap = self.stats.usable_peak;
             let first = (pointer >> 4).wrapping_mul(0x9e3779b1) % SLOTS;
             for i in 0..SLOTS {
                 let slot = (first + i) % SLOTS;
@@ -205,6 +245,7 @@ mod process {
                 let entry = self.entries[slot];
                 self.stats.requested_live -= entry.requested as isize;
                 self.stats.usable_live -= entry.usable as isize;
+                self.stats.deallocations += 1;
                 self.entries[slot].pointer = 1;
             }
         }
@@ -289,4 +330,88 @@ mod process {
 
 pub(crate) fn measure_process<T>(f: impl FnOnce() -> T) -> (T, Stats) {
     process::measure(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Explicit serial run because the nested process probe sees every thread.
+    #[test]
+    #[ignore = "explicit serial native allocator audit"]
+    fn m1_allocator_accounting_self_tests() {
+        for new_size in [256, 32] {
+            let (((), thread), process) = measure_process(|| {
+                measure(|| unsafe {
+                    let layout = Layout::from_size_align(64, 8).unwrap();
+                    let ptr = std::alloc::alloc(layout);
+                    assert!(!ptr.is_null());
+                    let grown = std::alloc::realloc(ptr, layout, new_size);
+                    assert!(!grown.is_null());
+                    assert_eq!(stats().requested_live, new_size as isize);
+                    std::alloc::dealloc(grown, Layout::from_size_align(new_size, 8).unwrap());
+                })
+            });
+            assert_eq!(thread.requested_peak_with_overlap, 64 + new_size);
+            assert_eq!(thread.requested_peak_with_overlap, process.requested_peak);
+            assert_eq!(thread.usable_peak_with_overlap, process.usable_peak);
+            assert_eq!(thread.requested_live, 0);
+            assert_eq!((thread.allocations, thread.deallocations), (2, 2));
+            assert_eq!(thread.deallocations, process.deallocations);
+        }
+        // Native OOM return-null is not reliable on every allocator/platform.
+        // Exercise the exact success-gated accounting entry point synthetically.
+        let (_, failed) = measure(|| {
+            let value = Box::new([0u8; 64]);
+            let before = stats();
+            record_reallocation(64, 64, None);
+            let after = stats();
+            assert_eq!(formatless(before), formatless(after));
+            drop(std::hint::black_box(value));
+        });
+        assert_eq!((failed.allocations, failed.deallocations), (1, 1));
+
+        // Create the receiver before measuring so thread startup is excluded.
+        let (send, receive) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            drop(receive.recv().unwrap());
+            drop(receive.recv().unwrap());
+        });
+        send.send(Box::new([0u8; 64])).unwrap(); // Initialize sender TLS first.
+        let (_, escaped) = measure(|| send.send(Box::new([0u8; 64])).unwrap());
+        worker.join().unwrap();
+        assert_eq!(escaped.requested_live, 64);
+        assert_eq!(escaped.deallocations, 0);
+
+        let external = Box::new([0u8; 64]);
+        let negative = std::panic::catch_unwind(|| measure(|| drop(external)));
+        assert!(negative.is_err()); // Preserve measure's existing nonnegative guard.
+        assert_eq!(stats().requested_live, -64);
+
+        let external = Box::new([0u8; 64]);
+        let (leaked, compensated) = measure(|| {
+            drop(external);
+            Box::into_raw(Box::new([0u8; 64]))
+        });
+        assert_eq!(compensated.requested_live, 0);
+        assert_eq!(compensated.usable_live, 0);
+        assert_eq!(compensated.allocations, compensated.deallocations);
+        assert_eq!(compensated.requested_peak, 0); // Hidden peak: not detected.
+        unsafe {
+            drop(Box::from_raw(leaked));
+        }
+    }
+
+    fn formatless(s: Stats) -> (isize, isize, usize, usize, usize, usize, usize, usize) {
+        (
+            s.requested_live,
+            s.usable_live,
+            s.requested_peak,
+            s.usable_peak,
+            s.requested_peak_with_overlap,
+            s.usable_peak_with_overlap,
+            s.allocations,
+            s.deallocations,
+        )
+    }
 }
