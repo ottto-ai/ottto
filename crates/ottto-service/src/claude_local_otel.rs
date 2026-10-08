@@ -2740,8 +2740,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sidecar_decode_reuse_unchanged_scan_reads_one_api_file() {
-        let dir = std::env::temp_dir().join(format!("ottto-decode-overlap-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = crate::test_scratch::private_dir("ottto-decode-overlap");
         let sessions = dir.join("projects");
         fs::create_dir_all(&sessions).unwrap();
         let rows = api_evidence_from_json(parent_and_subagent_body()).unwrap();
@@ -2883,8 +2882,7 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     fn decode_reuse_fixture(label: &str) -> (PathBuf, Vec<ClaudeLocalOtelEvidence>) {
-        let dir = std::env::temp_dir().join(format!("ottto-decode-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = crate::test_scratch::private_dir(&format!("ottto-decode-{label}"));
         let rows = api_evidence_from_json(parent_and_subagent_body()).unwrap();
         for row in &rows {
             append_evidence(&dir, row).unwrap();
@@ -3180,5 +3178,24 @@ mod tests {
             }
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+    #[test]
+    fn sidecar_decode_reuse_same_label_fixtures_keep_independent_evidence() {
+        let (first, rows) = decode_reuse_fixture("cap");
+        let (second, _) = decode_reuse_fixture("cap");
+        File::options()
+            .write(true)
+            .open(evidence_path(&second, "sess-mixed"))
+            .unwrap()
+            .set_len(MAX_EVIDENCE_FILE_BYTES)
+            .unwrap();
+        let first_report = load_claude_api_request_evidence_report(&first, ["sess-mixed".into()]);
+        assert!(
+            first_report.health.is_complete(),
+            "a second fixture must not delete or truncate the first"
+        );
+        assert_eq!(first_report.evidence["sess-mixed"], rows);
+        fs::remove_dir_all(first).unwrap();
+        fs::remove_dir_all(second).unwrap();
     }
 }
