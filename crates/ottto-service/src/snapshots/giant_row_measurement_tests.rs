@@ -351,6 +351,8 @@ fn balanced(s: Stats) {
 }
 #[test]
 #[ignore = "explicit serial native measurement; no bound claimed"]
+// Fail unsupported explicit runs at runtime without failing cross-platform compilation.
+#[allow(clippy::assertions_on_constants)]
 fn m1_giant_row_allocation_receipts() {
     assert!(cfg!(all(target_os = "macos", target_pointer_width = "64")));
     assert!(env!("OTTTO_SCAN_LAYOUT_RUSTC").starts_with("rustc 1.95.0 "));
