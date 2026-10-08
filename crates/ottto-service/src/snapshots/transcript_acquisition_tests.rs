@@ -1518,7 +1518,7 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
             );
             if pass == 0 {
                 assert_eq!(events["full_reasons"], json!({"state_missing": modes.0}));
-                println!("RESOURCE_V2_COLD_FIXTURE {}", record);
+                println!("RESOURCE_V2_COLD_FIXTURE {record}");
             }
             let gauges = &counters["index_state_at_page_end"];
             assert_eq!(
