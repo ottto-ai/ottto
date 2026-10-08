@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 486,
-  "content_sha256": "7db6806f7a54a8179b5b374335ce6e1acf8fd4ed130bc162fab84987b49abc62",
+  "candidate_file_count": 487,
+  "content_sha256": "f9b15f30ad2acff6d83ac0191dc93eab84ac8aebeed2a4e2f01b074e521db895",
   "files": [
     {
       "executable": false,
@@ -1098,8 +1098,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join.rs",
-      "sha256": "0de451988815e65f8ddbddb7ac17879b8dc7c1d4df44fe1bb3baa47f7aade557",
-      "size_bytes": 124739
+      "sha256": "f520a7ab8025cca5235aff9646cac2c729c9cbf22a63397579013f633571dcd9",
+      "size_bytes": 129080
     },
     {
       "executable": false,
@@ -2308,6 +2308,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-08-codex-header-census-bound.md",
+      "sha256": "630837a6769b30d8aa186e7f7733762b549364e83e5e5a9fdb380274b106461a",
+      "size_bytes": 2485
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-08-isolate-full-parser-cache-refusal.md",
       "sha256": "de7b0603bf5f1f7db81effb759643a87b7c82a0b47f6e31fa196f3f9994ba07e",
       "size_bytes": 1832
@@ -3405,9 +3412,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-08T05:06:22+00:00",
+  "generated_at": "2026-10-08T05:22:37+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 487,
+  "output_file_count": 488,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3444,5 +3451,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ca82094f0e21f9883899adc17433049245a0f810"
+  "source_commit": "8989a3ea4f6ba545912f076915d17b2d511d2b4a"
 }
