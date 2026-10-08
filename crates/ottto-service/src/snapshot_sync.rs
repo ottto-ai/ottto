@@ -4503,16 +4503,18 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         requested_session_count: session_ids.len(),
         ..Default::default()
     };
-    match crate::claude_local_otel::load_claude_effort_evidence(support_dir, session_ids) {
+    let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
+    match crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, session_ids) {
         Ok(evidence) => {
             let census_window_end = scan_result.census_window_end.clone();
             crate::snapshots::apply_claude_effort_evidence_with_index(
                 &mut scan_result.snapshots,
-                &evidence,
+                &evidence.evidence,
                 index,
                 census_complete,
                 &census_window_end,
             );
+            api_read = evidence;
         }
         Err(_) => stats.effort_evidence_load_failed = true,
     }
@@ -4536,16 +4538,16 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         })
         .collect::<Vec<_>>();
     stats.paired_sidecar_root_count = usage_roots.len();
+    // Effort has already updated pending-family state. Release all non-paired
+    // rows before moving the selected roots into the usage aggregate.
+    api_read.retain_roots(&usage_roots.iter().cloned().collect());
     // Health is family-scoped: one malformed historical sidecar must make
     // that family unproven, not suppress an unrelated healthy family.
     let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
     for root_session_id in usage_roots {
-        let api = crate::claude_local_otel::load_claude_api_request_evidence_report(
-            support_dir,
-            [root_session_id.clone()],
-        );
-        let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+        let mut api = api_read.take_strict_report(support_dir, &root_session_id);
+        let mut trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
             support_dir,
             [root_session_id.clone()],
         );
@@ -4581,15 +4583,13 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
             stats.trace_only_request_count +=
                 trace_request_ids.difference(&api_request_ids).count();
         }
-        if let Some(rows) = api.evidence.get(&root_session_id) {
+        if let Some(rows) = api.evidence.remove(&root_session_id) {
             stats.api_evidence_row_count += rows.len();
-            api_report
-                .evidence
-                .insert(root_session_id.clone(), rows.clone());
+            api_report.evidence.insert(root_session_id.clone(), rows);
         }
-        if let Some(rows) = trace.evidence.get(&root_session_id) {
+        if let Some(rows) = trace.evidence.remove(&root_session_id) {
             stats.trace_evidence_row_count += rows.len();
-            trace_report.evidence.insert(root_session_id, rows.clone());
+            trace_report.evidence.insert(root_session_id, rows);
         }
     }
     let census_window_end = scan_result.census_window_end.clone();
