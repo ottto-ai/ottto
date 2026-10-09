@@ -21,6 +21,9 @@ grant key, the status table, field refusals, ordering, the 20-grant cap and
 - `credits: null` (a count-only answer, or a failed detail call that Codex
   silently replaces with the count) is `unavailable` with the count kept. It is
   never an empty list.
+- Every app-server Codex balance now carries the read completion clock
+  (`observed_at`) and the packaging time (`updated_at`, through the model's
+  `stamp_packaged_at`). Quota windows already carried the read clock.
 - Every Codex balance now carries `kind`: `credits` → `plan_credits`,
   `reset_bank` → `saved_resets`, `workspace_monthly_credits` →
   `workspace_allowance`. A pool other than `codex` keeps its existing
@@ -84,6 +87,11 @@ launcher, then the inner binary, before falling back to `PATH`.
 
 ## Tests
 
+- Canonical fixtures: every Codex `provider/*.json` body of
+  `fixtures/agent-status/quota-contract-v2.2/`, read through the adapter,
+  equals its `expected/*.wire.json` (complete, provider-capped, 21 rows capped
+  by the sender, count-only as `unavailable`), and the re-send sequence
+  matches step for step.
 - Adapter fixtures: provider JSON → expected wire for complete two- and
   three-grant lists, count-only and `credits: null`, provider-capped, invalid
   rows (partial, with field-path diagnostics), empty list with zero count.

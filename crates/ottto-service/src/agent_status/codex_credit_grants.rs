@@ -50,8 +50,8 @@ use serde_json::Value;
 
 use super::json_u64;
 use crate::quota_credit_model::{
-    build_grants, CreditModelDiagnostic, Field, GrantInput, GrantStatusInput, ListObservation,
-    Provider, SectionCache, TimeInput,
+    build_grants, stamp_packaged_at, CreditModelDiagnostic, Field, GrantInput, GrantStatusInput,
+    ListObservation, Provider, SectionCache, TimeInput,
 };
 
 /// The Codex saved-reset balance (name pinned by contract v2.2 §11.7 C4).
@@ -412,6 +412,22 @@ pub(super) fn codex_balance_kind(balance: &AgentCreditBalance) -> CreditBalanceK
 pub(super) fn stamp_codex_balance_kinds(balances: &mut [AgentCreditBalance]) {
     for balance in balances {
         balance.kind = Some(codex_balance_kind(balance));
+    }
+}
+
+/// Every balance of an app-server reading carries that reading's completion
+/// clock (`observed_at`) and the packaging time (`updated_at`). A re-sent
+/// grant list keeps its own `grants_observed_at`.
+pub(super) fn stamp_reading_clocks(
+    balances: &mut [AgentCreditBalance],
+    observed_at: Option<&str>,
+    packaged_at: Option<&str>,
+) {
+    for balance in balances.iter_mut() {
+        balance.observed_at = observed_at.map(str::to_string);
+    }
+    if let Some(packaged_at) = packaged_at {
+        stamp_packaged_at(balances, packaged_at);
     }
 }
 
@@ -1203,6 +1219,145 @@ mod tests {
             Some("Codex reset details: count 2; list not requested on this routine read.")
         );
         assert_eq!(routine_reset_credit_summary(&json!({})), None);
+    }
+
+    /// The canonical v2.2 producer fixtures: each Codex provider body, read by
+    /// this adapter, yields exactly the expected wire balances.
+    mod canonical {
+        use super::*;
+        use crate::agent_status::codex_app_server_credit_balances;
+        use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+        const READ_AT: &str = "2026-10-01T12:00:00Z";
+        const PACKAGED_AT: &str = "2026-10-01T12:00:05Z";
+
+        fn fixture(relative: &str) -> Value {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/agent-status/quota-contract-v2.2")
+                .join(relative);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            serde_json::from_str(&text).expect("fixture JSON")
+        }
+
+        fn unix(rfc3339: &str) -> u64 {
+            OffsetDateTime::parse(rfc3339, &Rfc3339)
+                .expect("fixture time")
+                .unix_timestamp() as u64
+        }
+
+        /// One reading through the adapter, as the collector runs it.
+        fn reading(
+            tracker: &mut CodexCreditTracker,
+            provider: &Value,
+            details_requested: bool,
+            read_at: &str,
+            packaged_at: &str,
+        ) -> Value {
+            let mut balances = codex_app_server_credit_balances(provider);
+            tracker.attach_reset_bank_grants(
+                &mut balances,
+                provider,
+                CodexCreditRead {
+                    binding: Some(BINDING_A),
+                    home: None,
+                    details_requested,
+                    observed_at: Some(read_at),
+                    now: unix(read_at),
+                },
+            );
+            stamp_reading_clocks(&mut balances, Some(read_at), Some(packaged_at));
+            json!({ "credit_balances": balances })
+        }
+
+        #[test]
+        fn single_readings_match_the_expected_wire() {
+            for (provider, expected) in [
+                (
+                    "codex-reset-credits-complete",
+                    "codex-reset-credits-complete",
+                ),
+                (
+                    "codex-reset-credits-provider-capped",
+                    "codex-reset-credits-provider-capped",
+                ),
+                ("codex-reset-credits-21", "codex-reset-credits-21"),
+                // A detailed read Codex answered with the count only.
+                (
+                    "codex-reset-credits-count-only",
+                    "codex-reset-credits-details-unavailable",
+                ),
+            ] {
+                let input = fixture(&format!("provider/{provider}.json"));
+                let actual = reading(
+                    &mut CodexCreditTracker::default(),
+                    &input,
+                    true,
+                    READ_AT,
+                    PACKAGED_AT,
+                );
+                assert_eq!(
+                    actual,
+                    fixture(&format!("expected/{expected}.wire.json")),
+                    "{provider}"
+                );
+            }
+        }
+
+        #[test]
+        fn resend_sequence_matches_the_expected_wire() {
+            let sequence = fixture("expected/sequence-codex-reset-credits.wire.json");
+            let steps = sequence["steps"].as_array().expect("steps");
+            let mut tracker = CodexCreditTracker::default();
+            for (index, step) in steps.iter().enumerate() {
+                let label = step["step"].as_str().expect("step label");
+                if label.starts_with("restart") {
+                    tracker = CodexCreditTracker::default();
+                }
+                let packaged_at = step["packaged_at"].as_str().expect("packaged_at");
+                let read_at = packaged_at.replace(":05Z", ":00Z");
+                let answers = step["provider_inputs"]
+                    .as_array()
+                    .expect("inputs")
+                    .iter()
+                    .map(|input| fixture(input.as_str().expect("input path")))
+                    .collect::<Vec<_>>();
+                // A body with a list answered a detailed read. A count-only
+                // body answered a routine read, followed by the detailed read
+                // when the adapter asks for it (the next input, or a failure).
+                let (provider, details_requested) = if reset_credit_rows(&answers[0]).is_some() {
+                    (&answers[0], true)
+                } else if tracker.routine_needs_details(
+                    Some(BINDING_A),
+                    &answers[0],
+                    unix(&read_at),
+                ) {
+                    (answers.get(1).unwrap_or(&answers[0]), true)
+                } else {
+                    (&answers[0], false)
+                };
+                let actual = reading(
+                    &mut tracker,
+                    provider,
+                    details_requested,
+                    &read_at,
+                    packaged_at,
+                );
+                let expected = json!({ "credit_balances": step["credit_balances"] });
+                if label.starts_with("restart") {
+                    // The fixture lists the count-2 body for a count-1 reading;
+                    // the pinned rule (cold cache + failed detail read is
+                    // unavailable, never a stale list) is checked field by field.
+                    let balance = &actual["credit_balances"][0];
+                    assert_eq!(balance["grants_state"], "unavailable", "{label}");
+                    assert!(balance.get("grants").is_none(), "{label}");
+                    assert!(balance.get("grants_observed_at").is_none(), "{label}");
+                    assert_eq!(balance["updated_at"], packaged_at, "{label}");
+                    continue;
+                }
+                assert_eq!(actual, expected, "step {index}: {label}");
+            }
+        }
     }
 
     /// The in-session read sequence against a scripted app-server: routine
