@@ -8,6 +8,22 @@
 //! Adapters own provider field names and parsing. They hand this module
 //! provider-neutral inputs ([`ListObservation`], [`GrantInput`]) and never
 //! re-implement a rule that lives here.
+//!
+//! Adapter flow for a balance with grants:
+//!
+//! 1. build the balance (name/unit/kind/status per the adapter's table);
+//! 2. `build_grants(observation).apply_to(&mut balance)` writes `grants`,
+//!    `grants_state`, `grant_count`, `grants_observed_at` and the summaries;
+//! 3. stamp packaging time with [`stamp_packaged_at`] (fresh and re-sent
+//!    balances alike), and use [`SectionCache`] for sections this reading
+//!    did not include.
+//!
+//! Summaries ([`summarize`]) are complete-gated. One exception lives in
+//! [`GrantsBuild::apply_to`]: when a complete provider enumeration was cut
+//! only by the daemon's 20 cap, `next_expires_at` is still exact (computed over
+//! the whole list before the cut) and is set although the state is `capped`.
+//! A provider-capped list (fewer rows than the provider count) or a partial
+//! one never gets one.
 
 use std::collections::BTreeMap;
 
@@ -167,9 +183,14 @@ pub(crate) struct GrantsBuild {
     pub(crate) grants_state: Option<CreditGrantsState>,
     pub(crate) grant_count: Option<u64>,
     pub(crate) grants_observed_at: Option<Rfc3339Timestamp>,
-    /// The daemon dropped trailing grants at the 20 cap. The kept prefix is in
-    /// soonest-expiry order, so `next_expires_at` stays exact.
+    /// The provider enumeration was complete and only the daemon's 20 cap cut
+    /// it, so the soonest expiry is still known exactly.
     pub(crate) sender_capped: bool,
+    /// Soonest available/paused expiry over the whole list, computed before
+    /// the cap dropped any grant. Set only with `sender_capped`.
+    pub(crate) sender_capped_next_expires_at: Option<Rfc3339Timestamp>,
+    /// Provider of a read list; `None` for unavailable/not-supported.
+    pub(crate) provider: Option<Provider>,
     pub(crate) diagnostics: Vec<CreditModelDiagnostic>,
 }
 
@@ -180,9 +201,9 @@ impl GrantsBuild {
         balance.grants_state = self.grants_state;
         balance.grant_count = self.grant_count;
         balance.grants_observed_at = self.grants_observed_at;
-        summarize(balance);
+        summarize_with(balance, self.provider);
         if self.sender_capped && balance.grants_state == Some(CreditGrantsState::Capped) {
-            balance.next_expires_at = next_expires_at(balance.grants.as_deref().unwrap_or(&[]));
+            balance.next_expires_at = self.sender_capped_next_expires_at;
         }
         self.diagnostics
     }
@@ -239,7 +260,7 @@ pub(crate) fn build_grants(obs: ListObservation) -> GrantsBuild {
     }
     grants.sort_by(grant_order);
 
-    let mut capped = match provider_count {
+    let provider_capped = match provider_count {
         Some(count) if count == returned as u64 => false,
         Some(count) if count > returned as u64 => true,
         // An unknown total or a list longer than the provider's own count is
@@ -249,11 +270,19 @@ pub(crate) fn build_grants(obs: ListObservation) -> GrantsBuild {
             false
         }
     };
+    let mut capped = provider_capped;
     let mut sender_capped = false;
+    let mut sender_capped_next_expires_at = None;
     if grants.len() > GRANTS_MAX {
+        // Only a list that was complete before the cut keeps an exact soonest
+        // expiry, and it is taken over the whole list: redeemed grants that
+        // expire earlier can push every eligible grant past the cut.
+        if !provider_capped && !partial {
+            sender_capped = true;
+            sender_capped_next_expires_at = next_expires_at(&grants);
+        }
         grants.truncate(GRANTS_MAX);
         capped = true;
-        sender_capped = true;
         diagnostics.push(CreditModelDiagnostic::new("grants_capped", "grants"));
     }
     let state = if partial {
@@ -268,7 +297,9 @@ pub(crate) fn build_grants(obs: ListObservation) -> GrantsBuild {
         grants_state: Some(state),
         grant_count,
         grants_observed_at: Some(observed_at),
-        sender_capped: sender_capped && state == CreditGrantsState::Capped,
+        sender_capped,
+        sender_capped_next_expires_at,
+        provider: Some(provider),
         diagnostics,
     }
 }
@@ -582,49 +613,74 @@ fn latest_granted_at(grants: &[AgentCreditGrant]) -> Option<Rfc3339Timestamp> {
 
 /// Balance summaries over its grants (contract v2.2 §11.1, v2.1 §3 A).
 ///
-/// Only a `complete` list is a basis: `next_expires_at` (min `expires_at`) and
-/// `latest_granted_at` (max `granted_at`) over available/paused grants, with
-/// no clock filter (the reader judges whether an instant has passed). For
-/// saved resets whose grants report `resets_left` (Anthropic), `remaining` is
-/// the sum over non-paused grants. Otherwise all three summaries are `None`
-/// (a provider-reported `remaining` is kept). The sender-capped expiry case is
-/// applied by [`GrantsBuild::apply_to`].
+/// Only a `complete` list is a basis. `next_expires_at` (min `expires_at`)
+/// and `latest_granted_at` (max `granted_at`) range over available/paused
+/// grants with no clock filter: the reader judges whether an instant passed.
+/// Otherwise both are `None`.
+///
+/// Saved resets whose grants carry per-grant `resets_left` (Anthropic) get
+/// `remaining` = Σ `resets_left` of non-paused grants when the list is
+/// `complete` (an empty complete list is 0), and `None` in every other state.
+/// A provider-reported count (OpenAI `availableCount`, no per-grant counts) is
+/// left as sent. The sender-capped expiry case is in [`GrantsBuild::apply_to`].
 pub(crate) fn summarize(balance: &mut AgentCreditBalance) {
+    summarize_with(balance, None);
+}
+
+fn summarize_with(balance: &mut AgentCreditBalance, provider: Option<Provider>) {
     balance.next_expires_at = None;
     balance.latest_granted_at = None;
     let complete = balance.grants_state == Some(CreditGrantsState::Complete);
-    let grants = balance.grants.as_deref().unwrap_or(&[]);
-    let sums_resets_left = balance.kind == Some(CreditBalanceKind::SavedResets)
-        && balance.unit == AgentCreditBalanceUnit::Resets
-        && balance.grants.is_some()
-        && grants_report_resets_left(grants, balance.remaining);
-    if !complete {
-        if sums_resets_left {
-            balance.remaining = None;
-        }
+    if complete {
+        let grants = balance.grants.as_deref().unwrap_or(&[]);
+        balance.next_expires_at = next_expires_at(grants);
+        balance.latest_granted_at = latest_granted_at(grants);
+    }
+    if !sums_resets_left(balance, provider) {
         return;
     }
-    balance.next_expires_at = next_expires_at(grants);
-    balance.latest_granted_at = latest_granted_at(grants);
-    if sums_resets_left {
-        balance.remaining = Some(
-            grants
+    balance.remaining = if complete {
+        Some(
+            balance
+                .grants
                 .iter()
+                .flatten()
                 .filter(|grant| grant.status != CreditGrantStatus::Paused)
                 .filter_map(|grant| grant.resets_left)
                 .sum(),
-        );
+        )
+    } else {
+        None
+    };
+}
+
+/// Whether `remaining` is the model's Σ `resets_left` rather than a provider
+/// count. Known for a list the model just built from Anthropic records;
+/// otherwise recognised by grants carrying `resets_left` (OpenAI never sends
+/// one), or an empty list with no provider count.
+fn sums_resets_left(balance: &AgentCreditBalance, provider: Option<Provider>) -> bool {
+    if balance.kind != Some(CreditBalanceKind::SavedResets)
+        || balance.unit != AgentCreditBalanceUnit::Resets
+    {
+        return false;
+    }
+    let Some(grants) = balance.grants.as_deref() else {
+        return false;
+    };
+    match provider {
+        Some(Provider::Anthropic) => true,
+        Some(Provider::OpenAi) => false,
+        None if grants.is_empty() => balance.remaining.is_none(),
+        None => grants.iter().any(|grant| grant.resets_left.is_some()),
     }
 }
 
-/// Whether `remaining` is the model's sum rather than a provider count: the
-/// grants carry `resets_left`, or the list is empty and no provider count was
-/// set.
-fn grants_report_resets_left(grants: &[AgentCreditGrant], remaining: Option<u64>) -> bool {
-    if grants.is_empty() {
-        return remaining.is_none();
+/// Packaging time of every credit balance a snapshot emits, fresh or re-sent
+/// (contract v2.2 §11.7 C9): never carried over from an earlier snapshot.
+pub(crate) fn stamp_packaged_at(balances: &mut [AgentCreditBalance], packaged_at: &str) {
+    for balance in balances {
+        balance.updated_at = Some(packaged_at.to_string());
     }
-    grants.iter().any(|grant| grant.resets_left.is_some())
 }
 
 /// A one-time credit pool (contract v2.2 §11.3, names pinned by §11.7 C4):
@@ -787,16 +843,9 @@ impl SectionCache {
         let CachedSection::Balances(balances) = &entry.section else {
             return None;
         };
-        Some(
-            balances
-                .iter()
-                .cloned()
-                .map(|mut balance| {
-                    balance.updated_at = Some(packaged_at.to_string());
-                    balance
-                })
-                .collect(),
-        )
+        let mut balances = balances.clone();
+        stamp_packaged_at(&mut balances, packaged_at);
+        Some(balances)
     }
 
     /// Record a successfully read grant list together with the provider count
@@ -850,25 +899,4 @@ impl SectionCache {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn credit_grant_key_matches_backend_reference() {
-        // `printf '%s' '<provider>:credit_grant:<id>' | shasum -a 256`
-        assert_eq!(
-            credit_grant_key(Provider::OpenAi, "abc"),
-            "f046fce7d928781b53b3363e5fa279c5d12ad1d48a496b7d9f78d86689ff41af"
-        );
-        assert_eq!(
-            credit_grant_key(Provider::Anthropic, "Grant_01"),
-            "2213d165fe6d9ddd7781bebd676341547af6bb3fb1a3b29fae743c62b56a6297"
-        );
-        // Case-preserving: `ABC` is a different grant from `abc`.
-        assert_eq!(
-            credit_grant_key(Provider::OpenAi, "ABC"),
-            "4f00d656df736e2e89d39b30fee5cadc785f3787a9e5111c1e8e5cfed933b02d"
-        );
-        assert_eq!(SectionCache::new().len(), 0);
-    }
-}
+mod tests;

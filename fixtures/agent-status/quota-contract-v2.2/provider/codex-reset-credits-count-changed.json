@@ -1,0 +1,16 @@
+{
+  "rateLimitResetCredits": {
+    "availableCount": 1,
+    "credits": [
+      {
+        "id": "rc_synth_a2",
+        "resetType": "codexRateLimits",
+        "status": "available",
+        "grantedAt": 1790617200,
+        "expiresAt": 1793209200,
+        "title": "Full reset",
+        "description": "Synthetic reset credit description."
+      }
+    ]
+  }
+}
