@@ -1221,7 +1221,8 @@ mod tests {
 
         /// `mode`: `count` answers a routine read with the count only;
         /// `reject` answers a routine read with an error, like a server that
-        /// does not know the parameter; `exit` quits after the routine answer.
+        /// does not know the parameter; `exit` closes its stdin, answers the
+        /// routine read and quits.
         /// Every request line is logged.
         const FAKE_APP_SERVER: &str = r#"import json
 import os
@@ -1246,12 +1247,16 @@ for line in sys.stdin:
         print(json.dumps({"id": "ottto_account", "result": {"account": {"type": "chatgpt", "planType": "pro"}}}), flush=True)
     elif request.get("method") == "account/rateLimits/read":
         excluded = request.get("params", {}).get("excludeResetCreditDetails") is True
+        if excluded and mode == "exit":
+            # Close the only read end before answering, so the collector's
+            # follow-up write fails with a broken pipe.
+            os.close(0)
+            print(json.dumps({"id": request["id"], "result": routine}), flush=True)
+            sys.exit(0)
         if excluded and mode == "reject":
             print(json.dumps({"id": request["id"], "error": {"code": -32602, "message": "unknown field"}}), flush=True)
         else:
             print(json.dumps({"id": request["id"], "result": routine if excluded else detailed}), flush=True)
-        if excluded and mode == "exit":
-            sys.exit(0)
 "#;
 
         struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
