@@ -3634,10 +3634,13 @@ fn collect_claude_status(
                 &caller,
             )
         }
-        _ => ClaudeOAuthUsageOutcome::from(Err(
-            "Claude OAuth usage requires strong matching local account and organization identity."
-                .to_string(),
-        )),
+        _ => {
+            claude_oauth_end_caller_run(&ClaudeOAuthUsageCaller::Default);
+            ClaudeOAuthUsageOutcome::from(Err(
+                "Claude OAuth usage requires strong matching local account and organization identity."
+                    .to_string(),
+            ))
+        }
     };
     // Pushed before the quota branch below so the reason the endpoint was or
     // was not called rides the snapshot regardless of which source ends up
@@ -3971,6 +3974,7 @@ fn collect_claude_status_snapshots(
                 crate::claude_browser_auth::ClaudeCollectionSuppression::PreserveCanonicalReconnect
                 | crate::claude_browser_auth::ClaudeCollectionSuppression::PreserveWhileStateUnavailable,
             ) => {
+                claude_oauth_end_slot_run(&descriptor.slot_id);
                 slot_states.insert(descriptor.slot_id.clone(), descriptor.collection.clone());
                 continue;
             }
@@ -3983,7 +3987,7 @@ fn collect_claude_status_snapshots(
             match claude_slot_pre_collection_gate(&descriptor, previous, &captured_at) {
                 Ok(expected) => expected,
                 Err(status) => {
-                    claude_oauth_end_caller_run(&descriptor.slot_id);
+                    claude_oauth_end_slot_run(&descriptor.slot_id);
                     slot_states.insert(descriptor.slot_id, status);
                     continue;
                 }
@@ -4054,7 +4058,7 @@ fn collect_claude_status_snapshots(
             previous,
             &captured_at,
         ) {
-            claude_oauth_end_caller_run(&slot_id);
+            claude_oauth_end_slot_run(&slot_id);
             slot_states.insert(slot_id, status);
             continue;
         }
@@ -5046,12 +5050,16 @@ pub(crate) fn collect_registered_claude_slot_status(
     };
     match crate::claude_browser_auth::collection_suppression(slot_id) {
         Some(crate::claude_browser_auth::ClaudeCollectionSuppression::HideProvisionalTarget) => {
+            claude_oauth_end_slot_run(slot_id);
             return ClaudeSlotProbeFailure::IdentityUnknown.status(&captured_at);
         }
         Some(
             crate::claude_browser_auth::ClaudeCollectionSuppression::PreserveCanonicalReconnect
             | crate::claude_browser_auth::ClaudeCollectionSuppression::PreserveWhileStateUnavailable,
-        ) => return descriptor.collection,
+        ) => {
+            claude_oauth_end_slot_run(slot_id);
+            return descriptor.collection;
+        }
         None => {}
     }
     let previous_states = read_persisted_claude_slot_collection_state();
@@ -5060,7 +5068,7 @@ pub(crate) fn collect_registered_claude_slot_status(
         match claude_slot_pre_collection_gate(&descriptor, previous, &captured_at) {
             Ok(expected) => expected,
             Err(mut status) => {
-                claude_oauth_end_caller_run(slot_id);
+                claude_oauth_end_slot_run(slot_id);
                 apply_claude_slot_approval_notice(
                     &mut status,
                     claude_slot_approvals().get(slot_id),
@@ -5120,7 +5128,7 @@ pub(crate) fn collect_registered_claude_slot_status(
         previous,
         &captured_at,
     ) {
-        claude_oauth_end_caller_run(slot_id);
+        claude_oauth_end_slot_run(slot_id);
         let _ = persist_one_claude_slot_collection_state(slot_id, &status);
         return status;
     }
@@ -5958,6 +5966,7 @@ fn safe_claude_slot_check_diagnostics(
             "claude_oauth_usage_check_succeeded" => "A supported exact-account quota response was collected successfully.",
             "claude_oauth_usage_network_disabled" => "Quota network collection is disabled on this machine.",
             "claude_oauth_usage_collection_in_progress" => "Quota collection is already in progress; no duplicate provider check was made.",
+            CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_CODE => CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_MESSAGE,
             // Our own typed auth classification; only the HTTP status is kept.
             "claude_oauth_usage_auth_rejected" => {
                 if diagnostic.message.contains(" with HTTP 401 ") {
@@ -10079,6 +10088,8 @@ static CLAUDE_OAUTH_TEST_RESPONSE: Mutex<Option<ClaudeOAuthTestResponder>> = Mut
 
 const CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_CODE: &str =
     "claude_saved_reset_variant_unrecognized";
+/// Fixed, value-free text: the same words reach the slot status and upload.
+const CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_MESSAGE: &str = "Claude's saved-reset reading had no recognizable saved-reset section; this account uses the plain reading for 24 hours.";
 
 /// Handle one 200 response body.
 ///
@@ -10106,7 +10117,7 @@ fn claude_oauth_usage_after_response(
     let unrecognized = (variant_recognized == Some(false)).then(|| {
         claude_quota_check_diagnostic(
             CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_CODE,
-            "Claude's saved-reset reading had no recognizable saved-reset section; this account uses the plain reading for 24 hours.",
+            CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_MESSAGE,
             now,
         )
     });
@@ -10174,15 +10185,21 @@ static CLAUDE_OAUTH_CALLER_BINDINGS: Mutex<
     BTreeMap<String, claude_credit_pools::ClaudeCallerBinding>,
 > = Mutex::new(BTreeMap::new());
 
-/// A registered slot's identity gate refused its sign-in this pass: end that
-/// caller's run so no passive body fetched meanwhile is ever adopted.
-fn claude_oauth_end_caller_run(slot_id: &str) {
+/// A pass did not see this caller signed in to a usable binding (an identity
+/// gate refused it, its identity did not resolve, or a browser re-sign-in
+/// suppressed it): end its run so no passive body fetched meanwhile is ever
+/// adopted.
+fn claude_oauth_end_caller_run(caller: &ClaudeOAuthUsageCaller) {
     claude_credit_pools::claude_end_caller_binding(
         &mut CLAUDE_OAUTH_CALLER_BINDINGS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-        &ClaudeOAuthUsageCaller::RegisteredSlot(slot_id.to_string()).breaker_key(),
+        &caller.breaker_key(),
     );
+}
+
+fn claude_oauth_end_slot_run(slot_id: &str) {
+    claude_oauth_end_caller_run(&ClaudeOAuthUsageCaller::RegisteredSlot(slot_id.to_string()));
 }
 
 /// One usable OAuth usage body: a provider response, or a passive reading
@@ -10277,14 +10294,11 @@ fn claude_oauth_usage_record_reading(
 
 /// The Claude Code config file of this caller's own login, whose passive
 /// reading may stand in for a call.
-///
-/// Registered slots only: every refused pass of a slot ends its run at the
-/// identity gate. A default-login pass whose identity does not resolve skips
-/// the collector without ending the run, so the default login reads no
-/// passive body.
 fn claude_oauth_caller_identity_path(caller: &ClaudeOAuthUsageCaller) -> Option<PathBuf> {
     match caller {
-        ClaudeOAuthUsageCaller::Default | ClaudeOAuthUsageCaller::DefaultDeferredToSlot => None,
+        ClaudeOAuthUsageCaller::Default | ClaudeOAuthUsageCaller::DefaultDeferredToSlot => {
+            Some(claude_cli_config_path())
+        }
         ClaudeOAuthUsageCaller::RegisteredSlot(slot_id) => {
             let registry = FileClaudeConfigSlotSettingsStore::default().load().ok()?;
             registry
@@ -31380,52 +31394,44 @@ exit 0
     }
 
     /// Passive Claude Code readings (`cachedUsageUtilization`) carry no
-    /// organization. A pass whose identity gate refuses the slot ends the
-    /// slot's sign-in run, so a body fetched while the slot was signed in
-    /// elsewhere is never adopted when the approved login comes back.
-    #[test]
-    #[serial]
-    fn failed_slot_gate_never_lets_a_passive_reading_through() {
-        struct ForbidProviderCalls;
-        impl Drop for ForbidProviderCalls {
-            fn drop(&mut self) {
-                CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        let fixture = ClaudeBindingFixture::new("passive-gate");
-        let team = ClaudeBindingFixture::hashes(TEAM_PREMIUM);
-        fixture.sign_in(TEAM_PREMIUM);
-        let slot_id = fixture.register();
-        fixture.collect();
-        CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _forbid = ForbidProviderCalls;
-        let make_due = || {
+    /// organization, so one is adopted only inside a continuous run of passes
+    /// that all saw the caller signed in to the exact binding. Each harness
+    /// run proves one way a pass can end that run.
+    struct PassiveRunHarness<'a> {
+        fixture: &'a ClaudeBindingFixture,
+        /// The Claude Code config whose passive reading the caller may adopt.
+        config: PathBuf,
+        team: (String, String),
+    }
+
+    impl PassiveRunHarness<'_> {
+        fn make_due(&self) {
             let observed = current_unix_seconds() - 2 * 60 * 60;
             let window = AgentQuotaWindow {
                 name: "session".to_string(),
                 scope: AgentQuotaWindowScope::Account,
                 freshness: AgentQuotaWindowFreshness::Fresh,
                 used_percent: Some(10),
-                account_identifier_hash: Some(team.0.clone()),
-                organization_identifier_hash: Some(team.1.clone()),
+                account_identifier_hash: Some(self.team.0.clone()),
+                organization_identifier_hash: Some(self.team.1.clone()),
                 ..Default::default()
             };
             write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
                 schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
-                account_identifier_hash: team.0.clone(),
-                organization_identifier_hash: team.1.clone(),
+                account_identifier_hash: self.team.0.clone(),
+                organization_identifier_hash: self.team.1.clone(),
                 observed_at_epoch_seconds: observed,
                 next_refresh_after_epoch_seconds: observed,
                 windows: vec![window],
                 credit_balances: Vec::new(),
             })
             .expect("write due cache");
-        };
-        let passive = |fetched_at: u64| {
-            let path = fixture.slot_dir.join(".claude.json");
+        }
+
+        fn passive(&self, fetched_at: u64) {
             let mut config: Value =
-                serde_json::from_slice(&fs::read(&path).expect("read identity")).expect("json");
+                serde_json::from_slice(&fs::read(&self.config).expect("read identity"))
+                    .expect("json");
             config["cachedUsageUtilization"] = serde_json::json!({
                 "fetchedAtMs": fetched_at * 1_000,
                 "accountUuid": TEAM_PREMIUM.0,
@@ -31434,49 +31440,336 @@ exit 0
                     "seven_day": {"utilization": 33, "resets_at": "2026-10-04T05:00:00+00:00"}
                 }
             });
-            fs::write(&path, serde_json::to_vec(&config).expect("serialize")).expect("write");
-        };
-        let calls = || CLAUDE_OAUTH_PROVIDER_CALLS.load(std::sync::atomic::Ordering::SeqCst);
-        let cache_observed_at = || {
-            read_claude_oauth_usage_cache(&team.0, &team.1)
+            fs::write(
+                &self.config,
+                serde_json::to_vec(&config).expect("serialize"),
+            )
+            .expect("write");
+        }
+
+        fn calls() -> usize {
+            CLAUDE_OAUTH_PROVIDER_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn cache_observed_at(&self) -> u64 {
+            read_claude_oauth_usage_cache(&self.team.0, &self.team.1)
                 .expect("team cache")
                 .observed_at_epoch_seconds
-        };
+        }
 
-        // Pass 1 opens the run; a body fetched before it is not adopted.
-        make_due();
-        passive(current_unix_seconds() - 60);
-        let before = calls();
-        fixture.collect();
-        assert_eq!(calls(), before + 1, "a call, not the older passive body");
+        /// Pass 1 opens the run; pass 2 adopts a body fetched inside it;
+        /// `skipped_pass` runs a pass that must end the run and `restore`
+        /// undoes its cause; pass 4 must call the provider rather than adopt a
+        /// body fetched during the skipped pass, which the old run would
+        /// still cover.
+        fn assert_skipped_pass_ends_run(
+            &self,
+            pass: &dyn Fn(),
+            skipped_pass: &dyn Fn(),
+            restore: &dyn Fn(),
+        ) {
+            struct ForbidProviderCalls;
+            impl Drop for ForbidProviderCalls {
+                fn drop(&mut self) {
+                    CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _forbid = ForbidProviderCalls;
 
-        // Pass 2, same sign-in: a body fetched inside the run is adopted.
-        make_due();
-        let fetched = current_unix_seconds();
-        passive(fetched);
-        let before = calls();
-        fixture.collect();
-        assert_eq!(calls(), before, "the passive body replaced the call");
-        assert_eq!(cache_observed_at(), fetched);
+            self.make_due();
+            self.passive(current_unix_seconds() - 60);
+            let before = Self::calls();
+            pass();
+            assert_eq!(
+                Self::calls(),
+                before + 1,
+                "a call, not the older passive body"
+            );
 
-        // Pass 3: the slot is signed in to another account; the gate refuses.
-        fixture.sign_in(MAX_20X);
-        fixture.collect();
-        assert_eq!(
-            fixture.slot(&slot_id).collection.state,
-            ClaudeConfigSlotCollectionStateV1::IdentityMismatch
-        );
+            self.make_due();
+            let fetched = current_unix_seconds();
+            self.passive(fetched);
+            let before = Self::calls();
+            pass();
+            assert_eq!(Self::calls(), before, "the passive body replaced the call");
+            assert_eq!(self.cache_observed_at(), fetched);
 
-        // Pass 4: back on the approved login with a body fetched before this
-        // pass, i.e. while the slot was signed in elsewhere. Without the gate
-        // ending the run, the pass-1 run would still cover it.
+            // The body is fetched during the skipped pass: after the run
+            // opened, before the next accepted pass. Whole-second clocks, so
+            // the passes are spaced apart.
+            std::thread::sleep(Duration::from_millis(1_100));
+            let fetched = current_unix_seconds();
+            skipped_pass();
+            restore();
+            std::thread::sleep(Duration::from_millis(1_100));
+
+            self.make_due();
+            self.passive(fetched);
+            let before = Self::calls();
+            pass();
+            assert_eq!(Self::calls(), before + 1, "never adopted across that pass");
+            assert_ne!(self.cache_observed_at(), fetched);
+        }
+    }
+
+    /// The default login on the fixture HOME, file credential included.
+    fn sign_in_default(fixture: &ClaudeBindingFixture, which: (&str, &str), with_org: bool) {
+        let home = fixture.root.join("home");
+        let mut account = serde_json::json!({
+            "accountUuid": which.0,
+            "emailAddress": "team.person@example.invalid",
+            "organizationType": "claude_team",
+            "seatTier": "premium",
+        });
+        if with_org {
+            account["organizationUuid"] = serde_json::json!(which.1);
+        }
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::to_vec(&serde_json::json!({ "oauthAccount": account }))
+                .expect("serialize identity"),
+        )
+        .expect("write identity");
+        fs::create_dir_all(home.join(".claude")).expect("create default config dir");
+        fs::write(
+            home.join(".claude").join(".credentials.json"),
+            serde_json::to_vec(&claude_credential_fixture(
+                "fixture-secret-token-default",
+                TimeDuration::hours(6),
+                Some("team"),
+            ))
+            .expect("serialize credential"),
+        )
+        .expect("write credential");
+    }
+
+    fn browser_auth_state_path(fixture: &ClaudeBindingFixture) -> PathBuf {
+        fixture
+            .root
+            .join("support")
+            .join("claude-browser-auth-state.json")
+    }
+
+    #[test]
+    #[serial]
+    fn failed_slot_gate_never_lets_a_passive_reading_through() {
+        let fixture = ClaudeBindingFixture::new("passive-gate");
         fixture.sign_in(TEAM_PREMIUM);
-        make_due();
-        passive(current_unix_seconds() - 1);
-        let before = calls();
+        let slot_id = fixture.register();
         fixture.collect();
-        assert_eq!(calls(), before + 1, "never adopted across a refused pass");
-        assert_ne!(cache_observed_at(), current_unix_seconds() - 1);
+        let harness = PassiveRunHarness {
+            fixture: &fixture,
+            config: fixture.slot_dir.join(".claude.json"),
+            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
+        };
+        harness.assert_skipped_pass_ends_run(
+            &|| {
+                harness.fixture.collect();
+            },
+            &|| {
+                // Another account signed in to the slot: the gate refuses.
+                fixture.sign_in(MAX_20X);
+                fixture.collect();
+                assert_eq!(
+                    fixture.slot(&slot_id).collection.state,
+                    ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+                );
+            },
+            &|| fixture.sign_in(TEAM_PREMIUM),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn unresolved_default_identity_never_lets_a_passive_reading_through() {
+        let fixture = ClaudeBindingFixture::new("passive-default");
+        sign_in_default(&fixture, TEAM_PREMIUM, true);
+        let harness = PassiveRunHarness {
+            fixture: &fixture,
+            config: fixture.root.join("home").join(".claude.json"),
+            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
+        };
+        harness.assert_skipped_pass_ends_run(
+            &|| {
+                harness.fixture.collect();
+            },
+            &|| {
+                // The default login's organization is not resolvable this pass.
+                sign_in_default(&fixture, TEAM_PREMIUM, false);
+                fixture.collect();
+            },
+            &|| sign_in_default(&fixture, TEAM_PREMIUM, true),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn browser_resign_in_pass_never_lets_a_passive_reading_through() {
+        let fixture = ClaudeBindingFixture::new("passive-browser");
+        fixture.sign_in(TEAM_PREMIUM);
+        fixture.register();
+        fixture.collect();
+        let harness = PassiveRunHarness {
+            fixture: &fixture,
+            config: fixture.slot_dir.join(".claude.json"),
+            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
+        };
+        let state = browser_auth_state_path(&fixture);
+        harness.assert_skipped_pass_ends_run(
+            &|| {
+                harness.fixture.collect();
+            },
+            &|| {
+                // Unreadable browser sign-in state: collection is suppressed.
+                fs::write(&state, b"{not json").expect("write browser state");
+                fixture.collect();
+            },
+            &|| fs::remove_file(&state).expect("remove browser state"),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn single_slot_browser_resign_in_never_lets_a_passive_reading_through() {
+        let fixture = ClaudeBindingFixture::new("passive-browser-single");
+        fixture.sign_in(TEAM_PREMIUM);
+        let slot_id = fixture.register();
+        fixture.collect();
+        let harness = PassiveRunHarness {
+            fixture: &fixture,
+            config: fixture.slot_dir.join(".claude.json"),
+            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
+        };
+        let state = browser_auth_state_path(&fixture);
+        let pass = || {
+            collect_registered_claude_slot_status(
+                &slot_id,
+                binding_test_time(0),
+                binding_test_time(15),
+            );
+        };
+        harness.assert_skipped_pass_ends_run(
+            &pass,
+            &|| {
+                fs::write(&state, b"{not json").expect("write browser state");
+                pass();
+            },
+            &|| fs::remove_file(&state).expect("remove browser state"),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn single_slot_provisional_target_never_lets_a_passive_reading_through() {
+        let fixture = ClaudeBindingFixture::new("passive-target-single");
+        fixture.sign_in(TEAM_PREMIUM);
+        let slot_id = fixture.register();
+        fixture.collect();
+        let harness = PassiveRunHarness {
+            fixture: &fixture,
+            config: fixture.slot_dir.join(".claude.json"),
+            team: ClaudeBindingFixture::hashes(TEAM_PREMIUM),
+        };
+        let state = browser_auth_state_path(&fixture);
+        let pass = || {
+            collect_registered_claude_slot_status(
+                &slot_id,
+                binding_test_time(0),
+                binding_test_time(15),
+            );
+        };
+        harness.assert_skipped_pass_ends_run(
+            &pass,
+            &|| {
+                // A browser sign-in targeting this slot is still running.
+                let now = current_unix_seconds();
+                fs::write(
+                    &state,
+                    serde_json::to_vec(&serde_json::json!({
+                        "schema_version": 1,
+                        "operations": [{
+                            "operation_id": "operation-target",
+                            "slot_id": slot_id,
+                            "mode": "target",
+                            "phase": "waiting_for_provider",
+                            "started_unix_seconds": now,
+                            "deadline_unix_seconds": now + 600
+                        }]
+                    }))
+                    .expect("serialize browser state"),
+                )
+                .expect("write browser state");
+                assert_eq!(
+                    crate::claude_browser_auth::collection_suppression(&slot_id),
+                    Some(crate::claude_browser_auth::ClaudeCollectionSuppression::HideProvisionalTarget)
+                );
+                pass();
+            },
+            &|| fs::remove_file(&state).expect("remove browser state"),
+        );
+    }
+
+    fn respond_variant_unrecognized(_endpoint: &str) -> Value {
+        serde_json::json!({
+            "five_hour": {"utilization": 12, "resets_at": "2026-10-01T15:00:00+00:00"},
+            "seven_day": {"utilization": 34, "resets_at": "2026-10-04T05:00:00+00:00"},
+            "cedar_ember": null, "extra_usage": null, "spend": null
+        })
+    }
+
+    fn respond_variant_without_windows(_endpoint: &str) -> Value {
+        serde_json::json!({})
+    }
+
+    /// The variant self-check diagnostic survives slot sanitization and
+    /// reaches the upload, with and without windows in the body.
+    #[test]
+    #[serial]
+    fn unrecognized_variant_diagnostic_reaches_the_upload() {
+        for respond in [
+            respond_variant_without_windows as ClaudeOAuthTestResponder,
+            respond_variant_unrecognized,
+        ] {
+            let fixture = ClaudeBindingFixture::new("variant-upload");
+            fixture.sign_in(TEAM_PREMIUM);
+            let slot_id = fixture.register();
+            fixture.collect();
+            let team = ClaudeBindingFixture::hashes(TEAM_PREMIUM);
+            let state_dir = claude_oauth_usage_account_state_dir(&team.0, &team.1);
+            let now = current_unix_seconds();
+            claude_credit_pools::write_claude_read_schedule(
+                &state_dir,
+                &claude_credit_pools::ClaudeReadSchedule {
+                    last_plain_read_at: Some(now - 3_600),
+                    ..Default::default()
+                },
+            )
+            .expect("write schedule");
+            let _ = fs::remove_file(claude_oauth_usage_cache_path(&team.0, &team.1));
+            *CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = Some(respond);
+            let snapshots = fixture.collect();
+            *CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = None;
+            let upload = serde_json::to_string(
+                &snapshots
+                    .into_iter()
+                    .map(|snapshot| snapshot.redacted_for_backend())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("serialize upload");
+            assert!(
+                upload.contains("claude_saved_reset_variant_unrecognized"),
+                "upload carries the code"
+            );
+            assert!(upload.contains(CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_MESSAGE));
+            assert!(fixture
+                .slot(&slot_id)
+                .collection
+                .quota_check_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "claude_saved_reset_variant_unrecognized"));
+        }
     }
 
     #[test]

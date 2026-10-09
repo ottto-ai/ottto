@@ -38,6 +38,8 @@ another shape, or a body with no windows at all) adds the code-only diagnostic
 `claude_saved_reset_variant_unrecognized`, sends no saved-reset balance from
 that read (the last observed section is re-sent; never an `unknown` stand-in),
 and pauses the variant for that binding for 24 h, so every slot reads plain.
+The diagnostic carries a fixed message and is allowlisted for registered-slot
+status, so it reaches the upload.
 The pause is separate variant state, never a strike on the endpoint breaker.
 After 24 h the variant is read and checked again. Variant HTTP errors follow
 the existing backoff; a variant 429 counts toward the shared rate-limit
@@ -62,12 +64,12 @@ extra calls:
   call. The cached body has no organization, so it is adopted only when it
   was fetched inside a continuous run of collection passes (every ~5 min,
   gaps up to 15 min) that all found that caller signed in to exactly this
-  account and organization. Another binding, a longer gap, a restart, a clock
-  going backwards, or a registered slot's identity gate refusing the slot
-  (another account or organization signed in) ends the run, and a run never
-  adopts a body fetched before it began. Only registered slots read passive
-  bodies for now: a default-login pass that cannot resolve its identity skips
-  the collector without ending its run. A passive body that lacks the credit
+  account and organization. Another binding, a longer gap, a restart or a
+  clock going backwards starts a new run, and a run never adopts a body
+  fetched before it began. Every pass that does not see the caller on a usable
+  binding ends its run: a registered slot's identity gate refusing the slot, a
+  default-login pass whose identity does not resolve, and a browser re-sign-in
+  that suppresses the slot's collection. A passive body that lacks the credit
   keys (`spend`/`extra_usage`) updates windows only and re-sends the stored
   credit sections;
 - the existing 5-minute post-success spacing, Retry-After handling, breaker and
@@ -110,6 +112,9 @@ Claude fixtures and sequence, the variant self-check (valid, unrecognized,
 collector, `read-schedule.json` permissions and restart, passive identity
 matching, and a simulated 24 h day for the scheduler (slot spacing,
 alternation, plain every ~6 h while off, active and idle slots, passive input,
-kill switch). `agent_status::tests::failed_slot_gate_never_lets_a_passive_reading_through`
-drives a registered slot through a refused identity gate and proves a body
-fetched meanwhile is never adopted.
+kill switch). End-to-end `agent_status` tests drive a refused identity gate, an unresolved
+default-login identity, a browser re-sign-in (in the slot loop and the
+single-slot path) and a provisional browser target through real collection
+passes, and prove a body fetched during that pass is never adopted; removing
+any one run-end makes its test fail. Another test proves the variant
+diagnostic reaches the upload, with and without windows in the body.

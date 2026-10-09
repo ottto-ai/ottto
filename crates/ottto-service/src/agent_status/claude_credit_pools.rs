@@ -28,9 +28,9 @@ use crate::quota_credit_model::{
 /// Passive input from Claude Code's own `cachedUsageUtilization` (Ron Q3).
 /// Every collection pass records where each caller is signed in, and a
 /// registered slot's identity gate ends the caller's run when it refuses the
-/// slot, so a body fetched under another organization is never adopted. The
-/// default login is not a passive caller yet: a pass that cannot resolve its
-/// identity skips the collector without ending the run.
+/// slot, as does a pass that skips the collector (an unresolved default-login
+/// identity, a browser re-sign-in), so a body fetched under another
+/// organization is never adopted.
 pub(super) const CLAUDE_PASSIVE_READING_ENABLED: bool = true;
 /// Kill switch for the activity-based slot (Ron Q3). `false` falls back to
 /// today's 55-65 min gate for every binding: no active boost, no idle
@@ -1242,21 +1242,6 @@ mod tests {
         let read = claude_credit_read(&no_spend, ClaudeUsageRead::Plain, READ_AT);
         assert_eq!(read.usage_credits.as_deref(), Some(&[][..]));
         assert_eq!(read.one_time_credits.as_ref().map(Vec::len), Some(1));
-    }
-
-    #[test]
-    fn default_login_reads_no_passive_body() {
-        use super::super::ClaudeOAuthUsageCaller;
-        assert_eq!(
-            super::super::claude_oauth_caller_identity_path(&ClaudeOAuthUsageCaller::Default),
-            None
-        );
-        assert_eq!(
-            super::super::claude_oauth_caller_identity_path(
-                &ClaudeOAuthUsageCaller::DefaultDeferredToSlot
-            ),
-            None
-        );
     }
 
     #[test]
