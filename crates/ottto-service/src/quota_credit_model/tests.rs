@@ -561,6 +561,64 @@ fn list_longer_than_provider_count_is_partial() {
 }
 
 #[test]
+fn sender_cap_on_a_provider_capped_list_has_no_expiry() {
+    // The provider reports 30 but returns 25: rows it omitted may expire first.
+    let build = build_grants(read(Provider::OpenAi, Some(30), overflow(25)));
+    assert!(!build.sender_capped);
+    let mut balance = saved_resets(Some(30), READ_AT);
+    build.apply_to(&mut balance);
+    assert_eq!(balance.grants_state, Some(CreditGrantsState::Capped));
+    assert_eq!(balance.grants.as_ref().unwrap().len(), GRANTS_MAX);
+    assert_eq!(balance.next_expires_at, None);
+}
+
+#[test]
+fn sender_capped_expiry_counts_grants_past_the_cut() {
+    // 20 redeemed grants expire before the only available one, which the cap
+    // drops; its expiry is still the soonest eligible one.
+    let mut records = (0..20)
+        .map(|k| {
+            anthropic_grant(
+                &format!("grant_spent_{k:02}"),
+                None,
+                1,
+                0,
+                "2026-09-01T00:00:00Z",
+                &format!("2026-10-{:02}T00:00:00Z", k + 1),
+                &[],
+                false,
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    records.push(anthropic_grant(
+        "grant_live",
+        None,
+        1,
+        1,
+        "2026-09-01T00:00:00Z",
+        "2026-10-25T00:00:00Z",
+        &[],
+        false,
+        false,
+    ));
+    let balance = claude_reset_bank(READ_AT, read(Provider::Anthropic, Some(21), records));
+    assert_eq!(balance.grants_state, Some(CreditGrantsState::Capped));
+    assert!(balance
+        .grants
+        .as_ref()
+        .unwrap()
+        .iter()
+        .all(|grant| grant.status == CreditGrantStatus::Redeemed));
+    assert_eq!(
+        balance.next_expires_at.as_deref(),
+        Some("2026-10-25T00:00:00Z")
+    );
+    // Capped: the saved-reset count stays unknown.
+    assert_eq!(balance.remaining, None);
+}
+
+#[test]
 fn partial_wins_over_sender_cap() {
     let mut records = overflow(25);
     records[3].id = Field::Absent;

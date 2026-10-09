@@ -19,10 +19,11 @@
 //!    did not include.
 //!
 //! Summaries ([`summarize`]) are complete-gated. One exception lives in
-//! [`GrantsBuild::apply_to`]: when the daemon itself cut the list at 20, the
-//! kept prefix is the soonest-expiring one, so `next_expires_at` is still
-//! exact and is set although the state is `capped`. A provider-capped list
-//! (fewer rows than the provider count) never gets one.
+//! [`GrantsBuild::apply_to`]: when a complete provider enumeration was cut
+//! only by the daemon's 20 cap, `next_expires_at` is still exact (computed over
+//! the whole list before the cut) and is set although the state is `capped`.
+//! A provider-capped list (fewer rows than the provider count) or a partial
+//! one never gets one.
 
 use std::collections::BTreeMap;
 
@@ -182,9 +183,12 @@ pub(crate) struct GrantsBuild {
     pub(crate) grants_state: Option<CreditGrantsState>,
     pub(crate) grant_count: Option<u64>,
     pub(crate) grants_observed_at: Option<Rfc3339Timestamp>,
-    /// The daemon dropped trailing grants at the 20 cap. The kept prefix is in
-    /// soonest-expiry order, so `next_expires_at` stays exact.
+    /// The provider enumeration was complete and only the daemon's 20 cap cut
+    /// it, so the soonest expiry is still known exactly.
     pub(crate) sender_capped: bool,
+    /// Soonest available/paused expiry over the whole list, computed before
+    /// the cap dropped any grant. Set only with `sender_capped`.
+    pub(crate) sender_capped_next_expires_at: Option<Rfc3339Timestamp>,
     /// Provider of a read list; `None` for unavailable/not-supported.
     pub(crate) provider: Option<Provider>,
     pub(crate) diagnostics: Vec<CreditModelDiagnostic>,
@@ -199,7 +203,7 @@ impl GrantsBuild {
         balance.grants_observed_at = self.grants_observed_at;
         summarize_with(balance, self.provider);
         if self.sender_capped && balance.grants_state == Some(CreditGrantsState::Capped) {
-            balance.next_expires_at = next_expires_at(balance.grants.as_deref().unwrap_or(&[]));
+            balance.next_expires_at = self.sender_capped_next_expires_at;
         }
         self.diagnostics
     }
@@ -256,7 +260,7 @@ pub(crate) fn build_grants(obs: ListObservation) -> GrantsBuild {
     }
     grants.sort_by(grant_order);
 
-    let mut capped = match provider_count {
+    let provider_capped = match provider_count {
         Some(count) if count == returned as u64 => false,
         Some(count) if count > returned as u64 => true,
         // An unknown total or a list longer than the provider's own count is
@@ -266,11 +270,19 @@ pub(crate) fn build_grants(obs: ListObservation) -> GrantsBuild {
             false
         }
     };
+    let mut capped = provider_capped;
     let mut sender_capped = false;
+    let mut sender_capped_next_expires_at = None;
     if grants.len() > GRANTS_MAX {
+        // Only a list that was complete before the cut keeps an exact soonest
+        // expiry, and it is taken over the whole list: redeemed grants that
+        // expire earlier can push every eligible grant past the cut.
+        if !provider_capped && !partial {
+            sender_capped = true;
+            sender_capped_next_expires_at = next_expires_at(&grants);
+        }
         grants.truncate(GRANTS_MAX);
         capped = true;
-        sender_capped = true;
         diagnostics.push(CreditModelDiagnostic::new("grants_capped", "grants"));
     }
     let state = if partial {
@@ -285,7 +297,8 @@ pub(crate) fn build_grants(obs: ListObservation) -> GrantsBuild {
         grants_state: Some(state),
         grant_count,
         grants_observed_at: Some(observed_at),
-        sender_capped: sender_capped && state == CreditGrantsState::Capped,
+        sender_capped,
+        sender_capped_next_expires_at,
         provider: Some(provider),
         diagnostics,
     }
