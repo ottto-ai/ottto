@@ -9626,6 +9626,24 @@ fn collect_claude_oauth_usage_unstamped(
         && !claude_access_token_locally_expired(credential_expires_at, now);
     let open_breaker = breaker.filter(|breaker| claude_oauth_usage_breaker_is_open(breaker, now));
 
+    // Read cadence (design R7; Ron Q1/Q3): one read per binding per slot. The
+    // slot follows the account's recent activity; due slots alternate the
+    // plain and saved-reset reads.
+    let account_state_dir =
+        claude_oauth_usage_account_state_dir(account_identifier_hash, organization_identifier_hash);
+    let mut read_schedule = claude_credit_pools::read_claude_read_schedule(&account_state_dir);
+    let latest_activity_at =
+        claude_oauth_latest_activity_at(account_identifier_hash, organization_identifier_hash);
+    let slot_seconds = claude_oauth_usage_slot_seconds(
+        &read_schedule,
+        latest_activity_at,
+        account_identifier_hash,
+        organization_identifier_hash,
+        now,
+    );
+    let mut last_reading_at = None;
+    let mut previous_credit_balances = Vec::new();
+
     let mut exact_stale_fallback = None;
     if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
         account_identifier_hash,
@@ -9635,22 +9653,24 @@ fn collect_claude_oauth_usage_unstamped(
         if mirror_legacy_default {
             let _ = write_legacy_claude_oauth_usage_cache(&cache);
         }
+        // The last stored reading: its sections are re-sent by a read that
+        // does not carry them.
+        previous_credit_balances = cache.credit_balances.clone();
+        if !cache.windows.is_empty() {
+            last_reading_at = Some(cache.observed_at_epoch_seconds);
+        }
         let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
         if !cache.windows.is_empty()
             && cache_age <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
-            && (cache_age
-                <= claude_oauth_usage_fresh_age_seconds(
-                    account_identifier_hash,
-                    organization_identifier_hash,
-                )
-                || now < cache.next_refresh_after_epoch_seconds)
+            && !claude_credit_pools::claude_reading_due(
+                Some(cache.observed_at_epoch_seconds),
+                cache.next_refresh_after_epoch_seconds,
+                slot_seconds,
+                now,
+            )
         {
             let retry_after = (rate_limit_retry_evidenced
-                && cache_age
-                    > claude_oauth_usage_fresh_age_seconds(
-                        account_identifier_hash,
-                        organization_identifier_hash,
-                    )
+                && cache_age > slot_seconds
                 && now < cache.next_refresh_after_epoch_seconds)
                 .then(|| rfc3339_from_unix_seconds(cache.next_refresh_after_epoch_seconds))
                 .flatten();
@@ -9673,6 +9693,44 @@ fn collect_claude_oauth_usage_unstamped(
         }
         if !cache.windows.is_empty() && cache_age <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS {
             exact_stale_fallback = Some(cache);
+        }
+    }
+
+    // Passive input (Ron Q3): Claude Code's own plain reading for exactly this
+    // binding, newer than ours and inside the slot, stands in for this slot's
+    // call. Parsed by the same plain-body parser; no provider request.
+    if let Some(passive) = claude_oauth_passive_usage(
+        caller,
+        account_identifier_hash,
+        organization_identifier_hash,
+    )
+    .filter(|passive| {
+        claude_credit_pools::claude_passive_reading_usable(
+            passive.fetched_at,
+            last_reading_at,
+            slot_seconds,
+            now,
+        )
+    }) {
+        if let Ok(usage) = claude_oauth_usage_record_reading(
+            ClaudeOAuthReading {
+                account_identifier_hash,
+                organization_identifier_hash,
+                body: &passive.body,
+                read: claude_credit_pools::ClaudeUsageRead::Plain,
+                observed_at_epoch_seconds: passive.fetched_at,
+                previous_credit_balances: &previous_credit_balances,
+                latest_activity_at,
+                now,
+                mirror_legacy_default,
+            },
+            &mut read_schedule,
+        ) {
+            return ClaudeOAuthUsageOutcome::from(Ok(usage)).with_check_outcome(
+                "claude_oauth_usage_cache_reused",
+                "A newer local quota reading that Claude Code made for this exact account was reused; no provider request was made.",
+                now,
+            );
         }
     }
 
@@ -9798,6 +9856,15 @@ fn collect_claude_oauth_usage_unstamped(
     }
     let authorization = format!("Bearer {token}");
     let user_agent = ottto_user_agent();
+    // Same endpoint, same slot: the saved-reset variant replaces the plain
+    // read in its slot, never adds a call.
+    let usage_read = claude_credit_pools::claude_usage_read_kind(
+        &read_schedule,
+        claude_credit_pools::claude_usage_credits_off(&previous_credit_balances),
+        claude_credit_pools::CLAUDE_SAVED_RESETS_READ_ENABLED,
+        now,
+    );
+    let endpoint = format!("{CLAUDE_OAUTH_USAGE_ENDPOINT}{}", usage_read.query());
     #[cfg(test)]
     CLAUDE_OAUTH_PROVIDER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     #[cfg(test)]
@@ -9806,7 +9873,7 @@ fn collect_claude_oauth_usage_unstamped(
             "This test forbids Claude OAuth provider requests.".to_string(),
         ));
     }
-    let response = ureq::get(CLAUDE_OAUTH_USAGE_ENDPOINT)
+    let response = ureq::get(&endpoint)
         .set("Accept", "application/json")
         .set("Content-Type", "application/json")
         .set("Authorization", &authorization)
@@ -9933,56 +10000,45 @@ fn collect_claude_oauth_usage_unstamped(
             current_unix_seconds(),
         );
     };
-    let mut usage = ClaudeOAuthUsage {
-        windows: claude_oauth_quota_windows(&value),
-        credit_balances: claude_oauth_credit_balances(&value),
-    };
-    if usage.windows.is_empty() {
+    // This is the local successful response time, never a provider-supplied
+    // timestamp. Cache reuse preserves it rather than stamping a later upload.
+    let usage = match claude_oauth_usage_record_reading(
+        ClaudeOAuthReading {
+            account_identifier_hash,
+            organization_identifier_hash,
+            body: &value,
+            read: usage_read,
+            observed_at_epoch_seconds: current_unix_seconds(),
+            previous_credit_balances: &previous_credit_balances,
+            latest_activity_at,
+            now,
+            mirror_legacy_default,
+        },
+        &mut read_schedule,
+    ) {
+        Ok(usage) => usage,
         // A 200 that carries none of the expected quota fields is a shape
         // change, not an empty account: every plan this endpoint answers for
         // reports at least one window.
-        return ClaudeOAuthUsageOutcome {
-            result: Ok(usage),
-            diagnostics: record_claude_oauth_usage_failure_with_legacy(
-                ClaudeOAuthUsageFailure::ResponseShape,
-                account_identifier_hash,
-                organization_identifier_hash,
-                &config_fingerprint,
-                now,
-                mirror_legacy_default,
-            ),
+        Err(usage) => {
+            return ClaudeOAuthUsageOutcome {
+                result: Ok(usage),
+                diagnostics: record_claude_oauth_usage_failure_with_legacy(
+                    ClaudeOAuthUsageFailure::ResponseShape,
+                    account_identifier_hash,
+                    organization_identifier_hash,
+                    &config_fingerprint,
+                    now,
+                    mirror_legacy_default,
+                ),
+            }
+            .with_check_outcome(
+                "claude_oauth_usage_check_failed",
+                "The latest Claude OAuth response contained no supported quota windows.",
+                current_unix_seconds(),
+            )
         }
-        .with_check_outcome(
-            "claude_oauth_usage_check_failed",
-            "The latest Claude OAuth response contained no supported quota windows.",
-            current_unix_seconds(),
-        );
-    }
-    claude_oauth_stamp_account_identity(
-        &mut usage,
-        account_identifier_hash,
-        Some(organization_identifier_hash),
-    );
-    // This is the local successful response time, never a provider-supplied
-    // timestamp. Cache reuse preserves it rather than stamping a later upload.
-    let observed_at_epoch_seconds = current_unix_seconds();
-    let observed_at = rfc3339_from_unix_seconds(observed_at_epoch_seconds);
-    for window in &mut usage.windows {
-        window.observed_at = observed_at.clone();
-    }
-    let cache = ClaudeOAuthUsageCache {
-        schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
-        account_identifier_hash: account_identifier_hash.to_string(),
-        organization_identifier_hash: organization_identifier_hash.to_string(),
-        observed_at_epoch_seconds,
-        next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
-        windows: usage.windows.clone(),
-        credit_balances: usage.credit_balances.clone(),
     };
-    let _ = write_claude_oauth_usage_cache(&cache);
-    if mirror_legacy_default {
-        let _ = write_legacy_claude_oauth_usage_cache(&cache);
-    }
     // One clean answer clears the accumulated failure counters: the thresholds
     // below are about *consecutive* failures. Another caller's own auth
     // streak survives: this answer says nothing about that credential.
@@ -9997,6 +10053,193 @@ fn collect_claude_oauth_usage_unstamped(
         "claude_oauth_usage_check_succeeded",
         "A supported Claude OAuth quota response was collected successfully.",
         current_unix_seconds(),
+    )
+}
+
+/// One usable OAuth usage body: a provider response, or a passive reading
+/// Claude Code made for the same binding.
+struct ClaudeOAuthReading<'a> {
+    account_identifier_hash: &'a str,
+    organization_identifier_hash: &'a str,
+    body: &'a Value,
+    read: claude_credit_pools::ClaudeUsageRead,
+    /// When the body was read: the local response time, or the passive
+    /// reading's own fetch time.
+    observed_at_epoch_seconds: u64,
+    previous_credit_balances: &'a [AgentCreditBalance],
+    latest_activity_at: Option<u64>,
+    now: u64,
+    mirror_legacy_default: bool,
+}
+
+/// Parse, merge and store one reading. `Err` carries the unstored parse when
+/// the body has no supported quota window (a shape change).
+fn claude_oauth_usage_record_reading(
+    reading: ClaudeOAuthReading<'_>,
+    read_schedule: &mut claude_credit_pools::ClaudeReadSchedule,
+) -> Result<ClaudeOAuthUsage, ClaudeOAuthUsage> {
+    let observed_at = rfc3339_from_unix_seconds(reading.observed_at_epoch_seconds);
+    let mut usage = ClaudeOAuthUsage {
+        windows: claude_oauth_quota_windows(reading.body),
+        credit_balances: Vec::new(),
+    };
+    let Some(observed_at) = observed_at.filter(|_| !usage.windows.is_empty()) else {
+        usage.credit_balances = claude_oauth_credit_balances(reading.body);
+        return Err(usage);
+    };
+    let credit_read =
+        claude_credit_pools::claude_credit_read(reading.body, reading.read, &observed_at);
+    if !credit_read.diagnostics.is_empty() {
+        // Field paths only, never values.
+        let fields = credit_read
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("{}:{}", diagnostic.code, diagnostic.field))
+            .collect::<BTreeSet<_>>();
+        eprintln!(
+            "claude_status credit_fields_refused fields={}",
+            fields.into_iter().collect::<Vec<_>>().join(",")
+        );
+    }
+    usage.credit_balances = claude_credit_pools::claude_merge_credit_sections(
+        &claude_oauth_binding_key(
+            reading.account_identifier_hash,
+            reading.organization_identifier_hash,
+        ),
+        reading.previous_credit_balances,
+        &credit_read,
+    );
+    claude_oauth_stamp_account_identity(
+        &mut usage,
+        reading.account_identifier_hash,
+        Some(reading.organization_identifier_hash),
+    );
+    for window in &mut usage.windows {
+        window.observed_at = Some(observed_at.clone());
+    }
+    let cache = ClaudeOAuthUsageCache {
+        schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+        account_identifier_hash: reading.account_identifier_hash.to_string(),
+        organization_identifier_hash: reading.organization_identifier_hash.to_string(),
+        observed_at_epoch_seconds: reading.observed_at_epoch_seconds,
+        next_refresh_after_epoch_seconds: reading.now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
+        windows: usage.windows.clone(),
+        credit_balances: usage.credit_balances.clone(),
+    };
+    let _ = write_claude_oauth_usage_cache(&cache);
+    if reading.mirror_legacy_default {
+        let _ = write_legacy_claude_oauth_usage_cache(&cache);
+    }
+    read_schedule.after_reading(
+        reading.read,
+        reading.observed_at_epoch_seconds,
+        reading.latest_activity_at,
+        reading.now,
+    );
+    let _ = claude_credit_pools::write_claude_read_schedule(
+        &claude_oauth_usage_account_state_dir(
+            reading.account_identifier_hash,
+            reading.organization_identifier_hash,
+        ),
+        read_schedule,
+    );
+    Ok(usage)
+}
+
+/// The Claude Code config file of this caller's own login, whose passive
+/// reading may stand in for a call.
+fn claude_oauth_caller_identity_path(caller: &ClaudeOAuthUsageCaller) -> Option<PathBuf> {
+    match caller {
+        ClaudeOAuthUsageCaller::Default | ClaudeOAuthUsageCaller::DefaultDeferredToSlot => {
+            Some(claude_cli_config_path())
+        }
+        ClaudeOAuthUsageCaller::RegisteredSlot(slot_id) => {
+            let registry = FileClaudeConfigSlotSettingsStore::default().load().ok()?;
+            registry
+                .managed_slots
+                .iter()
+                .chain(registry.external_slots.iter())
+                .find(|descriptor| &descriptor.slot_id == slot_id)
+                .and_then(claude_config_slot_for_descriptor)
+                .map(|slot| slot.identity_path(&home_dir()))
+        }
+    }
+}
+
+/// Claude Code's own plain usage reading for exactly this binding, if its
+/// config holds one. Reads only `cachedUsageUtilization` and `oauthAccount`.
+fn claude_oauth_passive_usage(
+    caller: &ClaudeOAuthUsageCaller,
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> Option<claude_credit_pools::ClaudePassiveUsage> {
+    let body = fs::read(claude_oauth_caller_identity_path(caller)?).ok()?;
+    let config = serde_json::from_slice::<Value>(&body).ok()?;
+    claude_credit_pools::claude_passive_usage(
+        &config,
+        account_identifier_hash,
+        organization_identifier_hash,
+    )
+}
+
+/// Latest Claude session activity for this exact binding, from the daemon's
+/// active-session scan.
+fn claude_oauth_latest_activity_at(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> Option<u64> {
+    let reconciliation = crate::active_sessions::read_active_session_reconciliation(
+        &default_support_dir(),
+        crate::snapshots::SnapshotSource::ClaudeCode,
+    );
+    claude_credit_pools::claude_latest_activity_at(
+        reconciliation.as_ref(),
+        account_identifier_hash,
+        organization_identifier_hash,
+    )
+}
+
+/// The binding's read slot: active, default (the jittered gate below) or idle.
+fn claude_oauth_usage_slot_seconds(
+    read_schedule: &claude_credit_pools::ClaudeReadSchedule,
+    latest_activity_at: Option<u64>,
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: u64,
+) -> u64 {
+    claude_credit_pools::claude_usage_slot_seconds(
+        read_schedule,
+        latest_activity_at,
+        claude_oauth_usage_fresh_age_seconds(account_identifier_hash, organization_identifier_hash),
+        claude_credit_pools::claude_idle_slot_seconds(
+            account_identifier_hash,
+            organization_identifier_hash,
+        ),
+        now,
+    )
+}
+
+/// How old a stored reading may be and still be labelled fresh: never less
+/// than the default gate, and the full slot while an idle account waits for
+/// its next read.
+fn claude_oauth_usage_serve_gate_seconds(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: u64,
+) -> u64 {
+    let read_schedule =
+        claude_credit_pools::read_claude_read_schedule(&claude_oauth_usage_account_state_dir(
+            account_identifier_hash,
+            organization_identifier_hash,
+        ));
+    claude_oauth_usage_fresh_age_seconds(account_identifier_hash, organization_identifier_hash).max(
+        claude_oauth_usage_slot_seconds(
+            &read_schedule,
+            claude_oauth_latest_activity_at(account_identifier_hash, organization_identifier_hash),
+            account_identifier_hash,
+            organization_identifier_hash,
+            now,
+        ),
     )
 }
 
@@ -11537,7 +11780,9 @@ fn claude_oauth_spend_credit_balance(spend: Option<&Value>) -> Option<AgentCredi
     let spend = spend?;
     let enabled = spend.get("enabled").and_then(Value::as_bool)?;
     if !enabled {
-        return Some(claude_disabled_usage_credit_balance());
+        return Some(claude_disabled_usage_credit_balance(
+            claude_credit_pools::claude_usage_credits_disabled_reason(spend),
+        ));
     }
     let used = claude_oauth_money_cents(spend.get("used"));
     let quota = claude_oauth_money_cents(spend.get("cap"))
@@ -11555,7 +11800,7 @@ fn claude_oauth_spend_credit_balance(spend: Option<&Value>) -> Option<AgentCredi
     });
     let severity = spend.get("severity").and_then(Value::as_str).unwrap_or("");
     Some(AgentCreditBalance {
-        name: "Usage credits".to_string(),
+        name: claude_credit_pools::CLAUDE_USAGE_CREDITS_NAME.to_string(),
         status: if used.is_none() && quota.is_none() && remaining.is_none() {
             AgentCreditBalanceStatus::Unknown
         } else {
@@ -11571,6 +11816,7 @@ fn claude_oauth_spend_credit_balance(spend: Option<&Value>) -> Option<AgentCredi
         resets_at: json_timestamp_rfc3339(spend, &["resets_at", "reset_at"]),
         used_percent,
         enabled: Some(true),
+        kind: Some(CreditBalanceKind::UsageCredits),
         ..Default::default()
     })
 }
@@ -11579,8 +11825,15 @@ fn claude_oauth_extra_usage_credit_balance(extra: Option<&Value>) -> Option<Agen
     let extra = extra?;
     let enabled = extra.get("is_enabled").and_then(Value::as_bool)?;
     if !enabled {
-        return Some(claude_disabled_usage_credit_balance());
+        return Some(claude_disabled_usage_credit_balance(
+            claude_credit_pools::claude_usage_credits_disabled_reason(extra),
+        ));
     }
+    // Latent, deliberately untouched: real `extra_usage` bare numbers are minor
+    // units (`monthly_limit 1000` beside `spend.limit.amount_minor 1000`,
+    // `decimal_places: 2`), so this fallback would read them x100. It is never
+    // reached on observed data: every plain body since July 2026 carries
+    // `spend`, which wins above.
     let quota = claude_oauth_money_cents(extra.get("monthly_limit"));
     let used = claude_oauth_money_cents(extra.get("used_credits"));
     let remaining = match (quota, used) {
@@ -11592,7 +11845,7 @@ fn claude_oauth_extra_usage_credit_balance(extra: Option<&Value>) -> Option<Agen
     let unlimited = extra.get("monthly_limit").is_some_and(Value::is_null);
     let used_percent = json_u8(extra, &["utilization"]);
     Some(AgentCreditBalance {
-        name: "Usage credits".to_string(),
+        name: claude_credit_pools::CLAUDE_USAGE_CREDITS_NAME.to_string(),
         status: if unlimited {
             AgentCreditBalanceStatus::Unlimited
         } else {
@@ -11608,17 +11861,20 @@ fn claude_oauth_extra_usage_credit_balance(extra: Option<&Value>) -> Option<Agen
         used_percent,
         enabled: Some(true),
         unlimited: unlimited.then_some(true),
+        kind: Some(CreditBalanceKind::UsageCredits),
         ..Default::default()
     })
 }
 
-fn claude_disabled_usage_credit_balance() -> AgentCreditBalance {
+fn claude_disabled_usage_credit_balance(disabled_reason: Option<String>) -> AgentCreditBalance {
     AgentCreditBalance {
-        name: "Usage credits".to_string(),
+        name: claude_credit_pools::CLAUDE_USAGE_CREDITS_NAME.to_string(),
         status: AgentCreditBalanceStatus::Unknown,
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Usd,
         enabled: Some(false),
+        disabled_reason,
+        kind: Some(CreditBalanceKind::UsageCredits),
         ..Default::default()
     }
 }
@@ -11743,12 +11999,14 @@ fn claude_oauth_quota_window(
 
 fn claude_oauth_usage_from_cache(cache: ClaudeOAuthUsageCache, now: u64) -> ClaudeOAuthUsage {
     let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
-    // Same jittered gate the refresh decision uses, seeded from the account the
-    // cache belongs to: a payload served as fresh must not be labelled stale.
+    // The refresh slot, seeded from the account the cache belongs to: a
+    // payload served as fresh must not be labelled stale. A shorter active
+    // slot never labels a reading stale sooner than the default gate.
     let cache_is_stale = cache_age
-        > claude_oauth_usage_fresh_age_seconds(
+        > claude_oauth_usage_serve_gate_seconds(
             &cache.account_identifier_hash,
             &cache.organization_identifier_hash,
+            now,
         );
     let observed_at = rfc3339_from_unix_seconds(cache.observed_at_epoch_seconds);
     ClaudeOAuthUsage {
