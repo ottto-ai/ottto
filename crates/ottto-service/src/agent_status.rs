@@ -3890,7 +3890,10 @@ fn collect_claude_status_snapshots(
     }
 
     let mut slot_states = BTreeMap::new();
-    let mut default_state = claude_default_slot_collection_status(&default_snapshot);
+    let mut default_state = prepare_default_claude_slot_status(
+        &mut default_snapshot,
+        crate::command_env::claude_default_login_executable_path(&home_dir()).is_some(),
+    );
     if let Some(warning) = default_snapshot
         .diagnostics
         .iter()
@@ -7618,6 +7621,25 @@ fn upkeep_state_diagnostic(
             "Claude Code background upkeep did not prove that this expired credential advanced; cached readings remain honestly stale.",
         ),
     }
+}
+
+/// Classify before suppressing display warnings: these diagnostics also carry
+/// the internal failure state, including transient unreadable credentials.
+/// Desktop authenticates its own Code sessions; its bundled binary alone does
+/// not make an unusable default login actionable. Registered slots never pass
+/// through this default-only display preparation.
+fn prepare_default_claude_slot_status(
+    snapshot: &mut AgentStatusSnapshot,
+    claude_cli_installed: bool,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    let status = claude_default_slot_collection_status(snapshot);
+    if !claude_cli_installed {
+        snapshot.diagnostics.retain(|diagnostic| {
+            diagnostic.code != ClaudeSlotProbeFailure::CredentialUnavailable.diagnostic_code()
+                && diagnostic.code != ClaudeSlotProbeFailure::ProbeFailed.diagnostic_code()
+        });
+    }
+    status
 }
 
 fn default_claude_identity_diagnostic(failure: ClaudeSlotProbeFailure) -> AgentStatusDiagnostic {
@@ -23163,6 +23185,85 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn default_unusable_login_display_preserves_classification_with_or_without_cli() {
+        use ClaudeLocalLoginState as State;
+        for state in [
+            State::SignedOutByCli,
+            State::NeedsLogin,
+            State::NotSignedIn,
+            State::Unreadable,
+            State::AccessValid,
+            State::RefreshPending,
+        ] {
+            let failure = match state {
+                State::Unreadable => Some(ClaudeSlotProbeFailure::ProbeFailed),
+                State::SignedOutByCli | State::NeedsLogin | State::NotSignedIn => {
+                    Some(ClaudeSlotProbeFailure::CredentialUnavailable)
+                }
+                State::AccessValid | State::RefreshPending => None,
+            };
+            let mut snapshot = base_snapshot(
+                SourceKind::ClaudeCode,
+                AgentStatusState::Degraded,
+                AgentStatusCollectionMethod::CommandProbe,
+                "2026-10-09T06:00:00Z".to_string(),
+                "2026-10-09T06:15:00Z".to_string(),
+            );
+            snapshot.account = Some(unsupported_account("anthropic"));
+            if let Some(failure) = failure {
+                snapshot
+                    .diagnostics
+                    .push(default_claude_identity_diagnostic(failure));
+            }
+            // Other diagnostics must survive the display filtering.
+            snapshot
+                .diagnostics
+                .push(default_claude_identity_diagnostic(
+                    ClaudeSlotProbeFailure::IdentityUnknown,
+                ));
+            let expected = claude_default_slot_collection_status(&snapshot);
+            for cli in [false, true] {
+                let mut display = snapshot.clone();
+                let status = prepare_default_claude_slot_status(&mut display, cli);
+                assert_eq!(
+                    serde_json::to_value(&status).unwrap(),
+                    serde_json::to_value(&expected).unwrap(),
+                    "{state:?}, cli={cli}"
+                );
+                assert_eq!(
+                    serde_json::to_value(&display.account).unwrap(),
+                    serde_json::to_value(&snapshot.account).unwrap()
+                );
+                assert!(display
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code == ClaudeSlotProbeFailure::IdentityUnknown.diagnostic_code()));
+                if let Some(failure) = failure {
+                    assert_eq!(
+                        display
+                            .diagnostics
+                            .iter()
+                            .any(|d| d.code == failure.diagnostic_code()),
+                        cli
+                    );
+                    if state == State::Unreadable {
+                        // A previously verified default retains its binding; this
+                        // must still be temporary failure, never a sign-in demand.
+                        let mut bound = status;
+                        bound.account_identifier_hash = Some("fixture-account".to_string());
+                        bound.organization_identifier_hash = Some("fixture-org".to_string());
+                        assert_eq!(bound.state, ClaudeConfigSlotCollectionStateV1::ProbeFailed);
+                        assert_eq!(
+                            projected_claude_quota_access_state(&bound),
+                            Some(ClaudeQuotaAccessState::TemporarilyUnavailable)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     #[serial]
     fn cli_cleared_credential_is_signed_out_without_any_spawn_until_rewritten() {
         let fixture = LocalSlotFixture::new("cli-cleared", SECURITY_ITEM_NOT_FOUND);
@@ -23182,6 +23283,8 @@ for line in sys.stdin:
                 "subscriptionType": "max"
             }
         }));
+        fs::remove_file(fixture.root.join("bin/claude")).expect("remove fixture CLI");
+        assert!(crate::command_env::claude_default_login_executable_path(&home_dir()).is_none());
         let descriptor = fixture.descriptor.clone();
 
         let failure = resolve_registered_claude_slot(descriptor.clone())

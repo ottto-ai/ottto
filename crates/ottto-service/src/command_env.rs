@@ -49,6 +49,32 @@ pub(crate) fn claude_executable_path(effective_home: &Path) -> Option<PathBuf> {
         .find(|candidate| is_absolute_executable(candidate))
 }
 
+/// Resolve a CLI that can consume the default login, without automatically
+/// discovering Desktop's private bundle. Keep the launchd-safe native/npm
+/// prefixes: absence from the service PATH alone does not mean absent CLI.
+pub(crate) fn claude_default_login_executable_path(effective_home: &Path) -> Option<PathBuf> {
+    let (path_var, home, include_default_dirs) = match env::var_os(COMMAND_SEARCH_PATH_ENV) {
+        Some(path_var) => (Some(path_var), None, false),
+        None => (
+            env::var_os("PATH"),
+            Some(effective_home.as_os_str().to_os_string()),
+            true,
+        ),
+    };
+    claude_default_login_executable_from(path_var, home, include_default_dirs)
+}
+
+fn claude_default_login_executable_from(
+    path_var: Option<OsString>,
+    home: Option<OsString>,
+    include_default_dirs: bool,
+) -> Option<PathBuf> {
+    executable_search_dirs_from(path_var, home, include_default_dirs)
+        .into_iter()
+        .map(|dir| dir.join("claude"))
+        .find(|candidate| is_absolute_executable(candidate))
+}
+
 pub(crate) fn claude_path_env(effective_home: &Path) -> Option<OsString> {
     env::join_paths(claude_search_dirs(effective_home)).ok()
 }
@@ -554,6 +580,57 @@ mod tests {
         assert!(local_bin_pos < new_pos.expect("new pos"));
 
         fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn default_login_resolver_ignores_desktop_fallback_but_finds_off_path_cli() {
+        let home = scratch_home("default-login-cli");
+        let desktop_bin = home.join(
+            "Library/Application Support/Claude/claude-code/2.1.202/claude.app/Contents/MacOS",
+        );
+        fs::create_dir_all(&desktop_bin).expect("desktop bin");
+        let desktop_cli = desktop_bin.join("claude");
+        fs::write(&desktop_cli, "#!/bin/sh\n").expect("desktop cli");
+        fs::set_permissions(&desktop_cli, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let resolve = || {
+            claude_default_login_executable_from(
+                Some(home.join("service-bin").into_os_string()),
+                Some(home.as_os_str().to_os_string()),
+                false,
+            )
+        };
+        assert_eq!(
+            resolve(),
+            None,
+            "Desktop's bundled CLI does not require default login"
+        );
+        assert!(claude_desktop_vendored_bin_dirs(&home).contains(&desktop_bin));
+        for prefix in [
+            ".local/bin",
+            ".npm-global/bin",
+            ".nvm/versions/node/v22.19.0/bin",
+            ".claude/local",
+        ] {
+            let bin = home.join(prefix);
+            fs::create_dir_all(&bin).expect("cli prefix");
+            let cli = bin.join("claude");
+            symlink(&desktop_cli, &cli).expect("executable shim");
+            assert_eq!(resolve(), Some(cli.clone()), "off-PATH {prefix}");
+            fs::remove_file(&cli).expect("remove shim");
+            fs::write(&cli, "non executable").expect("write inert file");
+            assert_eq!(resolve(), None, "inert {prefix} file is not a CLI");
+            fs::remove_file(cli).expect("remove inert file");
+        }
+        // An explicit search override is authoritative and may point at a bundle.
+        assert_eq!(
+            claude_default_login_executable_from(Some(desktop_bin.into_os_string()), None, false),
+            Some(desktop_cli),
+        );
+        assert_eq!(
+            claude_default_login_executable_from(Some(OsString::from("relative")), None, false),
+            None,
+        );
+        fs::remove_dir_all(home).expect("cleanup");
     }
 
     #[test]
