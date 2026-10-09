@@ -7,6 +7,7 @@
 //! the Claude read cadence (design R7, Ron Q1/Q3). Grant building, summaries,
 //! the one-time pool shape and section re-send stay in the model.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use ottto_protocol::{
@@ -422,6 +423,11 @@ pub(super) struct ClaudeReadSchedule {
     /// active. Never counts as activity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) tracked_since: Option<u64>,
+    /// Per caller (opaque caller key): since when every check of that caller's
+    /// Claude Code config found it signed in to exactly this binding. Cleared
+    /// as soon as a check finds anything else.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) config_bound_since: BTreeMap<String, u64>,
 }
 
 impl ClaudeReadSchedule {
@@ -449,6 +455,30 @@ impl ClaudeReadSchedule {
 
     fn activity_at(&self, latest_activity_at: Option<u64>) -> Option<u64> {
         self.last_activity_at.max(latest_activity_at)
+    }
+
+    /// Keep the newest activity the scan reported. The scan lists a session
+    /// only while its activity advances, so a sighting must be kept even when
+    /// no reading is due. Returns whether anything changed.
+    pub(super) fn observe_activity(&mut self, latest_activity_at: Option<u64>) -> bool {
+        let activity = self.activity_at(latest_activity_at);
+        let changed = activity != self.last_activity_at;
+        self.last_activity_at = activity;
+        changed
+    }
+
+    /// Record one check of a caller's Claude Code config. Returns whether
+    /// anything changed.
+    pub(super) fn observe_config(&mut self, caller_key: &str, bound: bool, now: u64) -> bool {
+        if bound {
+            if self.config_bound_since.contains_key(caller_key) {
+                return false;
+            }
+            self.config_bound_since.insert(caller_key.to_string(), now);
+            true
+        } else {
+            self.config_bound_since.remove(caller_key).is_some()
+        }
     }
 }
 
@@ -583,26 +613,46 @@ pub(super) struct ClaudePassiveUsage {
     pub(super) body: Value,
 }
 
-/// The passive reading in a Claude Code `.claude.json`, only when it is
-/// provably this binding's: `cachedUsageUtilization.accountUuid` hashes to the
-/// binding's account, and the config's own `oauthAccount` names that same
-/// account under the binding's organization (the cache itself has no org).
-pub(super) fn claude_passive_usage(
+/// One check of a Claude Code `.claude.json` against a binding.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(super) struct ClaudePassiveConfig {
+    /// `oauthAccount` names exactly the binding's account and organization.
+    pub(super) bound: bool,
+    /// The passive reading, only when the config is bound and
+    /// `cachedUsageUtilization.accountUuid` is that same account.
+    pub(super) reading: Option<ClaudePassiveUsage>,
+}
+
+/// Check a Claude Code `.claude.json` against a binding. Reads only
+/// `oauthAccount` and `cachedUsageUtilization`.
+pub(super) fn claude_passive_config(
     config: &Value,
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
-) -> Option<ClaudePassiveUsage> {
-    let cached = config.get("cachedUsageUtilization")?;
-    let account_uuid = cached.get("accountUuid")?.as_str()?;
-    let oauth = config.get("oauthAccount")?;
-    let organization_uuid = oauth.get("organizationUuid")?.as_str()?;
-    if oauth.get("accountUuid")?.as_str()? != account_uuid
-        || ottto_core::billing_identity_hash("anthropic", "account", account_uuid).as_deref()
-            != Some(account_identifier_hash)
-        || ottto_core::billing_identity_hash("anthropic", "organization", organization_uuid)
+) -> ClaudePassiveConfig {
+    let Some((account_uuid, bound)) = config.get("oauthAccount").and_then(|oauth| {
+        let account_uuid = oauth.get("accountUuid")?.as_str()?;
+        let organization_uuid = oauth.get("organizationUuid")?.as_str()?;
+        let bound = ottto_core::billing_identity_hash("anthropic", "account", account_uuid)
             .as_deref()
-            != Some(organization_identifier_hash)
-    {
+            == Some(account_identifier_hash)
+            && ottto_core::billing_identity_hash("anthropic", "organization", organization_uuid)
+                .as_deref()
+                == Some(organization_identifier_hash);
+        Some((account_uuid, bound))
+    }) else {
+        return ClaudePassiveConfig::default();
+    };
+    ClaudePassiveConfig {
+        bound,
+        reading: bound
+            .then(|| claude_passive_reading(config.get("cachedUsageUtilization")?, account_uuid))
+            .flatten(),
+    }
+}
+
+fn claude_passive_reading(cached: &Value, account_uuid: &str) -> Option<ClaudePassiveUsage> {
+    if cached.get("accountUuid")?.as_str()? != account_uuid {
         return None;
     }
     let fetched = cached.get("fetchedAtMs")?;
@@ -620,14 +670,22 @@ pub(super) fn claude_passive_usage(
 }
 
 /// Use the passive reading instead of a call when it is newer than our last
-/// reading and still inside the slot (so it would serve as fresh).
+/// reading, still inside the slot (so it would serve as fresh), and fetched
+/// while the config was already known to be signed in to this binding.
+///
+/// The cached body carries no organization, so the organization is proved by
+/// bracketing: an earlier check (`config_bound_since`) and the current one
+/// both found this exact account and organization, with no other sign-in seen
+/// in between. A first sighting never adopts an older body.
 pub(super) fn claude_passive_reading_usable(
     fetched_at: u64,
     last_reading_at: Option<u64>,
+    config_bound_since: Option<u64>,
     slot_seconds: u64,
     now: u64,
 ) -> bool {
-    fetched_at <= now.saturating_add(PASSIVE_CLOCK_SKEW_SECONDS)
+    config_bound_since.is_some_and(|since| since <= fetched_at)
+        && fetched_at <= now.saturating_add(PASSIVE_CLOCK_SKEW_SECONDS)
         && last_reading_at.map_or(true, |last| fetched_at > last)
         && now.saturating_sub(fetched_at) <= slot_seconds
 }
@@ -1121,12 +1179,13 @@ mod tests {
     #[test]
     fn passive_reading_is_used_only_for_the_exact_binding() {
         let (account, org) = hashes("acct-1", "org-1");
-        let passive = claude_passive_usage(
+        let config = claude_passive_config(
             &passive_config("acct-1", "acct-1", "org-1", 1_791_000_000_500),
             &account,
             &org,
-        )
-        .expect("matching binding");
+        );
+        assert!(config.bound);
+        let passive = config.reading.expect("matching binding");
         assert_eq!(passive.fetched_at, 1_791_000_000);
         // Same plain-body parser: the passive body yields the same pools.
         let read = claude_credit_read(&passive.body, ClaudeUsageRead::Plain, READ_AT);
@@ -1134,30 +1193,110 @@ mod tests {
             read.one_time_credits.unwrap()[0].limit_id.as_deref(),
             Some("iguana_necktie")
         );
+        // Signed in to this binding, but the cached body is another account's.
+        let other_cache = claude_passive_config(
+            &passive_config("acct-2", "acct-1", "org-1", 1),
+            &account,
+            &org,
+        );
+        assert!(other_cache.bound && other_cache.reading.is_none());
+        let no_cache = claude_passive_config(
+            &json!({"oauthAccount": {"accountUuid": "acct-1", "organizationUuid": "org-1"}}),
+            &account,
+            &org,
+        );
+        assert!(no_cache.bound && no_cache.reading.is_none());
+        // Signed in to another account or organization, or not at all.
         for config in [
-            passive_config("acct-2", "acct-1", "org-1", 1),
             passive_config("acct-1", "acct-2", "org-1", 1),
             passive_config("acct-1", "acct-1", "org-2", 1),
-            json!({"oauthAccount": {"accountUuid": "acct-1", "organizationUuid": "org-1"}}),
+            json!({"cachedUsageUtilization": {"fetchedAtMs": 1, "accountUuid": "acct-1",
+                                              "utilization": {}}}),
         ] {
-            assert_eq!(claude_passive_usage(&config, &account, &org), None);
+            assert_eq!(
+                claude_passive_config(&config, &account, &org),
+                ClaudePassiveConfig::default()
+            );
         }
         // Newer than our reading and inside the slot, else a call is made.
+        let since = Some(0);
         assert!(claude_passive_reading_usable(
             1_000,
             Some(900),
+            since,
             3_600,
             1_100
         ));
-        assert!(claude_passive_reading_usable(1_000, None, 3_600, 1_100));
-        assert!(!claude_passive_reading_usable(900, Some(900), 3_600, 1_100));
+        assert!(claude_passive_reading_usable(
+            1_000, None, since, 3_600, 1_100
+        ));
+        assert!(!claude_passive_reading_usable(
+            900,
+            Some(900),
+            since,
+            3_600,
+            1_100
+        ));
         assert!(!claude_passive_reading_usable(
             1_000,
             Some(900),
+            since,
             3_600,
             5_000
         ));
-        assert!(!claude_passive_reading_usable(2_000, None, 3_600, 1_000));
+        assert!(!claude_passive_reading_usable(
+            2_000, None, since, 3_600, 1_000
+        ));
+    }
+
+    /// The cached body has no organization: it is adopted only when an
+    /// earlier check and the current one both found the config signed in to
+    /// this exact binding, so a body fetched under another organization of the
+    /// same account is never stamped with this one.
+    #[test]
+    fn passive_reading_needs_the_config_bound_before_its_fetch() {
+        let mut schedule = ClaudeReadSchedule::default();
+        // First sighting: nothing earlier proves the organization.
+        let since = schedule.config_bound_since.get("caller").copied();
+        assert!(!claude_passive_reading_usable(
+            1_000, None, since, 3_600, 1_100
+        ));
+        assert!(schedule.observe_config("caller", true, 1_100));
+        assert!(!schedule.observe_config("caller", true, 1_200));
+        let since = schedule.config_bound_since.get("caller").copied();
+        assert_eq!(since, Some(1_100));
+        assert!(claude_passive_reading_usable(
+            1_150, None, since, 3_600, 1_300
+        ));
+        assert!(!claude_passive_reading_usable(
+            1_050, None, since, 3_600, 1_300
+        ));
+        // Switched to another organization: the bracket closes; after
+        // switching back, a body fetched in between is never adopted.
+        assert!(schedule.observe_config("caller", false, 1_400));
+        assert!(schedule.observe_config("caller", true, 1_500));
+        let since = schedule.config_bound_since.get("caller").copied();
+        assert!(!claude_passive_reading_usable(
+            1_450, None, since, 3_600, 1_600
+        ));
+        // Brackets are per caller and survive a restart.
+        assert_eq!(schedule.config_bound_since.get("other"), None);
+        let restored: ClaudeReadSchedule =
+            serde_json::from_slice(&serde_json::to_vec(&schedule).unwrap()).unwrap();
+        assert_eq!(restored, schedule);
+    }
+
+    #[test]
+    fn activity_sighting_is_kept_after_the_scan_drops_it() {
+        let mut schedule = ClaudeReadSchedule::default();
+        assert!(schedule.observe_activity(Some(1_000)));
+        assert!(!schedule.observe_activity(None));
+        assert!(!schedule.observe_activity(Some(900)));
+        assert_eq!(schedule.last_activity_at, Some(1_000));
+        let slot = |now| claude_usage_slot_seconds(&schedule, None, 3_600, 7_200, now);
+        assert_eq!(slot(1_000 + 20 * 60), ACTIVE_SLOT_SECONDS);
+        assert_eq!(slot(1_000 + 31 * 60), 3_600);
+        assert_eq!(slot(1_000 + 6 * 3_600 + 1), 7_200);
     }
 
     #[test]
@@ -1216,6 +1355,8 @@ mod tests {
         passive_used: Vec<u64>,
     }
 
+    const SIM_CALLER: &str = "caller";
+
     impl Simulation {
         fn new(usage_credits_off: bool) -> Self {
             Self {
@@ -1229,14 +1370,17 @@ mod tests {
         }
 
         fn tick(&mut self, now: u64, activity: Option<u64>, passive_fetched_at: Option<u64>) {
+            self.schedule.observe_activity(activity);
             let idle = claude_idle_slot_seconds("account-sim", "org-sim");
             let slot = claude_usage_slot_seconds(&self.schedule, activity, DEFAULT_SLOT, idle, now);
             if !claude_reading_due(self.last_reading_at, self.next_refresh_after, slot, now) {
                 return;
             }
-            if let Some(fetched) = passive_fetched_at
-                .filter(|at| claude_passive_reading_usable(*at, self.last_reading_at, slot, now))
-            {
+            let since = self.schedule.config_bound_since.get(SIM_CALLER).copied();
+            self.schedule.observe_config(SIM_CALLER, true, now);
+            if let Some(fetched) = passive_fetched_at.filter(|at| {
+                claude_passive_reading_usable(*at, self.last_reading_at, since, slot, now)
+            }) {
                 self.passive_used.push(now);
                 self.record(ClaudeUsageRead::Plain, fetched, activity, now);
                 return;
@@ -1253,19 +1397,15 @@ mod tests {
         }
     }
 
-    /// 24 h: idle start, active 08:00-10:00, idle again; activity is visible
-    /// only while the active-session scan still lists it (15 min).
+    /// 24 h: idle start, active 08:00-10:00, idle again. Like the
+    /// active-session scan, activity is reported only while it advances.
     fn run_day(usage_credits_off: bool, passive: &dyn Fn(u64) -> Option<u64>) -> Simulation {
         let start = 1_791_000_000;
         let mut simulation = Simulation::new(usage_credits_off);
-        let mut last_activity = None;
         let mut now = start;
         while now < start + 24 * HOUR {
             let hour = (now - start) / HOUR;
-            if (8..10).contains(&hour) {
-                last_activity = Some(now);
-            }
-            let visible = last_activity.filter(|at| now - at <= 15 * 60);
+            let visible = (8..10).contains(&hour).then_some(now);
             simulation.tick(
                 now,
                 visible,
@@ -1307,6 +1447,12 @@ mod tests {
         let active = gaps_in(8 * HOUR + 15 * 60, 10 * HOUR);
         assert!(active.len() >= 6);
         assert!(active.iter().all(|gap| (15 * 60..=17 * 60).contains(gap)));
+        // The active slot holds for 30 min after the last activity, although
+        // the scan stopped listing it.
+        assert!(calls.iter().any(|(at, _, slot)| {
+            (start + 10 * HOUR + 15 * 60..=start + 10 * HOUR + 30 * 60).contains(at)
+                && *slot == ACTIVE_SLOT_SECONDS
+        }));
         // Idle more than 6 h (06:00-08:00 and after 16:30): 2-3 h slots.
         let idle = gaps_in(17 * HOUR, 24 * HOUR);
         assert!(!idle.is_empty());
@@ -1370,9 +1516,7 @@ mod tests {
     fn saved_reset_variant_disabled_keeps_every_read_plain() {
         let schedule = ClaudeReadSchedule {
             last_plain_read_at: Some(1),
-            last_saved_resets_read_at: None,
-            last_activity_at: None,
-            tracked_since: None,
+            ..ClaudeReadSchedule::default()
         };
         assert_eq!(
             claude_usage_read_kind(&schedule, false, CLAUDE_SAVED_RESETS_READ_ENABLED, 10),

@@ -50,11 +50,19 @@ extra calls:
   account (its `accountUuid` and the config's `oauthAccount` account and
   organization match the binding) is newer than the stored reading and inside
   the slot, it is parsed by the same plain-body parser and used without a
-  call;
+  call. The cached body has no organization, so it is adopted only when an
+  earlier check of that caller's config (recorded per caller) and the current
+  one both found this exact account and organization, with nothing else seen
+  in between, and the body was fetched after that earlier check. A first
+  sighting never adopts an older body. The residual gap is two organization
+  switches plus a Claude Code usage fetch between two of our checks;
 - the existing 5-minute post-success spacing, Retry-After handling, breaker and
   per-caller auth backoff are unchanged.
 
 Cadence state (`read-schedule.json`) lives next to each binding's usage cache.
+The active-session scan lists a session only while its activity advances, so
+each sighting is saved when seen, even on passes that serve the stored
+reading.
 A stored reading is labelled stale only after the larger of the default gate
 and the binding's slot.
 

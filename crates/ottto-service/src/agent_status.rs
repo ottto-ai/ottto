@@ -9634,6 +9634,11 @@ fn collect_claude_oauth_usage_unstamped(
     let mut read_schedule = claude_credit_pools::read_claude_read_schedule(&account_state_dir);
     let latest_activity_at =
         claude_oauth_latest_activity_at(account_identifier_hash, organization_identifier_hash);
+    // The scan lists a session only while its activity advances: keep every
+    // sighting, even when this pass serves the stored reading.
+    if read_schedule.observe_activity(latest_activity_at) {
+        let _ = claude_credit_pools::write_claude_read_schedule(&account_state_dir, &read_schedule);
+    }
     let slot_seconds = claude_oauth_usage_slot_seconds(
         &read_schedule,
         latest_activity_at,
@@ -9699,15 +9704,22 @@ fn collect_claude_oauth_usage_unstamped(
     // Passive input (Ron Q3): Claude Code's own plain reading for exactly this
     // binding, newer than ours and inside the slot, stands in for this slot's
     // call. Parsed by the same plain-body parser; no provider request.
-    if let Some(passive) = claude_oauth_passive_usage(
+    let passive_config = claude_oauth_passive_config(
         caller,
         account_identifier_hash,
         organization_identifier_hash,
-    )
-    .filter(|passive| {
+    );
+    let caller_key = caller.breaker_key();
+    // The bracket start from earlier checks only: this check closes it.
+    let config_bound_since = read_schedule.config_bound_since.get(&caller_key).copied();
+    if read_schedule.observe_config(&caller_key, passive_config.bound, now) {
+        let _ = claude_credit_pools::write_claude_read_schedule(&account_state_dir, &read_schedule);
+    }
+    if let Some(passive) = passive_config.reading.filter(|passive| {
         claude_credit_pools::claude_passive_reading_usable(
             passive.fetched_at,
             last_reading_at,
+            config_bound_since,
             slot_seconds,
             now,
         )
@@ -10166,20 +10178,25 @@ fn claude_oauth_caller_identity_path(caller: &ClaudeOAuthUsageCaller) -> Option<
     }
 }
 
-/// Claude Code's own plain usage reading for exactly this binding, if its
-/// config holds one. Reads only `cachedUsageUtilization` and `oauthAccount`.
-fn claude_oauth_passive_usage(
+/// This caller's Claude Code config checked against the binding. An
+/// unreadable config is not signed in to it. Reads only
+/// `cachedUsageUtilization` and `oauthAccount`.
+fn claude_oauth_passive_config(
     caller: &ClaudeOAuthUsageCaller,
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
-) -> Option<claude_credit_pools::ClaudePassiveUsage> {
-    let body = fs::read(claude_oauth_caller_identity_path(caller)?).ok()?;
-    let config = serde_json::from_slice::<Value>(&body).ok()?;
-    claude_credit_pools::claude_passive_usage(
-        &config,
-        account_identifier_hash,
-        organization_identifier_hash,
-    )
+) -> claude_credit_pools::ClaudePassiveConfig {
+    claude_oauth_caller_identity_path(caller)
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+        .map(|config| {
+            claude_credit_pools::claude_passive_config(
+                &config,
+                account_identifier_hash,
+                organization_identifier_hash,
+            )
+        })
+        .unwrap_or_default()
 }
 
 /// Latest Claude session activity for this exact binding, from the daemon's
