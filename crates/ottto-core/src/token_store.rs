@@ -384,6 +384,38 @@ fn keychain_delete(account: &'static str) -> Result<(), TokenStoreError> {
     }
 }
 
+/// Outcome of an already captured Security CLI deletion response.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+pub enum SecurityCliDeleteOutcome {
+    Removed,
+    Missing,
+    Failed(String),
+}
+
+/// Classifies output without launching a process or touching credential state.
+/// Process success takes precedence over missing-item diagnostics; failures keep
+/// the original stderr/stdout spelling and Security status formatting.
+#[cfg(target_os = "macos")]
+pub fn classify_security_cli_delete_output(
+    output: &std::process::Output,
+) -> SecurityCliDeleteOutcome {
+    if output.status.success() {
+        return SecurityCliDeleteOutcome::Removed;
+    }
+    if security_cli_delete_reports_missing(output.status.code(), &output.stderr) {
+        return SecurityCliDeleteOutcome::Missing;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    SecurityCliDeleteOutcome::Failed(if message.is_empty() {
+        format!("security exited with status {}", output.status)
+    } else {
+        message
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn keychain_delete_with_security_cli(account: &'static str) -> Result<(), String> {
     let output = std::process::Command::new("/usr/bin/security")
@@ -396,19 +428,10 @@ fn keychain_delete_with_security_cli(account: &'static str) -> Result<(), String
         ])
         .output()
         .map_err(|error| error.to_string())?;
-    if output.status.success()
-        || security_cli_delete_reports_missing(output.status.code(), &output.stderr)
-    {
-        return Ok(());
+    match classify_security_cli_delete_output(&output) {
+        SecurityCliDeleteOutcome::Removed | SecurityCliDeleteOutcome::Missing => Ok(()),
+        SecurityCliDeleteOutcome::Failed(message) => Err(message),
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let message = if stderr.is_empty() { stdout } else { stderr };
-    Err(if message.is_empty() {
-        format!("security exited with status {}", output.status)
-    } else {
-        message
-    })
 }
 
 #[cfg(target_os = "macos")]
@@ -498,6 +521,18 @@ pub fn write_owner_only_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Resul
     write_secret_file_0600(path, bytes)
 }
 
+/// Owner-only atomic replacement for disposable local diagnostics/cache data.
+/// Shares the secure temporary-file path with durable writes, but deliberately
+/// skips fsync. A crash may lose this cache; never use it for credentials or a
+/// checkpoint/receipt ledger.
+pub fn write_owner_only_cache_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        restrict_secret_dir_to_owner(parent)?;
+    }
+    write_private_file_0600(path, bytes, false)
+}
+
 /// Writes `bytes` to `path` so the secret is never exposed through a
 /// world-readable or symlink-followable window.
 ///
@@ -512,6 +547,11 @@ pub fn write_owner_only_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Resul
 /// `io::Error` to its own error type.
 #[cfg(unix)]
 pub(crate) fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_private_file_0600(path, bytes, true)
+}
+
+#[cfg(unix)]
+fn write_private_file_0600(path: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -544,7 +584,10 @@ pub(crate) fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Resu
         }
     };
 
-    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+    if let Err(error) =
+        file.write_all(bytes)
+            .and_then(|()| if durable { file.sync_all() } else { Ok(()) })
+    {
         drop(file);
         let _ = fs::remove_file(&tmp_path);
         return Err(error);
@@ -561,6 +604,15 @@ pub(crate) fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Resu
 #[cfg(not(unix))]
 pub(crate) fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::write(path, bytes)
+}
+
+#[cfg(not(unix))]
+fn write_private_file_0600(path: &Path, bytes: &[u8], _durable: bool) -> std::io::Result<()> {
+    let _ = (path, bytes);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "owner-only atomic cache writes require Unix",
+    ))
 }
 
 /// Restricts a created secret directory to owner-only (`0o700`) so the secrecy
@@ -645,6 +697,39 @@ fn secret_file_name(account: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn diagnostic_cache_writer_is_private_atomic_and_does_not_follow_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = std::env::temp_dir().join(format!(
+            "ottto-disposable-cache-{}",
+            generate_control_token().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("unrelated");
+        fs::write(&target, b"unchanged").unwrap();
+        let cache = root.join("cache.json");
+        symlink(&target, &cache).unwrap();
+        write_owner_only_cache_file_atomic(&cache, b"first").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        write_owner_only_cache_file_atomic(&cache, b"second").unwrap();
+        assert_eq!(fs::read(&cache).unwrap(), b"second");
+        assert_eq!(
+            fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            2,
+            "no temporary files retained"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn memory_token_store_round_trips() {
@@ -817,6 +902,84 @@ mod tests {
         assert_eq!(mode, 0o700);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn security_cli_output_classification_preserves_precedence_and_messages() {
+        use std::os::unix::process::ExitStatusExt;
+        use SecurityCliDeleteOutcome::{Failed, Missing, Removed};
+
+        let cases: &[(i32, &[u8], &[u8], SecurityCliDeleteOutcome)] = &[
+            (0, b"item not found", b"failure", Removed),
+            (44 << 8, b"permission denied", b"ignored", Missing),
+            (
+                1 << 8,
+                b"The specified item COULD NOT BE FOUND.",
+                b"",
+                Missing,
+            ),
+            (1 << 8, b"ITEM NOT FOUND", b"", Missing),
+            (9, b"item not found", b"", Missing),
+            (1 << 8, b"\xffITEM NOT FOUND", b"", Missing),
+            (
+                1 << 8,
+                b"permission denied",
+                b"item not found",
+                Failed("permission denied".into()),
+            ),
+            (
+                1 << 8,
+                b"",
+                b"item not found",
+                Failed("item not found".into()),
+            ),
+            (
+                1 << 8,
+                b"  Mixed CASE error\n",
+                b"other",
+                Failed("Mixed CASE error".into()),
+            ),
+            (
+                1 << 8,
+                b" \t\n",
+                b"  stdout error\n",
+                Failed("stdout error".into()),
+            ),
+            (1 << 8, b"\xff", b"ignored", Failed("\u{fffd}".into())),
+            (
+                1 << 8,
+                "İTEM NOT FOUND".as_bytes(),
+                b"",
+                Failed("İTEM NOT FOUND".into()),
+            ),
+            (
+                1 << 8,
+                b"item not foun",
+                b"",
+                Failed("item not foun".into()),
+            ),
+            (
+                1 << 8,
+                b" \n",
+                b"\t",
+                Failed("security exited with status exit status: 1".into()),
+            ),
+            (
+                9,
+                b"signal failure",
+                b"ignored",
+                Failed("signal failure".into()),
+            ),
+        ];
+        for (status, stderr, stdout, expected) in cases {
+            let output = std::process::Output {
+                status: std::process::ExitStatus::from_raw(*status),
+                stderr: stderr.to_vec(),
+                stdout: stdout.to_vec(),
+            };
+            assert_eq!(&classify_security_cli_delete_output(&output), expected);
+        }
     }
 
     #[cfg(target_os = "macos")]

@@ -1,0 +1,43 @@
+{
+  "source": "claude_code",
+  "status": "available",
+  "collection_method": "cli_json",
+  "captured_at": "2026-10-05T09:00:00Z",
+  "expires_at": "2026-10-05T09:05:00Z",
+  "account": {
+    "login_state": "signed_in",
+    "email": "root@example.invalid",
+    "organization_label": "Root workspace",
+    "account_identifier_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "organization_identifier_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "plan_type": "pro",
+    "confidence": "high"
+  },
+  "plan_observations": [
+    {
+      "account_label": "member@example.invalid",
+      "organization_label": "Member workspace",
+      "account_identifier_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "organization_identifier_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "plan_type": "team",
+      "is_current": false,
+      "confidence": "high"
+    },
+    {
+      "account_label": "  Weak account @ workspace  ",
+      "organization_label": "\u00c9quipe",
+      "plan_type": "team",
+      "is_current": true,
+      "confidence": "low"
+    },
+    {
+      "provider": "openai",
+      "plan_type": "pro",
+      "confidence": "unknown"
+    }
+  ],
+  "quota_windows": [],
+  "credit_balances": [],
+  "capabilities": [],
+  "diagnostics": []
+}

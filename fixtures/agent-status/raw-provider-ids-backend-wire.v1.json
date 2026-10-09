@@ -8,11 +8,11 @@
       "billing_identity_confidence": "high",
       "billing_identity_evidence": "provider_account_id",
       "confidence": "high",
-      "email": null,
+      "email": "synthetic-owner@example.invalid",
       "login_state": "signed_in",
       "organization_id": "00000000-0000-4000-8000-00000000c1b2",
       "organization_identifier_hash": "79df0acdc22d160b4255901ee94bd2005d8464f430d1616fdbf21f2d0deb55bd",
-      "organization_label": null,
+      "organization_label": "Synthetic Workspace Label",
       "plan_type": "max_20x",
       "provider": "anthropic",
       "subscription_product": "claude_max_20x"
@@ -27,6 +27,7 @@
       {
         "account_id": "00000000-0000-4000-8000-00000000c1a1",
         "account_identifier_hash": "74d634f106c37b4cee14702e79ebafc86a18142b70c3bf1c7cd1f2529fc65b59",
+        "account_label": "synthetic-owner@example.invalid",
         "auth_mode": "oauth",
         "billing_channel": "subscription",
         "billing_identity_confidence": "high",
@@ -38,6 +39,7 @@
         "observed_at": "2026-10-02T08:00:00Z",
         "organization_id": "00000000-0000-4000-8000-00000000c1b2",
         "organization_identifier_hash": "79df0acdc22d160b4255901ee94bd2005d8464f430d1616fdbf21f2d0deb55bd",
+        "organization_label": "Synthetic Workspace Label",
         "plan_type": "max_20x",
         "provider": "anthropic",
         "subscription_product": "claude_max_20x"
@@ -56,11 +58,11 @@
       "billing_identity_confidence": "high",
       "billing_identity_evidence": "provider_account_id",
       "confidence": "high",
-      "email": null,
+      "email": "synthetic-owner@example.invalid",
       "login_state": "signed_in",
       "organization_id": "00000000-0000-4000-8000-00000000c0d3",
       "organization_identifier_hash": "3356d64578b5316e8b5a3f05ded65057db4f0728d8f03f0408716e898390e4bd",
-      "organization_label": null,
+      "organization_label": "Synthetic Workspace Label",
       "plan_type": "pro",
       "provider": "openai",
       "subscription_product": "chatgpt_pro"
@@ -75,6 +77,7 @@
       {
         "account_id": "user-SyntheticCodexUser01",
         "account_identifier_hash": "738543b7d40c26b07b2bddac467103af74d597a72472ee44379ec527861636b2",
+        "account_label": "synthetic-owner@example.invalid",
         "auth_mode": "oauth",
         "billing_channel": "subscription",
         "billing_identity_confidence": "high",
@@ -86,6 +89,7 @@
         "observed_at": "2026-10-02T08:00:00Z",
         "organization_id": "00000000-0000-4000-8000-00000000c0d3",
         "organization_identifier_hash": "3356d64578b5316e8b5a3f05ded65057db4f0728d8f03f0408716e898390e4bd",
+        "organization_label": "Synthetic Workspace Label",
         "plan_type": "pro",
         "provider": "openai",
         "subscription_product": "chatgpt_pro"

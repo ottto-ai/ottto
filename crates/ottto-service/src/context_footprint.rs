@@ -457,28 +457,92 @@ fn run_claude_context(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let command_timeout = configure_claude_context_command(&mut command, include_mcp_servers);
-    let mut child = command
-        .spawn()
-        .map_err(|_| anyhow!("Claude Code /context could not be started"))?;
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|_| anyhow!("Claude Code /context output could not be read"))?;
-                if !output.status.success() {
-                    return Err(anyhow!("Claude Code /context exited unsuccessfully"));
+    #[cfg(unix)]
+    {
+        capture_claude_context(command, &login, command_timeout)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut child = command
+            .spawn()
+            .map_err(|_| anyhow!("Claude Code /context could not be started"))?;
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    let output = child
+                        .wait_with_output()
+                        .map_err(|_| anyhow!("Claude Code /context output could not be read"))?;
+                    if !output.status.success() {
+                        return Err(anyhow!("Claude Code /context exited unsuccessfully"));
+                    }
+                    return String::from_utf8(output.stdout)
+                        .map_err(|_| anyhow!("Claude Code /context stdout was not UTF-8"));
                 }
-                return String::from_utf8(output.stdout)
-                    .map_err(|_| anyhow!("Claude Code /context stdout was not UTF-8"));
+                Ok(None) if started.elapsed() >= command_timeout => {
+                    crate::claude_spawn_gate::stop_claude_child(child, &login, "context");
+                    return Err(anyhow!("Claude Code /context timed out"));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) => return Err(anyhow!("Claude Code /context status could not be read")),
             }
-            Ok(None) if started.elapsed() >= command_timeout => {
-                crate::claude_spawn_gate::stop_claude_child(child, &login, "context");
-                return Err(anyhow!("Claude Code /context timed out"));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn capture_claude_context(
+    command: Command,
+    login: &ottto_core::ClaudeConfigDirSlot,
+    timeout: Duration,
+) -> Result<String> {
+    use crate::claude_spawn_gate::probe::{check_deadline, ChildProbe, Origin, Reader, StartError};
+    use std::io::Read;
+    let deadline = Instant::now() + timeout;
+    let mut child =
+        ChildProbe::spawn(command, Some(login), Origin::Context, deadline).map_err(|error| {
+            match error {
+                StartError::Refused(refusal) => anyhow::Error::new(ClaudeContextRefused(refusal)),
+                StartError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    anyhow!("Claude Code /context timed out")
+                }
+                StartError::Io(_) => anyhow!("Claude Code /context could not be started"),
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(_) => return Err(anyhow!("Claude Code /context status could not be read")),
+        })?;
+    // Accepted output remains complete and uncapped. Drain concurrently with
+    // execution; only the cleanup owner's discard scratch has a fixed size.
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut eof = false;
+    loop {
+        check_deadline(deadline).map_err(|_| anyhow!("Claude Code /context timed out"))?;
+        let status = child
+            .try_wait()
+            .map_err(|_| anyhow!("Claude Code /context status could not be read"))?;
+        if !eof {
+            match Reader(child.stdout(), deadline).read(&mut buffer) {
+                Ok(0) => eof = true,
+                Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(anyhow!("Claude Code /context timed out"))
+                }
+                Err(_) => return Err(anyhow!("Claude Code /context output could not be read")),
+            }
+        }
+        if let Some(status) = status.filter(|_| eof) {
+            child.finish(deadline);
+            if !status.success() {
+                return Err(anyhow!("Claude Code /context exited unsuccessfully"));
+            }
+            return String::from_utf8(bytes)
+                .map_err(|_| anyhow!("Claude Code /context stdout was not UTF-8"));
+        }
+        if eof {
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(50)),
+            );
         }
     }
 }
@@ -1097,29 +1161,45 @@ fn discovery_before_deadline(deadline: Instant) -> std::io::Result<()> {
     }
 }
 
-fn same_discovery_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
-    if before.len() != after.len()
-        || before
-            .modified()
-            .ok()
-            .zip(after.modified().ok())
-            .map(|(a, b)| a == b)
-            != Some(true)
-    {
-        return false;
-    }
+/// The same metadata witness used by discovery and composition's local cache.
+/// No transcript bytes are read. Unix ctime detects same-size rewrites even
+/// when mtime is restored; device/inode detect replacement at the same path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TranscriptFileMetadata {
+    len: u64,
+    modified: SystemTime,
+    object_identity: Option<(u64, u64)>,
+    change_time: Option<(i64, i64)>,
+}
+
+pub(crate) fn transcript_file_metadata(
+    metadata: &fs::Metadata,
+) -> std::io::Result<TranscriptFileMetadata> {
+    let modified = metadata.modified()?;
     #[cfg(unix)]
-    {
+    let (object_identity, change_time) = {
         use std::os::unix::fs::MetadataExt;
-        if before.dev() != after.dev()
-            || before.ino() != after.ino()
-            || before.ctime() != after.ctime()
-            || before.ctime_nsec() != after.ctime_nsec()
-        {
-            return false;
-        }
-    }
-    true
+        (
+            Some((metadata.dev(), metadata.ino())),
+            Some((metadata.ctime(), metadata.ctime_nsec())),
+        )
+    };
+    #[cfg(not(unix))]
+    let (object_identity, change_time) = (None, None);
+    Ok(TranscriptFileMetadata {
+        len: metadata.len(),
+        modified,
+        object_identity,
+        change_time,
+    })
+}
+
+fn same_discovery_file(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    transcript_file_metadata(before)
+        .ok()
+        .zip(transcript_file_metadata(after).ok())
+        .map(|(a, b)| a == b)
+        .unwrap_or(false)
 }
 
 fn first_existing_cwd_in_reader(
@@ -1382,6 +1462,174 @@ pub(crate) fn workspace_label(workspace: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::claude_spawn_gate::test_support::{set_probe_fault, ProbeFault, ProbeFixture};
+
+    #[cfg(unix)]
+    fn probe_context(fixture: &ProbeFixture, timeout: Duration) -> Result<String> {
+        let mut command = fixture.command();
+        configure_claude_context_command(&mut command, false);
+        capture_claude_context(command, &ottto_core::ClaudeConfigDirSlot::Default, timeout)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn probe_context_drains_large_complete_output_and_preserves_modes() {
+        let payload = json!({"result":"λ".repeat(600_000),"is_error":false}).to_string();
+        let fixture = ProbeFixture::new("probe-context-fidelity", "output", payload.as_bytes(), 0);
+        for sampled in [false, true] {
+            let mut command = fixture.command();
+            configure_claude_context_command(&mut command, sampled);
+            assert_eq!(
+                capture_claude_context(
+                    command,
+                    &ottto_core::ClaudeConfigDirSlot::Default,
+                    Duration::from_secs(3)
+                )
+                .unwrap(),
+                payload
+            );
+            let arguments = fs::read_to_string(fixture.fake.root.join("arguments")).unwrap();
+            assert!(arguments.starts_with("\n-p\n/context\n--output-format\njson\n"));
+            assert_eq!(arguments.contains("--strict-mcp-config"), !sampled);
+            assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
+        }
+        fixture.wait_settled();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn probe_context_preserves_exit_utf8_and_expired_launch_errors() {
+        for (output, exit, error) in [
+            (b"{}".as_slice(), 7, "exited unsuccessfully"),
+            ([0xff].as_slice(), 0, "stdout was not UTF-8"),
+        ] {
+            let fixture = ProbeFixture::new("probe-context-errors", "output", output, exit);
+            assert!(probe_context(&fixture, Duration::from_secs(2))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains(error));
+            fixture.wait_settled();
+        }
+        let fixture = ProbeFixture::new("probe-context-expired", "output", b"{}", 0);
+        assert!(probe_context(&fixture, Duration::ZERO)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("timed out"));
+        assert!(!fixture.fake.root.join("direct").exists());
+        assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn probe_context_prelaunch_failures_and_postlaunch_errors_keep_ownership() {
+        for fault in [ProbeFault::Prepare, ProbeFault::WorkerStart] {
+            let fixture = ProbeFixture::new("probe-context-no-launch", "protected", &[], 0);
+            set_probe_fault(fault);
+            assert!(probe_context(&fixture, Duration::from_secs(1)).is_err());
+            assert!(!fixture.fake.root.join("direct").exists());
+            assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
+        }
+        for fault in [ProbeFault::Read, ProbeFault::Status] {
+            let fixture = ProbeFixture::new("probe-context-owned-error", "protected", &[], 0);
+            set_probe_fault(fault);
+            assert!(probe_context(&fixture, Duration::from_secs(1)).is_err());
+            fixture.wait_started();
+            assert!(ProbeFixture::alive(fixture.pid("direct")));
+            assert_eq!(crate::claude_spawn_gate::probe::active_count(), 1);
+            for _ in 0..10 {
+                assert!(probe_context(&fixture, Duration::from_secs(1))
+                    .err()
+                    .unwrap()
+                    .downcast_ref::<ClaudeContextRefused>()
+                    .is_some());
+            }
+            fixture.release();
+            fixture.wait_settled();
+        }
+        let fixture = ProbeFixture::new("probe-context-spawn-error", "output", b"{}", 0);
+        fs::remove_file(&fixture.script).unwrap();
+        assert!(probe_context(&fixture, Duration::from_secs(1)).is_err());
+        assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn probe_context_held_writers_cannot_hold_active_deadline() {
+        for mode in ["hold-exit", "protected", "escaped"] {
+            let fixture = ProbeFixture::new("probe-context-held-writer", mode, &[], 0);
+            let budget = if mode == "escaped" {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(500)
+            };
+            let started = Instant::now();
+            assert!(probe_context(&fixture, budget)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("timed out"));
+            assert!(started.elapsed() < budget + Duration::from_secs(1));
+            fixture.wait_started();
+            if mode != "hold-exit" {
+                assert_eq!(crate::claude_spawn_gate::probe::active_count(), 1);
+                if mode == "protected" {
+                    assert!(ProbeFixture::alive(fixture.pid("direct")));
+                }
+                for _ in 0..20 {
+                    assert!(probe_context(&fixture, Duration::from_secs(1))
+                        .err()
+                        .unwrap()
+                        .downcast_ref::<ClaudeContextRefused>()
+                        .is_some());
+                }
+            }
+            fixture.release();
+            fixture.wait_settled();
+            if mode == "escaped" {
+                assert!(ProbeFixture::alive(fixture.pid("descendant")));
+                fs::write(fixture.fake.root.join("release"), []).unwrap();
+                fixture.wait_until(|| !ProbeFixture::alive(fixture.pid("descendant")));
+            }
+            assert_eq!(crate::claude_spawn_gate::probe::active_count(), 0);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "OS FD/thread measurements require an isolated test process"]
+    #[serial_test::serial]
+    fn probe_context_resource_measurement() {
+        use crate::claude_spawn_gate::test_support::probe_resources;
+        for mode in ["protected", "escaped"] {
+            let before = probe_resources();
+            {
+                let fixture = ProbeFixture::new("probe-context-resource", mode, &[], 0);
+                let budget = if mode == "escaped" {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_millis(500)
+                };
+                assert!(probe_context(&fixture, budget).is_err());
+                assert_eq!(crate::claude_spawn_gate::probe::active_count(), 1);
+                fixture.release();
+                fixture.wait_settled();
+            }
+            let end = Instant::now() + Duration::from_secs(2);
+            while probe_resources() != before && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let after = probe_resources();
+            println!("CONTEXT_RESOURCE mode={mode} fds_before={} fds_after={} threads_before={} threads_after={} admitted=0", before.0,after.0,before.1,after.1);
+            assert_eq!(after, before);
+        }
+    }
     use crate::test_scratch;
 
     fn temp_dir(name: &str) -> PathBuf {

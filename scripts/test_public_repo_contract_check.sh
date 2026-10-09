@@ -1397,8 +1397,9 @@ replacements = {
     "should not\nduplicate local setup or repair logic": "may duplicate local setup and repair logic",
     "must not upload raw prompts, raw responses, tool output,\n"
     "command output, browser cookies, OAuth credentials, API keys, passwords,\n"
-    "absolute local paths, provider account emails, or account and organization\n"
-    "labels": "may upload raw local content when support needs details",
+    "absolute local paths": "may upload raw local content when support needs details",
+    "email is permitted only in the named status display\nfields": "email may be sent on any upload",
+    "Tokens and credentials stay local": "Credentials may be sent",
     "derived and redacted fields": "raw fields",
     "hashed workspace identity": "workspace path",
     "display-safe account or plan evidence": "raw account evidence",
@@ -1433,6 +1434,10 @@ grep -q "privacy docs must name ottto-service as local owner" \
 grep -q "privacy docs must prohibit duplicate setup/repair logic" \
   /tmp/public-contract-broken-privacy-docs.out
 grep -q "privacy docs must prohibit uploading raw private local data" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must scope email to named status display fields" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must keep credentials local" \
   /tmp/public-contract-broken-privacy-docs.out
 grep -q "privacy docs must keep live telemetry source-level opt-in" \
   /tmp/public-contract-broken-privacy-docs.out

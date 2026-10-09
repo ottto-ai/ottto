@@ -1,4 +1,3 @@
-#[cfg(test)]
 use crate::agent_configs::codex_toml;
 use crate::{
     agent_configs::{claude_env, detection::detect_agent_installation, fence::AgentConfigError},
@@ -10098,11 +10097,10 @@ fn write_codex_source_off_body(
 /// Only an Ottto header AND a loopback signal destination establish ownership.
 /// External exporters and unrelated table fields survive, including inside a fence.
 fn codex_source_off_body(existing: &str) -> Result<String, LocalApiError> {
-    let has_marker = existing
-        .lines()
-        .any(|line| matches!(line.trim(), "# ottto:start" | "# ottto:end"));
-    if has_marker && crate::agent_configs::fence::extract_fence_lines(existing).is_none() {
-        return Err(LocalApiError::ManualFenceReviewRequired);
+    let fence = codex_toml::source_off_fence(existing, codex_exporter_relay_port)
+        .map_err(|_| LocalApiError::ManualFenceReviewRequired)?;
+    if let codex_toml::SourceOffFence::Recovered(next) = &fence {
+        return Ok(next.clone());
     }
     let mut document = existing
         .parse::<DocumentMut>()
@@ -10116,8 +10114,8 @@ fn codex_source_off_body(existing: &str) -> Result<String, LocalApiError> {
     }
     // A legacy fence containing only the generated telemetry fields can go away
     // entirely. Mixed/user-edited fences keep their remaining contents.
-    if let Some(lines) = crate::agent_configs::fence::extract_fence_lines(existing) {
-        let fenced_body = lines[1..lines.len() - 1].join("\n");
+    if let codex_toml::SourceOffFence::Complete { start, end } = fence {
+        let fenced_body = &existing[start.end..end.start];
         if let Ok(mut fenced) = fenced_body.parse::<DocumentMut>() {
             if let Some(table) = fenced.get_mut("otel").and_then(Item::as_table_like_mut) {
                 remove_owned_codex_exporters(table);
@@ -10135,29 +10133,18 @@ fn codex_source_off_body(existing: &str) -> Result<String, LocalApiError> {
                         })
                     });
                 if generated_only && full_table_generated_only {
-                    let mut offset = 0;
-                    let mut start = None;
-                    for line in existing.split_inclusive('\n') {
-                        if line.trim() == "# ottto:start" {
-                            start = Some(offset);
-                        }
-                        offset += line.len();
-                        if line.trim() == "# ottto:end" {
-                            let mut next = existing.to_string();
-                            next.replace_range(start.expect("validated fence")..offset, "");
-                            let mut remaining = next
-                                .parse::<DocumentMut>()
-                                .map_err(|_| LocalApiError::StatePoisoned)?;
-                            if let Some(otel) =
-                                remaining.get_mut("otel").and_then(Item::as_table_like_mut)
-                            {
-                                if remove_owned_codex_exporters(otel) {
-                                    return Ok(remaining.to_string());
-                                }
-                            }
-                            return Ok(next);
+                    let mut next = existing.to_string();
+                    next.replace_range(start.start..end.end, "");
+                    let mut remaining = next
+                        .parse::<DocumentMut>()
+                        .map_err(|_| LocalApiError::StatePoisoned)?;
+                    if let Some(otel) = remaining.get_mut("otel").and_then(Item::as_table_like_mut)
+                    {
+                        if remove_owned_codex_exporters(otel) {
+                            return Ok(remaining.to_string());
                         }
                     }
+                    return Ok(next);
                 }
             }
         }
@@ -14526,6 +14513,16 @@ fn config_drift_verification_result(
     config: SourceConfigState,
     repair_requested: bool,
 ) -> SourceVerificationResult {
+    if source == SourceKind::Codex
+        && config
+            .drift
+            .iter()
+            .any(|drift| drift.key == "codex.config_toml")
+    {
+        return verification_result_with_config(source, config, SourceVerificationStatus::Failed,
+            false, 0, None, None, None, "manual_fence_review_required",
+            "Codex configuration needs manual review. Ottto left it unchanged. Review the Ottto telemetry entries and fence markers in ~/.codex/config.toml, then run Verify again.");
+    }
     let missing = !config.discovered
         || config
             .drift
@@ -16536,10 +16533,19 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn post_confirm_device_file_failure_keeps_candidate_restart_recoverable() {
         use ottto_core::token_store::MemoryTokenStore;
 
         let root = control_test_root("credential-promote-file-failure");
+        // Promotion cleanup also touches the default pending setup-token store,
+        // even when the device stores below are explicit in-memory fixtures.
+        let secret_root = root.join("secrets");
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let setup_token_store = KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT);
+        setup_token_store
+            .save("setup-file-failure")
+            .expect("stage setup token");
         let pending_store = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
         let pending_secret = MemoryTokenStore::new();
         let active_secret = MemoryTokenStore::new();
@@ -16586,6 +16592,10 @@ mod tests {
             candidate
         );
 
+        assert_eq!(
+            setup_token_store.load().expect("setup token survives"),
+            "setup-file-failure"
+        );
         fs::remove_file(&blocked_parent).expect("remove blocker");
         fs::create_dir(&blocked_parent).expect("create device parent");
         promote_pending_device_credential_with_stores(
@@ -16599,6 +16609,10 @@ mod tests {
         .expect("retry promotion");
 
         assert!(pending_store.load().expect("pending cleared").is_none());
+        assert!(matches!(
+            setup_token_store.load(),
+            Err(TokenStoreError::Missing)
+        ));
         assert!(matches!(
             pending_secret.load(),
             Err(TokenStoreError::Missing)
@@ -22819,7 +22833,8 @@ mod tests {
             )
             .unwrap();
         let grant_before = grants.load().unwrap().unwrap();
-        let (api_base, register_observed) = observed_install_registration_server();
+        let (api_base, register_observed, operation_finished) =
+            observed_install_registration_server();
         let connection = LocalConnectionBinding {
             setup_run_id: "setup_install_blocked".to_string(),
             setup_run_token_expires_at: "2030-01-01T00:00:00Z".to_string(),
@@ -22840,16 +22855,19 @@ mod tests {
             source: Some("pi".to_string()),
         };
 
-        assert!(matches!(
-            run_install_source_action(
-                &daemon,
-                &api_base,
-                &mut credentials,
-                &action,
-                &test_machine(),
-            ),
-            Err(LocalApiError::CloudSessionCleanupRequired)
-        ));
+        let result = run_install_source_action(
+            &daemon,
+            &api_base,
+            &mut credentials,
+            &action,
+            &test_machine(),
+        );
+        // Observe until the operation completes, even when setup is slow.
+        let _ = operation_finished.send(());
+        assert!(
+            matches!(result, Err(LocalApiError::CloudSessionCleanupRequired)),
+            "actual install result: {result:?}"
+        );
         assert!(
             !register_observed
                 .recv_timeout(Duration::from_secs(2))
@@ -24156,7 +24174,7 @@ mod tests {
         assert_eq!(error.code, CliErrorCode::ManualFenceReviewRequired);
         assert_eq!(
             error.message,
-            "Ottto found a manually edited managed fence and needs you to review it."
+            "Ottto left the configuration unchanged. Review the Ottto telemetry entries and fence markers in the source config, then retry."
         );
         assert!(!error.retryable);
         assert!(store.load(&SourceKind::Codex, "key_manual_fence").is_ok());
@@ -25798,6 +25816,133 @@ X-API-Key = "otel_redacted"
                 .changed
         );
         assert!(!missing.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_source_off_recovers_orphan_end_with_exact_byte_preservation() {
+        let generated = render_codex_relay_toml_block_for_base("http://127.0.0.1:44621");
+        for eol in ["\n", "\r\n"] {
+            let prefix = format!("# user formatting{eol}model='kept'{eol}");
+            let suffix = format!("[profiles.work]{eol}model = 'also kept' # user comment{eol}");
+            let owned = generated.replace('\n', eol);
+            let body = format!("{prefix}{owned}{eol}# ottto:end{eol}{suffix}");
+            let expected = format!("{prefix}otel.environment = \"prod\"{eol}otel.log_user_prompt = false{eol}{eol}{eol}{eol}{suffix}");
+            let next = codex_source_off_body(&body).unwrap();
+            assert_eq!(next.as_bytes(), expected.as_bytes());
+            assert_eq!(codex_source_off_body(&next).unwrap(), next);
+            assert!(!next.contains("/v1/"));
+        }
+    }
+
+    #[test]
+    fn codex_source_off_orphan_keeps_external_exporter_and_assignment_comment() {
+        let generated = render_codex_relay_toml_block_for_base("http://127.0.0.1:44621");
+        let external = generated.lines().nth(3).unwrap().replace(
+            "http://127.0.0.1:44621/v1/traces",
+            "https://collector.example/v1/traces",
+        );
+        let body = format!(
+            "{} # retain annotation\n{external}\n# ottto:end\n",
+            generated.lines().nth(2).unwrap()
+        );
+        let expected = format!(" # retain annotation\n{external}\n");
+        let next = codex_source_off_body(&body).unwrap();
+        assert_eq!(next, expected);
+        assert_eq!(codex_source_off_body(&next).unwrap(), next);
+    }
+
+    #[test]
+    fn codex_source_off_orphan_keeps_otel_section_scope_and_user_fields() {
+        let body = "[otel]\nenvironment='custom'\nexporter = { otlp-http = { endpoint='http://localhost:44621/v1/logs', headers={ X-Ottto-Local-Relay='codex' } } }\n# ottto:end\ncustom_setting=true\n";
+        let expected = "[otel]\nenvironment='custom'\n\ncustom_setting=true\n";
+        assert_eq!(codex_source_off_body(body).unwrap(), expected);
+        assert_eq!(
+            expected.parse::<DocumentMut>().unwrap()["otel"]["custom_setting"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn codex_source_off_ignores_marker_lines_in_multiline_values_and_comments() {
+        let owned = render_codex_relay_toml_block_for_base("http://127.0.0.1:44621");
+        let prefix = "description = '''\n# ottto:start\n# ottto:end\n'''\n# example # ottto:end\n";
+        let body = format!("{prefix}{owned}\n# ottto:end\n");
+        let next = codex_source_off_body(&body).unwrap();
+        assert!(next.starts_with(prefix));
+        assert!(!next.contains("/v1/"));
+        assert_eq!(codex_source_off_body(&next).unwrap(), next);
+        assert_eq!(codex_source_off_body(prefix).unwrap(), prefix);
+    }
+
+    #[test]
+    fn codex_source_off_orphan_refuses_unknown_ownership_without_backup_or_write() {
+        let root = control_test_root("codex-orphan-fence-refusals");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let owned = render_codex_relay_toml_block_for_base("http://127.0.0.1:44621");
+        let orphan = format!("{owned}\n# ottto:end\n");
+        let cases = vec![
+            orphan.replace("# ottto:end", "# ottto:end\n# ottto:end"),
+            format!("# ottto:end\n{owned}\n"),
+            orphan.replace("X-Ottto-Local-Relay", "Looks-Like-Ottto"),
+            orphan.replace("http://127.0.0.1:44621", "https://collector.example"),
+            orphan.replace("http://127.0.0.1:44621", "http://127.0.0.1:44621/extra"),
+            orphan.replace("protocol = \"binary\"", "protocol = \"json\""),
+            orphan.replace("headers = {", "timeout=5, headers = {"),
+            orphan.replace("headers = {", "headers = { User-Header='keep',"),
+            orphan.replace("44621/v1/traces", "44622/v1/traces"),
+            format!("{orphan}[broken\n"),
+            format!("{orphan}[otel]\nenvironment='duplicate'\n"),
+            "[otel.exporter.otlp-http]\nendpoint='http://localhost:44621/v1/logs'\nheaders={X-Ottto-Local-Relay='codex'}\n# ottto:end\n".into(),
+            "otel={environment='user',exporter={otlp-http={endpoint='http://localhost:44621/v1/logs',headers={X-Ottto-Local-Relay='codex'}}}}\n# ottto:end\n".into(),
+        ];
+        for body in cases {
+            fs::write(&path, &body).unwrap();
+            assert!(
+                matches!(
+                    reconcile_codex_source_off_at(&path, &root.join("backups")),
+                    Err(LocalApiError::ManualFenceReviewRequired)
+                ),
+                "{body}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), body.as_bytes());
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_source_off_orphan_repair_clears_verify_drift_and_is_idempotent() {
+        let root = control_test_root("codex-orphan-fence-repair");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let body = format!(
+            "{}\n# ottto:end\n",
+            render_codex_relay_toml_block_for_base("http://127.0.0.1:44621")
+        );
+        fs::write(&path, &body).unwrap();
+        let before = codex_config_state_at(&path, "config", "", false);
+        assert_eq!(before.drift[0].key, "codex.ottto_exporters");
+        assert_eq!(
+            config_drift_verification_result(SourceKind::Codex, before, false)
+                .message
+                .code,
+            "config_drift"
+        );
+        let repaired = reconcile_codex_source_off_at(&path, &root.join("backups")).unwrap();
+        assert!(repaired.changed && repaired.backup_created);
+        assert!(codex_config_state_at(&path, "config", "", false)
+            .drift
+            .is_empty());
+        let unchanged = reconcile_codex_source_off_at(&path, &root.join("backups")).unwrap();
+        assert!(!unchanged.changed && !unchanged.backup_created);
+        fs::write(&path, "# ottto:end\n[broken\n").unwrap();
+        let manual = codex_config_state_at(&path, "config", "", false);
+        let message = config_drift_verification_result(SourceKind::Codex, manual, false).message;
+        assert_eq!(message.code, "manual_fence_review_required");
+        assert!(message.text.contains("left it unchanged"));
+        assert!(!message.text.contains("Use Repair"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -28920,13 +29065,14 @@ X-API-Key = "otel_redacted"
         )
     }
 
-    fn observed_install_registration_server() -> (String, mpsc::Receiver<bool>) {
+    fn observed_install_registration_server() -> (String, mpsc::Receiver<bool>, mpsc::Sender<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind install backend");
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().expect("install backend address");
         let (observed_tx, observed_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
         thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_millis(750);
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -28954,17 +29100,48 @@ X-API-Key = "otel_redacted"
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
-                            observed_tx.send(false).unwrap();
-                            return;
+                        match finished_rx.try_recv() {
+                            Ok(()) => {
+                                observed_tx.send(false).unwrap();
+                                return;
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => return,
+                            Err(mpsc::TryRecvError::Empty) => {}
                         }
+                        // A watchdog failure must not certify that no request
+                        // occurred while the operation was still in progress.
+                        assert!(
+                            Instant::now() < deadline,
+                            "install operation did not finish"
+                        );
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(error) => panic!("accept install registration: {error}"),
                 }
             }
         });
-        (format!("http://{address}"), observed_rx)
+        (format!("http://{address}"), observed_rx, finished_tx)
+    }
+
+    #[test]
+    fn observed_install_registration_remains_live_until_operation_finishes() {
+        let (api_base, observed, operation_finished) = observed_install_registration_server();
+        // Deliberately exceed the former 750ms mock lifetime. Slow setup must
+        // not turn an unobserved registration into a false cleanup success.
+        thread::sleep(Duration::from_secs(1));
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let response: serde_json::Value = backend_post_json(
+            &format!("{api_base}/api/v1/telemetry/devices/registration-preparations"),
+            &json!({}),
+            &[],
+        )
+        .expect("late synthetic registration reaches observer");
+        assert_eq!(response["preparation_id"], "preparation_should_not_rotate");
+        assert!(observed.recv_timeout(Duration::from_secs(2)).unwrap());
+        let _ = operation_finished.send(());
     }
 
     fn cloud_control_validation_rejection_server(action: &str) -> String {

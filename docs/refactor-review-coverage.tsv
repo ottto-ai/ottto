@@ -1,0 +1,447 @@
+path	lines	initial_review	complementary_review	additional_audit
+.cargo/audit.toml	16	inventory only	inventory only	not reviewed in this pass
+.github/dependabot.yml	52	inventory only	fully read (text only)	not reviewed in this pass
+.github/workflows/ci.yml	115	targeted reading	fully read (text only)	search only
+.github/workflows/macos-stable-release.yml	448	targeted reading	partially read: 1-160	partially read: 96-126,255-275
+CODE_OF_CONDUCT.md	26	inventory only	inventory only	not reviewed in this pass
+CONTRIBUTING.md	48	targeted reading	inventory only	not reviewed in this pass
+Cargo.lock	1685	inventory only	inventory only	not reviewed in this pass
+Cargo.toml	41	targeted reading	fully read (text only)	not reviewed in this pass
+LICENSE	201	inventory only	inventory only	not reviewed in this pass
+NOTICE	7	inventory only	inventory only	not reviewed in this pass
+PUBLIC_EXPORT_MANIFEST.json	3158	inventory only	inventory only	not reviewed in this pass
+README.md	858	inventory only	inventory only	not reviewed in this pass
+SECURITY.md	46	inventory only	inventory only	not reviewed in this pass
+SUPPORT.md	38	inventory only	inventory only	not reviewed in this pass
+TRADEMARKS.md	28	inventory only	inventory only	not reviewed in this pass
+agent-adapters/claude-code-skill/SKILL.md	201	inventory only	inventory only	not reviewed in this pass
+agent-adapters/codex-skill/SKILL.md	246	inventory only	inventory only	not reviewed in this pass
+agent-adapters/codex-skill/agents/openai.yaml	4	inventory only	inventory only	not reviewed in this pass
+connectors/README.md	271	inventory only	partially read: 1-175	partially read: 20-42,238-271
+connectors/registry.generated.json	368	inventory only	inventory only	not reviewed in this pass
+connectors/sources/claude-code/POLICY.md	42	inventory only	inventory only	not reviewed in this pass
+connectors/sources/claude-code/README.md	14	inventory only	inventory only	not reviewed in this pass
+connectors/sources/claude-code/collectors/identity_probe/collector.toml	17	inventory only	inventory only	not reviewed in this pass
+connectors/sources/claude-code/collectors/identity_probe/fixtures/minimal-evidence.json	38	inventory only	inventory only	not reviewed in this pass
+connectors/sources/claude-code/collectors/local_sessions/collector.toml	20	inventory only	inventory only	not reviewed in this pass
+connectors/sources/claude-code/collectors/local_sessions/fixtures/minimal-evidence.json	73	inventory only	inventory only	not reviewed in this pass
+connectors/sources/claude-code/collectors/otel_config/collector.toml	18	inventory only	inventory only	not reviewed in this pass
+connectors/sources/claude-code/collectors/otel_config/fixtures/minimal-evidence.json	51	inventory only	inventory only	not reviewed in this pass
+connectors/sources/claude-code/collectors/quota_status/collector.toml	18	inventory only	inventory only	not reviewed in this pass
+connectors/sources/claude-code/collectors/quota_status/fixtures/minimal-evidence.json	66	inventory only	inventory only	not reviewed in this pass
+connectors/sources/claude-code/fixtures/local_sessions/minimal-session.jsonl	2	inventory only	inventory only	not reviewed in this pass
+connectors/sources/claude-code/source.toml	24	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/POLICY.md	70	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/README.md	43	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/collectors/cloud_sessions/collector.toml	17	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/collectors/cloud_sessions/fixtures/minimal-evidence.json	73	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/collectors/identity_probe/collector.toml	22	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/collectors/identity_probe/fixtures/minimal-evidence.json	43	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/collectors/local_sessions/collector.toml	20	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json	72	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/collectors/logs2_trace/collector.toml	15	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/collectors/logs2_trace/fixtures/minimal-evidence.json	35	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/collectors/otel_config/collector.toml	18	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/collectors/otel_config/fixtures/minimal-evidence.json	51	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/collectors/quota_status/collector.toml	18	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/collectors/quota_status/fixtures/minimal-evidence.json	75	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/fixtures/local_sessions/minimal-session.jsonl	2	inventory only	inventory only	not reviewed in this pass
+connectors/sources/codex/source.toml	26	inventory only	inventory only	not reviewed in this pass
+connectors/sources/pi/POLICY.md	34	inventory only	inventory only	not reviewed in this pass
+connectors/sources/pi/README.md	14	inventory only	inventory only	not reviewed in this pass
+connectors/sources/pi/collectors/identity_probe/collector.toml	17	inventory only	inventory only	not reviewed in this pass
+connectors/sources/pi/collectors/identity_probe/fixtures/minimal-evidence.json	39	inventory only	inventory only	not reviewed in this pass
+connectors/sources/pi/collectors/live_batches/collector.toml	18	inventory only	inventory only	not reviewed in this pass
+connectors/sources/pi/collectors/live_batches/fixtures/minimal-evidence.json	54	inventory only	inventory only	not reviewed in this pass
+connectors/sources/pi/collectors/local_sessions/collector.toml	20	inventory only	inventory only	not reviewed in this pass
+connectors/sources/pi/collectors/local_sessions/fixtures/minimal-evidence.json	75	inventory only	inventory only	not reviewed in this pass
+connectors/sources/pi/collectors/route_status/collector.toml	18	inventory only	inventory only	not reviewed in this pass
+connectors/sources/pi/collectors/route_status/fixtures/minimal-evidence.json	50	inventory only	inventory only	not reviewed in this pass
+connectors/sources/pi/fixtures/local_sessions/minimal-session.jsonl	2	inventory only	inventory only	not reviewed in this pass
+connectors/sources/pi/source.toml	24	inventory only	inventory only	not reviewed in this pass
+crates/Cargo.lock	278	inventory only	inventory only	not reviewed in this pass
+crates/Cargo.toml	6	targeted reading	fully read (text only)	not reviewed in this pass
+crates/ottto-cli/Cargo.toml	19	inventory only	fully read (text only)	not reviewed in this pass
+crates/ottto-cli/src/main.rs	4868	structural scan	partially read: 810-940,991-1101,1935-2177	not reviewed in this pass
+crates/ottto-connector-sdk/Cargo.toml	10	inventory only	fully read (text only)	not reviewed in this pass
+crates/ottto-connector-sdk/src/lib.rs	496	targeted reading	fully read (text only)	partially read: 1-116
+crates/ottto-connector-testkit/Cargo.toml	19	inventory only	fully read (text only)	not reviewed in this pass
+crates/ottto-connector-testkit/src/lib.rs	1005	targeted reading	partially read: 1-520	partially read: 148-412
+crates/ottto-connector-testkit/tests/first_party_sources.rs	594	structural scan	partially read: 1-210	partially read: 25-85,520-594
+crates/ottto-core/Cargo.toml	22	inventory only	fully read (text only)	not reviewed in this pass
+crates/ottto-core/src/account_store.rs	871	structural scan	partially read: 205-570	partially read: 430-568
+crates/ottto-core/src/claude_account.rs	190	structural scan	structural scan	not reviewed in this pass
+crates/ottto-core/src/claude_config_slots.rs	4392	structural scan	partially read: 1-120,2064-2219	search only
+crates/ottto-core/src/claude_statusline.rs	1674	structural scan	structural scan	not reviewed in this pass
+crates/ottto-core/src/codex_account_slots.rs	2525	structural scan	partially read: 1647-1740	partially read: 106-240,465-731,791-985,1000-1061,1127-1203,1860-1921,2375-2407
+crates/ottto-core/src/lib.rs	86	targeted reading	fully read (text only)	not reviewed in this pass
+crates/ottto-core/src/lifecycle.rs	822	structural scan	structural scan	not reviewed in this pass
+crates/ottto-core/src/local_client.rs	241	structural scan	fully read (text only)	not reviewed in this pass
+crates/ottto-core/src/local_service.rs	228	structural scan	fully read (text only)	not reviewed in this pass
+crates/ottto-core/src/redaction.rs	841	structural scan	structural scan	not reviewed in this pass
+crates/ottto-core/src/status.rs	144	structural scan	structural scan	not reviewed in this pass
+crates/ottto-core/src/token_store.rs	914	targeted reading	fully read (text only)	partially read: 1-429,460-700
+crates/ottto-protocol/Cargo.toml	15	inventory only	fully read (text only)	not reviewed in this pass
+crates/ottto-protocol/src/lib.rs	7394	structural scan	partially read: 1-240,1023-1132	not reviewed in this pass
+crates/ottto-service/Cargo.toml	44	targeted reading	fully read (text only)	not reviewed in this pass
+crates/ottto-service/build.rs	49	structural scan	fully read (text only)	not reviewed in this pass
+crates/ottto-service/src/active_sessions.rs	1467	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/adaptive_collector.rs	378	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/agent_configs/claude_env.rs	94	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/agent_configs/codex_toml.rs	279	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/agent_configs/detection.rs	406	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/agent_configs/fence.rs	911	targeted reading	structural scan	not reviewed in this pass
+crates/ottto-service/src/agent_configs/mod.rs	4	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/agent_status.rs	32401	targeted reading	structural scan	not reviewed in this pass
+crates/ottto-service/src/agent_status_refresh.rs	799	targeted reading	partially read: 1-425	production fully read: 1-425; tests selective
+crates/ottto-service/src/backfill.rs	984	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/canonical_json.rs	244	targeted reading	structural scan	not reviewed in this pass
+crates/ottto-service/src/claude_browser_auth.rs	8339	targeted reading	structural scan	not reviewed in this pass
+crates/ottto-service/src/claude_local_otel.rs	2402	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/claude_refresher.rs	1462	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/claude_spawn_gate.rs	605	targeted reading	structural scan	not reviewed in this pass
+crates/ottto-service/src/claude_upkeep.rs	3376	structural scan	partially read: 1-140,594-735	not reviewed in this pass
+crates/ottto-service/src/client_report.rs	361	targeted reading	structural scan	not reviewed in this pass
+crates/ottto-service/src/cloud_sessions.rs	8980	structural scan	partially read: 67-240,4310-4365	partially read: 1590-1718,2208-2315,2530-2657,4310-4365
+crates/ottto-service/src/codex_process_homes.rs	110	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/command_env.rs	694	targeted reading	structural scan	not reviewed in this pass
+crates/ottto-service/src/context_composition.rs	1911	targeted reading	partially read: 1606-1640	not reviewed in this pass
+crates/ottto-service/src/context_composition/tests.rs	1265	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/context_footprint.rs	2104	structural scan	partially read: 1-240	partially read: 203-223,380-511,572-608
+crates/ottto-service/src/context_posture.rs	861	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/control.rs	29355	targeted reading	partially read: 285-455,4480-4525	partially read: 332-414,2628-2682,2940-3038,5302-5344,9800-9900
+crates/ottto-service/src/control_plane_health.rs	358	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/detected_uses.rs	759	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/external_scheduler_attribution.rs	1240	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/fd_guard.rs	323	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/heap_layout_bound.rs	437	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/keychain.rs	906	targeted reading	partially read: 1-230,590-669	partially read: 1-521,555-700
+crates/ottto-service/src/launch_events.rs	943	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/legacy_service.rs	492	structural scan	fully read (text only)	not reviewed in this pass
+crates/ottto-service/src/legacy_service_shim.m	39	inventory only	fully read (text only)	not reviewed in this pass
+crates/ottto-service/src/lib.rs	8695	targeted reading	partially read: 1415-1445	partially read: 1185-1335,1408-1445
+crates/ottto-service/src/macos_service.rs	671	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/main.rs	1040	targeted reading	partially read: 507-590	partially read: 275-388,505-590
+crates/ottto-service/src/mcp_inventory.rs	2932	structural scan	structural scan	partially read: 51-89,641-730,790-850,975-1035,1405-1432
+crates/ottto-service/src/net_resilience.rs	2086	targeted reading	structural scan	not reviewed in this pass
+crates/ottto-service/src/net_transition.rs	239	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/otlp_relay.rs	2531	structural scan	partially read: 1-150	partially read: 30-130,208-256,658-758,1064-1105,1200-1222,1275-1347
+crates/ottto-service/src/provider_daily_reference.rs	5887	structural scan	partially read: 3380-3415	partially read: 3380-3416
+crates/ottto-service/src/retry_allocation_probe.rs	123	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/retry_integrated_driver.rs	430	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/retry_owned_rotation.rs	484	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/retry_retention_bound.rs	116	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/session_attribution.rs	2469	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/snapshot_audit.rs	1408	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/snapshot_client.rs	4141	structural scan	structural scan	search only
+crates/ottto-service/src/snapshot_sync.rs	15696	targeted reading	partially read: 2805-2865	not reviewed in this pass
+crates/ottto-service/src/snapshot_watcher.rs	271	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/snapshots.rs	49895	targeted reading	structural scan	not reviewed in this pass
+crates/ottto-service/src/snapshots/cache_observations.rs	353	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/snapshots/cache_observations/tests.rs	165	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/snapshots/context_curve.rs	692	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/snapshots/context_curve/tests.rs	75	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/source_rotation.rs	116	targeted reading	structural scan	not reviewed in this pass
+crates/ottto-service/src/test_scratch.rs	102	targeted reading	structural scan	not reviewed in this pass
+crates/ottto-service/src/unix_socket.rs	1196	structural scan	partially read: 1-459,763-903,920-1020	partially read: 1-232,367-460
+crates/ottto-service/src/upload_receipts.rs	1301	structural scan	structural scan	not reviewed in this pass
+crates/ottto-service/src/xpc_mach.rs	186	structural scan	fully read (text only)	fully read (static only)
+crates/ottto-service/src/xpc_shim.c	95	inventory only	fully read (text only)	fully read (static only)
+docs/README.md	62	targeted reading	partially read: opening and command-surface sections	not reviewed in this pass
+docs/agent-adapters.md	49	inventory only	inventory only	not reviewed in this pass
+docs/cache-observations-v1.md	59	inventory only	inventory only	not reviewed in this pass
+docs/claude-accounts.md	404	inventory only	inventory only	not reviewed in this pass
+docs/claude-worker-outcome-diagnostics.md	96	inventory only	inventory only	not reviewed in this pass
+docs/cloud-connectors.md	72	inventory only	inventory only	not reviewed in this pass
+docs/codex-accounts.md	185	inventory only	inventory only	not reviewed in this pass
+docs/connectors.md	56	targeted reading	fully read (text only)	not reviewed in this pass
+docs/diagnostics.md	136	inventory only	inventory only	not reviewed in this pass
+docs/examples.md	114	inventory only	inventory only	not reviewed in this pass
+docs/install.md	89	inventory only	inventory only	not reviewed in this pass
+docs/notes/2026-10-02-claude-census-ownership-recovery.md	43	inventory only	inventory only	not reviewed in this pass
+docs/notes/2026-10-02-codex-child-creator-parent.md	31	inventory only	inventory only	not reviewed in this pass
+docs/privacy.md	361	inventory only	inventory only	not reviewed in this pass
+docs/release-verification.md	252	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-05-28-snapshot-v5-to-v6-followup.md	132	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-10-prompt-cache-economics.md	46	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-11-claude-local-reasoning-effort.md	57	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-11-gpt56-cache-write-evidence.md	36	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-21-cloud-session-transport-alignment.md	109	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-21-codex-cloud-sessions-collector.md	49	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-21-session-attribution-private-labels.md	60	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-22-cloud-connector-daemon-bridge.md	16	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-22-cloud-session-activation-authority-bridge.md	247	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-22-cloud-session-complete-snapshots.md	104	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-22-cloud-session-relay-composition.md	92	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-22-cloud-session-scan-epochs.md	75	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-22-local-semantic-sync-phase-1.md	90	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-22-snapshot-upload-resume-checkpoint.md	65	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-23-cloud-session-contract-and-io-fence.md	100	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-24-local-snapshot-audit-v2.md	100	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-25-claude-code-runtime-defaults.md	86	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-26-adaptive-scan-cadence.md	76	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-26-claude-max-tier-refinement.md	28	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-26-claude-oauth-usage-cache-account-key.md	91	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-26-claude-statusline-cache-account-key.md	118	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-26-claude-subagent-session-attribution.md	136	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-26-honest-user-agent.md	24	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-26-oauth-cadence-breaker.md	101	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-26-snapshot-content-identity-and-witnesses.md	195	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-26-snapshot-upload-backoff-and-compression.md	118	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-27-attribution-budget-8192.md	91	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-27-codex-daily-aggregates-collector.md	256	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-27-grant-socket-and-billing-period.md	303	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-27-oauth-window-account-stamp.md	36	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-27-subagent-session-display-names.md	69	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-28-plan-observation-identity.md	39	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-29-codex-agent-role-titles.md	33	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-29-codex-content-element-scaffolding.md	35	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-29-ignore-injected-prompt-scaffolding.md	35	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-29-retire-cookie-collector-and-last-checked.md	102	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-29-session-title-source-fixes.md	22	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-29-statusline-session-resolver.md	96	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-30-claude-compaction-boundary.md	26	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-31-claude-snapshot-account-attribution.md	123	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-31-pi-current-transcript-ingest.md	71	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-07-31-snapshot-replay-controls.md	195	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-01-claude-compaction-dedup.md	27	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-01-scanner-composition-final-audit.md	72	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-01-setup-claim-credential-continuity.md	64	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-02-claude-effort-per-request-attribution.md	96	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-02-pi-verify-upload-sandbox.md	106	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-02-scanner-correctness-followup.md	74	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-02-scanner-preflight-poison-liveness.md	33	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-04-claude-transcript-effort.md	77	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-04-public-daemon-a2-claude-connection-lifecycle.md	40	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-04-public-daemon-config-slot-foundation.md	136	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-04-public-daemon-consented-background-upkeep.md	64	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-04-public-daemon-multi-account-collection.md	82	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-05-claude-slot-reconnect-local-meters.md	75	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-06-claude-account-request-coverage.md	69	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-09-chatgpt-workspace-monthly-credits.md	32	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-09-claude-session-exclusive-usage.md	99	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-09-codex-session-exclusive-usage.md	105	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-09-launch-event-intake.md	180	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-09-provider-day-totals.md	45	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-12-claude-desktop-resumed-session-account.md	40	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-12-claude-quota-access-witness.md	43	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-12-claude-subagent-active-account-attribution.md	42	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-13-claude-slot-freshness-authority.md	26	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-15-headless-session-role.md	110	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-17-claude-default-slot-freshness.md	35	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-17-codex-subagent-agent-label.md	22	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-21-claude-empty-refresh-token.md	36	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-23-w3-multi-anchor.md	70	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-24-local-context-curves.md	78	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-26-codex-created-thread-lineage.md	31	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-28-codex-created-thread-fresh-epoch.md	279	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-30-claude-owned-context-posture.md	103	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-30-envelope-ack-witness.md	43	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-30-replay-manifest-window.md	65	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-08-31-claude-family-authority-quarantine.md	45	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-02-collector-status-report-kind.md	143	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-02-legacy-settlement-seal.md	168	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-03-census-residue-wire.md	153	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-03-non-progressing-census-residue.md	172	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-08-codex-effective-rate-limit-snapshot.md	22	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-09-claude-in-app-auth-code.md	55	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-10-claude-browser-pty.md	25	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-10-claude-supervisor-support-dir.md	25	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-11-claude-owned-start-emission.md	53	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-11-claude-upkeep-completion-status.md	48	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-11-pi-admin-disabled-verification.md	41	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-12-claude-upkeep-registration-identity.md	61	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-13-duplicate-claude-slot-is-not-attention.md	62	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-14-claude-expired-auth-recovery.md	25	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-14-claude-preflight-family-scope.md	41	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-14-claude-progressive-response-order.md	97	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-14-socket-bind-umask-poisons-state-directories.md	133	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-14-transient-claude-read-failure-is-not-attention.md	85	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-16-companion-code-requirement.md	254	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-21-context-curve-local-measurement.md	164	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-21-health-quota-integrity.md	22	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-22-context-curve-component.md	41	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-24-claude-stale-meter-collision.md	33	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-30-claude-slot-quota-diagnostics.md	48	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-30-claude-stale-auth-root.md	26	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-30-configured-subscription-availability.md	40	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-09-30-quota-observation-evidence.md	26	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-01-claude-original-organization-capture.md	17	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-01-claude-original-session-carrier.md	17	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-01-claude-upkeep-terminal-readback.md	66	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-01-claude-valid-access-continuity.md	29	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-02-cache-effective-upload-witness.md	29	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-02-effective-projection-adoption.md	33	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-02-effective-wire-finalizer-api.md	22	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-02-upload-raw-provider-ids.md	68	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-03-apps-health-reflects-paused-usage-checks.md	98	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-03-claude-slot-account-binding.md	137	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-03-claude-slot-rotation-recovery.md	103	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-03-claude-usage-single-caller-auth-backoff.md	106	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-03-statusline-reset-tolerance.md	32	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-03-validated-upload-receipt-evidence.md	13	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-04-claude-login-phase0.md	63	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-04-codex-managed-telemetry-source-off.md	48	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-04-composition-workspace-discovery.md	31	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-04-quota-window-truth.md	13	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-05-account-display-carrier.md	32	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-05-claude-evidence-cap-refusal.md	50	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-05-codex-orphan-fence-recovery.md	36	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-05-composition-cache-identity.md	52	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-05-daemon-status-freshness.md	53	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-05-partial-upload-error-checkpoints.md	38	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-05-session-admission-reoffer.md	41	inventory only	inventory only	not reviewed in this pass
+docs/session-2026-10-06-owned-source-rotation.md	11	inventory only	inventory only	not reviewed in this pass
+docs/session-account-binding.md	28	inventory only	inventory only	not reviewed in this pass
+docs/session-surfaces.md	41	inventory only	inventory only	not reviewed in this pass
+docs/setup.md	111	inventory only	inventory only	not reviewed in this pass
+docs/support.md	127	inventory only	inventory only	not reviewed in this pass
+docs/troubleshooting.md	163	inventory only	inventory only	not reviewed in this pass
+fixtures/agent-status/claude-multi-anchor-leaf-types.v1.json	225	inventory only	inventory only	not reviewed in this pass
+fixtures/agent-status/claude-multi-anchor-snapshots.v1.json	65	inventory only	inventory only	not reviewed in this pass
+fixtures/agent-status/claude-quota-access-witness.json	44	inventory only	inventory only	not reviewed in this pass
+fixtures/agent-status/display-carrier.json	43	inventory only	inventory only	not reviewed in this pass
+fixtures/agent-status/quota-check-diagnostics-leaf-types.v1.json	149	inventory only	inventory only	not reviewed in this pass
+fixtures/agent-status/quota-check-diagnostics.v1.json	50	inventory only	inventory only	not reviewed in this pass
+fixtures/agent-status/raw-provider-ids-backend-wire.v1.json	102	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/account-request.json	7	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/apps-detect-request.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/apps-root-request.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/apps-status-pi-request.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/context-request.json	19	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/context-without-json-error.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/costs-request.json	20	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/costs-without-json-error.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/daemon-unavailable-error.json	11	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/daemon-unavailable-watch-output.ndjson	2	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/diagnostics-collect-request.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/diagnostics-upload-request.json	14	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/doctor-request.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/fix-codex-request.json	9	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/help-contract.txt	568	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/login-headless-request.json	11	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/logout-local-request.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/logout-request.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/provider-impact-request.json	19	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/provider-impact-without-json-error.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/receipts-human-output.txt	2	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/receipts-json-output.json	35	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/receipts-request.json	10	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/recommendations-request.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/recommendations-without-json-error.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/sessions-request.json	26	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/sessions-without-json-error.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/setup-browser-claim-output.json	29	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/setup-claim-request.json	11	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/setup-failed-output.json	23	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/setup-headless-request.json	11	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/setup-needs-user-action-output.json	26	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/setup-timed-out-output.json	23	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/status-json-output.json	4	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/status-watch-output.ndjson	2	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/uninstall-incomplete-output.ndjson	2	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/uninstall-request.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/update-check-request.json	7	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/verify-repair-request.json	9	inventory only	inventory only	not reviewed in this pass
+fixtures/cli/watch-without-json-error.json	8	inventory only	inventory only	not reviewed in this pass
+fixtures/collector-status/census-residue-scan-status-v1.json	59	inventory only	inventory only	not reviewed in this pass
+fixtures/control/claude-auth-code-operation-v25.json	7	inventory only	inventory only	not reviewed in this pass
+fixtures/control/claude-browser-auth-operation-v23.json	7	inventory only	inventory only	not reviewed in this pass
+fixtures/control/receipts-request.json	9	inventory only	inventory only	not reviewed in this pass
+fixtures/control/receipts-response.json	40	inventory only	inventory only	not reviewed in this pass
+fixtures/control/status-request.json	6	inventory only	inventory only	not reviewed in this pass
+fixtures/control/status-response.json	9	inventory only	inventory only	not reviewed in this pass
+fixtures/diagnostics/redacted-bundle.json	126	inventory only	inventory only	not reviewed in this pass
+fixtures/local-health/README.md	5	inventory only	inventory only	not reviewed in this pass
+fixtures/local-health/contract-matrix.v1.json	776	inventory only	inventory only	not reviewed in this pass
+fixtures/setup/claim-run.json	36	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/attribution-budget-golden.json	764	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/body-witness-ack-normalization-v1.json	1	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/cache-observations-v1-manifest.json	44	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/cache_observation_claude_v1.json	238	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/cache_observation_codex_v1.json	281	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/claude-authority-demotion-cohort.v1.json	49	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/claude-original-source-corpus-v1.json	2809	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/context-curve-v1-golden.json	1	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/context-curve-v1-manifest.json	1	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/context-curve-v1-max-fractional.json	1	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/pi-session-current.jsonl	4	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/pi-session.jsonl	2	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/semantic-envelope-golden.json	4156	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/snapshot-manifest-v2-golden.json	9	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/snapshot-manifest-v2-metadata-only-golden.json	16	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/v2-golden-keys.json	17	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/v3-golden-keys.json	17	inventory only	inventory only	not reviewed in this pass
+fixtures/snapshot-audit/v4-golden-keys.json	17	inventory only	inventory only	not reviewed in this pass
+fixtures/source-health/codex-needs-repair.json	202	inventory only	inventory only	not reviewed in this pass
+fixtures/status/macos-empty.json	39	inventory only	inventory only	not reviewed in this pass
+homebrew/README.md	122	inventory only	inventory only	not reviewed in this pass
+public-export/README.md	218	inventory only	inventory only	not reviewed in this pass
+public-export/deny-patterns.tsv	17	inventory only	fully read (text only)	not reviewed in this pass
+public-export/path-map.tsv	32	inventory only	fully read (text only)	not reviewed in this pass
+public-export/rewrite-rules.tsv	2	inventory only	fully read (text only)	not reviewed in this pass
+public-export/roots.txt	32	inventory only	fully read (text only)	not reviewed in this pass
+release/README.md	558	inventory only	inventory only	not reviewed in this pass
+release/manifest.schema.json	440	inventory only	inventory only	not reviewed in this pass
+schemas/collector-fixture.schema.json	111	inventory only	fully read (text only)	partially read: 73-111
+schemas/collector-manifest.schema.json	229	inventory only	fully read (text only)	not reviewed in this pass
+schemas/connector-registry.schema.json	318	inventory only	inventory only	not reviewed in this pass
+schemas/source-manifest.schema.json	88	inventory only	inventory only	not reviewed in this pass
+scripts/check_macos_resource_bundle_guard.sh	66	structural scan	inventory only	not reviewed in this pass
+scripts/cyclonedx_sbom.sh	109	structural scan	inventory only	not reviewed in this pass
+scripts/dev_e2e_smoke.sh	243	structural scan	inventory only	not reviewed in this pass
+scripts/homebrew_formula.sh	280	structural scan	inventory only	not reviewed in this pass
+scripts/hosted_native_installer.sh	460	structural scan	inventory only	partially read: 1-90,126-208,259-278,300-460
+scripts/macos_attestation_bind.sh	299	structural scan	inventory only	not reviewed in this pass
+scripts/macos_bundle_url_scheme.sh	28	structural scan	inventory only	not reviewed in this pass
+scripts/macos_dev_install.sh	396	structural scan	inventory only	not reviewed in this pass
+scripts/macos_installer_qa.sh	145	structural scan	inventory only	not reviewed in this pass
+scripts/macos_launch_smoke.sh	250	structural scan	inventory only	not reviewed in this pass
+scripts/macos_manifest_signature.sh	156	structural scan	inventory only	partially read: 1-80
+scripts/macos_notarize.sh	435	structural scan	inventory only	not reviewed in this pass
+scripts/macos_package.sh	1128	structural scan	inventory only	search only
+scripts/macos_public_rc_evidence_template.sh	245	structural scan	inventory only	not reviewed in this pass
+scripts/macos_public_rc_gate.sh	302	targeted reading	inventory only	not reviewed in this pass
+scripts/macos_release_gate.sh	498	structural scan	inventory only	not reviewed in this pass
+scripts/macos_signing_readiness.sh	155	structural scan	inventory only	not reviewed in this pass
+scripts/macos_sparkle_bundle_version.sh	15	structural scan	inventory only	not reviewed in this pass
+scripts/macos_stable_closeout_gate.sh	323	targeted reading	inventory only	not reviewed in this pass
+scripts/macos_stable_preflight.sh	650	structural scan	partially read: 1-180	not reviewed in this pass
+scripts/macos_stable_qa_evidence_template.sh	318	structural scan	inventory only	not reviewed in this pass
+scripts/public_repo_bootstrap_plan.sh	488	structural scan	inventory only	not reviewed in this pass
+scripts/public_repo_contract_check.sh	2536	structural scan	partially read: 1-160,693-800,867-972	partially read: 85-141,692-840,890-1140
+scripts/public_repo_cutover_closeout.sh	687	structural scan	inventory only	not reviewed in this pass
+scripts/public_repo_export_bundle.sh	484	structural scan	inventory only	not reviewed in this pass
+scripts/public_repo_export_check.sh	197	structural scan	inventory only	fully read (static only)
+scripts/public_repo_manifest_check.sh	275	structural scan	inventory only	not reviewed in this pass
+scripts/public_repo_secret_scan.sh	297	structural scan	inventory only	not reviewed in this pass
+scripts/public_repo_skeleton_check.sh	246	structural scan	inventory only	not reviewed in this pass
+scripts/public_repo_surface_ci.sh	200	structural scan	fully read (text only)	not reviewed in this pass
+scripts/test_cyclonedx_sbom.sh	31	inventory only	inventory only	not reviewed in this pass
+scripts/test_homebrew_formula.sh	193	inventory only	inventory only	not reviewed in this pass
+scripts/test_hosted_native_installer.sh	229	inventory only	inventory only	fully read (static only)
+scripts/test_macos_attestation_bind.sh	252	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_installer_channel_policy.sh	41	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_launch_smoke.sh	83	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_manifest_signature.sh	157	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_notarize_filter.sh	388	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_package_root_resolution.sh	67	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_package_url_scheme_policy.sh	35	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_public_rc_gate.sh	491	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_release_gate.sh	448	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_resource_bundle_guard.sh	51	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_signing_readiness.sh	89	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_sparkle_bundle_version.sh	240	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_stable_closeout_gate.sh	371	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_stable_preflight.sh	401	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_stable_qa_evidence_template.sh	238	inventory only	inventory only	not reviewed in this pass
+scripts/test_macos_stable_release_workflow.sh	88	inventory only	inventory only	not reviewed in this pass
+scripts/test_public_repo_bootstrap_plan.sh	136	inventory only	inventory only	not reviewed in this pass
+scripts/test_public_repo_contract_check.sh	2064	inventory only	inventory only	not reviewed in this pass
+scripts/test_public_repo_cutover_closeout.sh	256	inventory only	inventory only	not reviewed in this pass
+scripts/test_public_repo_export_bundle.sh	257	inventory only	inventory only	not reviewed in this pass
+scripts/test_public_repo_export_check.sh	110	inventory only	inventory only	not reviewed in this pass
+scripts/test_public_repo_manifest_check.sh	175	inventory only	inventory only	not reviewed in this pass
+scripts/test_public_repo_secret_scan.sh	142	inventory only	inventory only	not reviewed in this pass
+scripts/test_public_repo_skeleton_check.sh	53	inventory only	inventory only	not reviewed in this pass
+scripts/test_public_repo_surface_ci.sh	30	inventory only	inventory only	not reviewed in this pass

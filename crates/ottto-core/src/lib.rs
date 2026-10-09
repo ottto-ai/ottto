@@ -78,9 +78,10 @@ pub use status::{
 };
 pub use token_store::{
     client_control_token, disable_keychain_user_interaction, generate_control_token,
-    load_or_create_control_token, write_owner_only_file_atomic, ControlTokenStore,
-    KeychainSecretStore, TokenStoreError, OTTTO_KEYCHAIN_ACCOUNT, OTTTO_KEYCHAIN_SERVICE,
-    OTTTO_LEGACY_KEYCHAIN_SERVICE, OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
-    OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT, OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT,
-    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+    load_or_create_control_token, write_owner_only_cache_file_atomic, write_owner_only_file_atomic,
+    ControlTokenStore, KeychainSecretStore, TokenStoreError, OTTTO_KEYCHAIN_ACCOUNT,
+    OTTTO_KEYCHAIN_SERVICE, OTTTO_LEGACY_KEYCHAIN_SERVICE,
+    OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
+    OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };

@@ -8,11 +8,13 @@ pub mod canonical_json;
 pub mod claude_browser_auth;
 pub mod claude_local_otel;
 pub(crate) mod claude_refresher;
+mod claude_session_registrations;
 pub(crate) mod claude_spawn_gate;
 pub mod claude_upkeep;
 pub mod client_report;
 pub mod cloud_sessions;
 mod codex_process_homes;
+mod codex_scan_diagnostics;
 pub(crate) mod command_env;
 pub mod context_composition;
 pub mod context_footprint;
@@ -26,20 +28,27 @@ pub(crate) mod fd_guard;
 pub mod keychain;
 mod launch_events;
 pub mod legacy_service;
+mod local_resource_diagnostics;
 pub mod macos_service;
 pub mod mcp_inventory;
 pub(crate) mod net_resilience;
 pub mod net_transition;
 pub mod otlp_relay;
 pub mod provider_daily_reference;
+mod retry_tls;
 pub mod session_attribution;
 pub mod snapshot_audit;
 pub mod snapshot_client;
+pub(crate) mod snapshot_retry;
+mod snapshot_roots;
 pub mod snapshot_sync;
 pub mod snapshot_watcher;
 pub mod snapshots;
+mod source_rotation;
 #[cfg(test)]
 mod test_scratch;
+mod transcript_acquisition;
+mod transcript_cache;
 #[cfg(unix)]
 pub mod unix_socket;
 pub mod upload_receipts;
@@ -175,7 +184,7 @@ pub enum LocalApiError {
     IdentityMutationInProgress,
     #[error("invalid local control request: {0}")]
     InvalidRequest(String),
-    #[error("Ottto found a manually edited managed fence and needs you to review it.")]
+    #[error("Ottto left the configuration unchanged. Review the Ottto telemetry entries and fence markers in the source config, then retry.")]
     ManualFenceReviewRequired,
     #[error("local operation failed: {0}")]
     LocalOperationFailed(String),
@@ -210,6 +219,7 @@ impl ControlToken {
 
 #[derive(Debug, Clone)]
 pub struct LocalDaemon {
+    transcript_cache: Arc<snapshots::sampled_scan::SharedCache>,
     inner: Arc<Mutex<DaemonState>>,
     control_token: ControlToken,
 }
@@ -417,6 +427,7 @@ impl LocalDaemon {
     ) -> Self {
         let now = now.into();
         Self {
+            transcript_cache: Arc::new(snapshots::sampled_scan::SharedCache::default()),
             inner: Arc::new(Mutex::new(DaemonState {
                 machine,
                 relay: RelayState {
@@ -526,6 +537,38 @@ impl LocalDaemon {
 
     pub fn status_for_trusted_client(&self) -> Result<DaemonStatus, LocalApiError> {
         self.status_for_authorized_client()
+    }
+
+    /// Allocation-free stop fence for an optional delivery-only turn.
+    pub(crate) fn snapshot_retry_running(&self) -> Result<bool, LocalApiError> {
+        Ok(self.state()?.running)
+    }
+
+    /// Allocation-free account identity fence for suspended snapshot scans.
+    pub(crate) fn snapshot_scan_account_witness(&self) -> Result<[u8; 32], LocalApiError> {
+        use sha2::{Digest, Sha256};
+        let state = self.state()?;
+        let mut digest = Sha256::new();
+        digest.update(b"ottto:snapshot-scan-account:v1\0");
+        digest.update(match state.account.state {
+            ottto_protocol::LocalAccountState::NotConnected => b"not_connected".as_slice(),
+            ottto_protocol::LocalAccountState::ClaimPending => b"claim_pending".as_slice(),
+            ottto_protocol::LocalAccountState::ReattachRequired => b"reattach_required".as_slice(),
+            ottto_protocol::LocalAccountState::Connected => b"connected".as_slice(),
+            ottto_protocol::LocalAccountState::ResetRequired => b"reset_required".as_slice(),
+            ottto_protocol::LocalAccountState::Error => b"error".as_slice(),
+        });
+        for value in [
+            state.account.user.as_ref().map(|u| u.id.as_str()),
+            state.account.organization.as_ref().map(|o| o.id.as_str()),
+            state.account.connected_at.as_deref(),
+        ] {
+            digest.update([0]);
+            if let Some(value) = value {
+                digest.update(value.as_bytes());
+            }
+        }
+        Ok(digest.finalize().into())
     }
 
     pub fn account_for_trusted_client(&self) -> Result<LocalAccountBinding, LocalApiError> {
@@ -1731,6 +1774,11 @@ impl LocalDaemon {
                 diagnostics_section("installation", installation),
                 diagnostics_section("repair", repair),
                 diagnostics_section("security", security),
+                #[cfg(unix)]
+                diagnostics_section(
+                    "claude_local_evidence",
+                    claude_local_otel::support_health::diagnostics_items(&default_support_dir()),
+                ),
             ],
         })
     }
@@ -4714,6 +4762,33 @@ mod tests {
         assert_eq!(approval.surface, RepairApprovalSurface::Browser);
         assert!(approval.setup_safe);
         assert!(!approval.server_backed);
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn diagnostics_collect_includes_support_only_claude_evidence_health() {
+        let support = test_scratch::private_dir("claude-diagnostics-consumer");
+        let _support_guard = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let bundle = daemon().diagnostics_stub(TOKEN).unwrap();
+        assert_eq!(
+            diagnostic_item(
+                &bundle,
+                "claude_local_evidence",
+                "complete_capture_authority"
+            ),
+            Some(&RedactedValue::Bool(false))
+        );
+        assert_eq!(
+            diagnostic_item(&bundle, "claude_local_evidence", "purpose"),
+            Some(&RedactedValue::String(
+                "bounded_support_inspection_only".into()
+            ))
+        );
+        let encoded = serde_json::to_string(&bundle).unwrap();
+        assert!(!encoded.contains(support.to_str().unwrap()));
+        assert!(!bundle.upload.requested);
+        std::fs::remove_dir_all(support).unwrap();
     }
 
     #[test]
@@ -8658,3 +8733,9 @@ mod tests {
         }
     }
 }
+
+mod heap_layout_bound;
+
+#[cfg(test)]
+mod retry_allocation_probe;
+mod retry_retention_bound;

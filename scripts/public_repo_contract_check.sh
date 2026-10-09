@@ -572,9 +572,16 @@ def check_privacy_docs_contracts() -> None:
         (
             "must not upload raw prompts, raw responses, tool output,\n"
             "command output, browser cookies, OAuth credentials, API keys, passwords,\n"
-            "absolute local paths, provider account emails, or account and organization\n"
-            "labels",
+            "absolute local paths",
             "privacy docs must prohibit uploading raw private local data",
+        ),
+        (
+            "email is permitted only in the named status display\nfields",
+            "privacy docs must scope email to named status display fields",
+        ),
+        (
+            "Tokens and credentials stay local",
+            "privacy docs must keep credentials local",
         ),
         ("derived and redacted fields", "privacy docs must require derived/redacted snapshot fields"),
         ("hashed workspace identity", "privacy docs must preserve hashed workspace identity wording"),

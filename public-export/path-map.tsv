@@ -3,6 +3,8 @@
 .github/dependabot.yml	.github	Public repository root file is already in export shape.
 .github/workflows/ci.yml	.github/workflows	Public repository root file is already in export shape.
 .github/workflows/macos-stable-release.yml	.github/workflows	Public repository root file is already in export shape.
+AGENTS.md	.	Public repository root file is already in export shape.
+CLAUDE.md	.	Public repository root file is already in export shape.
 CODE_OF_CONDUCT.md	.	Public repository root file is already in export shape.
 CONTRIBUTING.md	.	Public repository root file is already in export shape.
 Cargo.lock	.	Public repository root file is already in export shape.
@@ -13,6 +15,7 @@ README.md	.	Public repository root file is already in export shape.
 SECURITY.md	.	Public repository root file is already in export shape.
 SUPPORT.md	.	Public repository root file is already in export shape.
 TRADEMARKS.md	.	Public repository root file is already in export shape.
+agent-adapters/autoreview/	agent-adapters/autoreview/	Public repository root is already in export shape.
 agent-adapters/claude-code-skill/	agent-adapters/claude-code-skill/	Public repository root is already in export shape.
 agent-adapters/codex-skill/	agent-adapters/codex-skill/	Public repository root is already in export shape.
 connectors/	connectors/	Public repository root is already in export shape.

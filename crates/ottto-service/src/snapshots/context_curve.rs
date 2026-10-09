@@ -682,3 +682,11 @@ pub(super) fn validate_context_curve(
 
 #[cfg(test)]
 mod tests;
+
+// Closed owned-field inventory for optional scan overlap admission.
+crate::heap_layout_bound::fields!(ContextCurveCandidateBoundary; observed_at, point_count_before);
+crate::heap_layout_bound::fields!(ContextCurveCandidatePoint; observed_at, effective_input_tokens, model, context_window_tokens);
+crate::heap_layout_bound::fields!(SnapshotContextCurve; contract_version, parser_revision, ownership_revision, sampling_revision, coverage, total_owned_request_count, retained_point_count, total_compaction_boundary_count, retained_boundary_count, points, boundaries, model_windows);
+crate::heap_layout_bound::fields!(SnapshotContextCurveBoundary; boundary_index, observed_at, before_owned_request_ordinal, after_owned_request_ordinal, segment_before_ordinal, segment_after_ordinal);
+crate::heap_layout_bound::fields!(SnapshotContextCurveModelWindow; model_window_index, model, context_window_tokens, evidence_kind, evidence_revision);
+crate::heap_layout_bound::fields!(SnapshotContextCurvePoint; owned_request_ordinal, observed_at, effective_input_tokens, model_window_index, segment_ordinal, retention_flags, compaction_before_request_boundary_index, compaction_after_request_boundary_index);

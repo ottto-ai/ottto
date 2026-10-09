@@ -964,8 +964,19 @@ pub(crate) fn bounded_command_stdout(
     arguments: &[&str],
     maximum: usize,
 ) -> Option<Vec<u8>> {
+    bounded_command_stdout_with_env(program, arguments, maximum, &[])
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn bounded_command_stdout_with_env(
+    program: &str,
+    arguments: &[&str],
+    maximum: usize,
+    environment: &[(&str, &str)],
+) -> Option<Vec<u8>> {
     let mut child = Command::new(program)
         .args(arguments)
+        .envs(environment.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1220,5 +1231,21 @@ mod tests {
             Some(SnapshotSource::ClaudeCode)
         );
         assert!(definitions[0].scheduler_kind == ExternalSchedulerKind::Cron);
+    }
+}
+
+crate::heap_layout_bound::fields!(ExternalSchedulerInventory; definitions);
+
+crate::heap_layout_bound::fields!(ExternalSchedulerDefinition; scheduler_kind, opaque_id, launchd_label, provider_source, prompt_signature, repository_hash, schedule);
+
+crate::heap_layout_bound::fields!(ScheduleConstraint; calendar);
+
+crate::heap_layout_bound::fields!(CalendarConstraint; minute, hour, weekday, day, month);
+
+impl crate::heap_layout_bound::HeapLayoutBound for ExternalSchedulerKind {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Launchd | Self::Cron => c.add(0),
+        }
     }
 }

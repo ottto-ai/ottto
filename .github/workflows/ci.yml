@@ -25,6 +25,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Compiler receipt
+        run: rustc -Vv && cargo -V
+
       - name: Install Rust components
         run: rustup component add rustfmt clippy
 
@@ -42,6 +45,13 @@ jobs:
 
       - name: Runtime tests
         run: cargo test --workspace --locked
+
+      - name: Layout coverage receipt
+        run: |
+          set -euo pipefail
+          cargo test -p ottto-service --lib --locked heap_layout_bound::sampled_scalar_buffer_tests::layout_gate_coverage_receipt -- --exact --nocapture | tee "$RUNNER_TEMP/layout-coverage-receipt.log"
+          # An exact filter matching zero tests must not count as a receipt.
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/layout-coverage-receipt.log"
 
       - name: Connector tests
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked

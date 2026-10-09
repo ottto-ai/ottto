@@ -35,6 +35,7 @@ thiserror.workspace = true
 time.workspace = true
 toml_edit.workspace = true
 ureq.workspace = true
+webpki-roots.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

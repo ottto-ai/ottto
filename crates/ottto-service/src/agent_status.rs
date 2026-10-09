@@ -3484,7 +3484,7 @@ fn collect_claude_status(
                 .diagnostics
                 .extend(default_claude_unusable_login_diagnostic(
                     login_state,
-                    crate::command_env::executable_path("claude").is_some(),
+                    crate::command_env::claude_default_login_executable_path(&home_dir()).is_some(),
                 ));
         }
     }
@@ -5884,6 +5884,27 @@ fn custom_claude_snapshot_from_usage(
     Ok((snapshot, state))
 }
 
+const CLAUDE_CACHE_REUSED_MESSAGE: &str =
+    "Locally cached quota evidence was reused; no provider check was made.";
+/// Retain a canonical clock only on a bound cache-reuse outcome. Its deadline
+/// was still ahead at the producer's check time; consumers compare it with now.
+fn safe_claude_cache_retry_after(diagnostic: &AgentStatusDiagnostic) -> Option<String> {
+    let deadline = diagnostic
+        .retry_after
+        .as_deref()
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())?;
+    let observed = diagnostic
+        .observed_at
+        .as_deref()
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())?;
+    if deadline <= observed {
+        return None;
+    }
+    u64::try_from(deadline.unix_timestamp())
+        .ok()
+        .and_then(rfc3339_from_unix_seconds)
+}
+
 /// Persist only known producer outcomes, never provider errors, slot paths or
 /// caller-supplied messages. Both hashes must already match the proven slot.
 fn safe_claude_slot_check_diagnostics(
@@ -5906,7 +5927,7 @@ fn safe_claude_slot_check_diagnostics(
         let message = match diagnostic.code.as_str() {
             "claude_oauth_usage_check_failed" => "The exact-account quota provider request failed.",
             "claude_oauth_usage_check_suppressed" => "The local quota breaker suppressed the provider request; no provider check was made.",
-            "claude_oauth_usage_cache_reused" => "Locally cached quota evidence was reused; no provider check was made.",
+            "claude_oauth_usage_cache_reused" => CLAUDE_CACHE_REUSED_MESSAGE,
             "claude_oauth_usage_check_succeeded" => "A supported exact-account quota response was collected successfully.",
             "claude_oauth_usage_network_disabled" => "Quota network collection is disabled on this machine.",
             "claude_oauth_usage_collection_in_progress" => "Quota collection is already in progress; no duplicate provider check was made.",
@@ -5948,11 +5969,14 @@ fn safe_claude_slot_check_diagnostics(
         if claude_worker_diagnostic_message(&diagnostic.code).is_some() && clock.is_none() {
             continue;
         }
-        result.push(
+        let mut safe =
             AgentStatusDiagnostic::source(&diagnostic.code, diagnostic.severity.clone(), message)
                 .with_observed_at(clock)
-                .with_quota_binding(Some(account.to_string()), Some(organization.to_string())),
-        );
+                .with_quota_binding(Some(account.to_string()), Some(organization.to_string()));
+        if diagnostic.code == "claude_oauth_usage_cache_reused" && safe.observed_at.is_some() {
+            safe.retry_after = safe_claude_cache_retry_after(diagnostic);
+        }
+        result.push(safe);
     }
     result
 }
@@ -7591,12 +7615,11 @@ fn upkeep_state_diagnostic(
 
 /// The warning for a default login that cannot be used, or none.
 ///
-/// Without a `claude` CLI on this Mac nothing uses the default login: Claude
-/// Desktop authenticates its own Code sessions, and a keychain item a removed
-/// CLI left behind (often already cleared by that CLI) is not actionable. The
-/// slot itself still reports `credential_unavailable`; only the user-visible
-/// warning is withheld, as it was while status ran `claude auth status`, which
-/// added no diagnostic when the command was not found.
+/// Without a standalone CLI install, a leftover default login is not an
+/// actionable warning for Desktop-only use: Desktop authenticates its own Code
+/// sessions. Its bundled binary alone does not make that login a prerequisite.
+/// The slot/account state is unchanged; registered-slot warnings do not use
+/// this predicate. Explicit CLI search paths still count as default consumers.
 fn default_claude_unusable_login_diagnostic(
     state: ClaudeLocalLoginState,
     claude_cli_installed: bool,
@@ -9571,6 +9594,16 @@ fn collect_claude_oauth_usage_unstamped(
             claude_oauth_usage_caller_auth_hold(breaker, caller, now, credential_expires_at)
         })
         .cloned();
+    // The future cache gate alone also covers ordinary refresh. Require the
+    // matching-account rate-limit receipt and no competing auth/circuit hold
+    // before naming a Retry-After reason. This changes disclosure only.
+    let rate_limit_retry_evidenced = breaker.as_ref().is_some_and(|breaker| {
+        breaker.rate_limit_failures > 0
+            && breaker.auth_failures == 0
+            && !claude_oauth_usage_breaker_is_open(breaker, now)
+    }) && caller_auth_hold.is_none()
+        && access_token.is_some()
+        && !claude_access_token_locally_expired(credential_expires_at, now);
     let open_breaker = breaker.filter(|breaker| claude_oauth_usage_breaker_is_open(breaker, now));
 
     let mut exact_stale_fallback = None;
@@ -9592,8 +9625,26 @@ fn collect_claude_oauth_usage_unstamped(
                 )
                 || now < cache.next_refresh_after_epoch_seconds)
         {
-            return ClaudeOAuthUsageOutcome::from(Ok(claude_oauth_usage_from_cache(cache, now)))
-                .with_check_outcome("claude_oauth_usage_cache_reused", "A locally cached quota reading was reused under the local refresh or retry-after gate; no provider check was made.", now);
+            let retry_after = (rate_limit_retry_evidenced
+                && cache_age
+                    > claude_oauth_usage_fresh_age_seconds(
+                        account_identifier_hash,
+                        organization_identifier_hash,
+                    )
+                && now < cache.next_refresh_after_epoch_seconds)
+                .then(|| rfc3339_from_unix_seconds(cache.next_refresh_after_epoch_seconds))
+                .flatten();
+            let mut outcome =
+                ClaudeOAuthUsageOutcome::from(Ok(claude_oauth_usage_from_cache(cache, now)))
+                    .with_check_outcome(
+                        "claude_oauth_usage_cache_reused",
+                        CLAUDE_CACHE_REUSED_MESSAGE,
+                        now,
+                    );
+            if let Some(diagnostic) = outcome.diagnostics.last_mut() {
+                diagnostic.retry_after = retry_after;
+            }
+            return outcome;
         }
         if now < cache.next_refresh_after_epoch_seconds {
             return ClaudeOAuthUsageOutcome::from(Err(
@@ -16075,6 +16126,17 @@ pub(crate) fn home_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
+/// Local display supplement only: never contributes billing/account evidence.
+pub(crate) fn claude_session_registrations() -> crate::claude_session_registrations::Registrations {
+    #[cfg(not(test))]
+    {
+        crate::claude_session_registrations::collect(&home_path(".claude/sessions"))
+    }
+    // Ordinary unit tests must not acquire the operator's provider state.
+    #[cfg(test)]
+    crate::claude_session_registrations::Registrations::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -18421,8 +18483,8 @@ mod tests {
         let value = serde_json::to_value(raw_provider_id_backend_wire_snapshots())
             .expect("serialize backend wire snapshots");
         let wire = value.to_string();
-        assert!(!wire.contains('@'), "email must not reach the backend");
-        assert!(!wire.contains("Synthetic Workspace Label"));
+        assert!(wire.contains("synthetic-owner@example.invalid"));
+        assert!(wire.contains("Synthetic Workspace Label"));
         for raw in [
             "00000000-0000-4000-8000-00000000c1a1",
             "00000000-0000-4000-8000-00000000c1b2",
@@ -23160,6 +23222,8 @@ for line in sys.stdin:
                 "subscriptionType": "max"
             }
         }));
+        fs::remove_file(fixture.root.join("bin/claude")).expect("remove fixture CLI");
+        assert!(crate::command_env::claude_default_login_executable_path(&home_dir()).is_none());
         let descriptor = fixture.descriptor.clone();
 
         let failure = resolve_registered_claude_slot(descriptor.clone())
@@ -25699,6 +25763,150 @@ for line in sys.stdin:
         );
         clear_claude_oauth_usage_auth_breaker(other.0, other.1, "slot-u");
         assert!(!claude_oauth_usage_breaker_path(other.0, other.1).exists());
+        let _ = fs::remove_dir_all(support_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn retry_after_cache_disclosure_requires_exact_rate_limit_evidence() {
+        let support_dir = single_caller_test_support_dir("retry-after-copy");
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let _network_guard =
+            EnvVarGuard::set_os("OTTTO_DISABLE_CLAUDE_OAUTH_USAGE", OsString::from("0"));
+        let now = current_unix_seconds();
+        let observed = now.saturating_sub(2 * 60 * 60);
+        let deadline = now + 60 * 60;
+        let account = "retry-account";
+        let organization = "retry-organization";
+        let caller = ClaudeOAuthUsageCaller::RegisteredSlot("retry-slot".to_string());
+        let fingerprint = claude_oauth_usage_config_fingerprint();
+        let calls_before = CLAUDE_OAUTH_PROVIDER_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        single_caller_test_cache(account, organization, observed);
+        let mut cache = read_claude_oauth_usage_cache(account, organization).expect("cache");
+        cache.next_refresh_after_epoch_seconds = deadline;
+        write_claude_oauth_usage_cache(&cache).expect("retry gate");
+
+        // A future gate and an old sample alone do not prove rate limiting.
+        for other_org in [organization, "another-organization"] {
+            if other_org != organization {
+                record_claude_oauth_usage_failure(
+                    ClaudeOAuthUsageFailure::RateLimited,
+                    account,
+                    other_org,
+                    &fingerprint,
+                    now,
+                );
+            }
+            let result = collect_claude_oauth_usage_with_access_token(
+                account,
+                organization,
+                Some("synthetic-not-sent".to_string()),
+                &caller,
+            );
+            assert_eq!(result.diagnostics[0].message, CLAUDE_CACHE_REUSED_MESSAGE);
+            assert!(result.diagnostics[0].retry_after.is_none());
+        }
+        record_claude_oauth_usage_failure(
+            ClaudeOAuthUsageFailure::RateLimited,
+            account,
+            organization,
+            &fingerprint,
+            now,
+        );
+        let result = collect_claude_oauth_usage_with_access_token(
+            account,
+            organization,
+            Some("synthetic-not-sent".to_string()),
+            &caller,
+        );
+        assert_eq!(
+            result.diagnostics[0].retry_after,
+            rfc3339_from_unix_seconds(deadline)
+        );
+        let usage = result.result.expect("last-known limits");
+        assert_eq!(usage.windows[0].used_percent, Some(25));
+        assert_eq!(usage.windows[0].freshness, AgentQuotaWindowFreshness::Stale);
+        assert_eq!(
+            usage.windows[0].observed_at,
+            rfc3339_from_unix_seconds(observed)
+        );
+        assert_eq!(
+            usage.windows[0].organization_identifier_hash.as_deref(),
+            Some(organization)
+        );
+
+        // Missing/expired credentials and an auth hold must not be described
+        // as an automatic rate-limit retry, even if old 429 evidence remains.
+        for token in [None, Some("synthetic-not-sent".to_string())] {
+            let expiry = token
+                .as_ref()
+                .map(|_| rfc3339_from_unix_seconds(now - 1).unwrap());
+            let result = collect_claude_oauth_usage_with_credential(
+                account,
+                organization,
+                token,
+                expiry,
+                &caller,
+            );
+            assert_eq!(result.diagnostics[0].message, CLAUDE_CACHE_REUSED_MESSAGE);
+            assert!(result.diagnostics[0].retry_after.is_none());
+        }
+        record_claude_oauth_usage_auth_failure(
+            &caller,
+            401,
+            account,
+            organization,
+            &fingerprint,
+            now,
+            None,
+        );
+        let result = collect_claude_oauth_usage_with_access_token(
+            account,
+            organization,
+            Some("synthetic-not-sent".to_string()),
+            &caller,
+        );
+        assert_eq!(result.diagnostics[0].message, CLAUDE_CACHE_REUSED_MESSAGE);
+        assert!(result.diagnostics[0].retry_after.is_none());
+        clear_claude_oauth_usage_breaker(account, organization);
+        record_claude_oauth_usage_failure(
+            ClaudeOAuthUsageFailure::RateLimited,
+            account,
+            organization,
+            &fingerprint,
+            now,
+        );
+        // An ordinary fresh sample still uses ordinary cache wording.
+        cache.observed_at_epoch_seconds = now;
+        write_claude_oauth_usage_cache(&cache).expect("fresh cache");
+        let result = collect_claude_oauth_usage_with_access_token(
+            account,
+            organization,
+            Some("synthetic-not-sent".to_string()),
+            &caller,
+        );
+        assert_eq!(result.diagnostics[0].message, CLAUDE_CACHE_REUSED_MESSAGE);
+        assert!(result.diagnostics[0].retry_after.is_none());
+        // Expired or absent deadlines are no longer Retry-After holds. Use
+        // no credential so this test also proves no provider request occurred.
+        cache.observed_at_epoch_seconds = observed;
+        for ended in [now - 1, 0] {
+            cache.next_refresh_after_epoch_seconds = ended;
+            write_claude_oauth_usage_cache(&cache).expect("ended hold");
+            let result =
+                collect_claude_oauth_usage_with_access_token(account, organization, None, &caller);
+            assert!(result
+                .diagnostics
+                .iter()
+                .all(|item| item.retry_after.is_none()));
+        }
+        assert_eq!(
+            CLAUDE_OAUTH_PROVIDER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before
+        );
         let _ = fs::remove_dir_all(support_dir);
     }
 
@@ -28843,8 +29051,8 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             .redacted_for_backend()
             .account
             .expect("upload account");
-        assert!(upload.email.is_none());
-        assert!(upload.organization_label.is_none());
+        assert_eq!(upload.email, account.email);
+        assert_eq!(upload.organization_label, account.organization_label);
         assert_eq!(upload.plan_type, account.plan_type);
         assert_eq!(
             upload.account_identifier_hash,
@@ -29060,6 +29268,52 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         assert!(!serde_json::to_string(&snapshot)
             .expect("snapshot json")
             .contains("private"));
+    }
+
+    #[test]
+    fn retry_after_cache_disclosure_persists_only_a_canonical_bound_clock() {
+        let deadline = current_unix_seconds() + 3600;
+        let mut diagnostic = AgentStatusDiagnostic::source(
+            "claude_oauth_usage_cache_reused",
+            AgentDiagnosticSeverity::Info,
+            "private message",
+        )
+        .with_observed_at(rfc3339_from_unix_seconds(deadline - 3600))
+        .with_quota_binding(
+            Some("account".to_string()),
+            Some("organization".to_string()),
+        );
+        diagnostic.retry_after = rfc3339_from_unix_seconds(deadline);
+        let safe =
+            safe_claude_slot_check_diagnostics(&[diagnostic.clone()], "account", "organization");
+        assert_eq!(safe[0].message, CLAUDE_CACHE_REUSED_MESSAGE);
+        assert_eq!(safe[0].retry_after, diagnostic.retry_after);
+        assert_eq!(
+            safe_claude_slot_check_diagnostics(&safe, "account", "organization"),
+            safe
+        );
+        assert!(
+            safe_claude_slot_check_diagnostics(&[diagnostic.clone()], "account", "foreign")
+                .is_empty()
+        );
+        for clock in [
+            None,
+            Some("private@example.test"),
+            Some("not-a-clock"),
+            Some("1960-01-01T00:00:00Z"),
+        ] {
+            let mut invalid = diagnostic.clone();
+            invalid.retry_after = clock.map(ToString::to_string);
+            let safe = safe_claude_slot_check_diagnostics(&[invalid], "account", "organization");
+            assert!(safe[0].retry_after.is_none());
+        }
+        let mut no_clock = diagnostic;
+        no_clock.observed_at = None;
+        assert!(
+            safe_claude_slot_check_diagnostics(&[no_clock], "account", "organization")[0]
+                .retry_after
+                .is_none()
+        );
     }
 
     #[test]
@@ -30429,7 +30683,12 @@ exit 0
                 .collect::<Vec<_>>(),
         )
         .expect("serialize upload");
-        assert!(!wire.contains('@'), "no email in uploads");
+        for snapshot in &snapshots {
+            let diagnostics =
+                serde_json::to_string(&snapshot.clone().redacted_for_backend().diagnostics)
+                    .expect("serialize redacted diagnostics");
+            assert!(!diagnostics.contains('@'), "no email in diagnostic uploads");
+        }
         assert!(
             !wire.contains("Claude Max 20x"),
             "the local message is not uploaded"
@@ -32431,3 +32690,7 @@ exit 44
         }
     }
 }
+
+crate::heap_layout_bound::fields!(AgentStatusCollection; snapshots, source_health_snapshot, codex_scan_homes, codex_home_bindings);
+
+crate::heap_layout_bound::fields!(CodexHomeBinding; home, account_identifier_hash, workspace_identifier_hash, auth_modified_at);

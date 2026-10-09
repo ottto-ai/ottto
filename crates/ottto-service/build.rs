@@ -1,4 +1,14 @@
 fn main() {
+    let compiler = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let version = std::process::Command::new(compiler)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=OTTTO_SCAN_LAYOUT_RUSTC={}", version.trim());
+    println!("cargo:rerun-if-env-changed=RUSTC");
     let manifest_dir = std::path::PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"),
     );

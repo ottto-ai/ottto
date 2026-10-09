@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
@@ -358,6 +359,18 @@ impl FileClaudeConfigSlotSettingsStore {
     pub fn load(&self) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
         let persisted = self.load_persisted()?;
         Ok(status_contract(&persisted))
+    }
+
+    /// Transcript discovery needs registration paths, never login material or
+    /// upkeep consent. Share the normal decoder/validation, with a bounded
+    /// regular-file read and no retired reconnect sidecar acquisition.
+    pub fn registered_config_dirs(&self) -> Result<Vec<PathBuf>, ClaudeConfigSlotSettingsError> {
+        let persisted = self.load_persisted_with_limit(Some(1024 * 1024), false)?;
+        Ok(persisted
+            .registered_slots
+            .into_iter()
+            .map(|slot| PathBuf::from(slot.config_dir))
+            .collect())
     }
 
     /// Inspect the current registry while holding the same process and
@@ -1424,10 +1437,71 @@ impl FileClaudeConfigSlotSettingsStore {
     fn load_persisted(
         &self,
     ) -> Result<PersistedClaudeConfigSlotSettingsV1, ClaudeConfigSlotSettingsError> {
-        let mut persisted = if self.path.exists() {
-            let body = fs::read_to_string(&self.path).map_err(|error| {
-                ClaudeConfigSlotSettingsError::State(format!("read settings: {error}"))
-            })?;
+        self.load_persisted_with_limit(None, true)
+    }
+
+    fn load_persisted_with_limit(
+        &self,
+        limit: Option<usize>,
+        include_retired_reconnect_filter: bool,
+    ) -> Result<PersistedClaudeConfigSlotSettingsV1, ClaudeConfigSlotSettingsError> {
+        let present = if limit.is_some() {
+            match fs::symlink_metadata(&self.path) {
+                Ok(metadata) => {
+                    if !metadata.is_file() || metadata.file_type().is_symlink() {
+                        return Err(ClaudeConfigSlotSettingsError::State(
+                            "registration settings are not a regular file".into(),
+                        ));
+                    }
+                    true
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(ClaudeConfigSlotSettingsError::State(format!(
+                        "inspect settings: {error}"
+                    )));
+                }
+            }
+        } else {
+            self.path.exists()
+        };
+        let mut persisted = if present {
+            let body = if let Some(limit) = limit {
+                let mut options = fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+                }
+                let file = options.open(&self.path).map_err(|error| {
+                    ClaudeConfigSlotSettingsError::State(format!("open settings: {error}"))
+                })?;
+                let metadata = file.metadata().map_err(|error| {
+                    ClaudeConfigSlotSettingsError::State(format!("inspect settings: {error}"))
+                })?;
+                if !metadata.is_file() || metadata.len() > limit as u64 {
+                    return Err(ClaudeConfigSlotSettingsError::State(
+                        "registration settings exceed regular-file read limit".into(),
+                    ));
+                }
+                let mut body = String::new();
+                file.take(limit as u64 + 1)
+                    .read_to_string(&mut body)
+                    .map_err(|error| {
+                        ClaudeConfigSlotSettingsError::State(format!("read settings: {error}"))
+                    })?;
+                if body.len() > limit {
+                    return Err(ClaudeConfigSlotSettingsError::State(
+                        "registration settings grew beyond read limit".into(),
+                    ));
+                }
+                body
+            } else {
+                fs::read_to_string(&self.path).map_err(|error| {
+                    ClaudeConfigSlotSettingsError::State(format!("read settings: {error}"))
+                })?
+            };
             serde_json::from_str::<PersistedClaudeConfigSlotSettingsV1>(&body).map_err(|error| {
                 ClaudeConfigSlotSettingsError::State(format!("parse settings: {error}"))
             })?
@@ -1443,7 +1517,11 @@ impl FileClaudeConfigSlotSettingsStore {
                 )))
             }
         }
-        if let Some(sidecar) = self.read_retired_reconnect_filter()? {
+        if let Some(sidecar) = include_retired_reconnect_filter
+            .then(|| self.read_retired_reconnect_filter())
+            .transpose()?
+            .flatten()
+        {
             if persisted.retired_reconnect_operation_filter.is_empty() {
                 persisted.retired_reconnect_operation_filter = sidecar;
             } else {
@@ -2589,6 +2667,54 @@ fn status_contract_with_selected_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_registration_paths_ignore_upkeep_and_retired_sidecar() {
+        let path = temp_path("transcript-paths");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        store
+            .register_path(1, "/synthetic/claude-one".into())
+            .unwrap();
+        store
+            .register_path(1, "/synthetic/claude-two".into())
+            .unwrap();
+        fs::write(store.retired_reconnect_filter_path(), b"corrupt sidecar").unwrap();
+        assert_eq!(
+            store.registered_config_dirs().unwrap(),
+            vec![
+                PathBuf::from("/synthetic/claude-one"),
+                PathBuf::from("/synthetic/claude-two"),
+            ]
+        );
+        assert!(store.load().is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn transcript_registration_read_is_bounded_and_missing_is_empty() {
+        let path = temp_path("transcript-bound");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        assert!(store.registered_config_dirs().unwrap().is_empty());
+        fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        assert!(store.registered_config_dirs().is_err());
+        fs::write(&path, b"not JSON").unwrap();
+        assert!(store.registered_config_dirs().is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_registration_rejects_symlink_even_with_missing_target() {
+        let path = temp_path("transcript-symlink");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(path.with_extension("missing"), &path).unwrap();
+        assert!(FileClaudeConfigSlotSettingsStore::new(&path)
+            .registered_config_dirs()
+            .is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir()

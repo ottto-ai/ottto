@@ -3,6 +3,8 @@
 .github/dependabot.yml
 .github/workflows/ci.yml
 .github/workflows/macos-stable-release.yml
+AGENTS.md
+CLAUDE.md
 CODE_OF_CONDUCT.md
 CONTRIBUTING.md
 Cargo.lock
@@ -13,6 +15,7 @@ README.md
 SECURITY.md
 SUPPORT.md
 TRADEMARKS.md
+agent-adapters/autoreview/
 agent-adapters/claude-code-skill/
 agent-adapters/codex-skill/
 connectors/

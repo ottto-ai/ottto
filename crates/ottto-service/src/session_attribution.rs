@@ -204,6 +204,38 @@ impl SessionAttributionContext {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn expire_launch_lookup_for_test(&self) {
+        self.launch_events.expire_for_test();
+    }
+
+    pub(crate) fn launches_prepared(&self, workers: &[String]) -> bool {
+        self.launch_events.prepared(workers)
+    }
+
+    pub(crate) fn prepare_launch_step(&self, workers: &[String]) -> Result<bool, ()> {
+        self.launch_events.prepare_step(workers)
+    }
+
+    pub(crate) fn launch_witness(&self, workers: &[String]) -> Option<String> {
+        let mut hasher = Sha256::new();
+        let mut any = false;
+        for worker in workers {
+            if let Some(event) = self.launch_events.matching(worker) {
+                any = true;
+                hasher.update(event.controller_session_ref.as_bytes());
+                hasher.update([0]);
+                hasher.update(event.worker_session_ref.as_bytes());
+                hasher.update([0]);
+                hasher.update(event.workflow_ref.as_deref().unwrap_or("").as_bytes());
+                hasher.update([0]);
+                hasher.update(event.agent_kind.as_bytes());
+                hasher.update([0]);
+            }
+        }
+        any.then(|| format!("{:x}", hasher.finalize()))
+    }
+
     /// Direct lineage facts for a worker session an instrumented launcher
     /// started, or nothing at all.
     ///
@@ -2457,3 +2489,13 @@ status = "ACTIVE"
         assert!(fits_wire_budget(&facts));
     }
 }
+
+// Closed owned-field inventory for optional scan overlap admission.
+crate::heap_layout_bound::fields!(SessionAttributionFact; field, value, display_label, display_label_source, evidence);
+crate::heap_layout_bound::fields!(SessionFieldEvidence; kind, strength, observed_at, source_version, evidence_ref);
+
+crate::heap_layout_bound::fields!(SessionAttributionContext; key, provider_schedules, external_schedulers, launch_events);
+
+crate::heap_layout_bound::fields!(ProviderScheduleInventory; definitions);
+
+crate::heap_layout_bound::fields!(ProviderScheduleDefinition; opaque_id, prompt_signature);
