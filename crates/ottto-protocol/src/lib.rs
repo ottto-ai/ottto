@@ -4370,7 +4370,7 @@ fn redact_credit_balance_for_backend(mut credit: AgentCreditBalance) -> Option<A
     credit.ineligible_reason = credit
         .ineligible_reason
         .take()
-        .filter(|reason| is_credit_reason_code(reason));
+        .filter(|reason| is_credit_reason_code(reason) && is_safe_backend_text(reason));
     if let Some(grants) = credit.grants.as_mut() {
         for grant in grants {
             grant.title = safe_optional_text(grant.title.take());
