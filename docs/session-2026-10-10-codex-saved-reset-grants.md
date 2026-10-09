@@ -22,8 +22,8 @@ grant key, the status table, field refusals, ordering, the 20-grant cap and
   silently replaces with the count) is `unavailable` with the count kept. It is
   never an empty list.
 - Every app-server Codex balance now carries the read completion clock
-  (`observed_at`) and the packaging time (`updated_at`, through the model's
-  `stamp_packaged_at`). Quota windows already carried the read clock.
+  (`observed_at`), as quota windows already did. Credit balances carry no
+  `updated_at`; consumers use the snapshot capture time.
 - Every Codex balance now carries `kind`: `credits` → `plan_credits`,
   `reset_bank` → `saved_resets`, `workspace_monthly_credits` →
   `workspace_allowance`. A pool other than `codex` keeps its existing
@@ -98,8 +98,9 @@ launcher, then the inner binary, before falling back to `PATH`.
 - Cadence: a simulated hour with two count changes is exactly three detailed
   reads and eleven routine reads; the next hourly read lands one hour after the
   last detailed read.
-- Stability: the list is byte-identical across four routine polls; a cold
-  cache reads details first; A→B→A keeps A's list; a failed hourly read re-sends
+- Stability: the list is byte-identical across four routine polls; after a
+  daemon restart the first poll reads details eagerly, so the first upload
+  already carries the list; A→B→A keeps A's list; a failed hourly read re-sends
   the matching list; a failed read after a count change is `unavailable` and is
   retried on the next count change or after the retry wait.
 - Session: a scripted app-server confirms the routine request carries the

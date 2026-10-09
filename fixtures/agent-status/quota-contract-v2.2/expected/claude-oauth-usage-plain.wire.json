@@ -8,8 +8,7 @@
       "name": "Usage credits",
       "observed_at": "2026-10-01T12:00:00Z",
       "status": "unknown",
-      "unit": "usd",
-      "updated_at": "2026-10-01T12:00:05Z"
+      "unit": "usd"
     },
     {
       "currency": "USD",
@@ -23,7 +22,6 @@
       "remaining": 23750,
       "status": "ok",
       "unit": "usd",
-      "updated_at": "2026-10-01T12:00:05Z",
       "used": 1250
     }
   ]

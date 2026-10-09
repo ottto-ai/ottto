@@ -2,6 +2,7 @@
   "sequence": "claude-plain-saved-resets",
   "steps": [
     {
+      "captured_at": "2026-10-01T13:00:05Z",
       "credit_balances": [
         {
           "account_identifier_hash": "aee4a4a8295cc944eec37fad21700e06d84528a1339b8504915ab71c37ca3d11",
@@ -12,8 +13,7 @@
           "name": "Usage credits",
           "observed_at": "2026-10-01T13:00:00Z",
           "status": "unknown",
-          "unit": "usd",
-          "updated_at": "2026-10-01T13:00:05Z"
+          "unit": "usd"
         },
         {
           "account_identifier_hash": "aee4a4a8295cc944eec37fad21700e06d84528a1339b8504915ab71c37ca3d11",
@@ -28,17 +28,16 @@
           "remaining": 23750,
           "status": "ok",
           "unit": "usd",
-          "updated_at": "2026-10-01T13:00:05Z",
           "used": 1250
         }
       ],
-      "packaged_at": "2026-10-01T13:00:05Z",
       "provider_inputs": [
         "provider/claude-oauth-usage-plain.json"
       ],
       "step": "cold start: plain read; saved resets never read, not sent"
     },
     {
+      "captured_at": "2026-10-01T14:00:05Z",
       "credit_balances": [
         {
           "account_identifier_hash": "aee4a4a8295cc944eec37fad21700e06d84528a1339b8504915ab71c37ca3d11",
@@ -49,8 +48,7 @@
           "name": "Usage credits",
           "observed_at": "2026-10-01T13:00:00Z",
           "status": "unknown",
-          "unit": "usd",
-          "updated_at": "2026-10-01T14:00:05Z"
+          "unit": "usd"
         },
         {
           "account_identifier_hash": "aee4a4a8295cc944eec37fad21700e06d84528a1339b8504915ab71c37ca3d11",
@@ -60,12 +58,11 @@
           "kind": "one_time_credit",
           "limit_id": "iguana_necktie",
           "name": "one_time_credit",
-          "observed_at": "2026-10-01T13:00:00Z",
+          "observed_at": "2026-10-01T14:00:00Z",
           "quota": 25000,
           "remaining": 23750,
           "status": "ok",
           "unit": "usd",
-          "updated_at": "2026-10-01T14:00:05Z",
           "used": 1250
         },
         {
@@ -127,17 +124,16 @@
           "observed_at": "2026-10-01T14:00:00Z",
           "remaining": 1,
           "status": "ok",
-          "unit": "resets",
-          "updated_at": "2026-10-01T14:00:05Z"
+          "unit": "resets"
         }
       ],
-      "packaged_at": "2026-10-01T14:00:05Z",
       "provider_inputs": [
         "provider/claude-usage-cedar.json"
       ],
-      "step": "saved-reset read; plain section re-sent unchanged"
+      "step": "saved-reset read; one-time pool fresh; usage credits re-sent unchanged"
     },
     {
+      "captured_at": "2026-10-01T17:00:05Z",
       "credit_balances": [
         {
           "account_identifier_hash": "aee4a4a8295cc944eec37fad21700e06d84528a1339b8504915ab71c37ca3d11",
@@ -148,8 +144,7 @@
           "name": "Usage credits",
           "observed_at": "2026-10-01T17:00:00Z",
           "status": "unknown",
-          "unit": "usd",
-          "updated_at": "2026-10-01T17:00:05Z"
+          "unit": "usd"
         },
         {
           "account_identifier_hash": "aee4a4a8295cc944eec37fad21700e06d84528a1339b8504915ab71c37ca3d11",
@@ -164,7 +159,6 @@
           "remaining": 23750,
           "status": "ok",
           "unit": "usd",
-          "updated_at": "2026-10-01T17:00:05Z",
           "used": 1250
         },
         {
@@ -226,17 +220,16 @@
           "observed_at": "2026-10-01T14:00:00Z",
           "remaining": 1,
           "status": "ok",
-          "unit": "resets",
-          "updated_at": "2026-10-01T17:00:05Z"
+          "unit": "resets"
         }
       ],
-      "packaged_at": "2026-10-01T17:00:05Z",
       "provider_inputs": [
         "provider/claude-oauth-usage-plain.json"
       ],
       "step": "plain read after a 3 h sleep; saved-reset section re-sent unchanged"
     },
     {
+      "captured_at": "2026-10-01T18:00:05Z",
       "credit_balances": [
         {
           "account_identifier_hash": "d4e221c567a07b0ee1db32b47b15600a30cdf6dd8e237771852c2bc1ca4eec5f",
@@ -247,8 +240,7 @@
           "name": "Usage credits",
           "observed_at": "2026-10-01T18:00:00Z",
           "status": "unknown",
-          "unit": "usd",
-          "updated_at": "2026-10-01T18:00:05Z"
+          "unit": "usd"
         },
         {
           "account_identifier_hash": "d4e221c567a07b0ee1db32b47b15600a30cdf6dd8e237771852c2bc1ca4eec5f",
@@ -263,17 +255,16 @@
           "remaining": 23750,
           "status": "ok",
           "unit": "usd",
-          "updated_at": "2026-10-01T18:00:05Z",
           "used": 1250
         }
       ],
-      "packaged_at": "2026-10-01T18:00:05Z",
       "provider_inputs": [
         "provider/claude-oauth-usage-plain.json"
       ],
       "step": "switch to account B: plain read; B's saved resets never read, not sent"
     },
     {
+      "captured_at": "2026-10-01T19:00:05Z",
       "credit_balances": [
         {
           "account_identifier_hash": "aee4a4a8295cc944eec37fad21700e06d84528a1339b8504915ab71c37ca3d11",
@@ -284,8 +275,7 @@
           "name": "Usage credits",
           "observed_at": "2026-10-01T19:00:00Z",
           "status": "unknown",
-          "unit": "usd",
-          "updated_at": "2026-10-01T19:00:05Z"
+          "unit": "usd"
         },
         {
           "account_identifier_hash": "aee4a4a8295cc944eec37fad21700e06d84528a1339b8504915ab71c37ca3d11",
@@ -300,7 +290,6 @@
           "remaining": 23750,
           "status": "ok",
           "unit": "usd",
-          "updated_at": "2026-10-01T19:00:05Z",
           "used": 1250
         },
         {
@@ -362,17 +351,16 @@
           "observed_at": "2026-10-01T14:00:00Z",
           "remaining": 1,
           "status": "ok",
-          "unit": "resets",
-          "updated_at": "2026-10-01T19:00:05Z"
+          "unit": "resets"
         }
       ],
-      "packaged_at": "2026-10-01T19:00:05Z",
       "provider_inputs": [
         "provider/claude-oauth-usage-plain.json"
       ],
       "step": "back to account A: plain read; A's saved-reset section re-sent from before the switch"
     },
     {
+      "captured_at": "2026-10-01T20:00:05Z",
       "credit_balances": [
         {
           "account_identifier_hash": "aee4a4a8295cc944eec37fad21700e06d84528a1339b8504915ab71c37ca3d11",
@@ -383,8 +371,7 @@
           "name": "Usage credits",
           "observed_at": "2026-10-01T20:00:00Z",
           "status": "unknown",
-          "unit": "usd",
-          "updated_at": "2026-10-01T20:00:05Z"
+          "unit": "usd"
         },
         {
           "account_identifier_hash": "aee4a4a8295cc944eec37fad21700e06d84528a1339b8504915ab71c37ca3d11",
@@ -399,11 +386,9 @@
           "remaining": 23750,
           "status": "ok",
           "unit": "usd",
-          "updated_at": "2026-10-01T20:00:05Z",
           "used": 1250
         }
       ],
-      "packaged_at": "2026-10-01T20:00:05Z",
       "provider_inputs": [
         "provider/claude-oauth-usage-plain.json"
       ],

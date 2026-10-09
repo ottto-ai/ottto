@@ -13035,10 +13035,9 @@ fn codex_usage_probe_from_app_server_observation(
             now,
         },
     );
-    codex_credit_grants::stamp_reading_clocks(
+    codex_credit_grants::stamp_read_clock(
         &mut credit_balances,
         observation.response_completed_at.as_deref(),
-        rfc3339_from_unix_seconds(now).as_deref(),
     );
     let reset_credit_detail_summary = if observation.details_requested {
         codex_reset_credit_detail_summary(&observation.rate_limits)

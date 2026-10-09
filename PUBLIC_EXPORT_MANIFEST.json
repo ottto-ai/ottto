@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 523,
-  "content_sha256": "eed4ba57acb1db402035fba2f871140c052c86f652a071dfe5ca9d66e1b988a0",
+  "candidate_file_count": 524,
+  "content_sha256": "7e30f120b8ff958084c12188b1f0626c4230cf93876be7ba9aacad1aa6b393a5",
   "files": [
     {
       "executable": false,
@@ -62,8 +62,8 @@
       "executable": false,
       "mode": "0644",
       "path": "Cargo.lock",
-      "sha256": "6fe83eae9ffbd1deb8c4854951cdfb6d0a1e8f30f09246ed6a695288fe0bbd44",
-      "size_bytes": 43372
+      "sha256": "b4768b579c99b8ab4a418d6804f875e0c0146e6dd92f4b5bc3d21de424effc44",
+      "size_bytes": 43398
     },
     {
       "executable": false,
@@ -608,15 +608,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "eecd7e80b901f7a87de962c5680713bcba95775705a7caf8a99ec9150bb5f431",
-      "size_bytes": 311136
+      "sha256": "e240ec0c5647946152f96d5f840354b320cec0fd7cf7ffc94ee9b03a878bf1b0",
+      "size_bytes": 321817
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/Cargo.toml",
-      "sha256": "facadfee91d655c098833a0a83ef36d90623d12f1d791bca465c903606400391",
-      "size_bytes": 1025
+      "sha256": "f20deb32d00e55c8b28d9a2738f252aeb45b856c963dad4fa525f59be27fb41f",
+      "size_bytes": 1064
     },
     {
       "executable": false,
@@ -986,15 +986,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/quota_credit_model.rs",
-      "sha256": "34054d01a62c1dcf54d4d6b4502cc8d13639179f64cdedfeeea9c2640c583580",
-      "size_bytes": 33278
+      "sha256": "39dd1e6e43b7d34d541b48f8a324ef89c4be6ebc6b2125e08994dec10a8b142c",
+      "size_bytes": 39484
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/quota_credit_model/tests.rs",
-      "sha256": "2c951b2bd7bb6c987e9807e071177c955f6d71fc002bf2b06a0d570e6a8c5596",
-      "size_bytes": 57149
+      "sha256": "993235771d0d1b95a329b270e3506716979de8adc4639f730b3eb56cd32b471f",
+      "size_bytes": 67995
     },
     {
       "executable": false,
@@ -2435,8 +2435,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-10-quota-credit-model.md",
-      "sha256": "9d4cbd969baf59ca7d292a0504b6059c4bfde0420cfcd1d91b395ab3d1c85918",
-      "size_bytes": 2399
+      "sha256": "a90c2aa8143904484c7b485f6f08b58e0f0c6436300cadf0cf7f9aa47f67b97c",
+      "size_bytes": 3299
     },
     {
       "executable": false,
@@ -2519,78 +2519,78 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/README.md",
-      "sha256": "39b5240e9d77fb87805baf0215380166b335d25750bd657dbb41c571caf35c2d",
-      "size_bytes": 3875
+      "sha256": "5e24c9bf689e2d8a32cac9d9d4fcb795ca1d2241171c40c40c48d0a3fbcce863",
+      "size_bytes": 5003
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/claude-oauth-usage-plain.wire.json",
-      "sha256": "89969284afd1e988d6299212e4e3746fc09ce4c53ccb3706a312ee6dd4af0ef6",
-      "size_bytes": 747
+      "sha256": "02b49bb6689e684cccc84d1739f5b0888f4e674e1a39d0de03776adf190138ff",
+      "size_bytes": 659
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/claude-usage-cedar-ineligible.wire.json",
-      "sha256": "9b23377b14f238ea2f6d322229134c577f201d5e73bc35cdbcdb22bef62bcca2",
-      "size_bytes": 509
+      "sha256": "f4cfee59cee1d104d710276664b07f067c3d9a571b674fdb6868c18472964f52",
+      "size_bytes": 465
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/claude-usage-cedar-refused-expiry.wire.json",
-      "sha256": "d2eb546b90343e09c198661ce97c734692934dfc7813bab73556d964eaed2bf6",
-      "size_bytes": 1402
+      "sha256": "60bca6633db71a9ed1c30bc521083c9cbcc3b839e888518461de5ddcb05ba1e3",
+      "size_bytes": 1358
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/claude-usage-cedar.wire.json",
-      "sha256": "70f8a17fe4a1a7cb5b341c3b96a61a80d54c643afdc51ad642bf3d18407e5db7",
-      "size_bytes": 2404
+      "sha256": "dc827efd5e5d97447af7d12f5297666563a0aac0cd9a7807450d6cbdc4a5b7da",
+      "size_bytes": 2316
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/codex-reset-credits-21.wire.json",
-      "sha256": "d7d24a0cde15744f340d633ae9fb07b45692403bfc78ccab9d35a2b55734dbae",
-      "size_bytes": 6788
+      "sha256": "4ebbc27e22fe12a1ea7df90014936292192ce7e3188bb5ecd36540258fa6dfc2",
+      "size_bytes": 6744
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/codex-reset-credits-complete.wire.json",
-      "sha256": "a299db0b9fbfc6c456c62f64efe5dda05c3526f19ef2c3b1d051f2fa857168a0",
-      "size_bytes": 1181
+      "sha256": "f9d3c4f61dee16291f09b5639d2cc3a66139558f7ea06fda38bf348ac7313117",
+      "size_bytes": 1137
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/codex-reset-credits-details-unavailable.wire.json",
-      "sha256": "0996ca567a185acb2d24ee7abc7805745f14ab2ebc15a8b9d2791b9a161c5aee",
-      "size_bytes": 372
+      "sha256": "e8601a51f1c8e755968cdcc60aefc864be223cee7f315c762e128ff1bd6dc750",
+      "size_bytes": 328
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/codex-reset-credits-provider-capped.wire.json",
-      "sha256": "e913aa360c1f1745318f12cf3299e10c903ba709aa6821bac8dff45e367608bb",
-      "size_bytes": 1079
+      "sha256": "77a05e9d7da9b54d204810f0412489300f59eebf4d4ad9968d7db5e1b438552c",
+      "size_bytes": 1035
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/sequence-claude-plain-saved-resets.wire.json",
-      "sha256": "82167a11efa317e0e69569bf247d1d6de2cb529c116d30362319fecf3e18be83",
-      "size_bytes": 14742
+      "sha256": "8deeef8d9cccd84464cd84eae43b972e4f8be00c80765d8f60c096c3779d980c",
+      "size_bytes": 14043
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/sequence-codex-reset-credits.wire.json",
-      "sha256": "15179d4d1bc5771e79072f4b78ab57d036b64ccedea473d12f3c24eaeda5e6c7",
-      "size_bytes": 6637
+      "sha256": "f714c238c0c654d27bcc142cea6c149b34885c12adb2d3589ee3cd483ff0ecbc",
+      "size_bytes": 6399
     },
     {
       "executable": false,
@@ -2640,6 +2640,13 @@
       "path": "fixtures/agent-status/quota-contract-v2.2/provider/codex-reset-credits-count-changed.json",
       "sha256": "20895d5a8cb308c5d8b0c1d907e7f81f107e576470e6f80e49169fb6c21dbb05",
       "size_bytes": 359
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/provider/codex-reset-credits-count-only-1.json",
+      "sha256": "f2553520a32b7d61bb1d081a75215a78face66445c754b1999344b8e440dddbc",
+      "size_bytes": 61
     },
     {
       "executable": false,
@@ -3664,9 +3671,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-09T21:28:17+00:00",
+  "generated_at": "2026-10-09T22:27:03+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 524,
+  "output_file_count": 525,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3703,5 +3710,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d0a4f95cf98cad67fddd71e89311c648bf09aa38"
+  "source_commit": "68420884fca6ae797d02c4b1bf451b5caf0bd977"
 }

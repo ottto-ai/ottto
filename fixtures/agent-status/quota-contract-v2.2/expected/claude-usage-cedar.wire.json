@@ -12,7 +12,6 @@
       "remaining": 23750,
       "status": "ok",
       "unit": "usd",
-      "updated_at": "2026-10-01T12:00:05Z",
       "used": 1250
     },
     {
@@ -73,8 +72,7 @@
       "observed_at": "2026-10-01T12:00:00Z",
       "remaining": 1,
       "status": "ok",
-      "unit": "resets",
-      "updated_at": "2026-10-01T12:00:05Z"
+      "unit": "resets"
     }
   ]
 }

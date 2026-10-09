@@ -50,14 +50,12 @@ use serde_json::Value;
 
 use super::json_u64;
 use crate::quota_credit_model::{
-    build_grants, stamp_packaged_at, CreditModelDiagnostic, Field, GrantInput, GrantStatusInput,
+    build_grants, BindingKey, CreditModelDiagnostic, Field, GrantInput, GrantStatusInput,
     ListObservation, Provider, SectionCache, TimeInput,
 };
 
 /// The Codex saved-reset balance (name pinned by contract v2.2 §11.7 C4).
 pub(super) const RESET_BANK: &str = "reset_bank";
-/// [`SectionCache`] section holding the `reset_bank` grant list.
-const RESET_BANK_GRANTS_SECTION: &str = "codex.reset_bank.grants";
 /// Longest gap between successful detailed reads of one binding.
 pub(super) const DETAIL_INTERVAL_SECS: u64 = 3_600;
 /// Wait after a failed detailed read before the next one for the same count.
@@ -212,11 +210,9 @@ impl CodexCreditTracker {
             return false;
         };
         let count = available_count(rate_limits);
-        let cached = count.is_some_and(|count| {
-            self.sections
-                .grant_list_for_count(binding, RESET_BANK_GRANTS_SECTION, count)
-                .is_some()
-        });
+        let key = BindingKey::from_credential_identity_hash(binding);
+        let cached =
+            count.is_some_and(|count| self.sections.grant_list_for_count(&key, count).is_some());
         self.cadence
             .get(binding)
             .copied()
@@ -262,20 +258,23 @@ impl CodexCreditTracker {
             .apply_to(balance);
             if let (Some(binding), Some(count)) = (read.binding, provider_count) {
                 self.sections.observe_grant_list(
-                    binding,
-                    RESET_BANK_GRANTS_SECTION,
+                    &BindingKey::from_credential_identity_hash(binding),
                     count,
                     balance,
                 );
             }
+            let mut diagnostics = diagnostics;
+            diagnostics.extend(self.sections.take_diagnostics());
             return diagnostics;
         }
         let cached = read
             .binding
             .zip(provider_count)
             .and_then(|(binding, count)| {
-                self.sections
-                    .grant_list_for_count(binding, RESET_BANK_GRANTS_SECTION, count)
+                self.sections.grant_list_for_count(
+                    &BindingKey::from_credential_identity_hash(binding),
+                    count,
+                )
             });
         match cached {
             Some(list) => {
@@ -416,18 +415,12 @@ pub(super) fn stamp_codex_balance_kinds(balances: &mut [AgentCreditBalance]) {
 }
 
 /// Every balance of an app-server reading carries that reading's completion
-/// clock (`observed_at`) and the packaging time (`updated_at`). A re-sent
-/// grant list keeps its own `grants_observed_at`.
-pub(super) fn stamp_reading_clocks(
-    balances: &mut [AgentCreditBalance],
-    observed_at: Option<&str>,
-    packaged_at: Option<&str>,
-) {
-    for balance in balances.iter_mut() {
+/// clock (`observed_at`). A re-sent grant list keeps its own
+/// `grants_observed_at`. Credit balances never carry `updated_at` (contract
+/// v2.2 §11.7 C9 as amended); consumers use the snapshot's capture time.
+pub(super) fn stamp_read_clock(balances: &mut [AgentCreditBalance], observed_at: Option<&str>) {
+    for balance in balances {
         balance.observed_at = observed_at.map(str::to_string);
-    }
-    if let Some(packaged_at) = packaged_at {
-        stamp_packaged_at(balances, packaged_at);
     }
 }
 
@@ -1058,6 +1051,67 @@ mod tests {
     }
 
     #[test]
+    fn daemon_restart_reads_details_on_the_first_poll_so_the_list_never_blinks() {
+        let home = Path::new("/synthetic/codex-home");
+        let mut tracker = CodexCreditTracker::default();
+        let mut emitted = Vec::new();
+        for step in 0..3u64 {
+            emitted.push(poll(
+                &mut tracker,
+                home,
+                BINDING_A,
+                T0 + step * 300,
+                2,
+                &rows(2),
+            ));
+        }
+        // Daemon restart: every in-memory cadence and cache entry is gone.
+        let mut tracker = CodexCreditTracker::default();
+        let restarted_at = T0 + 3 * 300;
+        assert_eq!(
+            tracker.plan_read(home, restarted_at),
+            CodexRateLimitsRead::Detailed,
+            "the first poll after start is detailed, not routine"
+        );
+        let (sent, first_after_restart) =
+            poll(&mut tracker, home, BINDING_A, restarted_at, 2, &rows(2));
+        assert_eq!(sent, vec![CodexRateLimitsRead::Detailed], "one eager read");
+        emitted.push((sent, first_after_restart.clone()));
+        emitted.push(poll(
+            &mut tracker,
+            home,
+            BINDING_A,
+            restarted_at + 300,
+            2,
+            &rows(2),
+        ));
+        for (index, (_, balance)) in emitted.iter().enumerate() {
+            assert_eq!(
+                balance.grants_state,
+                Some(CreditGrantsState::Complete),
+                "reading {index}"
+            );
+            assert_eq!(
+                balance.grants.as_ref().map(Vec::len),
+                Some(2),
+                "reading {index}"
+            );
+            assert_eq!(
+                balance.status,
+                AgentCreditBalanceStatus::Ok,
+                "reading {index}"
+            );
+        }
+        // The same grants before and after the restart.
+        assert_eq!(first_after_restart.grants, emitted[0].1.grants);
+        // The process-wide tracker plans a never-seen home the same way.
+        assert_eq!(
+            plan_rate_limits_read(Path::new("/synthetic/never-read-codex-home"), restarted_at),
+            CodexRateLimitsRead::Detailed
+        );
+    }
+
+    #[test]
     fn account_switch_a_b_a_keeps_a_list() {
         let mut tracker = CodexCreditTracker::default();
         let home = Path::new("/synthetic/codex-home");
@@ -1145,7 +1199,7 @@ mod tests {
         assert!(tracker.cadence.is_empty());
         assert!(tracker
             .sections
-            .grant_list_for_count(BINDING_A, RESET_BANK_GRANTS_SECTION, 2)
+            .grant_list_for_count(&BindingKey::from_credential_identity_hash(BINDING_A), 2)
             .is_none());
     }
 
@@ -1229,7 +1283,6 @@ mod tests {
         use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
         const READ_AT: &str = "2026-10-01T12:00:00Z";
-        const PACKAGED_AT: &str = "2026-10-01T12:00:05Z";
 
         fn fixture(relative: &str) -> Value {
             let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1252,7 +1305,6 @@ mod tests {
             provider: &Value,
             details_requested: bool,
             read_at: &str,
-            packaged_at: &str,
         ) -> Value {
             let mut balances = codex_app_server_credit_balances(provider);
             tracker.attach_reset_bank_grants(
@@ -1266,7 +1318,7 @@ mod tests {
                     now: unix(read_at),
                 },
             );
-            stamp_reading_clocks(&mut balances, Some(read_at), Some(packaged_at));
+            stamp_read_clock(&mut balances, Some(read_at));
             json!({ "credit_balances": balances })
         }
 
@@ -1289,13 +1341,7 @@ mod tests {
                 ),
             ] {
                 let input = fixture(&format!("provider/{provider}.json"));
-                let actual = reading(
-                    &mut CodexCreditTracker::default(),
-                    &input,
-                    true,
-                    READ_AT,
-                    PACKAGED_AT,
-                );
+                let actual = reading(&mut CodexCreditTracker::default(), &input, true, READ_AT);
                 assert_eq!(
                     actual,
                     fixture(&format!("expected/{expected}.wire.json")),
@@ -1314,20 +1360,14 @@ mod tests {
                 if label.starts_with("restart") {
                     tracker = CodexCreditTracker::default();
                 }
-                let packaged_at = step["packaged_at"].as_str().expect("packaged_at");
-                let read_at = packaged_at.replace(":05Z", ":00Z");
-                let mut answers = step["provider_inputs"]
+                let captured_at = step["captured_at"].as_str().expect("captured_at");
+                let read_at = captured_at.replace(":05Z", ":00Z");
+                let answers = step["provider_inputs"]
                     .as_array()
                     .expect("inputs")
                     .iter()
                     .map(|input| fixture(input.as_str().expect("input path")))
                     .collect::<Vec<_>>();
-                if label.starts_with("restart") {
-                    // The canonical step lists the count-2 body for a count-1
-                    // reading (reported to the fixture owner); read the
-                    // count-1 count-only body it describes.
-                    answers = vec![json!({"rateLimitResetCredits": {"availableCount": 1}})];
-                }
                 // A body with a list answered a detailed read. A count-only
                 // body answered a routine read, followed by the detailed read
                 // when the adapter asks for it (the next input, or a failure).
@@ -1342,13 +1382,7 @@ mod tests {
                 } else {
                     (&answers[0], false)
                 };
-                let actual = reading(
-                    &mut tracker,
-                    provider,
-                    details_requested,
-                    &read_at,
-                    packaged_at,
-                );
+                let actual = reading(&mut tracker, provider, details_requested, &read_at);
                 let expected = json!({ "credit_balances": step["credit_balances"] });
                 assert_eq!(actual, expected, "step {index}: {label}");
             }
