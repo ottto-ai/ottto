@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::quota_credit_model::{
-    apply_disabled, apply_readiness, build_grants, normalize_time, one_time_credit, BindingKey,
+    apply_disabled, apply_readiness, build_grants, one_time_credit, BindingKey,
     CreditModelDiagnostic, CreditSection, Field, GrantInput, GrantStatusInput, ListObservation,
     Provider, ReadinessInput, SectionCache, TimeInput,
 };
@@ -281,28 +281,24 @@ fn claude_one_time_credits(
             let pool = object.get(key)?.as_object()?;
             pool.get("limit_dollars")
                 .filter(|value| value.is_number())?;
-            let expires_at = match pool.get("resets_at") {
-                Some(Value::String(text)) => normalize_time(TimeInput::Rfc3339(text.clone()))
-                    .ok()
-                    .flatten(),
-                _ => None,
-            };
-            if let (Some(expiry), Some(read_at)) =
-                (expires_at.as_deref().and_then(parse_instant), read_at)
-            {
-                if expiry < read_at {
-                    return None;
-                }
-            }
             let (balance, refused) = one_time_credit(
                 key,
                 string_field(pool, "label"),
                 super::claude_oauth_money_cents(pool.get("limit_dollars")),
                 super::claude_oauth_money_cents(pool.get("used_dollars")),
                 super::claude_oauth_money_cents(pool.get("remaining_dollars")),
-                expires_at,
-                Some(observed_at.to_string()),
+                time_field(pool, "resets_at"),
+                TimeInput::Rfc3339(observed_at.to_string()),
             );
+            // A pool whose expiry passed before this read is gone, not empty.
+            if let (Some(expiry), Some(read_at)) = (
+                balance.expires_at.as_deref().and_then(parse_instant),
+                read_at,
+            ) {
+                if expiry < read_at {
+                    return None;
+                }
+            }
             diagnostics.extend(refused);
             Some(balance)
         })
@@ -332,6 +328,7 @@ fn claude_saved_resets(
             observed_at: observed_at.to_string(),
         },
         None => ListObservation::Unavailable {
+            provider: Provider::Anthropic,
             provider_count: None,
         },
     };
