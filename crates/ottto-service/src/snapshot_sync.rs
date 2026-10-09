@@ -2889,13 +2889,27 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
 /// agent-status sync response, so the status command can surface it on
 /// `status.machine.icon_url`. Never fails sync on a write error.
 fn persist_machine_icon(response: &AgentStatusSnapshotUploadResponse) {
+    persist_machine_icon_at(&default_support_dir().join("machine_icon.json"), response);
+}
+
+fn persist_machine_icon_at(path: &Path, response: &AgentStatusSnapshotUploadResponse) {
+    // This is a best-effort echo, not a deletion signal: older backends omit it
+    // and icon lookup failures return null. Leave the original machine binding
+    // and version intact; status only applies cached icons to that machine.
+    if response
+        .machine_icon_url
+        .as_deref()
+        .is_none_or(|url| url.trim().is_empty())
+    {
+        return;
+    }
     let payload = serde_json::json!({
         "machine_id": response.machine_id,
         "icon_url": response.machine_icon_url,
         "icon_version": response.machine_icon_version,
     });
     if let Ok(serialized) = serde_json::to_string(&payload) {
-        let _ = std::fs::write(default_support_dir().join("machine_icon.json"), serialized);
+        let _ = std::fs::write(path, serialized);
     }
 }
 
@@ -6469,6 +6483,66 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 mod tests {
     use super::*;
     use crate::snapshots::finalize_scan_after_policy;
+    #[test]
+    fn machine_icon_cache_preserves_missing_null_and_blank_echoes() {
+        let root = crate::test_scratch::ScratchDir::new("machine-icon-cache");
+        let path = root.join("machine_icon.json");
+        let cached = r#"{"machine_id":"otm_test","icon_url":"https://example.test/old.png","icon_version":7}"#;
+        for echo in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!(" \t\n")),
+        ] {
+            let mut response = serde_json::json!({"accepted":1,"machine_id":"otm_test","sources":["codex"],"machine_icon_version":8});
+            if let Some(echo) = echo {
+                response["machine_icon_url"] = echo;
+            }
+            let response = serde_json::from_value(response).unwrap();
+            persist_machine_icon_at(&path, &response);
+            assert!(
+                !path.exists(),
+                "missing echoes must not create an unusable cache"
+            );
+            std::fs::write(&path, cached).unwrap();
+            persist_machine_icon_at(&path, &response);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), cached);
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn machine_icon_cache_replaces_valid_echo_and_keeps_machine_identity() {
+        let root = crate::test_scratch::ScratchDir::new("machine-icon-replacement");
+        let path = root.join("machine_icon.json");
+        std::fs::write(&path, r#"{"machine_id":"otm_test","icon_url":"https://example.test/old.png","icon_version":7}"#).unwrap();
+        for machine_id in ["otm_test", "otm_other"] {
+            let response = serde_json::from_value(serde_json::json!({
+                "accepted":1,"machine_id":machine_id,"sources":["codex"],
+                "machine_icon_url":"https://example.test/new.png","machine_icon_version":9
+            }))
+            .unwrap();
+            persist_machine_icon_at(&path, &response);
+            let cached: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                cached,
+                serde_json::json!({"machine_id":machine_id,"icon_url":"https://example.test/new.png","icon_version":9})
+            );
+        }
+        let cached = std::fs::read(&path).unwrap();
+        let response = serde_json::from_value(
+            serde_json::json!({"accepted":1,"machine_id":"otm_test","sources":["codex"]}),
+        )
+        .unwrap();
+        persist_machine_icon_at(&path, &response);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            cached,
+            "a missing echo must not relabel another machine's icon"
+        );
+    }
+
     fn pending_head_index_item() -> (ScanIndex, SnapshotItem) {
         let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
         item.context_curve = None;
