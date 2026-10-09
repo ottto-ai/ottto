@@ -7733,7 +7733,8 @@ mod tests {
         for unsafe_text in [
             "/Users/someone/Library/Application Support/x",
             "~/.claude/credentials.json",
-            "Bearer sk-synthetic-secret",
+            "bearer synthetic",
+            "sk-synthetic",
             "someone@example.com",
         ] {
             let mut balance = v22_credit_balance();
