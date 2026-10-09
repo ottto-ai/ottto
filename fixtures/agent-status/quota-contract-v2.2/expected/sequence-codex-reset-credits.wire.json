@@ -1,0 +1,192 @@
+{
+  "sequence": "codex-reset-credits",
+  "steps": [
+    {
+      "credit_balances": [
+        {
+          "freshness": "fresh",
+          "grant_count": 2,
+          "grants": [
+            {
+              "expires_at": "2026-10-20T09:15:00Z",
+              "grant_key": "bb46b96ff7bde165739c49b1a496c364acb556cb48fd5dbfd556d39ba1a99a74",
+              "grant_type": "rate_limit_reset",
+              "granted_at": "2026-09-20T09:15:00Z",
+              "status": "available",
+              "title": "Full reset"
+            },
+            {
+              "expires_at": "2026-10-28T17:40:00Z",
+              "grant_key": "164efeae5aa544588be7c075080178fa5e5b2777894fb250ed6619be3f8a02c7",
+              "grant_type": "rate_limit_reset",
+              "granted_at": "2026-09-28T17:40:00Z",
+              "status": "available",
+              "title": "Full reset"
+            }
+          ],
+          "grants_observed_at": "2026-10-01T12:00:00Z",
+          "grants_state": "complete",
+          "kind": "saved_resets",
+          "latest_granted_at": "2026-09-28T17:40:00Z",
+          "name": "reset_bank",
+          "next_expires_at": "2026-10-20T09:15:00Z",
+          "observed_at": "2026-10-01T12:00:00Z",
+          "remaining": 2,
+          "status": "ok",
+          "unit": "resets",
+          "unlimited": false,
+          "updated_at": "2026-10-01T12:00:05Z"
+        }
+      ],
+      "packaged_at": "2026-10-01T12:00:05Z",
+      "provider_inputs": [
+        "provider/codex-reset-credits-count-only.json",
+        "provider/codex-reset-credits-complete.json"
+      ],
+      "step": "cold start: count 2, no cached list, details read now"
+    },
+    {
+      "credit_balances": [
+        {
+          "freshness": "fresh",
+          "grant_count": 2,
+          "grants": [
+            {
+              "expires_at": "2026-10-20T09:15:00Z",
+              "grant_key": "bb46b96ff7bde165739c49b1a496c364acb556cb48fd5dbfd556d39ba1a99a74",
+              "grant_type": "rate_limit_reset",
+              "granted_at": "2026-09-20T09:15:00Z",
+              "status": "available",
+              "title": "Full reset"
+            },
+            {
+              "expires_at": "2026-10-28T17:40:00Z",
+              "grant_key": "164efeae5aa544588be7c075080178fa5e5b2777894fb250ed6619be3f8a02c7",
+              "grant_type": "rate_limit_reset",
+              "granted_at": "2026-09-28T17:40:00Z",
+              "status": "available",
+              "title": "Full reset"
+            }
+          ],
+          "grants_observed_at": "2026-10-01T12:00:00Z",
+          "grants_state": "complete",
+          "kind": "saved_resets",
+          "latest_granted_at": "2026-09-28T17:40:00Z",
+          "name": "reset_bank",
+          "next_expires_at": "2026-10-20T09:15:00Z",
+          "observed_at": "2026-10-01T12:05:00Z",
+          "remaining": 2,
+          "status": "ok",
+          "unit": "resets",
+          "unlimited": false,
+          "updated_at": "2026-10-01T12:05:05Z"
+        }
+      ],
+      "packaged_at": "2026-10-01T12:05:05Z",
+      "provider_inputs": [
+        "provider/codex-reset-credits-count-only.json"
+      ],
+      "step": "routine poll: count unchanged, cached list re-sent with its original grants_observed_at"
+    },
+    {
+      "credit_balances": [
+        {
+          "freshness": "fresh",
+          "grant_count": 2,
+          "grants": [
+            {
+              "expires_at": "2026-10-20T09:15:00Z",
+              "grant_key": "bb46b96ff7bde165739c49b1a496c364acb556cb48fd5dbfd556d39ba1a99a74",
+              "grant_type": "rate_limit_reset",
+              "granted_at": "2026-09-20T09:15:00Z",
+              "status": "available",
+              "title": "Full reset"
+            },
+            {
+              "expires_at": "2026-10-28T17:40:00Z",
+              "grant_key": "164efeae5aa544588be7c075080178fa5e5b2777894fb250ed6619be3f8a02c7",
+              "grant_type": "rate_limit_reset",
+              "granted_at": "2026-09-28T17:40:00Z",
+              "status": "available",
+              "title": "Full reset"
+            }
+          ],
+          "grants_observed_at": "2026-10-01T12:00:00Z",
+          "grants_state": "complete",
+          "kind": "saved_resets",
+          "latest_granted_at": "2026-09-28T17:40:00Z",
+          "name": "reset_bank",
+          "next_expires_at": "2026-10-20T09:15:00Z",
+          "observed_at": "2026-10-01T12:10:00Z",
+          "remaining": 2,
+          "status": "ok",
+          "unit": "resets",
+          "unlimited": false,
+          "updated_at": "2026-10-01T12:10:05Z"
+        }
+      ],
+      "packaged_at": "2026-10-01T12:10:05Z",
+      "provider_inputs": [
+        "provider/codex-reset-credits-count-only.json"
+      ],
+      "step": "routine poll: count unchanged, cached list re-sent with its original grants_observed_at"
+    },
+    {
+      "credit_balances": [
+        {
+          "freshness": "fresh",
+          "grant_count": 1,
+          "grants": [
+            {
+              "expires_at": "2026-10-28T17:40:00Z",
+              "grant_key": "164efeae5aa544588be7c075080178fa5e5b2777894fb250ed6619be3f8a02c7",
+              "grant_type": "rate_limit_reset",
+              "granted_at": "2026-09-28T17:40:00Z",
+              "status": "available",
+              "title": "Full reset"
+            }
+          ],
+          "grants_observed_at": "2026-10-01T12:15:00Z",
+          "grants_state": "complete",
+          "kind": "saved_resets",
+          "latest_granted_at": "2026-09-28T17:40:00Z",
+          "name": "reset_bank",
+          "next_expires_at": "2026-10-28T17:40:00Z",
+          "observed_at": "2026-10-01T12:15:00Z",
+          "remaining": 1,
+          "status": "ok",
+          "unit": "resets",
+          "unlimited": false,
+          "updated_at": "2026-10-01T12:15:05Z"
+        }
+      ],
+      "packaged_at": "2026-10-01T12:15:05Z",
+      "provider_inputs": [
+        "provider/codex-reset-credits-count-changed.json"
+      ],
+      "step": "routine poll: count changed to 1, details read now"
+    },
+    {
+      "credit_balances": [
+        {
+          "freshness": "fresh",
+          "grant_count": 1,
+          "grants_state": "unavailable",
+          "kind": "saved_resets",
+          "name": "reset_bank",
+          "observed_at": "2026-10-01T12:20:00Z",
+          "remaining": 1,
+          "status": "ok",
+          "unit": "resets",
+          "unlimited": false,
+          "updated_at": "2026-10-01T12:20:05Z"
+        }
+      ],
+      "packaged_at": "2026-10-01T12:20:05Z",
+      "provider_inputs": [
+        "provider/codex-reset-credits-count-only.json"
+      ],
+      "step": "restart: cold cache, count 1, detail read failed"
+    }
+  ]
+}
