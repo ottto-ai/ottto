@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use ottto_protocol::{
-    is_credit_reason_code, ActiveSessionReconciliation, AgentCreditBalance,
-    AgentCreditBalanceStatus, AgentCreditBalanceUnit, AgentQuotaWindowFreshness, CreditBalanceKind,
+    is_credit_reason_code, ActiveSessionReconciliation, AgentCreditBalance, AgentCreditBalanceUnit,
+    AgentQuotaWindowFreshness, CreditBalanceKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -20,8 +20,9 @@ use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::quota_credit_model::{
-    build_grants, normalize_time, one_time_credit, CreditModelDiagnostic, Field, GrantInput,
-    GrantStatusInput, ListObservation, Provider, SectionCache, TimeInput,
+    apply_disabled, apply_readiness, build_grants, normalize_time, one_time_credit, BindingKey,
+    CreditModelDiagnostic, CreditSection, Field, GrantInput, GrantStatusInput, ListObservation,
+    Provider, ReadinessInput, SectionCache, TimeInput,
 };
 
 /// Passive input from Claude Code's own `cachedUsageUtilization` (Ron Q3).
@@ -89,15 +90,12 @@ impl ClaudeUsageRead {
     }
 }
 
-// Section names for the model's `SectionCache`. Each read owns some sections;
-// a read that does not carry a section re-sends the last observed one.
-const SECTION_USAGE_CREDITS: &str = "claude_usage_credits";
-const SECTION_ONE_TIME_CREDITS: &str = "claude_one_time_credits";
-const SECTION_SAVED_RESETS: &str = "claude_saved_resets";
-const SECTIONS: [&str; 3] = [
-    SECTION_USAGE_CREDITS,
-    SECTION_ONE_TIME_CREDITS,
-    SECTION_SAVED_RESETS,
+// The model's sections, in emission order. Each read owns some of them; a
+// read that does not carry a section re-sends the last observed one.
+const SECTIONS: [CreditSection; 3] = [
+    CreditSection::UsageCredits,
+    CreditSection::OneTimeCredits,
+    CreditSection::SavedResets,
 ];
 
 /// Credit sections one read observed. `None` = this read does not carry the
@@ -113,11 +111,13 @@ pub(super) struct ClaudeCreditRead {
 /// Parse the credit sections of one OAuth usage body read at `observed_at`
 /// (the local response time, or a passive reading's own fetch time).
 ///
-/// - Plain: usage credits (`spend`, else `extra_usage`) and every one-time
-///   dollar pool. Both are real observations even when empty.
-/// - Saved-reset variant: `cedar_ember` only. Its `spend` is skipped by
-///   request, and its pools stay owned by the plain read so a variant that
-///   omitted them can never toggle their presence.
+/// - Usage credits (`spend`, else `extra_usage`): the plain read only; the
+///   saved-reset variant skips `spend` by request.
+/// - One-time dollar pools: every read of a full usage body (both readings
+///   report them), so a pool is always fresh.
+/// - A body without the usage-credit keys (a passive reading that kept only
+///   windows, a provider drop) observes neither section: the stored ones are
+///   re-sent rather than erased. Observed sections are real even when empty.
 /// - `cedar_ember` is a saved-reset observation only when its shape is
 ///   recognized ([`claude_saved_resets_recognized`]); the plain read always
 ///   sends it as `null`. An unrecognized section yields no balance, never an
@@ -129,39 +129,28 @@ pub(super) fn claude_credit_read(
 ) -> ClaudeCreditRead {
     let mut diagnostics = Vec::new();
     let saved_resets = claude_saved_resets(body, observed_at, &mut diagnostics).map(|b| vec![b]);
-    match read {
-        // A body without the credit keys (a passive reading that kept only
-        // windows, a provider drop) observes no credit section: the stored
-        // ones are re-sent rather than erased.
-        ClaudeUsageRead::Plain if !carries_plain_credit_sections(body) => ClaudeCreditRead {
-            saved_resets,
-            diagnostics,
-            ..ClaudeCreditRead::default()
-        },
-        ClaudeUsageRead::Plain => {
-            let mut usage_credits = super::claude_oauth_credit_balances(body);
-            for balance in &mut usage_credits {
-                balance.observed_at = Some(observed_at.to_string());
-            }
-            ClaudeCreditRead {
-                usage_credits: Some(usage_credits),
-                one_time_credits: Some(claude_one_time_credits(body, observed_at)),
-                saved_resets,
-                diagnostics,
-            }
+    let full_body = carries_credit_sections(body);
+    let one_time_credits =
+        full_body.then(|| claude_one_time_credits(body, observed_at, &mut diagnostics));
+    let usage_credits = (full_body && read == ClaudeUsageRead::Plain).then(|| {
+        let mut usage_credits = super::claude_oauth_credit_balances(body);
+        for balance in &mut usage_credits {
+            balance.observed_at = Some(observed_at.to_string());
         }
-        ClaudeUsageRead::SavedResets => ClaudeCreditRead {
-            saved_resets,
-            diagnostics,
-            ..ClaudeCreditRead::default()
-        },
+        usage_credits
+    });
+    ClaudeCreditRead {
+        usage_credits,
+        one_time_credits,
+        saved_resets,
+        diagnostics,
     }
 }
 
-/// A full plain body: it carries the usage-credit keys (`spend` or the older
-/// `extra_usage`, null included). Only such a body observes the usage-credit
-/// and one-time pool sections; pool keys are sent with it, null when inactive.
-fn carries_plain_credit_sections(body: &Value) -> bool {
+/// A full usage body: it carries the usage-credit keys (`spend` or the older
+/// `extra_usage`, null included, as both readings send them). Pool keys come
+/// with it, null when inactive.
+fn carries_credit_sections(body: &Value) -> bool {
     body.get("spend").is_some() || body.get("extra_usage").is_some()
 }
 
@@ -177,13 +166,13 @@ pub(super) fn claude_saved_resets_recognized(body: &Value) -> bool {
         })
 }
 
-fn balance_section(balance: &AgentCreditBalance) -> Option<&'static str> {
+fn balance_section(balance: &AgentCreditBalance) -> Option<CreditSection> {
     match balance.kind {
-        Some(CreditBalanceKind::UsageCredits) => Some(SECTION_USAGE_CREDITS),
-        Some(CreditBalanceKind::OneTimeCredit) => Some(SECTION_ONE_TIME_CREDITS),
-        Some(CreditBalanceKind::SavedResets) => Some(SECTION_SAVED_RESETS),
+        Some(CreditBalanceKind::UsageCredits) => Some(CreditSection::UsageCredits),
+        Some(CreditBalanceKind::OneTimeCredit) => Some(CreditSection::OneTimeCredits),
+        Some(CreditBalanceKind::SavedResets) => Some(CreditSection::SavedResets),
         // Caches written before kinds existed held only the usage-credit row.
-        None if balance.name == CLAUDE_USAGE_CREDITS_NAME => Some(SECTION_USAGE_CREDITS),
+        None if balance.name == CLAUDE_USAGE_CREDITS_NAME => Some(CreditSection::UsageCredits),
         _ => None,
     }
 }
@@ -194,13 +183,18 @@ fn balance_section(balance: &AgentCreditBalance) -> Option<&'static str> {
 /// organization). Sections this read observed replace theirs; every other
 /// section is re-sent through the model's [`SectionCache`] exactly as last
 /// observed, with its original `observed_at`/`grants_observed_at`. A section
-/// never observed is not sent. Claude balances carry no `updated_at` (as
-/// before): the snapshot's packaging time is the row time, never carried over.
+/// never observed is not sent. Credit balances never carry `updated_at`
+/// (contract C9 as amended).
+///
+/// The stored reading is on disk per binding, so unlike an in-memory cache a
+/// restart still re-sends the last observed sections (no presence flip).
 pub(super) fn claude_merge_credit_sections(
     binding: &str,
     previous: &[AgentCreditBalance],
     read: &ClaudeCreditRead,
 ) -> Vec<AgentCreditBalance> {
+    let binding = BindingKey::from_credential_identity_hash(binding);
+    let binding = &binding;
     let mut sections = SectionCache::new();
     for section in SECTIONS {
         let prior = previous
@@ -213,9 +207,9 @@ pub(super) fn claude_merge_credit_sections(
         }
     }
     for (section, fresh) in [
-        (SECTION_USAGE_CREDITS, &read.usage_credits),
-        (SECTION_ONE_TIME_CREDITS, &read.one_time_credits),
-        (SECTION_SAVED_RESETS, &read.saved_resets),
+        (CreditSection::UsageCredits, &read.usage_credits),
+        (CreditSection::OneTimeCredits, &read.one_time_credits),
+        (CreditSection::SavedResets, &read.saved_resets),
     ] {
         if let Some(fresh) = fresh {
             sections.observe_balances(binding, section, fresh);
@@ -223,31 +217,36 @@ pub(super) fn claude_merge_credit_sections(
     }
     SECTIONS
         .into_iter()
-        .filter_map(|section| sections.resend_balances(binding, section, ""))
+        .filter_map(|section| sections.resend_balances(binding, section))
         .flatten()
-        .map(|mut balance| {
-            balance.updated_at = None;
-            balance
-        })
         .collect()
 }
 
 /// Whether the last observed usage-credit balance says credits are off.
 pub(super) fn claude_usage_credits_off(balances: &[AgentCreditBalance]) -> bool {
     balances.iter().any(|balance| {
-        balance_section(balance) == Some(SECTION_USAGE_CREDITS) && balance.enabled == Some(false)
+        balance_section(balance) == Some(CreditSection::UsageCredits)
+            && balance.enabled == Some(false)
     })
 }
 
-/// Provider reason a usage-credit balance is off (`spend.disabled_reason`,
-/// else `extra_usage.disabled_reason`). Only a reason-code shaped value is
-/// kept (contract v2.1 §2.2, v2.2 §11.1).
-pub(super) fn claude_usage_credits_disabled_reason(section: &Value) -> Option<String> {
-    section
-        .get("disabled_reason")
-        .and_then(Value::as_str)
-        .filter(|reason| is_credit_reason_code(reason))
-        .map(ToString::to_string)
+/// The usage-credit balance of a switched-off `spend` (or `extra_usage`)
+/// section: the model's disabled shape with the provider's
+/// `disabled_reason`. A refused reason is a field diagnostic only, never a
+/// lost balance.
+pub(super) fn claude_disabled_usage_credits(section: &Value) -> AgentCreditBalance {
+    let mut balance = AgentCreditBalance {
+        name: CLAUDE_USAGE_CREDITS_NAME.to_string(),
+        freshness: AgentQuotaWindowFreshness::Fresh,
+        unit: AgentCreditBalanceUnit::Usd,
+        kind: Some(CreditBalanceKind::UsageCredits),
+        ..Default::default()
+    };
+    let reason = section.as_object().map_or(Field::Absent, |section| {
+        string_field(section, "disabled_reason")
+    });
+    let _refused_reason = apply_disabled(&mut balance, reason);
+    balance
 }
 
 /// Top-level keys the window parser owns. A window may carry `*_dollars`
@@ -261,7 +260,11 @@ fn is_window_key(key: &str) -> bool {
 /// `wattle_ember`, ... `resets_at` on these pools is an expiry, not a cycle.
 /// Null pools, pools whose expiry passed before the read, and the
 /// percent-only `cinder_cove` are skipped.
-fn claude_one_time_credits(body: &Value, observed_at: &str) -> Vec<AgentCreditBalance> {
+fn claude_one_time_credits(
+    body: &Value,
+    observed_at: &str,
+    diagnostics: &mut Vec<CreditModelDiagnostic>,
+) -> Vec<AgentCreditBalance> {
     let Some(object) = body.as_object() else {
         return Vec::new();
     };
@@ -291,7 +294,7 @@ fn claude_one_time_credits(body: &Value, observed_at: &str) -> Vec<AgentCreditBa
                     return None;
                 }
             }
-            Some(one_time_credit(
+            let (balance, refused) = one_time_credit(
                 key,
                 string_field(pool, "label"),
                 super::claude_oauth_money_cents(pool.get("limit_dollars")),
@@ -299,15 +302,17 @@ fn claude_one_time_credits(body: &Value, observed_at: &str) -> Vec<AgentCreditBa
                 super::claude_oauth_money_cents(pool.get("remaining_dollars")),
                 expires_at,
                 Some(observed_at.to_string()),
-            ))
+            );
+            diagnostics.extend(refused);
+            Some(balance)
         })
         .take(ONE_TIME_POOLS_MAX)
         .collect()
 }
 
-/// `cedar_ember` → one saved-reset balance: grants through the model, plus the
-/// provider's readiness passthrough (`eligible`, `ineligible_reason`,
-/// `at_limit`, `cooldown_until`). `remaining` is the model's summary.
+/// `cedar_ember` → one saved-reset balance. Grants, `remaining`, `status` and
+/// the readiness passthrough (`eligible`, `ineligible_reason`, `at_limit`,
+/// `cooldown_until`) are all the model's rules; this only names the fields.
 fn claude_saved_resets(
     body: &Value,
     observed_at: &str,
@@ -330,57 +335,24 @@ fn claude_saved_resets(
             provider_count: None,
         },
     };
-    let mut refuse = |field: &'static str| {
-        diagnostics.push(CreditModelDiagnostic {
-            code: "field_refused",
-            field,
-        });
-    };
-    let ineligible_reason = match cedar.get("ineligible_reason") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(reason)) if is_credit_reason_code(reason) => Some(reason.clone()),
-        Some(_) => {
-            refuse("ineligible_reason");
-            None
-        }
-    };
-    let cooldown_until = match normalize_time(time_field(cedar, "cooldown_until")) {
-        Ok(value) => value,
-        Err(()) => {
-            refuse("cooldown_until");
-            None
-        }
-    };
-    let mut readiness_bool = |key: &'static str| match bool_field(cedar, key) {
-        Field::Value(value) => Some(value),
-        Field::Absent => None,
-        Field::Invalid => {
-            refuse(key);
-            None
-        }
-    };
-    let eligible = readiness_bool("eligible");
-    let at_limit = readiness_bool("at_limit");
     let mut balance = AgentCreditBalance {
         name: CLAUDE_SAVED_RESETS_NAME.to_string(),
-        status: AgentCreditBalanceStatus::Unknown,
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Resets,
         observed_at: Some(observed_at.to_string()),
         kind: Some(CreditBalanceKind::SavedResets),
-        eligible,
-        at_limit,
-        ineligible_reason,
-        cooldown_until,
         ..Default::default()
     };
+    diagnostics.extend(apply_readiness(
+        &mut balance,
+        ReadinessInput {
+            eligible: bool_field(cedar, "eligible"),
+            at_limit: bool_field(cedar, "at_limit"),
+            ineligible_reason: string_field(cedar, "ineligible_reason"),
+            cooldown_until: time_field(cedar, "cooldown_until"),
+        },
+    ));
     diagnostics.extend(build_grants(observation).apply_to(&mut balance));
-    // Contract v2.1 §2.2 state table, as the Codex `reset_bank` row sends it.
-    balance.status = match balance.remaining {
-        Some(0) => AgentCreditBalanceStatus::Exhausted,
-        Some(_) => AgentCreditBalanceStatus::Ok,
-        None => AgentCreditBalanceStatus::Unknown,
-    };
     Some(balance)
 }
 
@@ -793,7 +765,7 @@ pub(super) fn claude_passive_reading_usable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ottto_protocol::{CreditGrantStatus, CreditGrantsState};
+    use ottto_protocol::{AgentCreditBalanceStatus, CreditGrantStatus, CreditGrantsState};
     use serde_json::json;
 
     // Synthetic bodies shaped like the redacted real plain and saved-reset
@@ -894,7 +866,9 @@ mod tests {
 
     fn saved_resets(cedar: Value) -> AgentCreditBalance {
         let read = claude_credit_read(&variant_body(cedar), ClaudeUsageRead::SavedResets, READ_AT);
-        assert!(read.usage_credits.is_none() && read.one_time_credits.is_none());
+        // The variant skips `spend`; its one-time pools are fresh.
+        assert!(read.usage_credits.is_none());
+        assert_eq!(read.one_time_credits.as_ref().map(Vec::len), Some(1));
         let mut balances = read.saved_resets.expect("cedar_ember observed");
         assert_eq!(balances.len(), 1);
         balances.remove(0)
@@ -938,11 +912,11 @@ mod tests {
     #[test]
     fn expired_one_time_pool_is_skipped_and_live_one_is_kept() {
         let body = plain_max_body();
-        let after_expiry = claude_one_time_credits(&body, READ_AT);
+        let after_expiry = claude_one_time_credits(&body, READ_AT, &mut Vec::new());
         assert!(after_expiry
             .iter()
             .all(|credit| credit.limit_id.as_deref() != Some("amber_ladder")));
-        let before_expiry = claude_one_time_credits(&body, "2026-09-25T10:00:00Z");
+        let before_expiry = claude_one_time_credits(&body, "2026-09-25T10:00:00Z", &mut Vec::new());
         let amber = before_expiry
             .iter()
             .find(|credit| credit.limit_id.as_deref() == Some("amber_ladder"))
@@ -965,7 +939,7 @@ mod tests {
             },
             "Bad Key": {"limit_dollars": 1}
         });
-        let pools = claude_one_time_credits(&body, READ_AT);
+        let pools = claude_one_time_credits(&body, READ_AT, &mut Vec::new());
         assert_eq!(pools.len(), 1);
         assert_eq!(pools[0].limit_id.as_deref(), Some("wattle_ember"));
         assert_eq!(pools[0].title.as_deref(), Some("Promo credit"));
@@ -977,7 +951,7 @@ mod tests {
         let mut bodies = vec![plain_max_body(), variant_body(cedar_max())];
         bodies.push(json!({"iguana_necktie": {"limit_dollars": 1, "enabled": true}}));
         for body in bodies {
-            for credit in claude_one_time_credits(&body, "2026-09-01T00:00:00Z") {
+            for credit in claude_one_time_credits(&body, "2026-09-01T00:00:00Z", &mut Vec::new()) {
                 assert_eq!(credit.enabled, None);
             }
         }
@@ -1146,15 +1120,21 @@ mod tests {
         let t2 = "2026-10-09T11:00:00Z";
         let t3 = "2026-10-09T12:00:00Z";
 
-        // Cold: a first saved-reset read sends only what it observed; nothing
-        // stands in for the unread usage credits.
+        // Cold: a first saved-reset read sends only what it observed (the
+        // pool and saved resets); nothing stands in for the unread usage
+        // credits.
         let cold = claude_merge_credit_sections(
             "a",
             &[],
             &claude_credit_read(&variant, ClaudeUsageRead::SavedResets, t1),
         );
-        assert_eq!(cold.len(), 1);
-        assert_eq!(cold[0].kind, Some(CreditBalanceKind::SavedResets));
+        assert_eq!(
+            cold.iter().map(|b| b.kind).collect::<Vec<_>>(),
+            [
+                Some(CreditBalanceKind::OneTimeCredit),
+                Some(CreditBalanceKind::SavedResets)
+            ]
+        );
 
         let first = claude_merge_credit_sections(
             "a",
@@ -1295,7 +1275,11 @@ mod tests {
                 READ_AT,
             ),
         );
-        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged.len(),
+            3,
+            "legacy usage row, fresh pool, saved resets"
+        );
         assert_eq!(merged[0], legacy);
         assert!(claude_usage_credits_off(&merged));
     }
@@ -1852,7 +1836,7 @@ mod tests {
             } else {
                 ClaudeUsageRead::SavedResets
             };
-            let observed_at = step["packaged_at"]
+            let observed_at = step["captured_at"]
                 .as_str()
                 .unwrap()
                 .replace(":05Z", ":00Z");

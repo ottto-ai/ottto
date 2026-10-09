@@ -9,12 +9,13 @@ adapter module, `agent_status/claude_credit_pools.rs`.
 - **Usage credits** keep their name (`Usage credits`) and gain
   `kind: usage_credits`. When credits are off, the provider's
   `spend.disabled_reason` (or `extra_usage.disabled_reason`) is sent as
-  `disabled_reason` when it is a reason code (`^[a-z0-9_.-]{1,64}$`), such as
-  `out_of_credits`; any other text is dropped. The `extra_usage` fallback still
+  `disabled_reason` through the model's disabled shape (`apply_disabled`) when
+  it is a reason code (`^[a-z0-9_.-]{1,64}$`), such as `out_of_credits`; any
+  other text is refused. The `extra_usage` fallback still
   reads bare numbers as dollars. Real bodies show those numbers are minor
   units, but every observed plain body carries `spend`, which wins, so the
   fallback is latent and left unchanged with a code comment.
-- **One-time dollar pools.** Every top-level object of the plain body with a
+- **One-time dollar pools.** Every top-level object of a full usage body with a
   numeric `limit_dollars` (window keys excluded) becomes a
   `one_time_credit` balance: `limit_id` = the provider codename, amounts in
   cents from `*_dollars`, `expires_at` = the pool's `resets_at` (an expiry, not
@@ -23,10 +24,11 @@ adapter module, `agent_status/claude_credit_pools.rs`.
   skipped.
 - **Saved resets.** `cedar_ember` maps to one `reset_bank` balance
   (`unit: resets`, `kind: saved_resets`) whose grants, `grants_state`,
-  `grant_count`, `remaining` and expiry summary come from the model. Readiness
-  is passed through as the provider states it: `eligible`,
-  `ineligible_reason`, `at_limit`, `cooldown_until`, and grant `usable_now`.
-  Invalid values are refused field by field and never change the list state.
+  `grant_count`, `remaining`, `status` and expiry summary come from the model.
+  Readiness is passed through by the model (`apply_readiness`) as the
+  provider states it: `eligible`, `ineligible_reason`, `at_limit`,
+  `cooldown_until`, and grant `usable_now`. Invalid values are refused field
+  by field and never change the list state.
 
 `cedar_ember` is only populated by the saved-reset read variant
 (`?cedar_ember=1&skip_spend=1`), which is enabled and self-checks every
@@ -86,11 +88,12 @@ and the binding's slot.
 
 A read that does not carry a section re-sends the binding's last stored section
 unchanged through the model's `SectionCache`, with its original `observed_at`
-and `grants_observed_at`: the plain read owns usage credits and one-time pools,
-and the variant owns saved resets. Presence, `grants`, `grants_state` and
-`status` therefore do not flip across alternation, a restart (the stored
-reading is on disk per binding), or switching between accounts. A section never
-read is not sent. Claude balances still carry no `updated_at`.
+and `grants_observed_at`: the plain read owns usage credits, the variant owns
+saved resets, and one-time pools are fresh from every full usage body (both
+readings report them). Presence, `grants`, `grants_state` and `status`
+therefore do not flip across alternation, a restart (the stored reading is on
+disk per binding), or switching between accounts. A section never read is not
+sent. Credit balances carry no `updated_at`.
 
 The canonical v2.2 sequence fixture models an in-memory cache that starts cold
 after a restart. This adapter's stored reading is on disk per binding, so after

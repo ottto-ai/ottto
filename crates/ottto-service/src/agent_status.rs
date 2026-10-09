@@ -11918,9 +11918,7 @@ fn claude_oauth_spend_credit_balance(spend: Option<&Value>) -> Option<AgentCredi
     let spend = spend?;
     let enabled = spend.get("enabled").and_then(Value::as_bool)?;
     if !enabled {
-        return Some(claude_disabled_usage_credit_balance(
-            claude_credit_pools::claude_usage_credits_disabled_reason(spend),
-        ));
+        return Some(claude_credit_pools::claude_disabled_usage_credits(spend));
     }
     let used = claude_oauth_money_cents(spend.get("used"));
     let quota = claude_oauth_money_cents(spend.get("cap"))
@@ -11963,9 +11961,7 @@ fn claude_oauth_extra_usage_credit_balance(extra: Option<&Value>) -> Option<Agen
     let extra = extra?;
     let enabled = extra.get("is_enabled").and_then(Value::as_bool)?;
     if !enabled {
-        return Some(claude_disabled_usage_credit_balance(
-            claude_credit_pools::claude_usage_credits_disabled_reason(extra),
-        ));
+        return Some(claude_credit_pools::claude_disabled_usage_credits(extra));
     }
     // Latent, deliberately untouched: real `extra_usage` bare numbers are minor
     // units (`monthly_limit 1000` beside `spend.limit.amount_minor 1000`,
@@ -12002,19 +11998,6 @@ fn claude_oauth_extra_usage_credit_balance(extra: Option<&Value>) -> Option<Agen
         kind: Some(CreditBalanceKind::UsageCredits),
         ..Default::default()
     })
-}
-
-fn claude_disabled_usage_credit_balance(disabled_reason: Option<String>) -> AgentCreditBalance {
-    AgentCreditBalance {
-        name: claude_credit_pools::CLAUDE_USAGE_CREDITS_NAME.to_string(),
-        status: AgentCreditBalanceStatus::Unknown,
-        freshness: AgentQuotaWindowFreshness::Fresh,
-        unit: AgentCreditBalanceUnit::Usd,
-        enabled: Some(false),
-        disabled_reason,
-        kind: Some(CreditBalanceKind::UsageCredits),
-        ..Default::default()
-    }
 }
 
 fn claude_oauth_credit_status(
