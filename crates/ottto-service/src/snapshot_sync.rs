@@ -3496,7 +3496,12 @@ fn finish_sync_source(
         }
         Ok(())
     };
-    ensure_authority()?;
+    codex_scan_diagnostics::after_existing_census_fence(
+        source,
+        support_dir,
+        ensure_authority,
+        || codex_scan_diagnostics::write_fenced_census(support_dir, &scan_result, &index),
+    )?;
     let scan_agent_status = reconciliation_agent_status(&scan_agent_status_collection);
     // State advances only after the exact paged replay census and its upload
     // both finish. Incomplete pages persist their cursor in the destination
@@ -14046,6 +14051,127 @@ mod tests {
         assert_eq!(
             diagnostic.lineage[2].unwrap().after_disposition,
             SnapshotQuarantineDisposition::SupersededTerminal
+        );
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn fenced_census_native_scan_projection_stays_private_and_off_wire() {
+        let _guard = SourceManifestTestGuard::new();
+        let support = test_terminal_status_support_dir();
+        let roots = support.join("isolated-home/.codex/sessions");
+        std::fs::create_dir_all(&roots).unwrap();
+        let mut index = ScanIndex::default();
+        let mut scan = crate::snapshots::scan_source_roots(
+            SnapshotSource::Codex,
+            &[roots],
+            &mut index,
+            "2026-10-09T00:00:00Z",
+            183,
+        )
+        .unwrap();
+        let diagnostic = scan
+            .local_codex_diagnostics
+            .as_mut()
+            .expect("native Codex scan diagnostic");
+        diagnostic.generation = 17;
+        diagnostic.state_titles.first_failure_root_digest = Some([241; 32]);
+        index.generation = 18;
+        let (private_index, _) = pending_head_index_item();
+        index.files.insert(
+            "PRIVATE_PATH_CANARY".into(),
+            private_index.files.values().next().unwrap().clone(),
+        );
+        let before_index = serde_json::to_vec(&index).unwrap();
+        let before_snapshots = serde_json::to_vec(&scan.snapshots).unwrap();
+        let mut calls = 0;
+        codex_scan_diagnostics::after_existing_census_fence(
+            SnapshotSource::Codex,
+            support,
+            || {
+                calls += 1;
+                Ok(())
+            },
+            || codex_scan_diagnostics::write_fenced_census(support, &scan, &index),
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        let path = support.join("snapshots/codex-fenced-census-v1.json");
+        let bytes = std::fs::read(&path).unwrap();
+        let evidence: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(evidence["scan_input_generation"], 17);
+        assert_eq!(evidence["index"]["generation"], 18);
+        assert_eq!(evidence["index"]["file_count"], 1);
+        assert_eq!(evidence["producer_pid"], std::process::id());
+        assert_eq!(evidence["gates"]["census_complete"], scan.census_complete);
+        let text = String::from_utf8(bytes).unwrap();
+        for excluded in [
+            "PRIVATE_PATH_CANARY",
+            "first_failure_root_digest",
+            "lineage",
+            "fingerprint",
+            "namespace",
+            "root_digest",
+        ] {
+            assert!(!text.contains(excluded), "private field {excluded}");
+        }
+        assert_eq!(serde_json::to_vec(&index).unwrap(), before_index);
+        assert_eq!(
+            serde_json::to_vec(&scan.snapshots).unwrap(),
+            before_snapshots
+        );
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server_with_hints(
+            captured.clone(),
+            vec![30],
+        ));
+        let device = LocalDeviceBinding {
+            device_id: "fixture_device".into(),
+            machine_id: Some("fixture_machine".into()),
+            sources: vec!["codex".into()],
+        };
+        report_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "synthetic-secret",
+            support,
+            SnapshotSource::Codex,
+            TerminalManifestSource::Withdraw,
+            CollectorStatus {
+                source: SnapshotSource::Codex,
+                machine_id: "fixture_machine",
+                scan_started_at: "2026-10-09T00:00:00Z",
+                counts: SyncCounts::from_scan_result(&scan, 0, 30),
+                state: CollectorState::Success,
+            },
+        )
+        .unwrap();
+        let requests = captured.lock().unwrap();
+        let terminal = http_request_json(requests.last().unwrap());
+        for private in [
+            "local_codex_diagnostics",
+            "index",
+            "scope",
+            "producer_pid",
+            "scan_input_generation",
+            "index_view",
+        ] {
+            assert!(
+                terminal.get(private).is_none(),
+                "local field leaked to status HTTP: {private}"
+            );
+        }
+        scan.local_codex_diagnostics = None;
+        codex_scan_diagnostics::after_existing_census_fence(
+            SnapshotSource::Codex,
+            support,
+            || Ok(()),
+            || codex_scan_diagnostics::write_fenced_census(support, &scan, &index),
+        )
+        .unwrap();
+        assert!(
+            !path.exists(),
+            "missing scan evidence must not retain offered diagnostic"
         );
     }
 

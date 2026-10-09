@@ -43,6 +43,10 @@ pub(super) struct DirectoryCensus {
     stable: bool,
 }
 impl DirectoryCensus {
+    pub(super) fn local_diagnostic_counts(&self) -> (bool, u64) {
+        (self.stable, self.directories.len() as u64)
+    }
+
     pub(super) fn new() -> Self {
         Self {
             stable: true,
