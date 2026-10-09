@@ -574,25 +574,45 @@ pub(super) fn claude_reading_due(
     })
 }
 
-/// Which read a due slot makes (Ron Q1: no extra calls). Slots alternate
-/// plain and saved-reset reads; while usage credits are off the plain read
-/// runs only every ~6 h. While the variant is paused by its self-check every
-/// slot is plain.
+/// Which read a due slot makes (Ron Q1: no extra calls). `stored` is the
+/// binding's persisted reading.
+///
+/// - While the variant is paused by its self-check every slot is plain.
+/// - A missing section is filled first: with plain data known but no stored
+///   saved-reset section, the slot reads the variant; with saved resets stored
+///   but no plain data known, it reads plain. Nothing known: plain.
+/// - Otherwise slots alternate plain and saved-reset reads; while usage
+///   credits are off the plain read runs only every ~6 h.
 pub(super) fn claude_usage_read_kind(
     schedule: &ClaudeReadSchedule,
-    usage_credits_off: bool,
+    stored: &[AgentCreditBalance],
     now: u64,
 ) -> ClaudeUsageRead {
     if schedule.saved_resets_variant_paused(now) {
         return ClaudeUsageRead::Plain;
     }
-    let Some(plain_at) = schedule.last_plain_read_at else {
-        return ClaudeUsageRead::Plain;
+    let stored_section = |section| stored.iter().any(|b| balance_section(b) == Some(section));
+    let plain_known = schedule.last_plain_read_at.is_some()
+        || stored_section(CreditSection::UsageCredits)
+        || stored_section(CreditSection::OneTimeCredits);
+    let saved_stored = stored_section(CreditSection::SavedResets);
+    match (plain_known, saved_stored) {
+        (false, _) => return ClaudeUsageRead::Plain,
+        (true, false) => return ClaudeUsageRead::SavedResets,
+        (true, true) => {}
+    }
+    let (Some(plain_at), Some(saved_at)) = (
+        schedule.last_plain_read_at,
+        schedule.last_saved_resets_read_at,
+    ) else {
+        // Sections persisted but the schedule was lost: alternate from plain.
+        return if schedule.last_plain_read_at.is_none() {
+            ClaudeUsageRead::Plain
+        } else {
+            ClaudeUsageRead::SavedResets
+        };
     };
-    let Some(saved_at) = schedule.last_saved_resets_read_at else {
-        return ClaudeUsageRead::SavedResets;
-    };
-    if usage_credits_off {
+    if claude_usage_credits_off(stored) {
         return if now.saturating_sub(plain_at) >= PLAIN_WHILE_CREDITS_OFF_SECONDS {
             ClaudeUsageRead::Plain
         } else {
@@ -1474,6 +1494,28 @@ mod tests {
         }
     }
 
+    /// A stored reading holding the given sections.
+    fn stored(usage_credits_off: Option<bool>, saved_resets: bool) -> Vec<AgentCreditBalance> {
+        let mut balances = Vec::new();
+        if let Some(off) = usage_credits_off {
+            balances.push(AgentCreditBalance {
+                name: CLAUDE_USAGE_CREDITS_NAME.to_string(),
+                kind: Some(CreditBalanceKind::UsageCredits),
+                enabled: Some(!off),
+                ..Default::default()
+            });
+        }
+        if saved_resets {
+            balances.push(AgentCreditBalance {
+                name: "reset_bank".to_string(),
+                unit: AgentCreditBalanceUnit::Resets,
+                kind: Some(CreditBalanceKind::SavedResets),
+                ..Default::default()
+            });
+        }
+        balances
+    }
+
     const DEFAULT_SLOT: u64 = 3_600;
     const TICK: u64 = 60;
     const HOUR: u64 = 3_600;
@@ -1488,6 +1530,8 @@ mod tests {
         calls: Vec<(u64, ClaudeUsageRead, u64)>,
         passive_used: Vec<u64>,
         callers: BTreeMap<String, ClaudeCallerBinding>,
+        plain_read: bool,
+        saved_resets_read: bool,
     }
 
     impl Simulation {
@@ -1500,6 +1544,8 @@ mod tests {
                 calls: Vec::new(),
                 passive_used: Vec::new(),
                 callers: BTreeMap::new(),
+                plain_read: false,
+                saved_resets_read: false,
             }
         }
 
@@ -1519,12 +1565,20 @@ mod tests {
                 self.record(ClaudeUsageRead::Plain, fetched, activity, now);
                 return;
             }
-            let read = claude_usage_read_kind(&self.schedule, self.usage_credits_off, now);
+            let stored = stored(
+                self.plain_read.then_some(self.usage_credits_off),
+                self.saved_resets_read,
+            );
+            let read = claude_usage_read_kind(&self.schedule, &stored, now);
             self.calls.push((now, read, slot));
             self.record(read, now, activity, now);
         }
 
         fn record(&mut self, read: ClaudeUsageRead, at: u64, activity: Option<u64>, now: u64) {
+            match read {
+                ClaudeUsageRead::Plain => self.plain_read = true,
+                ClaudeUsageRead::SavedResets => self.saved_resets_read = true,
+            }
             self.last_reading_at = Some(at);
             self.next_refresh_after = now + 300;
             self.schedule.after_reading(read, at, activity, now);
@@ -1647,6 +1701,43 @@ mod tests {
     }
 
     #[test]
+    fn read_kind_fills_a_missing_section_first() {
+        let none = ClaudeReadSchedule::default();
+        let plain_only = ClaudeReadSchedule {
+            last_plain_read_at: Some(100),
+            ..ClaudeReadSchedule::default()
+        };
+        let kind = |schedule: &ClaudeReadSchedule, stored: &[AgentCreditBalance]| {
+            claude_usage_read_kind(schedule, stored, 1_000)
+        };
+        assert_eq!(kind(&none, &[]), ClaudeUsageRead::Plain);
+        assert_eq!(
+            kind(&none, &stored(Some(false), false)),
+            ClaudeUsageRead::SavedResets
+        );
+        assert_eq!(kind(&plain_only, &[]), ClaudeUsageRead::SavedResets);
+        assert_eq!(kind(&none, &stored(None, true)), ClaudeUsageRead::Plain);
+        // Both sections stored, schedule lost: alternate from plain.
+        assert_eq!(
+            kind(&none, &stored(Some(false), true)),
+            ClaudeUsageRead::Plain
+        );
+        assert_eq!(
+            kind(&plain_only, &stored(Some(false), true)),
+            ClaudeUsageRead::SavedResets
+        );
+        // A paused variant never fills the section.
+        let paused = ClaudeReadSchedule {
+            saved_resets_variant_paused_until: Some(2_000),
+            ..plain_only.clone()
+        };
+        assert_eq!(
+            kind(&paused, &stored(Some(false), false)),
+            ClaudeUsageRead::Plain
+        );
+    }
+
+    #[test]
     fn saved_reset_variant_self_check_recognizes_only_known_shapes() {
         for cedar in [
             cedar_team(),
@@ -1681,7 +1772,7 @@ mod tests {
             ..ClaudeReadSchedule::default()
         };
         assert_eq!(
-            claude_usage_read_kind(&schedule, false, now),
+            claude_usage_read_kind(&schedule, &stored(Some(false), false), now),
             ClaudeUsageRead::SavedResets
         );
         schedule.after_reading(ClaudeUsageRead::SavedResets, now, None, now);
@@ -1694,7 +1785,7 @@ mod tests {
         for later in [now + 1, now + 7 * 3_600, now + 24 * 3_600 - 1] {
             for credits_off in [false, true] {
                 assert_eq!(
-                    claude_usage_read_kind(&schedule, credits_off, later),
+                    claude_usage_read_kind(&schedule, &stored(Some(credits_off), true), later),
                     ClaudeUsageRead::Plain
                 );
             }
@@ -1702,7 +1793,7 @@ mod tests {
         schedule.after_reading(ClaudeUsageRead::Plain, now + 23 * 3_600, None, now);
         // Recovery: after 24 h the variant is tried again and re-checked.
         assert_eq!(
-            claude_usage_read_kind(&schedule, false, now + 24 * 3_600),
+            claude_usage_read_kind(&schedule, &stored(Some(false), false), now + 24 * 3_600),
             ClaudeUsageRead::SavedResets
         );
         schedule.after_saved_resets_variant(true, now + 24 * 3_600);
@@ -1898,6 +1989,11 @@ mod tests {
         respond_with(endpoint, Value::Null)
     }
 
+    fn respond_plain(endpoint: &str) -> Value {
+        REQUESTED.lock().unwrap().push(endpoint.to_string());
+        fixture("provider/claude-oauth-usage-plain.json")
+    }
+
     fn respond_empty(endpoint: &str) -> Value {
         REQUESTED.lock().unwrap().push(endpoint.to_string());
         json!({})
@@ -1946,6 +2042,17 @@ mod tests {
             let now = super::super::current_unix_seconds();
             schedule.last_plain_read_at.get_or_insert(now - 3_600);
             write_claude_read_schedule(&self.state_dir(), &schedule).unwrap();
+        }
+
+        /// Make the binding due while keeping its stored reading, as after a
+        /// daemon restart that slept past the slot.
+        fn due_keeping_reading(&self) {
+            let mut cache =
+                super::super::read_claude_oauth_usage_cache(self.account, self.organization)
+                    .expect("stored reading");
+            cache.observed_at_epoch_seconds -= 3 * 3_600;
+            cache.next_refresh_after_epoch_seconds = 0;
+            super::super::write_claude_oauth_usage_cache(&cache).unwrap();
         }
 
         fn schedule(&self) -> ClaudeReadSchedule {
@@ -2019,6 +2126,86 @@ mod tests {
         );
         assert!(!has_unrecognized(&outcome));
         assert_eq!(harness.schedule().saved_resets_variant_paused_until, None);
+    }
+
+    fn balances_of(outcome: &super::super::ClaudeOAuthUsageOutcome) -> &[AgentCreditBalance] {
+        &outcome.result.as_ref().unwrap().credit_balances
+    }
+
+    /// The saved-reset and one-time sections are persisted with the stored
+    /// reading, so a restarted daemon re-sends them with their original read
+    /// times instead of dropping them until the next variant read (a
+    /// disappearance and a return would each be stored by the backend).
+    #[test]
+    #[serial_test::serial]
+    fn restart_resends_persisted_saved_resets_with_original_read_times() {
+        let harness = VariantHarness::new("restart");
+        harness.due(ClaudeReadSchedule::default());
+        let first = harness.collect(respond_recognized);
+        let saved = saved_resets_of(&first);
+        assert_eq!(saved.len(), 1);
+        let read_at = saved[0].grants_observed_at.clone().expect("read time");
+        assert_eq!(saved[0].observed_at.as_ref(), Some(&read_at));
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+        // Restart: nothing in memory survives; the stored reading is served.
+        super::super::CLAUDE_OAUTH_CALLER_BINDINGS
+            .lock()
+            .unwrap()
+            .clear();
+        REQUESTED.lock().unwrap().clear();
+        let served = harness.collect(respond_plain);
+        assert!(
+            REQUESTED.lock().unwrap().is_empty(),
+            "no call inside the slot"
+        );
+        assert_eq!(saved_resets_of(&served), saved);
+
+        // The first due slot after the restart reads plain; the saved-reset
+        // section is re-sent unchanged, the plain sections are fresh.
+        harness.due_keeping_reading();
+        let after = harness.collect(respond_plain);
+        assert_eq!(
+            REQUESTED.lock().unwrap().as_slice(),
+            ["https://api.anthropic.com/api/oauth/usage"]
+        );
+        assert_eq!(saved_resets_of(&after), saved);
+        let usage = balances_of(&after)
+            .iter()
+            .find(|b| b.kind == Some(CreditBalanceKind::UsageCredits))
+            .expect("usage credits");
+        assert_ne!(usage.observed_at.as_ref(), Some(&read_at));
+        assert!(balances_of(&after)
+            .iter()
+            .any(|b| b.kind == Some(CreditBalanceKind::OneTimeCredit)));
+    }
+
+    /// A stored reading without a saved-reset section (cache from before
+    /// saved resets, or the schedule lost): the first due slot reads the
+    /// variant that fills it, in place of the plain read.
+    #[test]
+    #[serial_test::serial]
+    fn missing_saved_reset_section_is_filled_by_the_next_slot() {
+        let harness = VariantHarness::new("cold-fill");
+        let _ = std::fs::remove_file(harness.state_dir().join(CLAUDE_READ_SCHEDULE_FILE));
+        let first = harness.collect(respond_plain);
+        assert_eq!(
+            REQUESTED.lock().unwrap().as_slice(),
+            ["https://api.anthropic.com/api/oauth/usage"]
+        );
+        assert!(saved_resets_of(&first).is_empty());
+        std::fs::remove_file(harness.state_dir().join(CLAUDE_READ_SCHEDULE_FILE)).unwrap();
+        harness.due_keeping_reading();
+        REQUESTED.lock().unwrap().clear();
+        let filled = harness.collect(respond_recognized);
+        assert_eq!(
+            REQUESTED.lock().unwrap().as_slice(),
+            ["https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"]
+        );
+        assert_eq!(saved_resets_of(&filled).len(), 1);
+        assert!(balances_of(&filled)
+            .iter()
+            .any(|b| b.kind == Some(CreditBalanceKind::UsageCredits)));
     }
 
     #[test]

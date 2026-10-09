@@ -54,9 +54,11 @@ extra calls:
   daemon's active-session scan, exact account and organization) in the last
   30 min, the existing 55-65 min gate by default, and 2-3 h once the account
   has been idle more than 6 h (also spread deterministically per account);
-- with the variant enabled, due slots alternate the plain and saved-reset
-  reads; while usage credits are off, the plain read runs about every 6 h and
-  the other slots take the variant;
+- due slots alternate the plain and saved-reset reads; while usage credits
+  are off, the plain read runs about every 6 h and the other slots take the
+  variant. A section missing from the stored reading is filled first: with
+  plain data but no saved-reset section (an older cache, a lost schedule) the
+  next due slot reads the variant; the reverse reads plain;
 - if Claude Code's own `.claude.json` `cachedUsageUtilization` for the same
   account (its `accountUuid` and the config's `oauthAccount` account and
   organization match the binding) is newer than the stored reading and inside
@@ -97,7 +99,11 @@ therefore do not flip across alternation, a restart (the stored reading is on
 disk per binding), or switching between accounts. A section never read is not
 sent. Credit balances carry no `updated_at`.
 
-The canonical v2.2 sequence fixture models an in-memory cache that starts cold
+The saved-reset and one-time sections are persisted with the stored reading.
+A restart therefore never drops the saved-reset balance before the next
+variant read (each disappearance and return would be stored by the backend):
+it is re-sent with its original `observed_at`/`grants_observed_at`. The
+canonical v2.2 sequence fixture models an in-memory cache that starts cold
 after a restart. This adapter's stored reading is on disk per binding, so after
 a restart the last observed saved-reset section is still re-sent; every other
 step matches the fixture.

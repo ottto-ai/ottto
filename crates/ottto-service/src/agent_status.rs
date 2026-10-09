@@ -10,6 +10,7 @@ use ottto_core::{
     ClaudeStatusLineRateLimitCache, CodexHomeTrust, FileClaudeConfigSlotSettingsStore,
     FileCodexAccountSlotSettingsStore, MAX_CLAUDE_ACCOUNT_SLOTS,
 };
+use ottto_protocol::CreditBalanceKind;
 use ottto_protocol::{
     AgentAccountStatus, AgentAvailableModelStatus, AgentCapabilityGap, AgentCapabilityStatus,
     AgentContextCompleteness, AgentContextPressureSample, AgentContextState, AgentContextStatus,
@@ -47,12 +48,9 @@ use std::time::{Duration, Instant};
 use time::{
     format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime, UtcOffset,
 };
-// Quota contract v2.2 credit types, consumed by the provider adapters below
-// and their call sites in this file.
+// Quota contract v2.2 credit types the Codex adapter's call sites consume.
 #[allow(unused_imports)]
-use ottto_protocol::{
-    AgentCreditGrant, CreditBalanceKind, CreditGrantStatus, CreditGrantType, CreditGrantsState,
-};
+use ottto_protocol::{AgentCreditGrant, CreditGrantStatus, CreditGrantType, CreditGrantsState};
 
 mod claude_credit_pools;
 mod codex_credit_grants;
@@ -9895,11 +9893,8 @@ fn collect_claude_oauth_usage_unstamped(
     let user_agent = ottto_user_agent();
     // Same endpoint, same slot: the saved-reset variant replaces the plain
     // read in its slot, never adds a call.
-    let usage_read = claude_credit_pools::claude_usage_read_kind(
-        &read_schedule,
-        claude_credit_pools::claude_usage_credits_off(&previous_credit_balances),
-        now,
-    );
+    let usage_read =
+        claude_credit_pools::claude_usage_read_kind(&read_schedule, &previous_credit_balances, now);
     let endpoint = format!("{CLAUDE_OAUTH_USAGE_ENDPOINT}{}", usage_read.query());
     #[cfg(test)]
     CLAUDE_OAUTH_PROVIDER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
