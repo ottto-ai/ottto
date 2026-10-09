@@ -11400,7 +11400,7 @@ impl OwnedSourceScan {
         }
     }
     pub(crate) fn step(
-        self,
+        mut self,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     ) -> OwnedSourceScanStep {
         // Prepare one demand batch through bounded native continuations. Group
@@ -11460,7 +11460,7 @@ impl OwnedSourceScan {
         }
         let copy_budget = self.sampled_copy_budget();
         if copy_budget == 0 {
-            self.clear_sampled_cache();
+            self.release_sampled_cache_for_copy_refusal();
         }
         let Self {
             resource_probe,
@@ -12803,7 +12803,7 @@ impl OwnedSourceScan {
                         },
                     ),
                 };
-                if let Some(context) = sampling.as_ref() {
+                let sampled_acquisition = sampling.as_ref().map(|context| {
                     let audit_now = sampled_scan::now_seconds();
                     let pending = index
                         .files
@@ -12822,26 +12822,35 @@ impl OwnedSourceScan {
                         .map(|debt| audit_now.saturating_sub(debt.due_unix_seconds))
                         .max()
                         .unwrap_or(0);
-                    eprintln!("ottto-service: sampled acquisition {}: full={} tail={} unchanged={} native_bytes={} sample_bytes={} priority_full_replays={} full_reasons=[missing,due,clock,scope,invalid,replaced,shrank,same_size,head,boundary,unsupported]:{:?} pending_audits={} overdue_audits={} oldest_due_age_seconds={} audits_started={} audits_completed={} start_overdue_seconds={} completion_overdue_seconds={}; byte counts exclude discovery/header/sidecar/independent identity reads; overdue work remains owed until full verification",
-                    source.api_slug(), context.full_files, context.tail_files, context.unchanged_files,
-                    context.native_bytes, context.sample_bytes, context.priority_replays, context.full_reasons,
-                    pending, overdue, oldest_due_age, context.audits_started, context.audits_completed,
-                    context.start_overdue_seconds, context.completion_overdue_seconds);
-                }
+                    crate::local_resource_diagnostics::ReadCounts {
+                        full_selections: context.full_files,
+                        tail_selections: context.tail_files,
+                        unchanged_selections: context.unchanged_files,
+                        completed_native_bytes: context.native_bytes,
+                        completed_guard_bytes: context.sample_bytes,
+                        page_events: crate::local_resource_diagnostics::PageEvents {
+                            full_reasons: crate::local_resource_diagnostics::FullReasons(
+                                context.full_reasons,
+                            ),
+                            priority_full_replays: context.priority_replays,
+                            audits_started: context.audits_started,
+                            audits_completed: context.audits_completed,
+                            max_start_overdue_seconds: context.start_overdue_seconds,
+                            max_completion_overdue_seconds: context.completion_overdue_seconds,
+                        },
+                        index_state_at_page_end: crate::local_resource_diagnostics::IndexState {
+                            pending_audits: pending,
+                            overdue_audits: overdue,
+                            oldest_due_age_seconds: oldest_due_age,
+                        },
+                    }
+                });
                 resource_probe.collection(
                     source.api_slug(),
                     crate::local_resource_diagnostics::CollectionCounts {
                         scanned_files: scanned_file_count,
                         semantic_noops: semantic_noop_count,
-                        sampled_acquisition: sampling.as_ref().map(|context| {
-                            crate::local_resource_diagnostics::ReadCounts {
-                                full_selections: context.full_files,
-                                tail_selections: context.tail_files,
-                                unchanged_selections: context.unchanged_files,
-                                completed_native_bytes: context.native_bytes,
-                                completed_guard_bytes: context.sample_bytes,
-                            }
-                        }),
+                        sampled_acquisition,
                     },
                 );
                 return OwnedSourceScanStep::Complete {
@@ -18035,9 +18044,10 @@ impl CodexTitleMetadata {
                 &mut metadata.titles,
                 &mut metadata.identity_conflicts,
             );
-            metadata.local_diagnostics.state_titles.observe(
+            metadata.local_diagnostics.state_titles.observe_root(
                 &title_census,
                 metadata.identity_conflicts.len() != state_conflicts_before,
+                local_index_key(&codex_dir).as_str(),
             );
             let thread_conflicts_before = metadata.identity_conflicts.len();
             let state_census = load_codex_sqlite_state_threads(
@@ -18045,9 +18055,10 @@ impl CodexTitleMetadata {
                 &mut metadata.state_threads,
                 &mut metadata.identity_conflicts,
             );
-            metadata.local_diagnostics.state_threads.observe(
+            metadata.local_diagnostics.state_threads.observe_root(
                 &state_census,
                 metadata.identity_conflicts.len() != thread_conflicts_before,
+                local_index_key(&codex_dir).as_str(),
             );
             let spawn_conflicts_before = metadata.identity_conflicts.len();
             let spawn_census = load_codex_sqlite_spawn_edges(
@@ -18057,9 +18068,10 @@ impl CodexTitleMetadata {
                 &mut metadata.spawn_parent_conflicts,
                 &mut metadata.identity_conflicts,
             );
-            metadata.local_diagnostics.spawn_edges.observe(
+            metadata.local_diagnostics.spawn_edges.observe_root(
                 &spawn_census,
                 metadata.identity_conflicts.len() != spawn_conflicts_before,
+                local_index_key(&codex_dir).as_str(),
             );
             let title_census_incomplete = title_census.is_err();
             let state_census_incomplete = state_census.is_err();
@@ -18086,9 +18098,10 @@ impl CodexTitleMetadata {
                 &mut metadata.rollout_extents,
                 &mut metadata.identity_conflicts,
             );
-            metadata.local_diagnostics.rollout_extents.observe(
+            metadata.local_diagnostics.rollout_extents.observe_root(
                 &history_census,
                 metadata.identity_conflicts.len() != history_conflicts_before,
+                local_index_key(&codex_dir).as_str(),
             );
             if history_census.is_err() {
                 metadata.sidecar_census_incomplete = true;
@@ -18106,9 +18119,10 @@ impl CodexTitleMetadata {
                 &mut metadata.titles,
                 &mut metadata.identity_conflicts,
             );
-            metadata.local_diagnostics.session_index.observe(
+            metadata.local_diagnostics.session_index.observe_root(
                 &index_census,
                 metadata.identity_conflicts.len() != index_conflicts_before,
+                local_index_key(&codex_dir).as_str(),
             );
             if index_census.is_err() {
                 metadata.sidecar_census_incomplete = true;
@@ -18316,16 +18330,23 @@ fn load_codex_sqlite_titles(
         return Ok(());
     }
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context(crate::codex_scan_diagnostics::LoaderStage::Open)
         .context("open Codex title database")?;
     let mut statement = connection
         .prepare("SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''")
+        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
         .context("prepare Codex title census")?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
     let mut loaded = Vec::new();
     for row in rows {
-        loaded.push(row.context("read Codex title census row")?);
+        loaded.push(
+            row.context(crate::codex_scan_diagnostics::LoaderStage::Row)
+                .context("read Codex title census row")?,
+        );
     }
     let mut raw_ids_by_key = BTreeMap::new();
     for (raw_id, title) in loaded {
@@ -18349,6 +18370,7 @@ fn load_codex_sqlite_state_threads(
         return Ok(());
     }
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context(crate::codex_scan_diagnostics::LoaderStage::Open)
         .context("open Codex state database")?;
     let columns = sqlite_table_columns(&connection, "threads")?;
     if !columns.contains("id") || !columns.contains("tokens_used") {
@@ -18370,33 +18392,38 @@ fn load_codex_sqlite_state_threads(
     );
     let mut statement = connection
         .prepare(sql.as_str())
+        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
         .context("prepare Codex state thread census")?;
-    let rows = statement.query_map([], |row| {
-        let id: String = row.get(0)?;
-        let title: Option<String> = row.get(1)?;
-        let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2)?);
-        let archived = row.get::<_, i64>(3)? != 0;
-        let created_at = codex_state_timestamp(row.get(6)?, row.get(4)?);
-        let updated_at = codex_state_timestamp(row.get(7)?, row.get(5)?);
-        let model: Option<String> = row.get(8)?;
-        let rollout_path: Option<String> = row.get(9)?;
-        Ok((
-            id,
-            CodexStateThread {
-                title,
-                tokens_used,
-                archived,
-                created_at,
-                updated_at,
-                model,
-                rollout_path,
-            },
-        ))
-    })?;
+    let rows = statement
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let title: Option<String> = row.get(1)?;
+            let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2)?);
+            let archived = row.get::<_, i64>(3)? != 0;
+            let created_at = codex_state_timestamp(row.get(6)?, row.get(4)?);
+            let updated_at = codex_state_timestamp(row.get(7)?, row.get(5)?);
+            let model: Option<String> = row.get(8)?;
+            let rollout_path: Option<String> = row.get(9)?;
+            Ok((
+                id,
+                CodexStateThread {
+                    title,
+                    tokens_used,
+                    archived,
+                    created_at,
+                    updated_at,
+                    model,
+                    rollout_path,
+                },
+            ))
+        })
+        .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
     let mut loaded = BTreeMap::new();
     let mut raw_ids_by_key = BTreeMap::new();
     for row in rows {
-        let (raw_id, thread) = row.context("read Codex state thread census row")?;
+        let (raw_id, thread) = row
+            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
+            .context("read Codex state thread census row")?;
         let id =
             record_codex_identity_key(&mut raw_ids_by_key, identity_conflicts, raw_id.as_str());
         if identity_conflicts.contains(id.as_str()) {
@@ -18434,6 +18461,7 @@ fn load_codex_rollout_extents(
         return Ok(());
     }
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context(crate::codex_scan_diagnostics::LoaderStage::Open)
         .context("open Codex thread-history database")?;
     let columns = sqlite_table_columns(&connection, "thread_history_projection_state")?;
     if columns.is_empty() {
@@ -18451,18 +18479,22 @@ fn load_codex_rollout_extents(
             "SELECT thread_id, next_rollout_byte_offset, next_rollout_ordinal \
              FROM thread_history_projection_state",
         )
+        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
         .context("prepare Codex rollout-extent census")?;
-    let rows = statement.query_map([], |row| {
-        let thread_id: String = row.get(0)?;
-        let next_byte_offset: i64 = row.get(1)?;
-        let next_ordinal: i64 = row.get(2)?;
-        Ok((thread_id, next_byte_offset, next_ordinal))
-    })?;
+    let rows = statement
+        .query_map([], |row| {
+            let thread_id: String = row.get(0)?;
+            let next_byte_offset: i64 = row.get(1)?;
+            let next_ordinal: i64 = row.get(2)?;
+            Ok((thread_id, next_byte_offset, next_ordinal))
+        })
+        .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
     let mut loaded = BTreeMap::new();
     let mut raw_ids_by_key = BTreeMap::new();
     for row in rows {
-        let (raw_thread_id, next_byte_offset, next_ordinal) =
-            row.context("read Codex rollout-extent census row")?;
+        let (raw_thread_id, next_byte_offset, next_ordinal) = row
+            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
+            .context("read Codex rollout-extent census row")?;
         let thread_id = record_codex_identity_key(
             &mut raw_ids_by_key,
             identity_conflicts,
@@ -18512,6 +18544,7 @@ fn load_codex_sqlite_spawn_edges(
         return Ok(());
     }
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context(crate::codex_scan_diagnostics::LoaderStage::Open)
         .context("open Codex spawn-edge database")?;
 
     // Newer Codex Desktop builds can create a child task without populating
@@ -18531,14 +18564,18 @@ fn load_codex_sqlite_spawn_edges(
             "SELECT id, first_user_message FROM threads \
              WHERE thread_source = 'agent_created_thread'",
         )
+        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
         .context("prepare Codex created-thread census")?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
     let mut raw_created_ids_by_key = BTreeMap::new();
     for row in rows {
-        let (raw_child, first_user_message) =
-            row.context("read Codex created-thread census row")?;
+        let (raw_child, first_user_message) = row
+            .context(crate::codex_scan_diagnostics::LoaderStage::Row)
+            .context("read Codex created-thread census row")?;
         let child = record_codex_identity_key(
             &mut raw_created_ids_by_key,
             identity_conflicts,
@@ -18565,13 +18602,19 @@ fn load_codex_sqlite_spawn_edges(
     }
     let mut statement = connection
         .prepare("SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges")
+        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
         .context("prepare Codex spawn-edge census")?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
     let mut loaded = Vec::new();
     for row in rows {
-        loaded.push(row.context("read Codex spawn-edge census row")?);
+        loaded.push(
+            row.context(crate::codex_scan_diagnostics::LoaderStage::Row)
+                .context("read Codex spawn-edge census row")?,
+        );
     }
     let mut raw_parent_ids_by_key = BTreeMap::new();
     let mut raw_child_ids_by_key = BTreeMap::new();
@@ -18673,9 +18716,13 @@ fn record_codex_identity_key(
 fn sqlite_table_columns(connection: &Connection, table_name: &str) -> Result<BTreeSet<String>> {
     let mut statement = connection
         .prepare(format!("PRAGMA table_info({table_name})").as_str())
+        .context(crate::codex_scan_diagnostics::LoaderStage::Prepare)
         .context("prepare SQLite table census")?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .context(crate::codex_scan_diagnostics::LoaderStage::Query)?;
     rows.collect::<rusqlite::Result<BTreeSet<_>>>()
+        .context(crate::codex_scan_diagnostics::LoaderStage::Row)
         .context("read SQLite table census")
 }
 
@@ -23220,6 +23267,9 @@ pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<P
 #[cfg(test)]
 mod tests {
     include!("snapshots/claude_request_account_tests.rs");
+    mod giant_row_measurement_tests {
+        include!("snapshots/giant_row_measurement_tests.rs");
+    }
     use super::*;
     use base64::Engine as _;
 
@@ -42316,6 +42366,49 @@ mod tests {
     }
 
     #[test]
+    fn codex_local_diagnostics_bind_failed_root_and_sqlite_operation() {
+        let home = temp_dir("codex-local-root-fault");
+        let good = home.join("good");
+        let bad = home.join("bad");
+        let roots = [good.join("sessions"), bad.join("sessions")];
+        for root in &roots {
+            fs::create_dir_all(root).unwrap();
+        }
+        fs::write(bad.join("state_5.sqlite"), b"not a SQLite database").unwrap();
+        let metadata = CodexTitleMetadata::load_from_roots(&roots);
+        assert!(metadata.state_census_incomplete && metadata.sidecar_census_incomplete);
+        let diagnostics = serde_json::to_value(metadata.local_diagnostics).unwrap();
+        for loader in ["state_titles", "state_threads", "spawn_edges"] {
+            let evidence = &diagnostics[loader];
+            assert_eq!(evidence["failed_roots"], 1);
+            assert_eq!(evidence["completed_roots"], 1);
+            assert_eq!(evidence["sqlite_extended_code"], 26);
+            assert_eq!(evidence["first_failure_stage"], "prepare");
+            assert_eq!(
+                evidence["first_failure_root_digest"],
+                serde_json::to_value(crate::codex_scan_diagnostics::digest(
+                    local_index_key(&bad).as_str()
+                ))
+                .unwrap()
+            );
+        }
+        let serialized = serde_json::to_string(&diagnostics).unwrap();
+        assert!(!serialized.contains(home.to_str().unwrap()));
+        assert!(!serialized.contains("not a SQLite database"));
+        fs::remove_file(bad.join("state_5.sqlite")).unwrap();
+        let recovered = CodexTitleMetadata::load_from_roots(&roots);
+        assert!(!recovered.state_census_incomplete && !recovered.sidecar_census_incomplete);
+        let diagnostics = serde_json::to_value(recovered.local_diagnostics).unwrap();
+        for loader in ["state_titles", "state_threads", "spawn_edges"] {
+            assert_eq!(diagnostics[loader]["failed_roots"], 0);
+            assert!(diagnostics[loader]["first_failure_root_digest"].is_null());
+            assert!(diagnostics[loader]["sqlite_extended_code"].is_null());
+            assert!(diagnostics[loader]["first_failure_stage"].is_null());
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn codex_local_diagnostics_trace_successors_empty_and_incomplete_finalization() {
         for disposition in [FileReason::Complete, FileReason::ReadOrLineLoss] {
             for empty in [false, true] {
@@ -50258,7 +50351,9 @@ mod tests {
     }
 
     fn codex_creator_item(headers: &[Value], path_session_id: &str) -> SnapshotItem {
-        let root = temp_dir("codex-creator");
+        // Parallel creator cases share the same session filename. Clock-only
+        // directories can collide and mutate another case's opened fixture.
+        let root = crate::test_scratch::ScratchDir::new("codex-creator");
         let path = root.join(format!(
             "rollout-2026-09-30T10-00-00-{path_session_id}.jsonl"
         ));
@@ -50271,13 +50366,44 @@ mod tests {
         let body = records.iter().map(|v| format!("{v}\n")).collect::<String>();
         fs::write(&path, &body).expect("write creator fixture");
         let source_file_fingerprint = sha256_hex(&["codex_creator_fixture_source:v1"]);
-        let item = parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", source_file_fingerprint)
+        parse_codex_jsonl_file(&path, "2026-09-30T10:05:00Z", source_file_fingerprint)
             .expect("parse creator fixture")
             .into_iter()
             .next()
-            .expect("usage snapshot");
-        fs::remove_dir_all(root).expect("remove creator fixture");
-        item
+            .expect("usage snapshot")
+    }
+
+    #[test]
+    fn codex_creator_parallel_fixtures_keep_their_own_identity() {
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|worker| {
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        for iteration in 0..64 {
+                            let creator = format!("synthetic-worker-{worker}-{iteration}");
+                            let mut header = codex_creator_header();
+                            header["payload"]["creator_user_id"] = json!(creator);
+                            let id = header["payload"]["id"].as_str().unwrap();
+                            let item = codex_creator_item(std::slice::from_ref(&header), id);
+                            assert_eq!(item.source_session_id, id);
+                            assert_eq!(
+                                item.session_account_evidence
+                                    .as_ref()
+                                    .expect("isolated creator evidence")
+                                    .account_identifier_hash,
+                                ottto_core::billing_identity_hash("openai", "account", &creator)
+                            );
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().expect("parallel creator fixture");
+            }
+        });
     }
 
     fn codex_child_creator_header() -> Value {

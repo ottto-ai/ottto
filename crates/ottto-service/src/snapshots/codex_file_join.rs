@@ -7,7 +7,11 @@ pub(super) const MAX_RECORDS: usize = 50_000;
 pub(super) const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 pub(super) const MAX_HEADER_FILES: usize = 32_768;
-const MAX_HEADER_READ_BYTES: usize = 32 * 1024 * 1024;
+// Bound cumulative I/O by the supported population and individual secure
+// read bounds. Native headers may contain sizeable instructions; an unrelated
+// 32MiB ceiling permanently refused otherwise-valid inventories. Reads still
+// yield one header per step, and no decoded header is retained between steps.
+const MAX_HEADER_READ_BYTES: usize = MAX_HEADER_FILES * (MAX_HEADER_BYTES + 1);
 pub(super) const MAX_GROUP_BYTES: u64 = 256 * 1024 * 1024;
 
 fn metadata_witness(metadata: &fs::Metadata) -> String {
@@ -1406,6 +1410,87 @@ pub(super) mod tests {
         while !inventory.step(&CodexTitleMetadata::default()) {}
         (root, inventory)
     }
+    #[test]
+    fn header_inventory_completes_valid_large_headers_within_population_bound() {
+        let (root, _) = fixture();
+        let sessions = root.join("sessions");
+        let mut paths = BTreeSet::new();
+        // Native owning headers carry instructions as well as identity. A
+        // supported population of individually bounded headers can therefore
+        // exceed 32MiB before any transcript records have been parsed.
+        for number in 0..720 {
+            let path = sessions.join(format!("large-{number:04}.jsonl"));
+            let owner = format!("{number:08x}-1111-4111-8111-ffffffffffff");
+            let header = json!({"type":"session_meta","payload":{
+                "id":owner,"instructions":"x".repeat(48 * 1024)
+            }});
+            fs::write(&path, format!("{header}\n")).unwrap();
+            paths.insert(local_index_key(&path));
+        }
+        let mut directories = DirectoryCensus::new();
+        directories.observe(&sessions, &fs::metadata(&sessions).unwrap());
+        let metadata = CodexTitleMetadata::default();
+        let start = std::time::Instant::now();
+        let ((inventory, steps), allocations) = crate::retry_allocation_probe::measure(|| {
+            let mut inventory = HeaderInventory::new(&[sessions], &paths, Some(&directories));
+            let mut steps = 0;
+            while !inventory.step(&metadata) {
+                steps += 1;
+            }
+            (inventory, steps)
+        });
+        let complete = inventory.complete;
+        let header_count = inventory.headers.len();
+        let read_bytes = inventory.read_bytes;
+        fs::remove_dir_all(root).unwrap();
+        assert!(complete, "valid headers must not turn the whole census red");
+        assert_eq!(header_count, paths.len());
+        assert_eq!(steps, paths.len(), "one bounded header per native step");
+        assert!(read_bytes > 32 * 1024 * 1024);
+        assert!(read_bytes <= paths.len() * (MAX_HEADER_BYTES + 1));
+        eprintln!(
+            "CODEX_HEADER_CENSUS_MEASUREMENT {}",
+            json!({"synthetic_headers":header_count,"native_steps":steps,
+                "header_read_bytes":read_bytes,"wall_microseconds":start.elapsed().as_micros(),
+                "requested_allocation_peak":allocations.requested_peak,
+                "usable_allocation_peak":allocations.usable_peak,
+                "retained_requested_bytes":allocations.requested_live,
+                "retained_usable_bytes":allocations.usable_live})
+        );
+    }
+
+    #[test]
+    fn header_inventory_keeps_individual_header_and_population_refusals() {
+        let (root, _) = fixture();
+        let sessions = root.join("sessions");
+        let path = sessions.join("large.jsonl");
+        let mut directories = DirectoryCensus::new();
+        for header in [
+            format!("{}\n", "x".repeat(MAX_HEADER_BYTES + 1)),
+            "{malformed}\n".to_owned(),
+            "{\"type\":\"session_meta\",\"payload\":{}}\n".to_owned(),
+        ] {
+            fs::write(&path, header).unwrap();
+            directories.observe(&sessions, &fs::metadata(&sessions).unwrap());
+            let mut inventory = HeaderInventory::new(
+                std::slice::from_ref(&sessions),
+                &BTreeSet::from([local_index_key(&path)]),
+                Some(&directories),
+            );
+            while !inventory.step(&CodexTitleMetadata::default()) {}
+            assert!(!inventory.complete);
+            assert!(inventory.headers.is_empty());
+            assert_eq!(inventory.read_bytes, MAX_HEADER_BYTES + 1);
+        }
+        let paths = (0..=MAX_HEADER_FILES)
+            .map(|number| local_index_key(&sessions.join(format!("{number}.jsonl"))))
+            .collect();
+        let inventory = HeaderInventory::new(&[sessions], &paths, Some(&directories));
+        assert!(!inventory.complete, "oversized populations remain refused");
+        assert_eq!(inventory.pending.len(), MAX_HEADER_FILES + 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn header_owner_lookup_uses_complete_path_order() {
         let (root, inventory) = fixture();

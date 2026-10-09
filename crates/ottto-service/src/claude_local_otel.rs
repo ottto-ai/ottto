@@ -19,7 +19,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -375,11 +375,10 @@ fn api_evidence_from_protobuf(body: &[u8]) -> Result<Vec<ClaudeLocalOtelEvidence
                 );
                 let mut attrs = resource_attrs.clone();
                 attrs.extend(record_attrs);
-                let observed_at = format_nanos(i128::from(if record.time_unix_nano > 0 {
-                    record.time_unix_nano
-                } else {
-                    record.observed_time_unix_nano
-                }));
+                let observed_at = log_timestamp(
+                    Some(record.time_unix_nano),
+                    Some(record.observed_time_unix_nano),
+                );
                 if let Some(item) = api_evidence_from_attrs(&attrs, observed_at, identity) {
                     evidence.push(item);
                 }
@@ -579,110 +578,312 @@ fn append_request_evidence(
     conflict
 }
 
+#[cfg(test)]
+type ApiReadHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    // Actual API file opens and consumed bytes, isolated from parallel tests.
+    static API_BEFORE_OPEN: std::cell::RefCell<Option<ApiReadHook>> = const { std::cell::RefCell::new(None) };
+    static API_AFTER_READ: std::cell::RefCell<Option<ApiReadHook>> = const { std::cell::RefCell::new(None) };
+    static API_READ_RECEIPT: std::cell::Cell<(usize, usize, bool)> = const { std::cell::Cell::new((0, 0, false)) };
+}
+
+/// A scan-local owner of one decode and its strict diagnostics. Effort borrows
+/// the rows first; only roots selected afterward are retained for usage.
+#[derive(Default)]
+pub(crate) struct ClaudeApiEvidenceRead {
+    pub(crate) evidence: BTreeMap<String, Vec<ClaudeLocalOtelEvidence>>,
+    reads: BTreeMap<String, ApiReadWitness>,
+}
+
+struct ApiReadWitness {
+    health: ClaudeLocalOtelLoadHealth,
+    generation: Option<ApiFileGeneration>,
+}
+
+// Length/mtime alone cannot detect same-size replacement or restored mtimes.
+// This witness never becomes a persisted sidecar/candidate fingerprint.
+#[derive(Debug, PartialEq, Eq)]
+struct ApiFileGeneration {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+fn api_file_generation(metadata: &fs::Metadata) -> Option<ApiFileGeneration> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.is_file().then(|| ApiFileGeneration {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        // Without an opened-object generation witness, keep the strict reread.
+        None
+    }
+}
+
+impl ClaudeApiEvidenceRead {
+    pub(crate) fn load(
+        support_dir: &Path,
+        session_ids: impl IntoIterator<Item = String>,
+    ) -> Result<Self> {
+        let mut read = Self::default();
+        for session_id in session_ids {
+            // One open failure still discards the entire permissive effort map.
+            let (rows, witness) = decode_api_sidecar(support_dir, &session_id)?;
+            if !rows.is_empty() {
+                read.evidence.insert(session_id.clone(), rows);
+            }
+            read.reads.insert(session_id, witness);
+        }
+        Ok(read)
+    }
+
+    pub(crate) fn retain_roots(&mut self, roots: &BTreeSet<String>) {
+        self.evidence.retain(|root, _| roots.contains(root));
+        self.reads.retain(|root, _| roots.contains(root));
+    }
+
+    pub(crate) fn take_strict_report(
+        &mut self,
+        support_dir: &Path,
+        session_id: &str,
+    ) -> ClaudeLocalOtelLoadReport {
+        let witness = self.reads.remove(session_id);
+        let rows = self.evidence.remove(session_id);
+        let current = fs::metadata(evidence_path(support_dir, session_id))
+            .ok()
+            .and_then(|metadata| api_file_generation(&metadata));
+        #[cfg(test)]
+        let current = if API_READ_RECEIPT.with(|r| r.get().2) {
+            None
+        } else {
+            current
+        };
+        if let Some(witness) = witness {
+            if witness.health.is_complete()
+                && witness.generation.is_some()
+                && witness.generation == current
+            {
+                let mut report = ClaudeLocalOtelLoadReport {
+                    health: witness.health,
+                    ..Default::default()
+                };
+                if let Some(rows) = rows {
+                    report.evidence.insert(session_id.to_string(), rows);
+                }
+                return report;
+            }
+        }
+        // Drop the old owned rows before rereading. Appends, replacement,
+        // truncation, caps, non-files and errors cannot reuse stale evidence.
+        drop(rows);
+        load_claude_api_request_evidence_report(support_dir, [session_id.to_string()])
+    }
+}
+
 pub fn load_claude_effort_evidence(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
 ) -> Result<BTreeMap<String, Vec<ClaudeLocalOtelEvidence>>> {
-    let mut result = BTreeMap::new();
-    for session_id in session_ids {
-        let path = evidence_path(support_dir, &session_id);
-        let Ok(metadata) = fs::metadata(&path) else {
-            continue;
-        };
-        if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
-            continue;
-        }
-        let file = File::open(&path).context("open Claude effort evidence")?;
-        let mut seen = BTreeSet::new();
-        let mut request_rows = BTreeMap::new();
-        let mut rows = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let Ok(line) = line else { continue };
-            let Ok(item) = serde_json::from_str::<ClaudeLocalOtelEvidence>(&line) else {
-                continue;
-            };
-            if item.session_id != session_id {
-                continue;
-            }
-            append_request_evidence(&mut rows, &mut seen, &mut request_rows, item);
-        }
-        if !rows.is_empty() {
-            result.insert(session_id, rows);
-        }
-    }
-    Ok(result)
+    ClaudeApiEvidenceRead::load(support_dir, session_ids).map(|read| read.evidence)
 }
 
 /// Strict API-request evidence loader for completeness-sensitive accounting.
-///
-/// Unlike the compatibility loader above, this reports every condition that
-/// could hide or ambiguously duplicate one billed request. Callers must require
-/// `report.health.is_complete()` before asserting full request coverage.
+/// Unlike the compatibility view, this reports all hidden or ambiguous requests.
 pub fn load_claude_api_request_evidence_report(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
 ) -> ClaudeLocalOtelLoadReport {
     let mut report = ClaudeLocalOtelLoadReport::default();
     for session_id in BTreeSet::from_iter(session_ids) {
-        let path = evidence_path(support_dir, &session_id);
-        let metadata = match fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                report.health.missing_files += 1;
-                continue;
-            }
+        let (rows, witness) = match decode_api_sidecar(support_dir, &session_id) {
+            Ok(decoded) => decoded,
             Err(_) => {
                 report.health.unreadable_lines += 1;
                 continue;
             }
         };
-        if !metadata.is_file() {
-            report.health.unreadable_lines += 1;
-            continue;
-        }
-        if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
-            report.health.oversized_files += 1;
-            continue;
-        }
-        let Ok(file) = File::open(&path) else {
-            report.health.unreadable_lines += 1;
-            continue;
-        };
-        let mut seen_fingerprints = BTreeSet::new();
-        let mut request_rows = BTreeMap::new();
-        let mut rows = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = match line {
-                Ok(line) => line,
-                Err(_) => {
-                    report.health.unreadable_lines += 1;
-                    continue;
-                }
-            };
-            let item = match serde_json::from_str::<ClaudeLocalOtelEvidence>(&line) {
-                Ok(item) => item,
-                Err(_) => {
-                    report.health.malformed_lines += 1;
-                    continue;
-                }
-            };
-            if item.session_id != session_id {
-                report.health.invalid_session_rows += 1;
-                continue;
-            }
-            if item.request_id.is_empty() {
-                report.health.missing_request_ids += 1;
-            }
-            let request_id = item.request_id.clone();
-            if append_request_evidence(&mut rows, &mut seen_fingerprints, &mut request_rows, item) {
-                report.health.conflicting_request_ids.insert(request_id);
-            }
-        }
+        let health = witness.health;
+        report.health.missing_files += health.missing_files;
+        report.health.malformed_lines += health.malformed_lines;
+        report.health.unreadable_lines += health.unreadable_lines;
+        report.health.oversized_files += health.oversized_files;
+        report.health.invalid_session_rows += health.invalid_session_rows;
+        report.health.missing_request_ids += health.missing_request_ids;
+        report
+            .health
+            .conflicting_request_ids
+            .extend(health.conflicting_request_ids);
         if !rows.is_empty() {
             report.evidence.insert(session_id, rows);
         }
     }
     report
+}
+
+fn decode_api_sidecar(
+    support_dir: &Path,
+    session_id: &str,
+) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
+    let path = evidence_path(support_dir, session_id);
+    let mut health = ClaudeLocalOtelLoadHealth::default();
+    let empty = |health| {
+        (
+            Vec::new(),
+            ApiReadWitness {
+                health,
+                generation: None,
+            },
+        )
+    };
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                health.missing_files += 1;
+            } else {
+                health.unreadable_lines += 1;
+            }
+            return Ok(empty(health));
+        }
+    };
+    // Refuse before opening: a directory/erroring stream must never loop.
+    if !metadata.is_file() {
+        anyhow::bail!("Claude effort evidence is not a regular file");
+    }
+    if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
+        health.oversized_files += 1;
+        return Ok(empty(health));
+    }
+    let before_path = api_file_generation(&metadata);
+    #[cfg(test)]
+    API_BEFORE_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(&path);
+        }
+    });
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A stat/open race to a FIFO must refuse without blocking at open.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(&path).context("open Claude effort evidence")?;
+    #[cfg(test)]
+    API_READ_RECEIPT.with(|r| {
+        let (opens, bytes, force) = r.get();
+        r.set((opens + 1, bytes, force));
+    });
+    let opened = file
+        .metadata()
+        .context("stat opened Claude effort evidence")?;
+    if !opened.is_file() {
+        anyhow::bail!("opened Claude effort evidence is not a regular file");
+    }
+    if opened.len() >= MAX_EVIDENCE_FILE_BYTES {
+        health.oversized_files += 1;
+        return Ok(empty(health));
+    }
+    let before_opened = api_file_generation(&opened);
+    // A concurrent writer must not defeat the existing per-file read bound.
+    let mut reader = BufReader::new((&file).take(MAX_EVIDENCE_FILE_BYTES));
+    let (rows, bytes) = decode_api_rows(&mut reader, session_id, &mut health);
+    #[cfg(test)]
+    API_AFTER_READ.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook(&path);
+        }
+    });
+    if bytes >= MAX_EVIDENCE_FILE_BYTES {
+        health.oversized_files += 1;
+        return Ok(empty(health));
+    }
+    let after_opened = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| api_file_generation(&metadata));
+    let after_path = fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| api_file_generation(&metadata));
+    let generation = if before_opened.is_some()
+        && before_path == before_opened
+        && before_opened == after_opened
+        && before_opened == after_path
+        && bytes == opened.len()
+        && health.is_complete()
+    {
+        before_opened
+    } else {
+        None
+    };
+    Ok((rows, ApiReadWitness { health, generation }))
+}
+
+fn decode_api_rows(
+    reader: &mut impl BufRead,
+    session_id: &str,
+    health: &mut ClaudeLocalOtelLoadHealth,
+) -> (Vec<ClaudeLocalOtelEvidence>, u64) {
+    let mut seen = BTreeSet::new();
+    let mut request_rows = BTreeMap::new();
+    let mut rows = Vec::new();
+    let mut line = Vec::new();
+    let mut bytes = 0;
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(read) => {
+                bytes += read as u64;
+                #[cfg(test)]
+                API_READ_RECEIPT.with(|r| {
+                    let (opens, bytes, force) = r.get();
+                    r.set((opens, bytes + read, force));
+                });
+            }
+            Err(_) => {
+                health.unreadable_lines += 1;
+                break;
+            }
+        }
+        let Ok(line) = std::str::from_utf8(&line) else {
+            health.unreadable_lines += 1;
+            continue;
+        };
+        let item = match serde_json::from_str::<ClaudeLocalOtelEvidence>(line) {
+            Ok(item) => item,
+            Err(_) => {
+                health.malformed_lines += 1;
+                continue;
+            }
+        };
+        if item.session_id != session_id {
+            health.invalid_session_rows += 1;
+            continue;
+        }
+        if item.request_id.is_empty() {
+            health.missing_request_ids += 1;
+        }
+        let request_id = item.request_id.clone();
+        if append_request_evidence(&mut rows, &mut seen, &mut request_rows, item) {
+            health.conflicting_request_ids.insert(request_id);
+        }
+    }
+    (rows, bytes)
 }
 
 pub fn load_claude_trace_ownership_evidence(
@@ -1086,17 +1287,24 @@ pub(crate) fn canonical_uuid(value: &str) -> Option<String> {
 }
 
 fn timestamp_at(record: &Value) -> Option<String> {
-    let raw = record
-        .get("timeUnixNano")
-        .or_else(|| record.get("observedTimeUnixNano"))?;
-    let nanos = raw
-        .as_str()
-        .and_then(|value| value.parse::<i128>().ok())
-        .or_else(|| raw.as_u64().map(i128::from))?;
-    OffsetDateTime::from_unix_timestamp_nanos(nanos)
-        .ok()?
-        .format(&Rfc3339)
-        .ok()
+    let nanos = |key| {
+        record.get(key).and_then(|raw| {
+            raw.as_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .or_else(|| raw.as_u64())
+        })
+    };
+    log_timestamp(nanos("timeUnixNano"), nanos("observedTimeUnixNano"))
+}
+
+// OTLP LogRecord defines zero as unknown for both fields. The existing v2
+// sidecar stores only the selected clock, so an observed fallback is not proof
+// of an original provider event clock. No usable clock means no reduced row.
+fn log_timestamp(event: Option<u64>, observed: Option<u64>) -> Option<String> {
+    event
+        .filter(|value| *value > 0)
+        .or_else(|| observed.filter(|value| *value > 0))
+        .and_then(|value| format_nanos(i128::from(value)))
 }
 
 fn json_nanos(value: &Value) -> Option<i128> {
@@ -1566,6 +1774,133 @@ mod tests {
                 "body":{"stringValue":"claude_code.api_request"},
                 "attributes":attributes(&record_values)}]}]}]}))
         .unwrap()
+    }
+
+    fn clock_test_protobuf(event: u64, observed: u64) -> Vec<ClaudeLocalOtelEvidence> {
+        let payload = otlp_proto::ExportLogsServiceRequest {
+            resource_logs: vec![otlp_proto::ResourceLogs {
+                resource: Some(otlp_proto::Resource { attributes: vec![] }),
+                scope_logs: vec![otlp_proto::ScopeLogs {
+                    log_records: vec![otlp_proto::LogRecord {
+                        time_unix_nano: event,
+                        observed_time_unix_nano: observed,
+                        body: proto_string("body", "claude_code.api_request").value,
+                        attributes: vec![
+                            proto_string("session.id", "identity-session"),
+                            proto_string("request_id", "identity-request"),
+                            proto_string("model", "claude-test"),
+                            proto_string("input_tokens", "12"),
+                            proto_string("output_tokens", "3"),
+                            proto_string("user.account_uuid", ACCOUNT),
+                            proto_string("organization.id", ORGANIZATION),
+                        ],
+                    }],
+                }],
+            }],
+        };
+        api_evidence_from_protobuf(&payload.encode_to_vec()).unwrap()
+    }
+
+    fn clock_test_json(
+        event: Option<Value>,
+        observed: Option<Value>,
+    ) -> Vec<ClaudeLocalOtelEvidence> {
+        let mut payload: Value = serde_json::from_slice(&identity_json(
+            &[],
+            &[
+                ("user.account_uuid", ACCOUNT),
+                ("organization.id", ORGANIZATION),
+            ],
+        ))
+        .unwrap();
+        let record = payload
+            .pointer_mut("/resourceLogs/0/scopeLogs/0/logRecords/0")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        record.remove("timeUnixNano");
+        if let Some(value) = event {
+            record.insert("timeUnixNano".into(), value);
+        }
+        if let Some(value) = observed {
+            record.insert("observedTimeUnixNano".into(), value);
+        }
+        api_evidence_from_json(&serde_json::to_vec(&payload).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn claude_api_log_clock_zero_uses_observed_for_both_encodings() {
+        let observed = 1_783_728_000_000_000_000_u64;
+        let expected = clock_test_protobuf(0, observed);
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].observed_at, "2026-07-11T00:00:00Z");
+        for event in [
+            None,
+            Some(serde_json::json!("0")),
+            Some(serde_json::json!(0)),
+            Some(Value::Null),
+            Some(serde_json::json!("invalid")),
+            Some(serde_json::json!("-1")),
+            Some(serde_json::json!("18446744073709551616")),
+        ] {
+            for observer in [
+                serde_json::json!(observed.to_string()),
+                serde_json::json!(observed),
+            ] {
+                let rows = clock_test_json(event.clone(), Some(observer));
+                assert_eq!(rows, expected, "event={event:?}: fallback must retain counters, identity and exact fingerprint parity");
+            }
+        }
+    }
+
+    #[test]
+    fn claude_api_log_clock_both_absent_never_create_epoch_evidence() {
+        assert!(
+            clock_test_protobuf(0, 0).is_empty(),
+            "protobuf zero is absent, not epoch"
+        );
+        for event in [
+            None,
+            Some(serde_json::json!("0")),
+            Some(serde_json::json!(0)),
+            Some(Value::Null),
+        ] {
+            for observed in [
+                None,
+                Some(serde_json::json!("0")),
+                Some(serde_json::json!(0)),
+                Some(Value::Null),
+            ] {
+                assert!(
+                    clock_test_json(event.clone(), observed.clone()).is_empty(),
+                    "event={event:?}, observed={observed:?}: no usable clock"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claude_api_log_clock_real_event_wins_even_next_to_epoch() {
+        let observed = 1_783_728_000_000_000_000_u64;
+        for event in [1_u64, observed - 1, u64::MAX] {
+            let expected = clock_test_protobuf(event, observed);
+            assert_eq!(expected.len(), 1);
+            for raw in [
+                serde_json::json!(event.to_string()),
+                serde_json::json!(event),
+            ] {
+                assert_eq!(
+                    clock_test_json(Some(raw), Some(serde_json::json!(observed.to_string()))),
+                    expected
+                );
+            }
+            assert_ne!(expected[0].observed_at, "2026-07-11T00:00:00Z");
+        }
+        assert_eq!(
+            clock_test_protobuf(1, observed)[0].observed_at,
+            "1970-01-01T00:00:00.000000001Z",
+            "only zero is absence; genuine positive instants are preserved"
+        );
     }
 
     #[test]
@@ -2401,5 +2736,466 @@ mod tests {
         assert_eq!(row.cache_creation_tokens, 0);
         assert_eq!(row.cache_creation_5m_tokens, 2014);
         assert!(!row.account_identity_checked);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_decode_reuse_unchanged_scan_reads_one_api_file() {
+        let dir = crate::test_scratch::private_dir("ottto-decode-overlap");
+        let sessions = dir.join("projects");
+        fs::create_dir_all(&sessions).unwrap();
+        let rows = api_evidence_from_json(parent_and_subagent_body()).unwrap();
+        let mut transcript = String::new();
+        for (i, row) in rows.iter().enumerate() {
+            append_evidence(&dir, row).unwrap();
+            append_trace_ownership_evidence(
+                &dir,
+                &ClaudeTraceOwnershipEvidence {
+                    capture_revision: TRACE_OWNERSHIP_CAPTURE_REVISION.into(),
+                    fingerprint: format!("trace-{i}"),
+                    session_id: row.session_id.clone(),
+                    request_id: row.request_id.clone(),
+                    client_request_id: String::new(),
+                    agent_id: String::new(),
+                    parent_agent_id: String::new(),
+                    workflow_run_id: String::new(),
+                    observed_at: row.observed_at.clone(),
+                },
+            )
+            .unwrap();
+            transcript.push_str(&serde_json::json!({"type":"assistant", "timestamp":row.observed_at,
+                "sessionId":row.session_id, "requestId":row.request_id,
+                "message":{"id":format!("msg-{i}"),"model":row.model,"usage":{"input_tokens":row.input_tokens,"output_tokens":row.output_tokens}}}).to_string());
+            transcript.push('\n');
+        }
+        fs::write(sessions.join("sess-mixed.jsonl"), transcript).unwrap();
+        let mut index = crate::snapshots::ScanIndex::default();
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+            crate::snapshots::SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&sessions),
+            &mut index,
+            "2026-08-02T22:05:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+        )
+        .unwrap();
+        assert!(!scan.snapshots.is_empty());
+        let mut reference_scan = scan.clone();
+        let mut reference_index = index.clone();
+        API_READ_RECEIPT.with(|r| r.set((0, 0, true)));
+        let reference = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+            &dir,
+            &mut reference_scan,
+            &mut reference_index,
+        );
+        let reference_receipt = API_READ_RECEIPT.with(|r| r.get());
+        assert_eq!(reference_receipt.0, 2);
+        API_READ_RECEIPT.with(|r| r.set((0, 0, false)));
+        let (disposition, withheld, stats) =
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(&dir, &mut scan, &mut index);
+        assert_eq!(disposition, reference.0);
+        assert_eq!(withheld, reference.1);
+        assert_eq!(stats, reference.2);
+        assert_eq!(
+            serde_json::to_value(&scan.snapshots).unwrap(),
+            serde_json::to_value(&reference_scan.snapshots).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&index).unwrap(),
+            serde_json::to_value(&reference_index).unwrap()
+        );
+        assert_eq!(stats.requested_session_count, 1);
+        assert_eq!(stats.candidate_root_count, 1);
+        assert_eq!(stats.paired_sidecar_root_count, 1);
+        assert_eq!(stats.complete_sidecar_root_count, 1);
+        assert_eq!(stats.exact_request_set_root_count, 1);
+        assert_eq!(stats.api_evidence_row_count, 2);
+        assert_eq!(stats.trace_evidence_row_count, 2);
+        let expected_bytes = fs::metadata(evidence_path(&dir, "sess-mixed"))
+            .unwrap()
+            .len() as usize;
+        let (opens, bytes, _) = API_READ_RECEIPT.with(|r| r.get());
+        println!("API read receipt: reference_opens={}, reference_bytes={}, reuse_opens={opens}, reuse_bytes={bytes}, one_file_bytes={expected_bytes}", reference_receipt.0, reference_receipt.1);
+        assert_eq!(reference_receipt.1, expected_bytes * 2);
+        assert_eq!(opens, 1);
+        assert_eq!(bytes, expected_bytes);
+        // The offline caller must keep the full public audit output and stats.
+        use base64::Engine;
+        fs::write(dir.join("audit.key"), [7_u8; 32]).unwrap();
+        fs::write(
+            dir.join("attribution.key"),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([11_u8; 32]),
+        )
+        .unwrap();
+        let options = crate::snapshot_audit::SnapshotAuditOptions {
+            source: crate::snapshots::SnapshotSource::ClaudeCode,
+            roots: vec![sessions],
+            audit_state_dir: dir.join("audit-reference"),
+            audit_key_path: dir.join("audit.key"),
+            session_attribution_hmac_key_path: dir.join("attribution.key"),
+            attribution_home: Some(dir.clone()),
+            claude_support_dir: Some(dir.clone()),
+            machine_id: "synthetic-machine".into(),
+            collected_at: "2026-08-02T22:05:00Z".into(),
+            backfill_window_days: crate::snapshots::BACKFILL_WINDOW_DAYS,
+            private_upload_payload_out: None,
+        };
+        API_READ_RECEIPT.with(|r| r.set((0, 0, true)));
+        let reference_audit =
+            crate::snapshot_audit::run_snapshot_audit(options.clone(), &mut Vec::new()).unwrap();
+        let reference_receipt = API_READ_RECEIPT.with(|r| r.get());
+        let options = crate::snapshot_audit::SnapshotAuditOptions {
+            audit_state_dir: dir.join("audit-reuse"),
+            ..options
+        };
+        API_READ_RECEIPT.with(|r| r.set((0, 0, false)));
+        let reuse_audit =
+            crate::snapshot_audit::run_snapshot_audit(options, &mut Vec::new()).unwrap();
+        assert_eq!(
+            serde_json::to_value(reference_audit).unwrap(),
+            serde_json::to_value(reuse_audit).unwrap()
+        );
+        assert_eq!(reference_receipt.0, 2);
+        assert_eq!(reference_receipt.1, expected_bytes * 2);
+        assert_eq!(API_READ_RECEIPT.with(|r| r.get().0), 1);
+        assert_eq!(API_READ_RECEIPT.with(|r| r.get().1), expected_bytes);
+
+        // A malformed paired sibling must not poison the healthy aggregate.
+        let mut bad_snapshot = scan.snapshots[0].clone();
+        bad_snapshot.source_session_id = "bad-root".into();
+        scan.snapshots.push(bad_snapshot);
+        fs::write(evidence_path(&dir, "bad-root"), b"not json\n").unwrap();
+        let mut bad_trace = load_claude_trace_ownership_evidence(&dir, ["sess-mixed".into()])
+            .evidence
+            .remove("sess-mixed")
+            .unwrap()
+            .remove(0);
+        bad_trace.session_id = "bad-root".into();
+        append_trace_ownership_evidence(&dir, &bad_trace).unwrap();
+        let (_, _, stats) =
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(&dir, &mut scan, &mut index);
+        assert_eq!(stats.candidate_root_count, 2);
+        assert_eq!(stats.paired_sidecar_root_count, 2);
+        assert_eq!(stats.api_incomplete_root_count, 1);
+        assert_eq!(stats.complete_sidecar_root_count, 1);
+        assert_eq!(stats.api_evidence_row_count, 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    fn decode_reuse_fixture(label: &str) -> (PathBuf, Vec<ClaudeLocalOtelEvidence>) {
+        let dir = crate::test_scratch::private_dir(&format!("ottto-decode-{label}"));
+        let rows = api_evidence_from_json(parent_and_subagent_body()).unwrap();
+        for row in &rows {
+            append_evidence(&dir, row).unwrap();
+        }
+        (dir, rows)
+    }
+
+    #[test]
+    fn sidecar_decode_reuse_preserves_distinct_permissive_and_strict_views() {
+        let (dir, rows) = decode_reuse_fixture("views");
+        let path = evidence_path(&dir, "sess-mixed");
+        let mut bytes = fs::read(&path).unwrap();
+        let mut conflict = rows[0].clone();
+        conflict.fingerprint = "conflict".into();
+        conflict.output_tokens += 1;
+        let mut missing = rows[1].clone();
+        missing.fingerprint = "legacy".into();
+        missing.request_id.clear();
+        let mut foreign = rows[0].clone();
+        foreign.session_id = "foreign".into();
+        for row in [&rows[0], &conflict, &missing, &foreign] {
+            bytes.extend(serde_json::to_vec(row).unwrap());
+            bytes.push(b'\n');
+        }
+        bytes.extend(b"not json\n\xff\n");
+        fs::write(path, bytes).unwrap();
+        let permissive =
+            load_claude_effort_evidence(&dir, ["sess-mixed".into(), "absent".into()]).unwrap();
+        let strict = load_claude_api_request_evidence_report(&dir, ["sess-mixed".into()]);
+        assert_eq!(permissive, strict.evidence);
+        assert_eq!(strict.health.malformed_lines, 1);
+        assert_eq!(strict.health.unreadable_lines, 1);
+        assert_eq!(strict.health.invalid_session_rows, 1);
+        assert_eq!(strict.health.missing_request_ids, 1);
+        assert_eq!(
+            strict.health.conflicting_request_ids,
+            BTreeSet::from([rows[0].request_id.clone()])
+        );
+        let mut read =
+            ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into(), "absent".into()]).unwrap();
+        assert_eq!(read.evidence, permissive);
+        assert_eq!(read.take_strict_report(&dir, "sess-mixed"), strict);
+        assert_eq!(
+            read.take_strict_report(&dir, "absent").health.missing_files,
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_decode_reuse_releases_nonpaired_rows_and_moves_paired_allocation() {
+        let (dir, rows) = decode_reuse_fixture("allocation");
+        let mut extra = rows[0].clone();
+        extra.session_id = "effort-only".into();
+        append_evidence(&dir, &extra).unwrap();
+        let mut read =
+            ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into(), "effort-only".into()]).unwrap();
+        let allocation = read.evidence["sess-mixed"].as_ptr();
+        read.retain_roots(&BTreeSet::from(["sess-mixed".into()]));
+        assert_eq!(read.evidence.len(), 1);
+        assert_eq!(read.reads.len(), 1);
+        let report = read.take_strict_report(&dir, "sess-mixed");
+        assert_eq!(report.evidence["sess-mixed"].as_ptr(), allocation);
+        assert!(read.evidence.is_empty());
+        assert!(read.reads.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sidecar_decode_reuse_rereads_append_truncate_and_same_stat_replacement() {
+        for change in ["append", "truncate", "replace", "rewrite"] {
+            let (dir, rows) = decode_reuse_fixture(change);
+            let path = evidence_path(&dir, "sess-mixed");
+            let modified = fs::metadata(&path).unwrap().modified().unwrap();
+            let mut read = ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into()]).unwrap();
+            let mut changed = rows[0].clone();
+            changed.input_tokens += 1; // same byte length
+            if change == "append" {
+                changed.fingerprint = "append".into();
+                changed.request_id = "req-new".into();
+                append_evidence(&dir, &changed).unwrap();
+            } else {
+                let mut bytes = serde_json::to_vec(&changed).unwrap();
+                bytes.push(b'\n');
+                if change != "truncate" {
+                    bytes.extend(serde_json::to_vec(&rows[1]).unwrap());
+                    bytes.push(b'\n');
+                    assert_eq!(bytes.len() as u64, fs::metadata(&path).unwrap().len());
+                }
+                if change == "replace" {
+                    let replacement = dir.join("replacement");
+                    fs::write(&replacement, &bytes).unwrap();
+                    fs::rename(replacement, &path).unwrap();
+                } else {
+                    fs::write(&path, &bytes).unwrap();
+                }
+                File::open(&path)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+            }
+            let expected = load_claude_api_request_evidence_report(&dir, ["sess-mixed".into()]);
+            API_READ_RECEIPT.with(|r| r.set((0, 0, false)));
+            let actual = read.take_strict_report(&dir, "sess-mixed");
+            assert_eq!(actual, expected, "{change}");
+            assert_eq!(
+                API_READ_RECEIPT.with(|r| r.get().0),
+                1,
+                "{change} must reread"
+            );
+            assert_eq!(
+                actual.evidence["sess-mixed"]
+                    .iter()
+                    .find(|row| row.request_id == changed.request_id)
+                    .unwrap()
+                    .input_tokens,
+                changed.input_tokens
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn sidecar_decode_reuse_missing_nonfile_and_cap_never_reuse_rows() {
+        for change in ["missing", "nonfile", "cap", "over-cap"] {
+            let (dir, _) = decode_reuse_fixture(change);
+            let path = evidence_path(&dir, "sess-mixed");
+            let mut read = ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into()]).unwrap();
+            match change {
+                "missing" => fs::remove_file(&path).unwrap(),
+                "nonfile" => {
+                    fs::remove_file(&path).unwrap();
+                    fs::create_dir(&path).unwrap();
+                }
+                _ => File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(MAX_EVIDENCE_FILE_BYTES + u64::from(change == "over-cap"))
+                    .unwrap(),
+            }
+            let expected = load_claude_api_request_evidence_report(&dir, ["sess-mixed".into()]);
+            let actual = read.take_strict_report(&dir, "sess-mixed");
+            assert_eq!(actual, expected, "{change}");
+            assert!(actual.evidence.is_empty());
+            assert!(!actual.health.is_complete());
+            assert!(read.evidence.is_empty());
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_decode_reuse_preserves_whole_effort_open_error_and_metadata_skip() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let (dir, rows) = decode_reuse_fixture("errors");
+        let mut denied = rows[0].clone();
+        denied.session_id = "z-denied".into();
+        append_evidence(&dir, &denied).unwrap();
+        let denied_path = evidence_path(&dir, "z-denied");
+        let permissions = fs::metadata(&denied_path).unwrap().permissions();
+        fs::set_permissions(&denied_path, fs::Permissions::from_mode(0o0)).unwrap();
+        assert!(
+            ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into(), "z-denied".into()]).is_err()
+        );
+        let strict =
+            load_claude_api_request_evidence_report(&dir, ["sess-mixed".into(), "z-denied".into()]);
+        assert_eq!(strict.health.unreadable_lines, 1);
+        assert_eq!(strict.evidence["sess-mixed"], rows);
+        fs::set_permissions(&denied_path, permissions).unwrap();
+        let loop_path = evidence_path(&dir, "loop");
+        symlink(&loop_path, &loop_path).unwrap();
+        let permissive = ClaudeApiEvidenceRead::load(
+            &dir,
+            ["sess-mixed".into(), "loop".into(), "missing".into()],
+        )
+        .unwrap();
+        assert_eq!(permissive.evidence.len(), 1);
+        let strict =
+            load_claude_api_request_evidence_report(&dir, ["loop".into(), "missing".into()]);
+        assert_eq!(strict.health.unreadable_lines, 1);
+        assert_eq!(strict.health.missing_files, 1);
+        fs::remove_file(&loop_path).unwrap();
+        fs::create_dir(&loop_path).unwrap();
+        assert!(ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into(), "loop".into()]).is_err());
+        assert_eq!(
+            load_claude_api_request_evidence_report(&dir, ["loop".into()])
+                .health
+                .unreadable_lines,
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sidecar_decode_reuse_io_failure_stops_once_and_keeps_strict_refusal() {
+        struct FailingReader {
+            calls: usize,
+        }
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                unreachable!()
+            }
+        }
+        impl BufRead for FailingReader {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                self.calls += 1;
+                assert_eq!(self.calls, 1, "persistent errors must not loop");
+                Err(std::io::Error::other("synthetic read failure"))
+            }
+            fn consume(&mut self, _: usize) {
+                unreachable!()
+            }
+        }
+        let mut reader = FailingReader { calls: 0 };
+        let mut health = ClaudeLocalOtelLoadHealth::default();
+        let (rows, bytes) = decode_api_rows(&mut reader, "sess-mixed", &mut health);
+        assert!(rows.is_empty());
+        assert_eq!(bytes, 0);
+        assert_eq!(reader.calls, 1);
+        assert_eq!(health.unreadable_lines, 1);
+        assert!(!health.is_complete());
+    }
+    #[test]
+    fn sidecar_decode_reuse_lazy_new_root_and_read_snapshot_races_reread() {
+        for phase in ["before-open", "after-read"] {
+            let (dir, rows) = decode_reuse_fixture(phase);
+            let mut next = rows[0].clone();
+            next.request_id = "req-next".into();
+            next.fingerprint = "next".into();
+            let mut extra = serde_json::to_vec(&next).unwrap();
+            extra.push(b'\n');
+            let hook: ApiReadHook = Box::new(move |path| {
+                File::options()
+                    .append(true)
+                    .open(path)
+                    .unwrap()
+                    .write_all(&extra)
+                    .unwrap();
+            });
+            if phase == "before-open" {
+                API_BEFORE_OPEN.with(|h| *h.borrow_mut() = Some(hook));
+            } else {
+                API_AFTER_READ.with(|h| *h.borrow_mut() = Some(hook));
+            }
+            let mut read = ClaudeApiEvidenceRead::load(&dir, ["sess-mixed".into()]).unwrap();
+            assert!(read.reads["sess-mixed"].generation.is_none());
+            API_READ_RECEIPT.with(|r| r.set((0, 0, false)));
+            let report = read.take_strict_report(&dir, "sess-mixed");
+            assert!(report.health.is_complete());
+            assert_eq!(report.evidence["sess-mixed"].len(), 3);
+            assert_eq!(API_READ_RECEIPT.with(|r| r.get().0), 1);
+            let mut later = rows[0].clone();
+            later.session_id = "later-root".into();
+            append_evidence(&dir, &later).unwrap();
+            let report = read.take_strict_report(&dir, "later-root");
+            assert_eq!(report.evidence["later-root"], vec![later]);
+            assert_eq!(API_READ_RECEIPT.with(|r| r.get().0), 2);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_decode_reuse_stat_open_races_refuse_cap_and_fifo() {
+        for change in ["cap", "fifo"] {
+            let (dir, _) = decode_reuse_fixture(change);
+            API_BEFORE_OPEN.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |path| {
+                    if change == "cap" {
+                        File::options()
+                            .write(true)
+                            .open(path)
+                            .unwrap()
+                            .set_len(MAX_EVIDENCE_FILE_BYTES)
+                            .unwrap();
+                    } else {
+                        use std::os::unix::ffi::OsStrExt;
+                        fs::remove_file(path).unwrap();
+                        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                    }
+                }))
+            });
+            let report = load_claude_api_request_evidence_report(&dir, ["sess-mixed".into()]);
+            assert!(report.evidence.is_empty());
+            assert!(!report.health.is_complete());
+            if change == "cap" {
+                assert_eq!(report.health.oversized_files, 1);
+            } else {
+                assert_eq!(report.health.unreadable_lines, 1);
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
+    fn sidecar_decode_reuse_same_label_fixtures_keep_independent_evidence() {
+        let (first, rows) = decode_reuse_fixture("cap");
+        let (second, _) = decode_reuse_fixture("cap");
+        File::options()
+            .write(true)
+            .open(evidence_path(&second, "sess-mixed"))
+            .unwrap()
+            .set_len(MAX_EVIDENCE_FILE_BYTES)
+            .unwrap();
+        let first_report = load_claude_api_request_evidence_report(&first, ["sess-mixed".into()]);
+        assert!(
+            first_report.health.is_complete(),
+            "a second fixture must not delete or truncate the first"
+        );
+        assert_eq!(first_report.evidence["sess-mixed"], rows);
+        fs::remove_dir_all(first).unwrap();
+        fs::remove_dir_all(second).unwrap();
     }
 }

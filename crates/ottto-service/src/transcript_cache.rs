@@ -8,6 +8,23 @@ pub(crate) const CACHE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const ENTRY_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const CACHE_ENTRIES: usize = 256;
 
+/// Explicit adapter opt-in: a retained graph must have no externally mutable
+/// allocation. HeapLayoutBound alone also supports Arc/Mutex graphs, whose
+/// measured capacities could change without transferring ownership back out.
+pub(crate) trait FrozenCacheState: HeapLayoutBound {
+    fn supports_frozen_charge(&self) -> bool;
+}
+impl FrozenCacheState for String {
+    fn supports_frozen_charge(&self) -> bool {
+        true
+    }
+}
+impl<T: FrozenCacheState> FrozenCacheState for Vec<T> {
+    fn supports_frozen_charge(&self) -> bool {
+        self.iter().all(FrozenCacheState::supports_frozen_charge)
+    }
+}
+
 pub(crate) struct Retained<S> {
     pub(crate) checkpoint: Checkpoint,
     pub(crate) state: S,
@@ -22,12 +39,22 @@ impl<S: HeapLayoutBound> HeapLayoutBound for Retained<S> {
 struct Entry<S> {
     retained: Retained<S>,
     used: u64,
+    // Validated once at admission; private retained state is immutable until
+    // take transfers it out. Reinsertion always measures the mutated graph.
+    heap_bytes: usize,
+    modified_hint: (i64, i64),
+    admitted_at: u64,
 }
 impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        let Self { retained, used } = self;
-        retained.heap_bound(c)?;
-        used.heap_bound(c)
+        let Self {
+            retained: _,
+            used: _,
+            heap_bytes,
+            modified_hint: _,
+            admitted_at: _,
+        } = self;
+        c.add(*heap_bytes)
     }
 }
 
@@ -57,12 +84,12 @@ impl<S: HeapLayoutBound> HeapLayoutBound for TranscriptCache<S> {
         count_limit.heap_bound(c)
     }
 }
-impl<S: HeapLayoutBound> Default for TranscriptCache<S> {
+impl<S: FrozenCacheState> Default for TranscriptCache<S> {
     fn default() -> Self {
         Self::new(CACHE_BYTES, ENTRY_BYTES, CACHE_ENTRIES)
     }
 }
-impl<S: HeapLayoutBound> TranscriptCache<S> {
+impl<S: FrozenCacheState> TranscriptCache<S> {
     fn new(byte_limit: usize, entry_limit: usize, count_limit: usize) -> Self {
         Self {
             entries: BTreeMap::new(),
@@ -115,6 +142,18 @@ impl<S: HeapLayoutBound> TranscriptCache<S> {
         retained: Retained<S>,
         live_bytes: usize,
     ) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        self.insert_at(key, retained, live_bytes, now)
+    }
+    fn insert_at(
+        &mut self,
+        key: String,
+        retained: Retained<S>,
+        live_bytes: usize,
+        now: std::time::Duration,
+    ) -> bool {
         self.entries.remove(&key);
         let Some(resident_limit) = self.byte_limit.checked_sub(live_bytes) else {
             return false;
@@ -128,9 +167,31 @@ impl<S: HeapLayoutBound> TranscriptCache<S> {
         if self.count_limit == 0 || !heap_layout_bound::layout_supported() {
             return false;
         }
+        let Some(heap_bytes) = heap_layout_bound::bound(&retained, self.entry_limit)
+            .and_then(|bytes| bytes.checked_sub(std::mem::size_of_val(&retained)))
+        else {
+            return false;
+        };
+        if !retained.state.supports_frozen_charge() {
+            return false;
+        }
+        let clock_hint = (
+            i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
+            i64::from(now.subsec_nanos()),
+        );
+        // Future source timestamps cannot pin an entry forever. Inactive
+        // entries also expire at the existing audit interval, so backdated new
+        // work can regain space. Neither decision suppresses a native full read.
+        self.entries.retain(|_, entry| {
+            now.as_secs().saturating_sub(entry.admitted_at)
+                < crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS
+        });
         let entry = Entry {
+            modified_hint: retained.checkpoint.modified_hint().min(clock_hint),
             retained,
             used: next,
+            heap_bytes,
+            admitted_at: now.as_secs(),
         };
         let Some(state_bytes) = heap_layout_bound::bound(&entry, self.entry_limit) else {
             return false;
@@ -140,23 +201,28 @@ impl<S: HeapLayoutBound> TranscriptCache<S> {
         }
         self.clock = next;
         self.entries.insert(key.clone(), entry);
+        let mut admitted = true;
         loop {
             if self.entries.len() <= self.count_limit
                 && heap_layout_bound::bound(self, resident_limit).is_some()
             {
-                return true;
+                return admitted;
             }
             let victim = self
                 .entries
                 .iter()
-                .filter(|(candidate, _)| *candidate != &key)
-                .min_by_key(|(_, entry)| entry.used)
+                .min_by_key(|(_, entry)| (entry.modified_hint, entry.used))
                 .map(|(candidate, _)| candidate.clone());
             let Some(victim) = victim else {
                 self.entries.remove(&key);
                 return false;
             };
             self.entries.remove(&victim);
+            if victim == key {
+                // Even a rejected new entry must release enough older state
+                // for the caller's live allocation reservation.
+                admitted = false;
+            }
         }
     }
 }
@@ -188,6 +254,9 @@ mod tests {
         }
     }
     fn retained(text: String) -> Retained<String> {
+        retained_at(text, None)
+    }
+    fn retained_at(text: String, modified: Option<u64>) -> Retained<String> {
         use crate::transcript_acquisition::{ReadPlan, Scope};
         use std::fs::{self, OpenOptions};
         use std::io::{Read, Write};
@@ -206,6 +275,13 @@ mod tests {
             .open(&path)
             .unwrap();
         file.write_all(b"{}\n").unwrap();
+        if let Some(modified) = modified {
+            file.set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified)),
+            )
+            .unwrap();
+        }
         let scope = Scope("synthetic-cache".into());
         let mut plan = ReadPlan::prepare(&mut file, None, &scope, None, 100).unwrap();
         let mut bytes = Vec::new();
@@ -274,5 +350,129 @@ mod tests {
             "admission evicts instead of consuming live/overlap reservation"
         );
         assert!(!cache.insert_reserving("no-room".into(), retained("x".into()), 33 * 1024 * 1024));
+    }
+    #[test]
+    fn sampled_cache_frozen_charges_survive_aggregate_walk_pressure_and_remeasure_mutation() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let mut cache = TranscriptCache::new(8 * 1024 * 1024, 512 * 1024, 32);
+        for n in 0..24 {
+            let checkpoint = retained("synthetic".into()).checkpoint;
+            let state = vec![String::from("synthetic"); 1024];
+            let expected = heap_layout_bound::bound(&state, 512 * 1024).unwrap();
+            assert!(cache.insert(n.to_string(), Retained { checkpoint, state }));
+            assert!(cache.resident_bound().unwrap() >= expected * (n + 1));
+        }
+        assert_eq!(cache.entries.len(), 24);
+        let mut moved = cache.take("0").unwrap();
+        assert_eq!(cache.entries.len(), 23);
+        moved.state[0].reserve(1024 * 1024);
+        assert!(!cache.insert("0".into(), moved));
+        assert!(cache.take("0").is_none());
+        assert_eq!(cache.entries.len(), 23);
+        cache.clear();
+        assert!(cache.entries.is_empty());
+        assert!(cache.resident_bound().unwrap() < 64 * 1024);
+    }
+    #[test]
+    fn sampled_cache_recent_admission_expiry_and_ambiguous_time_are_bounded() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 2);
+        let at = |n| std::time::Duration::from_secs(n);
+        assert!(cache.insert_at(
+            "recent".into(),
+            retained_at("x".into(), Some(90)),
+            0,
+            at(100)
+        ));
+        assert!(cache.insert_at("old".into(), retained_at("x".into(), Some(10)), 0, at(100)));
+        assert!(!cache.insert_at("older".into(), retained_at("x".into(), Some(1)), 0, at(100)));
+        assert!(cache.take("recent").is_some());
+        // Equal/future timestamps fall back to finite admission order. A
+        // future timestamp is clipped once, and cannot block a later live file.
+        cache.clear();
+        for key in ["a", "b", "c"] {
+            assert!(cache.insert_at(
+                key.into(),
+                retained_at("x".into(), Some(999999)),
+                0,
+                at(100)
+            ));
+        }
+        assert!(cache.take("a").is_none());
+        assert!(cache.insert_at(
+            "live".into(),
+            retained_at("x".into(), Some(101)),
+            0,
+            at(101)
+        ));
+        assert!(cache.take("live").is_some());
+        // No permanent cache priority starvation for backdated source work.
+        assert!(cache.insert_at(
+            "backdated".into(),
+            retained_at("x".into(), Some(1)),
+            0,
+            at(3700)
+        ));
+        assert_eq!(cache.entries.len(), 1);
+        let mut restarted = TranscriptCache::<String>::default();
+        assert!(restarted.take("backdated").is_none());
+    }
+    #[test]
+    fn sampled_cache_rejected_old_admission_still_releases_live_reservation() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let mut cache = TranscriptCache::new(128 * 1024, 64 * 1024, 8);
+        let at = std::time::Duration::from_secs(100);
+        for (key, modified) in [("a", 90), ("b", 80)] {
+            assert!(cache.insert_at(
+                key.into(),
+                retained_at("x".repeat(32 * 1024), Some(modified)),
+                0,
+                at
+            ));
+        }
+        assert!(!cache.insert_at(
+            "older".into(),
+            retained_at("x".into(), Some(1)),
+            120 * 1024,
+            at
+        ));
+        assert!(cache.resident_bound().unwrap() + 120 * 1024 <= 128 * 1024);
+        assert!(cache.take("older").is_none());
+    }
+    #[test]
+    fn sampled_cache_adapter_refuses_externally_mutable_charge() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        struct Shared {
+            value: std::sync::Arc<std::sync::Mutex<String>>,
+        }
+        crate::heap_layout_bound::fields!(Shared; value);
+        impl FrozenCacheState for Shared {
+            fn supports_frozen_charge(&self) -> bool {
+                false
+            }
+        }
+        let value = std::sync::Arc::new(std::sync::Mutex::new(String::from("synthetic")));
+        let state = Shared {
+            value: value.clone(),
+        };
+        assert!(heap_layout_bound::bound(&state, ENTRY_BYTES).is_some());
+        let mut cache = TranscriptCache::default();
+        assert!(!cache.insert(
+            "shared".into(),
+            Retained {
+                checkpoint: retained("x".into()).checkpoint,
+                state
+            }
+        ));
+        value.lock().unwrap().reserve(1024 * 1024);
+        assert!(cache.take("shared").is_none());
     }
 }

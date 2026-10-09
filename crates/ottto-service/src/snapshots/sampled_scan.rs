@@ -198,15 +198,33 @@ impl OwnedSourceScan {
         }
         self
     }
-    pub(crate) fn clear_sampled_cache(&self) {
+    pub(crate) fn release_sampled_cache_for_copy_refusal(&self) {
         if let Some(context) = self.sampling.as_ref() {
+            // A full parser's native accumulator is the unchanged synchronous
+            // baseline. Its local layout refusal forbids optional copies, but
+            // does not invalidate other already bounded resident reductions.
+            // Acquisition/path scratch still uses the separate 1MiB reserve.
+            // Borrowed tail state, unsupported audit metadata and an unbounded
+            // resident graph retain the existing conservative release behavior.
+            let native_full_baseline = self.active_file.as_ref().is_some_and(|active| {
+                active
+                    .sampling
+                    .as_ref()
+                    .is_some_and(|sampling| matches!(sampling.mode, ReadMode::Full(_)))
+            });
+            if native_full_baseline
+                && context.audit_metadata_supported
+                && crate::heap_layout_bound::bound(context, STATE_BYTES).is_some()
+            {
+                return;
+            }
             context.cache.clear();
         }
     }
     /// Charge only optimization-owned native state, samples/keys and copies.
     /// The unchanged serial index/metadata is baseline; parked/proof/send
     /// frames still use their existing aggregate 32MiB allocation/lifetime gate.
-    pub(super) fn sampled_copy_budget(&self) -> usize {
+    pub(super) fn sampled_copy_budget(&mut self) -> usize {
         let Some(context) = self
             .sampling
             .as_ref()
@@ -220,8 +238,14 @@ impl OwnedSourceScan {
         let Some(remaining) = STATE_BYTES.checked_sub(resident) else {
             return 0;
         };
-        let active = self.active_file.as_ref().map_or(Some(0), |active| {
-            crate::heap_layout_bound::bound(active, remaining)
+        let active = self.active_file.as_mut().map_or(Some(0), |active| {
+            // These native source-wide inputs predate the optimization, are
+            // refreshed on reuse, and are absent from every retained copy.
+            // All active owned parser/acquisition/path/receipt state stays charged.
+            let inputs = active.parser.take_live_reduction_inputs();
+            let bound = crate::heap_layout_bound::bound(active, remaining);
+            active.parser.restore_live_reduction_inputs(inputs);
+            bound
         });
         active
             .and_then(|used| remaining.checked_sub(used))

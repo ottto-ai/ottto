@@ -496,6 +496,31 @@ fn production_scan_at(
     (usize, usize, usize),
     (u64, u64),
 ) {
+    production_scan_at_with_setup(
+        fixture,
+        source,
+        index,
+        cache,
+        namespace,
+        collected_at,
+        |_| {},
+    )
+}
+#[allow(clippy::too_many_arguments)] // Preserve the fixture's production scanner options.
+fn production_scan_at_with_setup(
+    fixture: &ScanFixture,
+    source: SnapshotSource,
+    index: ScanIndex,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
+    namespace: &str,
+    collected_at: &str,
+    setup: impl FnOnce(&mut OwnedSourceScan),
+) -> (
+    ScanIndex,
+    SourceScanResult,
+    (usize, usize, usize),
+    (u64, u64),
+) {
     let mut scan = OwnedSourceScan::new(
         source,
         std::slice::from_ref(&fixture.root),
@@ -512,6 +537,7 @@ fn production_scan_at(
     if let Some(cache) = cache {
         scan = scan.with_sampled_acquisition(cache, Scope(namespace.into()));
     }
+    setup(&mut scan);
     let mut modes = (0, 0, 0);
     let mut metrics = (0, 0);
     loop {
@@ -545,6 +571,142 @@ fn production_scan_at(
                 return (index, scan, modes, metrics);
             }
         }
+    }
+}
+
+#[test]
+fn sampled_native_live_inputs_restored_after_charge_and_copy() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = Fixture::new(SnapshotSource::Codex);
+    fixture.append(&usage(SnapshotSource::Codex, 100, 0, "fixture-model"));
+    let (mut parser, _, scope) = native_parser(&fixture, SnapshotSource::Codex);
+    let traces = Arc::new(CodexTurnTraceMap::default());
+    let parents = Arc::new(Mutex::new(BTreeMap::new()));
+    parser.accumulator.codex_turn_traces = Some(traces.clone());
+    parser.accumulator.codex_parent_ownership_ledgers = Some(parents.clone());
+    parser.prepare_acquisition(None, &scope, None, 100).unwrap();
+    while !parser.step().unwrap() {}
+    for limit in [0, crate::transcript_cache::ENTRY_BYTES] {
+        assert_eq!(parser.retention_bound(limit).is_some(), limit != 0);
+        assert!(Arc::ptr_eq(
+            parser.accumulator.codex_turn_traces.as_ref().unwrap(),
+            &traces
+        ));
+        assert!(Arc::ptr_eq(
+            parser
+                .accumulator
+                .codex_parent_ownership_ledgers
+                .as_ref()
+                .unwrap(),
+            &parents
+        ));
+    }
+    let completed = parser
+        .retain_reduction(&scope, 100, crate::transcript_cache::ENTRY_BYTES)
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::transcript_cache::FrozenCacheState::supports_frozen_charge(
+            completed.reduction.as_ref().unwrap()
+        )
+    );
+    assert_eq!(Arc::strong_count(&traces), 2);
+    assert_eq!(Arc::strong_count(&parents), 2);
+    assert!(Arc::ptr_eq(
+        parser.accumulator.codex_turn_traces.as_ref().unwrap(),
+        &traces
+    ));
+    assert!(Arc::ptr_eq(
+        parser
+            .accumulator
+            .codex_parent_ownership_ledgers
+            .as_ref()
+            .unwrap(),
+        &parents
+    ));
+}
+
+#[test]
+fn sampled_production_unrelated_live_codex_inputs_do_not_disable_owned_tail() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for inputs in ["traces", "parents", "both"] {
+        let fixture = ScanFixture::new(SnapshotSource::Codex);
+        fixture
+            .file
+            .append(&usage(SnapshotSource::Codex, 100, 0, "fixture-model"));
+        fixture
+            .file
+            .append(&json!({"type":"synthetic-padding", "text":"x".repeat(64 * 1024)}));
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let setup = |scan: &mut OwnedSourceScan| {
+            if inputs != "parents" {
+                let traces = Arc::new(CodexTurnTraceMap {
+                    priority_turns: (0..5000).map(|n| format!("unrelated-turn-{n}")).collect(),
+                });
+                assert!(crate::heap_layout_bound::bound(&traces, 31 * 1024 * 1024).is_none());
+                scan.codex_turn_traces = Some(traces);
+            }
+            if inputs != "traces" {
+                let parents = Arc::new(Mutex::new(
+                    (0..5000)
+                        .map(|n| {
+                            (
+                                format!("unrelated-parent-{n}"),
+                                CodexParentOwnershipLedger {
+                                    signatures: Vec::new(),
+                                    scan_complete: true,
+                                    opened_object_identity: "synthetic-unrelated".into(),
+                                },
+                            )
+                        })
+                        .collect(),
+                ));
+                assert!(crate::heap_layout_bound::bound(&parents, 31 * 1024 * 1024).is_none());
+                scan.codex_parent_ownership_ledgers = Some(parents);
+            }
+        };
+        let (index, _, _, _) = production_scan_at_with_setup(
+            &fixture,
+            SnapshotSource::Codex,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "live-inputs",
+            NOW,
+            setup,
+        );
+        fixture
+            .file
+            .append(&usage(SnapshotSource::Codex, 140, 1, "fixture-model"));
+        let (_, tail, modes, bytes) = production_scan_at_with_setup(
+            &fixture,
+            SnapshotSource::Codex,
+            index,
+            Some(cache),
+            "live-inputs",
+            NOW,
+            setup,
+        );
+        assert_eq!(modes, (0, 1, 0), "unrelated live {inputs}");
+        let full_bytes = fixture.file.0.metadata().unwrap().len();
+        assert!(bytes.0 + bytes.1 < full_bytes);
+        let (_, full, _, _) = production_scan_at_with_setup(
+            &fixture,
+            SnapshotSource::Codex,
+            ScanIndex::default(),
+            None,
+            "live-inputs",
+            NOW,
+            setup,
+        );
+        assert_eq!(
+            production_body(SnapshotSource::Codex, tail),
+            production_body(SnapshotSource::Codex, full)
+        );
+        eprintln!("SAMPLED_LIVE_INPUTS inputs={inputs} full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
     }
 }
 fn production_body(source: SnapshotSource, mut scan: SourceScanResult) -> Value {
@@ -765,6 +927,56 @@ fn sampled_native_trace_invalidation_is_scoped_to_consumed_turns() {
         parser.prepare_acquisition(old, &scope, None, 101).unwrap(),
         ReadMode::Full(_)
     ));
+}
+
+#[test]
+fn sampled_production_unretainable_full_file_preserves_other_native_tails() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let small = ScanFixture::new(source);
+        let large = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        small.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (index, _, _) = production_scan(
+            &small,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "mixed-files",
+        );
+        for n in 0..150 {
+            large
+                .file
+                .append(&usage(source, 100 + n as u64, n, &format!("model-{n}")));
+        }
+        let (mut parser, _, _) = native_parser(&large.file, source);
+        while !parser.step().unwrap() {}
+        assert!(
+            crate::heap_layout_bound::bound(&parser, 31 * 1024 * 1024).is_none(),
+            "fixture must trigger per-file optional-layout refusal {source:?}"
+        );
+        let (_, large_scan, _) = production_scan(
+            &large,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "mixed-files",
+        );
+        let (_, large_full, _) =
+            production_scan(&large, source, ScanIndex::default(), None, "mixed-files");
+        assert_eq!(
+            production_body(source, large_scan),
+            production_body(source, large_full)
+        );
+        small.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (_, tail, modes) = production_scan(&small, source, index, Some(cache), "mixed-files");
+        assert_eq!(modes, (0, 1, 0), "unrelated full-file refusal {source:?}");
+        let (_, full, _) =
+            production_scan(&small, source, ScanIndex::default(), None, "mixed-files");
+        assert_eq!(production_body(source, tail), production_body(source, full));
+    }
 }
 
 #[test]
@@ -1297,6 +1509,57 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
             assert_eq!(counters["unchanged_selections"], modes.2);
             assert_eq!(counters["completed_native_bytes"], bytes.0);
             assert_eq!(counters["completed_guard_bytes"], bytes.1);
+            assert_eq!(record["schema_version"], 2);
+            let events = &counters["page_events"];
+            let reasons = events["full_reasons"].as_object().unwrap();
+            assert_eq!(
+                reasons.values().map(|v| v.as_u64().unwrap()).sum::<u64>(),
+                modes.0 as u64
+            );
+            if pass == 0 {
+                assert_eq!(events["full_reasons"], json!({"state_missing": modes.0}));
+                println!("RESOURCE_V2_COLD_FIXTURE {record}");
+            }
+            let gauges = &counters["index_state_at_page_end"];
+            assert_eq!(
+                gauges["pending_audits"],
+                next.files
+                    .values()
+                    .filter(|entry| entry.has_unverified_source())
+                    .count()
+            );
+            let now = sampled_scan::now_seconds();
+            assert_eq!(
+                gauges["overdue_audits"],
+                next.files
+                    .values()
+                    .filter(|entry| entry.audit_requires_full(now))
+                    .count()
+            );
+            assert_eq!(
+                gauges["oldest_due_age_seconds"],
+                next.files
+                    .values()
+                    .filter_map(|entry| entry.audit_obligation(now))
+                    .map(|debt| now.saturating_sub(debt.due_unix_seconds))
+                    .max()
+                    .unwrap_or(0)
+            );
+            for key in ["pending_audits", "overdue_audits", "oldest_due_age_seconds"] {
+                assert!(events.get(key).is_none());
+                assert!(counters.get(key).is_none());
+            }
+            for key in [
+                "priority_full_replays",
+                "audits_started",
+                "audits_completed",
+                "max_start_overdue_seconds",
+                "max_completion_overdue_seconds",
+            ] {
+                assert!(events[key].is_u64());
+                assert!(gauges.get(key).is_none());
+            }
+
             assert_eq!(
                 bytes.0,
                 match pass {
@@ -1324,5 +1587,73 @@ fn resource_diagnostics_native_counts_match_full_tail_and_idle_boundaries() {
             records[0]["counts"]["sampled_acquisition"].is_null(),
             "uncovered read counts are unknown"
         );
+        assert!(records[0]["counts"]["sampled_acquisition"]
+            .get("page_events")
+            .is_none());
+        assert!(records[0]["counts"]["sampled_acquisition"]
+            .get("index_state_at_page_end")
+            .is_none());
+    }
+}
+
+#[test]
+fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let live = ScanFixture::new(source);
+        live.file.append(&usage(source, 100, 0, "fixture-model"));
+        live.file
+            .append(&json!({"type":"synthetic-padding", "text":"x".repeat(64 * 1024)}));
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (index, _, _) = production_scan(
+            &live,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "scan-pressure",
+        );
+        // More cold admissions than the shared count cap. Their old source
+        // timestamps must not promote them over the recent active session.
+        for _ in 0..crate::transcript_cache::CACHE_ENTRIES + 16 {
+            let historical = ScanFixture::new(source);
+            historical
+                .file
+                .append(&usage(source, 100, 0, "fixture-model"));
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&historical.file.0)
+                .unwrap();
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1791370000)),
+            )
+            .unwrap();
+            let (_, scan, modes) = production_scan(
+                &historical,
+                source,
+                ScanIndex::default(),
+                Some(cache.clone()),
+                "scan-pressure",
+            );
+            assert_eq!(modes, (1, 0, 0));
+            assert!(!scan.snapshots.is_empty());
+        }
+        live.file.append(&usage(source, 140, 1, "fixture-model"));
+        let (_, tail, modes, bytes) =
+            production_scan_with_metrics(&live, source, index, Some(cache), "scan-pressure");
+        assert_eq!(
+            modes,
+            (0, 1, 0),
+            "recent tail after old full admissions {source:?}"
+        );
+        let full_bytes = live.file.0.metadata().unwrap().len();
+        assert!(bytes.0 + bytes.1 < full_bytes);
+        assert!(bytes.1 > 0 && bytes.1 <= 8192);
+        eprintln!("SAMPLED_SCAN_PRESSURE source={source:?} full_native_bytes={full_bytes} tail_native_bytes={} guard_bytes={}", bytes.0, bytes.1);
+        let (_, full, _) =
+            production_scan(&live, source, ScanIndex::default(), None, "scan-pressure");
+        assert_eq!(production_body(source, tail), production_body(source, full));
     }
 }

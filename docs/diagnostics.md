@@ -37,11 +37,20 @@ appear in this section. Approved upload uses the existing disclosure and consent
 ## Local Resource Measurements
 
 The existing service error log contains content-free JSON lines prefixed
-`ottto-service: local_resources`. The standard macOS installation writes this
-log in `~/Library/Logs/Ottto/ottto-service.err.log`. These records add no remote
+`ottto-service: local_resources`. The macOS app/dev LaunchAgent writes
+`~/Library/Logs/Ottto/ottto-service.err.log`; Homebrew writes
+`~/Library/Logs/Ottto/ottto-service.error.log`. These records add no remote
 telemetry endpoint or CLI command. They contain counts, byte lengths, timing,
 process id and a fixed source label; no paths, account/session identifiers,
 payloads, credentials or backend response bodies.
+
+Records use `schema_version: 2`. Within a version, fields and stage values may
+only be added; readers must ignore unknown keys and stages. Removing a field
+or line, or changing its meaning, increments the version. Version 2 removes
+the `sampled acquisition` text line: full-read reasons now come from
+`counts.sampled_acquisition.page_events.full_reasons` in `local_resources` JSON.
+Version 1 readers that need reasons must retain their text fallback while
+accepting version 1 binaries; there is no version negotiation.
 
 Each completed `native_collection_page` records existing scanned-file and
 semantic-no-op counts. `sampled_acquisition` is `null` when unavailable. Its
@@ -53,6 +62,25 @@ sidecars and independent identity reads are excluded. Zero here does not prove
 zero filesystem work. Collection timing covers native initialization and steps,
 including time parked between steps, and ends before post-policy finalization
 and upload. A capped/partial page is still a completed page.
+
+When sampling is present, `page_events` records existing full-read reasons as a
+sparse map of closed snake_case keys (`state_missing`, `audit_due`,
+`clock_changed`, `scope_changed`, `invalid_checkpoint`, `replaced`, `shrunk`,
+`same_size_edit`, `head_changed`, `boundary_changed`, `unsupported_identity`).
+Their sum equals `full_selections`. It also records `priority_full_replays`,
+`audits_started`, `audits_completed`, `max_start_overdue_seconds` and
+`max_completion_overdue_seconds`. Separate `index_state_at_page_end` gauges
+record `pending_audits`, `overdue_audits` and `oldest_due_age_seconds` using the
+existing index calculations. These are state, not events; overdue work remains
+owed until full verification. Both objects are absent when sampling is null.
+
+A `source_finish` record wraps rotation finish, including its validation,
+post-policy finalization and upload work. It exists exactly when finish was
+called and returned normally, including an error return. It has `counts: {}`
+and no result field; outcome reporting and transport receipts remain the
+existing outcome owners. Prepare failures, prepare returning no frame,
+rotation validation failures before finish, panics, aborts and hard kills
+produce no finish record.
 
 Each `snapshot_batch_call` records the actual serialized body length and the
 encoded/decoded body lengths across attempts passed to HTTP. Gzip refusal adds
@@ -68,16 +96,25 @@ receipt processing, including failures.
 window, including concurrent stages; it excludes child processes. It must not
 be attributed to one provider. `process_lifetime_max_rss_bytes` is the process's
 lifetime memory high-water mark, not a collection/cycle peak or current RSS.
-Unavailable measurements and regressing CPU samples are `null`. Unix observation
+`process_lifetime_max_rss_before_bytes` preserves the start sample when both
+samples are available and non-regressing; otherwise it is `null`. A rise
+correlates only with a process-wide time window, not allocation ownership.
+Unavailable measurements and regressing CPU deltas are `null`. Unix observation
 time and process id support comparison with an independently measured matching
-process. Do not add overlapping CPU deltas or infer per-stage memory use.
+process. Never subtract or sum overlapping windows or infer per-stage memory
+use: the finish window contains its batch-call windows.
 
-There is one fixed-size observation per completed page/batch call and two OS
-resource samples per observation, with no per-row sampling, extra transcript
-reads or new diagnostic store. Log output uses existing service retention and
-may be unavailable; diagnostic write errors do not fail collection or upload.
+There is one bounded observation per completed page, batch call and normally
+returned finish, with two OS resource samples per observation, no per-row
+sampling, extra transcript reads or new diagnostic store. Version 2 adds one
+record per finish and removes one text line per sampled page; total log writes
+are not unchanged. Output is a synchronous best-effort write on the calling
+thread under std's stderr lock; errors are ignored, with no retry, queue or
+thread. It may block for the duration of a regular-file write, like existing
+service stderr lines. Log output uses existing service retention and may be
+unavailable; diagnostic write errors do not fail collection or upload.
 Status/quota refresh, OTLP reception and independent metadata/discovery work are
-outside this first measurement slice. Installed comparisons must use the same
+outside this measurement slice. Installed comparisons must use the same
 source/encoding settings and distinguish idle, ordinary changes, import and
 recovery. A containing release and matching installation are required before
 calling these measurements installed evidence.

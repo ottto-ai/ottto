@@ -1,0 +1,9 @@
+# Isolate optional full-file retention refusal
+
+A native full parser can exceed the optional retained-state allocation or traversal budget even while unrelated resident entries remain safely bounded. The production step previously cleared the entire process-owned transcript cache whenever its copy budget was zero. A large full file could therefore erase another session’s checkpoint and turn its next append into a missing-checkpoint full read.
+
+Keep unrelated resident entries only when the current acquisition is a native full read, audit metadata remains supported, and the complete shared context still satisfies its existing state budget. The full parser is the unchanged synchronous baseline. Its zero copy budget stays zero: the refused file gets no new optional retained copy. Acquisition and path scratch retain their existing reserve. Borrowed tail state, unsupported audit metadata and an unbounded resident context keep conservative cache release.
+
+The shared helper serves Claude Code and Codex. Byte guards, hourly audit debt, first-import authority, account/sidecar dependencies, native semantics, ACK settlement, entry/count/byte limits and traversal ceilings remain unchanged. The mixed-file regression compares the large full result and the surviving small-session tail with independent full-reader bodies. Original code fails at the small session’s missing checkpoint.
+
+Source tests do not prove installed cache effectiveness or explain every missing checkpoint. Large sequential pages can still evict bounded entries, individual native states can remain ineligible for retention, and recovery may deliberately refuse reuse until durable authority is available. Installed acceptance requires an ordinary eligible tail from a containing release, with compiler/source/runtime identity separately established.

@@ -30,6 +30,14 @@ pub(crate) struct CachedJsonlReduction {
 }
 crate::heap_layout_bound::fields!(CachedJsonlReduction; accumulator, report,
     recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
+impl crate::transcript_cache::FrozenCacheState for CachedJsonlReduction {
+    fn supports_frozen_charge(&self) -> bool {
+        // retain_reduction removes these live, shared inputs from the copy.
+        // Refuse frozen accounting if an adapter ever forgets that boundary.
+        self.accumulator.codex_turn_traces.is_none()
+            && self.accumulator.codex_parent_ownership_ledgers.is_none()
+    }
+}
 
 pub(super) struct CompletedNativeAcquisition {
     pub(super) checkpoint: Checkpoint,
@@ -37,7 +45,26 @@ pub(super) struct CompletedNativeAcquisition {
 }
 crate::heap_layout_bound::fields!(CompletedNativeAcquisition; checkpoint, reduction);
 
+// Source-scan dependencies are refreshed on reuse and never retained in a
+// checkpoint. Keep the same exclusion for active-copy and retained-copy charges.
+pub(super) struct LiveReductionInputs {
+    traces: Option<Arc<CodexTurnTraceMap>>,
+    parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+}
+
 impl OwnedJsonlParser {
+    pub(super) fn take_live_reduction_inputs(&mut self) -> LiveReductionInputs {
+        LiveReductionInputs {
+            traces: self.accumulator.codex_turn_traces.take(),
+            parents: self.accumulator.codex_parent_ownership_ledgers.take(),
+        }
+    }
+
+    pub(super) fn restore_live_reduction_inputs(&mut self, inputs: LiveReductionInputs) {
+        self.accumulator.codex_turn_traces = inputs.traces;
+        self.accumulator.codex_parent_ownership_ledgers = inputs.parents;
+    }
+
     /// Invoked on a fresh safely-opened parser before any fill/read. Scope and
     /// durable debt must be supplied by the existing source/index authority.
     pub(super) fn prepare_acquisition(
@@ -120,8 +147,7 @@ impl OwnedJsonlParser {
         }
         // These live dependencies are refreshed before every reuse and are not
         // retained in the copy. Their unchanged source-scan lifetime is baseline.
-        let traces = self.accumulator.codex_turn_traces.take();
-        let parents = self.accumulator.codex_parent_ownership_ledgers.take();
+        let inputs = self.take_live_reduction_inputs();
         let bound = (|| {
             let state = crate::heap_layout_bound::bound(&self.accumulator, limit)?;
             let checkpoint = crate::heap_layout_bound::bound(
@@ -133,8 +159,7 @@ impl OwnedJsonlParser {
             let total = state.checked_add(checkpoint)?.checked_add(inline)?;
             (total <= limit).then_some(total)
         })();
-        self.accumulator.codex_turn_traces = traces;
-        self.accumulator.codex_parent_ownership_ledgers = parents;
+        self.restore_live_reduction_inputs(inputs);
         bound
     }
 
@@ -178,11 +203,11 @@ impl OwnedJsonlParser {
                 reduction: None,
             }));
         }
-        let mut accumulator = self.accumulator.clone();
         // Extend no source-wide trace/ownership allocation's lifetime in RAM.
         // prepare_acquisition always installs this cycle's real dependencies.
-        accumulator.codex_turn_traces = None;
-        accumulator.codex_parent_ownership_ledgers = None;
+        let inputs = self.take_live_reduction_inputs();
+        let accumulator = self.accumulator.clone();
+        self.restore_live_reduction_inputs(inputs);
         let reduction = CachedJsonlReduction {
             accumulator,
             report: self.reader.report,
