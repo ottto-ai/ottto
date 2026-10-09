@@ -1316,12 +1316,18 @@ mod tests {
                 }
                 let packaged_at = step["packaged_at"].as_str().expect("packaged_at");
                 let read_at = packaged_at.replace(":05Z", ":00Z");
-                let answers = step["provider_inputs"]
+                let mut answers = step["provider_inputs"]
                     .as_array()
                     .expect("inputs")
                     .iter()
                     .map(|input| fixture(input.as_str().expect("input path")))
                     .collect::<Vec<_>>();
+                if label.starts_with("restart") {
+                    // The canonical step lists the count-2 body for a count-1
+                    // reading (reported to the fixture owner); read the
+                    // count-1 count-only body it describes.
+                    answers = vec![json!({"rateLimitResetCredits": {"availableCount": 1}})];
+                }
                 // A body with a list answered a detailed read. A count-only
                 // body answered a routine read, followed by the detailed read
                 // when the adapter asks for it (the next input, or a failure).
@@ -1344,17 +1350,6 @@ mod tests {
                     packaged_at,
                 );
                 let expected = json!({ "credit_balances": step["credit_balances"] });
-                if label.starts_with("restart") {
-                    // The fixture lists the count-2 body for a count-1 reading;
-                    // the pinned rule (cold cache + failed detail read is
-                    // unavailable, never a stale list) is checked field by field.
-                    let balance = &actual["credit_balances"][0];
-                    assert_eq!(balance["grants_state"], "unavailable", "{label}");
-                    assert!(balance.get("grants").is_none(), "{label}");
-                    assert!(balance.get("grants_observed_at").is_none(), "{label}");
-                    assert_eq!(balance["updated_at"], packaged_at, "{label}");
-                    continue;
-                }
                 assert_eq!(actual, expected, "step {index}: {label}");
             }
         }
