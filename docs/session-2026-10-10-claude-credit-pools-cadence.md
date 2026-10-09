@@ -55,8 +55,11 @@ extra calls:
   gaps up to 15 min) that all found that caller signed in to exactly this
   account and organization. Another binding, a longer gap, a restart or a
   clock going backwards starts a new run, and a run never adopts a body
-  fetched before it began. The residual gap is a switch away and back between
-  two consecutive passes with a Claude Code usage fetch in between;
+  fetched before it began. This input is implemented and tested but held
+  behind `CLAUDE_PASSIVE_READING_ENABLED = false`: a registered slot's identity
+  gate still returns before the usage collector records the pass, so a switch
+  away and back inside the run window could go unseen until that gate also
+  ends the run;
 - the existing 5-minute post-success spacing, Retry-After handling, breaker and
   per-caller auth backoff are unchanged.
 

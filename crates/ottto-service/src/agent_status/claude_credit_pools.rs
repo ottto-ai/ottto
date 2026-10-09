@@ -28,6 +28,12 @@ use crate::quota_credit_model::{
 /// of the observed web variant is witnessed and the lead confirms its shape.
 /// While `false` every read is the plain read, exactly as before.
 pub(super) const CLAUDE_SAVED_RESETS_READ_ENABLED: bool = false;
+/// Passive input from Claude Code's own `cachedUsageUtilization`. Held off
+/// until every pass that finds a registered slot signed in elsewhere also ends
+/// that caller's sign-in run: today the slot identity gates return before the
+/// usage collector records the pass, so a switch away and back within the run
+/// window would go unseen. While `false` no passive reading is adopted.
+pub(super) const CLAUDE_PASSIVE_READING_ENABLED: bool = false;
 /// Query of the saved-reset read variant. It returns the same windows and
 /// one-time pools as the plain read, `cedar_ember`, and no `spend`.
 const CLAUDE_SAVED_RESETS_QUERY: &str = "?cedar_ember=1&skip_spend=1";

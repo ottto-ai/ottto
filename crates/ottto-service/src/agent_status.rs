@@ -9714,14 +9714,18 @@ fn collect_claude_oauth_usage_unstamped(
     // Passive input (Ron Q3): Claude Code's own plain reading for exactly this
     // binding, newer than ours and inside the slot, stands in for this slot's
     // call. Parsed by the same plain-body parser; no provider request.
-    let passive_config = claude_oauth_passive_config(
-        caller,
-        account_identifier_hash,
-        organization_identifier_hash,
-    );
+    let passive_config = if claude_credit_pools::CLAUDE_PASSIVE_READING_ENABLED {
+        claude_oauth_passive_config(
+            caller,
+            account_identifier_hash,
+            organization_identifier_hash,
+        )
+    } else {
+        claude_credit_pools::ClaudePassiveConfig::default()
+    };
     if let Some(passive) = passive_config
         .reading
-        .filter(|_| passive_config.bound)
+        .filter(|_| claude_credit_pools::CLAUDE_PASSIVE_READING_ENABLED && passive_config.bound)
         .filter(|passive| {
             claude_credit_pools::claude_passive_reading_usable(
                 passive.fetched_at,
