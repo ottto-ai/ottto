@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 523,
-  "content_sha256": "141b8470cc02100b38d0099b38ad7f8208912eb9143a6e800a727cd64adb6d25",
+  "content_sha256": "eed4ba57acb1db402035fba2f871140c052c86f652a071dfe5ca9d66e1b988a0",
   "files": [
     {
       "executable": false,
@@ -986,15 +986,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/quota_credit_model.rs",
-      "sha256": "190bffa35729cb3f29d35ba6f5d80952105a565fbf78c5f204f1fae0a933c6eb",
-      "size_bytes": 32612
+      "sha256": "34054d01a62c1dcf54d4d6b4502cc8d13639179f64cdedfeeea9c2640c583580",
+      "size_bytes": 33278
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/quota_credit_model/tests.rs",
-      "sha256": "e23a92c256bfb8a7a6d33d3a054728e6e3fba0b6df43e8c4fa406bb77a5245e9",
-      "size_bytes": 55276
+      "sha256": "2c951b2bd7bb6c987e9807e071177c955f6d71fc002bf2b06a0d570e6a8c5596",
+      "size_bytes": 57149
     },
     {
       "executable": false,
@@ -3664,7 +3664,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-09T21:24:01+00:00",
+  "generated_at": "2026-10-09T21:28:17+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 524,
   "public_roots": [
@@ -3703,5 +3703,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f2bae041abd1c5b8711d87f499eec6f97e7f9c3f"
+  "source_commit": "d0a4f95cf98cad67fddd71e89311c648bf09aa38"
 }
