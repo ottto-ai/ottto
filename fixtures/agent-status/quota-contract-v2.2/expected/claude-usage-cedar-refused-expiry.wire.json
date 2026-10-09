@@ -41,8 +41,7 @@
       "name": "reset_bank",
       "observed_at": "2026-10-01T12:00:00Z",
       "status": "unknown",
-      "unit": "resets",
-      "updated_at": "2026-10-01T12:00:05Z"
+      "unit": "resets"
     }
   ]
 }

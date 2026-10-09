@@ -9,16 +9,22 @@
 //! provider-neutral inputs ([`ListObservation`], [`GrantInput`]) and never
 //! re-implement a rule that lives here.
 //!
-//! Adapter flow for a balance with grants:
+//! Adapter flow:
 //!
-//! 1. build the balance (name/unit/kind/status per the adapter's table);
-//! 2. `build_grants(observation).apply_to(&mut balance)` writes `grants`,
-//!    `grants_state`, `grant_count`, `grants_observed_at` and the summaries;
-//! 3. stamp packaging time with [`stamp_packaged_at`] (fresh and re-sent
-//!    balances alike), and use [`SectionCache`] for sections this reading
-//!    did not include.
+//! 1. build the balance with the adapter's name/unit/kind table, or
+//!    [`one_time_credit`] for a one-time pool;
+//! 2. for a balance with grants, `build_grants(observation).apply_to(&mut
+//!    balance)` writes `grants`, `grants_state`, `grant_count`,
+//!    `grants_observed_at`, the summaries and, for saved resets, `status`
+//!    (and the Anthropic `remaining`);
+//! 3. [`apply_readiness`] for provider readiness and [`apply_disabled`] for a
+//!    balance the provider switched off;
+//! 4. use [`SectionCache`] for sections this reading did not include.
 //!
-//! Summaries ([`summarize`]) are complete-gated. One exception lives in
+//! Credit balances never carry `updated_at`; consumers use the snapshot's
+//! capture time.
+//!
+//! Summaries are complete-gated. One exception lives in
 //! [`GrantsBuild::apply_to`]: when a complete provider enumeration was cut
 //! only by the daemon's 20 cap, `next_expires_at` is still exact (computed over
 //! the whole list before the cut) and is set although the state is `capped`.
@@ -53,8 +59,6 @@ const ANTHROPIC_GRANT_ID_MAX: usize = 40;
 /// Longest OpenAI grant id the daemon keys. Ids are hashed, so this only
 /// bounds work on a malformed body.
 const OPENAI_GRANT_ID_MAX: usize = 256;
-/// Upper bound on cached sections across all bindings.
-const SECTION_CACHE_MAX_ENTRIES: usize = 64;
 
 /// Provider whose grant ids are keyed. The token is part of `grant_key`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -177,31 +181,37 @@ impl CreditModelDiagnostic {
 }
 
 /// The grant section of one balance, built by [`build_grants`].
+/// Its fields are the model's decisions; adapters only read the diagnostics
+/// and call [`GrantsBuild::apply_to`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct GrantsBuild {
-    pub(crate) grants: Option<Vec<AgentCreditGrant>>,
-    pub(crate) grants_state: Option<CreditGrantsState>,
-    pub(crate) grant_count: Option<u64>,
-    pub(crate) grants_observed_at: Option<Rfc3339Timestamp>,
+    grants: Option<Vec<AgentCreditGrant>>,
+    grants_state: Option<CreditGrantsState>,
+    grant_count: Option<u64>,
+    grants_observed_at: Option<Rfc3339Timestamp>,
     /// The provider enumeration was complete and only the daemon's 20 cap cut
     /// it, so the soonest expiry is still known exactly.
-    pub(crate) sender_capped: bool,
+    sender_capped: bool,
     /// Soonest available/paused expiry over the whole list, computed before
     /// the cap dropped any grant. Set only with `sender_capped`.
-    pub(crate) sender_capped_next_expires_at: Option<Rfc3339Timestamp>,
+    sender_capped_next_expires_at: Option<Rfc3339Timestamp>,
     /// Provider of a read list; `None` for unavailable/not-supported.
-    pub(crate) provider: Option<Provider>,
-    pub(crate) diagnostics: Vec<CreditModelDiagnostic>,
+    provider: Option<Provider>,
+    diagnostics: Vec<CreditModelDiagnostic>,
 }
 
 impl GrantsBuild {
+    pub(crate) fn diagnostics(&self) -> &[CreditModelDiagnostic] {
+        &self.diagnostics
+    }
+
     /// Write the grant section into `balance` and recompute its summaries.
     pub(crate) fn apply_to(self, balance: &mut AgentCreditBalance) -> Vec<CreditModelDiagnostic> {
         balance.grants = self.grants;
         balance.grants_state = self.grants_state;
         balance.grant_count = self.grant_count;
         balance.grants_observed_at = self.grants_observed_at;
-        summarize_with(balance, self.provider);
+        summarize(balance, self.provider);
         if self.sender_capped && balance.grants_state == Some(CreditGrantsState::Capped) {
             balance.next_expires_at = self.sender_capped_next_expires_at;
         }
@@ -353,9 +363,7 @@ fn build_grant(
 
     let grant_type = match (provider, record.reset_type) {
         (Provider::Anthropic, _) => CreditGrantType::RateLimitReset,
-        (Provider::OpenAi, Field::Value(reset_type))
-            if matches!(reset_type.as_str(), "codexRateLimits" | "codex_rate_limits") =>
-        {
+        (Provider::OpenAi, Field::Value(reset_type)) if reset_type == "codexRateLimits" => {
             CreditGrantType::RateLimitReset
         }
         (Provider::OpenAi, _) => {
@@ -580,17 +588,18 @@ pub(crate) fn bounded_title(
     )
 }
 
-fn counts_toward_summary(grant: &AgentCreditGrant) -> bool {
+fn counts_toward_next_expiry(grant: &AgentCreditGrant) -> bool {
     matches!(
         grant.status,
         CreditGrantStatus::Available | CreditGrantStatus::Paused
     )
 }
 
+/// Soonest `expires_at` among available/paused grants (contract v2.2 §11.1).
 fn next_expires_at(grants: &[AgentCreditGrant]) -> Option<Rfc3339Timestamp> {
     grants
         .iter()
-        .filter(|grant| counts_toward_summary(grant))
+        .filter(|grant| counts_toward_next_expiry(grant))
         .filter_map(|grant| {
             let text = grant.expires_at.as_ref()?;
             Some((parse_instant(text)?, text))
@@ -599,10 +608,12 @@ fn next_expires_at(grants: &[AgentCreditGrant]) -> Option<Rfc3339Timestamp> {
         .map(|(_, text)| text.clone())
 }
 
+/// Latest provider `granted_at` over every grant, whatever its status
+/// (contract v2.2 §11.1): a grant used right after it was added is still the
+/// latest one added.
 fn latest_granted_at(grants: &[AgentCreditGrant]) -> Option<Rfc3339Timestamp> {
     grants
         .iter()
-        .filter(|grant| counts_toward_summary(grant))
         .filter_map(|grant| {
             let text = grant.granted_at.as_ref()?;
             Some((parse_instant(text)?, text))
@@ -611,23 +622,31 @@ fn latest_granted_at(grants: &[AgentCreditGrant]) -> Option<Rfc3339Timestamp> {
         .map(|(_, text)| text.clone())
 }
 
-/// Balance summaries over its grants (contract v2.2 §11.1, v2.1 §3 A).
-///
-/// Only a `complete` list is a basis. `next_expires_at` (min `expires_at`)
-/// and `latest_granted_at` (max `granted_at`) range over available/paused
-/// grants with no clock filter: the reader judges whether an instant passed.
-/// Otherwise both are `None`.
-///
-/// Saved resets whose grants carry per-grant `resets_left` (Anthropic) get
-/// `remaining` = Σ `resets_left` of non-paused grants when the list is
-/// `complete` (an empty complete list is 0), and `None` in every other state.
-/// A provider-reported count (OpenAI `availableCount`, no per-grant counts) is
-/// left as sent. The sender-capped expiry case is in [`GrantsBuild::apply_to`].
-pub(crate) fn summarize(balance: &mut AgentCreditBalance) {
-    summarize_with(balance, None);
+/// Balance state for a balance whose `remaining` is a count of what is left
+/// (contract v2.1 §2.2): zero is `exhausted`, a positive amount is `ok`, and
+/// an unknown amount is `unknown`.
+pub(crate) fn status_for_remaining(remaining: Option<u64>) -> AgentCreditBalanceStatus {
+    match remaining {
+        Some(0) => AgentCreditBalanceStatus::Exhausted,
+        Some(_) => AgentCreditBalanceStatus::Ok,
+        None => AgentCreditBalanceStatus::Unknown,
+    }
 }
 
-fn summarize_with(balance: &mut AgentCreditBalance, provider: Option<Provider>) {
+/// Balance summaries over its grants (contract v2.2 §11.1, v2.1 §3 A). Only
+/// [`GrantsBuild::apply_to`] calls this, with the provider of the list it just
+/// built; nothing here guesses the provider from the data.
+///
+/// - Only a `complete` list is a basis. `next_expires_at` is the soonest
+///   expiry among available/paused grants and `latest_granted_at` the latest
+///   grant time over all grants, with no clock filter (the reader judges
+///   whether an instant has passed). Otherwise both are `None`.
+/// - Anthropic saved resets: `remaining` = Σ `resets_left` of non-paused
+///   grants for a `complete` list (0 when empty) and `None` in every other
+///   state. A provider count (OpenAI `availableCount`) is left as sent.
+/// - Every saved-resets balance takes its `status` from
+///   [`status_for_remaining`].
+fn summarize(balance: &mut AgentCreditBalance, provider: Option<Provider>) {
     balance.next_expires_at = None;
     balance.latest_granted_at = None;
     let complete = balance.grants_state == Some(CreditGrantsState::Complete);
@@ -636,57 +655,125 @@ fn summarize_with(balance: &mut AgentCreditBalance, provider: Option<Provider>) 
         balance.next_expires_at = next_expires_at(grants);
         balance.latest_granted_at = latest_granted_at(grants);
     }
-    if !sums_resets_left(balance, provider) {
-        return;
-    }
-    balance.remaining = if complete {
-        Some(
-            balance
-                .grants
-                .iter()
-                .flatten()
-                .filter(|grant| grant.status != CreditGrantStatus::Paused)
-                .filter_map(|grant| grant.resets_left)
-                .sum(),
-        )
-    } else {
-        None
-    };
-}
-
-/// Whether `remaining` is the model's Σ `resets_left` rather than a provider
-/// count. Known for a list the model just built from Anthropic records;
-/// otherwise recognised by grants carrying `resets_left` (OpenAI never sends
-/// one), or an empty list with no provider count.
-fn sums_resets_left(balance: &AgentCreditBalance, provider: Option<Provider>) -> bool {
     if balance.kind != Some(CreditBalanceKind::SavedResets)
         || balance.unit != AgentCreditBalanceUnit::Resets
     {
-        return false;
+        return;
     }
-    let Some(grants) = balance.grants.as_deref() else {
-        return false;
-    };
-    match provider {
-        Some(Provider::Anthropic) => true,
-        Some(Provider::OpenAi) => false,
-        None if grants.is_empty() => balance.remaining.is_none(),
-        None => grants.iter().any(|grant| grant.resets_left.is_some()),
+    if provider == Some(Provider::Anthropic) && balance.grants.is_some() {
+        balance.remaining = if complete {
+            Some(
+                balance
+                    .grants
+                    .iter()
+                    .flatten()
+                    .filter(|grant| grant.status != CreditGrantStatus::Paused)
+                    .filter_map(|grant| grant.resets_left)
+                    .sum(),
+            )
+        } else {
+            None
+        };
     }
+    balance.status = status_for_remaining(balance.remaining);
 }
 
-/// Packaging time of every credit balance a snapshot emits, fresh or re-sent
-/// (contract v2.2 §11.7 C9): never carried over from an earlier snapshot.
-pub(crate) fn stamp_packaged_at(balances: &mut [AgentCreditBalance], packaged_at: &str) {
-    for balance in balances {
-        balance.updated_at = Some(packaged_at.to_string());
-    }
+/// Provider readiness for saved resets, passed through and never derived
+/// (design R6; contract v2.2 §11.1).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ReadinessInput {
+    pub(crate) eligible: Field<bool>,
+    pub(crate) at_limit: Field<bool>,
+    pub(crate) ineligible_reason: Field<String>,
+    pub(crate) cooldown_until: TimeInput,
+}
+
+/// Write provider readiness onto a saved-resets balance. Every field is valid
+/// only with `unit: resets`; on any other balance each sent field is refused.
+/// `ineligible_reason` must be a `^[a-z0-9_.-]{1,64}$` code that passes the
+/// privacy guard, and `cooldown_until` is normalized to UTC. A refused field
+/// stays `None` with a diagnostic.
+pub(crate) fn apply_readiness(
+    balance: &mut AgentCreditBalance,
+    input: ReadinessInput,
+) -> Vec<CreditModelDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let resets = balance.unit == AgentCreditBalanceUnit::Resets;
+    let mut refuse = |field: &'static str| {
+        diagnostics.push(CreditModelDiagnostic::new("field_refused", field));
+    };
+    let mut flag = |value: Field<bool>, field: &'static str| match value {
+        Field::Absent => None,
+        Field::Value(value) if resets => Some(value),
+        _ => {
+            refuse(field);
+            None
+        }
+    };
+    balance.eligible = flag(input.eligible, "eligible");
+    balance.at_limit = flag(input.at_limit, "at_limit");
+    balance.ineligible_reason = match input.ineligible_reason {
+        Field::Absent => None,
+        Field::Value(reason)
+            if resets && is_credit_reason_code(&reason) && is_backend_safe_credit_text(&reason) =>
+        {
+            Some(reason)
+        }
+        _ => {
+            refuse("ineligible_reason");
+            None
+        }
+    };
+    balance.cooldown_until = match normalize_time(input.cooldown_until) {
+        Ok(None) => None,
+        Ok(Some(instant)) if resets => Some(instant),
+        _ => {
+            refuse("cooldown_until");
+            None
+        }
+    };
+    diagnostics
+}
+
+/// Mark a balance as switched off by the provider (contract v2.1 §2.2
+/// "Disabled"): `enabled: false`, amounts absent, `status: unknown`, and the
+/// provider's reason when it is a `^[a-z0-9_.-]{1,64}$` code that passes the
+/// privacy guard; any other reason is refused with a diagnostic.
+pub(crate) fn apply_disabled(
+    balance: &mut AgentCreditBalance,
+    reason: Field<String>,
+) -> Vec<CreditModelDiagnostic> {
+    balance.enabled = Some(false);
+    balance.status = AgentCreditBalanceStatus::Unknown;
+    balance.remaining = None;
+    balance.used = None;
+    balance.quota = None;
+    balance.used_percent = None;
+    balance.unlimited = None;
+    let mut diagnostics = Vec::new();
+    balance.disabled_reason = match reason {
+        Field::Absent => None,
+        Field::Value(reason)
+            if is_credit_reason_code(&reason) && is_backend_safe_credit_text(&reason) =>
+        {
+            Some(reason)
+        }
+        _ => {
+            diagnostics.push(CreditModelDiagnostic::new(
+                "field_refused",
+                "disabled_reason",
+            ));
+            None
+        }
+    };
+    diagnostics
 }
 
 /// A one-time credit pool (contract v2.2 §11.3, names pinned by §11.7 C4):
 /// `name:"one_time_credit"`, `unit:"usd"`, `currency:"USD"`, amounts in
 /// cents, `expires_at` = the pool's expiry, `enabled: None` (the provider
-/// sends no flag), no `resets_at`.
+/// sends no flag), no `resets_at`. The title follows [`bounded_title`]; its
+/// refusal or truncation comes back as a diagnostic.
 pub(crate) fn one_time_credit(
     limit_id: &str,
     title: Field<String>,
@@ -695,16 +782,11 @@ pub(crate) fn one_time_credit(
     remaining_cents: Option<u64>,
     expires_at: Option<Rfc3339Timestamp>,
     observed_at: Option<Rfc3339Timestamp>,
-) -> AgentCreditBalance {
-    let (title, _) = bounded_title(title, "title");
-    let status = match remaining_cents {
-        Some(0) => AgentCreditBalanceStatus::Exhausted,
-        Some(_) => AgentCreditBalanceStatus::Ok,
-        None => AgentCreditBalanceStatus::Unknown,
-    };
-    AgentCreditBalance {
+) -> (AgentCreditBalance, Vec<CreditModelDiagnostic>) {
+    let (title, title_diagnostic) = bounded_title(title, "title");
+    let balance = AgentCreditBalance {
         name: "one_time_credit".to_string(),
-        status,
+        status: status_for_remaining(remaining_cents),
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Usd,
         remaining: remaining_cents,
@@ -717,19 +799,21 @@ pub(crate) fn one_time_credit(
         kind: Some(CreditBalanceKind::OneTimeCredit),
         title,
         ..Default::default()
-    }
+    };
+    (balance, title_diagnostic.into_iter().collect())
 }
 
 /// The grant-list part of a balance, cached so a reading without details can
-/// re-send the last observed list unchanged.
+/// re-send the last observed list unchanged. Built only from an observed
+/// balance; its fields are the model's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GrantListSection {
-    pub(crate) grant_count: Option<u64>,
-    pub(crate) grants: Vec<AgentCreditGrant>,
-    pub(crate) grants_state: CreditGrantsState,
-    pub(crate) grants_observed_at: Option<Rfc3339Timestamp>,
-    pub(crate) next_expires_at: Option<Rfc3339Timestamp>,
-    pub(crate) latest_granted_at: Option<Rfc3339Timestamp>,
+    grant_count: Option<u64>,
+    grants: Vec<AgentCreditGrant>,
+    grants_state: CreditGrantsState,
+    grants_observed_at: Option<Rfc3339Timestamp>,
+    next_expires_at: Option<Rfc3339Timestamp>,
+    latest_granted_at: Option<Rfc3339Timestamp>,
 }
 
 impl GrantListSection {
@@ -746,7 +830,8 @@ impl GrantListSection {
     }
 
     /// Copy the list into `balance` exactly as observed, keeping its original
-    /// `grants_observed_at`.
+    /// `grants_observed_at`. A saved-resets balance takes its `status` from its
+    /// freshly read count, as with [`GrantsBuild::apply_to`].
     pub(crate) fn apply_to(&self, balance: &mut AgentCreditBalance) {
         balance.grant_count = self.grant_count;
         balance.grants = Some(self.grants.clone());
@@ -754,7 +839,40 @@ impl GrantListSection {
         balance.grants_observed_at = self.grants_observed_at.clone();
         balance.next_expires_at = self.next_expires_at.clone();
         balance.latest_granted_at = self.latest_granted_at.clone();
+        if balance.kind == Some(CreditBalanceKind::SavedResets)
+            && balance.unit == AgentCreditBalanceUnit::Resets
+        {
+            balance.status = status_for_remaining(balance.remaining);
+        }
     }
+}
+
+/// Which credential a cached section belongs to. Built only from the
+/// credential-identity hash the adapter resolved for the binding (account and
+/// organization identity), never from a slot or directory name: a slot that
+/// switches from account A to B must not re-send A's sections as B's.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct BindingKey(String);
+
+impl BindingKey {
+    pub(crate) fn from_credential_identity_hash(hash: &str) -> Self {
+        Self(hash.to_string())
+    }
+}
+
+/// A section one provider read produces. Each balance belongs to exactly one
+/// section, so a snapshot never carries the same balance twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CreditSection {
+    /// A grant list re-sent onto a freshly read count
+    /// ([`SectionCache::observe_grant_list`]).
+    GrantList,
+    /// Usage-credit balances.
+    UsageCredits,
+    /// One-time credit pools; every read that reports them emits them fresh.
+    OneTimeCredits,
+    /// Saved-reset balances.
+    SavedResets,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -772,25 +890,35 @@ struct CacheEntry {
     stored_seq: u64,
 }
 
+/// Bound on cached sections across all bindings. Ottto watches at most 10
+/// Claude and 10 Codex account slots; a Claude binding uses up to three
+/// balance sections and a Codex binding one grant list, so the live set is at
+/// most 40 entries. The rest holds sections of identities a slot switched
+/// away from (A→B→A). Every section is re-observed on its read cadence, so the
+/// oldest-stored entry is the stalest; evicting it emits a diagnostic.
+const SECTION_CACHE_MAX_ENTRIES: usize = 64;
+
 /// Sender stability across read cadence (design R7b; contract v2.2 §11.5,
 /// §11.7 C8/C9).
 ///
-/// - Keyed by binding (the credential identity the adapter resolved) and a
-///   section name the adapter chooses. An entry is dropped only by
-///   [`SectionCache::clear_binding`] when that binding's identity changes, so
-///   A→B→A keeps A's sections.
+/// - Keyed by [`BindingKey`] (credential identity) and [`CreditSection`]. An
+///   entry is dropped only by [`SectionCache::clear_binding`] when that
+///   binding's identity changes, or by the size bound, so A→B→A keeps A's
+///   sections.
 /// - A re-sent section is the last observed one unchanged: original
 ///   `observed_at`/`grants_observed_at`, same presence, `grants`,
-///   `grants_state` and `status`. Only `updated_at` becomes the current
-///   packaging time.
+///   `grants_state` and `status`. `updated_at` is never carried over: re-sent
+///   balances leave it unset, like fresh ones, and consumers use the
+///   snapshot's capture time.
 /// - Cold cache: nothing is returned, so a section never read is never sent,
 ///   and nothing stands in for it with `status: unknown`.
 /// - A cached grant list is offered only while the provider count still
 ///   equals the count it was read with; otherwise the caller reads details now.
 #[derive(Debug, Default)]
 pub(crate) struct SectionCache {
-    entries: BTreeMap<(String, &'static str), CacheEntry>,
+    entries: BTreeMap<(BindingKey, CreditSection), CacheEntry>,
     next_seq: u64,
+    diagnostics: Vec<CreditModelDiagnostic>,
 }
 
 impl SectionCache {
@@ -798,10 +926,10 @@ impl SectionCache {
         Self::default()
     }
 
-    fn insert(&mut self, binding: &str, section: &'static str, value: CachedSection) {
+    fn insert(&mut self, binding: &BindingKey, section: CreditSection, value: CachedSection) {
         self.next_seq += 1;
         self.entries.insert(
-            (binding.to_string(), section),
+            (binding.clone(), section),
             CacheEntry {
                 section: value,
                 stored_seq: self.next_seq,
@@ -817,6 +945,12 @@ impl SectionCache {
                 break;
             };
             self.entries.remove(&oldest);
+            if self.diagnostics.len() < SECTION_CACHE_MAX_ENTRIES {
+                self.diagnostics.push(CreditModelDiagnostic::new(
+                    "section_cache_evicted",
+                    "section_cache",
+                ));
+            }
         }
     }
 
@@ -824,43 +958,43 @@ impl SectionCache {
     /// empty list is a real observation (the provider offers none).
     pub(crate) fn observe_balances(
         &mut self,
-        binding: &str,
-        section: &'static str,
+        binding: &BindingKey,
+        section: CreditSection,
         balances: &[AgentCreditBalance],
     ) {
-        self.insert(binding, section, CachedSection::Balances(balances.to_vec()));
+        let mut balances = balances.to_vec();
+        for balance in &mut balances {
+            balance.updated_at = None;
+        }
+        self.insert(binding, section, CachedSection::Balances(balances));
     }
 
-    /// The last observed balances of `section`, ready to re-send with
-    /// `updated_at = packaged_at`. `None` on a cold cache.
+    /// The last observed balances of `section`, unchanged, with `updated_at`
+    /// unset. `None` on a cold cache.
     pub(crate) fn resend_balances(
         &self,
-        binding: &str,
-        section: &'static str,
-        packaged_at: &str,
+        binding: &BindingKey,
+        section: CreditSection,
     ) -> Option<Vec<AgentCreditBalance>> {
-        let entry = self.entries.get(&(binding.to_string(), section))?;
+        let entry = self.entries.get(&(binding.clone(), section))?;
         let CachedSection::Balances(balances) = &entry.section else {
             return None;
         };
-        let mut balances = balances.clone();
-        stamp_packaged_at(&mut balances, packaged_at);
-        Some(balances)
+        Some(balances.clone())
     }
 
     /// Record a successfully read grant list together with the provider count
     /// it was read against. A list-less balance is not recorded.
     pub(crate) fn observe_grant_list(
         &mut self,
-        binding: &str,
-        section: &'static str,
+        binding: &BindingKey,
         provider_count: u64,
         balance: &AgentCreditBalance,
     ) {
         if let Some(list) = GrantListSection::from_balance(balance) {
             self.insert(
                 binding,
-                section,
+                CreditSection::GrantList,
                 CachedSection::GrantList {
                     provider_count,
                     list,
@@ -873,11 +1007,12 @@ impl SectionCache {
     /// read with. `None` means the caller must read details now.
     pub(crate) fn grant_list_for_count(
         &self,
-        binding: &str,
-        section: &'static str,
+        binding: &BindingKey,
         provider_count: u64,
     ) -> Option<GrantListSection> {
-        let entry = self.entries.get(&(binding.to_string(), section))?;
+        let entry = self
+            .entries
+            .get(&(binding.clone(), CreditSection::GrantList))?;
         match &entry.section {
             CachedSection::GrantList {
                 provider_count: cached,
@@ -888,8 +1023,13 @@ impl SectionCache {
     }
 
     /// The binding's credential identity changed: forget every section it had.
-    pub(crate) fn clear_binding(&mut self, binding: &str) {
+    pub(crate) fn clear_binding(&mut self, binding: &BindingKey) {
         self.entries.retain(|(key, _), _| key != binding);
+    }
+
+    /// Diagnostics since the last call (size-bound evictions).
+    pub(crate) fn take_diagnostics(&mut self) -> Vec<CreditModelDiagnostic> {
+        std::mem::take(&mut self.diagnostics)
     }
 
     #[cfg(test)]

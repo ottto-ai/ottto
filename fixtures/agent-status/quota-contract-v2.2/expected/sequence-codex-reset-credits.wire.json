@@ -2,6 +2,7 @@
   "sequence": "codex-reset-credits",
   "steps": [
     {
+      "captured_at": "2026-10-01T12:00:05Z",
       "credit_balances": [
         {
           "freshness": "fresh",
@@ -34,11 +35,9 @@
           "remaining": 2,
           "status": "ok",
           "unit": "resets",
-          "unlimited": false,
-          "updated_at": "2026-10-01T12:00:05Z"
+          "unlimited": false
         }
       ],
-      "packaged_at": "2026-10-01T12:00:05Z",
       "provider_inputs": [
         "provider/codex-reset-credits-count-only.json",
         "provider/codex-reset-credits-complete.json"
@@ -46,6 +45,7 @@
       "step": "cold start: count 2, no cached list, details read now"
     },
     {
+      "captured_at": "2026-10-01T12:05:05Z",
       "credit_balances": [
         {
           "freshness": "fresh",
@@ -78,17 +78,16 @@
           "remaining": 2,
           "status": "ok",
           "unit": "resets",
-          "unlimited": false,
-          "updated_at": "2026-10-01T12:05:05Z"
+          "unlimited": false
         }
       ],
-      "packaged_at": "2026-10-01T12:05:05Z",
       "provider_inputs": [
         "provider/codex-reset-credits-count-only.json"
       ],
       "step": "routine poll: count unchanged, cached list re-sent with its original grants_observed_at"
     },
     {
+      "captured_at": "2026-10-01T12:10:05Z",
       "credit_balances": [
         {
           "freshness": "fresh",
@@ -121,17 +120,16 @@
           "remaining": 2,
           "status": "ok",
           "unit": "resets",
-          "unlimited": false,
-          "updated_at": "2026-10-01T12:10:05Z"
+          "unlimited": false
         }
       ],
-      "packaged_at": "2026-10-01T12:10:05Z",
       "provider_inputs": [
         "provider/codex-reset-credits-count-only.json"
       ],
       "step": "routine poll: count unchanged, cached list re-sent with its original grants_observed_at"
     },
     {
+      "captured_at": "2026-10-01T12:15:05Z",
       "credit_balances": [
         {
           "freshness": "fresh",
@@ -156,17 +154,16 @@
           "remaining": 1,
           "status": "ok",
           "unit": "resets",
-          "unlimited": false,
-          "updated_at": "2026-10-01T12:15:05Z"
+          "unlimited": false
         }
       ],
-      "packaged_at": "2026-10-01T12:15:05Z",
       "provider_inputs": [
         "provider/codex-reset-credits-count-changed.json"
       ],
       "step": "routine poll: count changed to 1, details read now"
     },
     {
+      "captured_at": "2026-10-01T12:20:05Z",
       "credit_balances": [
         {
           "freshness": "fresh",
@@ -178,11 +175,9 @@
           "remaining": 1,
           "status": "ok",
           "unit": "resets",
-          "unlimited": false,
-          "updated_at": "2026-10-01T12:20:05Z"
+          "unlimited": false
         }
       ],
-      "packaged_at": "2026-10-01T12:20:05Z",
       "provider_inputs": [
         "provider/codex-reset-credits-count-only.json"
       ],

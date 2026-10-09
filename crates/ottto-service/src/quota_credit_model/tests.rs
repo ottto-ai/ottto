@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 
 const READ_AT: &str = "2026-10-01T12:00:00Z";
-const PACKAGED_AT: &str = "2026-10-01T12:00:05Z";
 
 fn unix(text: &str) -> i64 {
     OffsetDateTime::parse(text, &Rfc3339)
@@ -64,14 +63,10 @@ fn read(provider: Provider, count: Option<u64>, records: Vec<GrantInput>) -> Lis
 }
 
 /// The saved-resets balance an adapter builds before the model adds grants.
+/// `status` is left to the model.
 fn saved_resets(remaining: Option<u64>, observed_at: &str) -> AgentCreditBalance {
     AgentCreditBalance {
         name: "reset_bank".to_string(),
-        status: match remaining {
-            Some(0) => AgentCreditBalanceStatus::Exhausted,
-            Some(_) => AgentCreditBalanceStatus::Ok,
-            None => AgentCreditBalanceStatus::Unknown,
-        },
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Resets,
         remaining,
@@ -88,16 +83,15 @@ fn codex_reset_bank(count: u64, observed_at: &str, obs: ListObservation) -> Agen
     balance
 }
 
-/// Claude sets `remaining` only through the model's Σ `resets_left`.
+/// Claude sets `remaining` and `status` only through the model.
 fn claude_reset_bank(observed_at: &str, obs: ListObservation) -> AgentCreditBalance {
     let mut balance = saved_resets(None, observed_at);
     build_grants(obs).apply_to(&mut balance);
-    balance.status = match balance.remaining {
-        Some(0) => AgentCreditBalanceStatus::Exhausted,
-        Some(_) => AgentCreditBalanceStatus::Ok,
-        None => AgentCreditBalanceStatus::Unknown,
-    };
     balance
+}
+
+fn key(identity: &str) -> BindingKey {
+    BindingKey::from_credential_identity_hash(identity)
 }
 
 fn keys(balance: &AgentCreditBalance) -> Vec<String> {
@@ -304,6 +298,43 @@ fn v21_case7_redeemed_and_past_expiry_have_no_expired_status() {
     assert_eq!(
         balance.latest_granted_at.as_deref(),
         Some("2026-08-02T00:00:00Z")
+    );
+}
+
+#[test]
+fn latest_granted_at_counts_every_status() {
+    // The newest grant was already redeemed: it is still the latest added.
+    let mut newest = openai_grant("n1", "2026-09-30T00:00:00Z", Some("2026-10-30T00:00:00Z"));
+    newest.status = GrantStatusInput::Reported(Field::Value("redeemed".to_string()));
+    let older = openai_grant("o1", "2026-09-01T00:00:00Z", Some("2026-10-01T00:00:00Z"));
+    let balance = codex_reset_bank(
+        2,
+        READ_AT,
+        read(Provider::OpenAi, Some(2), vec![newest, older]),
+    );
+    assert_eq!(
+        balance.latest_granted_at.as_deref(),
+        Some("2026-09-30T00:00:00Z")
+    );
+    // next_expires_at still skips the redeemed grant.
+    assert_eq!(
+        balance.next_expires_at.as_deref(),
+        Some("2026-10-01T00:00:00Z")
+    );
+}
+
+#[test]
+fn only_the_documented_reset_type_maps() {
+    let mut snake = openai_grant("s1", "2026-09-01T00:00:00Z", None);
+    snake.reset_type = Field::Value("codex_rate_limits".to_string());
+    let build = build_grants(read(Provider::OpenAi, Some(1), vec![snake]));
+    assert_eq!(
+        build.grants.as_ref().unwrap()[0].grant_type,
+        CreditGrantType::Unknown
+    );
+    assert_eq!(
+        codes(build.diagnostics()),
+        vec![("field_refused", "grants[].grant_type")]
     );
 }
 
@@ -752,6 +783,23 @@ fn title_bounds_check_privacy_before_truncation() {
         bounded_title(Field::Value(String::new()), "title"),
         (None, None)
     );
+    // Unicode lookalikes fold before matching: full-width slashes, a division
+    // slash and a zero-width split all fail like their ASCII forms.
+    for lookalike in [
+        "see \u{FF0F}Users\u{FF0F}someone",
+        "see \u{2215}users\u{2215}someone",
+        "be\u{200B}arer synthetic",
+        "\u{FF53}\u{FF4B}-synthetic",
+    ] {
+        let (title, diagnostic) = bounded_title(Field::Value(lookalike.to_string()), "title");
+        assert_eq!(title, None, "{lookalike}");
+        assert_eq!(diagnostic.unwrap().code, "field_refused");
+    }
+    // Ordinary non-ASCII display text is kept.
+    let (title, diagnostic) =
+        bounded_title(Field::Value("Réinitialisation offerte".into()), "title");
+    assert_eq!(title.as_deref(), Some("Réinitialisation offerte"));
+    assert_eq!(diagnostic, None);
 }
 
 #[test]
@@ -865,7 +913,7 @@ fn claude_saved_resets_sum_only_when_complete() {
 }
 
 #[test]
-fn summarize_recomputes_without_provider_hint() {
+fn summarize_uses_only_the_explicit_provider() {
     let mut balance = claude_reset_bank(
         READ_AT,
         read(
@@ -885,20 +933,181 @@ fn summarize_recomputes_without_provider_hint() {
         ),
     );
     let before = balance.clone();
-    summarize(&mut balance);
+    summarize(&mut balance, Some(Provider::Anthropic));
     assert_eq!(balance, before);
-    // The same list downgraded to partial loses every summary.
+    // The same list downgraded to partial loses every summary and the count.
     balance.grants_state = Some(CreditGrantsState::Partial);
-    summarize(&mut balance);
+    summarize(&mut balance, Some(Provider::Anthropic));
     assert_eq!(balance.remaining, None);
+    assert_eq!(balance.status, AgentCreditBalanceStatus::Unknown);
     assert_eq!(balance.next_expires_at, None);
 
-    // A provider count is never replaced (OpenAI grants carry no resets_left),
-    // including an empty list read against a stale count.
+    // Without a provider nothing is summed, whatever the grants look like.
+    let mut unknown = saved_resets(None, READ_AT);
+    unknown.grants = Some(vec![]);
+    unknown.grants_state = Some(CreditGrantsState::Complete);
+    summarize(&mut unknown, None);
+    assert_eq!(unknown.remaining, None);
+    let mut shaped = before.clone();
+    shaped.remaining = None;
+    summarize(&mut shaped, None);
+    assert_eq!(shaped.remaining, None);
+
+    // A provider count is never replaced.
     let mut codex = codex_reset_bank(3, READ_AT, read(Provider::OpenAi, Some(0), vec![]));
     codex.grants_state = Some(CreditGrantsState::Partial);
-    summarize(&mut codex);
+    summarize(&mut codex, Some(Provider::OpenAi));
     assert_eq!(codex.remaining, Some(3));
+    assert_eq!(codex.status, AgentCreditBalanceStatus::Ok);
+}
+
+#[test]
+fn status_follows_remaining() {
+    assert_eq!(
+        status_for_remaining(Some(0)),
+        AgentCreditBalanceStatus::Exhausted
+    );
+    assert_eq!(status_for_remaining(Some(3)), AgentCreditBalanceStatus::Ok);
+    assert_eq!(
+        status_for_remaining(None),
+        AgentCreditBalanceStatus::Unknown
+    );
+    // Codex: the provider count decides; an unavailable list keeps it.
+    let codex = codex_reset_bank(
+        0,
+        READ_AT,
+        ListObservation::Unavailable {
+            provider_count: Some(0),
+        },
+    );
+    assert_eq!(codex.status, AgentCreditBalanceStatus::Exhausted);
+    // Claude without a list read: unknown, never a guess.
+    let claude = claude_reset_bank(
+        READ_AT,
+        ListObservation::Unavailable {
+            provider_count: None,
+        },
+    );
+    assert_eq!(claude.status, AgentCreditBalanceStatus::Unknown);
+}
+
+#[test]
+fn readiness_is_passed_through_for_saved_resets_only() {
+    let mut balance = saved_resets(None, READ_AT);
+    let diagnostics = apply_readiness(
+        &mut balance,
+        ReadinessInput {
+            eligible: Field::Value(false),
+            at_limit: Field::Value(true),
+            ineligible_reason: Field::Value("tenure".to_string()),
+            cooldown_until: TimeInput::Rfc3339("2026-10-01T20:00:00+02:00".to_string()),
+        },
+    );
+    assert!(diagnostics.is_empty());
+    assert_eq!(balance.eligible, Some(false));
+    assert_eq!(balance.at_limit, Some(true));
+    assert_eq!(balance.ineligible_reason.as_deref(), Some("tenure"));
+    assert_eq!(
+        balance.cooldown_until.as_deref(),
+        Some("2026-10-01T18:00:00Z")
+    );
+
+    // Bad values are refused field by field.
+    let mut balance = saved_resets(None, READ_AT);
+    let diagnostics = apply_readiness(
+        &mut balance,
+        ReadinessInput {
+            eligible: Field::Invalid,
+            at_limit: Field::Absent,
+            ineligible_reason: Field::Value("Not A Code".to_string()),
+            cooldown_until: TimeInput::Rfc3339("later".to_string()),
+        },
+    );
+    assert_eq!(
+        codes(&diagnostics),
+        vec![
+            ("field_refused", "eligible"),
+            ("field_refused", "ineligible_reason"),
+            ("field_refused", "cooldown_until"),
+        ]
+    );
+    assert_eq!(
+        (
+            balance.eligible,
+            balance.ineligible_reason,
+            balance.cooldown_until
+        ),
+        (None, None, None)
+    );
+    for reason in ["a".repeat(65), "sk-synthetic".to_string()] {
+        let mut balance = saved_resets(None, READ_AT);
+        let diagnostics = apply_readiness(
+            &mut balance,
+            ReadinessInput {
+                ineligible_reason: Field::Value(reason),
+                ..ReadinessInput::default()
+            },
+        );
+        assert_eq!(balance.ineligible_reason, None);
+        assert_eq!(diagnostics.len(), 1);
+    }
+
+    // Any other unit refuses every sent readiness field.
+    let (mut pool, _) = one_time_credit("pool", Field::Absent, None, None, None, None, None);
+    let diagnostics = apply_readiness(
+        &mut pool,
+        ReadinessInput {
+            eligible: Field::Value(true),
+            at_limit: Field::Value(false),
+            ineligible_reason: Field::Value("tenure".to_string()),
+            cooldown_until: TimeInput::Rfc3339(READ_AT.to_string()),
+        },
+    );
+    assert_eq!(diagnostics.len(), 4);
+    assert_eq!(
+        (
+            pool.eligible,
+            pool.at_limit,
+            pool.ineligible_reason,
+            pool.cooldown_until
+        ),
+        (None, None, None, None)
+    );
+}
+
+#[test]
+fn disabled_balance_shape_and_reason_code() {
+    let mut balance = usage_credits(READ_AT);
+    balance.remaining = Some(5);
+    balance.used = Some(7);
+    balance.status = AgentCreditBalanceStatus::Ok;
+    let diagnostics = apply_disabled(&mut balance, Field::Value("out_of_credits".to_string()));
+    assert!(diagnostics.is_empty());
+    assert_eq!(balance.enabled, Some(false));
+    assert_eq!(balance.status, AgentCreditBalanceStatus::Unknown);
+    assert_eq!(
+        (balance.remaining, balance.used, balance.quota),
+        (None, None, None)
+    );
+    assert_eq!(balance.disabled_reason.as_deref(), Some("out_of_credits"));
+    for reason in [
+        Field::Value("x".repeat(65)),
+        Field::Value("Out Of Credits".to_string()),
+        Field::Value("sk-synthetic".to_string()),
+        Field::Invalid,
+    ] {
+        let mut balance = usage_credits(READ_AT);
+        let diagnostics = apply_disabled(&mut balance, reason);
+        assert_eq!(balance.disabled_reason, None);
+        assert_eq!(
+            codes(&diagnostics),
+            vec![("field_refused", "disabled_reason")]
+        );
+        assert_eq!(balance.enabled, Some(false));
+    }
+    let mut silent = usage_credits(READ_AT);
+    assert!(apply_disabled(&mut silent, Field::Absent).is_empty());
+    assert_eq!(silent.disabled_reason, None);
 }
 
 #[test]
@@ -927,7 +1136,7 @@ fn summaries_need_saved_resets_kind_for_remaining() {
 
 #[test]
 fn one_time_credit_shape() {
-    let balance = one_time_credit(
+    let (balance, diagnostics) = one_time_credit(
         "iguana_necktie",
         Field::Absent,
         Some(25_000),
@@ -936,6 +1145,7 @@ fn one_time_credit_shape() {
         Some("2026-11-05T07:59:00Z".to_string()),
         Some(READ_AT.to_string()),
     );
+    assert!(diagnostics.is_empty());
     assert_eq!(
         serde_json::to_value(&balance).unwrap(),
         json!({
@@ -956,7 +1166,7 @@ fn one_time_credit_shape() {
     // No `enabled` flag, no recurring reset.
     assert_eq!(balance.enabled, None);
     assert_eq!(balance.resets_at, None);
-    let spent = one_time_credit(
+    let (spent, _) = one_time_credit(
         "pool",
         Field::Absent,
         Some(100),
@@ -966,9 +1176,9 @@ fn one_time_credit_shape() {
         None,
     );
     assert_eq!(spent.status, AgentCreditBalanceStatus::Exhausted);
-    let unknown = one_time_credit("pool", Field::Absent, None, None, None, None, None);
+    let (unknown, _) = one_time_credit("pool", Field::Absent, None, None, None, None, None);
     assert_eq!(unknown.status, AgentCreditBalanceStatus::Unknown);
-    let titled = one_time_credit(
+    let (titled, _) = one_time_credit(
         "pool",
         Field::Value("Synthetic promo credit".to_string()),
         None,
@@ -978,6 +1188,18 @@ fn one_time_credit_shape() {
         None,
     );
     assert_eq!(titled.title.as_deref(), Some("Synthetic promo credit"));
+    // A refused title is reported, not swallowed.
+    let (leaky, diagnostics) = one_time_credit(
+        "pool",
+        Field::Value("see /Users/someone/notes".to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(leaky.title, None);
+    assert_eq!(codes(&diagnostics), vec![("field_refused", "title")]);
 }
 
 #[test]
@@ -1003,33 +1225,36 @@ fn time_normalization() {
 
 // ---- R7b SectionCache sequences -------------------------------------------
 
-const CODEX_GRANTS: &str = "codex_reset_grants";
-const PLAIN: &str = "plain";
-const SAVED: &str = "saved_resets";
+/// The Claude usage-credit balance as the adapter reports it switched off.
+fn usage_credits(observed_at: &str) -> AgentCreditBalance {
+    AgentCreditBalance {
+        name: "Usage credits".to_string(),
+        freshness: AgentQuotaWindowFreshness::Fresh,
+        unit: AgentCreditBalanceUnit::Usd,
+        kind: Some(CreditBalanceKind::UsageCredits),
+        observed_at: Some(observed_at.to_string()),
+        ..Default::default()
+    }
+}
 
-fn plain_section(observed_at: &str) -> Vec<AgentCreditBalance> {
-    vec![
-        AgentCreditBalance {
-            name: "Usage credits".to_string(),
-            status: AgentCreditBalanceStatus::Unknown,
-            freshness: AgentQuotaWindowFreshness::Fresh,
-            unit: AgentCreditBalanceUnit::Usd,
-            enabled: Some(false),
-            disabled_reason: Some("out_of_credits".to_string()),
-            kind: Some(CreditBalanceKind::UsageCredits),
-            observed_at: Some(observed_at.to_string()),
-            ..Default::default()
-        },
-        one_time_credit(
-            "iguana_necktie",
-            Field::Absent,
-            Some(25_000),
-            Some(1_250),
-            Some(23_750),
-            Some("2026-11-05T07:59:00Z".to_string()),
-            Some(observed_at.to_string()),
-        ),
-    ]
+fn usage_section(observed_at: &str) -> Vec<AgentCreditBalance> {
+    let mut balance = usage_credits(observed_at);
+    assert!(apply_disabled(&mut balance, Field::Value("out_of_credits".to_string())).is_empty());
+    vec![balance]
+}
+
+fn one_time_section(observed_at: &str) -> Vec<AgentCreditBalance> {
+    let (balance, diagnostics) = one_time_credit(
+        "iguana_necktie",
+        Field::Absent,
+        Some(25_000),
+        Some(1_250),
+        Some(23_750),
+        Some("2026-11-05T07:59:00Z".to_string()),
+        Some(observed_at.to_string()),
+    );
+    assert!(diagnostics.is_empty());
+    vec![balance]
 }
 
 fn cedar_section(observed_at: &str) -> Vec<AgentCreditBalance> {
@@ -1042,9 +1267,16 @@ fn cedar_section(observed_at: &str) -> Vec<AgentCreditBalance> {
             observed_at: observed_at.to_string(),
         },
     );
-    balance.eligible = Some(true);
-    balance.at_limit = Some(true);
-    balance.cooldown_until = Some("2026-10-01T18:00:00Z".to_string());
+    let diagnostics = apply_readiness(
+        &mut balance,
+        ReadinessInput {
+            eligible: Field::Value(true),
+            at_limit: Field::Value(true),
+            ineligible_reason: Field::Absent,
+            cooldown_until: TimeInput::Rfc3339("2026-10-01T18:00:00+00:00".to_string()),
+        },
+    );
+    assert!(diagnostics.is_empty());
     vec![balance]
 }
 
@@ -1089,27 +1321,32 @@ fn claude_cedar_grants() -> Vec<GrantInput> {
 #[test]
 fn cache_cold_start_sends_nothing_unread() {
     let cache = SectionCache::new();
-    assert_eq!(cache.resend_balances("a", SAVED, PACKAGED_AT), None);
-    assert_eq!(cache.grant_list_for_count("a", CODEX_GRANTS, 2), None);
+    assert_eq!(
+        cache.resend_balances(&key("a"), CreditSection::SavedResets),
+        None
+    );
+    assert_eq!(cache.grant_list_for_count(&key("a"), 2), None);
 }
 
 #[test]
-fn cache_resend_keeps_read_clocks_and_stamps_packaging_time() {
+fn cache_resend_is_unchanged_and_never_carries_updated_at() {
     let mut cache = SectionCache::new();
     let observed = cedar_section("2026-10-01T13:00:00Z");
-    cache.observe_balances("a", SAVED, &observed);
-    for packaged_at in ["2026-10-01T13:05:00Z", "2026-10-01T16:05:00Z"] {
-        let resent = cache.resend_balances("a", SAVED, packaged_at).unwrap();
-        assert_eq!(resent.len(), 1);
-        let mut expected = observed[0].clone();
-        expected.updated_at = Some(packaged_at.to_string());
+    let mut stamped = observed.clone();
+    stamped[0].updated_at = Some("2026-10-01T13:00:05Z".to_string());
+    cache.observe_balances(&key("a"), CreditSection::SavedResets, &stamped);
+    for _ in 0..2 {
+        let resent = cache
+            .resend_balances(&key("a"), CreditSection::SavedResets)
+            .unwrap();
         // Presence, grants, state, status and both read clocks are unchanged;
-        // only `updated_at` is the packaging time (never carried over).
-        assert_eq!(resent[0], expected);
+        // `updated_at` is never carried over.
+        assert_eq!(resent, observed);
+        assert_eq!(resent[0].updated_at, None);
     }
     // A 3 h sleep changes nothing about what is re-sent.
     let after_sleep = cache
-        .resend_balances("a", SAVED, "2026-10-01T19:00:00Z")
+        .resend_balances(&key("a"), CreditSection::SavedResets)
         .unwrap();
     assert_eq!(
         after_sleep[0].grants_observed_at.as_deref(),
@@ -1121,43 +1358,62 @@ fn cache_resend_keeps_read_clocks_and_stamps_packaging_time() {
 #[test]
 fn cache_restart_is_cold() {
     let mut cache = SectionCache::new();
-    cache.observe_balances("a", SAVED, &cedar_section(READ_AT));
+    cache.observe_balances(
+        &key("a"),
+        CreditSection::SavedResets,
+        &cedar_section(READ_AT),
+    );
     drop(cache);
     let restarted = SectionCache::new();
-    assert_eq!(restarted.resend_balances("a", SAVED, PACKAGED_AT), None);
+    assert_eq!(
+        restarted.resend_balances(&key("a"), CreditSection::SavedResets),
+        None
+    );
 }
 
 #[test]
 fn cache_a_b_a_keeps_a_sections() {
+    let (a, b) = (key("account-a"), key("account-b"));
     let mut cache = SectionCache::new();
-    cache.observe_balances("account-a", SAVED, &cedar_section(READ_AT));
-    cache.observe_balances("account-a", PLAIN, &plain_section(READ_AT));
-    // B reads only plain; its saved resets were never read.
-    cache.observe_balances("account-b", PLAIN, &plain_section(READ_AT));
-    assert_eq!(cache.resend_balances("account-b", SAVED, PACKAGED_AT), None);
+    cache.observe_balances(&a, CreditSection::SavedResets, &cedar_section(READ_AT));
+    cache.observe_balances(&a, CreditSection::UsageCredits, &usage_section(READ_AT));
+    // B reads only usage credits; its saved resets were never read.
+    cache.observe_balances(&b, CreditSection::UsageCredits, &usage_section(READ_AT));
+    assert_eq!(cache.resend_balances(&b, CreditSection::SavedResets), None);
     // Back on A: A's saved resets are still there, unchanged.
     let resent = cache
-        .resend_balances("account-a", SAVED, PACKAGED_AT)
+        .resend_balances(&a, CreditSection::SavedResets)
         .unwrap();
-    assert_eq!(resent[0].grants, cedar_section(READ_AT)[0].grants);
+    assert_eq!(resent, cedar_section(READ_AT));
     // An identity change on A's binding clears only A.
-    cache.clear_binding("account-a");
-    assert_eq!(cache.resend_balances("account-a", SAVED, PACKAGED_AT), None);
-    assert_eq!(cache.resend_balances("account-a", PLAIN, PACKAGED_AT), None);
+    cache.clear_binding(&a);
+    assert_eq!(cache.resend_balances(&a, CreditSection::SavedResets), None);
+    assert_eq!(cache.resend_balances(&a, CreditSection::UsageCredits), None);
     assert!(cache
-        .resend_balances("account-b", PLAIN, PACKAGED_AT)
+        .resend_balances(&b, CreditSection::UsageCredits)
         .is_some());
 }
 
 #[test]
-fn cache_empty_section_is_a_real_observation() {
+fn cache_sections_do_not_cross() {
     let mut cache = SectionCache::new();
-    cache.observe_balances("a", PLAIN, &[]);
-    assert_eq!(cache.resend_balances("a", PLAIN, PACKAGED_AT), Some(vec![]));
+    cache.observe_balances(&key("a"), CreditSection::UsageCredits, &[]);
+    assert_eq!(
+        cache.resend_balances(&key("a"), CreditSection::UsageCredits),
+        Some(vec![])
+    );
+    assert_eq!(
+        cache.resend_balances(&key("a"), CreditSection::OneTimeCredits),
+        None
+    );
+    // A balance section is never offered as a grant list, or the reverse.
+    cache.observe_balances(&key("a"), CreditSection::GrantList, &usage_section(READ_AT));
+    assert_eq!(cache.grant_list_for_count(&key("a"), 0), None);
 }
 
 #[test]
 fn codex_cached_list_only_while_count_matches() {
+    let a = key("a");
     let mut cache = SectionCache::new();
     let detailed = codex_reset_bank(
         2,
@@ -1171,26 +1427,27 @@ fn codex_cached_list_only_while_count_matches() {
             ],
         ),
     );
-    cache.observe_grant_list("a", CODEX_GRANTS, 2, &detailed);
+    cache.observe_grant_list(&a, 2, &detailed);
 
     // Three routine polls at the same count: the list rides along unchanged.
     for minute in ["05", "10", "15"] {
         let read_at = format!("2026-10-01T12:{minute}:00Z");
         let mut routine = saved_resets(Some(2), &read_at);
         routine.unlimited = Some(false);
-        let list = cache.grant_list_for_count("a", CODEX_GRANTS, 2).unwrap();
+        let list = cache.grant_list_for_count(&a, 2).unwrap();
         list.apply_to(&mut routine);
         assert_eq!(routine.grants, detailed.grants);
         assert_eq!(routine.grants_state, Some(CreditGrantsState::Complete));
         assert_eq!(routine.grants_observed_at.as_deref(), Some(READ_AT));
         assert_eq!(routine.next_expires_at, detailed.next_expires_at);
         assert_eq!(routine.latest_granted_at, detailed.latest_granted_at);
+        assert_eq!(routine.status, AgentCreditBalanceStatus::Ok);
         // The count itself was read now.
         assert_eq!(routine.observed_at.as_deref(), Some(read_at.as_str()));
     }
     // The count moved: the caller must read details now.
-    assert_eq!(cache.grant_list_for_count("a", CODEX_GRANTS, 1), None);
-    assert_eq!(cache.grant_list_for_count("a", CODEX_GRANTS, 3), None);
+    assert_eq!(cache.grant_list_for_count(&a, 1), None);
+    assert_eq!(cache.grant_list_for_count(&a, 3), None);
 
     // A failed detail read is not cached; the stale list stays unusable.
     let failed = codex_reset_bank(
@@ -1200,37 +1457,38 @@ fn codex_cached_list_only_while_count_matches() {
             provider_count: Some(1),
         },
     );
-    cache.observe_grant_list("a", CODEX_GRANTS, 1, &failed);
-    assert_eq!(cache.grant_list_for_count("a", CODEX_GRANTS, 1), None);
-    assert!(cache.grant_list_for_count("a", CODEX_GRANTS, 2).is_some());
+    cache.observe_grant_list(&a, 1, &failed);
+    assert_eq!(cache.grant_list_for_count(&a, 1), None);
+    assert!(cache.grant_list_for_count(&a, 2).is_some());
 }
 
 #[test]
-fn cache_is_bounded() {
+fn cache_is_bounded_and_reports_evictions() {
     let mut cache = SectionCache::new();
     for k in 0..(SECTION_CACHE_MAX_ENTRIES + 5) {
-        cache.observe_balances(&format!("binding-{k}"), PLAIN, &[]);
+        cache.observe_balances(
+            &key(&format!("binding-{k}")),
+            CreditSection::UsageCredits,
+            &[],
+        );
     }
     assert_eq!(cache.len(), SECTION_CACHE_MAX_ENTRIES);
-    // The oldest entries went first.
-    assert_eq!(cache.resend_balances("binding-0", PLAIN, PACKAGED_AT), None);
+    // The oldest entries went first, and each eviction is reported once.
+    assert_eq!(
+        cache.resend_balances(&key("binding-0"), CreditSection::UsageCredits),
+        None
+    );
     assert!(cache
         .resend_balances(
-            &format!("binding-{}", SECTION_CACHE_MAX_ENTRIES + 4),
-            PLAIN,
-            PACKAGED_AT
+            &key(&format!("binding-{}", SECTION_CACHE_MAX_ENTRIES + 4)),
+            CreditSection::UsageCredits,
         )
         .is_some());
-}
-
-#[test]
-fn stamp_packaged_at_overwrites_every_balance() {
-    let mut balances = plain_section(READ_AT);
-    balances[0].updated_at = Some("2026-01-01T00:00:00Z".to_string());
-    stamp_packaged_at(&mut balances, PACKAGED_AT);
-    assert!(balances
-        .iter()
-        .all(|balance| balance.updated_at.as_deref() == Some(PACKAGED_AT)));
+    assert_eq!(
+        codes(&cache.take_diagnostics()),
+        vec![("section_cache_evicted", "section_cache"); 5]
+    );
+    assert!(cache.take_diagnostics().is_empty());
 }
 
 // ---- canonical fixtures ----------------------------------------------------
@@ -1240,13 +1498,8 @@ fn fixture_dir() -> PathBuf {
         .join("../../fixtures/agent-status/quota-contract-v2.2")
 }
 
-fn packaged(mut balances: Vec<AgentCreditBalance>) -> Vec<AgentCreditBalance> {
-    stamp_packaged_at(&mut balances, PACKAGED_AT);
-    balances
-}
-
 fn reading(balances: Vec<AgentCreditBalance>) -> Value {
-    json!({ "credit_balances": packaged(balances) })
+    json!({ "credit_balances": balances })
 }
 
 fn codex_two() -> Vec<GrantInput> {
@@ -1290,34 +1543,33 @@ fn codex_count_changed_at(read_at: &str) -> AgentCreditBalance {
     )
 }
 
-/// One reading step of a re-send sequence.
+/// One reading step of a re-send sequence. `captured_at` is the snapshot's
+/// capture time; credit balances never carry `updated_at`.
 fn step(
     step: &str,
-    packaged_at: &str,
+    captured_at: &str,
     provider_inputs: &[&str],
-    mut credit_balances: Vec<AgentCreditBalance>,
+    credit_balances: Vec<AgentCreditBalance>,
 ) -> Value {
-    stamp_packaged_at(&mut credit_balances, packaged_at);
     json!({
         "step": step,
-        "packaged_at": packaged_at,
+        "captured_at": captured_at,
         "provider_inputs": provider_inputs,
         "credit_balances": credit_balances,
     })
 }
 
 fn codex_sequence() -> Value {
+    let a = key("account-a");
     let mut cache = SectionCache::new();
     let mut steps = Vec::new();
 
     // 1. Cold start, routine poll reports count 2: no cached list, so the
     //    details are read now.
     let t1 = "2026-10-01T12:00:00Z";
-    assert!(cache
-        .grant_list_for_count("account-a", CODEX_GRANTS, 2)
-        .is_none());
+    assert!(cache.grant_list_for_count(&a, 2).is_none());
     let detailed = codex_complete_at(t1);
-    cache.observe_grant_list("account-a", CODEX_GRANTS, 2, &detailed);
+    cache.observe_grant_list(&a, 2, &detailed);
     steps.push(step(
         "cold start: count 2, no cached list, details read now",
         "2026-10-01T12:00:05Z",
@@ -1329,7 +1581,7 @@ fn codex_sequence() -> Value {
     ));
 
     // 2-3. Routine polls at the same count re-send the cached list.
-    for (minute, packaged) in [
+    for (minute, captured) in [
         ("05", "2026-10-01T12:05:05Z"),
         ("10", "2026-10-01T12:10:05Z"),
     ] {
@@ -1337,12 +1589,12 @@ fn codex_sequence() -> Value {
         let mut routine = saved_resets(Some(2), &read_at);
         routine.unlimited = Some(false);
         cache
-            .grant_list_for_count("account-a", CODEX_GRANTS, 2)
+            .grant_list_for_count(&a, 2)
             .expect("cached list at the same count")
             .apply_to(&mut routine);
         steps.push(step(
             "routine poll: count unchanged, cached list re-sent with its original grants_observed_at",
-            packaged,
+            captured,
             &["provider/codex-reset-credits-count-only.json"],
             vec![routine],
         ));
@@ -1350,11 +1602,9 @@ fn codex_sequence() -> Value {
 
     // 4. The count moved: details are read now.
     let t4 = "2026-10-01T12:15:00Z";
-    assert!(cache
-        .grant_list_for_count("account-a", CODEX_GRANTS, 1)
-        .is_none());
+    assert!(cache.grant_list_for_count(&a, 1).is_none());
     let changed = codex_count_changed_at(t4);
-    cache.observe_grant_list("account-a", CODEX_GRANTS, 1, &changed);
+    cache.observe_grant_list(&a, 1, &changed);
     steps.push(step(
         "routine poll: count changed to 1, details read now",
         "2026-10-01T12:15:05Z",
@@ -1365,9 +1615,7 @@ fn codex_sequence() -> Value {
     // 5. Daemon restart (cold cache) and the detail read fails: unavailable,
     //    never a stale or invented list.
     let restarted = SectionCache::new();
-    assert!(restarted
-        .grant_list_for_count("account-a", CODEX_GRANTS, 1)
-        .is_none());
+    assert!(restarted.grant_list_for_count(&a, 1).is_none());
     let failed = codex_reset_bank(
         1,
         "2026-10-01T12:20:00Z",
@@ -1397,103 +1645,124 @@ fn for_account(account: &str, mut balances: Vec<AgentCreditBalance>) -> Vec<Agen
     balances
 }
 
+/// What one Claude reading emits: every section it read, fresh (and recorded),
+/// plus the cached copy of every section it did not read.
+fn claude_reading(
+    cache: &mut SectionCache,
+    account: &str,
+    read: &[(CreditSection, Vec<AgentCreditBalance>)],
+) -> Vec<AgentCreditBalance> {
+    let binding = key(account);
+    let mut emitted = Vec::new();
+    for section in [
+        CreditSection::UsageCredits,
+        CreditSection::OneTimeCredits,
+        CreditSection::SavedResets,
+    ] {
+        match read
+            .iter()
+            .find(|(read_section, _)| *read_section == section)
+        {
+            Some((_, balances)) => {
+                let balances = for_account(account, balances.clone());
+                cache.observe_balances(&binding, section, &balances);
+                emitted.extend(balances);
+            }
+            None => emitted.extend(cache.resend_balances(&binding, section).unwrap_or_default()),
+        }
+    }
+    emitted
+}
+
+/// The plain usage read reports usage credits and the one-time pool; the
+/// saved-reset read reports saved resets and the one-time pool.
+fn plain_read(at: &str) -> Vec<(CreditSection, Vec<AgentCreditBalance>)> {
+    vec![
+        (CreditSection::UsageCredits, usage_section(at)),
+        (CreditSection::OneTimeCredits, one_time_section(at)),
+    ]
+}
+
+fn saved_reset_read(at: &str) -> Vec<(CreditSection, Vec<AgentCreditBalance>)> {
+    vec![
+        (CreditSection::OneTimeCredits, one_time_section(at)),
+        (CreditSection::SavedResets, cedar_section(at)),
+    ]
+}
+
 fn claude_sequence() -> Value {
     let mut cache = SectionCache::new();
     let mut steps = Vec::new();
     let a = "account-a";
+    let plain = ["provider/claude-oauth-usage-plain.json"];
 
     // 1. Cold start, plain read: saved resets were never read, so they are
     //    not sent at all (no `status: unknown` stand-in).
-    let plain_1 = for_account(a, plain_section("2026-10-01T13:00:00Z"));
-    cache.observe_balances(a, PLAIN, &plain_1);
-    assert!(cache.resend_balances(a, SAVED, "x").is_none());
     steps.push(step(
         "cold start: plain read; saved resets never read, not sent",
         "2026-10-01T13:00:05Z",
-        &["provider/claude-oauth-usage-plain.json"],
-        plain_1,
+        &plain,
+        claude_reading(&mut cache, a, &plain_read("2026-10-01T13:00:00Z")),
     ));
 
-    // 2. Saved-reset read; plain re-sent from the cache.
-    let saved_2 = for_account(a, cedar_section("2026-10-01T14:00:00Z"));
-    cache.observe_balances(a, SAVED, &saved_2);
-    let mut balances = cache
-        .resend_balances(a, PLAIN, "2026-10-01T14:00:05Z")
-        .unwrap();
-    balances.extend(saved_2);
+    // 2. Saved-reset read: saved resets and the one-time pool fresh; usage
+    //    credits re-sent from the cache.
     steps.push(step(
-        "saved-reset read; plain section re-sent unchanged",
+        "saved-reset read; one-time pool fresh; usage credits re-sent unchanged",
         "2026-10-01T14:00:05Z",
         &["provider/claude-usage-cedar.json"],
-        balances,
+        claude_reading(&mut cache, a, &saved_reset_read("2026-10-01T14:00:00Z")),
     ));
 
     // 3. Plain read after a 3 h sleep; saved resets re-sent from the cache.
-    let plain_3 = for_account(a, plain_section("2026-10-01T17:00:00Z"));
-    cache.observe_balances(a, PLAIN, &plain_3);
-    let mut balances = plain_3;
-    balances.extend(
-        cache
-            .resend_balances(a, SAVED, "2026-10-01T17:00:05Z")
-            .unwrap(),
-    );
     steps.push(step(
         "plain read after a 3 h sleep; saved-reset section re-sent unchanged",
         "2026-10-01T17:00:05Z",
-        &["provider/claude-oauth-usage-plain.json"],
-        balances,
+        &plain,
+        claude_reading(&mut cache, a, &plain_read("2026-10-01T17:00:00Z")),
     ));
 
     // 4. The slot now holds account B (cold for B): only B's plain read.
-    let plain_b = for_account("account-b", plain_section("2026-10-01T18:00:00Z"));
-    cache.observe_balances("account-b", PLAIN, &plain_b);
-    assert!(cache.resend_balances("account-b", SAVED, "x").is_none());
     steps.push(step(
         "switch to account B: plain read; B's saved resets never read, not sent",
         "2026-10-01T18:00:05Z",
-        &["provider/claude-oauth-usage-plain.json"],
-        plain_b,
+        &plain,
+        claude_reading(&mut cache, "account-b", &plain_read("2026-10-01T18:00:00Z")),
     ));
 
     // 5. Back to A: A's saved resets survive the A→B→A switch.
-    let plain_5 = for_account(a, plain_section("2026-10-01T19:00:00Z"));
-    cache.observe_balances(a, PLAIN, &plain_5);
-    let mut balances = plain_5;
-    balances.extend(
-        cache
-            .resend_balances(a, SAVED, "2026-10-01T19:00:05Z")
-            .unwrap(),
-    );
     steps.push(step(
         "back to account A: plain read; A's saved-reset section re-sent from before the switch",
         "2026-10-01T19:00:05Z",
-        &["provider/claude-oauth-usage-plain.json"],
-        balances,
+        &plain,
+        claude_reading(&mut cache, a, &plain_read("2026-10-01T19:00:00Z")),
     ));
 
-    // 6. Restart: cold again; only the section read now is sent.
+    // 6. Restart: cold again; only the sections read now are sent.
     let mut cache = SectionCache::new();
-    let plain_6 = for_account(a, plain_section("2026-10-01T20:00:00Z"));
-    cache.observe_balances(a, PLAIN, &plain_6);
-    assert!(cache.resend_balances(a, SAVED, "x").is_none());
     steps.push(step(
         "restart: cold cache, plain read; saved resets not sent until read",
         "2026-10-01T20:00:05Z",
-        &["provider/claude-oauth-usage-plain.json"],
-        plain_6,
+        &plain,
+        claude_reading(&mut cache, a, &plain_read("2026-10-01T20:00:00Z")),
     ));
     json!({ "sequence": "claude-plain-saved-resets", "steps": steps })
 }
 
-/// Every expected file: the model output for the inputs mirrored from the
-/// matching `provider/*.json` file.
+/// Every expected file: the model output for inputs that mirror the matching
+/// `provider/*.json` file.
 fn expected_fixtures() -> Vec<(&'static str, Value)> {
-    let mut cedar_one_time = plain_section(READ_AT).remove(1);
-    cedar_one_time.observed_at = Some(READ_AT.to_string());
     let mut ineligible = claude_reset_bank(READ_AT, read(Provider::Anthropic, Some(0), vec![]));
-    ineligible.eligible = Some(false);
-    ineligible.ineligible_reason = Some("tenure".to_string());
-    ineligible.at_limit = Some(false);
+    assert!(apply_readiness(
+        &mut ineligible,
+        ReadinessInput {
+            eligible: Field::Value(false),
+            at_limit: Field::Value(false),
+            ineligible_reason: Field::Value("tenure".to_string()),
+            cooldown_until: TimeInput::Absent,
+        },
+    )
+    .is_empty());
     let mut bad_expiry = claude_cedar_grants().remove(2);
     bad_expiry.id = Field::Value("grant_synth_badexpiry".to_string());
     bad_expiry.expires_at = TimeInput::Rfc3339("not-a-time".to_string());
@@ -1510,8 +1779,20 @@ fn expected_fixtures() -> Vec<(&'static str, Value)> {
             vec![claude_cedar_grants().remove(0), bad_expiry],
         ),
     );
-    refused.eligible = Some(true);
-    refused.at_limit = Some(false);
+    assert!(apply_readiness(
+        &mut refused,
+        ReadinessInput {
+            eligible: Field::Value(true),
+            at_limit: Field::Value(false),
+            ..ReadinessInput::default()
+        },
+    )
+    .is_empty());
+    let section_balances = |read: Vec<(CreditSection, Vec<AgentCreditBalance>)>| {
+        read.into_iter()
+            .flat_map(|(_, balances)| balances)
+            .collect::<Vec<_>>()
+    };
 
     vec![
         (
@@ -1546,15 +1827,14 @@ fn expected_fixtures() -> Vec<(&'static str, Value)> {
         ),
         (
             "claude-usage-cedar",
-            reading({
-                let mut balances = vec![cedar_one_time];
-                balances.extend(cedar_section(READ_AT));
-                balances
-            }),
+            reading(section_balances(saved_reset_read(READ_AT))),
         ),
         ("claude-usage-cedar-ineligible", reading(vec![ineligible])),
         ("claude-usage-cedar-refused-expiry", reading(vec![refused])),
-        ("claude-oauth-usage-plain", reading(plain_section(READ_AT))),
+        (
+            "claude-oauth-usage-plain",
+            reading(section_balances(plain_read(READ_AT))),
+        ),
         ("sequence-codex-reset-credits", codex_sequence()),
         ("sequence-claude-plain-saved-resets", claude_sequence()),
     ]
@@ -1599,18 +1879,37 @@ fn canonical_expected_fixtures_match_model() {
     }
 }
 
-fn wire_balances(value: &Value) -> Vec<&Value> {
+/// Every snapshot (a single reading, or one sequence step) in a fixture.
+fn snapshots(value: &Value) -> Vec<&Vec<Value>> {
     if let Some(steps) = value.get("steps").and_then(Value::as_array) {
         return steps
             .iter()
-            .flat_map(|step| step["credit_balances"].as_array().unwrap())
+            .map(|step| step["credit_balances"].as_array().unwrap())
             .collect();
     }
-    value["credit_balances"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .collect()
+    vec![value["credit_balances"].as_array().unwrap()]
+}
+
+#[test]
+fn no_snapshot_carries_the_same_balance_twice() {
+    for (name, value) in expected_fixtures() {
+        for balances in snapshots(&value) {
+            let mut identities = balances
+                .iter()
+                .map(|balance| {
+                    (
+                        balance["name"].to_string(),
+                        balance.get("limit_id").map(Value::to_string),
+                        balance.get("account_identifier_hash").map(Value::to_string),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let total = identities.len();
+            identities.sort();
+            identities.dedup();
+            assert_eq!(identities.len(), total, "{name} repeats a balance");
+        }
+    }
 }
 
 #[test]
@@ -1619,35 +1918,40 @@ fn canonical_fixtures_are_fixed_points_without_spelled_nulls() {
     for (name, _) in expected_fixtures() {
         let text = std::fs::read_to_string(dir.join(format!("expected/{name}.wire.json"))).unwrap();
         assert!(!text.contains("null"), "{name} spells a null");
+        assert!(!text.contains("updated_at"), "{name} carries updated_at");
+        let provider = if name.contains("codex") {
+            Provider::OpenAi
+        } else {
+            Provider::Anthropic
+        };
         let value: Value = serde_json::from_str(&text).unwrap();
-        for raw in wire_balances(&value) {
+        for raw in snapshots(&value).into_iter().flatten() {
             // Decodes and re-encodes to the same JSON: nothing unknown, nothing
             // the protocol would drop.
             let balance: AgentCreditBalance = serde_json::from_value(raw.clone()).unwrap();
             assert_eq!(&serde_json::to_value(&balance).unwrap(), raw, "{name}");
+            assert!(balance.kind.is_some(), "{name}: every balance has a kind");
+            let Some(grants) = &balance.grants else {
+                continue;
+            };
             // Every list is in wire order and every grant is in bounds.
-            if let Some(grants) = &balance.grants {
-                let mut sorted = grants.clone();
-                sorted.sort_by(grant_order);
-                assert_eq!(&sorted, grants, "{name} grant order");
-                assert!(grants.len() <= GRANTS_MAX);
-                assert!(grants
-                    .iter()
-                    .all(|grant| grant_wire_size(grant) <= GRANT_MAX_BYTES));
-                assert!(grants.iter().all(|grant| grant.grant_key.len() == 64));
-            }
-            // Summaries are what the model computes from the list (the sender
-            // cap is the one documented exception).
+            let mut sorted = grants.clone();
+            sorted.sort_by(grant_order);
+            assert_eq!(&sorted, grants, "{name} grant order");
+            assert!(grants.len() <= GRANTS_MAX);
+            assert!(grants
+                .iter()
+                .all(|grant| grant_wire_size(grant) <= GRANT_MAX_BYTES));
+            assert!(grants.iter().all(|grant| grant.grant_key.len() == 64));
+            // Summaries, the saved-reset count and status are what the model
+            // computes from the list. A capped list's expiry needs the grants
+            // past the cut, so it is checked by the cap tests instead.
             let mut resummarized = balance.clone();
-            summarize(&mut resummarized);
-            if balance.grants_state == Some(CreditGrantsState::Capped)
-                && balance.grant_count.unwrap_or(0) as usize > GRANTS_MAX
-            {
+            summarize(&mut resummarized, Some(provider));
+            if balance.grants_state == Some(CreditGrantsState::Capped) {
                 resummarized.next_expires_at = balance.next_expires_at.clone();
             }
             assert_eq!(resummarized, balance, "{name} summaries");
-            assert!(balance.kind.is_some(), "{name}: every balance has a kind");
-            assert!(balance.updated_at.is_some(), "{name}: packaging time");
         }
     }
     // Every provider input is referenced by some expected file name or step.
