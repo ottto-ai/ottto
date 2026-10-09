@@ -143,6 +143,45 @@ pub(crate) fn source_finish<T>(
     });
     result
 }
+/// Point outcome at an existing Codex authority boundary. Two fixed records at
+/// most per completed page, using the existing best-effort stderr carrier.
+/// This is not a completion heartbeat, resource window or ingestion verdict.
+pub(crate) fn codex_census_fence(
+    phase: crate::codex_scan_diagnostics::CensusFencePhase,
+    outcome: crate::codex_scan_diagnostics::CensusFenceOutcome,
+    invalidation: crate::codex_scan_diagnostics::CensusInvalidation,
+) {
+    #[derive(Serialize)]
+    struct Counts {
+        phase: crate::codex_scan_diagnostics::CensusFencePhase,
+        outcome: crate::codex_scan_diagnostics::CensusFenceOutcome,
+        invalidation: crate::codex_scan_diagnostics::CensusInvalidation,
+    }
+    emit(&Record {
+        schema_version: SCHEMA_VERSION,
+        process_id: std::process::id(),
+        stage: "codex_census_fence",
+        source: Source::Codex,
+        // A point observation has no measured resource window. Do not take
+        // extra CPU/RSS samples or invent numeric measurements for this event.
+        observation: Observation {
+            observed_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
+            wall_elapsed_us: 0,
+            shared_process_cpu_delta_us: None,
+            process_lifetime_max_rss_bytes: None,
+            process_lifetime_max_rss_before_bytes: None,
+        },
+        counts: Counts {
+            phase,
+            outcome,
+            invalidation,
+        },
+    });
+}
+
 #[derive(Serialize)]
 struct EmptyCounts {}
 
@@ -357,6 +396,74 @@ mod tests {
         assert_eq!(record["counts"], serde_json::json!({}));
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
+    }
+
+    #[test]
+    fn census_fence_events_have_closed_fields_and_bounded_encoding() {
+        use crate::codex_scan_diagnostics::{
+            CensusFenceOutcome as O, CensusFencePhase as P, CensusInvalidation as I,
+        };
+        let (_, rows) = capture(|| {
+            for phase in [P::Outer, P::Inner] {
+                for outcome in [
+                    O::Passed,
+                    O::Rejected,
+                    O::Published,
+                    O::ProjectionUnavailable,
+                    O::ClockUnavailable,
+                    O::EncodingFailed,
+                    O::PrivateWriteFailed,
+                ] {
+                    for invalidation in [I::NotAttempted, I::Removed, I::AlreadyMissing, I::Failed]
+                    {
+                        codex_census_fence(phase, outcome, invalidation);
+                    }
+                }
+            }
+        });
+        assert_eq!(rows.len(), 56);
+        for row in rows {
+            assert_eq!(row["stage"], "codex_census_fence");
+            assert_eq!(row["source"], "codex");
+            assert_eq!(row["observation"]["wall_elapsed_us"], 0);
+            assert!(row["observation"]["shared_process_cpu_delta_us"].is_null());
+            assert!(row["observation"]["process_lifetime_max_rss_bytes"].is_null());
+            assert_eq!(row["counts"].as_object().unwrap().len(), 3);
+            let text = serde_json::to_string(&row).unwrap();
+            assert!(text.len() < 1024);
+            for forbidden in [
+                "namespace",
+                "account",
+                "path",
+                "digest",
+                "credential",
+                "error",
+            ] {
+                assert!(!text.contains(forbidden));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "bounded native outcome carrier measurement"]
+    fn census_fence_event_native_measurement() {
+        use crate::codex_scan_diagnostics::{
+            CensusFenceOutcome as O, CensusFencePhase as P, CensusInvalidation as I,
+        };
+        const ITERATIONS: usize = 256;
+        // Warm the existing stderr handle before measuring the event path.
+        codex_census_fence(P::Inner, O::Published, I::NotAttempted);
+        let started = Instant::now();
+        let (_, stats) = crate::retry_allocation_probe::measure(|| {
+            for _ in 0..ITERATIONS {
+                codex_census_fence(P::Inner, O::PrivateWriteFailed, I::Failed);
+            }
+        });
+        assert_eq!(stats.requested_live, 0);
+        assert!(stats.requested_peak_with_overlap < 2048);
+        println!("CENSUS_FENCE_OVERHEAD iterations={ITERATIONS} elapsed_us={} peak_bytes={} allocations={} live_bytes={} includes_encoding_and_existing_stderr=true",
+            started.elapsed().as_micros(), stats.requested_peak_with_overlap,
+            stats.allocations, stats.requested_live);
     }
 
     #[test]

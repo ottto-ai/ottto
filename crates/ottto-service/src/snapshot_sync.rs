@@ -2628,8 +2628,10 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         let source = completed.0.source;
         crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
             let (preparation, index, scan) = completed;
-            self.validate(&preparation)?;
-            ensure_snapshot_destination_current(&preparation.upload_destination_namespace)?;
+            codex_scan_diagnostics::observe_existing_outer_census_fence(source, || {
+                self.validate(&preparation)?;
+                ensure_snapshot_destination_current(&preparation.upload_destination_namespace)
+            })?;
             let source = preparation.source;
             finish_sync_source(
                 preparation,
