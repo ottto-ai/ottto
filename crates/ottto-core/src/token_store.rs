@@ -521,6 +521,18 @@ pub fn write_owner_only_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Resul
     write_secret_file_0600(path, bytes)
 }
 
+/// Owner-only atomic replacement for disposable local diagnostics/cache data.
+/// Shares the secure temporary-file path with durable writes, but deliberately
+/// skips fsync. A crash may lose this cache; never use it for credentials or a
+/// checkpoint/receipt ledger.
+pub fn write_owner_only_cache_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        restrict_secret_dir_to_owner(parent)?;
+    }
+    write_private_file_0600(path, bytes, false)
+}
+
 /// Writes `bytes` to `path` so the secret is never exposed through a
 /// world-readable or symlink-followable window.
 ///
@@ -535,6 +547,11 @@ pub fn write_owner_only_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Resul
 /// `io::Error` to its own error type.
 #[cfg(unix)]
 pub(crate) fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_private_file_0600(path, bytes, true)
+}
+
+#[cfg(unix)]
+fn write_private_file_0600(path: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -567,7 +584,10 @@ pub(crate) fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Resu
         }
     };
 
-    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+    if let Err(error) =
+        file.write_all(bytes)
+            .and_then(|()| if durable { file.sync_all() } else { Ok(()) })
+    {
         drop(file);
         let _ = fs::remove_file(&tmp_path);
         return Err(error);
@@ -584,6 +604,15 @@ pub(crate) fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Resu
 #[cfg(not(unix))]
 pub(crate) fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::write(path, bytes)
+}
+
+#[cfg(not(unix))]
+fn write_private_file_0600(path: &Path, bytes: &[u8], _durable: bool) -> std::io::Result<()> {
+    let _ = (path, bytes);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "owner-only atomic cache writes require Unix",
+    ))
 }
 
 /// Restricts a created secret directory to owner-only (`0o700`) so the secrecy
@@ -668,6 +697,39 @@ fn secret_file_name(account: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn diagnostic_cache_writer_is_private_atomic_and_does_not_follow_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = std::env::temp_dir().join(format!(
+            "ottto-disposable-cache-{}",
+            generate_control_token().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("unrelated");
+        fs::write(&target, b"unchanged").unwrap();
+        let cache = root.join("cache.json");
+        symlink(&target, &cache).unwrap();
+        write_owner_only_cache_file_atomic(&cache, b"first").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"unchanged");
+        write_owner_only_cache_file_atomic(&cache, b"second").unwrap();
+        assert_eq!(fs::read(&cache).unwrap(), b"second");
+        assert_eq!(
+            fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            2,
+            "no temporary files retained"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn memory_token_store_round_trips() {

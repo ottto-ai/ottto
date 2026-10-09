@@ -20387,6 +20387,65 @@ fn canonicalize_codex_identity_map<T: PartialEq>(values: &mut BTreeMap<String, T
 }
 
 impl ScanIndex {
+    pub(crate) fn local_codex_census_aggregates(
+        &self,
+    ) -> codex_scan_diagnostics::CensusIndexAggregates {
+        let traversal = self.traversal.as_ref();
+        let directory = traversal
+            .and_then(|t| t.codex_join_directory_census.as_ref())
+            .map(codex_file_join::DirectoryCensus::local_diagnostic_counts);
+        let bounded = self.files.len() <= codex_scan_diagnostics::MAX_FENCED_CENSUS_ENTRIES
+            && traversal.map_or(true, |t| {
+                t.codex_rollout_paths.len() <= codex_scan_diagnostics::MAX_FENCED_CENSUS_ENTRIES
+            });
+        let mut result = codex_scan_diagnostics::CensusIndexAggregates {
+            schema_version: self.schema_version,
+            generation: self.generation,
+            file_count: self.files.len() as u64,
+            traversal_present: traversal.is_some(),
+            pending_directories: traversal.map(|t| t.pending_directories.len() as u64),
+            pending_candidates: traversal.map(|t| t.pending_candidates.len() as u64),
+            directory_census_present: directory.is_some(),
+            directory_census_stable: directory.map(|(stable, _)| stable),
+            directory_count: directory.map(|(_, count)| count),
+            reconciliation_started: traversal.map(|t| t.reconciliation_started),
+            watcher_hint_seen: traversal.map(|t| t.watcher_hint_seen),
+            retry_attempt: traversal.map(|t| t.unhealthy_retry_attempt),
+            retry_not_before_unix_seconds: traversal
+                .and_then(|t| t.unhealthy_retry_not_before_unix_seconds),
+            protected_aggregation_complete: bounded,
+            protected_history: bounded.then_some(0),
+            protected_absent_from_observed_rollouts: (bounded && traversal.is_some()).then_some(0),
+            protected_absent_valid_owner: (bounded && traversal.is_some()).then_some(0),
+        };
+        if bounded {
+            // One capped pass, borrowed set membership, no index/key clone or IO.
+            for (key, entry) in &self.files {
+                if !entry.codex_history_is_protected() {
+                    continue;
+                }
+                *result.protected_history.as_mut().expect("bounded") += 1;
+                if traversal.is_some_and(|t| !t.codex_rollout_paths.contains(key)) {
+                    *result
+                        .protected_absent_from_observed_rollouts
+                        .as_mut()
+                        .expect("traversal") += 1;
+                    if entry
+                        .codex_protected_owner
+                        .as_deref()
+                        .is_some_and(valid_codex_protected_owner)
+                    {
+                        *result
+                            .protected_absent_valid_owner
+                            .as_mut()
+                            .expect("traversal") += 1;
+                    }
+                }
+            }
+        }
+        result
+    }
+
     /// Attach only the owner proved for this session. A missing or conflicting
     /// Claude revision is held for a later complete scan; the durable proof
     /// remains intact.
@@ -51141,6 +51200,114 @@ mod tests {
             codex_captured_tier_receipt_required: false,
             codex_captured_uncommitted: false,
         }
+    }
+
+    #[test]
+    fn fenced_census_aggregates_cover_protected_predicates_without_mutation() {
+        let receipt: codex_file_join::AppliedTierReceipt = serde_json::from_value(json!({
+            "version": 1, "derivation": "PRIVATE_DERIVATION", "scope": "PRIVATE_SCOPE",
+            "records": 1, "prefix_digest": "PRIVATE_DIGEST", "tiers": {}
+        }))
+        .unwrap();
+        let mut index = ScanIndex::default();
+        let mut traversal = terminal_unhealthy_traversal("PRIVATE_CONTEXT".into());
+        traversal.codex_join_directory_census = Some(codex_file_join::DirectoryCensus::new());
+        traversal
+            .codex_join_directory_census
+            .as_mut()
+            .unwrap()
+            .invalidate_walk();
+        traversal.codex_rollout_paths.insert("present".into());
+        for kind in 0..8 {
+            let mut entry = manifest_index_entry(Some("PRIVATE_FINGERPRINT"));
+            match kind {
+                0 => entry.codex_protected_owner = Some("a".repeat(64)),
+                1 => entry.codex_joined_member_set = Some("PRIVATE_JOIN".into()),
+                2 => entry.codex_captured_joined_member_set = Some("PRIVATE_PENDING".into()),
+                3 => entry.codex_applied_tier_receipt = Some(receipt.clone()),
+                4 => entry.codex_applied_tier_receipt_required = true,
+                5 => entry.codex_captured_tier_receipt = Some(receipt.clone()),
+                6 => entry.codex_captured_tier_receipt_required = true,
+                7 => entry.codex_captured_uncommitted = true,
+                _ => unreachable!(),
+            }
+            index.files.insert(format!("PRIVATE_PATH_{kind}"), entry);
+        }
+        let mut present = manifest_index_entry(None);
+        present.codex_protected_owner = Some("b".repeat(64));
+        index.files.insert("present".into(), present);
+        index
+            .files
+            .insert("ordinary".into(), manifest_index_entry(None));
+        index.traversal = Some(traversal);
+        let before = serde_json::to_vec(&index).unwrap();
+        let result = index.local_codex_census_aggregates();
+        assert_eq!(result.protected_history, Some(9));
+        assert_eq!(result.protected_absent_from_observed_rollouts, Some(8));
+        assert_eq!(result.protected_absent_valid_owner, Some(1));
+        assert_eq!(result.directory_census_stable, Some(false));
+        assert_eq!(result.pending_candidates, Some(0));
+        assert_eq!(result.retry_attempt, Some(1));
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("PRIVATE"));
+        assert!(!json.contains(&"a".repeat(64)));
+        assert_eq!(serde_json::to_vec(&index).unwrap(), before);
+    }
+
+    #[test]
+    fn fenced_census_aggregate_caps_and_absent_traversal_stay_unknown() {
+        let mut index = ScanIndex::default();
+        let empty = index.local_codex_census_aggregates();
+        assert!(!empty.traversal_present);
+        assert_eq!(empty.pending_directories, None);
+        assert_eq!(empty.directory_census_stable, None);
+        assert_eq!(empty.protected_absent_from_observed_rollouts, None);
+        assert_eq!(empty.protected_history, Some(0));
+        let entry = manifest_index_entry(None);
+        for i in 0..=codex_scan_diagnostics::MAX_FENCED_CENSUS_ENTRIES {
+            index.files.insert(i.to_string(), entry.clone());
+        }
+        let capped = index.local_codex_census_aggregates();
+        assert!(!capped.protected_aggregation_complete);
+        assert_eq!(capped.protected_history, None);
+        index.files.clear();
+        let mut traversal = terminal_unhealthy_traversal("private".into());
+        for i in 0..=codex_scan_diagnostics::MAX_FENCED_CENSUS_ENTRIES {
+            traversal.codex_rollout_paths.insert(i.to_string());
+        }
+        index.traversal = Some(traversal);
+        let capped = index.local_codex_census_aggregates();
+        assert!(!capped.protected_aggregation_complete);
+        assert_eq!(capped.protected_absent_from_observed_rollouts, None);
+    }
+
+    #[test]
+    #[ignore = "bounded synthetic aggregate allocation and latency measurement"]
+    fn fenced_census_aggregate_native_measurement() {
+        let mut index = ScanIndex::default();
+        let mut traversal = terminal_unhealthy_traversal("private".into());
+        let mut entry = manifest_index_entry(None);
+        entry.codex_protected_owner = Some("a".repeat(64));
+        for i in 0..codex_scan_diagnostics::MAX_FENCED_CENSUS_ENTRIES {
+            let key = format!("synthetic/{i:05}");
+            traversal.codex_rollout_paths.insert(key.clone());
+            index.files.insert(key, entry.clone());
+        }
+        index.traversal = Some(traversal);
+        let started = std::time::Instant::now();
+        let (result, allocations) =
+            crate::retry_allocation_probe::measure(|| index.local_codex_census_aggregates());
+        let elapsed = started.elapsed();
+        assert_eq!(result.protected_history, Some(32_768));
+        assert_eq!(
+            allocations.allocations, 0,
+            "projection must not clone index/keys"
+        );
+        println!(
+            "fenced_census_aggregate entries=32768 elapsed_us={} heap_allocations={}",
+            elapsed.as_micros(),
+            allocations.allocations
+        );
     }
 
     #[test]
