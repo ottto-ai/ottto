@@ -47,6 +47,15 @@ use std::time::{Duration, Instant};
 use time::{
     format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime, UtcOffset,
 };
+// Quota contract v2.2 credit types, consumed by the provider adapters below
+// and their call sites in this file.
+#[allow(unused_imports)]
+use ottto_protocol::{
+    AgentCreditGrant, CreditBalanceKind, CreditGrantStatus, CreditGrantType, CreditGrantsState,
+};
+
+mod claude_credit_pools;
+mod codex_credit_grants;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -683,6 +692,10 @@ fn claude_provider_meter_payload_fingerprint(
         balance.account_identifier_hash = None;
         balance.organization_identifier_hash = None;
         balance.updated_at = None;
+        // Provider read clocks only: a re-sent cached section keeps its original
+        // read time, so two slots carrying the same meter differ only here.
+        balance.observed_at = None;
+        balance.grants_observed_at = None;
         balance.freshness = AgentQuotaWindowFreshness::Fresh;
         balance_rows.push(serde_json::to_string(balance).ok()?);
     }

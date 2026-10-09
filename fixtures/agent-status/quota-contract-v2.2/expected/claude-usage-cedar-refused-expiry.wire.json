@@ -1,0 +1,47 @@
+{
+  "credit_balances": [
+    {
+      "at_limit": false,
+      "eligible": true,
+      "freshness": "fresh",
+      "grant_count": 2,
+      "grants": [
+        {
+          "clears": [
+            "five_hour",
+            "seven_day"
+          ],
+          "expires_at": "2026-10-22T16:00:00Z",
+          "grant_key": "6e3cecf18e8b64075896d53daee2db9f3f0720871c840035bd4a1654e4f6c17d",
+          "grant_type": "rate_limit_reset",
+          "resets_included": 2,
+          "resets_left": 1,
+          "starts_at": "2026-09-22T16:00:00Z",
+          "status": "available",
+          "title": "Synthetic launch: one usage-limit reset",
+          "usable_now": true
+        },
+        {
+          "clears": [
+            "seven_day"
+          ],
+          "grant_key": "258060cc26af60ca582c902ce70f1d8c9422db01de7a204b80dc5ab7625f91fa",
+          "grant_type": "rate_limit_reset",
+          "resets_included": 1,
+          "resets_left": 1,
+          "starts_at": "2026-09-01T16:00:00Z",
+          "status": "available",
+          "title": "Synthetic welcome reset",
+          "usable_now": false
+        }
+      ],
+      "grants_observed_at": "2026-10-01T12:00:00Z",
+      "grants_state": "partial",
+      "kind": "saved_resets",
+      "name": "reset_bank",
+      "observed_at": "2026-10-01T12:00:00Z",
+      "status": "unknown",
+      "unit": "resets"
+    }
+  ]
+}

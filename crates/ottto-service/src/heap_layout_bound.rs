@@ -281,7 +281,52 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentContextS
     }
 }
 
-crate::heap_layout_bound::fields!(ottto_protocol::AgentCreditBalance; name, status, freshness, unit, account_label, account_identifier_hash, organization_identifier_hash, remaining, used, quota, unlimited, updated_at, currency, resets_at, used_percent, enabled, spend_control_reached, rate_limit_reached_type, limit_id);
+crate::heap_layout_bound::fields!(ottto_protocol::AgentCreditBalance; name, status, freshness, unit, account_label, account_identifier_hash, organization_identifier_hash, remaining, used, quota, unlimited, updated_at, currency, resets_at, used_percent, enabled, spend_control_reached, rate_limit_reached_type, limit_id, observed_at, expires_at, disabled_reason, grant_count, grants, grants_state, grants_observed_at, kind, title, next_expires_at, latest_granted_at, eligible, at_limit, ineligible_reason, cooldown_until);
+
+crate::heap_layout_bound::fields!(ottto_protocol::AgentCreditGrant; grant_key, grant_type, status, granted_at, starts_at, expires_at, resets_included, resets_left, clears, title, usable_now);
+
+impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditBalanceKind {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::UsageCredits
+            | Self::PlanCredits
+            | Self::SavedResets
+            | Self::OneTimeCredit
+            | Self::WorkspaceAllowance
+            | Self::Unknown => c.add(0),
+        }
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditGrantsState {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Complete
+            | Self::Capped
+            | Self::Partial
+            | Self::Unavailable
+            | Self::NotSupported => c.add(0),
+        }
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditGrantType {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::RateLimitReset | Self::Credit | Self::Unknown => c.add(0),
+        }
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditGrantStatus {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Available | Self::Redeeming | Self::Redeemed | Self::Paused | Self::Unknown => {
+                c.add(0)
+            }
+        }
+    }
+}
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentCreditBalanceUnit {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

@@ -35,6 +35,10 @@ pub(crate) mod net_resilience;
 pub mod net_transition;
 pub mod otlp_relay;
 pub mod provider_daily_reference;
+// The provider adapters (agent_status::{codex_credit_grants, claude_credit_pools})
+// are the callers; until they are wired, parts of the model are test-only.
+#[allow(dead_code)]
+pub(crate) mod quota_credit_model;
 mod retry_tls;
 pub mod session_attribution;
 pub mod snapshot_audit;

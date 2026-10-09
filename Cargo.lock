@@ -777,6 +777,7 @@ dependencies = [
  "thiserror",
  "time",
  "toml_edit",
+ "unicode-normalization",
  "ureq",
  "webpki-roots 0.26.11",
  "zeroize",
