@@ -28,6 +28,8 @@ both provider adapters:
   soonest-expiry order, and `grants_state` with `partial` > `capped` > `complete`;
 - complete-gated summaries (soonest expiry, latest grant time, Claude
   saved-reset count), with the saved-reset `status` following the count;
+- provider titles pass the privacy guard on the value as given and on its
+  NFKC form (as the backend does) before any truncation;
 - readiness passthrough and the switched-off balance shape;
 - the one-time pool shape;
 - `SectionCache`, which re-sends the last observed section when a reading
