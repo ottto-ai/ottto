@@ -24,16 +24,18 @@ use crate::quota_credit_model::{
     GrantStatusInput, ListObservation, Provider, SectionCache, TimeInput,
 };
 
-/// The saved-reset read variant (`cedar_ember`). Held off until the OAuth twin
-/// of the observed web variant is witnessed and the lead confirms its shape.
-/// While `false` every read is the plain read, exactly as before.
-pub(super) const CLAUDE_SAVED_RESETS_READ_ENABLED: bool = false;
-/// Passive input from Claude Code's own `cachedUsageUtilization`. Held off
-/// until every pass that finds a registered slot signed in elsewhere also ends
-/// that caller's sign-in run: today the slot identity gates return before the
-/// usage collector records the pass, so a switch away and back within the run
-/// window would go unseen. While `false` no passive reading is adopted.
-pub(super) const CLAUDE_PASSIVE_READING_ENABLED: bool = false;
+/// Passive input from Claude Code's own `cachedUsageUtilization` (Ron Q3).
+/// Every collection pass records where each caller is signed in, and a
+/// registered slot's identity gate ends the caller's run when it refuses the
+/// slot, so a body fetched under another organization is never adopted.
+pub(super) const CLAUDE_PASSIVE_READING_ENABLED: bool = true;
+/// Kill switch for the activity-based slot (Ron Q3). `false` falls back to
+/// today's 55-65 min gate for every binding: no active boost, no idle
+/// slowdown. Plain/saved-reset alternation is unaffected (same slot count).
+pub(super) const CLAUDE_ACTIVITY_CADENCE_ENABLED: bool = true;
+/// A saved-reset variant response without a recognizable `cedar_ember` stops
+/// the variant for that binding this long; every slot reads plain meanwhile.
+const SAVED_RESETS_VARIANT_PAUSE_SECONDS: u64 = 24 * 60 * 60;
 /// Query of the saved-reset read variant. It returns the same windows and
 /// one-time pools as the plain read, `cedar_ember`, and no `spend`.
 const CLAUDE_SAVED_RESETS_QUERY: &str = "?cedar_ember=1&skip_spend=1";
@@ -114,8 +116,10 @@ pub(super) struct ClaudeCreditRead {
 /// - Saved-reset variant: `cedar_ember` only. Its `spend` is skipped by
 ///   request, and its pools stay owned by the plain read so a variant that
 ///   omitted them can never toggle their presence.
-/// - `cedar_ember` is a saved-reset observation only when it is an object; the
-///   plain read always sends it as `null`.
+/// - `cedar_ember` is a saved-reset observation only when its shape is
+///   recognized ([`claude_saved_resets_recognized`]); the plain read always
+///   sends it as `null`. An unrecognized section yields no balance, never an
+///   `unknown` stand-in, so the last observed one is re-sent.
 pub(super) fn claude_credit_read(
     body: &Value,
     read: ClaudeUsageRead,
@@ -142,6 +146,18 @@ pub(super) fn claude_credit_read(
             ..ClaudeCreditRead::default()
         },
     }
+}
+
+/// The saved-reset variant self-check (Ron, 2026-10-09): `cedar_ember` is an
+/// object with a `grants` array, or with a boolean `eligible` status.
+/// Anything else (missing, null, another type) is unrecognized.
+pub(super) fn claude_saved_resets_recognized(body: &Value) -> bool {
+    body.get("cedar_ember")
+        .and_then(Value::as_object)
+        .is_some_and(|cedar| {
+            cedar.get("grants").is_some_and(Value::is_array)
+                || cedar.get("eligible").is_some_and(Value::is_boolean)
+        })
 }
 
 fn balance_section(balance: &AgentCreditBalance) -> Option<&'static str> {
@@ -280,6 +296,9 @@ fn claude_saved_resets(
     observed_at: &str,
     diagnostics: &mut Vec<CreditModelDiagnostic>,
 ) -> Option<AgentCreditBalance> {
+    if !claude_saved_resets_recognized(body) {
+        return None;
+    }
     let cedar = body.get("cedar_ember")?.as_object()?;
     let observation = match cedar.get("grants").and_then(Value::as_array) {
         // The raw array is the provider's complete enumeration (contract v2.1
@@ -432,6 +451,11 @@ pub(super) struct ClaudeReadSchedule {
     /// active. Never counts as activity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) tracked_since: Option<u64>,
+    /// The saved-reset variant is not used before this time: its last
+    /// response had no recognizable `cedar_ember`. Separate from the endpoint
+    /// breaker; never a breaker strike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) saved_resets_variant_paused_until: Option<u64>,
 }
 
 impl ClaudeReadSchedule {
@@ -455,6 +479,19 @@ impl ClaudeReadSchedule {
         }
         self.last_activity_at = self.activity_at(latest_activity_at);
         self.tracked_since.get_or_insert(now);
+    }
+
+    /// Record the self-check of a saved-reset variant response: an
+    /// unrecognized shape pauses the variant for 24 h; a recognized one ends
+    /// any pause.
+    pub(super) fn after_saved_resets_variant(&mut self, recognized: bool, now: u64) {
+        self.saved_resets_variant_paused_until =
+            (!recognized).then(|| now.saturating_add(SAVED_RESETS_VARIANT_PAUSE_SECONDS));
+    }
+
+    fn saved_resets_variant_paused(&self, now: u64) -> bool {
+        self.saved_resets_variant_paused_until
+            .is_some_and(|until| now < until)
     }
 
     fn activity_at(&self, latest_activity_at: Option<u64>) -> Option<u64> {
@@ -510,14 +547,19 @@ pub(super) fn claude_idle_slot_seconds(
 
 /// The account's read slot (Ron Q3): the active slot while the account was
 /// active in the last 30 min, the idle slot once idle more than 6 h, else the
-/// default slot (today's 55-65 min gate).
+/// default slot (today's 55-65 min gate). With `activity_cadence` off every
+/// slot is the default slot.
 pub(super) fn claude_usage_slot_seconds(
     schedule: &ClaudeReadSchedule,
     latest_activity_at: Option<u64>,
     default_slot_seconds: u64,
     idle_slot_seconds: u64,
+    activity_cadence: bool,
     now: u64,
 ) -> u64 {
+    if !activity_cadence {
+        return default_slot_seconds;
+    }
     let activity = schedule.activity_at(latest_activity_at);
     if activity.is_some_and(|at| now.saturating_sub(at) <= ACTIVE_WINDOW_SECONDS) {
         return ACTIVE_SLOT_SECONDS;
@@ -543,16 +585,16 @@ pub(super) fn claude_reading_due(
     })
 }
 
-/// Which read a due slot makes (Ron Q1: no extra calls). Without the variant
-/// every slot is plain. Otherwise slots alternate plain and saved-reset reads;
-/// while usage credits are off the plain read runs only every ~6 h.
+/// Which read a due slot makes (Ron Q1: no extra calls). Slots alternate
+/// plain and saved-reset reads; while usage credits are off the plain read
+/// runs only every ~6 h. While the variant is paused by its self-check every
+/// slot is plain.
 pub(super) fn claude_usage_read_kind(
     schedule: &ClaudeReadSchedule,
     usage_credits_off: bool,
-    saved_resets_read_enabled: bool,
     now: u64,
 ) -> ClaudeUsageRead {
-    if !saved_resets_read_enabled {
+    if schedule.saved_resets_variant_paused(now) {
         return ClaudeUsageRead::Plain;
     }
     let Some(plain_at) = schedule.last_plain_read_at else {
@@ -698,6 +740,15 @@ pub(super) fn claude_observe_caller_binding(
             now
         }
     }
+}
+
+/// A pass refused this caller's sign-in (a registered slot's identity gate):
+/// its run ends, so no body fetched before the next accepted pass is adopted.
+pub(super) fn claude_end_caller_binding(
+    callers: &mut BTreeMap<String, ClaudeCallerBinding>,
+    caller_key: &str,
+) {
+    callers.remove(caller_key);
 }
 
 /// Use the passive reading instead of a call when it is newer than our last
@@ -1337,10 +1388,17 @@ mod tests {
         assert!(!schedule.observe_activity(None));
         assert!(!schedule.observe_activity(Some(900)));
         assert_eq!(schedule.last_activity_at, Some(1_000));
-        let slot = |now| claude_usage_slot_seconds(&schedule, None, 3_600, 7_200, now);
+        let slot = |now| claude_usage_slot_seconds(&schedule, None, 3_600, 7_200, true, now);
         assert_eq!(slot(1_000 + 20 * 60), ACTIVE_SLOT_SECONDS);
         assert_eq!(slot(1_000 + 31 * 60), 3_600);
         assert_eq!(slot(1_000 + 6 * 3_600 + 1), 7_200);
+        // Kill switch: today's default gate everywhere.
+        for now in [1_000 + 20 * 60, 1_000 + 31 * 60, 1_000 + 6 * 3_600 + 1] {
+            assert_eq!(
+                claude_usage_slot_seconds(&schedule, Some(now), 3_600, 7_200, false, now),
+                3_600
+            );
+        }
     }
 
     #[test]
@@ -1417,7 +1475,8 @@ mod tests {
             let since = claude_observe_caller_binding(&mut self.callers, "default", "a/o", now);
             self.schedule.observe_activity(activity);
             let idle = claude_idle_slot_seconds("account-sim", "org-sim");
-            let slot = claude_usage_slot_seconds(&self.schedule, activity, DEFAULT_SLOT, idle, now);
+            let slot =
+                claude_usage_slot_seconds(&self.schedule, activity, DEFAULT_SLOT, idle, true, now);
             if !claude_reading_due(self.last_reading_at, self.next_refresh_after, slot, now) {
                 return;
             }
@@ -1428,7 +1487,7 @@ mod tests {
                 self.record(ClaudeUsageRead::Plain, fetched, activity, now);
                 return;
             }
-            let read = claude_usage_read_kind(&self.schedule, self.usage_credits_off, true, now);
+            let read = claude_usage_read_kind(&self.schedule, self.usage_credits_off, now);
             self.calls.push((now, read, slot));
             self.record(read, now, activity, now);
         }
@@ -1556,19 +1615,436 @@ mod tests {
     }
 
     #[test]
-    fn saved_reset_variant_disabled_keeps_every_read_plain() {
-        let schedule = ClaudeReadSchedule {
-            last_plain_read_at: Some(1),
+    fn saved_reset_variant_self_check_recognizes_only_known_shapes() {
+        for cedar in [
+            cedar_team(),
+            cedar_max(),
+            cedar_ineligible(),
+            json!({"eligible": true}),
+        ] {
+            assert!(claude_saved_resets_recognized(&variant_body(cedar)));
+        }
+        for cedar in [
+            json!(null),
+            json!("cedar"),
+            json!({}),
+            json!({"grants": "none"}),
+            json!({"eligible": "yes"}),
+        ] {
+            let body = variant_body(cedar);
+            assert!(!claude_saved_resets_recognized(&body));
+            let read = claude_credit_read(&body, ClaudeUsageRead::SavedResets, READ_AT);
+            assert!(read.saved_resets.is_none(), "no balance, never unknown");
+        }
+        let mut missing = variant_body(json!(null));
+        missing.as_object_mut().unwrap().remove("cedar_ember");
+        assert!(!claude_saved_resets_recognized(&missing));
+    }
+
+    #[test]
+    fn unrecognized_variant_pauses_it_for_24_hours_then_rechecks() {
+        let now = 10_000_000;
+        let mut schedule = ClaudeReadSchedule {
+            last_plain_read_at: Some(now - 3_600),
             ..ClaudeReadSchedule::default()
         };
         assert_eq!(
-            claude_usage_read_kind(&schedule, false, CLAUDE_SAVED_RESETS_READ_ENABLED, 10),
-            ClaudeUsageRead::Plain
+            claude_usage_read_kind(&schedule, false, now),
+            ClaudeUsageRead::SavedResets
         );
+        schedule.after_reading(ClaudeUsageRead::SavedResets, now, None, now);
+        schedule.after_saved_resets_variant(false, now);
+        assert_eq!(
+            schedule.saved_resets_variant_paused_until,
+            Some(now + 24 * 3_600)
+        );
+        // Plain only for 24 h, whatever alternation or credits-off would pick.
+        for later in [now + 1, now + 7 * 3_600, now + 24 * 3_600 - 1] {
+            for credits_off in [false, true] {
+                assert_eq!(
+                    claude_usage_read_kind(&schedule, credits_off, later),
+                    ClaudeUsageRead::Plain
+                );
+            }
+        }
+        schedule.after_reading(ClaudeUsageRead::Plain, now + 23 * 3_600, None, now);
+        // Recovery: after 24 h the variant is tried again and re-checked.
+        assert_eq!(
+            claude_usage_read_kind(&schedule, false, now + 24 * 3_600),
+            ClaudeUsageRead::SavedResets
+        );
+        schedule.after_saved_resets_variant(true, now + 24 * 3_600);
+        assert_eq!(schedule.saved_resets_variant_paused_until, None);
         assert_eq!(ClaudeUsageRead::Plain.query(), "");
         assert_eq!(
             ClaudeUsageRead::SavedResets.query(),
             "?cedar_ember=1&skip_spend=1"
         );
+    }
+
+    #[test]
+    fn read_schedule_file_is_owner_only_and_survives_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-claude-read-schedule-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            read_claude_read_schedule(&dir),
+            ClaudeReadSchedule::default()
+        );
+        let schedule = ClaudeReadSchedule {
+            last_plain_read_at: Some(1),
+            last_saved_resets_read_at: Some(2),
+            last_activity_at: Some(3),
+            tracked_since: Some(4),
+            saved_resets_variant_paused_until: Some(5),
+        };
+        write_claude_read_schedule(&dir, &schedule).unwrap();
+        let mode = std::fs::metadata(dir.join(CLAUDE_READ_SCHEDULE_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "no group/world access: {mode:o}");
+        // A restarted daemon reads the same schedule back.
+        assert_eq!(read_claude_read_schedule(&dir), schedule);
+        std::fs::write(dir.join(CLAUDE_READ_SCHEDULE_FILE), b"{not json").unwrap();
+        assert_eq!(
+            read_claude_read_schedule(&dir),
+            ClaudeReadSchedule::default()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn fixture_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/agent-status/quota-contract-v2.2")
+    }
+
+    fn fixture(path: &str) -> Value {
+        serde_json::from_slice(&std::fs::read(fixture_dir().join(path)).unwrap()).unwrap()
+    }
+
+    /// The emitted balances without the fields stamped outside the adapter:
+    /// packaging time (`updated_at`, contract C9) and the binding hashes.
+    fn comparable(balances: &Value) -> Value {
+        let mut balances = balances.clone();
+        for balance in balances.as_array_mut().unwrap() {
+            let balance = balance.as_object_mut().unwrap();
+            for key in [
+                "updated_at",
+                "account_identifier_hash",
+                "organization_identifier_hash",
+            ] {
+                balance.remove(key);
+            }
+        }
+        balances
+    }
+
+    /// Each canonical Claude provider body, read once on a cold binding,
+    /// produces the canonical expected balances.
+    #[test]
+    fn canonical_claude_fixtures_match_expected_wire() {
+        for name in [
+            "claude-oauth-usage-plain",
+            "claude-usage-cedar",
+            "claude-usage-cedar-ineligible",
+            "claude-usage-cedar-refused-expiry",
+        ] {
+            let body = fixture(&format!("provider/{name}.json"));
+            let read = claude_credit_read(&body, ClaudeUsageRead::Plain, "2026-10-01T12:00:00Z");
+            let emitted = claude_merge_credit_sections("fixture", &[], &read);
+            let expected = fixture(&format!("expected/{name}.wire.json"));
+            assert_eq!(
+                comparable(&serde_json::to_value(&emitted).unwrap()),
+                comparable(&expected["credit_balances"]),
+                "{name}"
+            );
+            assert!(emitted.iter().all(|balance| balance.enabled != Some(true)
+                || balance.kind != Some(CreditBalanceKind::OneTimeCredit)));
+        }
+    }
+
+    /// The canonical alternation sequence, with each binding's stored reading
+    /// carried between steps. The adapter's stored reading is on disk per
+    /// binding, so after a restart it is still the last observed section and
+    /// is re-sent (no presence flip); the in-memory model fixture starts cold.
+    #[test]
+    fn canonical_claude_sequence_matches_expected_wire() {
+        let sequence = fixture("expected/sequence-claude-plain-saved-resets.wire.json");
+        let mut stored: BTreeMap<String, Vec<AgentCreditBalance>> = BTreeMap::new();
+        for step in sequence["steps"].as_array().unwrap() {
+            let label = step["step"].as_str().unwrap();
+            let expected = &step["credit_balances"];
+            let binding = expected[0]["account_identifier_hash"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let input = step["provider_inputs"][0].as_str().unwrap();
+            let read = if input.ends_with("claude-oauth-usage-plain.json") {
+                ClaudeUsageRead::Plain
+            } else {
+                ClaudeUsageRead::SavedResets
+            };
+            let observed_at = step["packaged_at"]
+                .as_str()
+                .unwrap()
+                .replace(":05Z", ":00Z");
+            let previous = stored.get(&binding).cloned().unwrap_or_default();
+            let emitted = claude_merge_credit_sections(
+                &binding,
+                &previous,
+                &claude_credit_read(&fixture(input), read, &observed_at),
+            );
+            let emitted_value = comparable(&serde_json::to_value(&emitted).unwrap());
+            if label.starts_with("restart") {
+                let saved = emitted
+                    .iter()
+                    .find(|b| b.kind == Some(CreditBalanceKind::SavedResets))
+                    .expect("stored saved resets re-sent after a restart");
+                assert_eq!(
+                    saved.grants_observed_at.as_deref(),
+                    Some("2026-10-01T14:00:00Z")
+                );
+                let without_saved = Value::Array(
+                    emitted_value
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|b| b["kind"] != "saved_resets")
+                        .cloned()
+                        .collect(),
+                );
+                assert_eq!(without_saved, comparable(expected), "{label}");
+            } else {
+                assert_eq!(emitted_value, comparable(expected), "{label}");
+            }
+            stored.insert(binding, emitted);
+        }
+    }
+
+    /// Restores one environment variable on drop.
+    struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self(key, previous)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    static REQUESTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn respond_with(endpoint: &str, cedar: Value) -> Value {
+        REQUESTED.lock().unwrap().push(endpoint.to_string());
+        let mut body = fixture("provider/claude-usage-cedar.json");
+        body["cedar_ember"] = cedar;
+        body
+    }
+
+    fn respond_recognized(endpoint: &str) -> Value {
+        respond_with(
+            endpoint,
+            fixture("provider/claude-usage-cedar.json")["cedar_ember"].clone(),
+        )
+    }
+
+    fn respond_cedar_null(endpoint: &str) -> Value {
+        respond_with(endpoint, Value::Null)
+    }
+
+    fn respond_empty(endpoint: &str) -> Value {
+        REQUESTED.lock().unwrap().push(endpoint.to_string());
+        json!({})
+    }
+
+    /// End to end through the collector with a stand-in provider: a binding
+    /// whose plain read is recent and saved resets never read takes the
+    /// variant in its next due slot.
+    struct VariantHarness {
+        dir: std::path::PathBuf,
+        _support: EnvGuard,
+        account: &'static str,
+        organization: &'static str,
+    }
+
+    impl VariantHarness {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "ottto-claude-variant-{label}-{}-{}",
+                std::process::id(),
+                OffsetDateTime::now_utc().unix_timestamp_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &dir);
+            super::super::CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            REQUESTED.lock().unwrap().clear();
+            Self {
+                dir,
+                _support: support,
+                account: "account-variant",
+                organization: "organization-variant",
+            }
+        }
+
+        fn state_dir(&self) -> std::path::PathBuf {
+            super::super::claude_oauth_usage_account_state_dir(self.account, self.organization)
+        }
+
+        /// Make the binding due, with the plain read an hour ago.
+        fn due(&self, mut schedule: ClaudeReadSchedule) {
+            let _ = std::fs::remove_file(super::super::claude_oauth_usage_cache_path(
+                self.account,
+                self.organization,
+            ));
+            let now = super::super::current_unix_seconds();
+            schedule.last_plain_read_at.get_or_insert(now - 3_600);
+            write_claude_read_schedule(&self.state_dir(), &schedule).unwrap();
+        }
+
+        fn schedule(&self) -> ClaudeReadSchedule {
+            read_claude_read_schedule(&self.state_dir())
+        }
+
+        fn collect(&self, respond: fn(&str) -> Value) -> super::super::ClaudeOAuthUsageOutcome {
+            *super::super::CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = Some(respond);
+            let outcome = super::super::collect_claude_oauth_usage_with_access_token(
+                self.account,
+                self.organization,
+                Some("fixture-token".to_string()),
+                &super::super::ClaudeOAuthUsageCaller::RegisteredSlot("slot-variant".to_string()),
+            );
+            *super::super::CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = None;
+            outcome
+        }
+
+        fn shape_failures(&self) -> u32 {
+            super::super::read_claude_oauth_usage_breaker(
+                self.account,
+                self.organization,
+                &super::super::claude_oauth_usage_config_fingerprint(),
+            )
+            .map_or(0, |breaker| breaker.shape_failures)
+        }
+    }
+
+    impl Drop for VariantHarness {
+        fn drop(&mut self) {
+            *super::super::CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = None;
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn saved_resets_of(outcome: &super::super::ClaudeOAuthUsageOutcome) -> Vec<AgentCreditBalance> {
+        outcome
+            .result
+            .as_ref()
+            .unwrap()
+            .credit_balances
+            .iter()
+            .filter(|b| b.kind == Some(CreditBalanceKind::SavedResets))
+            .cloned()
+            .collect()
+    }
+
+    fn has_unrecognized(outcome: &super::super::ClaudeOAuthUsageOutcome) -> bool {
+        outcome
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "claude_saved_reset_variant_unrecognized")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn valid_variant_response_yields_grants() {
+        let harness = VariantHarness::new("valid");
+        harness.due(ClaudeReadSchedule::default());
+        let outcome = harness.collect(respond_recognized);
+        assert_eq!(
+            REQUESTED.lock().unwrap().as_slice(),
+            ["https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"]
+        );
+        let saved = saved_resets_of(&outcome);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].grants.as_ref().map(Vec::len), Some(3));
+        assert_eq!(
+            saved[0].grants_state,
+            Some(ottto_protocol::CreditGrantsState::Complete)
+        );
+        assert!(!has_unrecognized(&outcome));
+        assert_eq!(harness.schedule().saved_resets_variant_paused_until, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unrecognized_variant_goes_plain_for_24_hours_without_a_breaker_strike() {
+        let harness = VariantHarness::new("unrecognized");
+        harness.due(ClaudeReadSchedule::default());
+        let outcome = harness.collect(respond_cedar_null);
+        assert!(has_unrecognized(&outcome));
+        assert!(
+            saved_resets_of(&outcome).is_empty(),
+            "no saved-reset balance"
+        );
+        assert!(outcome
+            .result
+            .as_ref()
+            .unwrap()
+            .credit_balances
+            .iter()
+            .all(|b| b.status != AgentCreditBalanceStatus::Unknown
+                || b.kind != Some(CreditBalanceKind::SavedResets)));
+        assert_eq!(harness.shape_failures(), 0);
+        let now = super::super::current_unix_seconds();
+        let paused_until = harness
+            .schedule()
+            .saved_resets_variant_paused_until
+            .unwrap();
+        assert!((now + 24 * 3_600 - 5..=now + 24 * 3_600).contains(&paused_until));
+
+        // A variant body with no windows at all is still variant state, not a
+        // shape strike on the shared endpoint breaker.
+        harness.due(ClaudeReadSchedule::default());
+        let outcome = harness.collect(respond_empty);
+        assert!(has_unrecognized(&outcome));
+        assert_eq!(harness.shape_failures(), 0);
+
+        // While paused, the next due slot reads plain.
+        harness.due(harness.schedule());
+        REQUESTED.lock().unwrap().clear();
+        harness.collect(respond_recognized);
+        assert_eq!(
+            REQUESTED.lock().unwrap().as_slice(),
+            ["https://api.anthropic.com/api/oauth/usage"]
+        );
+
+        // Recovery after 24 h: the variant is read and re-checked again.
+        let mut schedule = harness.schedule();
+        schedule.saved_resets_variant_paused_until = Some(now - 1);
+        schedule.last_plain_read_at = Some(now - 3_600);
+        schedule.last_saved_resets_read_at = Some(now - 7_200);
+        harness.due(schedule);
+        REQUESTED.lock().unwrap().clear();
+        let outcome = harness.collect(respond_recognized);
+        assert_eq!(
+            REQUESTED.lock().unwrap().as_slice(),
+            ["https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"]
+        );
+        assert_eq!(saved_resets_of(&outcome).len(), 1);
+        assert_eq!(harness.schedule().saved_resets_variant_paused_until, None);
     }
 }

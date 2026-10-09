@@ -3983,6 +3983,7 @@ fn collect_claude_status_snapshots(
             match claude_slot_pre_collection_gate(&descriptor, previous, &captured_at) {
                 Ok(expected) => expected,
                 Err(status) => {
+                    claude_oauth_end_caller_run(&descriptor.slot_id);
                     slot_states.insert(descriptor.slot_id, status);
                     continue;
                 }
@@ -4053,6 +4054,7 @@ fn collect_claude_status_snapshots(
             previous,
             &captured_at,
         ) {
+            claude_oauth_end_caller_run(&slot_id);
             slot_states.insert(slot_id, status);
             continue;
         }
@@ -5058,6 +5060,7 @@ pub(crate) fn collect_registered_claude_slot_status(
         match claude_slot_pre_collection_gate(&descriptor, previous, &captured_at) {
             Ok(expected) => expected,
             Err(mut status) => {
+                claude_oauth_end_caller_run(slot_id);
                 apply_claude_slot_approval_notice(
                     &mut status,
                     claude_slot_approvals().get(slot_id),
@@ -5117,6 +5120,7 @@ pub(crate) fn collect_registered_claude_slot_status(
         previous,
         &captured_at,
     ) {
+        claude_oauth_end_caller_run(slot_id);
         let _ = persist_one_claude_slot_collection_state(slot_id, &status);
         return status;
     }
@@ -9885,7 +9889,6 @@ fn collect_claude_oauth_usage_unstamped(
     let usage_read = claude_credit_pools::claude_usage_read_kind(
         &read_schedule,
         claude_credit_pools::claude_usage_credits_off(&previous_credit_balances),
-        claude_credit_pools::CLAUDE_SAVED_RESETS_READ_ENABLED,
         now,
     );
     let endpoint = format!("{CLAUDE_OAUTH_USAGE_ENDPOINT}{}", usage_read.query());
@@ -9896,6 +9899,29 @@ fn collect_claude_oauth_usage_unstamped(
         return ClaudeOAuthUsageOutcome::from(Err(
             "This test forbids Claude OAuth provider requests.".to_string(),
         ));
+    }
+    #[cfg(test)]
+    if let Some(respond) = *CLAUDE_OAUTH_TEST_RESPONSE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        let value = respond(&endpoint);
+        return claude_oauth_usage_after_response(
+            ClaudeOAuthReading {
+                account_identifier_hash,
+                organization_identifier_hash,
+                body: &value,
+                read: usage_read,
+                observed_at_epoch_seconds: current_unix_seconds(),
+                previous_credit_balances: &previous_credit_balances,
+                latest_activity_at,
+                now,
+                mirror_legacy_default,
+            },
+            caller,
+            &config_fingerprint,
+            &mut read_schedule,
+        );
     }
     let response = ureq::get(&endpoint)
         .set("Accept", "application/json")
@@ -10026,7 +10052,7 @@ fn collect_claude_oauth_usage_unstamped(
     };
     // This is the local successful response time, never a provider-supplied
     // timestamp. Cache reuse preserves it rather than stamping a later upload.
-    let usage = match claude_oauth_usage_record_reading(
+    claude_oauth_usage_after_response(
         ClaudeOAuthReading {
             account_identifier_hash,
             organization_identifier_hash,
@@ -10038,29 +10064,87 @@ fn collect_claude_oauth_usage_unstamped(
             now,
             mirror_legacy_default,
         },
+        caller,
+        &config_fingerprint,
         &mut read_schedule,
-    ) {
+    )
+}
+
+/// Test-only stand-in for the provider: answers the request URL with a 200
+/// body, after every pre-request gate has run.
+#[cfg(test)]
+type ClaudeOAuthTestResponder = fn(&str) -> Value;
+#[cfg(test)]
+static CLAUDE_OAUTH_TEST_RESPONSE: Mutex<Option<ClaudeOAuthTestResponder>> = Mutex::new(None);
+
+const CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_CODE: &str =
+    "claude_saved_reset_variant_unrecognized";
+
+/// Handle one 200 response body.
+///
+/// The saved-reset variant is self-checked (Ron, 2026-10-09): a body without a
+/// recognizable `cedar_ember` adds a code-only diagnostic, sends no
+/// saved-reset balance (the last observed one is re-sent), and pauses the
+/// variant for this binding for 24 h. That pause is variant state, never a
+/// strike on the endpoint breaker, even when the variant body also lacks
+/// windows.
+fn claude_oauth_usage_after_response(
+    reading: ClaudeOAuthReading<'_>,
+    caller: &ClaudeOAuthUsageCaller,
+    config_fingerprint: &str,
+    read_schedule: &mut claude_credit_pools::ClaudeReadSchedule,
+) -> ClaudeOAuthUsageOutcome {
+    let account_identifier_hash = reading.account_identifier_hash;
+    let organization_identifier_hash = reading.organization_identifier_hash;
+    let now = reading.now;
+    let mirror_legacy_default = reading.mirror_legacy_default;
+    let variant_recognized = (reading.read == claude_credit_pools::ClaudeUsageRead::SavedResets)
+        .then(|| claude_credit_pools::claude_saved_resets_recognized(reading.body));
+    if let Some(recognized) = variant_recognized {
+        read_schedule.after_saved_resets_variant(recognized, now);
+    }
+    let unrecognized = (variant_recognized == Some(false)).then(|| {
+        claude_quota_check_diagnostic(
+            CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_CODE,
+            "Claude's saved-reset reading had no recognizable saved-reset section; this account uses the plain reading for 24 hours.",
+            now,
+        )
+    });
+    let usage = match claude_oauth_usage_record_reading(reading, read_schedule) {
         Ok(usage) => usage,
         // A 200 that carries none of the expected quota fields is a shape
         // change, not an empty account: every plan this endpoint answers for
         // reports at least one window.
         Err(usage) => {
-            return ClaudeOAuthUsageOutcome {
-                result: Ok(usage),
-                diagnostics: record_claude_oauth_usage_failure_with_legacy(
+            let mut diagnostics = Vec::new();
+            if let Some(unrecognized) = unrecognized {
+                let _ = claude_credit_pools::write_claude_read_schedule(
+                    &claude_oauth_usage_account_state_dir(
+                        account_identifier_hash,
+                        organization_identifier_hash,
+                    ),
+                    read_schedule,
+                );
+                diagnostics.push(unrecognized);
+            } else {
+                diagnostics = record_claude_oauth_usage_failure_with_legacy(
                     ClaudeOAuthUsageFailure::ResponseShape,
                     account_identifier_hash,
                     organization_identifier_hash,
-                    &config_fingerprint,
+                    config_fingerprint,
                     now,
                     mirror_legacy_default,
-                ),
+                );
+            }
+            return ClaudeOAuthUsageOutcome {
+                result: Ok(usage),
+                diagnostics,
             }
             .with_check_outcome(
                 "claude_oauth_usage_check_failed",
                 "The latest Claude OAuth response contained no supported quota windows.",
                 current_unix_seconds(),
-            )
+            );
         }
     };
     // One clean answer clears the accumulated failure counters: the thresholds
@@ -10070,10 +10154,14 @@ fn collect_claude_oauth_usage_unstamped(
         caller,
         account_identifier_hash,
         organization_identifier_hash,
-        &config_fingerprint,
+        config_fingerprint,
         now,
     );
-    ClaudeOAuthUsageOutcome::from(Ok(usage)).with_check_outcome(
+    ClaudeOAuthUsageOutcome {
+        result: Ok(usage),
+        diagnostics: unrecognized.into_iter().collect(),
+    }
+    .with_check_outcome(
         "claude_oauth_usage_check_succeeded",
         "A supported Claude OAuth quota response was collected successfully.",
         current_unix_seconds(),
@@ -10085,6 +10173,17 @@ fn collect_claude_oauth_usage_unstamped(
 static CLAUDE_OAUTH_CALLER_BINDINGS: Mutex<
     BTreeMap<String, claude_credit_pools::ClaudeCallerBinding>,
 > = Mutex::new(BTreeMap::new());
+
+/// A registered slot's identity gate refused its sign-in this pass: end that
+/// caller's run so no passive body fetched meanwhile is ever adopted.
+fn claude_oauth_end_caller_run(slot_id: &str) {
+    claude_credit_pools::claude_end_caller_binding(
+        &mut CLAUDE_OAUTH_CALLER_BINDINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        &ClaudeOAuthUsageCaller::RegisteredSlot(slot_id.to_string()).breaker_key(),
+    );
+}
 
 /// One usable OAuth usage body: a provider response, or a passive reading
 /// Claude Code made for the same binding.
@@ -10250,6 +10349,7 @@ fn claude_oauth_usage_slot_seconds(
             account_identifier_hash,
             organization_identifier_hash,
         ),
+        claude_credit_pools::CLAUDE_ACTIVITY_CADENCE_ENABLED,
         now,
     )
 }
@@ -31291,6 +31391,106 @@ exit 0
             fixture.slot(&slot_id).collection.state,
             ClaudeConfigSlotCollectionStateV1::Fresh
         );
+    }
+
+    /// Passive Claude Code readings (`cachedUsageUtilization`) carry no
+    /// organization. A pass whose identity gate refuses the slot ends the
+    /// slot's sign-in run, so a body fetched while the slot was signed in
+    /// elsewhere is never adopted when the approved login comes back.
+    #[test]
+    #[serial]
+    fn failed_slot_gate_never_lets_a_passive_reading_through() {
+        struct ForbidProviderCalls;
+        impl Drop for ForbidProviderCalls {
+            fn drop(&mut self) {
+                CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let fixture = ClaudeBindingFixture::new("passive-gate");
+        let team = ClaudeBindingFixture::hashes(TEAM_PREMIUM);
+        fixture.sign_in(TEAM_PREMIUM);
+        let slot_id = fixture.register();
+        fixture.collect();
+        CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _forbid = ForbidProviderCalls;
+        let make_due = || {
+            let observed = current_unix_seconds() - 2 * 60 * 60;
+            let window = AgentQuotaWindow {
+                name: "session".to_string(),
+                scope: AgentQuotaWindowScope::Account,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                used_percent: Some(10),
+                account_identifier_hash: Some(team.0.clone()),
+                organization_identifier_hash: Some(team.1.clone()),
+                ..Default::default()
+            };
+            write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
+                schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+                account_identifier_hash: team.0.clone(),
+                organization_identifier_hash: team.1.clone(),
+                observed_at_epoch_seconds: observed,
+                next_refresh_after_epoch_seconds: observed,
+                windows: vec![window],
+                credit_balances: Vec::new(),
+            })
+            .expect("write due cache");
+        };
+        let passive = |fetched_at: u64| {
+            let path = fixture.slot_dir.join(".claude.json");
+            let mut config: Value =
+                serde_json::from_slice(&fs::read(&path).expect("read identity")).expect("json");
+            config["cachedUsageUtilization"] = serde_json::json!({
+                "fetchedAtMs": fetched_at * 1_000,
+                "accountUuid": TEAM_PREMIUM.0,
+                "utilization": {
+                    "five_hour": {"utilization": 77, "resets_at": "2026-10-01T15:00:00+00:00"},
+                    "seven_day": {"utilization": 33, "resets_at": "2026-10-04T05:00:00+00:00"}
+                }
+            });
+            fs::write(&path, serde_json::to_vec(&config).expect("serialize")).expect("write");
+        };
+        let calls = || CLAUDE_OAUTH_PROVIDER_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let cache_observed_at = || {
+            read_claude_oauth_usage_cache(&team.0, &team.1)
+                .expect("team cache")
+                .observed_at_epoch_seconds
+        };
+
+        // Pass 1 opens the run; a body fetched before it is not adopted.
+        make_due();
+        passive(current_unix_seconds() - 60);
+        let before = calls();
+        fixture.collect();
+        assert_eq!(calls(), before + 1, "a call, not the older passive body");
+
+        // Pass 2, same sign-in: a body fetched inside the run is adopted.
+        make_due();
+        let fetched = current_unix_seconds();
+        passive(fetched);
+        let before = calls();
+        fixture.collect();
+        assert_eq!(calls(), before, "the passive body replaced the call");
+        assert_eq!(cache_observed_at(), fetched);
+
+        // Pass 3: the slot is signed in to another account; the gate refuses.
+        fixture.sign_in(MAX_20X);
+        fixture.collect();
+        assert_eq!(
+            fixture.slot(&slot_id).collection.state,
+            ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        );
+
+        // Pass 4: back on the approved login with a body fetched before this
+        // pass, i.e. while the slot was signed in elsewhere. Without the gate
+        // ending the run, the pass-1 run would still cover it.
+        fixture.sign_in(TEAM_PREMIUM);
+        make_due();
+        passive(current_unix_seconds() - 1);
+        let before = calls();
+        fixture.collect();
+        assert_eq!(calls(), before + 1, "never adopted across a refused pass");
+        assert_ne!(cache_observed_at(), current_unix_seconds() - 1);
     }
 
     #[test]

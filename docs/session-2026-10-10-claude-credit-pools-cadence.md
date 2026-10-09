@@ -29,10 +29,17 @@ adapter module, `agent_status/claude_credit_pools.rs`.
   Invalid values are refused field by field and never change the list state.
 
 `cedar_ember` is only populated by the saved-reset read variant
-(`?cedar_ember=1&skip_spend=1`). That variant is implemented and tested on
-synthetic bodies shaped like observed web responses, but stays behind
-`CLAUDE_SAVED_RESETS_READ_ENABLED = false` until its OAuth shape is witnessed.
-While the constant is off, every read is the plain read.
+(`?cedar_ember=1&skip_spend=1`), which is enabled and self-checks every
+response. A `cedar_ember` object with a `grants` array or a boolean `eligible`
+status is used normally. Anything else on a 200 response (missing, null,
+another shape, or a body with no windows at all) adds the code-only diagnostic
+`claude_saved_reset_variant_unrecognized`, sends no saved-reset balance from
+that read (the last observed section is re-sent; never an `unknown` stand-in),
+and pauses the variant for that binding for 24 h, so every slot reads plain.
+The pause is separate variant state, never a strike on the endpoint breaker.
+After 24 h the variant is read and checked again. Variant HTTP errors follow
+the existing backoff; a variant 429 counts toward the shared rate-limit
+breaker, as it is the same endpoint.
 
 ## Read cadence
 
@@ -53,17 +60,18 @@ extra calls:
   call. The cached body has no organization, so it is adopted only when it
   was fetched inside a continuous run of collection passes (every ~5 min,
   gaps up to 15 min) that all found that caller signed in to exactly this
-  account and organization. Another binding, a longer gap, a restart or a
-  clock going backwards starts a new run, and a run never adopts a body
-  fetched before it began. This input is implemented and tested but held
-  behind `CLAUDE_PASSIVE_READING_ENABLED = false`: a registered slot's identity
-  gate still returns before the usage collector records the pass, so a switch
-  away and back inside the run window could go unseen until that gate also
-  ends the run;
+  account and organization. Another binding, a longer gap, a restart, a clock
+  going backwards, or a registered slot's identity gate refusing the slot
+  (another account or organization signed in) ends the run, and a run never
+  adopts a body fetched before it began;
 - the existing 5-minute post-success spacing, Retry-After handling, breaker and
-  per-caller auth backoff are unchanged.
+  per-caller auth backoff are unchanged;
+- `CLAUDE_ACTIVITY_CADENCE_ENABLED` is a kill switch (default on): off, every
+  binding uses today's 55-65 min gate with no active boost or idle slowdown.
 
-Cadence state (`read-schedule.json`) lives next to each binding's usage cache.
+Cadence state (`read-schedule.json`: last plain and variant reads, last
+activity, first reading, variant pause) lives next to each binding's usage
+cache and is written the same owner-only, atomic way.
 The active-session scan lists a session only while its activity advances, so
 each sighting is saved when seen, even on passes that serve the stored
 reading.
@@ -80,10 +88,21 @@ and the variant owns saved resets. Presence, `grants`, `grants_state` and
 reading is on disk per binding), or switching between accounts. A section never
 read is not sent. Claude balances still carry no `updated_at`.
 
+The canonical v2.2 sequence fixture models an in-memory cache that starts cold
+after a restart. This adapter's stored reading is on disk per binding, so after
+a restart the last observed saved-reset section is still re-sent; every other
+step matches the fixture.
+
 ## Tests
 
 `claude_credit_pools::tests` covers the $250 pool, expired and percent-only
 pools, usage credits off with a reason, the saved-reset Team, Max and
-ineligible shapes, field refusals, section stability, passive identity
+ineligible shapes, field refusals, section stability, the canonical v2.2
+Claude fixtures and sequence, the variant self-check (valid, unrecognized,
+24 h plain-only, no breaker strike, recovery) end to end through the
+collector, `read-schedule.json` permissions and restart, passive identity
 matching, and a simulated 24 h day for the scheduler (slot spacing,
-alternation, plain every ~6 h while off, active and idle slots, passive input).
+alternation, plain every ~6 h while off, active and idle slots, passive input,
+kill switch). `agent_status::tests::failed_slot_gate_never_lets_a_passive_reading_through`
+drives a registered slot through a refused identity gate and proves a body
+fetched meanwhile is never adopted.
