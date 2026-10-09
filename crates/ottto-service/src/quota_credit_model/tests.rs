@@ -261,6 +261,7 @@ fn v21_case6_and_12_count_only_is_unavailable() {
         2,
         READ_AT,
         ListObservation::Unavailable {
+            provider: Provider::OpenAi,
             provider_count: Some(2),
         },
     );
@@ -271,6 +272,7 @@ fn v21_case6_and_12_count_only_is_unavailable() {
     assert_eq!(balance.remaining, Some(2));
 
     let unknown = build_grants(ListObservation::Unavailable {
+        provider: Provider::OpenAi,
         provider_count: None,
     });
     assert_eq!(unknown.grant_count, None);
@@ -476,7 +478,9 @@ fn v21_case11_invalid_id_drops_grant_and_makes_list_partial() {
 
 #[test]
 fn v21_case13_not_supported() {
-    let build = build_grants(ListObservation::NotSupported);
+    let build = build_grants(ListObservation::NotSupported {
+        provider: Provider::OpenAi,
+    });
     assert_eq!(build.grants, None);
     assert_eq!(build.grants_state, Some(CreditGrantsState::NotSupported));
     assert_eq!(build.grant_count, None);
@@ -922,6 +926,7 @@ fn claude_saved_resets_sum_only_when_complete() {
     let unavailable = claude_reset_bank(
         READ_AT,
         ListObservation::Unavailable {
+            provider: Provider::Anthropic,
             provider_count: None,
         },
     );
@@ -993,6 +998,7 @@ fn status_follows_remaining() {
         0,
         READ_AT,
         ListObservation::Unavailable {
+            provider: Provider::OpenAi,
             provider_count: Some(0),
         },
     );
@@ -1001,10 +1007,77 @@ fn status_follows_remaining() {
     let claude = claude_reset_bank(
         READ_AT,
         ListObservation::Unavailable {
+            provider: Provider::Anthropic,
             provider_count: None,
         },
     );
     assert_eq!(claude.status, AgentCreditBalanceStatus::Unknown);
+}
+
+#[test]
+fn one_time_credit_normalizes_and_refuses_instants() {
+    let (balance, diagnostics) = one_time_credit(
+        "pool",
+        Field::Absent,
+        None,
+        None,
+        Some(1),
+        TimeInput::Rfc3339("2026-11-05T09:59:00+02:00".to_string()),
+        TimeInput::UnixSeconds(1_789_895_700),
+    );
+    assert!(diagnostics.is_empty());
+    assert_eq!(balance.expires_at.as_deref(), Some("2026-11-05T07:59:00Z"));
+    assert_eq!(balance.observed_at.as_deref(), Some("2026-09-20T09:15:00Z"));
+    let (balance, diagnostics) = one_time_credit(
+        "pool",
+        Field::Absent,
+        None,
+        None,
+        Some(1),
+        TimeInput::Rfc3339("next month".to_string()),
+        TimeInput::Invalid,
+    );
+    assert_eq!((balance.expires_at, balance.observed_at), (None, None));
+    assert_eq!(
+        codes(&diagnostics),
+        vec![
+            ("field_refused", "expires_at"),
+            ("field_refused", "observed_at")
+        ]
+    );
+}
+
+#[test]
+fn claude_remaining_is_cleared_without_a_complete_list() {
+    // Even a count the adapter set by mistake never survives a list that was
+    // not read completely: Anthropic reports no count of its own.
+    for observation in [
+        ListObservation::Unavailable {
+            provider: Provider::Anthropic,
+            provider_count: None,
+        },
+        ListObservation::Unavailable {
+            provider: Provider::Anthropic,
+            provider_count: Some(3),
+        },
+        ListObservation::NotSupported {
+            provider: Provider::Anthropic,
+        },
+    ] {
+        let mut balance = saved_resets(Some(4), READ_AT);
+        build_grants(observation).apply_to(&mut balance);
+        assert_eq!(balance.remaining, None);
+        assert_eq!(balance.status, AgentCreditBalanceStatus::Unknown);
+    }
+    // The OpenAI count is the provider's and stays.
+    let mut codex = saved_resets(Some(4), READ_AT);
+    build_grants(ListObservation::NotSupported {
+        provider: Provider::OpenAi,
+    })
+    .apply_to(&mut codex);
+    assert_eq!(codex.remaining, Some(4));
+    assert_eq!(codex.status, AgentCreditBalanceStatus::Ok);
+    assert_eq!(codex.grants_state, Some(CreditGrantsState::NotSupported));
 }
 
 #[test]
@@ -1069,7 +1142,15 @@ fn readiness_is_passed_through_for_saved_resets_only() {
     }
 
     // Any other unit refuses every sent readiness field.
-    let (mut pool, _) = one_time_credit("pool", Field::Absent, None, None, None, None, None);
+    let (mut pool, _) = one_time_credit(
+        "pool",
+        Field::Absent,
+        None,
+        None,
+        None,
+        TimeInput::Absent,
+        TimeInput::Absent,
+    );
     let diagnostics = apply_readiness(
         &mut pool,
         ReadinessInput {
@@ -1158,8 +1239,8 @@ fn one_time_credit_shape() {
         Some(25_000),
         Some(1_250),
         Some(23_750),
-        Some("2026-11-05T07:59:00Z".to_string()),
-        Some(READ_AT.to_string()),
+        TimeInput::Rfc3339("2026-11-05T07:59:00+00:00".to_string()),
+        TimeInput::Rfc3339(READ_AT.to_string()),
     );
     assert!(diagnostics.is_empty());
     assert_eq!(
@@ -1188,11 +1269,19 @@ fn one_time_credit_shape() {
         Some(100),
         Some(100),
         Some(0),
-        None,
-        None,
+        TimeInput::Absent,
+        TimeInput::Absent,
     );
     assert_eq!(spent.status, AgentCreditBalanceStatus::Exhausted);
-    let (unknown, _) = one_time_credit("pool", Field::Absent, None, None, None, None, None);
+    let (unknown, _) = one_time_credit(
+        "pool",
+        Field::Absent,
+        None,
+        None,
+        None,
+        TimeInput::Absent,
+        TimeInput::Absent,
+    );
     assert_eq!(unknown.status, AgentCreditBalanceStatus::Unknown);
     let (titled, _) = one_time_credit(
         "pool",
@@ -1200,8 +1289,8 @@ fn one_time_credit_shape() {
         None,
         None,
         None,
-        None,
-        None,
+        TimeInput::Absent,
+        TimeInput::Absent,
     );
     assert_eq!(titled.title.as_deref(), Some("Synthetic promo credit"));
     // A refused title is reported, not swallowed.
@@ -1211,8 +1300,8 @@ fn one_time_credit_shape() {
         None,
         None,
         None,
-        None,
-        None,
+        TimeInput::Absent,
+        TimeInput::Absent,
     );
     assert_eq!(leaky.title, None);
     assert_eq!(codes(&diagnostics), vec![("field_refused", "title")]);
@@ -1266,8 +1355,8 @@ fn one_time_section(observed_at: &str) -> Vec<AgentCreditBalance> {
         Some(25_000),
         Some(1_250),
         Some(23_750),
-        Some("2026-11-05T07:59:00Z".to_string()),
-        Some(observed_at.to_string()),
+        TimeInput::Rfc3339("2026-11-05T07:59:00+00:00".to_string()),
+        TimeInput::Rfc3339(observed_at.to_string()),
     );
     assert!(diagnostics.is_empty());
     vec![balance]
@@ -1422,9 +1511,14 @@ fn cache_sections_do_not_cross() {
         cache.resend_balances(&key("a"), CreditSection::OneTimeCredits),
         None
     );
-    // A balance section is never offered as a grant list, or the reverse.
-    cache.observe_balances(&key("a"), CreditSection::GrantList, &usage_section(READ_AT));
-    assert_eq!(cache.grant_list_for_count(&key("a"), 0), None);
+    // A balance section is never offered as a grant list.
+    let mut list_only = SectionCache::new();
+    let detailed = codex_reset_bank(0, READ_AT, read(Provider::OpenAi, Some(0), vec![]));
+    list_only.observe_grant_list(&key("a"), 0, &detailed);
+    assert_eq!(
+        list_only.resend_balances(&key("a"), CreditSection::GrantList),
+        None
+    );
 }
 
 #[test]
@@ -1470,6 +1564,7 @@ fn codex_cached_list_only_while_count_matches() {
         1,
         READ_AT,
         ListObservation::Unavailable {
+            provider: Provider::OpenAi,
             provider_count: Some(1),
         },
     );
@@ -1636,6 +1731,7 @@ fn codex_sequence() -> Value {
         1,
         "2026-10-01T12:20:00Z",
         ListObservation::Unavailable {
+            provider: Provider::OpenAi,
             provider_count: Some(1),
         },
     );
@@ -1837,6 +1933,7 @@ fn expected_fixtures() -> Vec<(&'static str, Value)> {
                 2,
                 READ_AT,
                 ListObservation::Unavailable {
+                    provider: Provider::OpenAi,
                     provider_count: Some(2),
                 },
             )]),
