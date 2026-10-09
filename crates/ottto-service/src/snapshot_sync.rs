@@ -2896,10 +2896,10 @@ fn persist_machine_icon_at(path: &Path, response: &AgentStatusSnapshotUploadResp
     // This is a best-effort echo, not a deletion signal: older backends omit it
     // and icon lookup failures return null. Leave the original machine binding
     // and version intact; status only applies cached icons to that machine.
-    if response
+    if !response
         .machine_icon_url
         .as_deref()
-        .is_none_or(|url| url.trim().is_empty())
+        .is_some_and(|url| !url.trim().is_empty())
     {
         return;
     }
