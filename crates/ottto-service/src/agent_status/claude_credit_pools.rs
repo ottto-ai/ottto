@@ -55,6 +55,9 @@ const IDLE_SLOT_SPREAD_SECONDS: u64 = 60 * 60;
 const PLAIN_WHILE_CREDITS_OFF_SECONDS: u64 = 6 * 60 * 60;
 /// A passive reading stamped further ahead of the local clock is not trusted.
 const PASSIVE_CLOCK_SKEW_SECONDS: u64 = 60;
+/// Longest pause between two collection passes of one caller that still
+/// counts as continuous observation of its sign-in (passes run every ~5 min).
+const CALLER_BINDING_MAX_GAP_SECONDS: u64 = 15 * 60;
 /// Persisted cadence state, next to the account's usage cache.
 pub(super) const CLAUDE_READ_SCHEDULE_FILE: &str = "read-schedule.json";
 
@@ -423,11 +426,6 @@ pub(super) struct ClaudeReadSchedule {
     /// active. Never counts as activity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) tracked_since: Option<u64>,
-    /// Per caller (opaque caller key): since when every check of that caller's
-    /// Claude Code config found it signed in to exactly this binding. Cleared
-    /// as soon as a check finds anything else.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(super) config_bound_since: BTreeMap<String, u64>,
 }
 
 impl ClaudeReadSchedule {
@@ -465,20 +463,6 @@ impl ClaudeReadSchedule {
         let changed = activity != self.last_activity_at;
         self.last_activity_at = activity;
         changed
-    }
-
-    /// Record one check of a caller's Claude Code config. Returns whether
-    /// anything changed.
-    pub(super) fn observe_config(&mut self, caller_key: &str, bound: bool, now: u64) -> bool {
-        if bound {
-            if self.config_bound_since.contains_key(caller_key) {
-                return false;
-            }
-            self.config_bound_since.insert(caller_key.to_string(), now);
-            true
-        } else {
-            self.config_bound_since.remove(caller_key).is_some()
-        }
     }
 }
 
@@ -669,22 +653,64 @@ fn claude_passive_reading(cached: &Value, account_uuid: &str) -> Option<ClaudePa
     })
 }
 
+/// Where one caller's sign-in has been seen, pass after pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ClaudeCallerBinding {
+    binding: String,
+    since: u64,
+    last_seen: u64,
+}
+
+/// Record that this collection pass found `caller_key` signed in to
+/// `binding`, and return since when that caller has been continuously seen
+/// on it. Any other binding, a gap longer than a few passes (sleep, restart,
+/// an unresolved identity) or a clock going backwards starts a new run.
+pub(super) fn claude_observe_caller_binding(
+    callers: &mut BTreeMap<String, ClaudeCallerBinding>,
+    caller_key: &str,
+    binding: &str,
+    now: u64,
+) -> u64 {
+    match callers.get_mut(caller_key) {
+        Some(seen)
+            if seen.binding == binding
+                && now >= seen.last_seen
+                && now - seen.last_seen <= CALLER_BINDING_MAX_GAP_SECONDS =>
+        {
+            seen.last_seen = now;
+            seen.since
+        }
+        _ => {
+            callers.insert(
+                caller_key.to_string(),
+                ClaudeCallerBinding {
+                    binding: binding.to_string(),
+                    since: now,
+                    last_seen: now,
+                },
+            );
+            now
+        }
+    }
+}
+
 /// Use the passive reading instead of a call when it is newer than our last
 /// reading, still inside the slot (so it would serve as fresh), and fetched
-/// while the config was already known to be signed in to this binding.
+/// while this caller was already seen signed in to this binding.
 ///
 /// The cached body carries no organization, so the organization is proved by
-/// bracketing: an earlier check (`config_bound_since`) and the current one
-/// both found this exact account and organization, with no other sign-in seen
-/// in between. A first sighting never adopts an older body.
+/// bracketing: every collection pass of this caller since `bound_since` (one
+/// per ~5 min, see [`claude_observe_caller_binding`]) found this exact account
+/// and organization, and the body was fetched inside that run. A run never
+/// adopts a body fetched before it started.
 pub(super) fn claude_passive_reading_usable(
     fetched_at: u64,
     last_reading_at: Option<u64>,
-    config_bound_since: Option<u64>,
+    bound_since: Option<u64>,
     slot_seconds: u64,
     now: u64,
 ) -> bool {
-    config_bound_since.is_some_and(|since| since <= fetched_at)
+    bound_since.is_some_and(|since| since <= fetched_at)
         && fetched_at <= now.saturating_add(PASSIVE_CLOCK_SKEW_SECONDS)
         && last_reading_at.map_or(true, |last| fetched_at > last)
         && now.saturating_sub(fetched_at) <= slot_seconds
@@ -1249,41 +1275,53 @@ mod tests {
         ));
     }
 
-    /// The cached body has no organization: it is adopted only when an
-    /// earlier check and the current one both found the config signed in to
-    /// this exact binding, so a body fetched under another organization of the
-    /// same account is never stamped with this one.
+    /// The cached body has no organization: it is adopted only when it was
+    /// fetched inside a continuous run of passes that all saw this caller on
+    /// this exact binding, so a body fetched while the same account was on
+    /// another organization is never stamped with this one.
     #[test]
-    fn passive_reading_needs_the_config_bound_before_its_fetch() {
-        let mut schedule = ClaudeReadSchedule::default();
-        // First sighting: nothing earlier proves the organization.
-        let since = schedule.config_bound_since.get("caller").copied();
+    fn passive_reading_needs_a_continuous_run_on_the_binding() {
+        let mut callers = BTreeMap::new();
+        let mut seen = |caller: &str, binding: &str, now: u64| {
+            claude_observe_caller_binding(&mut callers, caller, binding, now)
+        };
+        // First pass: nothing earlier proves the organization.
+        assert_eq!(seen("default", "a/x", 1_000), 1_000);
         assert!(!claude_passive_reading_usable(
-            1_000, None, since, 3_600, 1_100
+            900,
+            None,
+            Some(1_000),
+            3_600,
+            1_000
         ));
-        assert!(schedule.observe_config("caller", true, 1_100));
-        assert!(!schedule.observe_config("caller", true, 1_200));
-        let since = schedule.config_bound_since.get("caller").copied();
-        assert_eq!(since, Some(1_100));
+        // Continuous passes keep the run; a body fetched inside it is adopted.
+        assert_eq!(seen("default", "a/x", 1_300), 1_000);
+        assert_eq!(seen("default", "a/x", 1_600), 1_000);
         assert!(claude_passive_reading_usable(
-            1_150, None, since, 3_600, 1_300
+            1_100,
+            None,
+            Some(1_000),
+            3_600,
+            1_600
         ));
+        // Same account, other organization, then back: a body fetched while
+        // on the other organization predates the new run.
+        assert_eq!(seen("default", "a/y", 1_900), 1_900);
+        assert_eq!(seen("default", "a/x", 2_200), 2_200);
         assert!(!claude_passive_reading_usable(
-            1_050, None, since, 3_600, 1_300
+            2_000,
+            None,
+            Some(2_200),
+            3_600,
+            2_500
         ));
-        // Switched to another organization: the bracket closes; after
-        // switching back, a body fetched in between is never adopted.
-        assert!(schedule.observe_config("caller", false, 1_400));
-        assert!(schedule.observe_config("caller", true, 1_500));
-        let since = schedule.config_bound_since.get("caller").copied();
-        assert!(!claude_passive_reading_usable(
-            1_450, None, since, 3_600, 1_600
-        ));
-        // Brackets are per caller and survive a restart.
-        assert_eq!(schedule.config_bound_since.get("other"), None);
-        let restored: ClaudeReadSchedule =
-            serde_json::from_slice(&serde_json::to_vec(&schedule).unwrap()).unwrap();
-        assert_eq!(restored, schedule);
+        // A long gap (sleep, restart, unresolved identity) starts a new run.
+        assert_eq!(seen("default", "a/x", 2_200 + 16 * 60), 2_200 + 16 * 60);
+        // A clock going backwards starts a new run.
+        assert_eq!(seen("default", "a/x", 2_000), 2_000);
+        // Runs are per caller.
+        assert_eq!(seen("slot-sha256:1", "a/x", 2_100), 2_100);
+        assert_eq!(seen("default", "a/x", 2_100), 2_000);
     }
 
     #[test]
@@ -1353,9 +1391,8 @@ mod tests {
         usage_credits_off: bool,
         calls: Vec<(u64, ClaudeUsageRead, u64)>,
         passive_used: Vec<u64>,
+        callers: BTreeMap<String, ClaudeCallerBinding>,
     }
-
-    const SIM_CALLER: &str = "caller";
 
     impl Simulation {
         fn new(usage_credits_off: bool) -> Self {
@@ -1366,20 +1403,20 @@ mod tests {
                 usage_credits_off,
                 calls: Vec::new(),
                 passive_used: Vec::new(),
+                callers: BTreeMap::new(),
             }
         }
 
         fn tick(&mut self, now: u64, activity: Option<u64>, passive_fetched_at: Option<u64>) {
+            let since = claude_observe_caller_binding(&mut self.callers, "default", "a/o", now);
             self.schedule.observe_activity(activity);
             let idle = claude_idle_slot_seconds("account-sim", "org-sim");
             let slot = claude_usage_slot_seconds(&self.schedule, activity, DEFAULT_SLOT, idle, now);
             if !claude_reading_due(self.last_reading_at, self.next_refresh_after, slot, now) {
                 return;
             }
-            let since = self.schedule.config_bound_since.get(SIM_CALLER).copied();
-            self.schedule.observe_config(SIM_CALLER, true, now);
             if let Some(fetched) = passive_fetched_at.filter(|at| {
-                claude_passive_reading_usable(*at, self.last_reading_at, since, slot, now)
+                claude_passive_reading_usable(*at, self.last_reading_at, Some(since), slot, now)
             }) {
                 self.passive_used.push(now);
                 self.record(ClaudeUsageRead::Plain, fetched, activity, now);

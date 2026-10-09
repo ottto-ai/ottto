@@ -9510,6 +9510,16 @@ fn collect_claude_oauth_usage_unstamped(
 ) -> ClaudeOAuthUsageOutcome {
     let now = current_unix_seconds();
     let mirror_legacy_default = caller.mirrors_legacy_default();
+    // Every pass is evidence of where this caller's login is signed in; a
+    // passive reading must have been fetched inside that continuous run.
+    let caller_bound_since = claude_credit_pools::claude_observe_caller_binding(
+        &mut CLAUDE_OAUTH_CALLER_BINDINGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        &caller.breaker_key(),
+        &claude_oauth_binding_key(account_identifier_hash, organization_identifier_hash),
+        now,
+    );
 
     // Off-switch first, ahead of the cache. Existing account-scoped cache files
     // are retained and continue aging honestly; no endpoint data is served and
@@ -9709,21 +9719,19 @@ fn collect_claude_oauth_usage_unstamped(
         account_identifier_hash,
         organization_identifier_hash,
     );
-    let caller_key = caller.breaker_key();
-    // The bracket start from earlier checks only: this check closes it.
-    let config_bound_since = read_schedule.config_bound_since.get(&caller_key).copied();
-    if read_schedule.observe_config(&caller_key, passive_config.bound, now) {
-        let _ = claude_credit_pools::write_claude_read_schedule(&account_state_dir, &read_schedule);
-    }
-    if let Some(passive) = passive_config.reading.filter(|passive| {
-        claude_credit_pools::claude_passive_reading_usable(
-            passive.fetched_at,
-            last_reading_at,
-            config_bound_since,
-            slot_seconds,
-            now,
-        )
-    }) {
+    if let Some(passive) = passive_config
+        .reading
+        .filter(|_| passive_config.bound)
+        .filter(|passive| {
+            claude_credit_pools::claude_passive_reading_usable(
+                passive.fetched_at,
+                last_reading_at,
+                Some(caller_bound_since),
+                slot_seconds,
+                now,
+            )
+        })
+    {
         if let Ok(usage) = claude_oauth_usage_record_reading(
             ClaudeOAuthReading {
                 account_identifier_hash,
@@ -10067,6 +10075,12 @@ fn collect_claude_oauth_usage_unstamped(
         current_unix_seconds(),
     )
 }
+
+/// Per caller: the binding its login was seen on, pass after pass. In memory
+/// only, so a restart starts every run afresh.
+static CLAUDE_OAUTH_CALLER_BINDINGS: Mutex<
+    BTreeMap<String, claude_credit_pools::ClaudeCallerBinding>,
+> = Mutex::new(BTreeMap::new());
 
 /// One usable OAuth usage body: a provider response, or a passive reading
 /// Claude Code made for the same binding.

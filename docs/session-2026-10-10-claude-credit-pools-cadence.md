@@ -50,12 +50,13 @@ extra calls:
   account (its `accountUuid` and the config's `oauthAccount` account and
   organization match the binding) is newer than the stored reading and inside
   the slot, it is parsed by the same plain-body parser and used without a
-  call. The cached body has no organization, so it is adopted only when an
-  earlier check of that caller's config (recorded per caller) and the current
-  one both found this exact account and organization, with nothing else seen
-  in between, and the body was fetched after that earlier check. A first
-  sighting never adopts an older body. The residual gap is two organization
-  switches plus a Claude Code usage fetch between two of our checks;
+  call. The cached body has no organization, so it is adopted only when it
+  was fetched inside a continuous run of collection passes (every ~5 min,
+  gaps up to 15 min) that all found that caller signed in to exactly this
+  account and organization. Another binding, a longer gap, a restart or a
+  clock going backwards starts a new run, and a run never adopts a body
+  fetched before it began. The residual gap is a switch away and back between
+  two consecutive passes with a Claude Code usage fetch in between;
 - the existing 5-minute post-success spacing, Retry-After handling, breaker and
   per-caller auth backoff are unchanged.
 
