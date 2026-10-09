@@ -1726,7 +1726,7 @@ pub struct AgentCreditBalance {
     /// Soonest grant expiry among available/paused grants (no clock filter).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_expires_at: Option<Rfc3339Timestamp>,
-    /// Latest provider grant time among available/paused grants.
+    /// Latest provider grant time over every grant of a complete list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_granted_at: Option<Rfc3339Timestamp>,
     /// Provider readiness passthrough; only with `unit: resets`. Never derived.
@@ -4363,23 +4363,80 @@ fn redact_credit_balance_for_backend(mut credit: AgentCreditBalance) -> Option<A
     // secret never rides along.
     credit.rate_limit_reached_type = safe_optional_text(credit.rate_limit_reached_type.take());
     credit.limit_id = safe_optional_text(credit.limit_id.take());
-    // Quota contract v2.2: every new provider text field passes the same guard;
-    // an unsafe value is dropped field-by-field, never the whole balance.
-    credit.title = safe_optional_text(credit.title.take());
-    credit.disabled_reason = safe_optional_text(credit.disabled_reason.take());
+    // Quota contract v2.2: every new field is checked on the way out and an
+    // invalid value is dropped field by field, never the whole balance.
+    credit.title = credit
+        .title
+        .take()
+        .filter(|title| is_backend_safe_credit_text(title));
+    credit.disabled_reason = credit.disabled_reason.take().filter(|reason| {
+        credit.enabled == Some(false)
+            && is_credit_reason_code(reason)
+            && is_safe_backend_text(reason)
+    });
     credit.ineligible_reason = credit
         .ineligible_reason
         .take()
         .filter(|reason| is_credit_reason_code(reason) && is_safe_backend_text(reason));
+    if credit.unit != AgentCreditBalanceUnit::Resets {
+        // Readiness is only meaningful for saved resets.
+        credit.eligible = None;
+        credit.at_limit = None;
+        credit.ineligible_reason = None;
+        credit.cooldown_until = None;
+    }
+    for time in [
+        &mut credit.observed_at,
+        &mut credit.expires_at,
+        &mut credit.grants_observed_at,
+        &mut credit.next_expires_at,
+        &mut credit.latest_granted_at,
+        &mut credit.cooldown_until,
+    ] {
+        *time = time.take().filter(|value| is_rfc3339_instant(value));
+    }
+    let mut list_degraded = false;
     if let Some(grants) = credit.grants.as_mut() {
-        for grant in grants {
-            grant.title = safe_optional_text(grant.title.take());
+        let before = grants.len();
+        grants.retain(|grant| is_credit_grant_key(&grant.grant_key));
+        list_degraded |= grants.len() != before;
+        for grant in grants.iter_mut() {
+            grant.title = grant
+                .title
+                .take()
+                .filter(|title| is_backend_safe_credit_text(title));
             grant.clears = grant.clears.take().filter(|clears| {
                 clears
                     .iter()
                     .all(|name| is_credit_reason_code(name) && is_safe_backend_text(name))
             });
+            for time in [
+                &mut grant.granted_at,
+                &mut grant.starts_at,
+                &mut grant.expires_at,
+            ] {
+                if time
+                    .as_deref()
+                    .is_some_and(|value| !is_rfc3339_instant(value))
+                {
+                    *time = None;
+                    list_degraded = true;
+                }
+            }
         }
+    }
+    if list_degraded {
+        // A dropped grant or refused grant time means the list may now miss
+        // something: never claim completeness, and drop the complete-gated
+        // summaries with it.
+        if matches!(
+            credit.grants_state,
+            Some(CreditGrantsState::Complete | CreditGrantsState::Capped)
+        ) {
+            credit.grants_state = Some(CreditGrantsState::Partial);
+        }
+        credit.next_expires_at = None;
+        credit.latest_granted_at = None;
     }
     Some(credit)
 }
@@ -4393,11 +4450,137 @@ pub fn is_credit_reason_code(value: &str) -> bool {
         })
 }
 
+/// `grant_key` shape: 64 lowercase hex characters.
+fn is_credit_grant_key(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Strict RFC 3339 instant (`YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`) with
+/// calendar ranges checked. The protocol crate has no time dependency, so the
+/// shape is checked by hand.
+fn is_rfc3339_instant(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes.len() > 64 || !value.is_ascii() {
+        return false;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<u32> {
+        let part = &value[range];
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    let separators = [(4, b'-'), (7, b'-'), (13, b':'), (16, b':')];
+    if separators.iter().any(|(at, ch)| bytes[*at] != *ch) || !matches!(bytes[10], b'T' | b't') {
+        return false;
+    }
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        number(0..4),
+        number(5..7),
+        number(8..10),
+        number(11..13),
+        number(14..16),
+        number(17..19),
+    ) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if day == 0 || day > days || hour > 23 || minute > 59 || second > 60 {
+        return false;
+    }
+    let mut rest = &value[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if !(1..=9).contains(&digits) {
+            return false;
+        }
+        rest = &fraction[digits..];
+    }
+    match rest.as_bytes() {
+        [b'Z' | b'z'] => true,
+        [b'+' | b'-', h1, h2, b':', m1, m2] => {
+            [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit())
+                && (h1 - b'0') * 10 + (h2 - b'0') <= 23
+                && (m1 - b'0') * 10 + (m2 - b'0') <= 59
+        }
+        _ => false,
+    }
+}
+
 /// The backend-upload privacy guard for provider credit display text (balance
-/// and grant `title`). The daemon credit model runs it on the full value before
-/// any truncation, so a cut never hides a leak.
+/// and grant `title`). It checks the value as given and a lookalike-folded
+/// copy (see [`fold_for_privacy_match`]), so `／Users／…` or a zero-width
+/// split `be\u{200b}arer` fails like its ASCII form. The daemon credit model
+/// runs it on the full value before any truncation, so a cut never hides a leak.
 pub fn is_backend_safe_credit_text(value: &str) -> bool {
     is_safe_backend_text(value)
+        && (value.is_ascii() || is_safe_backend_text(&fold_for_privacy_match(value)))
+}
+
+/// Matching-only fold of Unicode lookalikes, mirroring the backend's privacy
+/// match without a Unicode-tables dependency: full-width ASCII forms and the
+/// slash/solidus lookalikes become ASCII, invisible format characters are
+/// dropped, every whitespace run becomes one space, and letters are lowercased.
+fn fold_for_privacy_match(value: &str) -> String {
+    let mut folded = String::with_capacity(value.len());
+    let mut in_space = false;
+    for ch in value.chars() {
+        let mapped = match ch {
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(ch as u32 - 0xFEE0).unwrap_or(ch),
+            '\u{2044}' | '\u{2215}' | '\u{29F8}' => '/',
+            '\u{FE6B}' => '@',
+            '\u{2216}' | '\u{29F5}' | '\u{29F9}' | '\u{FE68}' => '\\',
+            _ if is_format_char(ch) => continue,
+            _ => ch,
+        };
+        if mapped.is_whitespace() {
+            if !in_space {
+                folded.push(' ');
+            }
+            in_space = true;
+            continue;
+        }
+        in_space = false;
+        folded.extend(mapped.to_lowercase());
+    }
+    folded
+}
+
+/// Unicode `Cf` (format) characters that render invisibly.
+fn is_format_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
 }
 
 fn redact_plan_observation_for_backend(
@@ -7760,6 +7943,109 @@ mod tests {
         balance.ineligible_reason = Some("Not A Code".to_string());
         let redacted = redact_credit_balance_for_backend(balance).unwrap();
         assert_eq!(redacted.ineligible_reason, None);
+    }
+
+    #[test]
+    fn credit_redaction_checks_times_keys_and_reason_codes() {
+        // Malformed instants are dropped field by field.
+        let mut balance = v22_credit_balance();
+        balance.observed_at = Some("yesterday".to_string());
+        balance.cooldown_until = Some("2026-02-30T00:00:00Z".to_string());
+        let redacted = redact_credit_balance_for_backend(balance).unwrap();
+        assert_eq!(redacted.observed_at, None);
+        assert_eq!(redacted.cooldown_until, None);
+        assert_eq!(
+            redacted.grants_observed_at.as_deref(),
+            Some("2026-10-01T12:00:00Z")
+        );
+        assert_eq!(redacted.grants_state, Some(CreditGrantsState::Complete));
+
+        // A malformed grant key drops the grant; a malformed grant time drops
+        // the time. Either way the list is no longer complete and loses its
+        // complete-gated summaries.
+        for mutate in [
+            (|grant: &mut AgentCreditGrant| grant.grant_key = "A".repeat(64))
+                as fn(&mut AgentCreditGrant),
+            |grant| grant.grant_key = "abc".to_string(),
+            |grant| grant.expires_at = Some("2026-10-22 16:00".to_string()),
+        ] {
+            let mut balance = v22_credit_balance();
+            mutate(&mut balance.grants.as_mut().unwrap()[0]);
+            let redacted = redact_credit_balance_for_backend(balance).unwrap();
+            assert_eq!(redacted.grants_state, Some(CreditGrantsState::Partial));
+            assert_eq!(redacted.next_expires_at, None);
+            assert_eq!(redacted.latest_granted_at, None);
+        }
+
+        // disabled_reason: a reason code, at most 64 characters, only when off.
+        for (enabled, reason, kept) in [
+            (Some(false), "out_of_credits".to_string(), true),
+            (Some(false), "x".repeat(65), false),
+            (Some(false), "Out of credits".to_string(), false),
+            (Some(true), "out_of_credits".to_string(), false),
+            (None, "out_of_credits".to_string(), false),
+        ] {
+            let mut balance = v22_credit_balance();
+            balance.enabled = enabled;
+            balance.disabled_reason = Some(reason.clone());
+            let redacted = redact_credit_balance_for_backend(balance).unwrap();
+            assert_eq!(redacted.disabled_reason.is_some(), kept, "{reason}");
+        }
+
+        // Readiness rides only on saved resets.
+        let mut balance = v22_credit_balance();
+        balance.unit = AgentCreditBalanceUnit::Usd;
+        let redacted = redact_credit_balance_for_backend(balance).unwrap();
+        assert_eq!(
+            (
+                redacted.eligible,
+                redacted.at_limit,
+                redacted.ineligible_reason,
+                redacted.cooldown_until
+            ),
+            (None, None, None, None)
+        );
+
+        // Unicode lookalikes of a path or secret are stripped from titles.
+        for lookalike in [
+            "see \u{FF0F}Users\u{FF0F}someone",
+            "be\u{200B}arer synthetic",
+            "\u{FF53}\u{FF4B}-synthetic",
+        ] {
+            let mut balance = v22_credit_balance();
+            balance.title = Some(lookalike.to_string());
+            balance.grants.as_mut().unwrap()[0].title = Some(lookalike.to_string());
+            let redacted = redact_credit_balance_for_backend(balance).unwrap();
+            assert_eq!(redacted.title, None, "{lookalike}");
+            assert_eq!(redacted.grants.as_ref().unwrap()[0].title, None);
+        }
+        assert!(is_backend_safe_credit_text("Réinitialisation offerte"));
+    }
+
+    #[test]
+    fn rfc3339_instant_shape() {
+        for valid in [
+            "2026-10-01T12:00:00Z",
+            "2026-10-01T12:00:00.69185Z",
+            "2026-10-01T12:00:00+02:00",
+            "2024-02-29T23:59:60-05:30",
+        ] {
+            assert!(is_rfc3339_instant(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "2026-10-01",
+            "2026-10-01 12:00:00Z",
+            "2026-13-01T12:00:00Z",
+            "2025-02-29T12:00:00Z",
+            "2026-10-01T24:00:00Z",
+            "2026-10-01T12:00:00",
+            "2026-10-01T12:00:00.Z",
+            "2026-10-01T12:00:00+2:00",
+            "２026-10-01T12:00:00Z",
+        ] {
+            assert!(!is_rfc3339_instant(invalid), "{invalid}");
+        }
     }
 
     #[test]

@@ -11,19 +11,35 @@ absent, so an older balance serializes byte for byte as before (pinned by a
 test). New enum values decode leniently: an unknown `kind`, grant type or
 grant status becomes `unknown`, and an unknown `grants_state` becomes absent.
 
-The backend-upload redaction cleans every new provider text field (balance
-`title`, `disabled_reason`, `ineligible_reason`, grant `title` and `clears`)
-field by field; a path, secret or email never rides along and never drops the
-balance.
+The backend-upload redaction checks every new field one at a time; a bad value
+never rides along and never drops the balance. Provider text (balance and grant
+`title`) passes the privacy guard, also after folding Unicode lookalikes
+(full-width forms, slash lookalikes, invisible format characters). Reason codes
+(`disabled_reason`, `ineligible_reason`, grant `clears`) must be short
+lowercase codes. `disabled_reason` rides only with `enabled: false`, and
+readiness only on saved resets. Timestamps must be RFC 3339 instants. A grant
+with a malformed `grant_key` is dropped, and the list is then no longer
+complete.
 
 `ottto-service` gains one shared credit model, `quota_credit_model`, used by
-both provider adapters: grant keys (SHA-256 of `<provider>:credit_grant:<id>`,
-case-preserving), grant building (status table, per-field refusal, the
-20-grant cap in soonest-expiry order, `grants_state` with `partial` >
-`capped` > `complete`), complete-gated summaries (soonest expiry, latest
-grant time, Claude saved-reset count), the one-time pool shape, a packaging
-time stamp, and `SectionCache`, which re-sends the last observed section when
-a reading skipped it so read cadence never toggles what the backend sees.
+both provider adapters:
+- grant keys (SHA-256 of `<provider>:credit_grant:<id>`, case-preserving);
+- grant building: status table, per-field refusal, the 20-grant cap in
+  soonest-expiry order, and `grants_state` with `partial` > `capped` > `complete`;
+- complete-gated summaries (soonest expiry, latest grant time, Claude
+  saved-reset count), with the saved-reset `status` following the count;
+- readiness passthrough and the switched-off balance shape;
+- the one-time pool shape;
+- `SectionCache`, which re-sends the last observed section when a reading
+  skipped it, so read cadence never toggles what the backend sees.
+
+Its decisions live in private fields: adapters build inputs, call the
+constructors and `apply_to`, and read diagnostics.
+
+Credit balances never carry `updated_at`, fresh or re-sent. Today's consumers
+read it as an observation time and otherwise fall back to the snapshot's
+capture time.
+
 Adapter submodules for Codex grants and Claude pools exist as empty stubs; the
 adapters wire the model in follow-up changes. Until then the model module and
 the new imports carry temporary dead-code allowances.

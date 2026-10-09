@@ -17,17 +17,19 @@ account in these files comes from a real account; only the provider response
 - `expected/*.wire.json`: the credit balances the daemon must emit for those
   inputs, as `{"credit_balances": [...]}`. A file named like a provider file is
   the output for that one reading. `sequence-*.wire.json` files are multi-step
-  readings (`steps[]`, each with `packaged_at`, the `provider_inputs` it read,
-  and the emitted `credit_balances`).
+  readings (`steps[]`, each with the snapshot `captured_at`, the
+  `provider_inputs` it read, and the emitted `credit_balances`).
 
-All readings use read time `2026-10-01T12:00:00Z` and packaging time
-`2026-10-01T12:00:05Z` unless a sequence step says otherwise.
+All single readings use read time `2026-10-01T12:00:00Z`.
 
 ## Rules the expected files pin
 
 - Fields the protocol skips when absent are never spelled as `null`.
-- Every balance carries `kind` and `updated_at` = the packaging time of the
-  snapshot that sends it (fresh or re-sent).
+- Every balance carries `kind`. No credit balance carries `updated_at`, fresh
+  or re-sent; consumers use the snapshot's capture time. Provider read time is
+  `observed_at` (and `grants_observed_at` for a grant list).
+- A snapshot never carries the same balance (`name`, `limit_id`, account)
+  twice.
 - Grants are ordered by `expires_at` ascending (no expiry last), then
   `grant_key`, and capped at 20. `codex-reset-credits-21` is the cap case:
   21 provider rows in reverse order, two expiry ties and two rows without an
@@ -38,25 +40,37 @@ All readings use read time `2026-10-01T12:00:00Z` and packaging time
   returned; `capped` when the provider (fewer rows than its count) or the
   sender (more than 20) cut the list; `partial` when a row or field was
   refused; `unavailable` when details were not read.
-- `next_expires_at` and `latest_granted_at` range over available/paused grants
-  of a `complete` list; `next_expires_at` is also set for a sender-capped list.
-  There is no clock filter: readers compare with their own clock.
+- Only a `complete` list has summaries: `next_expires_at` is the soonest
+  expiry among available/paused grants, and `latest_granted_at` the latest
+  grant time over all grants. `next_expires_at` is also set when a complete
+  list was cut only by the sender's 20 cap (computed before the cut). There is
+  no clock filter: readers compare with their own clock.
 - Claude saved resets (`reset_bank`, `unit: resets`): `remaining` is the sum of
   `resets_left` over non-paused grants of a `complete` list (0 for an empty
   one) and is absent otherwise. Codex `remaining` is the provider count.
+  Saved-reset `status` follows `remaining`: 0 is `exhausted`, more is `ok`,
+  unknown is `unknown`.
+- Readiness (`eligible`, `at_limit`, `ineligible_reason`, `cooldown_until`)
+  appears only on saved resets. A switched-off balance has `enabled: false`,
+  no amounts, `status: unknown`, and an optional `disabled_reason` code.
 - One-time pools: `name: one_time_credit`, `unit: usd`, `currency: USD`, cents,
   `limit_id` = the pool's codename, `expires_at` = the pool expiry, no
   `enabled` flag and no `resets_at`.
 - Sequences (re-send stability):
+  - each balance belongs to one section (Claude: usage credits, one-time
+    pools, saved resets; Codex: the reset-credit grant list); a reading emits
+    every section it read fresh, so the one-time pool, which both Claude
+    readings report, is always fresh;
   - a section that was never read is not sent, and nothing stands in for it;
   - a section a reading did not include is re-sent exactly as last observed,
-    with its original `observed_at` / `grants_observed_at`; only `updated_at`
-    changes;
+    with its original `observed_at` / `grants_observed_at`;
   - a cached Codex list is re-sent only while `availableCount` equals the count
     it was read with; otherwise details are read now (`unavailable` if that
     read fails);
   - sections are kept per account, so switching A → B → A keeps A's sections,
-    and a restart starts cold.
+    and a restart starts cold;
+  - the daemon keeps at most 64 cached sections (sized for 10 Claude and
+    10 Codex accounts); evicting the stalest one is reported as a diagnostic.
 
 ## Producing and checking
 
@@ -68,6 +82,8 @@ every test run. To regenerate after an intended change:
 OTTTO_WRITE_QUOTA_V22_FIXTURES=1 cargo test -p ottto-service --lib quota_credit_model
 ```
 
-Provider adapter tests prove that each `provider/*.json` input produces the
-matching expected balances. Consumers (backend acceptance, app decoders) read
-the `expected/` files as the producer's ground truth.
+Until the provider adapters land, the `expected/` files are the model's output
+for inputs that mirror the `provider/*.json` files by hand. The provider
+adapter tests, added with the adapters, will prove that each provider input
+produces the matching expected balances. Consumers (backend acceptance, app
+decoders) read the `expected/` files as the producer's ground truth.
