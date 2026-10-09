@@ -281,7 +281,11 @@ impl CodexCreditTracker {
                 list.apply_to(balance);
                 Vec::new()
             }
-            None => build_grants(ListObservation::Unavailable { provider_count }).apply_to(balance),
+            None => build_grants(ListObservation::Unavailable {
+                provider: Provider::OpenAi,
+                provider_count,
+            })
+            .apply_to(balance),
         }
     }
 }
