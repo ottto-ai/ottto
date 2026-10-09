@@ -13305,10 +13305,12 @@ fn call_codex_app_server_rate_limits_for_home(
         if read_kind == codex_credit_grants::CodexRateLimitsRead::Routine {
             let (refreshed, _) = credentials.get_or_insert_with(read_credentials);
             if needs_details(account, rate_limits, refreshed.as_ref()) {
-                if write_codex_app_server_message(&mut stdin, &detail_read).is_err() {
-                    break Err("Codex app-server quota request failed.".to_string());
-                }
                 detail_requested = true;
+                // The detailed read is optional here: if it cannot be sent,
+                // the routine reading stands and the attempt counts as failed.
+                if write_codex_app_server_message(&mut stdin, &detail_read).is_err() {
+                    break Ok(true);
+                }
                 continue;
             }
         }

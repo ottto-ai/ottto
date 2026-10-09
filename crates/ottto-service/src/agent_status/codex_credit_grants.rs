@@ -1221,7 +1221,8 @@ mod tests {
 
         /// `mode`: `count` answers a routine read with the count only;
         /// `reject` answers a routine read with an error, like a server that
-        /// does not know the parameter. Every request line is logged.
+        /// does not know the parameter; `exit` quits after the routine answer.
+        /// Every request line is logged.
         const FAKE_APP_SERVER: &str = r#"import json
 import os
 import sys
@@ -1249,6 +1250,8 @@ for line in sys.stdin:
             print(json.dumps({"id": request["id"], "error": {"code": -32602, "message": "unknown field"}}), flush=True)
         else:
             print(json.dumps({"id": request["id"], "result": routine if excluded else detailed}), flush=True)
+        if excluded and mode == "exit":
+            sys.exit(0)
 "#;
 
         struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
@@ -1367,6 +1370,19 @@ for line in sys.stdin:
             );
             assert!(observation.details_requested);
             assert!(has_list(&observation));
+        }
+
+        #[test]
+        #[serial]
+        fn a_server_gone_before_the_detail_read_keeps_the_routine_reading() {
+            let (observation, requests) = run("exit", CodexRateLimitsRead::Routine, true);
+            assert_eq!(requests.len(), 1);
+            assert!(
+                observation.details_requested,
+                "the attempt counts as failed"
+            );
+            assert!(!has_list(&observation));
+            assert_eq!(available_count(&observation.rate_limits), Some(2));
         }
 
         #[test]
