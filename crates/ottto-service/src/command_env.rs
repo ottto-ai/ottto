@@ -592,7 +592,7 @@ mod tests {
         let binary = write_codex(
             new_root.join("ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS"),
         );
-        let new_dirs = codex_desktop_bundle_dirs(&[new_root.clone()]);
+        let new_dirs = codex_desktop_bundle_dirs(std::slice::from_ref(&new_root));
         assert_eq!(codex_resolved_in(&new_dirs), Some(launcher.clone()));
 
         // A bundle that ships only the inner app binary still resolves.
