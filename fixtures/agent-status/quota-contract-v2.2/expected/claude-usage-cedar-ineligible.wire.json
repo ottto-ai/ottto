@@ -1,0 +1,20 @@
+{
+  "credit_balances": [
+    {
+      "at_limit": false,
+      "eligible": false,
+      "freshness": "fresh",
+      "grant_count": 0,
+      "grants": [],
+      "grants_observed_at": "2026-10-01T12:00:00Z",
+      "grants_state": "complete",
+      "ineligible_reason": "tenure",
+      "kind": "saved_resets",
+      "name": "reset_bank",
+      "observed_at": "2026-10-01T12:00:00Z",
+      "remaining": 0,
+      "status": "exhausted",
+      "unit": "resets"
+    }
+  ]
+}

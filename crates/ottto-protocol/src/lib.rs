@@ -1686,6 +1686,153 @@ pub struct AgentCreditBalance {
     /// `codex`). Free-form string; additive and drift-safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_id: Option<String>,
+    // Quota contract v2.1 §2.2 and v2.2 §11.1. Every field below is additive
+    // and skipped when `None`, so a balance without them serializes exactly as
+    // before. Times are provider read/expiry instants, never `updated_at`.
+    /// Provider read time of this balance. A re-sent cached section keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    /// Expiry of a one-time balance. Never a recurring `resets_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Rfc3339Timestamp>,
+    /// Provider reason the balance is off; only with `enabled: Some(false)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+    /// Total grant records in the provider's enumeration scope; `None` is
+    /// unknown. Never the returned list length and never available uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_count: Option<u64>,
+    /// Individual grants. `None` = not observed in this reading; `Some(vec![])`
+    /// is authoritative-empty only with `grants_state: complete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Vec<AgentCreditGrant>>,
+    /// Completeness of `grants`; the only completeness signal.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_optional"
+    )]
+    pub grants_state: Option<CreditGrantsState>,
+    /// Provider read time of the grants list. A re-sent cached list keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants_observed_at: Option<Rfc3339Timestamp>,
+    /// What this balance is, set by the provider adapter. Never part of the
+    /// meter identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<CreditBalanceKind>,
+    /// Provider label for the pool, bounded like a grant title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Soonest grant expiry among available/paused grants (no clock filter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_expires_at: Option<Rfc3339Timestamp>,
+    /// Latest provider grant time over every grant of a complete list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_granted_at: Option<Rfc3339Timestamp>,
+    /// Provider readiness passthrough; only with `unit: resets`. Never derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_limit: Option<bool>,
+    /// `^[a-z0-9_.-]{1,64}$` provider reason code (e.g. `tenure`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ineligible_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<Rfc3339Timestamp>,
+}
+
+/// One provider credit grant inside an [`AgentCreditBalance`] (quota contract
+/// v2.1 §5 plus v2.2 `usable_now`). No per-grant amount: no provider reports one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentCreditGrant {
+    /// `credit-grant-sha256:v1`: lowercase hex SHA-256 of
+    /// `"<provider>:credit_grant:<id>"`, id case-preserving.
+    pub grant_key: String,
+    #[serde(default)]
+    pub grant_type: CreditGrantType,
+    #[serde(default)]
+    pub status: CreditGrantStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts_at: Option<Rfc3339Timestamp>,
+    /// `None` = no expiry reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_included: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_left: Option<u64>,
+    /// Window names this grant resets, as given by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clears: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Provider readiness passthrough; volatile, never used for `status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usable_now: Option<bool>,
+}
+
+/// What a credit balance is. Lenient: an unrecognized value decodes as
+/// `Unknown` instead of failing the whole snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditBalanceKind {
+    UsageCredits,
+    PlanCredits,
+    SavedResets,
+    OneTimeCredit,
+    WorkspaceAllowance,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Completeness of a balance's `grants` list (quota contract v2.1 §4). There
+/// is no `unknown` value on the wire; an unrecognized value decodes as `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditGrantsState {
+    Complete,
+    Capped,
+    Partial,
+    Unavailable,
+    NotSupported,
+}
+
+/// Lenient: an unrecognized value decodes as `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditGrantType {
+    RateLimitReset,
+    Credit,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Lenient: an unrecognized value decodes as `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditGrantStatus {
+    Available,
+    Redeeming,
+    Redeemed,
+    Paused,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Decode an optional value, mapping any value `T` does not accept to `None`
+/// so one drifted enum never fails the surrounding snapshot.
+fn lenient_optional<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -4216,7 +4363,225 @@ fn redact_credit_balance_for_backend(mut credit: AgentCreditBalance) -> Option<A
     // secret never rides along.
     credit.rate_limit_reached_type = safe_optional_text(credit.rate_limit_reached_type.take());
     credit.limit_id = safe_optional_text(credit.limit_id.take());
+    // Quota contract v2.2: every new field is checked on the way out and an
+    // invalid value is dropped field by field, never the whole balance.
+    credit.title = credit
+        .title
+        .take()
+        .filter(|title| is_backend_safe_credit_text(title));
+    credit.disabled_reason = credit.disabled_reason.take().filter(|reason| {
+        credit.enabled == Some(false)
+            && is_credit_reason_code(reason)
+            && is_safe_backend_text(reason)
+    });
+    credit.ineligible_reason = credit
+        .ineligible_reason
+        .take()
+        .filter(|reason| is_credit_reason_code(reason) && is_safe_backend_text(reason));
+    if credit.unit != AgentCreditBalanceUnit::Resets {
+        // Readiness is only meaningful for saved resets.
+        credit.eligible = None;
+        credit.at_limit = None;
+        credit.ineligible_reason = None;
+        credit.cooldown_until = None;
+    }
+    for time in [
+        &mut credit.observed_at,
+        &mut credit.expires_at,
+        &mut credit.grants_observed_at,
+        &mut credit.next_expires_at,
+        &mut credit.latest_granted_at,
+        &mut credit.cooldown_until,
+    ] {
+        *time = time.take().filter(|value| is_rfc3339_instant(value));
+    }
+    let mut list_degraded = false;
+    if let Some(grants) = credit.grants.as_mut() {
+        let before = grants.len();
+        grants.retain(|grant| is_credit_grant_key(&grant.grant_key));
+        list_degraded |= grants.len() != before;
+        for grant in grants.iter_mut() {
+            grant.title = grant
+                .title
+                .take()
+                .filter(|title| is_backend_safe_credit_text(title));
+            grant.clears = grant.clears.take().filter(|clears| {
+                clears
+                    .iter()
+                    .all(|name| is_credit_reason_code(name) && is_safe_backend_text(name))
+            });
+            for time in [
+                &mut grant.granted_at,
+                &mut grant.starts_at,
+                &mut grant.expires_at,
+            ] {
+                if time
+                    .as_deref()
+                    .is_some_and(|value| !is_rfc3339_instant(value))
+                {
+                    *time = None;
+                    list_degraded = true;
+                }
+            }
+        }
+    }
+    if list_degraded {
+        // A dropped grant or refused grant time means the list may now miss
+        // something: never claim completeness, and drop the complete-gated
+        // summaries with it.
+        if matches!(
+            credit.grants_state,
+            Some(CreditGrantsState::Complete | CreditGrantsState::Capped)
+        ) {
+            credit.grants_state = Some(CreditGrantsState::Partial);
+        }
+        credit.next_expires_at = None;
+        credit.latest_granted_at = None;
+    }
     Some(credit)
+}
+
+/// `^[a-z0-9_.-]{1,64}$`: the closed shape of provider reason codes and grant
+/// `clears` window names (quota contract v2.1 §5, v2.2 §11.1).
+pub fn is_credit_reason_code(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+        })
+}
+
+/// `grant_key` shape: 64 lowercase hex characters.
+fn is_credit_grant_key(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Strict RFC 3339 instant (`YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`) with
+/// calendar ranges checked. The protocol crate has no time dependency, so the
+/// shape is checked by hand.
+fn is_rfc3339_instant(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes.len() > 64 || !value.is_ascii() {
+        return false;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<u32> {
+        let part = &value[range];
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    let separators = [(4, b'-'), (7, b'-'), (13, b':'), (16, b':')];
+    if separators.iter().any(|(at, ch)| bytes[*at] != *ch) || !matches!(bytes[10], b'T' | b't') {
+        return false;
+    }
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        number(0..4),
+        number(5..7),
+        number(8..10),
+        number(11..13),
+        number(14..16),
+        number(17..19),
+    ) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    if day == 0 || day > days || hour > 23 || minute > 59 || second > 60 {
+        return false;
+    }
+    let mut rest = &value[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if !(1..=9).contains(&digits) {
+            return false;
+        }
+        rest = &fraction[digits..];
+    }
+    match rest.as_bytes() {
+        [b'Z' | b'z'] => true,
+        [b'+' | b'-', h1, h2, b':', m1, m2] => {
+            [h1, h2, m1, m2].iter().all(|b| b.is_ascii_digit())
+                && (h1 - b'0') * 10 + (h2 - b'0') <= 23
+                && (m1 - b'0') * 10 + (m2 - b'0') <= 59
+        }
+        _ => false,
+    }
+}
+
+/// The backend-upload privacy guard for provider credit display text (balance
+/// and grant `title`). It checks the value as given and a lookalike-folded
+/// copy (see [`fold_for_privacy_match`]), so `／Users／…` or a zero-width
+/// split `be\u{200b}arer` fails like its ASCII form. The daemon credit model
+/// runs it on the full value before any truncation, so a cut never hides a leak.
+pub fn is_backend_safe_credit_text(value: &str) -> bool {
+    // The fold also runs on ASCII: it collapses whitespace runs, so
+    // `bearer\tx` matches the `bearer ` fragment as on the backend.
+    is_safe_backend_text(value) && is_safe_backend_text(&fold_for_privacy_match(value))
+}
+
+/// Matching-only fold of Unicode lookalikes, mirroring the backend's privacy
+/// match without a Unicode-tables dependency: full-width ASCII forms and the
+/// slash/solidus lookalikes become ASCII, invisible format characters are
+/// dropped, every whitespace run becomes one space, and letters are lowercased.
+fn fold_for_privacy_match(value: &str) -> String {
+    let mut folded = String::with_capacity(value.len());
+    let mut in_space = false;
+    for ch in value.chars() {
+        let mapped = match ch {
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(ch as u32 - 0xFEE0).unwrap_or(ch),
+            '\u{2044}' | '\u{2215}' | '\u{29F8}' => '/',
+            '\u{FE6B}' => '@',
+            '\u{2216}' | '\u{29F5}' | '\u{29F9}' | '\u{FE68}' => '\\',
+            _ if is_format_char(ch) => continue,
+            _ => ch,
+        };
+        if mapped.is_whitespace() {
+            if !in_space {
+                folded.push(' ');
+            }
+            in_space = true;
+            continue;
+        }
+        in_space = false;
+        folded.extend(mapped.to_lowercase());
+    }
+    folded
+}
+
+/// Unicode `Cf` (format) characters that render invisibly.
+fn is_format_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
 }
 
 fn redact_plan_observation_for_backend(
@@ -7425,5 +7790,277 @@ mod tests {
         let parsed: PersonalMeterLocalSnapshot =
             serde_json::from_value(value).expect("snapshot round-trips");
         assert_eq!(parsed, snapshot);
+    }
+
+    /// A balance from before quota contract v2.2, with every older field set.
+    const LEGACY_CREDIT_BALANCE_JSON: &str = concat!(
+        r#"{"name":"credits","status":"low","freshness":"fresh","unit":"credits","#,
+        r#""account_label":"Synthetic","account_identifier_hash":"aaaa","#,
+        r#""organization_identifier_hash":"bbbb","remaining":12,"used":3,"quota":15,"#,
+        r#""unlimited":false,"updated_at":"2026-10-01T12:00:05Z","currency":"USD","#,
+        r#""resets_at":"2026-11-01T00:00:00Z","used_percent":20,"enabled":true,"#,
+        r#""spend_control_reached":false,"#,
+        r#""rate_limit_reached_type":"workspaceMemberCreditsDepleted","limit_id":"codex"}"#
+    );
+
+    #[test]
+    fn legacy_credit_balance_bytes_are_unchanged() {
+        let balance: AgentCreditBalance =
+            serde_json::from_str(LEGACY_CREDIT_BALANCE_JSON).expect("legacy balance");
+        assert_eq!(
+            serde_json::to_string(&balance).unwrap(),
+            LEGACY_CREDIT_BALANCE_JSON
+        );
+        let minimal = AgentCreditBalance {
+            name: "reset_bank".to_string(),
+            unit: AgentCreditBalanceUnit::Resets,
+            remaining: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&minimal).unwrap(),
+            r#"{"name":"reset_bank","status":"unknown","freshness":"unknown","unit":"resets","remaining":2}"#
+        );
+        // The backend-upload copy of a legacy balance only loses the label.
+        let redacted = redact_credit_balance_for_backend(balance).unwrap();
+        assert_eq!(
+            serde_json::to_string(&redacted).unwrap(),
+            LEGACY_CREDIT_BALANCE_JSON.replace(r#""account_label":"Synthetic","#, "")
+        );
+    }
+
+    fn v22_credit_balance() -> AgentCreditBalance {
+        AgentCreditBalance {
+            name: "reset_bank".to_string(),
+            status: AgentCreditBalanceStatus::Ok,
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            unit: AgentCreditBalanceUnit::Resets,
+            remaining: Some(1),
+            observed_at: Some("2026-10-01T12:00:00Z".to_string()),
+            enabled: Some(false),
+            disabled_reason: Some("out_of_credits".to_string()),
+            grant_count: Some(1),
+            grants: Some(vec![AgentCreditGrant {
+                grant_key: "a".repeat(64),
+                grant_type: CreditGrantType::RateLimitReset,
+                status: CreditGrantStatus::Available,
+                expires_at: Some("2026-10-22T16:00:00Z".to_string()),
+                resets_left: Some(1),
+                clears: Some(vec!["five_hour".to_string()]),
+                title: Some("Synthetic reset".to_string()),
+                usable_now: Some(true),
+                ..Default::default()
+            }]),
+            grants_state: Some(CreditGrantsState::Complete),
+            grants_observed_at: Some("2026-10-01T12:00:00Z".to_string()),
+            kind: Some(CreditBalanceKind::SavedResets),
+            title: Some("Synthetic pool".to_string()),
+            next_expires_at: Some("2026-10-22T16:00:00Z".to_string()),
+            eligible: Some(false),
+            at_limit: Some(false),
+            ineligible_reason: Some("tenure".to_string()),
+            cooldown_until: Some("2026-10-02T00:00:00Z".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn v22_credit_balance_round_trips_with_snake_case_values() {
+        let balance = v22_credit_balance();
+        let value = serde_json::to_value(&balance).unwrap();
+        assert_eq!(value["kind"], "saved_resets");
+        assert_eq!(value["grants_state"], "complete");
+        assert_eq!(value["grants"][0]["grant_type"], "rate_limit_reset");
+        assert_eq!(value["grants"][0]["status"], "available");
+        assert!(value["grants"][0].get("granted_at").is_none());
+        let parsed: AgentCreditBalance = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, balance);
+        // Clean values pass the backend redaction untouched.
+        let mut expected = balance.clone();
+        expected.account_label = None;
+        assert_eq!(redact_credit_balance_for_backend(balance), Some(expected));
+    }
+
+    #[test]
+    fn v22_credit_enums_decode_leniently() {
+        let parsed: AgentCreditBalance = serde_json::from_value(serde_json::json!({
+            "name": "future",
+            "status": "ok",
+            "freshness": "fresh",
+            "kind": "brand_new_kind",
+            "grants_state": "brand_new_state",
+            "grants": [{
+                "grant_key": "b".repeat(64),
+                "grant_type": "brand_new_type",
+                "status": "brand_new_status"
+            }]
+        }))
+        .expect("drifted enum values never fail the balance");
+        assert_eq!(parsed.kind, Some(CreditBalanceKind::Unknown));
+        assert_eq!(parsed.grants_state, None);
+        let grant = &parsed.grants.as_ref().unwrap()[0];
+        assert_eq!(grant.grant_type, CreditGrantType::Unknown);
+        assert_eq!(grant.status, CreditGrantStatus::Unknown);
+        let missing: AgentCreditBalance = serde_json::from_value(serde_json::json!({
+            "name": "old",
+            "status": "ok",
+            "freshness": "fresh",
+            "grants_state": null
+        }))
+        .unwrap();
+        assert_eq!(missing.grants_state, None);
+        assert_eq!(missing.kind, None);
+    }
+
+    #[test]
+    fn credit_redaction_strips_unsafe_text_in_every_new_field() {
+        for unsafe_text in [
+            "/Users/someone/Library/Application Support/x",
+            "~/.claude/credentials.json",
+            "bearer synthetic",
+            "sk-synthetic",
+            "someone@example.com",
+        ] {
+            let mut balance = v22_credit_balance();
+            balance.title = Some(unsafe_text.to_string());
+            balance.disabled_reason = Some(unsafe_text.to_string());
+            balance.ineligible_reason = Some(unsafe_text.to_string());
+            let grant = &mut balance.grants.as_mut().unwrap()[0];
+            grant.title = Some(unsafe_text.to_string());
+            grant.clears = Some(vec!["five_hour".to_string(), unsafe_text.to_string()]);
+            let redacted = redact_credit_balance_for_backend(balance).expect("balance kept");
+            assert_eq!(redacted.title, None, "{unsafe_text}");
+            assert_eq!(redacted.disabled_reason, None, "{unsafe_text}");
+            assert_eq!(redacted.ineligible_reason, None, "{unsafe_text}");
+            let grant = &redacted.grants.as_ref().unwrap()[0];
+            assert_eq!(grant.title, None, "{unsafe_text}");
+            assert_eq!(grant.clears, None, "{unsafe_text}");
+            // Everything else in the balance survives.
+            assert_eq!(redacted.grants_state, Some(CreditGrantsState::Complete));
+            assert_eq!(grant.usable_now, Some(true));
+        }
+        // Reason codes keep their closed shape on the way out.
+        let mut balance = v22_credit_balance();
+        balance.ineligible_reason = Some("Not A Code".to_string());
+        let redacted = redact_credit_balance_for_backend(balance).unwrap();
+        assert_eq!(redacted.ineligible_reason, None);
+    }
+
+    #[test]
+    fn credit_redaction_checks_times_keys_and_reason_codes() {
+        // Malformed instants are dropped field by field.
+        let mut balance = v22_credit_balance();
+        balance.observed_at = Some("yesterday".to_string());
+        balance.cooldown_until = Some("2026-02-30T00:00:00Z".to_string());
+        let redacted = redact_credit_balance_for_backend(balance).unwrap();
+        assert_eq!(redacted.observed_at, None);
+        assert_eq!(redacted.cooldown_until, None);
+        assert_eq!(
+            redacted.grants_observed_at.as_deref(),
+            Some("2026-10-01T12:00:00Z")
+        );
+        assert_eq!(redacted.grants_state, Some(CreditGrantsState::Complete));
+
+        // A malformed grant key drops the grant; a malformed grant time drops
+        // the time. Either way the list is no longer complete and loses its
+        // complete-gated summaries.
+        for mutate in [
+            (|grant: &mut AgentCreditGrant| grant.grant_key = "A".repeat(64))
+                as fn(&mut AgentCreditGrant),
+            |grant| grant.grant_key = "abc".to_string(),
+            |grant| grant.expires_at = Some("2026-10-22 16:00".to_string()),
+        ] {
+            let mut balance = v22_credit_balance();
+            mutate(&mut balance.grants.as_mut().unwrap()[0]);
+            let redacted = redact_credit_balance_for_backend(balance).unwrap();
+            assert_eq!(redacted.grants_state, Some(CreditGrantsState::Partial));
+            assert_eq!(redacted.next_expires_at, None);
+            assert_eq!(redacted.latest_granted_at, None);
+        }
+
+        // disabled_reason: a reason code, at most 64 characters, only when off.
+        for (enabled, reason, kept) in [
+            (Some(false), "out_of_credits".to_string(), true),
+            (Some(false), "x".repeat(65), false),
+            (Some(false), "Out of credits".to_string(), false),
+            (Some(true), "out_of_credits".to_string(), false),
+            (None, "out_of_credits".to_string(), false),
+        ] {
+            let mut balance = v22_credit_balance();
+            balance.enabled = enabled;
+            balance.disabled_reason = Some(reason.clone());
+            let redacted = redact_credit_balance_for_backend(balance).unwrap();
+            assert_eq!(redacted.disabled_reason.is_some(), kept, "{reason}");
+        }
+
+        // Readiness rides only on saved resets.
+        let mut balance = v22_credit_balance();
+        balance.unit = AgentCreditBalanceUnit::Usd;
+        let redacted = redact_credit_balance_for_backend(balance).unwrap();
+        assert_eq!(
+            (
+                redacted.eligible,
+                redacted.at_limit,
+                redacted.ineligible_reason,
+                redacted.cooldown_until
+            ),
+            (None, None, None, None)
+        );
+
+        // Unicode lookalikes of a path or secret are stripped from titles.
+        for lookalike in [
+            "see \u{FF0F}Users\u{FF0F}someone",
+            "be\u{200B}arer synthetic",
+            "\u{FF53}\u{FF4B}-synthetic",
+            // ASCII whitespace variants fold too, as on the backend.
+            "Bearer\tsynthetic",
+        ] {
+            let mut balance = v22_credit_balance();
+            balance.title = Some(lookalike.to_string());
+            balance.grants.as_mut().unwrap()[0].title = Some(lookalike.to_string());
+            let redacted = redact_credit_balance_for_backend(balance).unwrap();
+            assert_eq!(redacted.title, None, "{lookalike}");
+            assert_eq!(redacted.grants.as_ref().unwrap()[0].title, None);
+        }
+        assert!(is_backend_safe_credit_text("Réinitialisation offerte"));
+        // Only the fold catches the tab: the raw guard looks for `bearer `.
+        assert!(is_safe_backend_text("Bearer\tsynthetic"));
+        assert!(!is_backend_safe_credit_text("Bearer\tsynthetic"));
+    }
+
+    #[test]
+    fn rfc3339_instant_shape() {
+        for valid in [
+            "2026-10-01T12:00:00Z",
+            "2026-10-01T12:00:00.69185Z",
+            "2026-10-01T12:00:00+02:00",
+            "2024-02-29T23:59:60-05:30",
+        ] {
+            assert!(is_rfc3339_instant(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "2026-10-01",
+            "2026-10-01 12:00:00Z",
+            "2026-13-01T12:00:00Z",
+            "2025-02-29T12:00:00Z",
+            "2026-10-01T24:00:00Z",
+            "2026-10-01T12:00:00",
+            "2026-10-01T12:00:00.Z",
+            "2026-10-01T12:00:00+2:00",
+            "２026-10-01T12:00:00Z",
+        ] {
+            assert!(!is_rfc3339_instant(invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn credit_reason_code_shape() {
+        assert!(is_credit_reason_code("tenure"));
+        assert!(is_credit_reason_code("seven_day.overage-1"));
+        assert!(!is_credit_reason_code(""));
+        assert!(!is_credit_reason_code("Tenure"));
+        assert!(!is_credit_reason_code(&"a".repeat(65)));
+        assert!(!is_credit_reason_code("five hour"));
     }
 }

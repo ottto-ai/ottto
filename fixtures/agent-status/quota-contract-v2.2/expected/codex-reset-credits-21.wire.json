@@ -1,0 +1,179 @@
+{
+  "credit_balances": [
+    {
+      "freshness": "fresh",
+      "grant_count": 21,
+      "grants": [
+        {
+          "expires_at": "2026-10-02T08:00:00Z",
+          "grant_key": "b0918489a35db4f1c118f743cf6876923de3b5d1b62423260f4a85faa1cab9ff",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-03T08:00:00Z",
+          "grant_key": "58bc75f39d4241754f188a575fe6196336b1ea5f0fb2890335ef92c499bac632",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-04T08:00:00Z",
+          "grant_key": "66be970d44069878fdc4fa3932bdfaa48f401a5489defa826020c9c262da739c",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-05T08:00:00Z",
+          "grant_key": "69600bc92246079a8d99a514937846229b92805bfe6183a038d0a84c3acf008b",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-06T08:00:00Z",
+          "grant_key": "045a2bac5b6b1d6cdb03d301e969ae2efc7ed67237a0a4a1ccd2c5028647d5ed",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-07T08:00:00Z",
+          "grant_key": "fc3586403a2373c7e4e24da5e9dd31c6e1abdf65beb2ae57b67c00013817874b",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-08T08:00:00Z",
+          "grant_key": "3d8ce25be8fe3be995fc720574a5c1ba88b89b010f7b821013f4ebb59f82d37c",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-15T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-09T08:00:00Z",
+          "grant_key": "5a10b3480a51a13822349bd38f0ea25c358733105fe60bbe88e2acefc2af62e8",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-10T08:00:00Z",
+          "grant_key": "2d5ed666258285413648892aa6da689f9411f75fb0c500ed8c36694f81f39c58",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-10T08:00:00Z",
+          "grant_key": "562bbcd740274fd818a76bda3fce1559a1c140b71ecc413aaba21b2e06de4a4a",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-10T08:00:00Z",
+          "grant_key": "65c7672d239902df33603e3f042fc8316691c615af8f270e870c593f6c790140",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-11T08:00:00Z",
+          "grant_key": "1a85387f59dddb88de3787a7e9ed1dd106aa217298a9f70b3cfd32984957b65b",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-12T08:00:00Z",
+          "grant_key": "b149320f8269f4aed55c6b9cc03fc36a826843911a8c269c405a828ffcd1fb2e",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-13T08:00:00Z",
+          "grant_key": "3b4fc7907e82237eeade9dad9910b1bfd2d7bd014a6a1088062d577ef4b325b7",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-14T08:00:00Z",
+          "grant_key": "8ea72e65856371792a33bed85ec18f18f2e8042df219b8fcb24806218de1422d",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-15T08:00:00Z",
+          "grant_key": "ee481c4127a09dbaf91dd044aa8bee15c40546f74b9adca4b5d483367bb2d938",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-16T08:00:00Z",
+          "grant_key": "adfe12936cae2fd04a24dd77562ac8b50f2efc2f14198e76c8ab2039af89fd41",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-17T08:00:00Z",
+          "grant_key": "a002285eed72a307fda347614168c3ad5c284f6df6f66183d1dbf91503b8003d",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "expires_at": "2026-10-18T08:00:00Z",
+          "grant_key": "3601470da8037f45802c6b7740f94224bb212dab5232553de51abd43c647f2b0",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        },
+        {
+          "grant_key": "0b31ecb514be4a28af3ee819e850009dce5307a77abffd5b6efc6e6d027441c9",
+          "grant_type": "rate_limit_reset",
+          "granted_at": "2026-09-01T08:00:00Z",
+          "status": "available",
+          "title": "Full reset"
+        }
+      ],
+      "grants_observed_at": "2026-10-01T12:00:00Z",
+      "grants_state": "capped",
+      "kind": "saved_resets",
+      "name": "reset_bank",
+      "next_expires_at": "2026-10-02T08:00:00Z",
+      "observed_at": "2026-10-01T12:00:00Z",
+      "remaining": 21,
+      "status": "ok",
+      "unit": "resets",
+      "unlimited": false
+    }
+  ]
+}

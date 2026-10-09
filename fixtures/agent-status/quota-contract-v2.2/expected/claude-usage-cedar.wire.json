@@ -1,0 +1,78 @@
+{
+  "credit_balances": [
+    {
+      "currency": "USD",
+      "expires_at": "2026-11-05T07:59:00Z",
+      "freshness": "fresh",
+      "kind": "one_time_credit",
+      "limit_id": "iguana_necktie",
+      "name": "one_time_credit",
+      "observed_at": "2026-10-01T12:00:00Z",
+      "quota": 25000,
+      "remaining": 23750,
+      "status": "ok",
+      "unit": "usd",
+      "used": 1250
+    },
+    {
+      "at_limit": true,
+      "cooldown_until": "2026-10-01T18:00:00Z",
+      "eligible": true,
+      "freshness": "fresh",
+      "grant_count": 3,
+      "grants": [
+        {
+          "clears": [
+            "seven_day"
+          ],
+          "expires_at": "2026-10-05T16:00:00Z",
+          "grant_key": "d568461f0c253f452f6388efa1ccef301920378adaaec13d641c7cf3ecc2716d",
+          "grant_type": "rate_limit_reset",
+          "resets_included": 1,
+          "resets_left": 0,
+          "starts_at": "2026-09-01T16:00:00Z",
+          "status": "redeemed",
+          "title": "Synthetic welcome reset",
+          "usable_now": false
+        },
+        {
+          "clears": [
+            "five_hour"
+          ],
+          "expires_at": "2026-10-15T16:00:00Z",
+          "grant_key": "a45a4cb4fb446b94ab18cc622e4c6ca1eca4895a0a44dde64e9dee46b77ba83d",
+          "grant_type": "rate_limit_reset",
+          "resets_included": 1,
+          "resets_left": 1,
+          "starts_at": "2026-09-25T16:00:00Z",
+          "status": "paused",
+          "usable_now": false
+        },
+        {
+          "clears": [
+            "five_hour",
+            "seven_day"
+          ],
+          "expires_at": "2026-10-22T16:00:00Z",
+          "grant_key": "6e3cecf18e8b64075896d53daee2db9f3f0720871c840035bd4a1654e4f6c17d",
+          "grant_type": "rate_limit_reset",
+          "resets_included": 2,
+          "resets_left": 1,
+          "starts_at": "2026-09-22T16:00:00Z",
+          "status": "available",
+          "title": "Synthetic launch: one usage-limit reset",
+          "usable_now": true
+        }
+      ],
+      "grants_observed_at": "2026-10-01T12:00:00Z",
+      "grants_state": "complete",
+      "kind": "saved_resets",
+      "name": "reset_bank",
+      "next_expires_at": "2026-10-15T16:00:00Z",
+      "observed_at": "2026-10-01T12:00:00Z",
+      "remaining": 1,
+      "status": "ok",
+      "unit": "resets"
+    }
+  ]
+}
