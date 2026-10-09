@@ -3537,11 +3537,12 @@ fn finish_sync_source(
         crate::agent_status_refresh::current_codex_home_bindings(&scan_agent_status_collection);
     let cached_codex_login_changed = source == SnapshotSource::Codex
         && current_codex_bindings.len() != scan_agent_status_collection.codex_home_bindings.len();
-    let deferred_accounts = index.bind_session_accounts(
+    let deferred_accounts = index.bind_session_accounts_with_mixed(
         source,
         machine_id,
         &mut scan_result.snapshots,
         &current_codex_bindings,
+        &claude_authority_disposition.mixed_uploads,
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
 
@@ -4498,6 +4499,17 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     ClaudeLocalEvidenceStats,
 ) {
     let census_complete = scan_result.census_complete;
+    // Preserve this scan's original carrier independently from later request
+    // logins; only a fully qualified mixed body may undo the legacy login veto.
+    let originals = scan_result
+        .snapshots
+        .iter()
+        .filter_map(|item| {
+            item.session_account_evidence
+                .clone()
+                .map(|original| (item.source_session_id.clone(), original))
+        })
+        .collect();
     let mut session_ids = claude_evidence_session_ids(&scan_result.snapshots)
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -4598,7 +4610,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         }
     }
     let census_window_end = scan_result.census_window_end.clone();
-    let disposition = crate::snapshots::apply_claude_reported_usage_with_index(
+    let mut disposition = crate::snapshots::apply_claude_reported_usage_with_index(
         &mut scan_result.snapshots,
         &api_report,
         &trace_report,
@@ -4606,6 +4618,14 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         census_complete,
         &census_window_end,
     );
+    let qualification = crate::snapshots::claude_request_accounts::apply_with_originals(
+        &mut scan_result.snapshots,
+        &api_report,
+        &trace_report,
+        &originals,
+    );
+    let _account_coverage = qualification.coverage;
+    disposition.mixed_uploads = qualification.mixed;
     stats.identity_complete_session_count = scan_result
         .snapshots
         .iter()
@@ -16837,6 +16857,362 @@ mod tests {
                 f.progress.destination_namespace_hash
             );
         }
+    }
+    #[test]
+    fn claude_p92_typed_mixed_uses_full_enrichment_order() {
+        use crate::claude_local_otel::ClaudeIdentityDisposition;
+        use sha2::{Digest, Sha256};
+        let (dir, raw, api, trace) =
+            crate::snapshots::claude_request_account_mixed_fixture(4, false);
+        let mut index = ScanIndex::default();
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&dir),
+            &mut index,
+            "2026-08-02T07:10:00Z",
+            7,
+            100,
+            false,
+        )
+        .unwrap();
+        scan.snapshots = vec![raw.clone()];
+        assert!(scan.census_complete);
+        let support = dir.join("support");
+        let digest = format!("{:x}", Sha256::digest(raw.source_session_id.as_bytes()));
+        let write = |kind: &str, rows: Vec<serde_json::Value>| {
+            let path = support
+                .join("local-otel")
+                .join(kind)
+                .join(format!("{digest}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                rows.iter()
+                    .map(|row| row.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+        };
+        let base = scan.clone();
+        let before = raw.session_account_evidence.clone();
+        for case in [
+            "complete",
+            "creator_org_conflict",
+            "typed_conflict",
+            "typed_invalid",
+            "missing_trace",
+            "missing_api",
+            "original_conflict",
+        ] {
+            let mut api = api.clone();
+            let mut trace = trace.clone();
+            let rows = api.evidence.get_mut(&raw.source_session_id).unwrap();
+            match case {
+                "creator_org_conflict" => {
+                    rows[0]
+                        .request_identity
+                        .as_mut()
+                        .unwrap()
+                        .organization
+                        .log_record_hash = Some("d".repeat(64))
+                }
+                "typed_conflict" => {
+                    rows[3].request_identity.as_mut().unwrap().disposition =
+                        ClaudeIdentityDisposition::Conflict
+                }
+                "typed_invalid" => {
+                    rows[3].request_identity.as_mut().unwrap().disposition =
+                        ClaudeIdentityDisposition::Invalid
+                }
+                "missing_api" => {
+                    rows.pop();
+                }
+                "missing_trace" => {
+                    trace
+                        .evidence
+                        .get_mut(&raw.source_session_id)
+                        .unwrap()
+                        .pop();
+                }
+                _ => {}
+            }
+            for row in rows.iter_mut() {
+                row.fingerprint.clear();
+                row.fingerprint = format!(
+                    "sha256:{:x}",
+                    Sha256::digest(serde_json::to_vec(row).unwrap())
+                );
+            }
+            write(
+                "claude-code-effort",
+                rows.iter()
+                    .map(|row| serde_json::to_value(row).unwrap())
+                    .collect(),
+            );
+            write(
+                "claude-code-trace-ownership",
+                trace.evidence[&raw.source_session_id]
+                    .iter()
+                    .map(|row| serde_json::to_value(row).unwrap())
+                    .collect(),
+            );
+            let mut candidate = base.clone();
+            if case == "original_conflict" {
+                candidate.snapshots[0]
+                    .session_account_evidence
+                    .as_mut()
+                    .unwrap()
+                    .identity_disposition = Some("conflict");
+            }
+            let (proof, _, _) =
+                apply_claude_local_evidence_to_scan(&support, &mut candidate, &mut index.clone());
+            let item = &mut candidate.snapshots[0];
+            if case == "complete" {
+                assert_eq!(
+                    item.provenance.collector,
+                    "claude_code_jsonl:own_request_account_mixed:v1"
+                );
+                assert_eq!(item.session_account_evidence, before);
+                assert_eq!(
+                    item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+                    Some("4")
+                );
+                assert!(item
+                    .model_usage
+                    .iter()
+                    .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
+                    .all(|row| row.account_identifier_hash.is_none()));
+                let mut retained = ScanIndex::default();
+                let (prior_dir, mut prior, _, _) =
+                    crate::snapshots::claude_request_account_mixed_fixture(2, true);
+                retained.bind_session_accounts(
+                    SnapshotSource::ClaudeCode,
+                    "machine",
+                    std::slice::from_mut(&mut prior),
+                    &[],
+                );
+                assert!(retained
+                    .bind_session_accounts_with_mixed(
+                        SnapshotSource::ClaudeCode,
+                        "machine",
+                        std::slice::from_mut(item),
+                        &[],
+                        &proof.mixed_uploads
+                    )
+                    .is_empty());
+                crate::snapshots::claude_request_account_output(
+                    "native-mixed-production.json",
+                    item,
+                );
+                std::fs::remove_dir_all(prior_dir).unwrap();
+            } else {
+                assert_ne!(
+                    item.provenance.collector, "claude_code_jsonl:own_request_account_mixed:v1",
+                    "{case}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
+        let (root, mut prior, _, _) =
+            crate::snapshots::claude_request_account_mixed_fixture(2, true);
+        let (candidate_root, mut candidate, api, trace) =
+            crate::snapshots::claude_request_account_mixed_fixture(4, true);
+        let mut index = ScanIndex::default();
+        index.bind_session_accounts(
+            SnapshotSource::ClaudeCode,
+            "machine",
+            std::slice::from_mut(&mut prior),
+            &[],
+        );
+        let owner = serde_json::to_value(&index).unwrap()["session_account_bindings"].clone();
+        let proof = crate::snapshots::claude_request_accounts::apply(
+            std::slice::from_mut(&mut candidate),
+            &api,
+            &trace,
+        );
+        assert!(index
+            .bind_session_accounts_with_mixed(
+                SnapshotSource::ClaudeCode,
+                "machine",
+                std::slice::from_mut(&mut candidate),
+                &[],
+                &proof.mixed
+            )
+            .is_empty());
+        let expected = serde_json::to_vec(&candidate).unwrap();
+        let semantic = candidate.snapshot_fingerprint.clone();
+        let body = snapshot_upload_body_witness(&candidate);
+        let path = root.join("progress.json");
+        let index_path = root.join("index.json");
+        index.save(&index_path).unwrap();
+        let namespace = format!("{:064x}", 99);
+        let mut progress = SnapshotUploadProgress::new(
+            namespace.clone(),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        );
+        let mut accepted = 0;
+        let scope = unique_poison_scope();
+        let result = upload_resumable_batches_with_body_witness(
+            &[candidate.clone()],
+            &scope,
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                assert_eq!(serde_json::to_vec(&items[0]).unwrap(), expected);
+                Err(anyhow::Error::new(UploadShed {
+                    status: 503,
+                    retry_after: Some(Duration::from_secs(60)),
+                }))
+            },
+            |state| state.save(&path),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ResumableUploadResult::Shed {
+                retry_after: Some(Duration::from_secs(60))
+            }
+        );
+        assert_eq!(accepted, 0);
+        assert!(!progress.accepted_fingerprints.contains(&semantic));
+        assert_eq!(
+            serde_json::to_value(&index).unwrap()["session_account_bindings"],
+            owner
+        );
+        // Save/reload the existing checkpoint domains. Fresh proof reconstructs
+        // the same body; a marker-only restarted binder cannot release it.
+        progress.save(&path).unwrap();
+        let mut restored = SnapshotUploadProgress::load(
+            &path,
+            &namespace,
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        let mut restarted = ScanIndex::load(&index_path).unwrap();
+        assert!(restarted
+            .bind_session_accounts(
+                SnapshotSource::ClaudeCode,
+                "machine",
+                &mut [candidate.clone()],
+                &[]
+            )
+            .contains(&candidate.source_session_id));
+        let (retry_root, mut retry, api, trace) =
+            crate::snapshots::claude_request_account_mixed_fixture(4, true);
+        let proof = crate::snapshots::claude_request_accounts::apply(
+            std::slice::from_mut(&mut retry),
+            &api,
+            &trace,
+        );
+        assert!(restarted
+            .bind_session_accounts_with_mixed(
+                SnapshotSource::ClaudeCode,
+                "machine",
+                std::slice::from_mut(&mut retry),
+                &[],
+                &proof.mixed
+            )
+            .is_empty());
+        assert_eq!(serde_json::to_vec(&retry).unwrap(), expected);
+        let lost = upload_resumable_batches_with_body_witness(
+            &[retry.clone()],
+            &scope,
+            &mut restored,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                assert_eq!(serde_json::to_vec(&items[0]).unwrap(), expected);
+                Err(anyhow!("synthetic response lost after server settlement"))
+            },
+            |state| state.save(&path),
+        );
+        assert!(lost.is_err());
+        assert_eq!(accepted, 0);
+        assert!(!restored.accepted_fingerprints.contains(&semantic));
+        restored.save(&path).unwrap();
+        let mut after_loss = SnapshotUploadProgress::load(
+            &path,
+            &namespace,
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        upload_resumable_batches_with_body_witness(
+            &[retry.clone()],
+            &scope,
+            &mut after_loss,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |items| {
+                assert_eq!(serde_json::to_vec(&items[0]).unwrap(), expected);
+                assert_eq!(snapshot_upload_body_witness(&items[0]), body);
+                let mut response = accepted_batch(1);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                response
+                    .accepted_entities
+                    .push(crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: items[0].source_session_id.clone(),
+                        snapshot_fingerprint: semantic.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: Some(if items[0].cache_observations.is_some() {
+                            14
+                        } else {
+                            8
+                        }),
+                        body_witness_digest: Some(body.clone()),
+                        head_etag: Some("f".repeat(64)),
+                        head_challenge: None,
+                    });
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: "claude_code".into(),
+                    machine_id: "a".repeat(64),
+                    collector_version: Some(collector_version()),
+                    snapshots: items,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                response.validate_entity_ack_with_head_cas(&request, true)?;
+                Ok(response)
+            },
+            |state| state.save(&path),
+        )
+        .unwrap();
+        assert_eq!(accepted, 1);
+        assert!(after_loss.accepted_fingerprints.contains(&semantic));
+        assert_eq!(
+            serde_json::to_value(&restarted).unwrap()["session_account_bindings"],
+            owner,
+            "settlement does not rewrite creator/retained owner"
+        );
+        let mut calls = 0;
+        upload_resumable_batches_with_body_witness(
+            &[retry],
+            &scope,
+            &mut after_loss,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |_| {
+                calls += 1;
+                Ok(accepted_batch(1))
+            },
+            |state| state.save(&path),
+        )
+        .unwrap();
+        assert_eq!(calls, 0);
+        assert_eq!(accepted, 1, "same settled candidate is a no-op");
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(candidate_root).unwrap();
+        std::fs::remove_dir_all(retry_root).unwrap();
     }
 }
 
