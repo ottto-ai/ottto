@@ -162,9 +162,12 @@ pub(crate) enum ListObservation {
     },
     /// Details were not read, or the read failed. A provider count may still
     /// be known (count-only reading).
-    Unavailable { provider_count: Option<u64> },
+    Unavailable {
+        provider: Provider,
+        provider_count: Option<u64>,
+    },
     /// The provider/plan has no per-grant details.
-    NotSupported,
+    NotSupported { provider: Provider },
 }
 
 /// A model rule that refused or shaped a value. Field paths only, never the
@@ -196,7 +199,7 @@ pub(crate) struct GrantsBuild {
     /// Soonest available/paused expiry over the whole list, computed before
     /// the cap dropped any grant. Set only with `sender_capped`.
     sender_capped_next_expires_at: Option<Rfc3339Timestamp>,
-    /// Provider of a read list; `None` for unavailable/not-supported.
+    /// Provider of the observation; `None` only for a default value.
     provider: Option<Provider>,
     diagnostics: Vec<CreditModelDiagnostic>,
 }
@@ -238,18 +241,23 @@ pub(crate) fn build_grants(obs: ListObservation) -> GrantsBuild {
             records,
             observed_at,
         } => (provider, provider_count, records, observed_at),
-        ListObservation::Unavailable { provider_count } => {
+        ListObservation::Unavailable {
+            provider,
+            provider_count,
+        } => {
             let mut diagnostics = Vec::new();
             return GrantsBuild {
                 grants_state: Some(CreditGrantsState::Unavailable),
                 grant_count: bounded_grant_count(provider_count, &mut diagnostics),
+                provider: Some(provider),
                 diagnostics,
                 ..GrantsBuild::default()
             };
         }
-        ListObservation::NotSupported => {
+        ListObservation::NotSupported { provider } => {
             return GrantsBuild {
                 grants_state: Some(CreditGrantsState::NotSupported),
+                provider: Some(provider),
                 ..GrantsBuild::default()
             };
         }
@@ -671,7 +679,10 @@ fn summarize(balance: &mut AgentCreditBalance, provider: Option<Provider>) {
     {
         return;
     }
-    if provider == Some(Provider::Anthropic) && balance.grants.is_some() {
+    if provider == Some(Provider::Anthropic) {
+        // Anthropic reports no saved-reset count of its own: the model's sum
+        // over a complete list is the only source, so every other state
+        // (partial, capped, unavailable, not supported) clears it.
         balance.remaining = if complete {
             Some(
                 balance
@@ -783,18 +794,28 @@ pub(crate) fn apply_disabled(
 /// A one-time credit pool (contract v2.2 §11.3, names pinned by §11.7 C4):
 /// `name:"one_time_credit"`, `unit:"usd"`, `currency:"USD"`, amounts in
 /// cents, `expires_at` = the pool's expiry, `enabled: None` (the provider
-/// sends no flag), no `resets_at`. The title follows [`bounded_title`]; its
-/// refusal or truncation comes back as a diagnostic.
+/// sends no flag), no `resets_at`. The title follows [`bounded_title`] and
+/// both instants are normalized to UTC like grant times; a refused title or
+/// instant comes back as a diagnostic.
 pub(crate) fn one_time_credit(
     limit_id: &str,
     title: Field<String>,
     limit_cents: Option<u64>,
     used_cents: Option<u64>,
     remaining_cents: Option<u64>,
-    expires_at: Option<Rfc3339Timestamp>,
-    observed_at: Option<Rfc3339Timestamp>,
+    expires_at: TimeInput,
+    observed_at: TimeInput,
 ) -> (AgentCreditBalance, Vec<CreditModelDiagnostic>) {
     let (title, title_diagnostic) = bounded_title(title, "title");
+    let mut diagnostics = title_diagnostic.into_iter().collect::<Vec<_>>();
+    let mut instant = |input: TimeInput, field: &'static str| {
+        normalize_time(input).unwrap_or_else(|()| {
+            diagnostics.push(CreditModelDiagnostic::new("field_refused", field));
+            None
+        })
+    };
+    let expires_at = instant(expires_at, "expires_at");
+    let observed_at = instant(observed_at, "observed_at");
     let balance = AgentCreditBalance {
         name: "one_time_credit".to_string(),
         status: status_for_remaining(remaining_cents),
@@ -811,7 +832,7 @@ pub(crate) fn one_time_credit(
         title,
         ..Default::default()
     };
-    (balance, title_diagnostic.into_iter().collect())
+    (balance, diagnostics)
 }
 
 /// The grant-list part of a balance, cached so a reading without details can
@@ -973,6 +994,11 @@ impl SectionCache {
         section: CreditSection,
         balances: &[AgentCreditBalance],
     ) {
+        // The grant-list section holds only lists (`observe_grant_list`).
+        debug_assert_ne!(section, CreditSection::GrantList);
+        if section == CreditSection::GrantList {
+            return;
+        }
         let mut balances = balances.to_vec();
         for balance in &mut balances {
             balance.updated_at = None;

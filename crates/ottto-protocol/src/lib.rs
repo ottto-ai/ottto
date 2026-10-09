@@ -4523,8 +4523,9 @@ fn is_rfc3339_instant(value: &str) -> bool {
 /// split `be\u{200b}arer` fails like its ASCII form. The daemon credit model
 /// runs it on the full value before any truncation, so a cut never hides a leak.
 pub fn is_backend_safe_credit_text(value: &str) -> bool {
-    is_safe_backend_text(value)
-        && (value.is_ascii() || is_safe_backend_text(&fold_for_privacy_match(value)))
+    // The fold also runs on ASCII: it collapses whitespace runs, so
+    // `bearer\tx` matches the `bearer ` fragment as on the backend.
+    is_safe_backend_text(value) && is_safe_backend_text(&fold_for_privacy_match(value))
 }
 
 /// Matching-only fold of Unicode lookalikes, mirroring the backend's privacy
@@ -8011,6 +8012,8 @@ mod tests {
             "see \u{FF0F}Users\u{FF0F}someone",
             "be\u{200B}arer synthetic",
             "\u{FF53}\u{FF4B}-synthetic",
+            // ASCII whitespace variants fold too, as on the backend.
+            "Bearer\tsynthetic",
         ] {
             let mut balance = v22_credit_balance();
             balance.title = Some(lookalike.to_string());
@@ -8020,6 +8023,9 @@ mod tests {
             assert_eq!(redacted.grants.as_ref().unwrap()[0].title, None);
         }
         assert!(is_backend_safe_credit_text("Réinitialisation offerte"));
+        // Only the fold catches the tab: the raw guard looks for `bearer `.
+        assert!(is_safe_backend_text("Bearer\tsynthetic"));
+        assert!(!is_backend_safe_credit_text("Bearer\tsynthetic"));
     }
 
     #[test]
