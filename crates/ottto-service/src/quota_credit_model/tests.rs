@@ -795,6 +795,22 @@ fn title_bounds_check_privacy_before_truncation() {
         assert_eq!(title, None, "{lookalike}");
         assert_eq!(diagnostic.unwrap().code, "field_refused");
     }
+    // Compatibility forms only NFKC folds (mathematical alphanumerics) fail
+    // like their ASCII forms, as on the backend.
+    for compatibility in [
+        "see /\u{1D414}\u{1D42C}\u{1D41E}\u{1D42B}\u{1D42C}/someone",
+        "\u{1D42C}\u{1D424}-synthetic",
+        "\u{1D41B}\u{1D41E}\u{1D41A}\u{1D42B}\u{1D41E}\u{1D42B} synthetic",
+    ] {
+        // The protocol guard alone does not see these.
+        assert!(
+            is_backend_safe_credit_text(compatibility),
+            "{compatibility}"
+        );
+        let (title, diagnostic) = bounded_title(Field::Value(compatibility.to_string()), "title");
+        assert_eq!(title, None, "{compatibility}");
+        assert_eq!(diagnostic.unwrap().code, "field_refused");
+    }
     // Ordinary non-ASCII display text is kept.
     let (title, diagnostic) =
         bounded_title(Field::Value("Réinitialisation offerte".into()), "title");
@@ -1626,7 +1642,7 @@ fn codex_sequence() -> Value {
     steps.push(step(
         "restart: cold cache, count 1, detail read failed",
         "2026-10-01T12:20:05Z",
-        &["provider/codex-reset-credits-count-only.json"],
+        &["provider/codex-reset-credits-count-only-1.json"],
         vec![failed],
     ));
     json!({ "sequence": "codex-reset-credits", "steps": steps })

@@ -179,7 +179,7 @@
         }
       ],
       "provider_inputs": [
-        "provider/codex-reset-credits-count-only.json"
+        "provider/codex-reset-credits-count-only-1.json"
       ],
       "step": "restart: cold cache, count 1, detail read failed"
     }

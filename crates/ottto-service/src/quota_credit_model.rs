@@ -40,6 +40,7 @@ use ottto_protocol::{
 };
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime, UtcOffset};
+use unicode_normalization::UnicodeNormalization;
 
 /// Most grants one balance carries on the wire (contract v2.1 §4).
 pub(crate) const GRANTS_MAX: usize = 20;
@@ -546,6 +547,16 @@ fn parse_instant(text: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(text, &Rfc3339).ok()
 }
 
+/// The backend's privacy match for provider display text: the value as given
+/// and its NFKC form (compatibility characters such as mathematical letters,
+/// full-width or small forms fold to ASCII) must both pass the protocol guard,
+/// which then folds slash lookalikes, invisible format characters, whitespace
+/// runs and case.
+fn is_privacy_safe_display_text(text: &str) -> bool {
+    is_backend_safe_credit_text(text)
+        && is_backend_safe_credit_text(&text.nfkc().collect::<String>())
+}
+
 /// Provider display title (grant or pool), contract v2.1 §5: the privacy check
 /// runs on the full value first (unsafe → refused), then an over-long value is
 /// cut at a character boundary to ≤128 chars and ≤512 UTF-8 bytes.
@@ -566,7 +577,7 @@ pub(crate) fn bounded_title(
     if text.is_empty() {
         return (None, None);
     }
-    if !is_backend_safe_credit_text(&text) || text.chars().any(char::is_control) {
+    if !is_privacy_safe_display_text(&text) || text.chars().any(char::is_control) {
         return (
             None,
             Some(CreditModelDiagnostic::new("field_refused", field)),
