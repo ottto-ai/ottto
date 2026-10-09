@@ -1686,6 +1686,153 @@ pub struct AgentCreditBalance {
     /// `codex`). Free-form string; additive and drift-safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_id: Option<String>,
+    // Quota contract v2.1 §2.2 and v2.2 §11.1. Every field below is additive
+    // and skipped when `None`, so a balance without them serializes exactly as
+    // before. Times are provider read/expiry instants, never `updated_at`.
+    /// Provider read time of this balance. A re-sent cached section keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    /// Expiry of a one-time balance. Never a recurring `resets_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Rfc3339Timestamp>,
+    /// Provider reason the balance is off; only with `enabled: Some(false)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+    /// Total grant records in the provider's enumeration scope; `None` is
+    /// unknown. Never the returned list length and never available uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_count: Option<u64>,
+    /// Individual grants. `None` = not observed in this reading; `Some(vec![])`
+    /// is authoritative-empty only with `grants_state: complete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Vec<AgentCreditGrant>>,
+    /// Completeness of `grants`; the only completeness signal.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_optional"
+    )]
+    pub grants_state: Option<CreditGrantsState>,
+    /// Provider read time of the grants list. A re-sent cached list keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants_observed_at: Option<Rfc3339Timestamp>,
+    /// What this balance is, set by the provider adapter. Never part of the
+    /// meter identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<CreditBalanceKind>,
+    /// Provider label for the pool, bounded like a grant title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Soonest grant expiry among available/paused grants (no clock filter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_expires_at: Option<Rfc3339Timestamp>,
+    /// Latest provider grant time among available/paused grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_granted_at: Option<Rfc3339Timestamp>,
+    /// Provider readiness passthrough; only with `unit: resets`. Never derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_limit: Option<bool>,
+    /// `^[a-z0-9_.-]{1,64}$` provider reason code (e.g. `tenure`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ineligible_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<Rfc3339Timestamp>,
+}
+
+/// One provider credit grant inside an [`AgentCreditBalance`] (quota contract
+/// v2.1 §5 plus v2.2 `usable_now`). No per-grant amount: no provider reports one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentCreditGrant {
+    /// `credit-grant-sha256:v1`: lowercase hex SHA-256 of
+    /// `"<provider>:credit_grant:<id>"`, id case-preserving.
+    pub grant_key: String,
+    #[serde(default)]
+    pub grant_type: CreditGrantType,
+    #[serde(default)]
+    pub status: CreditGrantStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts_at: Option<Rfc3339Timestamp>,
+    /// `None` = no expiry reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_included: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_left: Option<u64>,
+    /// Window names this grant resets, as given by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clears: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Provider readiness passthrough; volatile, never used for `status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usable_now: Option<bool>,
+}
+
+/// What a credit balance is. Lenient: an unrecognized value decodes as
+/// `Unknown` instead of failing the whole snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditBalanceKind {
+    UsageCredits,
+    PlanCredits,
+    SavedResets,
+    OneTimeCredit,
+    WorkspaceAllowance,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Completeness of a balance's `grants` list (quota contract v2.1 §4). There
+/// is no `unknown` value on the wire; an unrecognized value decodes as `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditGrantsState {
+    Complete,
+    Capped,
+    Partial,
+    Unavailable,
+    NotSupported,
+}
+
+/// Lenient: an unrecognized value decodes as `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditGrantType {
+    RateLimitReset,
+    Credit,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Lenient: an unrecognized value decodes as `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditGrantStatus {
+    Available,
+    Redeeming,
+    Redeemed,
+    Paused,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Decode an optional value, mapping any value `T` does not accept to `None`
+/// so one drifted enum never fails the surrounding snapshot.
+fn lenient_optional<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -4216,7 +4363,41 @@ fn redact_credit_balance_for_backend(mut credit: AgentCreditBalance) -> Option<A
     // secret never rides along.
     credit.rate_limit_reached_type = safe_optional_text(credit.rate_limit_reached_type.take());
     credit.limit_id = safe_optional_text(credit.limit_id.take());
+    // Quota contract v2.2: every new provider text field passes the same guard;
+    // an unsafe value is dropped field-by-field, never the whole balance.
+    credit.title = safe_optional_text(credit.title.take());
+    credit.disabled_reason = safe_optional_text(credit.disabled_reason.take());
+    credit.ineligible_reason = credit
+        .ineligible_reason
+        .take()
+        .filter(|reason| is_credit_reason_code(reason));
+    if let Some(grants) = credit.grants.as_mut() {
+        for grant in grants {
+            grant.title = safe_optional_text(grant.title.take());
+            grant.clears = grant.clears.take().filter(|clears| {
+                clears
+                    .iter()
+                    .all(|name| is_credit_reason_code(name) && is_safe_backend_text(name))
+            });
+        }
+    }
     Some(credit)
+}
+
+/// `^[a-z0-9_.-]{1,64}$`: the closed shape of provider reason codes and grant
+/// `clears` window names (quota contract v2.1 §5, v2.2 §11.1).
+pub fn is_credit_reason_code(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+        })
+}
+
+/// The backend-upload privacy guard for provider credit display text (balance
+/// and grant `title`). The daemon credit model runs it on the full value before
+/// any truncation, so a cut never hides a leak.
+pub fn is_backend_safe_credit_text(value: &str) -> bool {
+    is_safe_backend_text(value)
 }
 
 fn redact_plan_observation_for_backend(
