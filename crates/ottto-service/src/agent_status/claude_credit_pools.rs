@@ -27,7 +27,9 @@ use crate::quota_credit_model::{
 /// Passive input from Claude Code's own `cachedUsageUtilization` (Ron Q3).
 /// Every collection pass records where each caller is signed in, and a
 /// registered slot's identity gate ends the caller's run when it refuses the
-/// slot, so a body fetched under another organization is never adopted.
+/// slot, so a body fetched under another organization is never adopted. The
+/// default login is not a passive caller yet: a pass that cannot resolve its
+/// identity skips the collector without ending the run.
 pub(super) const CLAUDE_PASSIVE_READING_ENABLED: bool = true;
 /// Kill switch for the activity-based slot (Ron Q3). `false` falls back to
 /// today's 55-65 min gate for every binding: no active boost, no idle
@@ -128,6 +130,14 @@ pub(super) fn claude_credit_read(
     let mut diagnostics = Vec::new();
     let saved_resets = claude_saved_resets(body, observed_at, &mut diagnostics).map(|b| vec![b]);
     match read {
+        // A body without the credit keys (a passive reading that kept only
+        // windows, a provider drop) observes no credit section: the stored
+        // ones are re-sent rather than erased.
+        ClaudeUsageRead::Plain if !carries_plain_credit_sections(body) => ClaudeCreditRead {
+            saved_resets,
+            diagnostics,
+            ..ClaudeCreditRead::default()
+        },
         ClaudeUsageRead::Plain => {
             let mut usage_credits = super::claude_oauth_credit_balances(body);
             for balance in &mut usage_credits {
@@ -146,6 +156,13 @@ pub(super) fn claude_credit_read(
             ..ClaudeCreditRead::default()
         },
     }
+}
+
+/// A full plain body: it carries the usage-credit keys (`spend` or the older
+/// `extra_usage`, null included). Only such a body observes the usage-credit
+/// and one-time pool sections; pool keys are sent with it, null when inactive.
+fn carries_plain_credit_sections(body: &Value) -> bool {
+    body.get("spend").is_some() || body.get("extra_usage").is_some()
 }
 
 /// The saved-reset variant self-check (Ron, 2026-10-09): `cedar_ember` is an
@@ -1214,6 +1231,52 @@ mod tests {
             ),
         );
         assert_eq!(presence(&a_again), expected);
+    }
+
+    /// A plain-read body without the credit keys (a passive reading that kept
+    /// only windows) observes no credit section, so it never erases the stored
+    /// usage credits or one-time pools.
+    #[test]
+    fn body_without_credit_keys_keeps_stored_credit_sections() {
+        let stored = claude_merge_credit_sections(
+            "a",
+            &[],
+            &claude_credit_read(&plain_max_body(), ClaudeUsageRead::Plain, READ_AT),
+        );
+        assert_eq!(stored.len(), 2);
+        let windows_only = json!({
+            "five_hour": window(10, Some("2026-10-09T18:00:00+00:00")),
+            "seven_day": window(20, Some("2026-10-10T05:00:00+00:00"))
+        });
+        let read = claude_credit_read(
+            &windows_only,
+            ClaudeUsageRead::Plain,
+            "2026-10-09T15:00:00Z",
+        );
+        assert!(read.usage_credits.is_none() && read.one_time_credits.is_none());
+        assert_eq!(claude_merge_credit_sections("a", &stored, &read), stored);
+        // A full plain body with `spend: null` still observes its sections.
+        let mut no_spend = plain_max_body();
+        no_spend["spend"] = Value::Null;
+        no_spend["extra_usage"] = Value::Null;
+        let read = claude_credit_read(&no_spend, ClaudeUsageRead::Plain, READ_AT);
+        assert_eq!(read.usage_credits.as_deref(), Some(&[][..]));
+        assert_eq!(read.one_time_credits.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn default_login_reads_no_passive_body() {
+        use super::super::ClaudeOAuthUsageCaller;
+        assert_eq!(
+            super::super::claude_oauth_caller_identity_path(&ClaudeOAuthUsageCaller::Default),
+            None
+        );
+        assert_eq!(
+            super::super::claude_oauth_caller_identity_path(
+                &ClaudeOAuthUsageCaller::DefaultDeferredToSlot
+            ),
+            None
+        );
     }
 
     #[test]

@@ -10277,11 +10277,14 @@ fn claude_oauth_usage_record_reading(
 
 /// The Claude Code config file of this caller's own login, whose passive
 /// reading may stand in for a call.
+///
+/// Registered slots only: every refused pass of a slot ends its run at the
+/// identity gate. A default-login pass whose identity does not resolve skips
+/// the collector without ending the run, so the default login reads no
+/// passive body.
 fn claude_oauth_caller_identity_path(caller: &ClaudeOAuthUsageCaller) -> Option<PathBuf> {
     match caller {
-        ClaudeOAuthUsageCaller::Default | ClaudeOAuthUsageCaller::DefaultDeferredToSlot => {
-            Some(claude_cli_config_path())
-        }
+        ClaudeOAuthUsageCaller::Default | ClaudeOAuthUsageCaller::DefaultDeferredToSlot => None,
         ClaudeOAuthUsageCaller::RegisteredSlot(slot_id) => {
             let registry = FileClaudeConfigSlotSettingsStore::default().load().ok()?;
             registry

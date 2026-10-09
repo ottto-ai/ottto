@@ -63,7 +63,11 @@ extra calls:
   account and organization. Another binding, a longer gap, a restart, a clock
   going backwards, or a registered slot's identity gate refusing the slot
   (another account or organization signed in) ends the run, and a run never
-  adopts a body fetched before it began;
+  adopts a body fetched before it began. Only registered slots read passive
+  bodies for now: a default-login pass that cannot resolve its identity skips
+  the collector without ending its run. A passive body that lacks the credit
+  keys (`spend`/`extra_usage`) updates windows only and re-sends the stored
+  credit sections;
 - the existing 5-minute post-success spacing, Retry-After handling, breaker and
   per-caller auth backoff are unchanged;
 - `CLAUDE_ACTIVITY_CADENCE_ENABLED` is a kill switch (default on): off, every
