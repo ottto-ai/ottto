@@ -117,8 +117,14 @@ most 500 receipts and 4 MiB. A request-specific validated ACK may retain a
 private content-free annotation with full semantic fingerprints, body-witness
 versions and hashes, one-way session and destination identifiers, hashed
 accepted-head or conflict-challenge references, occurrence counts, uploaded
-cache-patch presence, two numeric usage scalars and coverage. At most 50 entity
-records are retained per receipt. This diagnostic
+cache-patch presence, two numeric usage scalars and coverage. Rejected entities
+also retain a closed reason category (authority downgrade or other), hashed
+machine/entity matching references, numeric usage floors, bounded decimal costs,
+semantic activity time, and a count/digest of usage grains. Grain dimensions and
+server detail strings are not retained. At most 50 entity records are retained
+per receipt, with rejected entities taking the private evidence slots first.
+Coverage explicitly reports truncation; a grain digest detects change but cannot
+identify a decreased or missing hourly floor. This diagnostic
 annotation survives ordinary checkpoint retirement; it never becomes ACK,
 retry, checkpoint or publication authority. Raw session/account/device ids,
 head tokens, request bodies, local paths and credentials are not retained.

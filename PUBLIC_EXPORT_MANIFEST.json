@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 498,
-  "content_sha256": "96bf5f52943ece706daf061a550b1945e5ef3d4ebcf09d2d8b3e54a3713b582a",
+  "candidate_file_count": 499,
+  "content_sha256": "0caee5cd107aeb4d87a44e4ce39b4860ca6bcee980773391d987fb3f5ea13296",
   "files": [
     {
       "executable": false,
@@ -1210,8 +1210,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/upload_receipts.rs",
-      "sha256": "caaec4193e24f1862d2d31e549b8d8a351d0e80090f6408913cb1b1f972335e1",
-      "size_bytes": 49665
+      "sha256": "c5e9f3ec85a4cbf7811dc67c3208bb89c37d94b2a3228628c52198851f02607b",
+      "size_bytes": 60014
     },
     {
       "executable": false,
@@ -1322,8 +1322,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "6c55a60521fb575f0ff154eac6b94c589f71b29ac1f10408736bcdae854aeaef",
-      "size_bytes": 22443
+      "sha256": "0925099acfea4b4e55c7f03317ab627e9f77494cf3314db6013a4a2a5d268997",
+      "size_bytes": 22930
     },
     {
       "executable": false,
@@ -2402,6 +2402,13 @@
       "path": "docs/session-2026-10-09-fenced-census-diagnostics.md",
       "sha256": "c54672abc4f04e93685ba6dcc9ae7698a8beeb62143dce2311daeeae5ecb9f0b",
       "size_bytes": 4324
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-09-rejected-usage-receipts.md",
+      "sha256": "09bb98cd8dbaf057bb3b74d8279c3d6e753a7b293b84fec0d786310db311a2a3",
+      "size_bytes": 2300
     },
     {
       "executable": false,
@@ -3489,9 +3496,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-09T14:01:49+00:00",
+  "generated_at": "2026-10-09T20:51:04+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 499,
+  "output_file_count": 500,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3528,5 +3535,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "3b1aa6655da693ff37996e58bc4d23f0050c96c9"
+  "source_commit": "a45f0b45943f70fd8b61794d37a556677e19117a"
 }
