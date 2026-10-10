@@ -326,7 +326,7 @@ fn claude_one_time_credits(
                 });
                 return None;
             }
-            let (balance, refused) = one_time_credit(
+            let (balance, refused) = match one_time_credit(
                 key,
                 string_field(pool, "label"),
                 super::claude_oauth_money_cents(pool.get("limit_dollars")),
@@ -334,7 +334,13 @@ fn claude_one_time_credits(
                 super::claude_oauth_money_cents(pool.get("remaining_dollars")),
                 time_field(pool, "resets_at"),
                 TimeInput::Rfc3339(observed_at.to_string()),
-            );
+            ) {
+                Ok(built) => built,
+                Err(refusal) => {
+                    diagnostics.push(refusal.diagnostic());
+                    return None;
+                }
+            };
             // A pool whose expiry passed before this read is gone, not empty.
             if let (Some(expiry), Some(read_at)) = (
                 balance.expires_at.as_deref().and_then(parse_instant),
