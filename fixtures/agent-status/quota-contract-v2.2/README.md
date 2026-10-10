@@ -12,20 +12,32 @@ account in these files comes from a real account; only the provider response
     (`availableCount` plus `credits[]` rows with Unix-second times).
   - `claude-usage-cedar*.json`: Claude usage body with the saved-reset section
     (`cedar_ember`) and a one-time credit pool (`iguana_necktie`).
+  - `codex-rate-limits-plan-and-workspace.json`: Codex app-server `rateLimits`
+    with plan credits (`credits`) and a workspace monthly allowance
+    (`individualLimit`).
   - `claude-oauth-usage-plain.json`: the plain Claude usage body (usage credits
     switched off, plus a one-time pool).
+  - `claude-oauth-usage-credits-off.json`: the plain Claude usage body with
+    usage credits switched off by the organization and no one-time pool.
 - `expected/*.wire.json`: the credit balances the daemon must emit for those
   inputs, as `{"credit_balances": [...]}`. A file named like a provider file is
   the output for that one reading. `sequence-*.wire.json` files are multi-step
   readings (`steps[]`, each with the snapshot `captured_at`, the
   `provider_inputs` it read, and the emitted `credit_balances`).
 
+`expected/legacy-no-kind.wire.json` has no provider input: it is a body from a
+daemon that predates contract v2.2 (no `kind`, no read clocks, no grants), for
+consumers that must recover the kind from the pinned names (contract v2.2
+§11.7 C4), including a non-`codex` pool (`<limit_id>_credits`).
+
 All single readings use read time `2026-10-01T12:00:00Z`.
 
 ## Rules the expected files pin
 
 - Fields the protocol skips when absent are never spelled as `null`.
-- Every balance carries `kind`. No credit balance carries `updated_at`, fresh
+- Every balance carries `kind` (except in `legacy-no-kind`). Every `kind`
+  appears: `plan_credits` and `workspace_allowance` (Codex), `saved_resets`
+  (both), `usage_credits` and `one_time_credit` (Claude). No credit balance carries `updated_at`, fresh
   or re-sent; consumers use the snapshot's capture time. Provider read time is
   `observed_at` (and `grants_observed_at` for a grant list).
 - A snapshot never carries the same balance (`name`, `limit_id`, account)
