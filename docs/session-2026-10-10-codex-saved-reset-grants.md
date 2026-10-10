@@ -54,10 +54,27 @@ to the routine read makes the collector send the plain request instead (older
 servers). Any other error fails the reading as before, without a costlier
 retry.
 
-A failed detailed read is retried after 15 minutes, or at once if the count
-changes again, never on every poll. Per account and hour that is twelve routine
-reads plus one detailed read (about 14 backend calls instead of 24), and about
-20 while the detail endpoint keeps failing.
+At most one detailed read is sent per session. A failed detailed read is
+retried after 15 minutes, not on every poll; a count with no cached list is
+still read at once. A whole session that fails before any reading (spawn error,
+JSON-RPC error, timeout) counts as a failed detailed read for the account last
+validated at that Codex home: the next 5-minute routine read still runs, but the
+hourly detailed read waits 15 minutes. A home that was never validated records
+nothing, so no identity or count is invented.
+
+Cost per account and hour, assuming one backend call per routine read and two
+per detailed read (inferred from the upstream client, not measured):
+
+- stable count: 11 routine polls plus 1 routine-and-detailed poll, about 14
+  calls instead of the historical 24;
+- two count changes: 9 routine polls plus 3 routine-and-detailed polls, about
+  18;
+- detail endpoint failing throughout: one detailed retry every 15 minutes,
+  about 20.
+
+An escalated poll costs 3 calls, more than the old 2. A count that keeps
+changing, a persistent routine/detail count disagreement or a server rejecting
+the parameter can therefore cost more than before in that hour.
 
 The decisions are pure functions of a per-binding state and the clock
 (`DetailCadence`, `CodexCreditTracker::routine_needs_details`), unit-tested over
@@ -120,6 +137,10 @@ launcher, then the inner binary, before falling back to `PATH`.
   be sent keeps the
   routine reading. A rejected parameter falls back to the plain read, and fails
   the reading if that read fails too. Any other routine error is not retried.
+- Whole-session failures: a failed session charges the detail back-off to the
+  binding last validated at that home (unit and end-to-end with a scripted
+  app-server that dies), a count change still escalates, and a never-validated
+  home records nothing.
 - Resolver: executable scratch bundles with the old and new layouts, through
   the same lookup the resolver uses.
 
@@ -128,8 +149,10 @@ No live provider calls were made; all fixtures are synthetic.
 ## Limits
 
 - If Codex's routine count and detail count ever disagreed persistently, every
-  poll would send the routine and the detailed read: one backend call more per
-  poll than the old every-poll detailed read.
+  poll would send the routine and the detailed read: 3 calls per poll instead
+  of the old 2.
+- The cost figures are inferred from the upstream client's request pattern,
+  not measured provider calls.
 - The legacy OAuth fallback path (opt-in, default home only) gains `kind` but
   no grants; it never read the reset list.
 - Emitting pools as meters, an exact-decimal credit balance and an

@@ -34,10 +34,25 @@
 //! parameter as invalid ([`routine_param_rejected`]) gets the plain request
 //! instead; any other error fails the reading as before.
 //!
-//! A failed detailed read (Codex silently falls back to `credits: null`) is
-//! retried after [`DETAIL_RETRY_SECS`] or on the next count change, not on
-//! every poll. [`DetailCadence`] holds these decisions as pure functions of the
-//! clock.
+//! At most one detailed read is sent per session. A failed detailed read
+//! (Codex silently falls back to `credits: null`) is retried after
+//! [`DETAIL_RETRY_SECS`], not on every poll; a count with no cached list still
+//! escalates at once. A whole session that fails (spawn, RPC error or timeout
+//! before any reading) counts as a failed detailed read for the binding last
+//! validated at that Codex home ([`CodexCreditTracker::record_session_failure`]):
+//! the next 5-minute routine read still runs, but the hourly detailed read waits
+//! for the retry gate. A home never validated records nothing; no identity or
+//! count is invented. [`DetailCadence`] holds these decisions as pure functions
+//! of the clock.
+//!
+//! Cost, assuming Codex answers a routine read with one backend call and a
+//! detailed read with two (inferred from the upstream client, not measured):
+//! with a stable count an hour is 11 routine polls plus 1 routine-and-detailed
+//! poll, about 14 calls instead of the historical 24 (12 detailed polls). Two
+//! count changes in an hour give about 18. An escalated poll costs 3, more than
+//! the old 2, so a count that keeps changing, a persistent routine/detail count
+//! disagreement or a server rejecting the parameter can cost more than before
+//! in that hour. There is never more than one escalation per session.
 //!
 //! # Sender stability (R7b)
 //!
@@ -49,6 +64,7 @@
 //! identity (account + workspace hash), so A→B→A keeps A's list.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -69,7 +85,7 @@ pub(super) const DETAIL_INTERVAL_SECS: u64 = 3_600;
 pub(super) const DETAIL_RETRY_SECS: u64 = 900;
 /// A poll this close to a deadline counts as reaching it.
 pub(super) const POLL_SLACK_SECS: u64 = 60;
-/// Bound on bindings the cadence remembers.
+/// Bound on bindings (and Codex homes) the cadence remembers.
 const TRACKED_BINDINGS_MAX: usize = 64;
 /// JSON-RPC id of a detailed read sent after a routine one in the same session.
 pub(super) const DETAIL_READ_ID: &str = "ottto_rate_limits_details";
@@ -216,6 +232,10 @@ pub(super) struct CodexCreditRead<'a> {
 pub(super) struct CodexCreditTracker {
     sections: SectionCache,
     cadence: BTreeMap<String, DetailCadence>,
+    /// The binding last validated at each Codex home. Used only to charge a
+    /// whole-session failure to a known identity; never to plan a request or
+    /// to attach a list.
+    home_binding: BTreeMap<PathBuf, String>,
 }
 
 impl CodexCreditTracker {
@@ -314,6 +334,32 @@ impl CodexCreditTracker {
 }
 
 impl CodexCreditTracker {
+    /// A reading at `home` validated as `binding`.
+    pub(super) fn remember_home_binding(&mut self, home: &Path, binding: &str) {
+        if !self.home_binding.contains_key(home) && self.home_binding.len() >= TRACKED_BINDINGS_MAX
+        {
+            // Homes are re-learned on their next successful reading.
+            if let Some(evict) = self.home_binding.keys().next().cloned() {
+                self.home_binding.remove(&evict);
+            }
+        }
+        self.home_binding
+            .insert(home.to_path_buf(), binding.to_string());
+    }
+
+    /// The whole app-server session at `home` failed before any reading
+    /// (spawn, RPC error, timeout). Charge it as a failed detailed read to the
+    /// binding last validated there, so the next poll does not escalate for
+    /// the hourly read before [`DETAIL_RETRY_SECS`]. The failed count is
+    /// unknown, so a count with no cached list still escalates. A home with no
+    /// validated binding records nothing.
+    pub(super) fn record_session_failure(&mut self, home: &Path, now: u64) {
+        let Some(binding) = self.home_binding.get(home).cloned() else {
+            return;
+        };
+        self.cadence_entry(&binding).record_detail(false, None, now);
+    }
+
     /// The binding's cadence, evicting the least recently read other binding
     /// at the bound. An evicted binding is simply re-learned (it reads
     /// details on its next poll).
@@ -338,6 +384,27 @@ fn tracker() -> MutexGuard<'static, CodexCreditTracker> {
         .get_or_init(|| Mutex::new(CodexCreditTracker::default()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Process-wide [`CodexCreditTracker::remember_home_binding`].
+pub(super) fn remember_home_binding(home: &Path, binding: &str) {
+    tracker().remember_home_binding(home, binding);
+}
+
+/// Process-wide [`CodexCreditTracker::record_session_failure`].
+pub(super) fn record_session_failure(home: &Path, now: u64) {
+    tracker().record_session_failure(home, now);
+}
+
+/// The binding's last failed detailed read, for tests of the process-wide
+/// tracker.
+#[cfg(test)]
+pub(super) fn last_detail_failed_at(binding: &str) -> Option<u64> {
+    tracker()
+        .cadence
+        .get(binding)
+        .and_then(|cadence| cadence.last_detail_failed)
+        .map(|(at, _)| at)
 }
 
 /// Process-wide [`CodexCreditTracker::routine_needs_details`].
@@ -1208,6 +1275,65 @@ mod tests {
         tracker.attach_reset_bank_grants(&mut [], &no_resets, read(Some(BINDING_A), true, T0));
         assert!(!tracker.routine_needs_details(Some(BINDING_A), &no_resets, T0 + 300));
         assert!(tracker.routine_needs_details(Some(BINDING_A), &no_resets, T0 + 3_600));
+    }
+
+    const HOME: &str = "/synthetic/codex-home";
+
+    #[test]
+    fn whole_session_failure_backs_off_the_hourly_detail_read() {
+        let mut tracker = CodexCreditTracker::default();
+        let home = Path::new(HOME);
+        let (_, first) = poll(&mut tracker, BINDING_A, T0, 2, &rows(2));
+        tracker.remember_home_binding(home, BINDING_A);
+        // At the hour the whole session fails before any reading (spawn,
+        // RPC error or timeout), so not even the routine read came back.
+        let hour = T0 + 3_600;
+        assert!(tracker.routine_needs_details(Some(BINDING_A), &count_only(2), hour));
+        tracker.record_session_failure(home, hour);
+        // The next 5-minute poll still sends the routine read, and re-sends
+        // the cached list, but does not escalate for the hourly read ...
+        let (sent, balance) = poll(&mut tracker, BINDING_A, hour + 300, 2, &rows(2));
+        assert_eq!(sent, vec![ROUTINE]);
+        assert_eq!(wire(&balance), wire(&first));
+        // ... until the retry gate.
+        let (sent, _) = poll(
+            &mut tracker,
+            BINDING_A,
+            hour + DETAIL_RETRY_SECS,
+            2,
+            &rows(2),
+        );
+        assert_eq!(sent, vec![ROUTINE, DETAILED]);
+    }
+
+    #[test]
+    fn whole_session_failures_never_suppress_a_count_change_read() {
+        let mut tracker = CodexCreditTracker::default();
+        let home = Path::new(HOME);
+        poll(&mut tracker, BINDING_A, T0, 2, &rows(2));
+        tracker.remember_home_binding(home, BINDING_A);
+        tracker.record_session_failure(home, T0 + 300);
+        // The failed session had no count; a count without a cached list is
+        // still read at once.
+        let (sent, balance) = poll(&mut tracker, BINDING_A, T0 + 600, 3, &rows(3));
+        assert_eq!(sent, vec![ROUTINE, DETAILED]);
+        assert_eq!(balance.grants.as_ref().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn whole_session_failure_at_an_unvalidated_home_records_nothing() {
+        // Cold start: the first session fails before any identity is known.
+        let mut tracker = CodexCreditTracker::default();
+        tracker.record_session_failure(Path::new(HOME), T0);
+        assert!(tracker.cadence.is_empty(), "no identity is invented");
+        // The next successful routine read escalates as any cold binding.
+        let (sent, _) = poll(&mut tracker, BINDING_A, T0 + 300, 2, &rows(2));
+        assert_eq!(sent, vec![ROUTINE, DETAILED]);
+        // A home charges only the binding last validated there.
+        tracker.remember_home_binding(Path::new(HOME), BINDING_B);
+        tracker.record_session_failure(Path::new(HOME), T0 + 600);
+        assert!(tracker.cadence[BINDING_A].last_detail_failed.is_none());
+        assert!(tracker.cadence[BINDING_B].last_detail_failed.is_some());
     }
 
     #[test]

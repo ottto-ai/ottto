@@ -12987,8 +12987,20 @@ fn collect_codex_app_server_usage_for_home(
             codex_credit_grants::routine_read_needs_details(binding.as_deref(), rate_limits, now)
         };
     let observation =
-        call_codex_app_server_rate_limits_for_home(codex_home, home_trust, &needs_details)?;
-    Ok(codex_usage_probe_from_app_server_observation(observation))
+        match call_codex_app_server_rate_limits_for_home(codex_home, home_trust, &needs_details) {
+            Ok(observation) => observation,
+            Err(message) => {
+                // No reading at all: the detail back-off still applies to the
+                // account last validated at this home (design R7).
+                codex_credit_grants::record_session_failure(codex_home, now);
+                return Err(message);
+            }
+        };
+    let probe = codex_usage_probe_from_app_server_observation(observation);
+    if let Some(identity) = probe.identity.as_ref() {
+        codex_credit_grants::remember_home_binding(codex_home, &codex_credit_binding(identity));
+    }
+    Ok(probe)
 }
 
 fn codex_credit_binding(identity: &CodexStrongIdentity) -> String {
@@ -19548,8 +19560,10 @@ for line in sys.stdin:
     elif '"id":"ottto_account"' in line:
         print('{"id":"ottto_account","result":{"account":{"type":"chatgpt","email":"synthetic-account","planType":"pro"},"requiresOpenaiAuth":true}}', flush=True)
     elif "account/rateLimits/read" in line:
-        request_id = "ottto_rate_limits_details" if "ottto_rate_limits_details" in line else "ottto_rate_limits"
-        print('{"id":"' + request_id + '","result":{"rateLimits":{"limitId":"synthetic-limit","planType":"pro","primary":{"usedPercent":25,"windowDurationMins":300}},"rateLimitResetCredits":{"availableCount":2}}}', flush=True)
+        detailed = "ottto_rate_limits_details" in line
+        request_id = "ottto_rate_limits_details" if detailed else "ottto_rate_limits"
+        credits = ',"credits":[]' if detailed else ''
+        print('{"id":"' + request_id + '","result":{"rateLimits":{"limitId":"synthetic-limit","planType":"pro","primary":{"usedPercent":25,"windowDurationMins":300}},"rateLimitResetCredits":{"availableCount":2' + credits + '}}}', flush=True)
 "#,
         )
         .expect("fake Codex executable");
@@ -19632,6 +19646,49 @@ for line in sys.stdin:
             check.observed_at.as_deref(),
             Some(snapshot.captured_at.as_str()),
             "snapshot capture is not the read clock"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_whole_session_failure_backs_off_the_validated_binding() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, home) = synthetic_codex_collector_home("session-failure", 0o600);
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        let collect = || {
+            collect_codex_status_for_home(
+                "2026-08-26T00:00:00Z".to_string(),
+                "2026-08-26T00:15:00Z".to_string(),
+                &home,
+                CodexHomeTrust::ProviderDefault,
+            )
+        };
+
+        // A successful reading validates the binding for this home; its
+        // detailed read returned a list, so no failure is on record.
+        let (_, identity, _) = collect();
+        let binding = codex_credit_binding(&identity.expect("validated identity"));
+        assert_eq!(codex_credit_grants::last_detail_failed_at(&binding), None);
+
+        // The app-server now dies before any answer: no reading at all.
+        let executable = root.join("codex");
+        std::fs::write(&executable, "#!/bin/sh\nexit 1\n").expect("failing codex");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("failing codex mode");
+        let (snapshot, identity, _) = collect();
+        assert!(identity.is_none());
+        assert!(snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_usage_probe_failed"));
+        assert!(
+            codex_credit_grants::last_detail_failed_at(&binding).is_some(),
+            "the failed session feeds the detail back-off of the known binding"
         );
 
         let _ = std::fs::remove_dir_all(root);
