@@ -19784,6 +19784,11 @@ import time
 if sys.argv[1:] != ["app-server", "--stdio"]:
     sys.exit(1)
 mode = os.environ["FAKE_CODEX_MODE"]
+if mode in ("early_exit", "signal_exit", "line_bound", "message_bound", "total_bound"):
+    # Take initialize, initialized and account/read first, so the collector's
+    # opening writes never race this process's exit.
+    for _ in range(3):
+        sys.stdin.readline()
 if mode == "early_exit":
     sys.exit(2)
 if mode == "signal_exit":
@@ -19829,9 +19834,10 @@ for line in sys.stdin:
             reply(request_id, with_code=False)
             sys.exit(0)
         reply(request_id, {"account": {"type": "chatgpt", "planType": "pro"}})
-        if mode == "quota_eof":
-            sys.exit(0)
     elif method == "account/rateLimits/read":
+        if mode == "quota_eof":
+            # The quota request arrived; go away without answering it.
+            sys.exit(0)
         if mode == "quota_error":
             reply(request_id, code=-32603)
             sys.exit(0)
