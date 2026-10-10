@@ -4772,9 +4772,21 @@ mod tests {
     #[serial]
     #[cfg(unix)]
     fn diagnostics_collect_includes_support_only_claude_evidence_health() {
-        let support = test_scratch::private_dir("claude-diagnostics-consumer");
+        let support = test_scratch::ScratchDir::new("claude-diagnostics-consumer");
         let _support_guard = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let _secret_guard = TestEnvVar::set(
+            ottto_core::OTTTO_SECRET_FALLBACK_DIR_ENV,
+            &support.join("secrets"),
+        );
+        let _key_guard = TestEnvVar::set(
+            keychain::TELEMETRY_KEY_FILE_STORE_ENV,
+            &support.join("telemetry-keys"),
+        );
         let bundle = daemon().diagnostics_stub(TOKEN).unwrap();
+        assert_eq!(
+            diagnostic_item(&bundle, "security", "keychain_item_count"),
+            Some(&RedactedValue::Number(0))
+        );
         assert_eq!(
             diagnostic_item(
                 &bundle,
@@ -4792,17 +4804,46 @@ mod tests {
         let encoded = serde_json::to_string(&bundle).unwrap();
         assert!(!encoded.contains(support.to_str().unwrap()));
         assert!(!bundle.upload.requested);
-        std::fs::remove_dir_all(support).unwrap();
     }
 
     #[test]
+    #[serial]
     fn diagnostics_stub_does_not_expose_auth() {
+        let support = test_scratch::ScratchDir::new("diagnostics-redaction");
+        let secrets = support.join("secrets");
+        let _support_guard = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let _secret_guard = TestEnvVar::set(ottto_core::OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+        let _key_guard = TestEnvVar::set(
+            keychain::TELEMETRY_KEY_FILE_STORE_ENV,
+            &support.join("telemetry-keys"),
+        );
+        let synthetic_control_token = "synthetic-diagnostics-control-token";
+        let synthetic_relay_secret = "synthetic-diagnostics-relay-secret";
+        for (account, value) in [
+            (OTTTO_KEYCHAIN_ACCOUNT, synthetic_control_token),
+            (OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, synthetic_relay_secret),
+        ] {
+            ottto_core::token_store::FileControlTokenStore::new(secrets.join(account))
+                .save(value)
+                .expect("save synthetic diagnostic secret");
+        }
         let daemon = daemon();
         let bundle = daemon
             .diagnostics_stub(TOKEN)
             .expect("diagnostics should succeed");
         let encoded = serde_json::to_string(&bundle).expect("diagnostics serialize");
 
+        assert_eq!(
+            diagnostic_item(&bundle, "security", "keychain_item_count"),
+            Some(&RedactedValue::Number(if cfg!(target_os = "macos") {
+                2
+            } else {
+                0
+            }))
+        );
+        assert!(!encoded.contains(synthetic_control_token));
+        assert!(!encoded.contains(synthetic_relay_secret));
+        assert!(!encoded.contains(support.to_str().unwrap()));
         assert_eq!(
             diagnostic_item(&bundle, "security", "auth_header"),
             Some(&RedactedValue::String("[REDACTED]".to_string()))
