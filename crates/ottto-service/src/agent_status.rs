@@ -9736,6 +9736,13 @@ fn collect_claude_oauth_usage_unstamped(
     let mut last_reading_at = None;
     let mut previous_credit_balances = Vec::new();
 
+    // A saved-reset reading that was not usable (or had no windows) moved
+    // this binding's next read to its next slot.
+    let held = claude_credit_pools::claude_read_held(&mut read_schedule, slot_seconds, now);
+    if held.cleared {
+        let _ = claude_credit_pools::write_claude_read_schedule(&account_state_dir, &read_schedule);
+    }
+
     let mut exact_stale_fallback = None;
     if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
         account_identifier_hash,
@@ -9779,6 +9786,13 @@ fn collect_claude_oauth_usage_unstamped(
             return outcome;
         }
         if now < cache.next_refresh_after_epoch_seconds {
+            // A stored reading without windows under the hold: the saved-reset
+            // section of a windowless variant read, served for this slot.
+            if held.active && cache.windows.is_empty() {
+                return claude_oauth_read_held_outcome(Ok(claude_oauth_usage_from_cache(
+                    cache, now,
+                )));
+            }
             return ClaudeOAuthUsageOutcome::from(Err(
                 "Claude OAuth usage endpoint is rate limited.".to_string(),
             ));
@@ -9788,25 +9802,21 @@ fn collect_claude_oauth_usage_unstamped(
         }
     }
 
-    // Passive input (design R7: active-account freshness): Claude Code's own plain reading for exactly this
-    // binding, newer than ours and inside the slot, stands in for this slot's
-    // call. Parsed by the same plain-body parser; no provider request.
-    // A saved-reset reading that was not usable (or had no windows) moved
-    // this binding's next read to the next slot; hold it even without a
-    // stored reading to serve.
-    if read_schedule
-        .next_read_not_before
-        .is_some_and(|not_before| now < not_before)
-    {
-        return ClaudeOAuthUsageOutcome::from(Err(
-            "Claude usage for this account is read again at its next slot.".to_string(),
-        ))
-        .with_check_outcome(
-            "claude_oauth_usage_check_suppressed",
-            "The last Claude saved-reset reading was not usable; no provider request is made before this account's next slot.",
-            now,
-        );
+    // The hold applies even without a stored reading to serve; a servable
+    // stale reading is served.
+    if held.active {
+        return claude_oauth_read_held_outcome(match exact_stale_fallback {
+            Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
+            None => {
+                Err("Claude usage for this account is read again at its next slot.".to_string())
+            }
+        });
     }
+
+    // Passive input (design R7: active-account freshness): Claude Code's own
+    // plain reading for exactly this binding, newer than ours and inside the
+    // slot, stands in for a plain slot's call. Parsed by the same plain-body
+    // parser; no provider request.
 
     // The slot's read is chosen first (same endpoint, same slot: the
     // saved-reset variant replaces the plain read in its slot, never adds a
@@ -10314,6 +10324,18 @@ fn claude_oauth_usage_after_response(
     )
 }
 
+/// The binding is held until its next slot after a saved-reset reading that
+/// was not usable (or had no windows): no provider request in this slot.
+fn claude_oauth_read_held_outcome(
+    result: Result<ClaudeOAuthUsage, String>,
+) -> ClaudeOAuthUsageOutcome {
+    ClaudeOAuthUsageOutcome::from(result).with_check_outcome(
+        "claude_oauth_usage_check_suppressed",
+        "The last Claude saved-reset reading was not usable; no provider request is made before this account's next slot.",
+        current_unix_seconds(),
+    )
+}
+
 /// The saved-reset variant answered with a recognizable saved-reset section
 /// but no windows. Not a shape failure, so no breaker strike: the fresh
 /// saved-reset section is kept, the stored windows and other sections are
@@ -10386,9 +10408,10 @@ fn claude_oauth_saved_resets_without_windows(
     if reading.mirror_legacy_default {
         let _ = write_legacy_claude_oauth_usage_cache(&cache);
     }
-    let result = if !cache.windows.is_empty()
-        && now.saturating_sub(cache.observed_at_epoch_seconds)
-            <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
+    // Without a stored reading, the cache holds just this saved-reset section
+    // (no windows), served as such.
+    let result = if now.saturating_sub(cache.observed_at_epoch_seconds)
+        <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
     {
         Ok(claude_oauth_usage_from_cache(cache, now))
     } else {

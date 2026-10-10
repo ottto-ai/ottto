@@ -609,6 +609,42 @@ pub(super) fn claude_usage_slot_seconds(
     }
 }
 
+/// Whether the binding's "not before next slot" hold applies now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClaudeReadHold {
+    pub(super) active: bool,
+    /// A stale hold was dropped from `schedule` (persist it).
+    pub(super) cleared: bool,
+}
+
+/// The hold set by an unusable saved-reset reading. A value more than one
+/// slot ahead of `now` can only come from the clock stepping back after it
+/// was written: it is ignored and cleared, so a corrected clock never holds a
+/// binding for longer than one slot.
+pub(super) fn claude_read_held(
+    schedule: &mut ClaudeReadSchedule,
+    slot_seconds: u64,
+    now: u64,
+) -> ClaudeReadHold {
+    match schedule.next_read_not_before {
+        Some(not_before) if not_before > now.saturating_add(slot_seconds) => {
+            schedule.next_read_not_before = None;
+            ClaudeReadHold {
+                active: false,
+                cleared: true,
+            }
+        }
+        Some(not_before) => ClaudeReadHold {
+            active: now < not_before,
+            cleared: false,
+        },
+        None => ClaudeReadHold {
+            active: false,
+            cleared: false,
+        },
+    }
+}
+
 /// Whether a slot has elapsed since a reading `age_seconds` old. Readings are
 /// taken inside a collection pass (every ~5 min), so the pass one slot later
 /// can see an age a few seconds short of the slot; this slack admits it at the
@@ -2947,6 +2983,93 @@ mod tests {
             reused.credit_balances[1].grants_observed_at,
             snapshot.credit_balances[1].grants_observed_at
         );
+    }
+
+    #[test]
+    fn read_hold_is_bounded_to_one_slot_ahead() {
+        let now = 1_000_000;
+        let slot = 900;
+        let mut schedule = ClaudeReadSchedule {
+            next_read_not_before: Some(now + slot),
+            ..ClaudeReadSchedule::default()
+        };
+        assert_eq!(
+            claude_read_held(&mut schedule, slot, now),
+            ClaudeReadHold {
+                active: true,
+                cleared: false
+            }
+        );
+        assert!(!claude_read_held(&mut schedule, slot, now + slot).active);
+        // Further ahead than one slot: a clock that stepped back. Ignored and
+        // cleared.
+        schedule.next_read_not_before = Some(now + 10 * slot);
+        assert_eq!(
+            claude_read_held(&mut schedule, slot, now),
+            ClaudeReadHold {
+                active: false,
+                cleared: true
+            }
+        );
+        assert_eq!(schedule.next_read_not_before, None);
+    }
+
+    /// A hold written before the clock stepped back (10 slots ahead) never
+    /// blocks the binding: one read happens.
+    #[test]
+    #[serial_test::serial]
+    fn far_future_hold_after_a_clock_step_does_not_block_reads() {
+        let harness = VariantHarness::new("clock-step");
+        harness.due(ClaudeReadSchedule::default());
+        let mut schedule = harness.schedule();
+        schedule.next_read_not_before = Some(super::super::current_unix_seconds() + 10 * 3_600);
+        write_claude_read_schedule(&harness.state_dir(), &schedule).unwrap();
+        harness.collect(respond_recognized);
+        assert_eq!(REQUESTED.lock().unwrap().len(), 1, "one read happens");
+        assert_eq!(harness.schedule().next_read_not_before, None);
+    }
+
+    /// No stored reading, a cedar-only windowless 200: later passes in the
+    /// slot serve its saved-reset section with the hold's reason, never a
+    /// rate-limit reason, and make no call.
+    #[test]
+    #[serial_test::serial]
+    fn cedar_only_without_a_stored_reading_is_served_for_the_slot() {
+        let harness = VariantHarness::new("cedar-only-cold");
+        harness.due(ClaudeReadSchedule::default());
+        let first = harness.collect(respond_cedar_only);
+        assert_eq!(saved_resets_of(&first).len(), 1);
+        REQUESTED.lock().unwrap().clear();
+        for _ in 0..2 {
+            let held = harness.collect(respond_cedar_only);
+            assert!(REQUESTED.lock().unwrap().is_empty());
+            let saved = saved_resets_of(&held);
+            assert_eq!(saved.len(), 1, "the fresh saved-reset section is served");
+            assert_eq!(saved[0].eligible, Some(true));
+            assert!(held
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "claude_oauth_usage_check_suppressed"));
+        }
+    }
+
+    /// Under the hold, a servable stale stored reading is served.
+    #[test]
+    #[serial_test::serial]
+    fn hold_serves_a_stale_stored_reading() {
+        let harness = VariantHarness::new("hold-stale");
+        let _ = std::fs::remove_file(harness.state_dir().join(CLAUDE_READ_SCHEDULE_FILE));
+        harness.collect(respond_plain);
+        harness.due_keeping_reading();
+        let mut schedule = harness.schedule();
+        schedule.next_read_not_before = Some(super::super::current_unix_seconds() + 600);
+        write_claude_read_schedule(&harness.state_dir(), &schedule).unwrap();
+        REQUESTED.lock().unwrap().clear();
+        let held = harness.collect(respond_plain);
+        assert!(REQUESTED.lock().unwrap().is_empty());
+        let usage = held.result.as_ref().expect("stale stored reading served");
+        assert!(!usage.windows.is_empty());
+        assert!(!usage.credit_balances.is_empty());
     }
 
     #[test]
