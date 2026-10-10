@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 527,
-  "content_sha256": "ffc602783963d5ce4392126f20cdbadebd781d40d58a316041652a98b1d48baf",
+  "content_sha256": "789a8358837129d95f810e3a9da4309e876863bd5dd5145d3bd7e6adae9a8004",
   "files": [
     {
       "executable": false,
@@ -678,8 +678,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "bd14020c27d9e17dd3ae39a178a6d8b522a8e0cde83cf79d80a2a8ba4c1f5187",
-      "size_bytes": 1345674
+      "sha256": "a419bbf87527957203d9e63ee0384f9362792b8cd51e8866b17caf52a2f2da8e",
+      "size_bytes": 1348269
     },
     {
       "executable": false,
@@ -2442,8 +2442,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-10-codex-probe-diagnostics.md",
-      "sha256": "b15261fa6a54519dd44dd7dda123c072002cb9470fd7630e8b3160ad585920d2",
-      "size_bytes": 2663
+      "sha256": "42daed62e41b35019d0bbb0eab33270af3fb82369a275f84d3de0ce2394c35f3",
+      "size_bytes": 3069
     },
     {
       "executable": false,
@@ -3692,7 +3692,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-10T07:45:39+00:00",
+  "generated_at": "2026-10-10T08:13:59+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 528,
   "public_roots": [
@@ -3731,5 +3731,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "453f6a5d007e522ba93788f626b4f389cd68d908"
+  "source_commit": "a62a68712a65b1c6f3cf146884d0f078a16c83dd"
 }
