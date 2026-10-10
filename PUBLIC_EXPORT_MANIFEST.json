@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 533,
-  "content_sha256": "ba389345e865f5eb45ef4a68bc83844ab5b008d39272343bd2e1e301decad5ed",
+  "candidate_file_count": 534,
+  "content_sha256": "221f62e546b8adb581ee78c876a628ce44f9d9b7a0617663382f3796fc26f38a",
   "files": [
     {
       "executable": false,
@@ -1091,8 +1091,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "fe6a64279d3220ec53eef5d68e4859d6c6c9660cc39c570151b9f829798e8060",
-      "size_bytes": 728830
+      "sha256": "9d7dd27ea38c745041d498ba3489a1c0917fbafa1c3b4b8c9a64af7f80f682c1",
+      "size_bytes": 729745
     },
     {
       "executable": false,
@@ -1105,8 +1105,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "59d5da054e5629714997112a2de96ab93674fd2e06d9551a32fc0aef3b9ced36",
-      "size_bytes": 2332098
+      "sha256": "d4b5e12fb7c5e8002d426b41f1e0b63390c51c40547e9bfed589053fa1735456",
+      "size_bytes": 2332558
     },
     {
       "executable": false,
@@ -1126,15 +1126,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_account_tests.rs",
-      "sha256": "e235f4b6c96d55e20b1cb5061116f63bfd43c942ac3e50f32cc1db7fceccfe98",
-      "size_bytes": 21237
+      "sha256": "863648126035d92f3227095e28e5083ef0a2eff145f4768ae62fe733cc99bc61",
+      "size_bytes": 34732
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_accounts.rs",
-      "sha256": "7122bc2a73246b75dfa0f5928229000726a0cefae50abf817c05107a364b84f5",
-      "size_bytes": 18438
+      "sha256": "0df50e635c34a02fc89e7f9a3f49430971025bae7f40f52b88f2d2565812a927",
+      "size_bytes": 19327
     },
     {
       "executable": false,
@@ -2469,6 +2469,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-11-claude-root-request-evidence.md",
+      "sha256": "ff60ba0c0150d602399ce49504d4822904b8ad636d6a520c9a91fb49740b6d76",
+      "size_bytes": 3047
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -3734,9 +3741,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-10T08:30:03+00:00",
+  "generated_at": "2026-10-10T21:27:47Z",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 534,
+  "output_file_count": 535,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
