@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 533,
-  "content_sha256": "c23c20197d452c83d364430817f4523c24b54a2281a8418cc4433b1efa46673e",
+  "content_sha256": "e140cac42c5ba1ead6ba1b7f02d5404284ac86b917f3cb6ef88e79788da184fd",
   "files": [
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/claude_credit_pools.rs",
-      "sha256": "14f87e534e9f7ef47e924badd57262e4bf430c9e186e5e27b542cb629dbaba61",
-      "size_bytes": 131569
+      "sha256": "6fa5523c28b48966f6936f1d7f90fdfd9d07edd5465b5494cd6acb5e07384d33",
+      "size_bytes": 131772
     },
     {
       "executable": false,
@@ -3734,7 +3734,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-10T08:35:30+00:00",
+  "generated_at": "2026-10-10T08:59:27+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 534,
   "public_roots": [
@@ -3773,5 +3773,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "7d13804799ecd0f0bd7b5d6f16d16ddf82c9804e"
+  "source_commit": "d42ce2aa981c60b7add0f7e4796e9ec0bd08e76f"
 }
