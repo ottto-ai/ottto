@@ -54,11 +54,16 @@ the stored windows and other sections are served unchanged, and the next read
 moves out by one slot. With no stored reading at all, an unusable or
 windowless variant still holds the binding until its next slot (a
 "not before" time in the read schedule), so it never leads to a plain call in
-the same slot. During that hold a servable stored reading is served (a
-cedar-only reading with no stored windows serves its saved-reset section),
-with the hold's own reason. A "not before" time more than one slot ahead can
-only come from the clock stepping back after it was written, so it is ignored
-and cleared. The stored reading's `next_refresh_after` is not bounded the same
+the same slot. During that hold a servable stored reading (with windows) is
+served, with the hold's own reason. A cedar-only reading with no stored
+windows keeps its saved-reset section in the stored reading for the next
+reading; until windows return, the snapshot shows no OAuth quota for that
+binding (both callers drop a reading without windows), exactly as before the
+read. A "not before" time further ahead than the longest slot any binding can
+have (the idle slot's 3 h maximum) can only come from the clock stepping back
+after it was written, so it is ignored and cleared; bounding by the longest
+slot, not the current one, keeps the hold when the account turns active and
+its slot shrinks. The stored reading's `next_refresh_after` is not bounded the same
 way, because it also carries a provider Retry-After, which may be longer than
 a slot. Other variant HTTP errors (401/403, 429, 5xx) follow the
 existing backoff; a variant 429 counts toward the shared rate-limit breaker,

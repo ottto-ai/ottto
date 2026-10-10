@@ -5982,7 +5982,7 @@ fn safe_claude_slot_check_diagnostics(
         }
         let message = match diagnostic.code.as_str() {
             "claude_oauth_usage_check_failed" => "The exact-account quota provider request failed.",
-            "claude_oauth_usage_check_suppressed" => "The local quota breaker suppressed the provider request; no provider check was made.",
+            "claude_oauth_usage_check_suppressed" => "A local hold (quota breaker, credential backoff or this account's read slot) suppressed the provider request; no provider check was made.",
             "claude_oauth_usage_cache_reused" => CLAUDE_CACHE_REUSED_MESSAGE,
             "claude_oauth_usage_check_succeeded" => "A supported exact-account quota response was collected successfully.",
             "claude_oauth_usage_network_disabled" => "Quota network collection is disabled on this machine.",
@@ -9789,9 +9789,10 @@ fn collect_claude_oauth_usage_unstamped(
             // A stored reading without windows under the hold: the saved-reset
             // section of a windowless variant read, served for this slot.
             if held.active && cache.windows.is_empty() {
-                return claude_oauth_read_held_outcome(Ok(claude_oauth_usage_from_cache(
-                    cache, now,
-                )));
+                return claude_oauth_read_held_outcome(
+                    Ok(claude_oauth_usage_from_cache(cache, now)),
+                    now,
+                );
             }
             return ClaudeOAuthUsageOutcome::from(Err(
                 "Claude OAuth usage endpoint is rate limited.".to_string(),
@@ -9805,12 +9806,15 @@ fn collect_claude_oauth_usage_unstamped(
     // The hold applies even without a stored reading to serve; a servable
     // stale reading is served.
     if held.active {
-        return claude_oauth_read_held_outcome(match exact_stale_fallback {
-            Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
-            None => {
-                Err("Claude usage for this account is read again at its next slot.".to_string())
-            }
-        });
+        return claude_oauth_read_held_outcome(
+            match exact_stale_fallback {
+                Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
+                None => {
+                    Err("Claude usage for this account is read again at its next slot.".to_string())
+                }
+            },
+            now,
+        );
     }
 
     // Passive input (design R7: active-account freshness): Claude Code's own
@@ -10328,11 +10332,12 @@ fn claude_oauth_usage_after_response(
 /// was not usable (or had no windows): no provider request in this slot.
 fn claude_oauth_read_held_outcome(
     result: Result<ClaudeOAuthUsage, String>,
+    now: u64,
 ) -> ClaudeOAuthUsageOutcome {
     ClaudeOAuthUsageOutcome::from(result).with_check_outcome(
         "claude_oauth_usage_check_suppressed",
         "The last Claude saved-reset reading was not usable; no provider request is made before this account's next slot.",
-        current_unix_seconds(),
+        now,
     )
 }
 

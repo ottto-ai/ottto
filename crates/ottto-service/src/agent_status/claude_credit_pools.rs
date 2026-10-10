@@ -617,17 +617,24 @@ pub(super) struct ClaudeReadHold {
     pub(super) cleared: bool,
 }
 
-/// The hold set by an unusable saved-reset reading. A value more than one
-/// slot ahead of `now` can only come from the clock stepping back after it
-/// was written: it is ignored and cleared, so a corrected clock never holds a
-/// binding for longer than one slot.
+/// The hold set by an unusable saved-reset reading, written one slot ahead.
+/// The slot can shrink after that (the account becomes active), so the bound
+/// is the longest slot any binding can have (the idle slot's maximum): a
+/// value further ahead can only come from the clock stepping back after it
+/// was written, and is ignored and cleared. A corrected clock therefore never
+/// holds a binding for longer than that.
 pub(super) fn claude_read_held(
     schedule: &mut ClaudeReadSchedule,
     slot_seconds: u64,
     now: u64,
 ) -> ClaudeReadHold {
     match schedule.next_read_not_before {
-        Some(not_before) if not_before > now.saturating_add(slot_seconds) => {
+        Some(not_before)
+            if not_before
+                > now.saturating_add(
+                    slot_seconds.max(IDLE_SLOT_BASE_SECONDS + IDLE_SLOT_SPREAD_SECONDS),
+                ) =>
+        {
             schedule.next_read_not_before = None;
             ClaudeReadHold {
                 active: false,
@@ -2986,7 +2993,7 @@ mod tests {
     }
 
     #[test]
-    fn read_hold_is_bounded_to_one_slot_ahead() {
+    fn read_hold_is_bounded_to_the_longest_slot() {
         let now = 1_000_000;
         let slot = 900;
         let mut schedule = ClaudeReadSchedule {
@@ -3001,9 +3008,19 @@ mod tests {
             }
         );
         assert!(!claude_read_held(&mut schedule, slot, now + slot).active);
-        // Further ahead than one slot: a clock that stepped back. Ignored and
-        // cleared.
-        schedule.next_read_not_before = Some(now + 10 * slot);
+        // Written under a default slot, read under a shorter active slot: still
+        // a legitimate hold.
+        schedule.next_read_not_before = Some(now + 3_600);
+        assert_eq!(
+            claude_read_held(&mut schedule, 900, now),
+            ClaudeReadHold {
+                active: true,
+                cleared: false
+            }
+        );
+        // Further ahead than the longest slot (3 h): a clock that stepped back.
+        // Ignored and cleared.
+        schedule.next_read_not_before = Some(now + 4 * 3_600);
         assert_eq!(
             claude_read_held(&mut schedule, slot, now),
             ClaudeReadHold {
@@ -3012,6 +3029,32 @@ mod tests {
             }
         );
         assert_eq!(schedule.next_read_not_before, None);
+    }
+
+    /// No stored reading, a rejected variant, then the account becomes active
+    /// (its slot shrinks to 15 min): the hold written under the longer slot
+    /// still holds, so no plain call follows in the same slot.
+    #[test]
+    #[serial_test::serial]
+    fn hold_survives_the_account_becoming_active() {
+        let harness = VariantHarness::new("hold-activity");
+        harness.due(ClaudeReadSchedule::default());
+        harness.collect(respond_variant_400);
+        assert_eq!(REQUESTED.lock().unwrap().len(), 1);
+        let mut schedule = harness.schedule();
+        schedule.last_activity_at = Some(super::super::current_unix_seconds());
+        write_claude_read_schedule(&harness.state_dir(), &schedule).unwrap();
+        REQUESTED.lock().unwrap().clear();
+        let held = harness.collect(respond_plain);
+        assert!(
+            REQUESTED.lock().unwrap().is_empty(),
+            "no second call in the slot"
+        );
+        assert!(held
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "claude_oauth_usage_check_suppressed"));
+        assert!(harness.schedule().next_read_not_before.is_some());
     }
 
     /// A hold written before the clock stepped back (10 slots ahead) never
