@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 526,
-  "content_sha256": "7caef120d88990c7bb4d9bab521b19851e96d0d18195c7721a7e39780ba59793",
+  "candidate_file_count": 527,
+  "content_sha256": "d3297b5a4241b0471a78483f9516b01b2e851d90bbd48584f7dbe1ec33a47af3",
   "files": [
     {
       "executable": false,
@@ -986,15 +986,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/quota_credit_model.rs",
-      "sha256": "ede699cc5009f848c0afb07ac0a314ca5ee0080f14bb85b997d23a77b28c8896",
-      "size_bytes": 40522
+      "sha256": "c9f5ce284424fcf3b5bf7d527cf959cbd01a232dc03bcce7c692316129df7c43",
+      "size_bytes": 41566
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/quota_credit_model/tests.rs",
-      "sha256": "a76d326826b5e68b81bde37c94be539138f5b659972f9512a45ded0823c654c7",
-      "size_bytes": 71038
+      "sha256": "112b585a1c3662500eff1b1ac2f41938d1b393cafa72eb214422b8f3f3bbe079",
+      "size_bytes": 72534
     },
     {
       "executable": false,
@@ -2455,6 +2455,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-10-quota-one-time-codename.md",
+      "sha256": "a509f65f1757b803846caff6ed36b8e96382af4bac6efb4d57880361999dab25",
+      "size_bytes": 1382
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -3685,9 +3692,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-09T23:56:31+00:00",
+  "generated_at": "2026-10-10T07:33:16+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 527,
+  "output_file_count": 528,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3724,5 +3731,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b72e816b3f5cd5dbce4776d54c1211d0d1adb143"
+  "source_commit": "e30aa68229f3f7904bc84546a98af6a3f33b21b8"
 }
