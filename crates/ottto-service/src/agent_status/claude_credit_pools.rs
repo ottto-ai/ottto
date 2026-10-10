@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use ottto_protocol::{
-    is_credit_reason_code, ActiveSessionReconciliation, AgentCreditBalance, AgentCreditBalanceUnit,
+    ActiveSessionReconciliation, AgentCreditBalance, AgentCreditBalanceUnit,
     AgentQuotaWindowFreshness, CreditBalanceKind,
 };
 use serde::{Deserialize, Serialize};
@@ -317,15 +317,9 @@ fn claude_one_time_credits(
             let pool = object.get(key)?.as_object()?;
             pool.get("limit_dollars")
                 .filter(|value| value.is_number())?;
-            // The codename is the pool's `limit_id`: a closed code shape. A
-            // pool whose codename is not one is refused, visibly.
-            if !is_credit_reason_code(key) {
-                diagnostics.push(CreditModelDiagnostic {
-                    code: "field_refused",
-                    field: "limit_id",
-                });
-                return None;
-            }
+            // The codename becomes the pool's `limit_id`; the model refuses a
+            // codename that is not a closed code shape (or is secret-shaped),
+            // and the pool is skipped with that refusal's diagnostic.
             let (balance, refused) = match one_time_credit(
                 key,
                 string_field(pool, "label"),
@@ -1513,6 +1507,34 @@ mod tests {
         assert_eq!(replaced.remaining, Some(0));
     }
 
+    /// The model owns the codename check: a pool whose codename is not a code,
+    /// or is secret-shaped, is skipped with the model's `limit_id` refusal.
+    #[test]
+    fn refused_codename_pools_are_skipped_with_the_model_refusal() {
+        let mut body = plain_max_body();
+        body["Bad Pool"] = json!({"limit_dollars": 5, "used_dollars": 0, "remaining_dollars": 5});
+        body["sk-synthetic"] =
+            json!({"limit_dollars": 5, "used_dollars": 0, "remaining_dollars": 5});
+        let read = claude_credit_read(&body, ClaudeUsageRead::Plain, READ_AT);
+        let pools = read.one_time_credits.unwrap();
+        assert_eq!(
+            pools
+                .iter()
+                .map(|pool| pool.limit_id.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("iguana_necktie")]
+        );
+        let limit_id_refusals = read
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                **diagnostic
+                    == crate::quota_credit_model::OneTimeCreditRefusal::LimitId.diagnostic()
+            })
+            .count();
+        assert_eq!(limit_id_refusals, 2);
+    }
+
     #[test]
     fn refused_reason_and_codename_are_diagnosed_not_silent() {
         let mut body = plain_max_body();
@@ -2321,11 +2343,13 @@ mod tests {
     }
 
     /// Each canonical Claude provider body, read once on a cold binding,
-    /// produces the canonical expected balances.
+    /// produces the canonical expected wire file byte for byte (rendered the
+    /// way the model writes it: pretty JSON, sorted keys, trailing newline).
     #[test]
     fn canonical_claude_fixtures_match_expected_wire() {
         for name in [
             "claude-oauth-usage-plain",
+            "claude-oauth-usage-credits-off",
             "claude-usage-cedar",
             "claude-usage-cedar-ineligible",
             "claude-usage-cedar-refused-expiry",
@@ -2333,12 +2357,15 @@ mod tests {
             let body = fixture(&format!("provider/{name}.json"));
             let read = claude_credit_read(&body, ClaudeUsageRead::Plain, "2026-10-01T12:00:00Z");
             let emitted = claude_merge_credit_sections("fixture", &[], &read);
-            let expected = fixture(&format!("expected/{name}.wire.json"));
-            assert_eq!(
-                comparable(&serde_json::to_value(&emitted).unwrap()),
-                comparable(&expected["credit_balances"]),
-                "{name}"
-            );
+            let mut rendered = serde_json::to_string_pretty(
+                &json!({ "credit_balances": serde_json::to_value(&emitted).unwrap() }),
+            )
+            .unwrap();
+            rendered.push('\n');
+            let on_disk =
+                std::fs::read_to_string(fixture_dir().join(format!("expected/{name}.wire.json")))
+                    .unwrap();
+            assert_eq!(rendered, on_disk, "{name}");
             assert!(emitted.iter().all(|balance| balance.enabled != Some(true)
                 || balance.kind != Some(CreditBalanceKind::OneTimeCredit)));
         }

@@ -22,8 +22,9 @@ adapter module, `agent_status/claude_credit_pools.rs`.
   cents from `*_dollars`, `expires_at` = the pool's `resets_at` (an expiry, not
   a cycle), `title` = `label` when present, `enabled` absent. Null pools, pools
   whose expiry passed before the read, and the percent-only `cinder_cove` are
-  skipped; a pool whose codename is not a code-shaped `limit_id` is refused
-  with a field refusal.
+  skipped; a pool whose codename is not a code-shaped, privacy-safe
+  `limit_id` is refused by the model (`one_time_credit`) and skipped with its
+  `field_refused:limit_id` refusal.
 - **Saved resets.** `cedar_ember` maps to one `reset_bank` balance
   (`unit: resets`, `kind: saved_resets`) whose grants, `grants_state`,
   `grant_count`, `remaining`, `status` and expiry summary come from the model.
