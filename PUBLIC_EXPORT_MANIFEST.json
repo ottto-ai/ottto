@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 534,
-  "content_sha256": "08118c851f189675e1fd36b3e6519fb999cf6afe2106076d6219c5d21e2a1e2f",
+  "content_sha256": "51c082d678fc3b77733dcfa54d46c4595eba952b8a99b0bab0de59f0bdebbf7d",
   "files": [
     {
       "executable": false,
@@ -678,8 +678,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "b97c587a2711fd290e59ea73b71137f81a7a22811a1e703aecb9a507b35d5710",
-      "size_bytes": 1356360
+      "sha256": "5bb447ac223cef12a065afe3dfe1d81b0ca1e05967d4284cbe92d1fca49dbca2",
+      "size_bytes": 1356649
     },
     {
       "executable": false,
@@ -692,8 +692,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/codex_credit_grants.rs",
-      "sha256": "4e0b77fe3a19c852ba2f11f54efc092b55c10a678206a6df2bac76ef0e971aa9",
-      "size_bytes": 75718
+      "sha256": "32e34eab18aa723fc43d0c40eea790a418e34153f45464528ccd94c19965d9ee",
+      "size_bytes": 77312
     },
     {
       "executable": false,
@@ -2449,8 +2449,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-10-codex-saved-reset-grants.md",
-      "sha256": "dbbcdc78da9fab70404ff0b9cffe952dce51b615849230c98fde100dedc90fa1",
-      "size_bytes": 8566
+      "sha256": "2c2b601a4943949cdcec0e97cf2938da94423fd4584fe24ab5170407eb8b499b",
+      "size_bytes": 8780
     },
     {
       "executable": false,
@@ -3741,7 +3741,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-10T08:50:16+00:00",
+  "generated_at": "2026-10-10T09:01:27+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 535,
   "public_roots": [
@@ -3780,5 +3780,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "9a5074899665ff7c60f91185df878026b95d09ff"
+  "source_commit": "102c25546fdf93c6472f6d4472cb91a2c3c84f3d"
 }
