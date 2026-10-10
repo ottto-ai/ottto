@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 527,
-  "content_sha256": "ad4535d7f41290d5347a42a7796d8939e7c72846949307b766cbf79b4f745e5d",
+  "candidate_file_count": 533,
+  "content_sha256": "c23c20197d452c83d364430817f4523c24b54a2281a8418cc4433b1efa46673e",
   "files": [
     {
       "executable": false,
@@ -678,15 +678,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "7997113602c13d27a268caa12c7345334d40cb2bcb67b810788a78a8c5036c6b",
-      "size_bytes": 1396372
+      "sha256": "4748a98d0546fa34f00c18abb927b4e02baff23e77c00513d03d135f6996cd66",
+      "size_bytes": 1396505
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/claude_credit_pools.rs",
-      "sha256": "48e4055ba22a054df6cfcf87c688e38f751b072deb9684df5a0a48898e4428fc",
-      "size_bytes": 129748
+      "sha256": "14f87e534e9f7ef47e924badd57262e4bf430c9e186e5e27b542cb629dbaba61",
+      "size_bytes": 131569
     },
     {
       "executable": false,
@@ -986,15 +986,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/quota_credit_model.rs",
-      "sha256": "ede699cc5009f848c0afb07ac0a314ca5ee0080f14bb85b997d23a77b28c8896",
-      "size_bytes": 40522
+      "sha256": "5b4ab4f40dc25ce7748132895ea1551df65d23712f15187e1ad5099a3381b318",
+      "size_bytes": 41903
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/quota_credit_model/tests.rs",
-      "sha256": "a76d326826b5e68b81bde37c94be539138f5b659972f9512a45ded0823c654c7",
-      "size_bytes": 71038
+      "sha256": "df66dba76cddcab8217ba4ec79a075af32998169a83ac2bcbfbbf11d9c76a9d5",
+      "size_bytes": 76352
     },
     {
       "executable": false,
@@ -2442,8 +2442,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-10-claude-credit-pools-cadence.md",
-      "sha256": "48e3c2ce2d55dd2e6ad291c8c039e973b879819761987b24ac7d261775a4bbd9",
-      "size_bytes": 12138
+      "sha256": "b695e47288c57e6c44450649ad7e769c49a9aad74ffc5c936a2bb53ba0a658c5",
+      "size_bytes": 12522
     },
     {
       "executable": false,
@@ -2458,6 +2458,13 @@
       "path": "docs/session-2026-10-10-quota-credit-model.md",
       "sha256": "a90c2aa8143904484c7b485f6f08b58e0f0c6436300cadf0cf7f9aa47f67b97c",
       "size_bytes": 3299
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-10-quota-one-time-codename.md",
+      "sha256": "302958bf63bb3c2a974b5536ed23c84af0723e069229a0fce5e6a32e3f17ac01",
+      "size_bytes": 2033
     },
     {
       "executable": false,
@@ -2540,8 +2547,15 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/README.md",
-      "sha256": "5e24c9bf689e2d8a32cac9d9d4fcb795ca1d2241171c40c40c48d0a3fbcce863",
-      "size_bytes": 5003
+      "sha256": "c8addc4b60d9a4df64fe9d3bbd47bf03d3e19741aa911d73ce7ee9eef8cbd50f",
+      "size_bytes": 5798
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/expected/claude-oauth-usage-credits-off.wire.json",
+      "sha256": "adc6404d4fd2b40adc5a2278f3c23edbabdcb747e4e522590700868d6bff9bf8",
+      "size_bytes": 299
     },
     {
       "executable": false,
@@ -2574,6 +2588,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/expected/codex-rate-limits-plan-and-workspace.wire.json",
+      "sha256": "e8f10e098aa00aefe93eef3ea1647814bab485b7e62bdb1f6990f5d0f6c9a7e3",
+      "size_bytes": 715
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/codex-reset-credits-21.wire.json",
       "sha256": "4ebbc27e22fe12a1ea7df90014936292192ce7e3188bb5ecd36540258fa6dfc2",
       "size_bytes": 6744
@@ -2602,6 +2623,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/expected/legacy-no-kind.wire.json",
+      "sha256": "33ff0d6a18e3d2ae847d590c8b5b5553a2937a032ec75127892d1b4ef42ccfa4",
+      "size_bytes": 1077
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/sequence-claude-plain-saved-resets.wire.json",
       "sha256": "8deeef8d9cccd84464cd84eae43b972e4f8be00c80765d8f60c096c3779d980c",
       "size_bytes": 14043
@@ -2612,6 +2640,13 @@
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/sequence-codex-reset-credits.wire.json",
       "sha256": "f714c238c0c654d27bcc142cea6c149b34885c12adb2d3589ee3cd483ff0ecbc",
       "size_bytes": 6399
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/provider/claude-oauth-usage-credits-off.json",
+      "sha256": "6583a3b87f10fdb08ad91987204a5a4b443db49ce7632db39e93dd9e47c39698",
+      "size_bytes": 947
     },
     {
       "executable": false,
@@ -2640,6 +2675,13 @@
       "path": "fixtures/agent-status/quota-contract-v2.2/provider/claude-usage-cedar.json",
       "sha256": "47c2a6f0bad4b2083589abd353b8d4fa0a72c3de166eef76f552dc453f1c9c60",
       "size_bytes": 2582
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/provider/codex-rate-limits-plan-and-workspace.json",
+      "sha256": "09618459baf3f7715d164cb4d3383ecfd02f74c71c7a9160beb36f14c14409f4",
+      "size_bytes": 439
     },
     {
       "executable": false,
@@ -3692,9 +3734,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-10T07:47:23+00:00",
+  "generated_at": "2026-10-10T08:35:30+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 528,
+  "output_file_count": 534,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3731,5 +3773,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "4e8ffb8a68d249abec61f137ed41a270510152c6"
+  "source_commit": "7d13804799ecd0f0bd7b5d6f16d16ddf82c9804e"
 }

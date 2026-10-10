@@ -166,7 +166,9 @@ pub(crate) enum ListObservation {
         provider: Provider,
         provider_count: Option<u64>,
     },
-    /// The provider/plan has no per-grant details.
+    /// The provider/plan has no per-grant details. No adapter reports this
+    /// yet, so it is test-only until one does.
+    #[cfg(test)]
     NotSupported { provider: Provider },
 }
 
@@ -205,6 +207,8 @@ pub(crate) struct GrantsBuild {
 }
 
 impl GrantsBuild {
+    /// Test-only: adapters take the diagnostics from [`GrantsBuild::apply_to`].
+    #[cfg(test)]
     pub(crate) fn diagnostics(&self) -> &[CreditModelDiagnostic] {
         &self.diagnostics
     }
@@ -254,6 +258,7 @@ pub(crate) fn build_grants(obs: ListObservation) -> GrantsBuild {
                 ..GrantsBuild::default()
             };
         }
+        #[cfg(test)]
         ListObservation::NotSupported { provider } => {
             return GrantsBuild {
                 grants_state: Some(CreditGrantsState::NotSupported),
@@ -791,12 +796,34 @@ pub(crate) fn apply_disabled(
     diagnostics
 }
 
+/// Why [`one_time_credit`] built no balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OneTimeCreditRefusal {
+    /// The pool codename is not a `^[a-z0-9_.-]{1,64}$` code that passes the
+    /// privacy guard. It would become the pool's `limit_id`, which splits the
+    /// history series, so the pool is skipped rather than renamed.
+    LimitId,
+}
+
+impl OneTimeCreditRefusal {
+    /// The diagnostic an adapter records for the skipped pool.
+    pub(crate) fn diagnostic(self) -> CreditModelDiagnostic {
+        match self {
+            Self::LimitId => CreditModelDiagnostic::new("field_refused", "limit_id"),
+        }
+    }
+}
+
 /// A one-time credit pool (contract v2.2 §11.3, names pinned by §11.7 C4):
 /// `name:"one_time_credit"`, `unit:"usd"`, `currency:"USD"`, amounts in
-/// cents, `expires_at` = the pool's expiry, `enabled: None` (the provider
-/// sends no flag), no `resets_at`. The title follows [`bounded_title`] and
-/// both instants are normalized to UTC like grant times; a refused title or
-/// instant comes back as a diagnostic.
+/// cents, `limit_id` = the pool codename, `expires_at` = the pool's expiry,
+/// `enabled: None` (the provider sends no flag), no `resets_at`.
+///
+/// The codename must be a `^[a-z0-9_.-]{1,64}$` code that passes the privacy
+/// guard, else the whole pool is refused ([`OneTimeCreditRefusal::LimitId`]).
+/// The title follows [`bounded_title`] and both instants are normalized to UTC
+/// like grant times; a refused title or instant comes back as a diagnostic on
+/// the built balance.
 pub(crate) fn one_time_credit(
     limit_id: &str,
     title: Field<String>,
@@ -805,7 +832,10 @@ pub(crate) fn one_time_credit(
     remaining_cents: Option<u64>,
     expires_at: TimeInput,
     observed_at: TimeInput,
-) -> (AgentCreditBalance, Vec<CreditModelDiagnostic>) {
+) -> Result<(AgentCreditBalance, Vec<CreditModelDiagnostic>), OneTimeCreditRefusal> {
+    if !is_credit_reason_code(limit_id) || !is_backend_safe_credit_text(limit_id) {
+        return Err(OneTimeCreditRefusal::LimitId);
+    }
     let (title, title_diagnostic) = bounded_title(title, "title");
     let mut diagnostics = title_diagnostic.into_iter().collect::<Vec<_>>();
     let mut instant = |input: TimeInput, field: &'static str| {
@@ -832,7 +862,7 @@ pub(crate) fn one_time_credit(
         title,
         ..Default::default()
     };
-    (balance, diagnostics)
+    Ok((balance, diagnostics))
 }
 
 /// The grant-list part of a balance, cached so a reading without details can
@@ -933,10 +963,9 @@ const SECTION_CACHE_MAX_ENTRIES: usize = 64;
 /// Sender stability across read cadence (design R7b; contract v2.2 §11.5,
 /// §11.7 C8/C9).
 ///
-/// - Keyed by [`BindingKey`] (credential identity) and [`CreditSection`]. An
-///   entry is dropped only by [`SectionCache::clear_binding`] when that
-///   binding's identity changes, or by the size bound, so A→B→A keeps A's
-///   sections.
+/// - Keyed by [`BindingKey`] (credential identity) and [`CreditSection`]. A
+///   slot that switches account reads under a new key, and entries leave only
+///   by the size bound, so A→B→A keeps A's sections.
 /// - A re-sent section is the last observed one unchanged: original
 ///   `observed_at`/`grants_observed_at`, same presence, `grants`,
 ///   `grants_state` and `status`. `updated_at` is never carried over: re-sent
@@ -1059,7 +1088,10 @@ impl SectionCache {
         }
     }
 
-    /// The binding's credential identity changed: forget every section it had.
+    /// Forget every section of `binding`. Test-only: the key is the credential
+    /// identity, so a binding whose identity changes is simply a new key and
+    /// the old identity's sections age out under the size bound.
+    #[cfg(test)]
     pub(crate) fn clear_binding(&mut self, binding: &BindingKey) {
         self.entries.retain(|(key, _), _| key != binding);
     }
