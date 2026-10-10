@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 527,
-  "content_sha256": "789a8358837129d95f810e3a9da4309e876863bd5dd5145d3bd7e6adae9a8004",
+  "candidate_file_count": 533,
+  "content_sha256": "ba389345e865f5eb45ef4a68bc83844ab5b008d39272343bd2e1e301decad5ed",
   "files": [
     {
       "executable": false,
@@ -986,15 +986,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/quota_credit_model.rs",
-      "sha256": "ede699cc5009f848c0afb07ac0a314ca5ee0080f14bb85b997d23a77b28c8896",
-      "size_bytes": 40522
+      "sha256": "5b4ab4f40dc25ce7748132895ea1551df65d23712f15187e1ad5099a3381b318",
+      "size_bytes": 41903
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/quota_credit_model/tests.rs",
-      "sha256": "a76d326826b5e68b81bde37c94be539138f5b659972f9512a45ded0823c654c7",
-      "size_bytes": 71038
+      "sha256": "df66dba76cddcab8217ba4ec79a075af32998169a83ac2bcbfbbf11d9c76a9d5",
+      "size_bytes": 76352
     },
     {
       "executable": false,
@@ -2462,6 +2462,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-10-quota-one-time-codename.md",
+      "sha256": "302958bf63bb3c2a974b5536ed23c84af0723e069229a0fce5e6a32e3f17ac01",
+      "size_bytes": 2033
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -2540,8 +2547,15 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/README.md",
-      "sha256": "5e24c9bf689e2d8a32cac9d9d4fcb795ca1d2241171c40c40c48d0a3fbcce863",
-      "size_bytes": 5003
+      "sha256": "c8addc4b60d9a4df64fe9d3bbd47bf03d3e19741aa911d73ce7ee9eef8cbd50f",
+      "size_bytes": 5798
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/expected/claude-oauth-usage-credits-off.wire.json",
+      "sha256": "adc6404d4fd2b40adc5a2278f3c23edbabdcb747e4e522590700868d6bff9bf8",
+      "size_bytes": 299
     },
     {
       "executable": false,
@@ -2574,6 +2588,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/expected/codex-rate-limits-plan-and-workspace.wire.json",
+      "sha256": "e8f10e098aa00aefe93eef3ea1647814bab485b7e62bdb1f6990f5d0f6c9a7e3",
+      "size_bytes": 715
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/codex-reset-credits-21.wire.json",
       "sha256": "4ebbc27e22fe12a1ea7df90014936292192ce7e3188bb5ecd36540258fa6dfc2",
       "size_bytes": 6744
@@ -2602,6 +2623,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/expected/legacy-no-kind.wire.json",
+      "sha256": "33ff0d6a18e3d2ae847d590c8b5b5553a2937a032ec75127892d1b4ef42ccfa4",
+      "size_bytes": 1077
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/sequence-claude-plain-saved-resets.wire.json",
       "sha256": "8deeef8d9cccd84464cd84eae43b972e4f8be00c80765d8f60c096c3779d980c",
       "size_bytes": 14043
@@ -2612,6 +2640,13 @@
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/sequence-codex-reset-credits.wire.json",
       "sha256": "f714c238c0c654d27bcc142cea6c149b34885c12adb2d3589ee3cd483ff0ecbc",
       "size_bytes": 6399
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/provider/claude-oauth-usage-credits-off.json",
+      "sha256": "6583a3b87f10fdb08ad91987204a5a4b443db49ce7632db39e93dd9e47c39698",
+      "size_bytes": 947
     },
     {
       "executable": false,
@@ -2640,6 +2675,13 @@
       "path": "fixtures/agent-status/quota-contract-v2.2/provider/claude-usage-cedar.json",
       "sha256": "47c2a6f0bad4b2083589abd353b8d4fa0a72c3de166eef76f552dc453f1c9c60",
       "size_bytes": 2582
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/provider/codex-rate-limits-plan-and-workspace.json",
+      "sha256": "09618459baf3f7715d164cb4d3383ecfd02f74c71c7a9160beb36f14c14409f4",
+      "size_bytes": 439
     },
     {
       "executable": false,
@@ -3692,9 +3734,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-10T08:13:59+00:00",
+  "generated_at": "2026-10-10T08:30:03+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 528,
+  "output_file_count": 534,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3731,5 +3773,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "a62a68712a65b1c6f3cf146884d0f078a16c83dd"
+  "source_commit": "ff9513f36ecd6b86b1e62b85a4e032cdd975cee9"
 }
