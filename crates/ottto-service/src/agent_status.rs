@@ -13059,6 +13059,45 @@ fn codex_app_server_success_diagnostic(
     )
 }
 
+/// Fixed producer text only; never persist provider error messages or data.
+fn codex_app_server_rpc_failure(phase: &str, error: &Value) -> String {
+    match error.get("code").and_then(Value::as_i64) {
+        Some(code) => format!("Codex app-server {phase} RPC failed with code {code}."),
+        None => format!("Codex app-server {phase} RPC failed without a numeric code."),
+    }
+}
+
+/// Observe child termination before our cleanup; never report our own kill signal.
+fn codex_app_server_end_failure(
+    phase: &str,
+    disconnected: bool,
+    initialize_error: Option<&str>,
+    child: &mut std::process::Child,
+) -> String {
+    if let Some(message) = initialize_error {
+        return message.to_string();
+    }
+    if !disconnected {
+        return format!("Codex app-server {phase} read timed out.");
+    }
+    let status = child.try_wait().ok().flatten();
+    if let Some(status) = status {
+        if let Some(code) = status.code() {
+            return format!(
+                "Codex app-server stdout closed during {phase}; child exited with code {code}."
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = status.signal() {
+                return format!("Codex app-server stdout closed during {phase}; child terminated by signal {signal}.");
+            }
+        }
+    }
+    format!("Codex app-server stdout closed during {phase}; child termination was not observed before cleanup.")
+}
+
 fn call_codex_app_server_rate_limits_for_home(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
@@ -13149,6 +13188,9 @@ fn call_codex_app_server_rate_limits_for_home(
     }
 
     let start = Instant::now();
+    let mut initialize_error = None;
+    let mut initialize_completed = false;
+    let mut disconnected = false;
     let mut account_result = None;
     let mut rate_limits_result = None;
     let mut rate_limits_requested = false;
@@ -13165,13 +13207,29 @@ fn call_codex_app_server_rate_limits_for_home(
             }
             Ok(Ok(message)) => {
                 let response_id = message.get("id").and_then(Value::as_str);
-                if matches!(response_id, Some("ottto_account" | "ottto_rate_limits"))
-                    && message.get("error").is_some()
+                if message.get("id").and_then(Value::as_i64) == Some(1) {
+                    if let Some(error) = message.get("error") {
+                        initialize_error = Some(codex_app_server_rpc_failure("initialize", error));
+                    } else if message.get("result").is_some() {
+                        initialize_completed = true;
+                    }
+                }
+                if let (Some(id @ ("ottto_account" | "ottto_rate_limits")), Some(error)) =
+                    (response_id, message.get("error"))
                 {
+                    let phase = if id == "ottto_account" {
+                        "account"
+                    } else {
+                        "quota"
+                    };
+                    // An earlier initialize rejection is the likelier cause.
+                    let message = initialize_error
+                        .clone()
+                        .unwrap_or_else(|| codex_app_server_rpc_failure(phase, error));
                     drop(stdin);
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err("Codex app-server account/quota read failed.".to_string());
+                    return Err(message);
                 }
                 if response_id == Some("ottto_account") {
                     account_result = message.get("result").cloned();
@@ -13224,13 +13282,25 @@ fn call_codex_app_server_rate_limits_for_home(
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
         }
     }
+    let phase = if account_result.is_some() {
+        "quota"
+    } else if initialize_completed {
+        "account"
+    } else {
+        "initialize"
+    };
+    let message =
+        codex_app_server_end_failure(phase, disconnected, initialize_error.as_deref(), &mut child);
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
-    Err("Codex app-server rate-limit read timed out.".to_string())
+    Err(message)
 }
 
 fn read_bounded_codex_app_server_stdout<R: BufRead>(
@@ -13247,7 +13317,10 @@ fn read_bounded_codex_app_server_stdout<R: BufRead>(
             .read_until(b'\n', &mut line)
         {
             Ok(read) => read,
-            Err(_) => return,
+            Err(_) => {
+                let _ = sender.send(Err("Codex app-server stdout read failed.".to_string()));
+                return;
+            }
         };
         if read == 0 {
             return;
@@ -19700,6 +19773,281 @@ for line in sys.stdin:
             .as_ref()
             .expect_err("message count must fail")
             .contains("message limit"));
+    }
+
+    /// A scripted Codex app-server for the rate-limit probe's failure
+    /// messages. `mode` picks the failure; provider text and data markers in
+    /// every error must never reach a returned message.
+    const CODEX_PROBE_FAILURE_FAKE: &str = r#"import json
+import os
+import signal
+import sys
+import time
+
+if sys.argv[1:] != ["app-server", "--stdio"]:
+    sys.exit(1)
+mode = os.environ["FAKE_CODEX_MODE"]
+if mode in ("early_exit", "signal_exit", "line_bound", "message_bound", "total_bound"):
+    # Take initialize, initialized and account/read first, so the collector's
+    # opening writes never race this process's exit.
+    for _ in range(3):
+        sys.stdin.readline()
+if mode == "early_exit":
+    sys.exit(2)
+if mode == "signal_exit":
+    os.kill(os.getpid(), signal.SIGTERM)
+if mode == "line_bound":
+    print("x" * (256 * 1024 + 1), flush=True)
+    sys.exit(0)
+if mode == "message_bound":
+    print("{}\n" * 257, end="", flush=True)
+    sys.exit(0)
+if mode == "total_bound":
+    print(("x" * 20000 + "\n") * 106, end="", flush=True)
+    sys.exit(0)
+PROVIDER_ERROR = {"message": "sensitive-provider-text", "data": {"url": "private-url-marker"}}
+
+def reply(request_id, result=None, code=None, with_code=True):
+    if result is not None:
+        print(json.dumps({"id": request_id, "result": result}), flush=True)
+        return
+    error = dict(PROVIDER_ERROR)
+    if with_code:
+        error["code"] = code
+    print(json.dumps({"id": request_id, "error": error}), flush=True)
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "initialize":
+        if mode in ("initialize_error", "initialize_error_then_success", "initialize_error_then_account_error"):
+            reply(1, code=-32602)
+            if mode == "initialize_error":
+                sys.exit(0)
+        else:
+            reply(1, {})
+    elif method == "account/read":
+        if mode == "account_timeout":
+            time.sleep(60)
+        if mode in ("account_error", "initialize_error_then_account_error"):
+            reply(request_id, code=-32603)
+            sys.exit(0)
+        if mode == "account_error_without_code":
+            reply(request_id, with_code=False)
+            sys.exit(0)
+        reply(request_id, {"account": {"type": "chatgpt", "planType": "pro"}})
+    elif method == "account/rateLimits/read":
+        if mode == "quota_eof":
+            # The quota request arrived; go away without answering it.
+            sys.exit(0)
+        if mode == "quota_error":
+            reply(request_id, code=-32603)
+            sys.exit(0)
+        reply(request_id, {"rateLimits": {"primary": {"usedPercent": 25, "windowDurationMins": 300}}})
+"#;
+
+    /// Run the probe against [`CODEX_PROBE_FAILURE_FAKE`] in `mode` with an
+    /// empty synthetic Codex home.
+    #[cfg(unix)]
+    fn run_codex_probe_failure_fake(mode: &str) -> Result<CodexAppServerObservation, String> {
+        let dir = crate::test_scratch::ScratchDir::new("codex-probe-failure");
+        let home = dir.join("codex-home");
+        std::fs::create_dir_all(&home).expect("synthetic codex home");
+        let script = dir.join("fake_codex.py");
+        std::fs::write(&script, CODEX_PROBE_FAILURE_FAKE).expect("fake app-server");
+        // The app-server child gets a cleared environment, so the launcher
+        // carries the mode.
+        let executable = dir.join("codex");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nFAKE_CODEX_MODE='{mode}' exec /usr/bin/python3 '{}' \"$@\"\n",
+                script.display()
+            ),
+        )
+        .expect("fake codex");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("fake codex mode");
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
+        call_codex_app_server_rate_limits_for_home(&home, CodexHomeTrust::Managed)
+    }
+
+    fn assert_no_provider_text(message: &str) {
+        assert!(
+            !message.contains("sensitive-provider-text") && !message.contains("private-url-marker"),
+            "provider text leaked: {message}"
+        );
+    }
+
+    /// The child's own exit is reported only when it was observed before our
+    /// cleanup; our kill is never attributed to it.
+    fn assert_closed_during(message: &str, phase: &str, observed_end: &str) {
+        let prefix = format!("Codex app-server stdout closed during {phase}; ");
+        let rest = message
+            .strip_prefix(&prefix)
+            .unwrap_or_else(|| panic!("unexpected message: {message}"));
+        assert!(
+            rest == observed_end || rest == "child termination was not observed before cleanup.",
+            "unexpected end: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_probe_failures_name_the_phase_and_numeric_code_only() {
+        for (mode, expected) in [
+            (
+                "initialize_error",
+                "Codex app-server initialize RPC failed with code -32602.",
+            ),
+            (
+                "account_error",
+                "Codex app-server account RPC failed with code -32603.",
+            ),
+            // The earlier initialize rejection, not the account error it
+            // caused, is reported.
+            (
+                "initialize_error_then_account_error",
+                "Codex app-server initialize RPC failed with code -32602.",
+            ),
+            (
+                "account_error_without_code",
+                "Codex app-server account RPC failed without a numeric code.",
+            ),
+            (
+                "quota_error",
+                "Codex app-server quota RPC failed with code -32603.",
+            ),
+            // The reader bounds are unchanged: 256 KiB line, 256 messages,
+            // 2 MiB total.
+            (
+                "line_bound",
+                "Codex app-server output exceeded its byte limit.",
+            ),
+            (
+                "message_bound",
+                "Codex app-server output exceeded its message limit.",
+            ),
+            (
+                "total_bound",
+                "Codex app-server output exceeded its byte limit.",
+            ),
+        ] {
+            let message = run_codex_probe_failure_fake(mode).err().expect(mode);
+            assert_eq!(message, expected, "{mode}");
+            assert_no_provider_text(&message);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_probe_eof_names_the_phase_and_an_observed_exit() {
+        for (mode, phase, observed_end) in [
+            ("early_exit", "initialize", "child exited with code 2."),
+            (
+                "signal_exit",
+                "initialize",
+                "child terminated by signal 15.",
+            ),
+            ("quota_eof", "quota", "child exited with code 0."),
+        ] {
+            let message = run_codex_probe_failure_fake(mode).err().expect(mode);
+            assert_closed_during(&message, phase, observed_end);
+            assert_no_provider_text(&message);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_probe_initialize_error_then_success_still_succeeds() {
+        let observation =
+            run_codex_probe_failure_fake("initialize_error_then_success").expect("reading");
+        assert!(observation.rate_limits.get("rateLimits").is_some());
+        assert!(run_codex_probe_failure_fake("success").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_probe_deadline_is_a_timeout_with_its_phase_not_an_eof() {
+        let started = Instant::now();
+        let message = run_codex_probe_failure_fake("account_timeout")
+            .err()
+            .expect("deadline");
+        assert_eq!(message, "Codex app-server account read timed out.");
+        assert!(started.elapsed() >= CODEX_APP_SERVER_TIMEOUT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_app_server_end_failure_reports_only_an_already_observed_exit() {
+        let spawn = |script: &str| {
+            Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("synthetic child")
+        };
+        // `wait` caches the status, so the helper's `try_wait` sees it.
+        let mut exited = spawn("exit 3");
+        exited.wait().expect("exited child");
+        assert_eq!(
+            codex_app_server_end_failure("account", true, None, &mut exited),
+            "Codex app-server stdout closed during account; child exited with code 3."
+        );
+        let mut signalled = spawn("kill -TERM $$");
+        signalled.wait().expect("signalled child");
+        assert_eq!(
+            codex_app_server_end_failure("quota", true, None, &mut signalled),
+            "Codex app-server stdout closed during quota; child terminated by signal 15."
+        );
+        let mut running = spawn("sleep 30");
+        assert_eq!(
+            codex_app_server_end_failure("initialize", true, None, &mut running),
+            "Codex app-server stdout closed during initialize; child termination was not observed before cleanup."
+        );
+        let _ = running.kill();
+        let _ = running.wait();
+        // An earlier initialize rejection wins over EOF and the deadline.
+        let initialize = "Codex app-server initialize RPC failed with code -32602.";
+        assert_eq!(
+            codex_app_server_end_failure("quota", true, Some(initialize), &mut exited),
+            initialize
+        );
+        assert_eq!(
+            codex_app_server_end_failure("quota", false, Some(initialize), &mut exited),
+            initialize
+        );
+        // The deadline makes no exit claim.
+        assert_eq!(
+            codex_app_server_end_failure("account", false, None, &mut exited),
+            "Codex app-server account read timed out."
+        );
+    }
+
+    #[test]
+    fn codex_app_server_stdout_read_error_has_fixed_text() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("sensitive-provider-text"))
+            }
+        }
+        let (sender, receiver) = mpsc::sync_channel(CODEX_APP_SERVER_CHANNEL_CAPACITY);
+        read_bounded_codex_app_server_stdout(BufReader::new(FailingReader), sender);
+        let message = receiver
+            .recv()
+            .expect("reader result")
+            .expect_err("an I/O error must fail");
+        assert_eq!(message, "Codex app-server stdout read failed.");
+        assert_no_provider_text(&message);
     }
 
     #[test]
