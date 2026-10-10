@@ -48,7 +48,13 @@ reads plain. A body without windows or a rejection serves the stored reading
 unchanged and moves the binding's next read out by one slot: no second call in
 that slot and no retry on every pass. The pause is separate variant state,
 never a strike on the endpoint breaker. After 24 h the variant is read and
-checked again. Other variant HTTP errors (401/403, 429, 5xx) follow the
+checked again. A variant 200 without windows but with a recognizable
+`cedar_ember` is not a shape failure either: its saved-reset section is kept,
+the stored windows and other sections are served unchanged, and the next read
+moves out by one slot. With no stored reading at all, an unusable or
+windowless variant still holds the binding until its next slot (a
+"not before" time in the read schedule), so it never leads to a plain call in
+the same slot. Other variant HTTP errors (401/403, 429, 5xx) follow the
 existing backoff; a variant 429 counts toward the shared rate-limit breaker,
 as it is the same endpoint.
 
@@ -90,7 +96,10 @@ extra calls:
   caller that did not reach the collector loses its run, whatever made it skip
   (an identity gate, upkeep, a failed resolution or settings load, capacity, a
   missing binary, a browser re-sign-in). The single-slot path, which is not a
-  full pass, ends the run explicitly on each of its skip returns. Accepted
+  full pass, ends the run explicitly on each of its skip returns. Overlapping
+  full passes share one reached set (their union) and sweep when the last one
+  ends, so a caller reached by one of them keeps its run there; the skipping
+  pass's explicit run-end and the 15 min run gap still apply. Accepted
   residual: a switch to another organization and back by the same login inside
   one pass interval, combined with a Claude Code usage fetch in flight across
   the switch, cannot be told apart from local evidence;
@@ -124,7 +133,9 @@ gate is G (G = the larger of the default gate and the binding's slot):
 While active, the variant still runs every other 15 min slot (~30 min), well
 inside the 2 G bound. A 24 h variant pause, an open breaker or an auth hold
 therefore shows the affected section as Stale, with its original read time
-kept. Window freshness and the slot snapshot's state follow the windows only.
+kept. Window freshness and the slot snapshot's state follow the windows only. A
+retained slot snapshot reused as fresh has its credit sections relabelled from
+their own read times at reuse.
 
 ## Section stability
 
@@ -155,8 +166,9 @@ refusals, section stability, the canonical v2.2 Claude fixtures and sequence,
 per-section freshness (directly and through the cache serve path), retained
 snapshot freshness during an idle slot, the variant self-check end to end
 through the collector (valid; unrecognized; 400/404/422 and windowless 200
-keeping the stored reading with no second call; 24 h plain-only; no breaker
-strike; recovery), restart re-send and missing-section fill,
+keeping the stored reading with no second call; a cedar-only windowless 200
+kept over repeated passes with the breaker closed; no stored reading; 24 h
+plain-only; no breaker strike; recovery), restart re-send and missing-section fill,
 `read-schedule.json` permissions and restart, passive identity matching, and
 24 h scheduler days on real 5-min passes (15/60 min slots on the pass grid,
 alternation, plain every ~6 h while off, active and idle slots, sleep without
@@ -166,7 +178,8 @@ End-to-end `agent_status` tests drive real collection passes through each way
 a pass can skip a caller (identity gates before and after resolution,
 resolution failures from conflicting files or a missing credential, an
 unresolved default-login identity, a failed settings load, a browser
-re-sign-in, a provisional browser target, an unregistered slot), in the slot
+re-sign-in, a provisional browser target, an unregistered slot, an upkeep-blocked pass
+whose refresh grant expired), in the slot
 loop and the single-slot path, and prove a body fetched during that pass is
 never adopted. Another proves a passive body never displaces a saved-reset
 slot, and another that the variant diagnostic reaches the upload, with and

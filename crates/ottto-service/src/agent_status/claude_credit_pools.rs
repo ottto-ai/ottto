@@ -487,6 +487,11 @@ pub(super) struct ClaudeReadSchedule {
     /// breaker; never a breaker strike.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) saved_resets_variant_paused_until: Option<u64>,
+    /// No provider read before this time: a saved-reset reading without
+    /// anything usable (or without windows) consumed this slot. Cleared by the
+    /// next reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) next_read_not_before: Option<u64>,
 }
 
 impl ClaudeReadSchedule {
@@ -510,6 +515,7 @@ impl ClaudeReadSchedule {
         }
         self.last_activity_at = self.activity_at(latest_activity_at);
         self.tracked_since.get_or_insert(now);
+        self.next_read_not_before = None;
     }
 
     /// Record the self-check of a saved-reset variant response: an
@@ -2221,6 +2227,7 @@ mod tests {
             last_activity_at: Some(3),
             tracked_since: Some(4),
             saved_resets_variant_paused_until: Some(5),
+            next_read_not_before: Some(6),
         };
         write_claude_read_schedule(&dir, &schedule).unwrap();
         let mode = std::fs::metadata(dir.join(CLAUDE_READ_SCHEDULE_FILE))
@@ -2396,6 +2403,11 @@ mod tests {
         Ok(json!({}))
     }
 
+    fn respond_cedar_only(endpoint: &str) -> Result<Value, u16> {
+        REQUESTED.lock().unwrap().push(endpoint.to_string());
+        Ok(json!({"cedar_ember": {"eligible": true}}))
+    }
+
     fn respond_status(endpoint: &str, status: u16) -> Result<Value, u16> {
         REQUESTED.lock().unwrap().push(endpoint.to_string());
         if endpoint.contains("cedar_ember") {
@@ -2459,6 +2471,7 @@ mod tests {
             ));
             let now = super::super::current_unix_seconds();
             schedule.last_plain_read_at.get_or_insert(now - 3_600);
+            schedule.next_read_not_before = None;
             write_claude_read_schedule(&self.state_dir(), &schedule).unwrap();
         }
 
@@ -2471,6 +2484,10 @@ mod tests {
             cache.observed_at_epoch_seconds -= 3 * 3_600;
             cache.next_refresh_after_epoch_seconds = 0;
             super::super::write_claude_oauth_usage_cache(&cache).unwrap();
+            // The slot has passed: any "not before the next slot" hold is over.
+            let mut schedule = self.schedule();
+            schedule.next_read_not_before = None;
+            write_claude_read_schedule(&self.state_dir(), &schedule).unwrap();
         }
 
         fn schedule(&self) -> ClaudeReadSchedule {
@@ -2775,6 +2792,161 @@ mod tests {
     #[serial_test::serial]
     fn windowless_variant_200_keeps_the_stored_reading() {
         assert_unusable_variant_keeps_the_stored_reading(respond_empty);
+    }
+
+    fn breaker_open(harness: &VariantHarness) -> bool {
+        super::super::read_claude_oauth_usage_breaker(
+            harness.account,
+            harness.organization,
+            &super::super::claude_oauth_usage_config_fingerprint(),
+        )
+        .is_some_and(|breaker| {
+            super::super::claude_oauth_usage_breaker_is_open(
+                &breaker,
+                super::super::current_unix_seconds(),
+            )
+        })
+    }
+
+    /// A windowless variant 200 whose `cedar_ember` is recognizable: the
+    /// saved-reset section is kept fresh, the stored windows and other
+    /// sections are served, no breaker strike, and no call until the next
+    /// slot, over several passes.
+    #[test]
+    #[serial_test::serial]
+    fn recognized_windowless_variant_keeps_cedar_and_the_stored_reading() {
+        let harness = VariantHarness::new("cedar-only");
+        let _ = std::fs::remove_file(harness.state_dir().join(CLAUDE_READ_SCHEDULE_FILE));
+        let stored = harness.collect(respond_plain);
+        let stored_usage = balances_of(&stored)
+            .iter()
+            .find(|b| b.kind == Some(CreditBalanceKind::UsageCredits))
+            .unwrap()
+            .clone();
+        harness.due_keeping_reading();
+        REQUESTED.lock().unwrap().clear();
+
+        let outcome = harness.collect(respond_cedar_only);
+        assert_eq!(
+            REQUESTED.lock().unwrap().as_slice(),
+            ["https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"]
+        );
+        assert!(!has_unrecognized(&outcome));
+        let usage = outcome.result.as_ref().expect("stored reading served");
+        assert!(!usage.windows.is_empty(), "windows do not flip off");
+        let saved = saved_resets_of(&outcome);
+        assert_eq!(saved.len(), 1, "the fresh saved-reset section is kept");
+        assert_eq!(saved[0].eligible, Some(true));
+        let usage_now = balances_of(&outcome)
+            .iter()
+            .find(|b| b.kind == Some(CreditBalanceKind::UsageCredits))
+            .unwrap();
+        assert_eq!(usage_now.observed_at, stored_usage.observed_at);
+        assert_eq!(harness.shape_failures(), 0);
+        assert_eq!(harness.schedule().saved_resets_variant_paused_until, None);
+
+        // Repeated passes inside the slot: no call, breaker closed.
+        REQUESTED.lock().unwrap().clear();
+        for _ in 0..3 {
+            let served = harness.collect(respond_cedar_only);
+            assert_eq!(saved_resets_of(&served).len(), 1);
+        }
+        assert!(REQUESTED.lock().unwrap().is_empty(), "no retry every pass");
+        assert_eq!(harness.shape_failures(), 0);
+        assert!(!breaker_open(&harness));
+
+        // Next slot: one read again. Usage credits are off in this body, so
+        // the saved-reset variant takes the slots between ~6 h plain reads.
+        harness.due_keeping_reading();
+        harness.collect(respond_recognized);
+        assert_eq!(
+            REQUESTED.lock().unwrap().as_slice(),
+            ["https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"]
+        );
+    }
+
+    /// No stored reading at all: a variant that is rejected, or that answers
+    /// without windows, never leads to a plain call in the same slot.
+    #[test]
+    #[serial_test::serial]
+    fn unusable_variant_without_a_stored_reading_waits_for_the_next_slot() {
+        for respond in [
+            respond_variant_400 as super::super::ClaudeOAuthTestResponder,
+            respond_cedar_only,
+        ] {
+            let harness = VariantHarness::new("no-stored-reading");
+            harness.due(ClaudeReadSchedule::default());
+            assert!(super::super::read_claude_oauth_usage_cache(
+                harness.account,
+                harness.organization
+            )
+            .is_none());
+            harness.collect(respond);
+            assert_eq!(
+                REQUESTED.lock().unwrap().as_slice(),
+                ["https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"]
+            );
+            REQUESTED.lock().unwrap().clear();
+            for _ in 0..3 {
+                harness.collect(respond_plain);
+            }
+            assert!(
+                REQUESTED.lock().unwrap().is_empty(),
+                "no call in the same slot"
+            );
+            assert_eq!(harness.shape_failures(), 0);
+            // Once the slot has passed, the next read happens.
+            let mut schedule = harness.schedule();
+            schedule.next_read_not_before = None;
+            write_claude_read_schedule(&harness.state_dir(), &schedule).unwrap();
+            let _ = std::fs::remove_file(super::super::claude_oauth_usage_cache_path(
+                harness.account,
+                harness.organization,
+            ));
+            harness.collect(respond_plain);
+            assert_eq!(REQUESTED.lock().unwrap().len(), 1);
+        }
+    }
+
+    /// A retained slot snapshot reused as fresh relabels each credit section
+    /// from its own read time.
+    #[test]
+    #[serial_test::serial]
+    fn retained_snapshot_reuse_relabels_credit_sections() {
+        let harness = VariantHarness::new("retained-relabel");
+        let now = OffsetDateTime::now_utc();
+        let at = |age: u64| Some(rfc3339(now.unix_timestamp() as u64 - age));
+        let mut old_saved = stored(None, true).remove(0);
+        old_saved.grants_observed_at = at(5 * 3_600);
+        old_saved.freshness = AgentQuotaWindowFreshness::Fresh;
+        let mut new_usage = stored(Some(false), false).remove(0);
+        new_usage.observed_at = at(600);
+        new_usage.freshness = AgentQuotaWindowFreshness::Fresh;
+        let snapshot = ottto_protocol::ClaudeConfigSlotQuotaSnapshotV1 {
+            state: ottto_protocol::ClaudeConfigSlotQuotaSnapshotStateV1::Fresh,
+            captured_at: rfc3339(now.unix_timestamp() as u64 - 600),
+            observed_at: at(600),
+            quota_windows: Vec::new(),
+            credit_balances: vec![new_usage, old_saved],
+        };
+        let reused = super::super::claude_retained_snapshot_relabelled(
+            &snapshot,
+            harness.account,
+            harness.organization,
+            now,
+        );
+        assert_eq!(
+            reused.credit_balances[0].freshness,
+            AgentQuotaWindowFreshness::Fresh
+        );
+        assert_eq!(
+            reused.credit_balances[1].freshness,
+            AgentQuotaWindowFreshness::Stale
+        );
+        assert_eq!(
+            reused.credit_balances[1].grants_observed_at,
+            snapshot.credit_balances[1].grants_observed_at
+        );
     }
 
     #[test]

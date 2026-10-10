@@ -6139,6 +6139,38 @@ fn local_claude_quota_snapshot_is_fresh_for_account(
     (0..=i64::try_from(gate).unwrap_or(i64::MAX)).contains(&age_seconds)
 }
 
+/// A retained full snapshot reused as fresh: its meters are fresh, but each
+/// credit section is relabelled from its own read time (the label taken at
+/// capture can be past that section's own limit by now).
+fn claude_retained_snapshot_relabelled(
+    snapshot: &ClaudeConfigSlotQuotaSnapshotV1,
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: OffsetDateTime,
+) -> ClaudeConfigSlotQuotaSnapshotV1 {
+    let mut snapshot = snapshot.clone();
+    let now = u64::try_from(now.unix_timestamp()).unwrap_or_default();
+    let represented_at = snapshot
+        .observed_at
+        .as_deref()
+        .unwrap_or(snapshot.captured_at.as_str());
+    let stored_read_at = OffsetDateTime::parse(represented_at, &Rfc3339)
+        .ok()
+        .and_then(|instant| u64::try_from(instant.unix_timestamp()).ok())
+        .unwrap_or(now);
+    claude_credit_pools::label_credit_freshness(
+        &mut snapshot.credit_balances,
+        claude_oauth_usage_serve_gate_seconds(
+            account_identifier_hash,
+            organization_identifier_hash,
+            now,
+        ),
+        stored_read_at,
+        now,
+    );
+    snapshot
+}
+
 fn claude_usage_has_exact_identity(
     usage: &ClaudeOAuthUsage,
     account_hash: &str,
@@ -8331,7 +8363,18 @@ fn merge_claude_slot_collection_state_at(
                                     },
                                 );
                             if remains_fresh {
-                                snapshot.clone()
+                                claude_retained_snapshot_relabelled(
+                                    snapshot,
+                                    candidate
+                                        .account_identifier_hash
+                                        .as_deref()
+                                        .unwrap_or_default(),
+                                    candidate
+                                        .organization_identifier_hash
+                                        .as_deref()
+                                        .unwrap_or_default(),
+                                    now,
+                                )
                             } else {
                                 stale_local_claude_quota_snapshot(snapshot)
                             }
@@ -9748,6 +9791,23 @@ fn collect_claude_oauth_usage_unstamped(
     // Passive input (design R7: active-account freshness): Claude Code's own plain reading for exactly this
     // binding, newer than ours and inside the slot, stands in for this slot's
     // call. Parsed by the same plain-body parser; no provider request.
+    // A saved-reset reading that was not usable (or had no windows) moved
+    // this binding's next read to the next slot; hold it even without a
+    // stored reading to serve.
+    if read_schedule
+        .next_read_not_before
+        .is_some_and(|not_before| now < not_before)
+    {
+        return ClaudeOAuthUsageOutcome::from(Err(
+            "Claude usage for this account is read again at its next slot.".to_string(),
+        ))
+        .with_check_outcome(
+            "claude_oauth_usage_check_suppressed",
+            "The last Claude saved-reset reading was not usable; no provider request is made before this account's next slot.",
+            now,
+        );
+    }
+
     // The slot's read is chosen first (same endpoint, same slot: the
     // saved-reset variant replaces the plain read in its slot, never adds a
     // call). A passive body can only stand in for a plain slot, so it never
@@ -10125,8 +10185,6 @@ fn collect_claude_oauth_usage_unstamped(
     )
 }
 
-/// Test-only stand-in for the provider: answers the request URL with a 200
-/// body, after every pre-request gate has run.
 /// Test-only: runs between a registered slot's pre-collection gate and its
 /// resolution read, to change the slot's login in between.
 #[cfg(test)]
@@ -10145,6 +10203,9 @@ fn claude_slot_after_pre_gate_hook() {
     }
 }
 
+/// Test-only stand-in for the provider, consulted after every pre-request
+/// gate has run: answers the request URL with a 200 body (`Ok`) or an HTTP
+/// status (`Err`) that goes through the real response arms.
 #[cfg(test)]
 type ClaudeOAuthTestResponder = fn(&str) -> Result<Value, u16>;
 #[cfg(test)]
@@ -10187,12 +10248,20 @@ fn claude_oauth_usage_after_response(
             now,
         )
     });
+    let read = reading.read;
     let usage = match claude_oauth_usage_record_reading(reading, read_schedule) {
         Ok(usage) => usage,
-        // A 200 that carries none of the expected quota fields is a shape
-        // change, not an empty account: every plan this endpoint answers for
-        // reports at least one window.
-        Err(_) if unrecognized.is_some() => {
+        // The saved-reset variant without windows is variant state, never an
+        // endpoint shape failure: a recognizable saved-reset section is kept,
+        // anything else pauses the variant.
+        Err(_) if read == claude_credit_pools::ClaudeUsageRead::SavedResets => {
+            if unrecognized.is_none() {
+                return claude_oauth_saved_resets_without_windows(
+                    reading,
+                    slot_seconds,
+                    read_schedule,
+                );
+            }
             return claude_oauth_saved_resets_variant_unusable(
                 account_identifier_hash,
                 organization_identifier_hash,
@@ -10202,6 +10271,9 @@ fn claude_oauth_usage_after_response(
                 now,
             );
         }
+        // A plain 200 that carries none of the expected quota fields is a
+        // shape change, not an empty account: every plan this endpoint answers
+        // for reports at least one window.
         Err(usage) => {
             return ClaudeOAuthUsageOutcome {
                 result: Ok(usage),
@@ -10242,6 +10314,93 @@ fn claude_oauth_usage_after_response(
     )
 }
 
+/// The saved-reset variant answered with a recognizable saved-reset section
+/// but no windows. Not a shape failure, so no breaker strike: the fresh
+/// saved-reset section is kept, the stored windows and other sections are
+/// served unchanged, and the binding's next read moves out by one slot (no
+/// second call in this slot, with or without a stored reading).
+fn claude_oauth_saved_resets_without_windows(
+    reading: ClaudeOAuthReading<'_>,
+    slot_seconds: u64,
+    read_schedule: &mut claude_credit_pools::ClaudeReadSchedule,
+) -> ClaudeOAuthUsageOutcome {
+    let account_identifier_hash = reading.account_identifier_hash;
+    let organization_identifier_hash = reading.organization_identifier_hash;
+    let now = reading.now;
+    let next_read = now.saturating_add(slot_seconds);
+    let observed_at =
+        rfc3339_from_unix_seconds(reading.observed_at_epoch_seconds).unwrap_or_default();
+    let credit_read = claude_credit_pools::claude_credit_read(
+        reading.body,
+        claude_credit_pools::ClaudeUsageRead::SavedResets,
+        &observed_at,
+    );
+    let stored = read_claude_oauth_usage_cache_with_legacy_migration(
+        account_identifier_hash,
+        organization_identifier_hash,
+        reading.mirror_legacy_default,
+    );
+    let mut usage = ClaudeOAuthUsage {
+        windows: Vec::new(),
+        credit_balances: claude_credit_pools::claude_merge_credit_sections(
+            &claude_oauth_binding_key(account_identifier_hash, organization_identifier_hash),
+            stored
+                .as_ref()
+                .map_or(reading.previous_credit_balances, |cache| {
+                    cache.credit_balances.as_slice()
+                }),
+            &credit_read,
+        ),
+    };
+    claude_oauth_stamp_account_identity(
+        &mut usage,
+        account_identifier_hash,
+        Some(organization_identifier_hash),
+    );
+    read_schedule.after_reading(
+        claude_credit_pools::ClaudeUsageRead::SavedResets,
+        reading.observed_at_epoch_seconds,
+        reading.latest_activity_at,
+        now,
+    );
+    read_schedule.next_read_not_before = Some(next_read);
+    let _ = claude_credit_pools::write_claude_read_schedule(
+        &claude_oauth_usage_account_state_dir(
+            account_identifier_hash,
+            organization_identifier_hash,
+        ),
+        read_schedule,
+    );
+    let mut cache = stored.unwrap_or(ClaudeOAuthUsageCache {
+        schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+        account_identifier_hash: account_identifier_hash.to_string(),
+        organization_identifier_hash: organization_identifier_hash.to_string(),
+        observed_at_epoch_seconds: now,
+        next_refresh_after_epoch_seconds: next_read,
+        windows: Vec::new(),
+        credit_balances: Vec::new(),
+    });
+    cache.credit_balances = usage.credit_balances;
+    cache.next_refresh_after_epoch_seconds = next_read;
+    let _ = write_claude_oauth_usage_cache(&cache);
+    if reading.mirror_legacy_default {
+        let _ = write_legacy_claude_oauth_usage_cache(&cache);
+    }
+    let result = if !cache.windows.is_empty()
+        && now.saturating_sub(cache.observed_at_epoch_seconds)
+            <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
+    {
+        Ok(claude_oauth_usage_from_cache(cache, now))
+    } else {
+        Err("Claude's saved-reset reading carried no quota windows.".to_string())
+    };
+    ClaudeOAuthUsageOutcome::from(result).with_check_outcome(
+        "claude_oauth_usage_cache_reused",
+        "The latest Claude saved-reset reading carried no quota windows; its saved-reset section was kept and the stored windows were reused.",
+        current_unix_seconds(),
+    )
+}
+
 /// The saved-reset variant gave this binding nothing usable this slot: a 200
 /// without windows or a recognizable `cedar_ember`, or a 4xx rejection other
 /// than auth or rate limiting. Variant state only, never an endpoint-breaker
@@ -10260,6 +10419,8 @@ fn claude_oauth_saved_resets_variant_unusable(
     now: u64,
 ) -> ClaudeOAuthUsageOutcome {
     read_schedule.after_saved_resets_variant(false, now);
+    // No call before the next slot, with or without a stored reading.
+    read_schedule.next_read_not_before = Some(now.saturating_add(slot_seconds));
     let _ = claude_credit_pools::write_claude_read_schedule(
         &claude_oauth_usage_account_state_dir(
             account_identifier_hash,
@@ -10319,6 +10480,12 @@ static CLAUDE_OAUTH_PASS_CALLERS: Mutex<(usize, BTreeSet<String>)> =
 
 /// One full collection pass (`collect_claude_status_snapshots`). When the last
 /// open pass ends, every caller run not seen at the collector during it ends.
+///
+/// Overlapping passes share one reached set (their union), and the sweep runs
+/// when the last of them ends: a caller reached by one overlapping pass but
+/// skipped by another keeps its run here. The skipping pass's explicit run-end
+/// on that skip return, and the 15 min run gap, still apply, so the sweep is
+/// defense in depth for that case rather than the only guard.
 struct ClaudeOAuthCollectionPass;
 
 impl ClaudeOAuthCollectionPass {
@@ -10383,6 +10550,7 @@ fn claude_oauth_end_slot_run(slot_id: &str) {
 
 /// One usable OAuth usage body: a provider response, or a passive reading
 /// Claude Code made for the same binding.
+#[derive(Clone, Copy)]
 struct ClaudeOAuthReading<'a> {
     account_identifier_hash: &'a str,
     organization_identifier_hash: &'a str,
@@ -32214,6 +32382,71 @@ exit 0
             .unwrap()
             .iter()
             .all(|endpoint| endpoint.contains("cedar_ember=1")));
+    }
+
+    /// Claude Code's refresh grant has expired: the slot's upkeep stops
+    /// collection after the identity gate passed.
+    fn expire_slot_refresh(fixture: &ClaudeBindingFixture) {
+        let mut credential = claude_credential_fixture(
+            "fixture-secret-token-expired",
+            TimeDuration::hours(6),
+            Some("team"),
+        );
+        credential["claudeAiOauth"]["refreshTokenExpiresAt"] = serde_json::json!(
+            (OffsetDateTime::now_utc() - TimeDuration::hours(1)).unix_timestamp() * 1_000
+        );
+        fs::write(
+            fixture.slot_dir.join(".credentials.json"),
+            serde_json::to_vec(&credential).expect("serialize credential"),
+        )
+        .expect("write credential");
+    }
+
+    #[test]
+    #[serial]
+    fn slot_upkeep_blocked_pass_never_lets_a_passive_reading_through() {
+        let fixture = ClaudeBindingFixture::new("passive-upkeep");
+        fixture.sign_in(TEAM_PREMIUM);
+        let slot_id = fixture.register();
+        fixture.collect();
+        let harness = slot_harness(&fixture);
+        harness.assert_skipped_pass_ends_run(
+            &|| {
+                harness.fixture.collect();
+            },
+            &|| {
+                expire_slot_refresh(&fixture);
+                fixture.collect();
+                assert_eq!(
+                    fixture.slot(&slot_id).collection.state,
+                    ClaudeConfigSlotCollectionStateV1::NeedsLogin
+                );
+            },
+            &|| fixture.sign_in(TEAM_PREMIUM),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn single_slot_upkeep_blocked_pass_never_lets_a_passive_reading_through() {
+        let fixture = ClaudeBindingFixture::new("passive-upkeep-single");
+        fixture.sign_in(TEAM_PREMIUM);
+        let slot_id = fixture.register();
+        fixture.collect();
+        let harness = slot_harness(&fixture);
+        harness.assert_skipped_pass_ends_run(
+            &|| single_slot_pass(&slot_id),
+            &|| {
+                expire_slot_refresh(&fixture);
+                let status = collect_registered_claude_slot_status(
+                    &slot_id,
+                    binding_test_time(0),
+                    binding_test_time(15),
+                );
+                assert_eq!(status.state, ClaudeConfigSlotCollectionStateV1::NeedsLogin);
+            },
+            &|| fixture.sign_in(TEAM_PREMIUM),
+        );
     }
 
     fn respond_variant_unrecognized(_endpoint: &str) -> Result<Value, u16> {
