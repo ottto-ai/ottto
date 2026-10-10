@@ -13233,6 +13233,9 @@ fn call_codex_app_server_rate_limits_for_home(
             break Ok(false);
         };
         let message = match receiver.recv_timeout(remaining.min(Duration::from_millis(250))) {
+            // Output bounds still end the session; a routine reading taken
+            // before the detailed read stands (the attempt counts as failed).
+            Ok(Err(_)) if detail_requested && rate_limits_result.is_some() => break Ok(true),
             Ok(Err(message)) => break Err(message),
             Ok(Ok(message)) => message,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,

@@ -116,7 +116,8 @@ launcher, then the inner binary, before falling back to `PATH`.
   retried on the next count change or after the retry wait.
 - Session: a scripted app-server confirms the routine request carries the
   parameter and the escalation sends the plain request in the same session. An
-  escalated read that errors, never answers, or cannot be sent keeps the
+  escalated read that errors, never answers, exceeds the output bound or cannot
+  be sent keeps the
   routine reading. A rejected parameter falls back to the plain read, and fails
   the reading if that read fails too. Any other routine error is not retried.
 - Resolver: executable scratch bundles with the old and new layouts, through

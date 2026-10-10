@@ -1438,6 +1438,7 @@ mod tests {
         /// - `reject_then_error`: `reject`, then the detailed read fails too;
         /// - `detail_error`: the detailed read fails;
         /// - `detail_silent`: the detailed read is never answered;
+        /// - `detail_oversized`: the detailed answer exceeds the line bound;
         /// - `exit`: closes its stdin, answers the routine read and quits.
         ///
         /// Every request line is logged.
@@ -1486,6 +1487,8 @@ for line in sys.stdin:
                 answer(request, routine)
         elif mode in ("detail_error", "reject_then_error"):
             answer(request, code=-32603)
+        elif mode == "detail_oversized":
+            answer(request, dict(detailed, padding="x" * (300 * 1024)))
         elif mode != "detail_silent":
             answer(request, detailed)
 "#;
@@ -1628,6 +1631,14 @@ for line in sys.stdin:
             assert_routine_reading_kept(&observation.expect("reading"));
             // The detailed read had its own budget, then gave up.
             assert!(started.elapsed() >= DETAIL_READ_MIN_BUDGET);
+        }
+
+        #[test]
+        #[serial]
+        fn an_oversized_escalated_answer_keeps_the_routine_reading() {
+            let (observation, requests) = run("detail_oversized", true);
+            assert_eq!(requests, vec![routine_request(), detail_request()]);
+            assert_routine_reading_kept(&observation.expect("reading"));
         }
 
         #[test]
