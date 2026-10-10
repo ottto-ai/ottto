@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 533,
-  "content_sha256": "ba389345e865f5eb45ef4a68bc83844ab5b008d39272343bd2e1e301decad5ed",
+  "candidate_file_count": 534,
+  "content_sha256": "dbf3e12c1345670df4337a0fa2a59c11522af5795f6b133e58ebd313b6a7feef",
   "files": [
     {
       "executable": false,
@@ -678,15 +678,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "a419bbf87527957203d9e63ee0384f9362792b8cd51e8866b17caf52a2f2da8e",
-      "size_bytes": 1348269
+      "sha256": "45b00682d2c75dda0ed941e4f1f1ce3ff3d1ebf80be74ed3548c0b8092a59ec8",
+      "size_bytes": 1410091
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/claude_credit_pools.rs",
-      "sha256": "5ae67fe4ab3642e6f533c1f568c24797cc1c03c06c01b2bcd24c3f563181d2c9",
-      "size_bytes": 214
+      "sha256": "ad9b1db5edbfc7708caa04056b48cececd0b6974e5d1aff09c8fadfd4f93fdbd",
+      "size_bytes": 133050
     },
     {
       "executable": false,
@@ -2441,6 +2441,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-10-claude-credit-pools-cadence.md",
+      "sha256": "bf2e7a707dfbbdbc051cf616ae0536ed4a79dee10c886d03766cd8dc5c6d046d",
+      "size_bytes": 12604
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-10-codex-probe-diagnostics.md",
       "sha256": "42daed62e41b35019d0bbb0eab33270af3fb82369a275f84d3de0ce2394c35f3",
       "size_bytes": 3069
@@ -3734,9 +3741,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-10T08:30:03+00:00",
+  "generated_at": "2026-10-10T09:49:48+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 534,
+  "output_file_count": 535,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3773,5 +3780,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ff9513f36ecd6b86b1e62b85a4e032cdd975cee9"
+  "source_commit": "d4f1cb68c9283c68e62c91a2c47603f3107151ab"
 }
