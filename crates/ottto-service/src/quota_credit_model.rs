@@ -166,7 +166,9 @@ pub(crate) enum ListObservation {
         provider: Provider,
         provider_count: Option<u64>,
     },
-    /// The provider/plan has no per-grant details.
+    /// The provider/plan has no per-grant details. No adapter reports this
+    /// yet, so it is test-only until one does.
+    #[cfg(test)]
     NotSupported { provider: Provider },
 }
 
@@ -205,6 +207,8 @@ pub(crate) struct GrantsBuild {
 }
 
 impl GrantsBuild {
+    /// Test-only: adapters take the diagnostics from [`GrantsBuild::apply_to`].
+    #[cfg(test)]
     pub(crate) fn diagnostics(&self) -> &[CreditModelDiagnostic] {
         &self.diagnostics
     }
@@ -254,6 +258,7 @@ pub(crate) fn build_grants(obs: ListObservation) -> GrantsBuild {
                 ..GrantsBuild::default()
             };
         }
+        #[cfg(test)]
         ListObservation::NotSupported { provider } => {
             return GrantsBuild {
                 grants_state: Some(CreditGrantsState::NotSupported),
@@ -958,10 +963,9 @@ const SECTION_CACHE_MAX_ENTRIES: usize = 64;
 /// Sender stability across read cadence (design R7b; contract v2.2 §11.5,
 /// §11.7 C8/C9).
 ///
-/// - Keyed by [`BindingKey`] (credential identity) and [`CreditSection`]. An
-///   entry is dropped only by [`SectionCache::clear_binding`] when that
-///   binding's identity changes, or by the size bound, so A→B→A keeps A's
-///   sections.
+/// - Keyed by [`BindingKey`] (credential identity) and [`CreditSection`]. A
+///   slot that switches account reads under a new key, and entries leave only
+///   by the size bound, so A→B→A keeps A's sections.
 /// - A re-sent section is the last observed one unchanged: original
 ///   `observed_at`/`grants_observed_at`, same presence, `grants`,
 ///   `grants_state` and `status`. `updated_at` is never carried over: re-sent
@@ -1084,7 +1088,10 @@ impl SectionCache {
         }
     }
 
-    /// The binding's credential identity changed: forget every section it had.
+    /// Forget every section of `binding`. Test-only: the key is the credential
+    /// identity, so a binding whose identity changes is simply a new key and
+    /// the old identity's sections age out under the size bound.
+    #[cfg(test)]
     pub(crate) fn clear_binding(&mut self, binding: &BindingKey) {
         self.entries.retain(|(key, _), _| key != binding);
     }

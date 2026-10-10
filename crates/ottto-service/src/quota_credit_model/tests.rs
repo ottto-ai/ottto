@@ -1917,6 +1917,79 @@ fn claude_sequence() -> Value {
     json!({ "sequence": "claude-plain-saved-resets", "steps": steps })
 }
 
+/// Codex plan credits and the workspace allowance as the adapter builds them
+/// (contract v2.2 §11.7 C4 names): today's balances plus `kind` and the read
+/// clock. Neither carries grants, so the model adds nothing else.
+fn codex_plan_and_workspace(observed_at: Option<&str>, kind: bool) -> Vec<AgentCreditBalance> {
+    let observed_at = observed_at.map(str::to_string);
+    vec![
+        AgentCreditBalance {
+            name: "credits".to_string(),
+            status: AgentCreditBalanceStatus::Ok,
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            unit: AgentCreditBalanceUnit::Credits,
+            remaining: Some(2583),
+            unlimited: Some(false),
+            limit_id: Some("codex".to_string()),
+            observed_at: observed_at.clone(),
+            kind: kind.then_some(CreditBalanceKind::PlanCredits),
+            ..Default::default()
+        },
+        AgentCreditBalance {
+            name: "workspace_monthly_credits".to_string(),
+            status: AgentCreditBalanceStatus::Ok,
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            unit: AgentCreditBalanceUnit::Credits,
+            remaining: Some(400),
+            used: Some(100),
+            quota: Some(500),
+            unlimited: Some(false),
+            resets_at: Some("2026-11-01T00:00:00Z".to_string()),
+            used_percent: Some(20),
+            enabled: Some(true),
+            limit_id: Some("codex".to_string()),
+            observed_at,
+            kind: kind.then_some(CreditBalanceKind::WorkspaceAllowance),
+            ..Default::default()
+        },
+    ]
+}
+
+/// A body from a daemon that predates contract v2.2: no `kind`, no read
+/// clocks, no grants. Every name/unit pair is one the backend's read-time
+/// kind rule recovers (contract v2.2 §11.7 C4), including a non-`codex` pool.
+fn legacy_no_kind() -> Vec<AgentCreditBalance> {
+    let mut balances = vec![AgentCreditBalance {
+        name: "reset_bank".to_string(),
+        status: AgentCreditBalanceStatus::Ok,
+        freshness: AgentQuotaWindowFreshness::Fresh,
+        unit: AgentCreditBalanceUnit::Resets,
+        remaining: Some(3),
+        unlimited: Some(false),
+        ..Default::default()
+    }];
+    balances.extend(codex_plan_and_workspace(None, false));
+    balances.push(AgentCreditBalance {
+        name: "codex_bengalfox_credits".to_string(),
+        status: AgentCreditBalanceStatus::Ok,
+        freshness: AgentQuotaWindowFreshness::Fresh,
+        unit: AgentCreditBalanceUnit::Credits,
+        remaining: Some(40),
+        unlimited: Some(false),
+        limit_id: Some("codex_bengalfox".to_string()),
+        ..Default::default()
+    });
+    balances.push(AgentCreditBalance {
+        name: "Usage credits".to_string(),
+        status: AgentCreditBalanceStatus::Unknown,
+        freshness: AgentQuotaWindowFreshness::Fresh,
+        unit: AgentCreditBalanceUnit::Usd,
+        enabled: Some(false),
+        ..Default::default()
+    });
+    balances
+}
+
 /// Every expected file: the model output for inputs that mirror the matching
 /// `provider/*.json` file.
 fn expected_fixtures() -> Vec<(&'static str, Value)> {
@@ -2004,6 +2077,23 @@ fn expected_fixtures() -> Vec<(&'static str, Value)> {
             "claude-oauth-usage-plain",
             reading(section_balances(plain_read(READ_AT))),
         ),
+        (
+            "codex-rate-limits-plan-and-workspace",
+            reading(codex_plan_and_workspace(Some(READ_AT), true)),
+        ),
+        (
+            "claude-oauth-usage-credits-off",
+            reading({
+                let mut balance = usage_credits(READ_AT);
+                assert!(apply_disabled(
+                    &mut balance,
+                    Field::Value("org_spend_cap_reached".to_string())
+                )
+                .is_empty());
+                vec![balance]
+            }),
+        ),
+        ("legacy-no-kind", reading(legacy_no_kind())),
         ("sequence-codex-reset-credits", codex_sequence()),
         ("sequence-claude-plain-saved-resets", claude_sequence()),
     ]
@@ -2099,7 +2189,13 @@ fn canonical_fixtures_are_fixed_points_without_spelled_nulls() {
             // the protocol would drop.
             let balance: AgentCreditBalance = serde_json::from_value(raw.clone()).unwrap();
             assert_eq!(&serde_json::to_value(&balance).unwrap(), raw, "{name}");
-            assert!(balance.kind.is_some(), "{name}: every balance has a kind");
+            if name == "legacy-no-kind" {
+                // An older daemon: no kind and no read clocks.
+                assert_eq!(balance.kind, None, "{name}");
+                assert_eq!(balance.observed_at, None, "{name}");
+            } else {
+                assert!(balance.kind.is_some(), "{name}: every balance has a kind");
+            }
             let Some(grants) = &balance.grants else {
                 continue;
             };
