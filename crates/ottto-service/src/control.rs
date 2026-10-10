@@ -16394,11 +16394,13 @@ mod tests {
 
     fn control_test_root(name: &str) -> PathBuf {
         let counter = TELEMETRY_KEY_STORE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "ottto-control-{name}-{}-{}-{counter}",
-            std::process::id(),
-            current_millis()
-        ));
+        let root = fs::canonicalize(std::env::temp_dir())
+            .expect("canonical scratch parent")
+            .join(format!(
+                "ottto-control-{name}-{}-{}-{counter}",
+                std::process::id(),
+                current_millis()
+            ));
         let _ = fs::remove_dir_all(&root);
         create_control_test_dir(&root);
         root
