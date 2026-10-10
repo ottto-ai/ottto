@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 534,
-  "content_sha256": "221f62e546b8adb581ee78c876a628ce44f9d9b7a0617663382f3796fc26f38a",
+  "candidate_file_count": 536,
+  "content_sha256": "705a976f62a0d5e8696c6797aaaea62de50da0da05f3aae938d2a3e147f7d308",
   "files": [
     {
       "executable": false,
@@ -649,6 +649,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/agent_configs/claude_managed_settings.rs",
+      "sha256": "abd8461f85c4831ee1ddf435e2e87c8e6ce10cda79f33f357b5bdf10603a187f",
+      "size_bytes": 34201
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/agent_configs/codex_toml.rs",
       "sha256": "03d123a7c7965dd2566cb52fa08d01ffd1e9baa4b89849e0e67265b51bb0d574",
       "size_bytes": 9398
@@ -671,8 +678,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_configs/mod.rs",
-      "sha256": "7c117b55cbfdae836e9943f087b9cf35dc58030a27a5acf98d3efda4eab87b60",
-      "size_bytes": 74
+      "sha256": "1d18a06906f236d4be4df2989e5e7de90323f7d358704a202d753e1d81eec56d",
+      "size_bytes": 114
     },
     {
       "executable": false,
@@ -727,8 +734,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_browser_auth.rs",
-      "sha256": "d3a2cd476ccd93e0b9022162bb12785a9c200e7cbf53b4529ed9d071e691a5a9",
-      "size_bytes": 346216
+      "sha256": "7e2af25a55e7d6eb832f841b8fcb8e287794be526631cf938a133dbb40ccb9d3",
+      "size_bytes": 349344
     },
     {
       "executable": false,
@@ -839,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "a100d169a550c1f4a8d666e5d522dac281f7097cae8b9cef07a59629094feddd",
-      "size_bytes": 1177655
+      "sha256": "4d2cea8abb459303fdb1a0d7a1edf58f28a2259674d933dd79c8e98c9e93a359",
+      "size_bytes": 1207131
     },
     {
       "executable": false,
@@ -2476,6 +2483,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-11-managed-claude-relay-settings.md",
+      "sha256": "8aff99e16f2a7d90d605d4bf4b0ee49fefebf778cedabd957dd1c53ea9e5ff0e",
+      "size_bytes": 3016
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -3741,9 +3755,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-10T21:27:47Z",
+  "generated_at": "2026-10-10T23:08:04Z",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 535,
+  "output_file_count": 537,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3780,5 +3794,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ff9513f36ecd6b86b1e62b85a4e032cdd975cee9"
+  "source_commit": "e1394f2579057c7b4b7a6b5027594c3cb3deba99"
 }
