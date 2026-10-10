@@ -15,21 +15,29 @@
 //! # Cadence (R7)
 //!
 //! Every detailed `account/rateLimits/read` costs Codex a second backend call
-//! for the reset-credit list. Routine polls therefore send
-//! `excludeResetCreditDetails: true`; the count still comes back. A detailed
-//! read (no params, byte-identical to the historical request) runs when:
+//! for the reset-credit list. Every poll therefore first sends the routine
+//! read, `excludeResetCreditDetails: true`, which still returns usage and the
+//! count. The detailed read (no params, byte-identical to the historical
+//! request) follows in the same app-server session when
+//! [`CodexCreditTracker::routine_needs_details`] asks for it:
 //! - the binding has no successful detailed read (hourly or count-triggered)
-//!   in the last hour ([`DETAIL_INTERVAL_SECS`], with [`POLL_SLACK_SECS`] so a 5-minute poll
-//!   lands on the hour rather than one poll after it);
-//! - a routine read reports an `availableCount` with no cached list for that
-//!   count (a count change, a cold cache, or an account switch); the detailed
-//!   read is sent at once in the same app-server session;
-//! - the app-server rejects the routine parameter.
+//!   in the last hour ([`DETAIL_INTERVAL_SECS`], with [`POLL_SLACK_SECS`] so a
+//!   5-minute poll lands on the hour rather than one poll after it), which
+//!   includes the first poll after a daemon start;
+//! - the routine count has no cached list for that count (a count change or
+//!   an account switch).
+//!
+//! The routine answer already carries usage and the count, so a detailed read
+//! that errors or times out never costs the reading; only the list is missing.
+//! A routine answer that already carries the list (a server ignoring the
+//! parameter) is used as the detailed read. A server that rejects the
+//! parameter as invalid ([`routine_param_rejected`]) gets the plain request
+//! instead; any other error fails the reading as before.
 //!
 //! A failed detailed read (Codex silently falls back to `credits: null`) is
-//! retried after [`DETAIL_RETRY_SECS`], not on every poll, so a failing detail
-//! endpoint never costs more calls than the old every-poll detailed read.
-//! [`DetailCadence`] holds these decisions as pure functions of the clock.
+//! retried after [`DETAIL_RETRY_SECS`] or on the next count change, not on
+//! every poll. [`DetailCadence`] holds these decisions as pure functions of the
+//! clock.
 //!
 //! # Sender stability (R7b)
 //!
@@ -38,12 +46,11 @@
 //! but only while the provider count equals the count the list was read with.
 //! Cadence never turns a list into `unavailable`; only a failed detail read
 //! with no matching cached list does. The cache is keyed by the credential
-//! identity (account + workspace hash), so A→B→A keeps A's list, and a cold
-//! cache (restart) starts with a detailed read instead of a guess.
+//! identity (account + workspace hash), so A→B→A keeps A's list.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use ottto_protocol::{AgentCreditBalance, CreditBalanceKind};
 use serde_json::Value;
@@ -62,10 +69,19 @@ pub(super) const DETAIL_INTERVAL_SECS: u64 = 3_600;
 pub(super) const DETAIL_RETRY_SECS: u64 = 900;
 /// A poll this close to a deadline counts as reaching it.
 pub(super) const POLL_SLACK_SECS: u64 = 60;
-/// Bound on bindings and homes the cadence remembers.
-const TRACKED_ENTRIES_MAX: usize = 64;
+/// Bound on bindings the cadence remembers.
+const TRACKED_BINDINGS_MAX: usize = 64;
 /// JSON-RPC id of a detailed read sent after a routine one in the same session.
 pub(super) const DETAIL_READ_ID: &str = "ottto_rate_limits_details";
+/// Least time a detailed read sent after the routine one gets to answer, even
+/// when the routine read used most of the session bound; at most
+/// [`DETAIL_READ_MAX_BUDGET`].
+pub(super) const DETAIL_READ_MIN_BUDGET: Duration = Duration::from_secs(10);
+pub(super) const DETAIL_READ_MAX_BUDGET: Duration = Duration::from_secs(20);
+/// JSON-RPC "invalid request" and "invalid params": the only answers that mean
+/// the server does not accept the routine parameter.
+const JSON_RPC_INVALID_REQUEST: i64 = -32600;
+const JSON_RPC_INVALID_PARAMS: i64 = -32602;
 /// A pool window whose reset sits this close to `read + duration` is idle: its
 /// boundary slides forward with every read.
 const IDLE_SLIDE_TOLERANCE_SECS: u64 = 120;
@@ -79,6 +95,22 @@ pub(super) enum CodexRateLimitsRead {
     Detailed,
     /// `excludeResetCreditDetails: true`: usage and the count only.
     Routine,
+}
+
+/// The routine read was refused because the server does not accept its
+/// parameter, so the plain request is worth sending. Any other error (auth,
+/// provider outage) is not retried with the costlier detailed read.
+pub(super) fn routine_param_rejected(error: &Value) -> bool {
+    matches!(
+        error.get("code").and_then(Value::as_i64),
+        Some(JSON_RPC_INVALID_REQUEST | JSON_RPC_INVALID_PARAMS)
+    )
+}
+
+/// Time the detailed read sent after the routine one may take: what is left of
+/// the session bound, but never less than [`DETAIL_READ_MIN_BUDGET`].
+pub(super) fn detail_read_budget(session_remaining: Duration) -> Duration {
+    session_remaining.clamp(DETAIL_READ_MIN_BUDGET, DETAIL_READ_MAX_BUDGET)
 }
 
 impl CodexRateLimitsRead {
@@ -150,6 +182,12 @@ impl DetailCadence {
         )
     }
 
+    /// Latest detailed read, failed or not; the eviction order.
+    fn last_activity(&self) -> Option<u64> {
+        self.last_detail_ok_at
+            .max(self.last_detail_failed.map(|(at, _)| at))
+    }
+
     fn record_detail(&mut self, ok: bool, count: Option<u64>, now: u64) {
         if ok {
             self.last_detail_ok_at = Some(now);
@@ -166,8 +204,7 @@ pub(super) struct CodexCreditRead<'a> {
     /// [`binding_key`] of the validated credential identity; `None` when the
     /// reading is not bound (its meters are dropped downstream).
     pub(super) binding: Option<&'a str>,
-    pub(super) home: Option<&'a Path>,
-    /// A detailed read was sent in this session (planned or escalated).
+    /// A detailed read was sent in this session.
     pub(super) details_requested: bool,
     /// Completion clock of the provider read.
     pub(super) observed_at: Option<&'a str>,
@@ -179,27 +216,11 @@ pub(super) struct CodexCreditRead<'a> {
 pub(super) struct CodexCreditTracker {
     sections: SectionCache,
     cadence: BTreeMap<String, DetailCadence>,
-    /// The binding each Codex home was last read as; plans the next request
-    /// before the reading reveals its identity.
-    home_binding: BTreeMap<PathBuf, String>,
 }
 
 impl CodexCreditTracker {
-    /// The request to send for `home`. An unknown home reads details.
-    pub(super) fn plan_read(&self, home: &Path, now: u64) -> CodexRateLimitsRead {
-        let due = self
-            .home_binding
-            .get(home)
-            .and_then(|binding| self.cadence.get(binding))
-            .map_or(true, |cadence| cadence.detail_due(now));
-        if due {
-            CodexRateLimitsRead::Detailed
-        } else {
-            CodexRateLimitsRead::Routine
-        }
-    }
-
-    /// After a routine reading, whether to send the detailed read at once.
+    /// After a routine reading, whether to send the detailed read at once. A
+    /// cold binding (first poll after start, or never read) is due.
     pub(super) fn routine_needs_details(
         &self,
         binding: Option<&str>,
@@ -209,6 +230,10 @@ impl CodexCreditTracker {
         let Some(binding) = binding else {
             return false;
         };
+        if reset_credit_rows(rate_limits).is_some() {
+            // The routine answer already carries the list.
+            return false;
+        }
         let count = available_count(rate_limits);
         let key = BindingKey::from_credential_identity_hash(binding);
         let cached =
@@ -231,14 +256,12 @@ impl CodexCreditTracker {
         let count = available_count(rate_limits);
         let rows = reset_credit_rows(rate_limits);
         if let Some(binding) = read.binding {
-            if read.details_requested {
-                // No reset section at all is a complete answer, not a failure.
+            // A list in any answer is a detailed reading; no reset section at
+            // all is a complete answer, not a failure.
+            if read.details_requested || rows.is_some() {
                 let ok = rows.is_some() || count.is_none();
-                bounded_entry(&mut self.cadence, binding.to_string())
+                self.cadence_entry(binding)
                     .record_detail(ok, count, read.now);
-            }
-            if let Some(home) = read.home {
-                *bounded_entry(&mut self.home_binding, home.to_path_buf()) = binding.to_string();
             }
         }
         let Some(balance) = balances
@@ -290,14 +313,23 @@ impl CodexCreditTracker {
     }
 }
 
-/// Insert-or-get with a size bound; the evicted entry is simply re-learned.
-fn bounded_entry<K: Ord + Clone, V: Default>(map: &mut BTreeMap<K, V>, key: K) -> &mut V {
-    if !map.contains_key(&key) && map.len() >= TRACKED_ENTRIES_MAX {
-        if let Some(evict) = map.keys().next().cloned() {
-            map.remove(&evict);
+impl CodexCreditTracker {
+    /// The binding's cadence, evicting the least recently read other binding
+    /// at the bound. An evicted binding is simply re-learned (it reads
+    /// details on its next poll).
+    fn cadence_entry(&mut self, binding: &str) -> &mut DetailCadence {
+        if !self.cadence.contains_key(binding) && self.cadence.len() >= TRACKED_BINDINGS_MAX {
+            if let Some(evict) = self
+                .cadence
+                .iter()
+                .min_by_key(|(_, cadence)| cadence.last_activity())
+                .map(|(key, _)| key.clone())
+            {
+                self.cadence.remove(&evict);
+            }
         }
+        self.cadence.entry(binding.to_string()).or_default()
     }
-    map.entry(key).or_default()
 }
 
 fn tracker() -> MutexGuard<'static, CodexCreditTracker> {
@@ -306,11 +338,6 @@ fn tracker() -> MutexGuard<'static, CodexCreditTracker> {
         .get_or_init(|| Mutex::new(CodexCreditTracker::default()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Process-wide [`CodexCreditTracker::plan_read`].
-pub(super) fn plan_rate_limits_read(home: &Path, now: u64) -> CodexRateLimitsRead {
-    tracker().plan_read(home, now)
 }
 
 /// Process-wide [`CodexCreditTracker::routine_needs_details`].
@@ -345,8 +372,9 @@ fn reset_credits(rate_limits: &Value) -> Option<&Value> {
         .filter(|value| value.is_object())
 }
 
-/// `availableCount`, parsed exactly as the `reset_bank` balance parses it.
-fn available_count(rate_limits: &Value) -> Option<u64> {
+/// `availableCount`: the one parse behind the `reset_bank` balance, the
+/// cadence and the counts diagnostic.
+pub(super) fn available_count(rate_limits: &Value) -> Option<u64> {
     json_u64(
         reset_credits(rate_limits)?,
         &["availableCount", "available_count"],
@@ -608,7 +636,6 @@ mod tests {
     ) -> CodexCreditRead<'a> {
         CodexCreditRead {
             binding,
-            home: None,
             details_requested,
             observed_at: Some(READ_AT),
             now,
@@ -908,33 +935,24 @@ mod tests {
         );
     }
 
-    /// One simulated poll through the tracker, returning the request kinds the
-    /// session sent and the emitted balance. `provider` answers a request:
-    /// routine reads get the count only.
+    /// One simulated poll as the session runs it: the routine read first, then
+    /// the detailed read in the same session when the tracker asks for it.
+    /// Returns the requests sent and the emitted balance.
     fn poll(
         tracker: &mut CodexCreditTracker,
-        home: &Path,
         binding: &str,
         now: u64,
         count: u64,
         list: &[Value],
     ) -> (Vec<CodexRateLimitsRead>, AgentCreditBalance) {
-        let answer = |kind| match kind {
-            CodexRateLimitsRead::Detailed => detailed(count, list.to_vec()),
-            CodexRateLimitsRead::Routine => count_only(count),
-        };
-        let planned = tracker.plan_read(home, now);
-        let mut sent = vec![planned];
-        let mut rate_limits = answer(planned);
-        if planned == CodexRateLimitsRead::Routine
-            && tracker.routine_needs_details(Some(binding), &rate_limits, now)
-        {
+        let mut sent = vec![CodexRateLimitsRead::Routine];
+        let mut rate_limits = count_only(count);
+        if tracker.routine_needs_details(Some(binding), &rate_limits, now) {
             sent.push(CodexRateLimitsRead::Detailed);
-            rate_limits = answer(CodexRateLimitsRead::Detailed);
+            rate_limits = detailed(count, list.to_vec());
         }
         let read = CodexCreditRead {
             binding: Some(binding),
-            home: Some(home),
             details_requested: sent.contains(&CodexRateLimitsRead::Detailed),
             observed_at: Some(READ_AT),
             now,
@@ -952,10 +970,12 @@ mod tests {
             .to_vec()
     }
 
+    const ROUTINE: CodexRateLimitsRead = CodexRateLimitsRead::Routine;
+    const DETAILED: CodexRateLimitsRead = CodexRateLimitsRead::Detailed;
+
     #[test]
     fn simulated_hour_is_one_detailed_read_plus_one_per_count_change() {
         let mut tracker = CodexCreditTracker::default();
-        let home = Path::new("/synthetic/codex-home");
         let mut detailed_reads = 0;
         let mut routine_reads = 0;
         // Twelve 5-minute polls; the count goes 2 → 3 at minute 20 and
@@ -969,65 +989,42 @@ mod tests {
             };
             let (sent, balance) = poll(
                 &mut tracker,
-                home,
                 BINDING_A,
                 T0 + minute * 60,
                 count,
                 &rows(count as usize),
             );
-            detailed_reads += sent
-                .iter()
-                .filter(|kind| **kind == CodexRateLimitsRead::Detailed)
-                .count();
-            routine_reads += sent
-                .iter()
-                .filter(|kind| **kind == CodexRateLimitsRead::Routine)
-                .count();
+            assert_eq!(sent[0], ROUTINE, "every poll starts with the routine read");
+            detailed_reads += sent.iter().filter(|kind| **kind == DETAILED).count();
+            routine_reads += sent.iter().filter(|kind| **kind == ROUTINE).count();
             assert_eq!(balance.grants_state, Some(CreditGrantsState::Complete));
             assert_eq!(balance.grants.as_ref().map(Vec::len), Some(count as usize));
         }
         assert_eq!(detailed_reads, 1 + 2, "one hourly + one per count change");
-        assert_eq!(routine_reads, 11, "every other poll is routine");
+        assert_eq!(routine_reads, 12, "every poll sends the routine read");
         // Any successful detailed read restarts the hour: the last one ran at
-        // minute 40, so minute 95 is routine and minute 100 is detailed.
+        // minute 40, so minute 95 is routine only and minute 100 escalates.
         let last_detail = T0 + 40 * 60;
-        let (sent, _) = poll(
-            &mut tracker,
-            home,
-            BINDING_A,
-            last_detail + 55 * 60,
-            2,
-            &rows(2),
-        );
-        assert_eq!(sent, vec![CodexRateLimitsRead::Routine]);
-        let (sent, _) = poll(
-            &mut tracker,
-            home,
-            BINDING_A,
-            last_detail + 60 * 60,
-            2,
-            &rows(2),
-        );
-        assert_eq!(sent, vec![CodexRateLimitsRead::Detailed]);
+        let (sent, _) = poll(&mut tracker, BINDING_A, last_detail + 55 * 60, 2, &rows(2));
+        assert_eq!(sent, vec![ROUTINE]);
+        let (sent, _) = poll(&mut tracker, BINDING_A, last_detail + 60 * 60, 2, &rows(2));
+        assert_eq!(sent, vec![ROUTINE, DETAILED]);
     }
 
     #[test]
     fn grants_stay_continuous_across_routine_polls_with_original_read_time() {
         let mut tracker = CodexCreditTracker::default();
-        let home = Path::new("/synthetic/codex-home");
-        let (sent, first) = poll(&mut tracker, home, BINDING_A, T0, 2, &rows(2));
-        assert_eq!(sent, vec![CodexRateLimitsRead::Detailed]);
+        let (sent, first) = poll(&mut tracker, BINDING_A, T0, 2, &rows(2));
+        assert_eq!(sent, vec![ROUTINE, DETAILED]);
         for step in 1..=4u64 {
             let mut balances = vec![reset_bank(2)];
             let now = T0 + step * 300;
-            assert_eq!(tracker.plan_read(home, now), CodexRateLimitsRead::Routine);
             assert!(!tracker.routine_needs_details(Some(BINDING_A), &count_only(2), now));
             tracker.attach_reset_bank_grants(
                 &mut balances,
                 &count_only(2),
                 CodexCreditRead {
                     binding: Some(BINDING_A),
-                    home: Some(home),
                     details_requested: false,
                     // A later read clock: the list keeps its own.
                     observed_at: Some("2026-10-09T15:05:00Z"),
@@ -1040,50 +1037,34 @@ mod tests {
     }
 
     #[test]
-    fn cold_cache_reads_details_first_and_never_sends_unknown() {
-        // A restart: a fresh tracker for a binding that had a list before.
+    fn cold_cache_escalates_at_once_and_never_sends_unknown() {
         let mut tracker = CodexCreditTracker::default();
-        let home = Path::new("/synthetic/codex-home");
-        assert_eq!(tracker.plan_read(home, T0), CodexRateLimitsRead::Detailed);
-        // Even if a routine reading arrives first (e.g. the planned home
-        // changed hands), a missing list escalates instead of guessing.
         assert!(tracker.routine_needs_details(Some(BINDING_A), &count_only(2), T0));
-        let (sent, balance) = poll(&mut tracker, home, BINDING_A, T0, 2, &rows(2));
-        assert_eq!(sent, vec![CodexRateLimitsRead::Detailed]);
+        let (sent, balance) = poll(&mut tracker, BINDING_A, T0, 2, &rows(2));
+        assert_eq!(sent, vec![ROUTINE, DETAILED]);
         assert_eq!(balance.status, AgentCreditBalanceStatus::Ok);
         assert_eq!(balance.grants_state, Some(CreditGrantsState::Complete));
     }
 
     #[test]
     fn daemon_restart_reads_details_on_the_first_poll_so_the_list_never_blinks() {
-        let home = Path::new("/synthetic/codex-home");
         let mut tracker = CodexCreditTracker::default();
         let mut emitted = Vec::new();
         for step in 0..3u64 {
-            emitted.push(poll(
-                &mut tracker,
-                home,
-                BINDING_A,
-                T0 + step * 300,
-                2,
-                &rows(2),
-            ));
+            emitted.push(poll(&mut tracker, BINDING_A, T0 + step * 300, 2, &rows(2)));
         }
         // Daemon restart: every in-memory cadence and cache entry is gone.
         let mut tracker = CodexCreditTracker::default();
         let restarted_at = T0 + 3 * 300;
+        let (sent, first_after_restart) = poll(&mut tracker, BINDING_A, restarted_at, 2, &rows(2));
         assert_eq!(
-            tracker.plan_read(home, restarted_at),
-            CodexRateLimitsRead::Detailed,
-            "the first poll after start is detailed, not routine"
+            sent,
+            vec![ROUTINE, DETAILED],
+            "the first poll after start reads details in the same session"
         );
-        let (sent, first_after_restart) =
-            poll(&mut tracker, home, BINDING_A, restarted_at, 2, &rows(2));
-        assert_eq!(sent, vec![CodexRateLimitsRead::Detailed], "one eager read");
         emitted.push((sent, first_after_restart.clone()));
         emitted.push(poll(
             &mut tracker,
-            home,
             BINDING_A,
             restarted_at + 300,
             2,
@@ -1108,37 +1089,37 @@ mod tests {
         }
         // The same grants before and after the restart.
         assert_eq!(first_after_restart.grants, emitted[0].1.grants);
-        // The process-wide tracker plans a never-seen home the same way.
-        assert_eq!(
-            plan_rate_limits_read(Path::new("/synthetic/never-read-codex-home"), restarted_at),
-            CodexRateLimitsRead::Detailed
-        );
+        // The process-wide tracker treats a never-read binding the same way.
+        assert!(routine_read_needs_details(
+            Some("synthetic-never-read:workspace"),
+            &count_only(2),
+            restarted_at
+        ));
     }
 
     #[test]
     fn account_switch_a_b_a_keeps_a_list() {
         let mut tracker = CodexCreditTracker::default();
-        let home = Path::new("/synthetic/codex-home");
-        let (_, a_first) = poll(&mut tracker, home, BINDING_A, T0, 2, &rows(2));
+        let (_, a_first) = poll(&mut tracker, BINDING_A, T0, 2, &rows(2));
         // B signs in at the same home: its first routine reading has no list
         // for B, so details are read at once.
-        let (sent, b) = poll(&mut tracker, home, BINDING_B, T0 + 300, 3, &rows(3));
-        assert!(sent.contains(&CodexRateLimitsRead::Detailed));
+        let (sent, b) = poll(&mut tracker, BINDING_B, T0 + 300, 3, &rows(3));
+        assert_eq!(sent, vec![ROUTINE, DETAILED]);
         assert_eq!(b.grants.as_ref().map(Vec::len), Some(3));
         // Back to A within the hour: A's list is re-sent unchanged.
-        let (sent, a_again) = poll(&mut tracker, home, BINDING_A, T0 + 600, 2, &rows(2));
-        assert_eq!(sent, vec![CodexRateLimitsRead::Routine]);
+        let (sent, a_again) = poll(&mut tracker, BINDING_A, T0 + 600, 2, &rows(2));
+        assert_eq!(sent, vec![ROUTINE]);
         assert_eq!(wire(&a_again), wire(&a_first));
     }
 
     #[test]
     fn failed_detail_read_resends_matching_list_and_retries_later() {
         let mut tracker = CodexCreditTracker::default();
-        let home = Path::new("/synthetic/codex-home");
-        let (_, first) = poll(&mut tracker, home, BINDING_A, T0, 2, &rows(2));
-        // The hourly detailed read fails (Codex falls back to the count).
+        let (_, first) = poll(&mut tracker, BINDING_A, T0, 2, &rows(2));
+        // The hourly detailed read is due and fails (Codex falls back to the
+        // count); the routine reading still stands.
         let hour = T0 + 3_600;
-        assert_eq!(tracker.plan_read(home, hour), CodexRateLimitsRead::Detailed);
+        assert!(tracker.routine_needs_details(Some(BINDING_A), &count_only(2), hour));
         let mut balances = vec![reset_bank(2)];
         tracker.attach_reset_bank_grants(
             &mut balances,
@@ -1151,22 +1132,19 @@ mod tests {
             "same count: last list re-sent"
         );
         // Not retried on every poll ...
-        assert_eq!(
-            tracker.plan_read(home, hour + 300),
-            CodexRateLimitsRead::Routine
-        );
+        assert!(!tracker.routine_needs_details(Some(BINDING_A), &count_only(2), hour + 300));
         // ... but after the retry wait.
-        assert_eq!(
-            tracker.plan_read(home, hour + DETAIL_RETRY_SECS),
-            CodexRateLimitsRead::Detailed
-        );
+        assert!(tracker.routine_needs_details(
+            Some(BINDING_A),
+            &count_only(2),
+            hour + DETAIL_RETRY_SECS
+        ));
     }
 
     #[test]
     fn count_change_with_failed_details_is_unavailable_then_retried() {
         let mut tracker = CodexCreditTracker::default();
-        let home = Path::new("/synthetic/codex-home");
-        poll(&mut tracker, home, BINDING_A, T0, 2, &rows(2));
+        poll(&mut tracker, BINDING_A, T0, 2, &rows(2));
         let now = T0 + 300;
         assert!(tracker.routine_needs_details(Some(BINDING_A), &count_only(3), now));
         // The escalated detailed read fails: the old list is not re-sent
@@ -1195,6 +1173,21 @@ mod tests {
     }
 
     #[test]
+    fn a_routine_answer_that_carries_the_list_is_the_detailed_read() {
+        // A server that ignores the parameter answers the routine read in full.
+        let mut tracker = CodexCreditTracker::default();
+        let full = detailed(2, rows(2));
+        assert!(
+            !tracker.routine_needs_details(Some(BINDING_A), &full, T0),
+            "no second request"
+        );
+        let (balance, _) = attach(&mut tracker, &full, read(Some(BINDING_A), false, T0));
+        assert_eq!(balance.grants_state, Some(CreditGrantsState::Complete));
+        // Recorded as a detailed read: nothing is due for the next hour.
+        assert!(!tracker.routine_needs_details(Some(BINDING_A), &count_only(2), T0 + 300));
+    }
+
+    #[test]
     fn unbound_readings_neither_escalate_nor_touch_the_cache() {
         let mut tracker = CodexCreditTracker::default();
         assert!(!tracker.routine_needs_details(None, &count_only(2), T0));
@@ -1210,22 +1203,54 @@ mod tests {
     #[test]
     fn accounts_without_saved_resets_are_detailed_hourly_not_every_poll() {
         let mut tracker = CodexCreditTracker::default();
-        let home = Path::new("/synthetic/codex-home");
         let no_resets = json!({"rateLimits": {}});
-        assert_eq!(tracker.plan_read(home, T0), CodexRateLimitsRead::Detailed);
-        tracker.attach_reset_bank_grants(
-            &mut [],
-            &no_resets,
-            CodexCreditRead {
-                home: Some(home),
-                ..read(Some(BINDING_A), true, T0)
-            },
+        assert!(tracker.routine_needs_details(Some(BINDING_A), &no_resets, T0));
+        tracker.attach_reset_bank_grants(&mut [], &no_resets, read(Some(BINDING_A), true, T0));
+        assert!(!tracker.routine_needs_details(Some(BINDING_A), &no_resets, T0 + 300));
+        assert!(tracker.routine_needs_details(Some(BINDING_A), &no_resets, T0 + 3_600));
+    }
+
+    #[test]
+    fn cadence_bound_evicts_the_least_recently_read_binding() {
+        let mut tracker = CodexCreditTracker::default();
+        for index in 0..TRACKED_BINDINGS_MAX as u64 {
+            // Binding "b00" is read last, so it is the most recent.
+            let at = T0 + (TRACKED_BINDINGS_MAX as u64 - index) * 60;
+            tracker
+                .cadence_entry(&format!("b{index:02}"))
+                .record_detail(true, Some(1), at);
+        }
+        tracker
+            .cadence_entry("new")
+            .record_detail(true, Some(1), T0 + 10_000);
+        assert_eq!(tracker.cadence.len(), TRACKED_BINDINGS_MAX);
+        assert!(tracker.cadence.contains_key("b00"), "the most recent stays");
+        assert!(tracker.cadence.contains_key("new"));
+        let oldest = format!("b{:02}", TRACKED_BINDINGS_MAX - 1);
+        assert!(!tracker.cadence.contains_key(&oldest), "the oldest goes");
+    }
+
+    #[test]
+    fn param_rejection_and_detail_budget_rules() {
+        assert!(routine_param_rejected(
+            &json!({"code": -32602, "message": "x"})
+        ));
+        assert!(routine_param_rejected(&json!({"code": -32600})));
+        assert!(!routine_param_rejected(&json!({"code": -32603})));
+        assert!(!routine_param_rejected(&json!({"code": 401})));
+        assert!(!routine_param_rejected(&json!({"message": "no code"})));
+        assert_eq!(
+            detail_read_budget(Duration::from_secs(1)),
+            DETAIL_READ_MIN_BUDGET
         );
         assert_eq!(
-            tracker.plan_read(home, T0 + 300),
-            CodexRateLimitsRead::Routine
+            detail_read_budget(Duration::from_secs(15)),
+            Duration::from_secs(15)
         );
-        assert!(!tracker.routine_needs_details(Some(BINDING_A), &no_resets, T0 + 300));
+        assert_eq!(
+            detail_read_budget(Duration::from_secs(60)),
+            DETAIL_READ_MAX_BUDGET
+        );
     }
 
     #[test]
@@ -1289,7 +1314,7 @@ mod tests {
         const READ_AT: &str = "2026-10-01T12:00:00Z";
 
         fn fixture(relative: &str) -> Value {
-            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../fixtures/agent-status/quota-contract-v2.2")
                 .join(relative);
             let text = std::fs::read_to_string(&path)
@@ -1316,7 +1341,6 @@ mod tests {
                 provider,
                 CodexCreditRead {
                     binding: Some(BINDING_A),
-                    home: None,
                     details_requested,
                     observed_at: Some(read_at),
                     now: unix(read_at),
@@ -1407,10 +1431,15 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::fs::PermissionsExt;
 
-        /// `mode`: `count` answers a routine read with the count only;
-        /// `reject` answers a routine read with an error, like a server that
-        /// does not know the parameter; `exit` closes its stdin, answers the
-        /// routine read and quits.
+        /// The fake answers the routine read with the count only and the
+        /// detailed read with the list, except as `mode` says:
+        /// - `reject`: the routine read is refused as invalid params (-32602);
+        /// - `outage`: the routine read fails with a non-parameter error;
+        /// - `reject_then_error`: `reject`, then the detailed read fails too;
+        /// - `detail_error`: the detailed read fails;
+        /// - `detail_silent`: the detailed read is never answered;
+        /// - `exit`: closes its stdin, answers the routine read and quits.
+        ///
         /// Every request line is logged.
         const FAKE_APP_SERVER: &str = r#"import json
 import os
@@ -1425,26 +1454,40 @@ detailed = {"rateLimits": {"limitId": "codex", "primary": {"usedPercent": 5, "wi
                 {"id": "grant-one", "resetType": "codexRateLimits", "status": "available", "grantedAt": 1790709296, "expiresAt": 1793301296, "title": "Full reset"},
                 {"id": "grant-two", "resetType": "codexRateLimits", "status": "available", "grantedAt": 1791416555, "expiresAt": 1794008555, "title": "Full reset"}]}}
 routine = {"rateLimits": detailed["rateLimits"], "rateLimitResetCredits": {"availableCount": 2, "credits": None}}
+
+def answer(request, result=None, code=None):
+    if code is None:
+        print(json.dumps({"id": request["id"], "result": result}), flush=True)
+    else:
+        print(json.dumps({"id": request["id"], "error": {"code": code, "message": "synthetic"}}), flush=True)
+
 for line in sys.stdin:
     request = json.loads(line)
     log.write(line)
     log.flush()
     if request.get("id") == 1:
-        print(json.dumps({"id": 1, "result": {"userAgent": "fake"}}), flush=True)
+        answer(request, {"userAgent": "fake"})
     elif request.get("id") == "ottto_account":
-        print(json.dumps({"id": "ottto_account", "result": {"account": {"type": "chatgpt", "planType": "pro"}}}), flush=True)
+        answer(request, {"account": {"type": "chatgpt", "planType": "pro"}})
     elif request.get("method") == "account/rateLimits/read":
         excluded = request.get("params", {}).get("excludeResetCreditDetails") is True
-        if excluded and mode == "exit":
-            # Close the only read end before answering, so the collector's
-            # follow-up write fails with a broken pipe.
-            os.close(0)
-            print(json.dumps({"id": request["id"], "result": routine}), flush=True)
-            sys.exit(0)
-        if excluded and mode == "reject":
-            print(json.dumps({"id": request["id"], "error": {"code": -32602, "message": "unknown field"}}), flush=True)
-        else:
-            print(json.dumps({"id": request["id"], "result": routine if excluded else detailed}), flush=True)
+        if excluded:
+            if mode == "exit":
+                # Close the only read end before answering, so the collector's
+                # follow-up write fails with a broken pipe.
+                os.close(0)
+                answer(request, routine)
+                sys.exit(0)
+            elif mode in ("reject", "reject_then_error"):
+                answer(request, code=-32602)
+            elif mode == "outage":
+                answer(request, code=-32603)
+            else:
+                answer(request, routine)
+        elif mode in ("detail_error", "reject_then_error"):
+            answer(request, code=-32603)
+        elif mode != "detail_silent":
+            answer(request, detailed)
 "#;
 
         struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
@@ -1474,11 +1517,12 @@ for line in sys.stdin:
             }
         }
 
+        /// One scripted session; `escalate` is the cadence's answer after the
+        /// routine reading.
         fn run(
             mode: &str,
-            read_kind: CodexRateLimitsRead,
             escalate: bool,
-        ) -> (CodexAppServerObservation, Vec<Value>) {
+        ) -> (Result<CodexAppServerObservation, String>, Vec<Value>) {
             let dir = ScratchDir::new("codex-credit-session");
             let bin = dir.join("bin");
             let home = dir.join("codex-home");
@@ -1507,10 +1551,8 @@ for line in sys.stdin:
                 call_codex_app_server_rate_limits_for_home(
                     &home,
                     CodexHomeTrust::Managed,
-                    read_kind,
                     &|_, _, _| escalate,
                 )
-                .expect("scripted read")
             };
             let requests = std::fs::read_to_string(&log)
                 .expect("request log")
@@ -1525,14 +1567,32 @@ for line in sys.stdin:
             reset_credit_rows(&observation.rate_limits).is_some()
         }
 
+        fn routine_request() -> Value {
+            CodexRateLimitsRead::Routine.request("ottto_rate_limits")
+        }
+
+        fn detail_request() -> Value {
+            CodexRateLimitsRead::Detailed.request(DETAIL_READ_ID)
+        }
+
+        /// The routine reading stood: usage and the count are kept, the list
+        /// is missing, and the detail attempt counts (as failed).
+        fn assert_routine_reading_kept(observation: &CodexAppServerObservation) {
+            assert!(
+                observation.details_requested,
+                "the attempt counts as failed"
+            );
+            assert!(!has_list(observation));
+            assert_eq!(available_count(&observation.rate_limits), Some(2));
+            assert!(observation.rate_limits.get("rateLimits").is_some());
+        }
+
         #[test]
         #[serial]
         fn routine_read_sends_the_exclude_param_and_keeps_the_count() {
-            let (observation, requests) = run("count", CodexRateLimitsRead::Routine, false);
-            assert_eq!(
-                requests,
-                vec![CodexRateLimitsRead::Routine.request("ottto_rate_limits")]
-            );
+            let (observation, requests) = run("count", false);
+            let observation = observation.expect("reading");
+            assert_eq!(requests, vec![routine_request()]);
             assert!(!observation.details_requested);
             assert!(!has_list(&observation));
             assert_eq!(available_count(&observation.rate_limits), Some(2));
@@ -1540,55 +1600,68 @@ for line in sys.stdin:
 
         #[test]
         #[serial]
-        fn routine_read_escalates_to_details_in_the_same_session() {
-            let (observation, requests) = run("count", CodexRateLimitsRead::Routine, true);
-            assert_eq!(
-                requests,
-                vec![
-                    CodexRateLimitsRead::Routine.request("ottto_rate_limits"),
-                    CodexRateLimitsRead::Detailed.request(DETAIL_READ_ID),
-                ]
-            );
+        fn routine_read_escalates_to_the_historical_detailed_read_in_the_same_session() {
+            let (observation, requests) = run("count", true);
+            let observation = observation.expect("reading");
+            assert_eq!(requests, vec![routine_request(), detail_request()]);
+            // The detailed request carries no params, byte-identical to the
+            // historical read.
+            assert!(detail_request().get("params").is_none());
             assert!(observation.details_requested);
             assert!(has_list(&observation));
         }
 
         #[test]
         #[serial]
-        fn detailed_plan_sends_the_historical_request_once() {
-            let (observation, requests) = run("count", CodexRateLimitsRead::Detailed, true);
-            assert_eq!(
-                requests,
-                vec![CodexRateLimitsRead::Detailed.request("ottto_rate_limits")]
-            );
-            assert!(observation.details_requested);
-            assert!(has_list(&observation));
+        fn an_escalated_detail_error_keeps_the_routine_reading() {
+            let (observation, requests) = run("detail_error", true);
+            assert_eq!(requests, vec![routine_request(), detail_request()]);
+            assert_routine_reading_kept(&observation.expect("reading"));
+        }
+
+        #[test]
+        #[serial]
+        fn an_unanswered_escalated_detail_read_keeps_the_routine_reading() {
+            let started = std::time::Instant::now();
+            let (observation, requests) = run("detail_silent", true);
+            assert_eq!(requests, vec![routine_request(), detail_request()]);
+            assert_routine_reading_kept(&observation.expect("reading"));
+            // The detailed read had its own budget, then gave up.
+            assert!(started.elapsed() >= DETAIL_READ_MIN_BUDGET);
         }
 
         #[test]
         #[serial]
         fn a_server_gone_before_the_detail_read_keeps_the_routine_reading() {
-            let (observation, requests) = run("exit", CodexRateLimitsRead::Routine, true);
-            assert_eq!(requests.len(), 1);
-            assert!(
-                observation.details_requested,
-                "the attempt counts as failed"
-            );
-            assert!(!has_list(&observation));
-            assert_eq!(available_count(&observation.rate_limits), Some(2));
+            let (observation, requests) = run("exit", true);
+            assert_eq!(requests, vec![routine_request()]);
+            assert_routine_reading_kept(&observation.expect("reading"));
         }
 
         #[test]
         #[serial]
         fn a_server_rejecting_the_param_falls_back_to_the_plain_read() {
-            let (observation, requests) = run("reject", CodexRateLimitsRead::Routine, false);
-            assert_eq!(requests.len(), 2);
-            assert_eq!(
-                requests[1],
-                CodexRateLimitsRead::Detailed.request(DETAIL_READ_ID)
-            );
+            let (observation, requests) = run("reject", false);
+            let observation = observation.expect("reading");
+            assert_eq!(requests, vec![routine_request(), detail_request()]);
             assert!(observation.details_requested);
             assert!(has_list(&observation));
+        }
+
+        #[test]
+        #[serial]
+        fn a_rejected_param_then_a_failing_detailed_read_fails_the_reading() {
+            let (observation, requests) = run("reject_then_error", false);
+            assert_eq!(requests, vec![routine_request(), detail_request()]);
+            assert!(observation.is_err(), "no reading to keep");
+        }
+
+        #[test]
+        #[serial]
+        fn other_routine_errors_do_not_retry_with_the_detailed_read() {
+            let (observation, requests) = run("outage", true);
+            assert_eq!(requests, vec![routine_request()], "no costlier retry");
+            assert!(observation.is_err());
         }
     }
 }

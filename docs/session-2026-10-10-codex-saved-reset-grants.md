@@ -31,26 +31,37 @@ grant key, the status table, field refusals, ordering, the 20-grant cap and
 
 ## Detail cadence
 
-A detailed `account/rateLimits/read` makes Codex call its backend twice. Routine
-polls now send `{"excludeResetCreditDetails": true}`, which still returns the
-count. The detailed request is unchanged (no params) and is sent when:
+A detailed `account/rateLimits/read` makes Codex call its backend twice. Every
+poll now first sends the routine read, `{"excludeResetCreditDetails": true}`,
+which still returns usage and the count. The detailed request is unchanged (no
+params) and follows in the same app-server session when:
 
 - the account binding has had no successful detailed read for an hour (a
-  one-minute slack keeps a 5-minute poll on the hour);
-- a routine answer reports a count with no cached list for that count: a count
-  change, a cold cache after restart or sleep, or a different account in the
-  same Codex home. The detailed read follows in the same app-server session;
-- the app-server rejects the routine parameter (older servers).
+  one-minute slack keeps a 5-minute poll on the hour); this includes the first
+  poll after the daemon starts;
+- the routine count has no cached list for that count: a count change or a
+  different account in the same Codex home.
+
+Because the routine answer comes first, a detailed read that errors, times out
+or cannot be sent never costs the poll's usage and count; only the list is
+missing, and the cached list is re-sent while the count matches. The detailed
+read gets its own time budget (at least 10 seconds, at most 20) after the
+routine answer. A routine answer that already carries the list (a server that
+ignores the parameter) counts as the detailed read, with no second request.
+
+Only a JSON-RPC "invalid params" or "invalid request" answer (-32602, -32600)
+to the routine read makes the collector send the plain request instead (older
+servers). Any other error fails the reading as before, without a costlier
+retry.
 
 A failed detailed read is retried after 15 minutes, or at once if the count
-changes again, never on every poll. A failing detail endpoint therefore never
-costs more than the old every-poll detailed read did. If the detailed read in
-the same session does not answer before the existing 20-second session bound,
-the routine answer is used.
+changes again, never on every poll. Per account and hour that is twelve routine
+reads plus one detailed read (about 14 backend calls instead of 24), and about
+20 while the detail endpoint keeps failing.
 
 The decisions are pure functions of a per-binding state and the clock
-(`DetailCadence`, `CodexCreditTracker::plan_read` and
-`routine_needs_details`), unit-tested over a simulated hour.
+(`DetailCadence`, `CodexCreditTracker::routine_needs_details`), unit-tested over
+a simulated hour.
 
 ## Sender stability
 
@@ -96,7 +107,7 @@ launcher, then the inner binary, before falling back to `PATH`.
   three-grant lists, count-only and `credits: null`, provider-capped, invalid
   rows (partial, with field-path diagnostics), empty list with zero count.
 - Cadence: a simulated hour with two count changes is exactly three detailed
-  reads and eleven routine reads; the next hourly read lands one hour after the
+  reads and twelve routine reads; the next hourly read lands one hour after the
   last detailed read.
 - Stability: the list is byte-identical across four routine polls; after a
   daemon restart the first poll reads details eagerly, so the first upload
@@ -104,17 +115,20 @@ launcher, then the inner binary, before falling back to `PATH`.
   the matching list; a failed read after a count change is `unavailable` and is
   retried on the next count change or after the retry wait.
 - Session: a scripted app-server confirms the routine request carries the
-  parameter, the escalation sends the plain request in the same session, the
-  detailed plan sends exactly the historical request, and a server that rejects
-  the parameter falls back to the plain read.
-- Resolver: scratch bundles with the old and new layouts.
+  parameter and the escalation sends the plain request in the same session. An
+  escalated read that errors, never answers, or cannot be sent keeps the
+  routine reading. A rejected parameter falls back to the plain read, and fails
+  the reading if that read fails too. Any other routine error is not retried.
+- Resolver: executable scratch bundles with the old and new layouts, through
+  the same lookup the resolver uses.
 
 No live provider calls were made; all fixtures are synthetic.
 
 ## Limits
 
 - If Codex's routine count and detail count ever disagreed persistently, every
-  routine poll would read details again: the old cost, not more.
+  poll would send the routine and the detailed read: one backend call more per
+  poll than the old every-poll detailed read.
 - The legacy OAuth fallback path (opt-in, default home only) gains `kind` but
   no grants; it never read the reset list.
 - Emitting pools as meters, an exact-decimal credit balance and an

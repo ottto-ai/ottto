@@ -27,16 +27,18 @@ const PROVIDER_ENV_KEYS: &[&str] = &[
 ];
 
 pub(crate) fn executable_path(program: &str) -> Option<PathBuf> {
-    executable_search_dirs_for_program(program)
-        .into_iter()
-        .find_map(|dir| {
-            let candidate = dir.join(program);
-            if candidate.is_file() {
-                Some(candidate)
-            } else {
-                None
-            }
-        })
+    first_program_in(executable_search_dirs_for_program(program), program)
+}
+
+fn first_program_in(dirs: impl IntoIterator<Item = PathBuf>, program: &str) -> Option<PathBuf> {
+    dirs.into_iter().find_map(|dir| {
+        let candidate = dir.join(program);
+        if candidate.is_file() {
+            Some(candidate)
+        } else {
+            None
+        }
+    })
 }
 
 /// Hardened Claude-only resolver. Every candidate comes from an absolute
@@ -562,10 +564,18 @@ mod tests {
         assert!(dirs.len() > expected.len(), "PATH directories follow");
     }
 
+    /// Resolve through the same lookup `executable_path` uses; whatever it
+    /// finds must also be runnable.
     fn codex_resolved_in(dirs: &[PathBuf]) -> Option<PathBuf> {
-        dirs.iter()
-            .map(|dir| dir.join("codex"))
-            .find(|candidate| candidate.is_file())
+        let found = first_program_in(dirs.iter().cloned(), "codex");
+        if let Some(path) = &found {
+            assert!(
+                is_absolute_executable(path),
+                "{} is not executable",
+                path.display()
+            );
+        }
+        found
     }
 
     #[test]
@@ -575,6 +585,7 @@ mod tests {
             fs::create_dir_all(&dir).expect("layout dir");
             let codex = dir.join("codex");
             fs::write(&codex, "#!/bin/sh\n").expect("codex");
+            fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).expect("chmod codex");
             codex
         };
 
