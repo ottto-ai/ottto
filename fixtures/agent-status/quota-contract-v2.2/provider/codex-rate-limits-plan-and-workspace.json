@@ -1,0 +1,23 @@
+{
+  "rateLimits": {
+    "limitId": "codex",
+    "primary": {
+      "usedPercent": 17,
+      "windowDurationMins": 10080,
+      "resetsAt": 1791273600
+    },
+    "secondary": null,
+    "credits": {
+      "hasCredits": true,
+      "unlimited": false,
+      "balance": "2583"
+    },
+    "individualLimit": {
+      "limit": 500,
+      "used": 100,
+      "remainingPercent": 80,
+      "resetsAt": 1793491200
+    },
+    "planType": "team"
+  }
+}

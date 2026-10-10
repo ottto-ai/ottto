@@ -1,0 +1,14 @@
+{
+  "credit_balances": [
+    {
+      "disabled_reason": "org_spend_cap_reached",
+      "enabled": false,
+      "freshness": "fresh",
+      "kind": "usage_credits",
+      "name": "Usage credits",
+      "observed_at": "2026-10-01T12:00:00Z",
+      "status": "unknown",
+      "unit": "usd"
+    }
+  ]
+}

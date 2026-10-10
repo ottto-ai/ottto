@@ -1,0 +1,51 @@
+{
+  "credit_balances": [
+    {
+      "freshness": "fresh",
+      "name": "reset_bank",
+      "remaining": 3,
+      "status": "ok",
+      "unit": "resets",
+      "unlimited": false
+    },
+    {
+      "freshness": "fresh",
+      "limit_id": "codex",
+      "name": "credits",
+      "remaining": 2583,
+      "status": "ok",
+      "unit": "credits",
+      "unlimited": false
+    },
+    {
+      "enabled": true,
+      "freshness": "fresh",
+      "limit_id": "codex",
+      "name": "workspace_monthly_credits",
+      "quota": 500,
+      "remaining": 400,
+      "resets_at": "2026-11-01T00:00:00Z",
+      "status": "ok",
+      "unit": "credits",
+      "unlimited": false,
+      "used": 100,
+      "used_percent": 20
+    },
+    {
+      "freshness": "fresh",
+      "limit_id": "codex_bengalfox",
+      "name": "codex_bengalfox_credits",
+      "remaining": 40,
+      "status": "ok",
+      "unit": "credits",
+      "unlimited": false
+    },
+    {
+      "enabled": false,
+      "freshness": "fresh",
+      "name": "Usage credits",
+      "status": "unknown",
+      "unit": "usd"
+    }
+  ]
+}

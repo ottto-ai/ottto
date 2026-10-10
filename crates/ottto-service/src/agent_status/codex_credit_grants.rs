@@ -1488,6 +1488,11 @@ mod tests {
                     "codex-reset-credits-provider-capped",
                 ),
                 ("codex-reset-credits-21", "codex-reset-credits-21"),
+                // Plan credits and the workspace allowance, no reset section.
+                (
+                    "codex-rate-limits-plan-and-workspace",
+                    "codex-rate-limits-plan-and-workspace",
+                ),
                 // A detailed read Codex answered with the count only.
                 (
                     "codex-reset-credits-count-only",
@@ -1791,6 +1796,28 @@ for line in sys.stdin:
             let (observation, requests) = run("reject_then_error", false);
             assert_eq!(requests, vec![routine_request(), detail_request()]);
             assert!(observation.is_err(), "no reading to keep");
+        }
+
+        /// A failed detailed read never costs a routine reading; only when no
+        /// routine reading exists does the session fail, with the precise
+        /// message of the failed request and no provider text.
+        #[test]
+        #[serial]
+        fn a_detailed_failure_keeps_the_routine_reading_or_reports_the_precise_message() {
+            for mode in ["detail_error", "detail_oversized"] {
+                let (observation, _) = run(mode, true);
+                assert_routine_reading_kept(&observation.expect(mode));
+            }
+            let (observation, _) = run("reject_then_error", false);
+            let message = observation.err().expect("no routine reading");
+            assert_eq!(
+                message,
+                "Codex app-server quota RPC failed with code -32603."
+            );
+            assert!(
+                !message.contains("synthetic"),
+                "no provider text: {message}"
+            );
         }
 
         #[test]

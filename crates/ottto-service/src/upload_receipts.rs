@@ -75,6 +75,130 @@ struct ValidatedReceiptEntity {
     acknowledged_body_witness_digest: Option<String>,
     accepted_head_hash: Option<String>,
     conflict_challenge_hash: Option<String>,
+    // Private diagnostic only. Older receipts had no rejection comparison data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rejection_usage: Option<RejectedUsageEvidence>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RejectedUsageEvidence {
+    schema_version: u16,
+    entity_ref: String,
+    machine_ref: String,
+    reason: RejectedUsageReason,
+    permanent: bool,
+    exclusive_usage_contract: bool,
+    // request, input, output, cache_read, cache_creation_5m,
+    // cache_creation_1h, reasoning_output, unattributed_total.
+    counters: [u64; 8],
+    // total, input, output, cache_read, cache_creation. Invalid decimals are absent.
+    costs_usd: [Option<String>; 5],
+    semantic_activity_unix_nanos: Option<i128>,
+    usage_bucket_count: usize,
+    usage_grain_count: usize,
+    // Sorted serialized grains; detects changes without retaining dimensions.
+    usage_grain_digest: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RejectedUsageReason {
+    UsageAccountingAuthorityDowngrade,
+    Other,
+}
+
+fn rejected_usage_evidence(
+    request: &SnapshotBatchRequest,
+    item: &crate::snapshots::SnapshotItem,
+    rejection: &SnapshotEntityRejection,
+) -> RejectedUsageEvidence {
+    fn decimal(value: &Option<String>) -> Option<String> {
+        value
+            .as_ref()
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 32
+                    && value.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                    && value.bytes().filter(|b| *b == b'.').count() <= 1
+                    && value.bytes().any(|b| b.is_ascii_digit())
+            })
+            .cloned()
+    }
+    fn timestamp(value: &Option<String>) -> Option<i128> {
+        OffsetDateTime::parse(value.as_deref()?, &Rfc3339)
+            .ok()
+            .map(|time| time.unix_timestamp_nanos())
+    }
+    let costs_usd = item
+        .cost
+        .as_ref()
+        .map(|cost| {
+            [
+                decimal(&cost.total_cost_usd),
+                decimal(&cost.input_cost_usd),
+                decimal(&cost.output_cost_usd),
+                decimal(&cost.cache_read_cost_usd),
+                decimal(&cost.cache_creation_cost_usd),
+            ]
+        })
+        .unwrap_or_default();
+    // Persist hashes only, never model/selector/account values or arbitrary reasons.
+    let mut grains = item
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| {
+            bucket
+                .model_usage
+                .iter()
+                .map(|model| serde_json::json!([bucket.bucket_start, model]).to_string())
+        })
+        .collect::<Vec<_>>();
+    grains.sort_unstable();
+    let mut digest = Sha256::new();
+    digest.update(b"ottto.rejected_usage.grains:v1\0");
+    for grain in &grains {
+        digest.update((grain.len() as u64).to_be_bytes());
+        digest.update(grain.as_bytes());
+    }
+    let entity_key = format!(
+        "{}\x1f{}\x1f{}",
+        request.source, request.machine_id, item.source_session_id
+    );
+    RejectedUsageEvidence {
+        schema_version: 1,
+        entity_ref: format!("{:x}", Sha256::digest(entity_key.as_bytes()))[..16].into(),
+        machine_ref: format!("{:x}", Sha256::digest(request.machine_id.as_bytes()))[..12].into(),
+        reason: if rejection.reason == "usage_accounting_authority_downgrade" {
+            RejectedUsageReason::UsageAccountingAuthorityDowngrade
+        } else {
+            RejectedUsageReason::Other
+        },
+        permanent: rejection.permanent,
+        exclusive_usage_contract: item.usage_accounting_contract.as_deref()
+            == Some("session_exclusive_reported_usage:v1"),
+        counters: [
+            item.request_count,
+            item.input_tokens,
+            item.output_tokens,
+            item.cache_read_tokens,
+            item.cache_creation_5m_tokens,
+            item.cache_creation_1h_tokens,
+            item.reasoning_output_tokens,
+            item.unattributed_total_tokens,
+        ],
+        costs_usd,
+        semantic_activity_unix_nanos: std::iter::once(timestamp(&item.source_last_activity_at))
+            .chain(
+                item.usage_buckets
+                    .iter()
+                    .map(|bucket| timestamp(&bucket.last_activity_at)),
+            )
+            .flatten()
+            .max(),
+        usage_bucket_count: item.usage_buckets.len(),
+        usage_grain_count: grains.len(),
+        usage_grain_digest: format!("{:x}", digest.finalize()),
+    }
 }
 
 pub(crate) fn full_hash(domain: &[u8], value: &str) -> String {
@@ -127,6 +251,39 @@ fn validated_evidence(
         entry.0 += 1;
     }
     let mut entities = Vec::new();
+    // Failures take the bounded evidence slots first; successful siblings must
+    // not erase the one rejected entity needed to diagnose a mixed page.
+    for reference in &response.rejected_entities {
+        let (count, item) = requested.get(&(
+            reference.source_session_id.as_str(),
+            reference.snapshot_fingerprint.as_str(),
+        ))?;
+        if entities.len() >= 50 {
+            continue;
+        }
+        entities.push(ValidatedReceiptEntity {
+            session_hash: full_hash(
+                b"ottto.validated_receipt.session:v1",
+                &reference.source_session_id,
+            ),
+            snapshot_fingerprint: reference.snapshot_fingerprint.clone(),
+            request_occurrences: *count,
+            uploaded_cache_patch_present: item.cache_observations.is_some(),
+            uploaded_request_count: item.request_count,
+            uploaded_output_tokens: item.output_tokens,
+            outcome: "rejected".into(),
+            outcome_occurrences: reference.occurrence_count,
+            request_body_witness_version: crate::snapshots::snapshot_upload_body_witness_version(
+                item,
+            ),
+            request_body_witness_digest: crate::snapshots::snapshot_upload_body_witness(item),
+            acknowledged_body_witness_version: None,
+            acknowledged_body_witness_digest: None,
+            accepted_head_hash: None,
+            conflict_challenge_hash: None,
+            rejection_usage: Some(rejected_usage_evidence(request, item, reference)),
+        });
+    }
     for (outcome, refs) in [
         ("accepted", &response.accepted_entities),
         ("unchanged", &response.unchanged_entities),
@@ -183,38 +340,9 @@ fn validated_evidence(
                     .head_challenge
                     .as_deref()
                     .map(|h| full_hash(b"ottto.validated_receipt.challenge:v1", h)),
+                rejection_usage: None,
             });
         }
-    }
-    for reference in &response.rejected_entities {
-        let (count, item) = requested.get(&(
-            reference.source_session_id.as_str(),
-            reference.snapshot_fingerprint.as_str(),
-        ))?;
-        if entities.len() >= 50 {
-            continue;
-        }
-        entities.push(ValidatedReceiptEntity {
-            session_hash: full_hash(
-                b"ottto.validated_receipt.session:v1",
-                &reference.source_session_id,
-            ),
-            snapshot_fingerprint: reference.snapshot_fingerprint.clone(),
-            request_occurrences: *count,
-            uploaded_cache_patch_present: item.cache_observations.is_some(),
-            uploaded_request_count: item.request_count,
-            uploaded_output_tokens: item.output_tokens,
-            outcome: "rejected".into(),
-            outcome_occurrences: reference.occurrence_count,
-            request_body_witness_version: crate::snapshots::snapshot_upload_body_witness_version(
-                item,
-            ),
-            request_body_witness_digest: crate::snapshots::snapshot_upload_body_witness(item),
-            acknowledged_body_witness_version: None,
-            acknowledged_body_witness_digest: None,
-            accepted_head_hash: None,
-            conflict_challenge_hash: None,
-        });
     }
     let total_entities = response.accepted_entities.len()
         + response.unchanged_entities.len()
@@ -1107,27 +1235,27 @@ mod tests {
         assert_eq!(proof.outcome_occurrences["accepted"], 2);
         assert_eq!(proof.outcome_occurrences.values().sum::<u64>(), 5);
         assert_eq!(proof.entities.len(), 4);
-        assert_eq!(proof.entities[0].request_occurrences, 2);
-        assert!(proof.entities[0].uploaded_cache_patch_present);
+        assert_eq!(proof.entities[1].request_occurrences, 2);
+        assert!(proof.entities[1].uploaded_cache_patch_present);
         assert_eq!(
-            proof.entities[0].uploaded_request_count,
+            proof.entities[1].uploaded_request_count,
             first.request_count
         );
         assert_eq!(
-            proof.entities[0].uploaded_output_tokens,
+            proof.entities[1].uploaded_output_tokens,
             first.output_tokens
         );
-        assert_eq!(proof.entities[0].outcome_occurrences, 2);
+        assert_eq!(proof.entities[1].outcome_occurrences, 2);
         assert_eq!(
             proof
                 .entities
                 .iter()
                 .map(|e| e.outcome.as_str())
                 .collect::<Vec<_>>(),
-            ["accepted", "unchanged", "conflict", "rejected"]
+            ["rejected", "accepted", "unchanged", "conflict"]
         );
-        assert!(proof.entities[2].accepted_head_hash.is_none());
-        assert!(proof.entities[2].conflict_challenge_hash.is_some());
+        assert!(proof.entities[3].accepted_head_hash.is_none());
+        assert!(proof.entities[3].conflict_challenge_hash.is_some());
         append_success_with_evidence_context(
             &dir,
             SourceKind::ClaudeCode,
@@ -1178,6 +1306,126 @@ mod tests {
     }
 
     #[test]
+    fn rejected_usage_survives_successful_siblings_and_old_receipts() {
+        let mut request = proof_request("claude_code", false);
+        let first = request.snapshots[0].clone();
+        request.snapshots = (1..=51)
+            .map(|n| {
+                let mut item = first.clone();
+                item.snapshot_fingerprint = format!("{n:064x}");
+                item
+            })
+            .collect();
+        let mut ack = proof_response(&request, false);
+        let template = ack.accepted_entities[0].clone();
+        ack.accepted = 50;
+        ack.accepted_entities = request.snapshots[..50]
+            .iter()
+            .map(|item| {
+                let mut entity = template.clone();
+                entity.snapshot_fingerprint = item.snapshot_fingerprint.clone();
+                entity
+            })
+            .collect();
+        ack.rejected_entities.push(SnapshotEntityRejection {
+            source_session_id: first.source_session_id.clone(),
+            snapshot_fingerprint: request.snapshots[50].snapshot_fingerprint.clone(),
+            occurrence_count: 1,
+            reason: "usage_accounting_authority_downgrade".into(),
+            detail: "private-server-detail".into(),
+            permanent: true,
+        });
+        let proof = evidence(&request, &ack, false).unwrap();
+        assert_eq!(proof.coverage, "truncated");
+        assert_eq!(proof.retained_entities, 50);
+        assert_eq!(proof.total_entities, 51);
+        let failure = &proof.entities[0];
+        assert_eq!(failure.outcome, "rejected");
+        assert_eq!(
+            failure.snapshot_fingerprint,
+            request.snapshots[50].snapshot_fingerprint
+        );
+        assert_eq!(
+            failure.rejection_usage.as_ref().unwrap().reason,
+            RejectedUsageReason::UsageAccountingAuthorityDowngrade
+        );
+        // Internal extension is optional: old ring rows decode with no invented evidence.
+        let mut old = serde_json::to_value(failure).unwrap();
+        old.as_object_mut().unwrap().remove("rejection_usage");
+        let old: ValidatedReceiptEntity = serde_json::from_value(old).unwrap();
+        assert!(old.rejection_usage.is_none());
+    }
+
+    #[test]
+    fn rejected_usage_is_content_free_and_detects_changed_floors_and_grain() {
+        let mut request = proof_request("claude_code", false);
+        let item = &mut request.snapshots[0];
+        item.input_tokens = 123;
+        item.cache_creation_5m_tokens = 456;
+        item.cache_creation_1h_tokens = 789;
+        item.source_last_activity_at = Some("2026-10-09T01:00:00Z".into());
+        item.cost = Some(crate::snapshots::SnapshotCost {
+            total_cost_usd: Some("1.234560".into()),
+            input_cost_usd: Some("secret-cost".into()),
+            output_cost_usd: None,
+            cache_read_cost_usd: None,
+            cache_creation_cost_usd: None,
+            evidence_source: "secret-cost-source".into(),
+        });
+        let mut model = item.model_usage[0].clone();
+        model.model = "secret-model".into();
+        model.account_identifier_hash = Some("secret-account".into());
+        item.usage_buckets = vec![crate::snapshots::SnapshotUsageBucket {
+            bucket_start: "2026-10-09T01:00:00Z".into(),
+            model_usage: vec![model.clone(), model],
+            first_activity_at: None,
+            last_activity_at: Some("2026-10-09T01:30:00Z".into()),
+        }];
+        let rejection = SnapshotEntityRejection {
+            source_session_id: item.source_session_id.clone(),
+            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+            occurrence_count: 1,
+            reason: "secret-reason".into(),
+            detail: "secret-detail".into(),
+            permanent: true,
+        };
+        let before = rejected_usage_evidence(&request, &request.snapshots[0], &rejection);
+        assert_eq!(before.reason, RejectedUsageReason::Other);
+        assert_eq!(before.counters[1], 123);
+        assert_eq!(&before.counters[4..6], &[456, 789]);
+        assert_eq!(before.costs_usd[0].as_deref(), Some("1.234560"));
+        assert!(before.costs_usd[1].is_none());
+        assert_eq!(before.usage_grain_count, 2);
+        assert_eq!(
+            before.semantic_activity_unix_nanos,
+            Some(
+                OffsetDateTime::parse("2026-10-09T01:30:00Z", &Rfc3339)
+                    .unwrap()
+                    .unix_timestamp_nanos()
+            )
+        );
+        let expected_key = format!(
+            "claude_code\x1f{}\x1f{}",
+            request.machine_id, request.snapshots[0].source_session_id
+        );
+        assert_eq!(
+            before.entity_ref,
+            format!("{:x}", Sha256::digest(expected_key.as_bytes()))[..16]
+        );
+        let bytes = serde_json::to_string(&before).unwrap();
+        assert!(!bytes.contains("secret-"));
+        assert!(!bytes.contains(&request.snapshots[0].source_session_id));
+        request.snapshots[0].usage_buckets[0].model_usage[0].input_tokens += 1;
+        request.snapshots[0].input_tokens += 1;
+        let after = rejected_usage_evidence(&request, &request.snapshots[0], &rejection);
+        assert_ne!(before.counters, after.counters);
+        assert_ne!(before.usage_grain_digest, after.usage_grain_digest);
+        request.snapshots[0].usage_buckets[0].model_usage.reverse();
+        let reordered = rejected_usage_evidence(&request, &request.snapshots[0], &rejection);
+        assert_eq!(after.usage_grain_digest, reordered.usage_grain_digest);
+    }
+
+    #[test]
     fn private_proof_old_rows_byte_eviction_and_truncation_remain_readable() {
         let dir = temp_dir();
         let mut request = proof_request("codex", false);
@@ -1201,7 +1449,7 @@ mod tests {
         assert_eq!(proof.total_entities, 51);
         assert_eq!(proof.retained_entities, 50);
         assert_eq!(proof.coverage, "truncated");
-        assert!(!proof.entities[0].uploaded_cache_patch_present);
+        assert!(!proof.entities[1].uploaded_cache_patch_present);
         {
             append_success_with_evidence_context(
                 &dir,
