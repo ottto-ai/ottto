@@ -1015,6 +1015,53 @@ fn status_follows_remaining() {
 }
 
 #[test]
+fn one_time_credit_refuses_a_codename_that_is_not_a_code() {
+    for codename in [
+        "",
+        "Bad Pool",
+        "iguana-NECKTIE",
+        "pool/../x",
+        "sk-synthetic",
+        &"p".repeat(65),
+    ] {
+        let refusal = one_time_credit(
+            codename,
+            Field::Absent,
+            Some(100),
+            Some(0),
+            Some(100),
+            TimeInput::Absent,
+            TimeInput::Absent,
+        )
+        .expect_err(codename);
+        assert_eq!(refusal, OneTimeCreditRefusal::LimitId);
+        assert_eq!(
+            refusal.diagnostic(),
+            CreditModelDiagnostic::new("field_refused", "limit_id")
+        );
+    }
+    for codename in [
+        "iguana_necktie",
+        "wattle_ember",
+        "pool.v2-1",
+        &"p".repeat(64),
+    ] {
+        let (balance, diagnostics) = one_time_credit(
+            codename,
+            Field::Absent,
+            None,
+            None,
+            None,
+            TimeInput::Absent,
+            TimeInput::Absent,
+        )
+        .expect(codename);
+        assert_eq!(balance.limit_id.as_deref(), Some(codename));
+        assert!(diagnostics.is_empty());
+    }
+}
+
+#[test]
 fn one_time_credit_normalizes_and_refuses_instants() {
     let (balance, diagnostics) = one_time_credit(
         "pool",
@@ -1024,7 +1071,8 @@ fn one_time_credit_normalizes_and_refuses_instants() {
         Some(1),
         TimeInput::Rfc3339("2026-11-05T09:59:00+02:00".to_string()),
         TimeInput::UnixSeconds(1_789_895_700),
-    );
+    )
+    .expect("valid pool codename");
     assert!(diagnostics.is_empty());
     assert_eq!(balance.expires_at.as_deref(), Some("2026-11-05T07:59:00Z"));
     assert_eq!(balance.observed_at.as_deref(), Some("2026-09-20T09:15:00Z"));
@@ -1036,7 +1084,8 @@ fn one_time_credit_normalizes_and_refuses_instants() {
         Some(1),
         TimeInput::Rfc3339("next month".to_string()),
         TimeInput::Invalid,
-    );
+    )
+    .expect("valid pool codename");
     assert_eq!((balance.expires_at, balance.observed_at), (None, None));
     assert_eq!(
         codes(&diagnostics),
@@ -1150,7 +1199,8 @@ fn readiness_is_passed_through_for_saved_resets_only() {
         None,
         TimeInput::Absent,
         TimeInput::Absent,
-    );
+    )
+    .expect("valid pool codename");
     let diagnostics = apply_readiness(
         &mut pool,
         ReadinessInput {
@@ -1241,7 +1291,8 @@ fn one_time_credit_shape() {
         Some(23_750),
         TimeInput::Rfc3339("2026-11-05T07:59:00+00:00".to_string()),
         TimeInput::Rfc3339(READ_AT.to_string()),
-    );
+    )
+    .expect("valid pool codename");
     assert!(diagnostics.is_empty());
     assert_eq!(
         serde_json::to_value(&balance).unwrap(),
@@ -1271,7 +1322,8 @@ fn one_time_credit_shape() {
         Some(0),
         TimeInput::Absent,
         TimeInput::Absent,
-    );
+    )
+    .expect("valid pool codename");
     assert_eq!(spent.status, AgentCreditBalanceStatus::Exhausted);
     let (unknown, _) = one_time_credit(
         "pool",
@@ -1281,7 +1333,8 @@ fn one_time_credit_shape() {
         None,
         TimeInput::Absent,
         TimeInput::Absent,
-    );
+    )
+    .expect("valid pool codename");
     assert_eq!(unknown.status, AgentCreditBalanceStatus::Unknown);
     let (titled, _) = one_time_credit(
         "pool",
@@ -1291,7 +1344,8 @@ fn one_time_credit_shape() {
         None,
         TimeInput::Absent,
         TimeInput::Absent,
-    );
+    )
+    .expect("valid pool codename");
     assert_eq!(titled.title.as_deref(), Some("Synthetic promo credit"));
     // A refused title is reported, not swallowed.
     let (leaky, diagnostics) = one_time_credit(
@@ -1302,7 +1356,8 @@ fn one_time_credit_shape() {
         None,
         TimeInput::Absent,
         TimeInput::Absent,
-    );
+    )
+    .expect("valid pool codename");
     assert_eq!(leaky.title, None);
     assert_eq!(codes(&diagnostics), vec![("field_refused", "title")]);
 }
@@ -1357,7 +1412,8 @@ fn one_time_section(observed_at: &str) -> Vec<AgentCreditBalance> {
         Some(23_750),
         TimeInput::Rfc3339("2026-11-05T07:59:00+00:00".to_string()),
         TimeInput::Rfc3339(observed_at.to_string()),
-    );
+    )
+    .expect("valid pool codename");
     assert!(diagnostics.is_empty());
     vec![balance]
 }

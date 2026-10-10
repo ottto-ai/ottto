@@ -791,12 +791,34 @@ pub(crate) fn apply_disabled(
     diagnostics
 }
 
+/// Why [`one_time_credit`] built no balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OneTimeCreditRefusal {
+    /// The pool codename is not a `^[a-z0-9_.-]{1,64}$` code that passes the
+    /// privacy guard. It would become the pool's `limit_id`, which splits the
+    /// history series, so the pool is skipped rather than renamed.
+    LimitId,
+}
+
+impl OneTimeCreditRefusal {
+    /// The diagnostic an adapter records for the skipped pool.
+    pub(crate) fn diagnostic(self) -> CreditModelDiagnostic {
+        match self {
+            Self::LimitId => CreditModelDiagnostic::new("field_refused", "limit_id"),
+        }
+    }
+}
+
 /// A one-time credit pool (contract v2.2 §11.3, names pinned by §11.7 C4):
 /// `name:"one_time_credit"`, `unit:"usd"`, `currency:"USD"`, amounts in
-/// cents, `expires_at` = the pool's expiry, `enabled: None` (the provider
-/// sends no flag), no `resets_at`. The title follows [`bounded_title`] and
-/// both instants are normalized to UTC like grant times; a refused title or
-/// instant comes back as a diagnostic.
+/// cents, `limit_id` = the pool codename, `expires_at` = the pool's expiry,
+/// `enabled: None` (the provider sends no flag), no `resets_at`.
+///
+/// The codename must be a `^[a-z0-9_.-]{1,64}$` code that passes the privacy
+/// guard, else the whole pool is refused ([`OneTimeCreditRefusal::LimitId`]).
+/// The title follows [`bounded_title`] and both instants are normalized to UTC
+/// like grant times; a refused title or instant comes back as a diagnostic on
+/// the built balance.
 pub(crate) fn one_time_credit(
     limit_id: &str,
     title: Field<String>,
@@ -805,7 +827,10 @@ pub(crate) fn one_time_credit(
     remaining_cents: Option<u64>,
     expires_at: TimeInput,
     observed_at: TimeInput,
-) -> (AgentCreditBalance, Vec<CreditModelDiagnostic>) {
+) -> Result<(AgentCreditBalance, Vec<CreditModelDiagnostic>), OneTimeCreditRefusal> {
+    if !is_credit_reason_code(limit_id) || !is_backend_safe_credit_text(limit_id) {
+        return Err(OneTimeCreditRefusal::LimitId);
+    }
     let (title, title_diagnostic) = bounded_title(title, "title");
     let mut diagnostics = title_diagnostic.into_iter().collect::<Vec<_>>();
     let mut instant = |input: TimeInput, field: &'static str| {
@@ -832,7 +857,7 @@ pub(crate) fn one_time_credit(
         title,
         ..Default::default()
     };
-    (balance, diagnostics)
+    Ok((balance, diagnostics))
 }
 
 /// The grant-list part of a balance, cached so a reading without details can
