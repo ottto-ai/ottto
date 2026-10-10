@@ -13222,7 +13222,10 @@ fn call_codex_app_server_rate_limits_for_home(
                     } else {
                         "quota"
                     };
-                    let message = codex_app_server_rpc_failure(phase, error);
+                    // An earlier initialize rejection is the likelier cause.
+                    let message = initialize_error
+                        .clone()
+                        .unwrap_or_else(|| codex_app_server_rpc_failure(phase, error));
                     drop(stdin);
                     let _ = child.kill();
                     let _ = child.wait();
@@ -19818,7 +19821,7 @@ for line in sys.stdin:
     method = request.get("method")
     request_id = request.get("id")
     if method == "initialize":
-        if mode in ("initialize_error", "initialize_error_then_success"):
+        if mode in ("initialize_error", "initialize_error_then_success", "initialize_error_then_account_error"):
             reply(1, code=-32602)
             if mode == "initialize_error":
                 sys.exit(0)
@@ -19827,7 +19830,7 @@ for line in sys.stdin:
     elif method == "account/read":
         if mode == "account_timeout":
             time.sleep(60)
-        if mode == "account_error":
+        if mode in ("account_error", "initialize_error_then_account_error"):
             reply(request_id, code=-32603)
             sys.exit(0)
         if mode == "account_error_without_code":
@@ -19904,6 +19907,12 @@ for line in sys.stdin:
                 "account_error",
                 "Codex app-server account RPC failed with code -32603.",
             ),
+            // The earlier initialize rejection, not the account error it
+            // caused, is reported.
+            (
+                "initialize_error_then_account_error",
+                "Codex app-server initialize RPC failed with code -32602.",
+            ),
             (
                 "account_error_without_code",
                 "Codex app-server account RPC failed without a numeric code.",
@@ -19972,6 +19981,55 @@ for line in sys.stdin:
             .expect("deadline");
         assert_eq!(message, "Codex app-server account read timed out.");
         assert!(started.elapsed() >= CODEX_APP_SERVER_TIMEOUT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_app_server_end_failure_reports_only_an_already_observed_exit() {
+        let spawn = |script: &str| {
+            Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("synthetic child")
+        };
+        // `wait` caches the status, so the helper's `try_wait` sees it.
+        let mut exited = spawn("exit 3");
+        exited.wait().expect("exited child");
+        assert_eq!(
+            codex_app_server_end_failure("account", true, None, &mut exited),
+            "Codex app-server stdout closed during account; child exited with code 3."
+        );
+        let mut signalled = spawn("kill -TERM $$");
+        signalled.wait().expect("signalled child");
+        assert_eq!(
+            codex_app_server_end_failure("quota", true, None, &mut signalled),
+            "Codex app-server stdout closed during quota; child terminated by signal 15."
+        );
+        let mut running = spawn("sleep 30");
+        assert_eq!(
+            codex_app_server_end_failure("initialize", true, None, &mut running),
+            "Codex app-server stdout closed during initialize; child termination was not observed before cleanup."
+        );
+        let _ = running.kill();
+        let _ = running.wait();
+        // An earlier initialize rejection wins over EOF and the deadline.
+        let initialize = "Codex app-server initialize RPC failed with code -32602.";
+        assert_eq!(
+            codex_app_server_end_failure("quota", true, Some(initialize), &mut exited),
+            initialize
+        );
+        assert_eq!(
+            codex_app_server_end_failure("quota", false, Some(initialize), &mut exited),
+            initialize
+        );
+        // The deadline makes no exit claim.
+        assert_eq!(
+            codex_app_server_end_failure("account", false, None, &mut exited),
+            "Codex app-server account read timed out."
+        );
     }
 
     #[test]

@@ -27,7 +27,8 @@ The diagnostic code, wire shape, severity and polling schedule are unchanged.
 An `initialize` error is recorded, not acted on: the loop continues as before,
 so an app-server that rejects `initialize` but still answers the account and
 quota requests is still read successfully. If the session then ends without a
-reading, the `initialize` error is the message.
+reading, whether by an account or quota RPC error, a closed stdout or the
+deadline, the `initialize` error is the message: it is the likelier cause.
 
 Nothing else changes: the handshake, response parsing, stdin lifetime,
 credential and home handling, resolver, 20-second deadline, 256 KiB line,
@@ -37,8 +38,9 @@ credential and home handling, resolver, 20-second deadline, 256 KiB line,
 
 A scripted app-server (synthetic Python fake, no provider calls) covers:
 
-- an `initialize` error with a numeric code, and an `initialize` error followed
-  by successful account and quota answers (still a reading);
+- an `initialize` error with a numeric code, an `initialize` error followed by
+  successful account and quota answers (still a reading), and one followed by
+  an account error (the `initialize` error is reported);
 - account versus quota JSON-RPC errors, and an error without a numeric code;
 - stdout closing during `initialize` (exit code 2, signal 15) and during the
   quota request, accepting only the observed exit or "not observed";
@@ -47,4 +49,7 @@ A scripted app-server (synthetic Python fake, no provider calls) covers:
   messages;
 - provider error text and data markers never appearing in any message.
 
-A unit test checks the fixed text for a stdout read error.
+Unit tests check the fixed text for a stdout read error and call the
+end-of-session helper directly on already-reaped children: exit code 3 and
+signal 15 are reported exactly, a still-running child is "not observed", an
+earlier `initialize` error wins, and the deadline makes no exit claim.
