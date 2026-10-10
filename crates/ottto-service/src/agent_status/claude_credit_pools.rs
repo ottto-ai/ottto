@@ -4,7 +4,7 @@
 //!
 //! This module owns the Claude provider field names for credits (quota
 //! contract v2.2 §11.1 kinds, §11.3 one-time pools, §11.7 C4 pinned names) and
-//! the Claude read cadence (design R7, Ron Q1/Q3). Grant building, summaries,
+//! the Claude read cadence (design R7). Grant building, summaries,
 //! the one-time pool shape and section re-send stay in the model.
 
 use std::collections::BTreeMap;
@@ -21,18 +21,19 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::quota_credit_model::{
     apply_disabled, apply_readiness, build_grants, one_time_credit, BindingKey,
-    CreditModelDiagnostic, CreditSection, Field, GrantInput, GrantStatusInput, ListObservation,
-    Provider, ReadinessInput, SectionCache, TimeInput,
+    CreditModelDiagnostic, CreditSection, Field, GrantInput, GrantListSection, GrantStatusInput,
+    ListObservation, Provider, ReadinessInput, SectionCache, TimeInput,
 };
 
-/// Passive input from Claude Code's own `cachedUsageUtilization` (Ron Q3).
+/// Passive input from Claude Code's own `cachedUsageUtilization` (design R7:
+/// active-account freshness).
 /// Every collection pass records where each caller is signed in, and a
 /// registered slot's identity gate ends the caller's run when it refuses the
 /// slot, as does a pass that skips the collector (an unresolved default-login
 /// identity, a browser re-sign-in), so a body fetched under another
 /// organization is never adopted.
 pub(super) const CLAUDE_PASSIVE_READING_ENABLED: bool = true;
-/// Kill switch for the activity-based slot (Ron Q3). `false` falls back to
+/// Kill switch for the activity-based slot (design R7). `false` falls back to
 /// today's 55-65 min gate for every binding: no active boost, no idle
 /// slowdown. Plain/saved-reset alternation is unaffected (same slot count).
 pub(super) const CLAUDE_ACTIVITY_CADENCE_ENABLED: bool = true;
@@ -64,6 +65,8 @@ const IDLE_SLOT_SPREAD_SECONDS: u64 = 60 * 60;
 /// While usage credits are off, the plain read runs about this often and the
 /// other slots take the saved-reset read.
 const PLAIN_WHILE_CREDITS_OFF_SECONDS: u64 = 6 * 60 * 60;
+/// Admission slack at the slot boundary (well under one 5-min pass).
+const SLOT_ADMISSION_SLACK_SECONDS: u64 = 60;
 /// A passive reading stamped further ahead of the local clock is not trusted.
 const PASSIVE_CLOCK_SKEW_SECONDS: u64 = 60;
 /// Longest pause between two collection passes of one caller that still
@@ -133,8 +136,11 @@ pub(super) fn claude_credit_read(
     let one_time_credits =
         full_body.then(|| claude_one_time_credits(body, observed_at, &mut diagnostics));
     let usage_credits = (full_body && read == ClaudeUsageRead::Plain).then(|| {
-        let mut usage_credits = super::claude_oauth_credit_balances(body);
+        let (mut usage_credits, refusals) = super::claude_oauth_credit_balances_and_refusals(body);
+        diagnostics.extend(refusals);
+        // `spend`/`extra_usage` → `usage_credits` (contract v2.2 §11.1).
         for balance in &mut usage_credits {
+            balance.kind = Some(CreditBalanceKind::UsageCredits);
             balance.observed_at = Some(observed_at.to_string());
         }
         usage_credits
@@ -147,6 +153,12 @@ pub(super) fn claude_credit_read(
     }
 }
 
+/// A rejection of the saved-reset variant itself: a 4xx other than auth
+/// (401/403) and rate limiting (429), which keep the endpoint's own handling.
+pub(super) fn claude_saved_resets_variant_rejected(status: u16) -> bool {
+    (400..500).contains(&status) && !matches!(status, 401 | 403 | 429)
+}
+
 /// A full usage body: it carries the usage-credit keys (`spend` or the older
 /// `extra_usage`, null included, as both readings send them). Pool keys come
 /// with it, null when inactive.
@@ -154,7 +166,7 @@ fn carries_credit_sections(body: &Value) -> bool {
     body.get("spend").is_some() || body.get("extra_usage").is_some()
 }
 
-/// The saved-reset variant self-check (Ron, 2026-10-09): `cedar_ember` is an
+/// The saved-reset variant self-check (owner decision): `cedar_ember` is an
 /// object with a `grants` array, or with a boolean `eligible` status.
 /// Anything else (missing, null, another type) is unrecognized.
 pub(super) fn claude_saved_resets_recognized(body: &Value) -> bool {
@@ -206,10 +218,14 @@ pub(super) fn claude_merge_credit_sections(
             sections.observe_balances(binding, section, &prior);
         }
     }
+    let saved_resets = read
+        .saved_resets
+        .clone()
+        .map(|fresh| keep_stored_grant_list(fresh, previous));
     for (section, fresh) in [
         (CreditSection::UsageCredits, &read.usage_credits),
         (CreditSection::OneTimeCredits, &read.one_time_credits),
-        (CreditSection::SavedResets, &read.saved_resets),
+        (CreditSection::SavedResets, &saved_resets),
     ] {
         if let Some(fresh) = fresh {
             sections.observe_balances(binding, section, fresh);
@@ -222,6 +238,27 @@ pub(super) fn claude_merge_credit_sections(
         .collect()
 }
 
+/// A saved-reset reading whose `cedar_ember` had readiness but no `grants`
+/// array lacks the grant list: re-send the last observed list (with its
+/// original `grants_observed_at`, count and `remaining`, so `status` holds)
+/// instead of replacing it with an unavailable one. Readiness stays fresh.
+fn keep_stored_grant_list(
+    mut fresh: Vec<AgentCreditBalance>,
+    previous: &[AgentCreditBalance],
+) -> Vec<AgentCreditBalance> {
+    let stored = previous
+        .iter()
+        .filter(|balance| balance_section(balance) == Some(CreditSection::SavedResets))
+        .find_map(|balance| Some((GrantListSection::from_balance(balance)?, balance.remaining)));
+    if let Some((list, remaining)) = stored {
+        for balance in fresh.iter_mut().filter(|balance| balance.grants.is_none()) {
+            balance.remaining = remaining;
+            list.apply_to(balance);
+        }
+    }
+    fresh
+}
+
 /// Whether the last observed usage-credit balance says credits are off.
 pub(super) fn claude_usage_credits_off(balances: &[AgentCreditBalance]) -> bool {
     balances.iter().any(|balance| {
@@ -232,9 +269,12 @@ pub(super) fn claude_usage_credits_off(balances: &[AgentCreditBalance]) -> bool 
 
 /// The usage-credit balance of a switched-off `spend` (or `extra_usage`)
 /// section: the model's disabled shape with the provider's
-/// `disabled_reason`. A refused reason is a field diagnostic only, never a
-/// lost balance.
-pub(super) fn claude_disabled_usage_credits(section: &Value) -> AgentCreditBalance {
+/// `disabled_reason`. A refused reason is a field diagnostic only (added to
+/// `refusals`), never a lost balance.
+pub(super) fn claude_disabled_usage_credits(
+    section: &Value,
+    refusals: &mut Vec<CreditModelDiagnostic>,
+) -> AgentCreditBalance {
     let mut balance = AgentCreditBalance {
         name: CLAUDE_USAGE_CREDITS_NAME.to_string(),
         freshness: AgentQuotaWindowFreshness::Fresh,
@@ -245,7 +285,7 @@ pub(super) fn claude_disabled_usage_credits(section: &Value) -> AgentCreditBalan
     let reason = section.as_object().map_or(Field::Absent, |section| {
         string_field(section, "disabled_reason")
     });
-    let _refused_reason = apply_disabled(&mut balance, reason);
+    refusals.extend(apply_disabled(&mut balance, reason));
     balance
 }
 
@@ -272,15 +312,20 @@ fn claude_one_time_credits(
     let mut keys = object.keys().collect::<Vec<_>>();
     keys.sort();
     keys.into_iter()
-        .filter(|key| {
-            !is_window_key(key) && key.as_str() != CLAUDE_PERCENT_ONLY_POOL
-                // The codename is the pool's `limit_id`: a closed code shape.
-                && is_credit_reason_code(key)
-        })
+        .filter(|key| !is_window_key(key) && key.as_str() != CLAUDE_PERCENT_ONLY_POOL)
         .filter_map(|key| {
             let pool = object.get(key)?.as_object()?;
             pool.get("limit_dollars")
                 .filter(|value| value.is_number())?;
+            // The codename is the pool's `limit_id`: a closed code shape. A
+            // pool whose codename is not one is refused, visibly.
+            if !is_credit_reason_code(key) {
+                diagnostics.push(CreditModelDiagnostic {
+                    code: "field_refused",
+                    field: "limit_id",
+                });
+                return None;
+            }
             let (balance, refused) = one_time_credit(
                 key,
                 string_field(pool, "label"),
@@ -531,7 +576,7 @@ pub(super) fn claude_idle_slot_seconds(
     IDLE_SLOT_BASE_SECONDS + u64::from_be_bytes(bytes) % (IDLE_SLOT_SPREAD_SECONDS + 1)
 }
 
-/// The account's read slot (Ron Q3): the active slot while the account was
+/// The account's read slot (design R7: active-account freshness): the active slot while the account was
 /// active in the last 30 min, the idle slot once idle more than 6 h, else the
 /// default slot (today's 55-65 min gate). With `activity_cadence` off every
 /// slot is the default slot.
@@ -558,8 +603,16 @@ pub(super) fn claude_usage_slot_seconds(
     }
 }
 
-/// Whether the binding is due a new reading: never read, or its last reading
-/// is older than the slot and any Retry-After/success spacing has passed.
+/// Whether a slot has elapsed since a reading `age_seconds` old. Readings are
+/// taken inside a collection pass (every ~5 min), so the pass one slot later
+/// can see an age a few seconds short of the slot; this slack admits it at the
+/// boundary instead of one pass late (a 15 min slot stays 15 min, not 20).
+pub(super) fn claude_slot_elapsed(age_seconds: u64, slot_seconds: u64) -> bool {
+    age_seconds.saturating_add(SLOT_ADMISSION_SLACK_SECONDS) >= slot_seconds
+}
+
+/// Whether the binding is due a new reading: never read, or its slot has
+/// elapsed and any Retry-After/success spacing has passed.
 pub(super) fn claude_reading_due(
     last_reading_at: Option<u64>,
     next_refresh_after: u64,
@@ -567,11 +620,11 @@ pub(super) fn claude_reading_due(
     now: u64,
 ) -> bool {
     last_reading_at.map_or(true, |at| {
-        now.saturating_sub(at) > slot_seconds && now >= next_refresh_after
+        claude_slot_elapsed(now.saturating_sub(at), slot_seconds) && now >= next_refresh_after
     })
 }
 
-/// Which read a due slot makes (Ron Q1: no extra calls). `stored` is the
+/// Which read a due slot makes (design R7: no extra calls). `stored` is the
 /// binding's persisted reading.
 ///
 /// - While the variant is paused by its self-check every slot is plain.
@@ -610,7 +663,12 @@ pub(super) fn claude_usage_read_kind(
         };
     };
     if claude_usage_credits_off(stored) {
-        return if now.saturating_sub(plain_at) >= PLAIN_WHILE_CREDITS_OFF_SECONDS {
+        // A due threshold, serviced by the next eligible slot. Measured from
+        // the usage-credit section's own read, so a windows-only body (a
+        // passive reading without credit keys) never resets it.
+        let credits_read_at =
+            section_read_at(stored, CreditSection::UsageCredits).unwrap_or(plain_at);
+        return if now.saturating_sub(credits_read_at) >= PLAIN_WHILE_CREDITS_OFF_SECONDS {
             ClaudeUsageRead::Plain
         } else {
             ClaudeUsageRead::SavedResets
@@ -620,6 +678,66 @@ pub(super) fn claude_usage_read_kind(
         ClaudeUsageRead::Plain
     } else {
         ClaudeUsageRead::SavedResets
+    }
+}
+
+/// When the stored `section` was observed (its newest balance's own
+/// `grants_observed_at`, else `observed_at`), as unix seconds.
+fn section_read_at(stored: &[AgentCreditBalance], section: CreditSection) -> Option<u64> {
+    stored
+        .iter()
+        .filter(|balance| balance_section(balance) == Some(section))
+        .filter_map(balance_read_at)
+        .max()
+}
+
+fn balance_read_at(balance: &AgentCreditBalance) -> Option<u64> {
+    balance
+        .grants_observed_at
+        .as_deref()
+        .or(balance.observed_at.as_deref())
+        .and_then(parse_instant)
+        .and_then(|instant| u64::try_from(instant.unix_timestamp()).ok())
+}
+
+/// Label each credit balance Fresh or Stale from its own read time, never
+/// from a newer windows or passive read of the same binding. Per-section ages,
+/// for a binding whose slot gate is `gate_seconds`:
+/// - saved resets, and usage credits while credits are on, are read once
+///   every two slots (plain/variant alternation): fresh for two gates;
+/// - usage credits while credits are off are re-read about every 6 h (a due
+///   threshold serviced at the next slot): fresh for 6 h plus one gate;
+/// - one-time pools come with every full usage body: fresh for two gates;
+/// - a balance with no read time of its own (stored before read times
+///   existed) falls back to the stored reading's time and one gate.
+///
+/// A 24 h variant pause or an open breaker therefore shows as Stale, with the
+/// section's original read time kept.
+pub(super) fn label_credit_freshness(
+    balances: &mut [AgentCreditBalance],
+    gate_seconds: u64,
+    stored_read_at: u64,
+    now: u64,
+) {
+    for balance in balances {
+        let (read_at, max_age) = match balance_read_at(balance) {
+            None => (stored_read_at, gate_seconds),
+            Some(read_at)
+                if balance_section(balance) == Some(CreditSection::UsageCredits)
+                    && balance.enabled == Some(false) =>
+            {
+                (
+                    read_at,
+                    PLAIN_WHILE_CREDITS_OFF_SECONDS.saturating_add(gate_seconds),
+                )
+            }
+            Some(read_at) => (read_at, gate_seconds.saturating_mul(2)),
+        };
+        balance.freshness = if now.saturating_sub(read_at) <= max_age {
+            AgentQuotaWindowFreshness::Fresh
+        } else {
+            AgentQuotaWindowFreshness::Stale
+        };
     }
 }
 
@@ -689,17 +807,24 @@ pub(super) fn claude_passive_config(
     }
 }
 
-fn claude_passive_reading(cached: &Value, account_uuid: &str) -> Option<ClaudePassiveUsage> {
-    if cached.get("accountUuid")?.as_str()? != account_uuid {
-        return None;
-    }
+/// When Claude Code fetched its cached usage body
+/// (`cachedUsageUtilization.fetchedAtMs`, epoch milliseconds). The one parser
+/// of that field: a non-negative integer or finite float.
+pub(super) fn claude_cached_usage_fetched_at_ms(cached: &Value) -> Option<u64> {
     let fetched = cached.get("fetchedAtMs")?;
-    let fetched_ms = fetched.as_u64().or_else(|| {
+    fetched.as_u64().or_else(|| {
         fetched
             .as_f64()
             .filter(|ms| ms.is_finite() && *ms >= 0.0)
             .map(|ms| ms as u64)
-    })?;
+    })
+}
+
+fn claude_passive_reading(cached: &Value, account_uuid: &str) -> Option<ClaudePassiveUsage> {
+    if cached.get("accountUuid")?.as_str()? != account_uuid {
+        return None;
+    }
+    let fetched_ms = claude_cached_usage_fetched_at_ms(cached)?;
     let body = cached.get("utilization")?;
     body.is_object().then(|| ClaudePassiveUsage {
         fetched_at: fetched_ms / 1000,
@@ -755,6 +880,15 @@ pub(super) fn claude_end_caller_binding(
     caller_key: &str,
 ) {
     callers.remove(caller_key);
+}
+
+/// End of a full collection pass: keep only the runs of callers that reached
+/// the collector during it. A caller skipped for any reason loses its run.
+pub(super) fn claude_keep_caller_bindings(
+    callers: &mut BTreeMap<String, ClaudeCallerBinding>,
+    reached: &std::collections::BTreeSet<String>,
+) {
+    callers.retain(|caller_key, _| reached.contains(caller_key));
 }
 
 /// Use the passive reading instead of a call when it is newer than our last
@@ -1261,6 +1395,134 @@ mod tests {
         assert_eq!(read.one_time_credits.as_ref().map(Vec::len), Some(1));
     }
 
+    /// A saved-reset reading whose `cedar_ember` has readiness but no
+    /// `grants` array keeps the stored complete list (and so its status);
+    /// readiness is fresh. complete → eligible-only → complete.
+    #[test]
+    fn eligible_only_cedar_keeps_the_stored_grant_list() {
+        let t1 = "2026-10-09T10:00:00Z";
+        let t2 = "2026-10-09T11:00:00Z";
+        let t3 = "2026-10-09T12:00:00Z";
+        let complete = claude_merge_credit_sections(
+            "a",
+            &[],
+            &claude_credit_read(&variant_body(cedar_max()), ClaudeUsageRead::SavedResets, t1),
+        );
+        let stored = complete
+            .iter()
+            .find(|b| b.kind == Some(CreditBalanceKind::SavedResets))
+            .unwrap()
+            .clone();
+        assert_eq!(stored.grants_state, Some(CreditGrantsState::Complete));
+        let readiness_only = json!({"eligible": true, "at_limit": false});
+        let next = claude_merge_credit_sections(
+            "a",
+            &complete,
+            &claude_credit_read(
+                &variant_body(readiness_only),
+                ClaudeUsageRead::SavedResets,
+                t2,
+            ),
+        );
+        let kept = next
+            .iter()
+            .find(|b| b.kind == Some(CreditBalanceKind::SavedResets))
+            .unwrap();
+        assert_eq!(kept.grants, stored.grants);
+        assert_eq!(kept.grants_state, Some(CreditGrantsState::Complete));
+        assert_eq!(
+            kept.grants_observed_at.as_deref(),
+            Some(t1),
+            "original list time"
+        );
+        assert_eq!(kept.grant_count, stored.grant_count);
+        assert_eq!(kept.remaining, stored.remaining);
+        assert_eq!(kept.status, stored.status, "no ok → unknown flip");
+        assert_eq!(kept.at_limit, Some(false), "readiness is fresh");
+        assert_eq!(kept.observed_at.as_deref(), Some(t2));
+        // The next full list replaces it as usual.
+        let after = claude_merge_credit_sections(
+            "a",
+            &next,
+            &claude_credit_read(
+                &variant_body(cedar_team()),
+                ClaudeUsageRead::SavedResets,
+                t3,
+            ),
+        );
+        let replaced = after
+            .iter()
+            .find(|b| b.kind == Some(CreditBalanceKind::SavedResets))
+            .unwrap();
+        assert_eq!(replaced.grants_observed_at.as_deref(), Some(t3));
+        assert_eq!(replaced.remaining, Some(0));
+    }
+
+    #[test]
+    fn refused_reason_and_codename_are_diagnosed_not_silent() {
+        let mut body = plain_max_body();
+        body["spend"]["disabled_reason"] = json!("Out of credits!");
+        body["Bad Pool"] = json!({"limit_dollars": 5, "used_dollars": 0, "remaining_dollars": 5});
+        let read = claude_credit_read(&body, ClaudeUsageRead::Plain, READ_AT);
+        let fields = read.diagnostics.iter().map(|d| d.field).collect::<Vec<_>>();
+        assert!(fields.contains(&"disabled_reason"), "{fields:?}");
+        assert!(fields.contains(&"limit_id"), "{fields:?}");
+        // The usage-credit kind is the adapter's mapping.
+        let usage = read.usage_credits.unwrap();
+        assert_eq!(usage[0].kind, Some(CreditBalanceKind::UsageCredits));
+        assert_eq!(usage[0].disabled_reason, None);
+        let enabled = claude_credit_read(
+            &json!({"spend": {"enabled": true, "used": {"amount_minor": 1, "exponent": 2}}}),
+            ClaudeUsageRead::Plain,
+            READ_AT,
+        );
+        assert_eq!(
+            enabled.usage_credits.unwrap()[0].kind,
+            Some(CreditBalanceKind::UsageCredits)
+        );
+    }
+
+    #[test]
+    fn credit_freshness_follows_each_sections_own_read_time() {
+        let now = 1_791_000_000;
+        let at = |age: u64| Some(rfc3339(now - age));
+        let gate = 3_600;
+        let mut balances = vec![
+            AgentCreditBalance {
+                name: CLAUDE_USAGE_CREDITS_NAME.to_string(),
+                kind: Some(CreditBalanceKind::UsageCredits),
+                enabled: Some(true),
+                observed_at: at(gate + 60),
+                ..Default::default()
+            },
+            AgentCreditBalance {
+                name: CLAUDE_USAGE_CREDITS_NAME.to_string(),
+                kind: Some(CreditBalanceKind::UsageCredits),
+                enabled: Some(false),
+                observed_at: at(5 * 3_600),
+                ..Default::default()
+            },
+            AgentCreditBalance {
+                name: "reset_bank".to_string(),
+                kind: Some(CreditBalanceKind::SavedResets),
+                observed_at: at(10),
+                grants_observed_at: at(3 * gate),
+                ..Default::default()
+            },
+            AgentCreditBalance {
+                name: "legacy".to_string(),
+                ..Default::default()
+            },
+        ];
+        // The stored reading itself is brand new (a windows-only read).
+        label_credit_freshness(&mut balances, gate, now - 5, now);
+        let fresh = |b: &AgentCreditBalance| b.freshness == AgentQuotaWindowFreshness::Fresh;
+        assert!(fresh(&balances[0]), "alternated section: two gates");
+        assert!(fresh(&balances[1]), "credits off: 6 h plus one gate");
+        assert!(!fresh(&balances[2]), "grant list read 3 gates ago is stale");
+        assert!(fresh(&balances[3]), "no own clock: the stored reading's");
+    }
+
     #[test]
     fn legacy_cached_usage_credit_row_is_its_section() {
         let legacy = AgentCreditBalance {
@@ -1513,22 +1775,34 @@ mod tests {
         balances
     }
 
-    const DEFAULT_SLOT: u64 = 3_600;
-    const TICK: u64 = 60;
+    /// The default slot of the simulated binding (inside the 55-65 min band).
+    const DEFAULT_SLOT: u64 = 3_480;
+    /// Collection passes run every 5 min.
+    const PASS: u64 = 300;
     const HOUR: u64 = 3_600;
 
-    /// One simulated binding driven exactly like the collection path: due
-    /// check, then passive input, then one read of the scheduled kind.
+    /// A reading the simulated binding took: a provider call or a passive body.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Reading {
+        at: u64,
+        read: ClaudeUsageRead,
+        passive: bool,
+        slot: u64,
+    }
+
+    /// One simulated binding driven like the collection path, one decision
+    /// per 5-min pass: record the caller's sign-in, keep activity, check the
+    /// slot, choose the read, then adopt a passive body only in a plain slot,
+    /// else make one call.
     struct Simulation {
         schedule: ClaudeReadSchedule,
         last_reading_at: Option<u64>,
         next_refresh_after: u64,
         usage_credits_off: bool,
-        calls: Vec<(u64, ClaudeUsageRead, u64)>,
-        passive_used: Vec<u64>,
+        stored: Vec<AgentCreditBalance>,
         callers: BTreeMap<String, ClaudeCallerBinding>,
-        plain_read: bool,
-        saved_resets_read: bool,
+        readings: Vec<Reading>,
+        passes_with_more_than_one_call: usize,
     }
 
     impl Simulation {
@@ -1538,15 +1812,16 @@ mod tests {
                 last_reading_at: None,
                 next_refresh_after: 0,
                 usage_credits_off,
-                calls: Vec::new(),
-                passive_used: Vec::new(),
+                stored: Vec::new(),
                 callers: BTreeMap::new(),
-                plain_read: false,
-                saved_resets_read: false,
+                readings: Vec::new(),
+                passes_with_more_than_one_call: 0,
             }
         }
 
-        fn tick(&mut self, now: u64, activity: Option<u64>, passive_fetched_at: Option<u64>) {
+        /// One pass at `now`. `passive_fetched_at` is the matching body
+        /// Claude Code holds, if any.
+        fn pass(&mut self, now: u64, activity: Option<u64>, passive_fetched_at: Option<u64>) {
             let since = claude_observe_caller_binding(&mut self.callers, "default", "a/o", now);
             self.schedule.observe_activity(activity);
             let idle = claude_idle_slot_seconds("account-sim", "org-sim");
@@ -1555,99 +1830,156 @@ mod tests {
             if !claude_reading_due(self.last_reading_at, self.next_refresh_after, slot, now) {
                 return;
             }
-            if let Some(fetched) = passive_fetched_at.filter(|at| {
-                claude_passive_reading_usable(*at, self.last_reading_at, Some(since), slot, now)
-            }) {
-                self.passive_used.push(now);
-                self.record(ClaudeUsageRead::Plain, fetched, activity, now);
-                return;
+            let read = claude_usage_read_kind(&self.schedule, &self.stored, now);
+            if read == ClaudeUsageRead::Plain {
+                if let Some(fetched) = passive_fetched_at.filter(|at| {
+                    claude_passive_reading_usable(*at, self.last_reading_at, Some(since), slot, now)
+                }) {
+                    self.record(read, fetched, true, slot, activity, now);
+                    return;
+                }
             }
-            let stored = stored(
-                self.plain_read.then_some(self.usage_credits_off),
-                self.saved_resets_read,
-            );
-            let read = claude_usage_read_kind(&self.schedule, &stored, now);
-            self.calls.push((now, read, slot));
-            self.record(read, now, activity, now);
+            // The provider answers a few seconds into the pass.
+            self.record(read, now + 3, false, slot, activity, now);
         }
 
-        fn record(&mut self, read: ClaudeUsageRead, at: u64, activity: Option<u64>, now: u64) {
-            match read {
-                ClaudeUsageRead::Plain => self.plain_read = true,
-                ClaudeUsageRead::SavedResets => self.saved_resets_read = true,
+        fn record(
+            &mut self,
+            read: ClaudeUsageRead,
+            at: u64,
+            passive: bool,
+            slot: u64,
+            activity: Option<u64>,
+            now: u64,
+        ) {
+            if self
+                .readings
+                .last()
+                .is_some_and(|last| !last.passive && !passive && last.at + PASS > at)
+            {
+                self.passes_with_more_than_one_call += 1;
             }
+            self.readings.push(Reading {
+                at,
+                read,
+                passive,
+                slot,
+            });
             self.last_reading_at = Some(at);
             self.next_refresh_after = now + 300;
             self.schedule.after_reading(read, at, activity, now);
+            let observed = rfc3339(at);
+            match read {
+                ClaudeUsageRead::Plain => {
+                    self.stored
+                        .retain(|b| b.kind != Some(CreditBalanceKind::UsageCredits));
+                    let mut usage = stored(Some(self.usage_credits_off), false);
+                    usage[0].observed_at = Some(observed);
+                    self.stored.extend(usage);
+                }
+                ClaudeUsageRead::SavedResets => {
+                    self.stored
+                        .retain(|b| b.kind != Some(CreditBalanceKind::SavedResets));
+                    let mut saved = stored(None, true);
+                    saved[0].observed_at = Some(observed);
+                    self.stored.extend(saved);
+                }
+            }
+        }
+
+        fn calls(&self) -> impl Iterator<Item = &Reading> {
+            self.readings.iter().filter(|reading| !reading.passive)
         }
     }
 
-    /// 24 h: idle start, active 08:00-10:00, idle again. Like the
-    /// active-session scan, activity is reported only while it advances.
+    fn rfc3339(at: u64) -> String {
+        OffsetDateTime::from_unix_timestamp(at as i64)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap()
+    }
+
+    const START: u64 = 1_791_000_000;
+
+    /// 24 h of 5-min passes, each a few seconds into its 5-min mark: idle start,
+    /// active 08:00-10:00 (the scan reports activity only while it advances),
+    /// then idle; the machine sleeps 13:00-16:00 (no passes).
     fn run_day(usage_credits_off: bool, passive: &dyn Fn(u64) -> Option<u64>) -> Simulation {
-        let start = 1_791_000_000;
         let mut simulation = Simulation::new(usage_credits_off);
-        let mut now = start;
-        while now < start + 24 * HOUR {
-            let hour = (now - start) / HOUR;
-            let visible = (8..10).contains(&hour).then_some(now);
-            simulation.tick(
-                now,
-                visible,
-                passive(now - start).map(|offset| start + offset),
-            );
-            now += TICK;
+        let mut tick = 0;
+        while tick * PASS < 24 * HOUR {
+            let offset = tick * PASS;
+            tick += 1;
+            if (13 * HOUR..16 * HOUR).contains(&offset) {
+                continue;
+            }
+            // Pass start drifts by a few seconds, as real passes do.
+            let now = START + offset + (tick * 7) % 20;
+            let activity = (8 * HOUR..10 * HOUR).contains(&offset).then_some(now);
+            simulation.pass(now, activity, passive(now));
         }
         simulation
     }
 
+    fn gaps_between(readings: &[Reading], from: u64, to: u64) -> Vec<u64> {
+        readings
+            .windows(2)
+            .filter(|pair| (START + from..START + to).contains(&pair[1].at))
+            .map(|pair| pair[1].at - pair[0].at)
+            .collect()
+    }
+
     #[test]
-    fn scheduler_day_respects_slots_alternation_and_activity() {
-        let start = 1_791_000_000;
+    fn scheduler_day_on_five_minute_passes() {
         let simulation = run_day(false, &|_| None);
-        let calls = &simulation.calls;
-        // At most one OAuth usage read per account-slot.
+        let calls = simulation.calls().copied().collect::<Vec<_>>();
+        // One read per slot, never two in one pass, no catch-up burst.
+        assert_eq!(simulation.passes_with_more_than_one_call, 0);
         for pair in calls.windows(2) {
-            let (at, _, slot) = pair[1];
-            assert!(at - pair[0].0 > slot, "read inside its slot");
-            assert!(at - pair[0].0 >= ACTIVE_SLOT_SECONDS);
+            assert!(
+                pair[1].at - pair[0].at + 60 >= pair[1].slot,
+                "read inside its slot"
+            );
         }
         // Credits on: plain and saved-reset reads strictly alternate.
-        assert_eq!(calls[0].1, ClaudeUsageRead::Plain);
+        assert_eq!(calls[0].read, ClaudeUsageRead::Plain);
         for pair in calls.windows(2) {
-            assert_ne!(pair[0].1, pair[1].1);
+            assert_ne!(pair[0].read, pair[1].read);
         }
-        let gaps_in = |from: u64, to: u64| {
-            calls
-                .windows(2)
-                .filter(|pair| pair[1].0 >= start + from && pair[1].0 < start + to)
-                .map(|pair| pair[1].0 - pair[0].0)
-                .collect::<Vec<_>>()
-        };
-        // 00:00-06:00: default slot (55-65 min).
-        assert!(gaps_in(0, 6 * HOUR)
+        // Default slot: the first pass at or after the boundary (≤ one pass late).
+        let default = gaps_between(&calls, 0, 6 * HOUR);
+        assert!(!default.is_empty());
+        assert!(default
             .iter()
-            .all(|gap| (55 * 60..=66 * 60).contains(gap)));
-        // 08:15-10:00: active, 15-min slots.
-        let active = gaps_in(8 * HOUR + 15 * 60, 10 * HOUR);
+            .all(|gap| (DEFAULT_SLOT - 60..=DEFAULT_SLOT + PASS).contains(gap)));
+        // Active: 15 min exactly on the 5-min grid (± the pass drift), not 20.
+        let active = gaps_between(&calls, 8 * HOUR + 15 * 60, 10 * HOUR);
         assert!(active.len() >= 6);
-        assert!(active.iter().all(|gap| (15 * 60..=17 * 60).contains(gap)));
-        // The active slot holds for 30 min after the last activity, although
-        // the scan stopped listing it.
-        assert!(calls.iter().any(|(at, _, slot)| {
-            (start + 10 * HOUR + 15 * 60..=start + 10 * HOUR + 30 * 60).contains(at)
-                && *slot == ACTIVE_SLOT_SECONDS
+        assert!(
+            active
+                .iter()
+                .all(|gap| (15 * 60 - 20..=15 * 60 + 20).contains(gap)),
+            "{active:?}"
+        );
+        // The active slot holds for 30 min after the last activity.
+        assert!(calls.iter().any(|call| {
+            (START + 10 * HOUR + 10 * 60..=START + 10 * HOUR + 30 * 60).contains(&call.at)
+                && call.slot == ACTIVE_SLOT_SECONDS
         }));
-        // Idle more than 6 h (06:00-08:00 and after 16:30): 2-3 h slots.
-        let idle = gaps_in(17 * HOUR, 24 * HOUR);
+        // Idle more than 6 h: 2-3 h slots (≤ one pass late).
+        let idle = gaps_between(&calls, 17 * HOUR, 24 * HOUR);
         assert!(!idle.is_empty());
         assert!(idle
             .iter()
-            .all(|gap| (2 * HOUR..=3 * HOUR + TICK).contains(gap)));
-        assert!(gaps_in(6 * HOUR + 30 * 60, 8 * HOUR)
+            .all(|gap| (2 * HOUR - 60..=3 * HOUR + PASS).contains(gap)));
+        // Waking from a 3 h sleep: one read at the first pass, then the slot.
+        let woke = calls
             .iter()
-            .all(|gap| *gap >= 2 * HOUR));
-        // Same posture as today: never more reads than the active slot allows.
+            .filter(|call| call.at >= START + 16 * HOUR)
+            .map(|call| call.at)
+            .collect::<Vec<_>>();
+        assert!(woke[0] < START + 16 * HOUR + PASS);
+        assert!(woke[1] - woke[0] >= 15 * 60);
         assert!(calls.len() <= 24 * 4);
     }
 
@@ -1655,23 +1987,22 @@ mod tests {
     fn scheduler_reads_plain_about_every_six_hours_while_credits_are_off() {
         let simulation = run_day(true, &|_| None);
         let plain = simulation
-            .calls
-            .iter()
-            .filter(|(_, read, _)| *read == ClaudeUsageRead::Plain)
-            .map(|(at, _, _)| *at)
+            .calls()
+            .filter(|call| call.read == ClaudeUsageRead::Plain)
+            .map(|call| call.at)
             .collect::<Vec<_>>();
         assert!(plain.len() >= 3);
+        // A due threshold, serviced at the next eligible slot.
         for pair in plain.windows(2) {
             let gap = pair[1] - pair[0];
             assert!(
-                (6 * HOUR..=9 * HOUR + TICK).contains(&gap),
+                (6 * HOUR..=9 * HOUR + PASS).contains(&gap),
                 "plain gap {gap}"
             );
         }
         let saved = simulation
-            .calls
-            .iter()
-            .filter(|(_, read, _)| *read == ClaudeUsageRead::SavedResets)
+            .calls()
+            .filter(|call| call.read == ClaudeUsageRead::SavedResets)
             .count();
         assert!(
             saved > plain.len() * 2,
@@ -1679,22 +2010,91 @@ mod tests {
         );
     }
 
+    /// Claude Code keeps a fresh matching body at every pass (an account in
+    /// constant use): passive input stands in for the plain slots only, and
+    /// the saved-reset read still happens every other slot.
     #[test]
-    fn scheduler_uses_newer_passive_reading_instead_of_a_call() {
-        // Claude Code refreshed its own reading every 20 min during 03:00-04:00.
-        let passive = |offset: u64| {
-            (3 * HOUR..4 * HOUR)
-                .contains(&offset)
-                .then(|| offset - offset % (20 * 60))
-        };
-        let with_passive = run_day(false, &passive);
+    fn continuous_passive_input_never_starves_saved_resets() {
+        let simulation = run_day(false, &|now| Some(now - 30));
+        assert!(simulation.readings.iter().any(|reading| reading.passive));
+        assert!(simulation
+            .readings
+            .iter()
+            .filter(|reading| reading.passive)
+            .all(|reading| reading.read == ClaudeUsageRead::Plain));
+        for pair in simulation.readings.windows(2) {
+            assert_ne!(
+                pair[0].read, pair[1].read,
+                "plain and saved-reset slots alternate"
+            );
+        }
+        let saved = simulation
+            .readings
+            .iter()
+            .filter(|reading| reading.read == ClaudeUsageRead::SavedResets)
+            .collect::<Vec<_>>();
+        assert!(saved.iter().all(|reading| !reading.passive));
+        // Active hours: a saved-reset read every ~30 min (two 15-min slots).
+        let active_saved = saved
+            .windows(2)
+            .filter(|pair| (START + 8 * HOUR + 30 * 60..START + 10 * HOUR).contains(&pair[1].at))
+            .map(|pair| pair[1].at - pair[0].at)
+            .collect::<Vec<_>>();
+        assert!(!active_saved.is_empty());
+        assert!(
+            active_saved.iter().all(|gap| *gap <= 30 * 60 + 60),
+            "{active_saved:?}"
+        );
+        // Over the whole day no saved-reset gap exceeds two idle slots.
+        for pair in saved.windows(2) {
+            assert!(pair[1].at - pair[0].at <= 2 * 3 * HOUR + 3 * HOUR + PASS);
+        }
+        // Passive bodies replace calls; never more than one reading per slot.
+        assert!(simulation.calls().count() < run_day(false, &|_| None).calls().count());
+        assert_eq!(simulation.passes_with_more_than_one_call, 0);
+    }
+
+    #[test]
+    fn stale_passive_body_is_never_adopted() {
         let without = run_day(false, &|_| None);
-        assert!(!with_passive.passive_used.is_empty());
-        assert!(with_passive.calls.len() < without.calls.len());
-        // A passive reading is never newer than one we already used.
-        let stale_passive = run_day(false, &|offset| (offset >= HOUR).then_some(0));
-        assert!(stale_passive.passive_used.is_empty());
-        assert_eq!(stale_passive.calls.len(), without.calls.len());
+        let stale = run_day(false, &|_| Some(START));
+        assert!(stale.readings.iter().all(|reading| !reading.passive));
+        assert_eq!(stale.calls().count(), without.calls().count());
+    }
+
+    /// A windows-only passive body adopted in a plain slot never resets the
+    /// credits-off plain clock: it is measured from the usage-credit section.
+    #[test]
+    fn windows_only_passive_body_keeps_the_credits_off_clock() {
+        let now = 100_000;
+        let mut credits = stored(Some(true), true);
+        credits[0].observed_at = Some(rfc3339(now - 7 * HOUR));
+        let schedule = ClaudeReadSchedule {
+            // A passive windows-only body was adopted 10 min ago.
+            last_plain_read_at: Some(now - 600),
+            last_saved_resets_read_at: Some(now - 1_800),
+            ..ClaudeReadSchedule::default()
+        };
+        assert_eq!(
+            claude_usage_read_kind(&schedule, &credits, now),
+            ClaudeUsageRead::Plain
+        );
+        credits[0].observed_at = Some(rfc3339(now - HOUR));
+        assert_eq!(
+            claude_usage_read_kind(&schedule, &credits, now),
+            ClaudeUsageRead::SavedResets
+        );
+    }
+
+    #[test]
+    fn slot_is_admitted_at_its_elapsed_boundary() {
+        // A reading a few seconds into one pass, checked a few seconds into
+        // the pass one slot later.
+        assert!(claude_slot_elapsed(900 - 7, 900));
+        assert!(claude_reading_due(Some(1_007), 1_307, 900, 1_900));
+        assert!(!claude_slot_elapsed(900 - 300, 900));
+        // Retry-After / success spacing still holds.
+        assert!(!claude_reading_due(Some(1_000), 5_000, 900, 1_900));
     }
 
     #[test]
@@ -1975,25 +2375,46 @@ mod tests {
         body
     }
 
-    fn respond_recognized(endpoint: &str) -> Value {
-        respond_with(
+    fn respond_recognized(endpoint: &str) -> Result<Value, u16> {
+        Ok(respond_with(
             endpoint,
             fixture("provider/claude-usage-cedar.json")["cedar_ember"].clone(),
-        )
+        ))
     }
 
-    fn respond_cedar_null(endpoint: &str) -> Value {
-        respond_with(endpoint, Value::Null)
+    fn respond_cedar_null(endpoint: &str) -> Result<Value, u16> {
+        Ok(respond_with(endpoint, Value::Null))
     }
 
-    fn respond_plain(endpoint: &str) -> Value {
+    fn respond_plain(endpoint: &str) -> Result<Value, u16> {
         REQUESTED.lock().unwrap().push(endpoint.to_string());
-        fixture("provider/claude-oauth-usage-plain.json")
+        Ok(fixture("provider/claude-oauth-usage-plain.json"))
     }
 
-    fn respond_empty(endpoint: &str) -> Value {
+    fn respond_empty(endpoint: &str) -> Result<Value, u16> {
         REQUESTED.lock().unwrap().push(endpoint.to_string());
-        json!({})
+        Ok(json!({}))
+    }
+
+    fn respond_status(endpoint: &str, status: u16) -> Result<Value, u16> {
+        REQUESTED.lock().unwrap().push(endpoint.to_string());
+        if endpoint.contains("cedar_ember") {
+            Err(status)
+        } else {
+            Ok(fixture("provider/claude-oauth-usage-plain.json"))
+        }
+    }
+
+    fn respond_variant_400(endpoint: &str) -> Result<Value, u16> {
+        respond_status(endpoint, 400)
+    }
+
+    fn respond_variant_404(endpoint: &str) -> Result<Value, u16> {
+        respond_status(endpoint, 404)
+    }
+
+    fn respond_variant_422(endpoint: &str) -> Result<Value, u16> {
+        respond_status(endpoint, 422)
     }
 
     /// End to end through the collector with a stand-in provider: a binding
@@ -2056,7 +2477,10 @@ mod tests {
             read_claude_read_schedule(&self.state_dir())
         }
 
-        fn collect(&self, respond: fn(&str) -> Value) -> super::super::ClaudeOAuthUsageOutcome {
+        fn collect(
+            &self,
+            respond: super::super::ClaudeOAuthTestResponder,
+        ) -> super::super::ClaudeOAuthUsageOutcome {
             *super::super::CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = Some(respond);
             let outcome = super::super::collect_claude_oauth_usage_with_access_token(
                 self.account,
@@ -2102,6 +2526,77 @@ mod tests {
             .diagnostics
             .iter()
             .any(|d| d.code == "claude_saved_reset_variant_unrecognized")
+    }
+
+    /// Through the actual cache serve path: a stored reading refreshed by a
+    /// recent windows-only read keeps an old saved-reset section Stale, with
+    /// its original read time.
+    #[test]
+    #[serial_test::serial]
+    fn served_cache_labels_an_old_section_stale_under_new_windows() {
+        let harness = VariantHarness::new("section-age");
+        let now = super::super::current_unix_seconds();
+        let mut saved = stored(None, true).remove(0);
+        saved.grants_observed_at = Some(rfc3339(now - 4 * 3_600));
+        saved.observed_at = saved.grants_observed_at.clone();
+        saved.account_identifier_hash = Some(harness.account.to_string());
+        saved.organization_identifier_hash = Some(harness.organization.to_string());
+        let mut usage = stored(Some(false), false).remove(0);
+        usage.observed_at = Some(rfc3339(now - 600));
+        usage.account_identifier_hash = saved.account_identifier_hash.clone();
+        usage.organization_identifier_hash = saved.organization_identifier_hash.clone();
+        let cache = super::super::ClaudeOAuthUsageCache {
+            schema_version: super::super::CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: harness.account.to_string(),
+            organization_identifier_hash: harness.organization.to_string(),
+            observed_at_epoch_seconds: now - 60,
+            next_refresh_after_epoch_seconds: now + 240,
+            windows: Vec::new(),
+            credit_balances: vec![usage, saved.clone()],
+        };
+        let served = super::super::claude_oauth_usage_from_cache(cache, now);
+        let saved_served = &served.credit_balances[1];
+        assert_eq!(saved_served.freshness, AgentQuotaWindowFreshness::Stale);
+        assert_eq!(saved_served.grants_observed_at, saved.grants_observed_at);
+        assert_eq!(
+            served.credit_balances[0].freshness,
+            AgentQuotaWindowFreshness::Fresh
+        );
+    }
+
+    /// A retained slot snapshot uses the same gate as the cache serve path:
+    /// fresh at 90 min during a 2-3 h idle slot, stale after the default gate
+    /// otherwise.
+    #[test]
+    #[serial_test::serial]
+    fn retained_snapshot_freshness_respects_the_idle_slot() {
+        let harness = VariantHarness::new("idle-snapshot");
+        let now = OffsetDateTime::now_utc();
+        let snapshot = ottto_protocol::ClaudeConfigSlotQuotaSnapshotV1 {
+            state: ottto_protocol::ClaudeConfigSlotQuotaSnapshotStateV1::Fresh,
+            captured_at: rfc3339(now.unix_timestamp() as u64 - 90 * 60),
+            observed_at: Some(rfc3339(now.unix_timestamp() as u64 - 90 * 60)),
+            quota_windows: Vec::new(),
+            credit_balances: Vec::new(),
+        };
+        let fresh = || {
+            super::super::local_claude_quota_snapshot_is_fresh_for_account(
+                &snapshot,
+                harness.account,
+                harness.organization,
+                now,
+            )
+        };
+        assert!(!fresh(), "default gate: 90 min is past 55-65 min");
+        write_claude_read_schedule(
+            &harness.state_dir(),
+            &ClaudeReadSchedule {
+                tracked_since: Some(now.unix_timestamp() as u64 - 7 * 3_600),
+                ..ClaudeReadSchedule::default()
+            },
+        )
+        .unwrap();
+        assert!(fresh(), "idle 2-3 h slot: 90 min is still inside it");
     }
 
     #[test]
@@ -2203,6 +2698,93 @@ mod tests {
         assert!(balances_of(&filled)
             .iter()
             .any(|b| b.kind == Some(CreditBalanceKind::UsageCredits)));
+    }
+
+    /// A stored plain reading, then a due saved-reset slot that the provider
+    /// answers with `respond`. The stored reading must be served unchanged,
+    /// the variant paused, no breaker strike recorded, and the next read
+    /// moved out by one slot (no second call in this slot or the next pass).
+    fn assert_unusable_variant_keeps_the_stored_reading(
+        respond: super::super::ClaudeOAuthTestResponder,
+    ) {
+        let harness = VariantHarness::new("unusable-variant");
+        let _ = std::fs::remove_file(harness.state_dir().join(CLAUDE_READ_SCHEDULE_FILE));
+        let stored = harness.collect(respond_plain);
+        let stored_credits = balances_of(&stored).to_vec();
+        assert!(!stored_credits.is_empty());
+        harness.due_keeping_reading();
+        REQUESTED.lock().unwrap().clear();
+
+        let outcome = harness.collect(respond);
+        assert_eq!(
+            REQUESTED.lock().unwrap().as_slice(),
+            ["https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"]
+        );
+        assert!(has_unrecognized(&outcome));
+        assert_eq!(harness.shape_failures(), 0, "never a breaker strike");
+        let usage = outcome.result.as_ref().expect("stored reading served");
+        assert!(!usage.windows.is_empty(), "windows do not flip off");
+        let kinds = |balances: &[AgentCreditBalance]| {
+            balances
+                .iter()
+                .map(|b| (b.kind, b.observed_at.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(&usage.credit_balances), kinds(&stored_credits));
+        assert!(harness
+            .schedule()
+            .saved_resets_variant_paused_until
+            .is_some());
+
+        // The next passes inside the pushed-out slot make no call.
+        REQUESTED.lock().unwrap().clear();
+        harness.collect(respond);
+        harness.collect(respond);
+        assert!(REQUESTED.lock().unwrap().is_empty(), "no retry every pass");
+
+        // One slot later: the paused variant gives way to the plain read.
+        harness.due_keeping_reading();
+        harness.collect(respond_plain);
+        assert_eq!(
+            REQUESTED.lock().unwrap().as_slice(),
+            ["https://api.anthropic.com/api/oauth/usage"]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn variant_400_pauses_it_and_keeps_the_stored_reading() {
+        assert_unusable_variant_keeps_the_stored_reading(respond_variant_400);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn variant_404_pauses_it_and_keeps_the_stored_reading() {
+        assert_unusable_variant_keeps_the_stored_reading(respond_variant_404);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn variant_422_pauses_it_and_keeps_the_stored_reading() {
+        assert_unusable_variant_keeps_the_stored_reading(respond_variant_422);
+    }
+
+    /// A windowless variant 200 serves the stored reading (no section flips
+    /// off) and makes no second call in its slot. The cache is kept.
+    #[test]
+    #[serial_test::serial]
+    fn windowless_variant_200_keeps_the_stored_reading() {
+        assert_unusable_variant_keeps_the_stored_reading(respond_empty);
+    }
+
+    #[test]
+    fn only_variant_rejections_pause_it() {
+        for status in [400, 404, 405, 410, 422] {
+            assert!(claude_saved_resets_variant_rejected(status), "{status}");
+        }
+        for status in [401, 403, 429, 500, 502, 503, 200] {
+            assert!(!claude_saved_resets_variant_rejected(status), "{status}");
+        }
     }
 
     #[test]
