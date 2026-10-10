@@ -9956,8 +9956,10 @@ fn collect_claude_oauth_usage_unstamped(
                 &mut read_schedule,
             );
         }
-        Some(Err(status)) => ureq::Response::new(status, "injected", "")
-            .and_then(|response| Err(ureq::Error::Status(status, response))),
+        Some(Err(status)) => match ureq::Response::new(status, "injected", "") {
+            Ok(response) => Err(ureq::Error::Status(status, response)),
+            Err(error) => Err(error),
+        },
         None => ureq::get(&endpoint)
             .set("Accept", "application/json")
             .set("Content-Type", "application/json")
