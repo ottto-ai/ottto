@@ -173,6 +173,8 @@ struct CodexUsageProbe {
     response_completed_at: Option<String>,
     /// Fixed vocabulary and aggregate counts only; never provider ids/titles.
     reset_credit_detail_summary: Option<String>,
+    /// Counts-only view of the non-selected rate-limit pools (design C2a).
+    rate_limit_pool_summary: Option<String>,
 }
 
 /// Strong active Codex identity from one exact credential home. This type is
@@ -2679,6 +2681,17 @@ fn collect_codex_status_for_home(
                 !usage.quota_windows.is_empty() || !usage.credit_balances.is_empty(),
             ) {
                 snapshot.diagnostics.push(diagnostic);
+            }
+            if let Some(summary) = usage.rate_limit_pool_summary {
+                if let Some(mut diagnostic) = codex_app_server_success_diagnostic(
+                    usage.response_completed_at.clone(),
+                    strong_identity.as_ref(),
+                    true,
+                ) {
+                    diagnostic.code = "codex_rate_limit_pools_observed".to_string();
+                    diagnostic.message = summary;
+                    snapshot.diagnostics.push(diagnostic);
+                }
             }
             if let Some(summary) = usage.reset_credit_detail_summary {
                 if let Some(mut diagnostic) = codex_app_server_success_diagnostic(
@@ -12963,8 +12976,38 @@ fn collect_codex_app_server_usage_for_home(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
 ) -> Result<CodexUsageProbe, String> {
-    let observation = call_codex_app_server_rate_limits_for_home(codex_home, home_trust)?;
-    Ok(codex_usage_probe_from_app_server_observation(observation))
+    let now = current_unix_seconds();
+    let needs_details =
+        |account: &Value, rate_limits: &Value, credentials: Option<&CodexAuthCredentials>| {
+            let binding = credentials
+                .and_then(|credentials| {
+                    validated_codex_identity(credentials, Some(account), Some(rate_limits), true)
+                })
+                .map(|identity| codex_credit_binding(&identity));
+            codex_credit_grants::routine_read_needs_details(binding.as_deref(), rate_limits, now)
+        };
+    let observation =
+        match call_codex_app_server_rate_limits_for_home(codex_home, home_trust, &needs_details) {
+            Ok(observation) => observation,
+            Err(message) => {
+                // No reading at all: the detail back-off still applies to the
+                // account last validated at this home (design R7).
+                codex_credit_grants::record_session_failure(codex_home, now);
+                return Err(message);
+            }
+        };
+    let probe = codex_usage_probe_from_app_server_observation(observation);
+    if let Some(identity) = probe.identity.as_ref() {
+        codex_credit_grants::remember_home_binding(codex_home, &codex_credit_binding(identity));
+    }
+    Ok(probe)
+}
+
+fn codex_credit_binding(identity: &CodexStrongIdentity) -> String {
+    codex_credit_grants::binding_key(
+        &identity.account_identifier_hash,
+        &identity.workspace_identifier_hash,
+    )
 }
 
 fn codex_usage_probe_from_app_server_observation(
@@ -12985,14 +13028,42 @@ fn codex_usage_probe_from_app_server_observation(
     for window in &mut quota_windows {
         window.observed_at = observation.response_completed_at.clone();
     }
+    let now = current_unix_seconds();
+    let binding = identity.as_ref().map(codex_credit_binding);
+    let mut credit_balances = codex_app_server_credit_balances(&observation.rate_limits);
+    let model_diagnostics = codex_credit_grants::attach_reset_bank_grants(
+        &mut credit_balances,
+        &observation.rate_limits,
+        codex_credit_grants::CodexCreditRead {
+            binding: binding.as_deref(),
+            details_requested: observation.details_requested,
+            details_answered: observation.details_answered,
+            observed_at: observation.response_completed_at.as_deref(),
+            now,
+        },
+    );
+    codex_credit_grants::stamp_read_clock(
+        &mut credit_balances,
+        observation.response_completed_at.as_deref(),
+    );
+    let reset_credit_detail_summary = if observation.details_requested {
+        codex_reset_credit_detail_summary(&observation.rate_limits)
+    } else {
+        codex_credit_grants::routine_reset_credit_summary(&observation.rate_limits)
+    }
+    .map(|summary| summary + &codex_credit_grants::model_diagnostics_suffix(&model_diagnostics));
     CodexUsageProbe {
         quota_windows,
-        credit_balances: codex_app_server_credit_balances(&observation.rate_limits),
+        credit_balances,
         account: codex_app_server_account(&observation.account),
         identity,
         credential_read_failed: observation.credential_read_failed,
         response_completed_at: observation.response_completed_at,
-        reset_credit_detail_summary: codex_reset_credit_detail_summary(&observation.rate_limits),
+        reset_credit_detail_summary,
+        rate_limit_pool_summary: Some(codex_credit_grants::rate_limit_pools_summary(
+            &observation.rate_limits,
+            now,
+        )),
     }
 }
 
@@ -13000,9 +13071,7 @@ fn codex_usage_probe_from_app_server_observation(
 /// without grant ids, titles, descriptions, timestamps or invented semantics.
 fn codex_reset_credit_detail_summary(value: &Value) -> Option<String> {
     let credits = value.get("rateLimitResetCredits")?.as_object()?;
-    let count = credits
-        .get("availableCount")
-        .and_then(Value::as_u64)
+    let count = codex_credit_grants::available_count(value)
         .filter(|n| *n <= 10_000)
         .map(|n| n.to_string())
         .unwrap_or_else(|| "unreported".to_string());
@@ -13035,6 +13104,10 @@ struct CodexAppServerObservation {
     refreshed_credentials: Option<CodexAuthCredentials>,
     credential_read_failed: bool,
     response_completed_at: Option<String>,
+    /// A detailed (reset-credit list) read was sent in this session.
+    details_requested: bool,
+    /// That detailed read answered with a result.
+    details_answered: bool,
 }
 
 fn codex_app_server_success_diagnostic(
@@ -13058,6 +13131,11 @@ fn codex_app_server_success_diagnostic(
         ),
     )
 }
+
+/// Decides, after the routine reading, whether to send the detailed read in
+/// the same session: `(account result, rate-limit result, refreshed
+/// credentials)`.
+type CodexNeedsDetails<'a> = &'a dyn Fn(&Value, &Value, Option<&CodexAuthCredentials>) -> bool;
 
 /// Fixed producer text only; never persist provider error messages or data.
 fn codex_app_server_rpc_failure(phase: &str, error: &Value) -> String {
@@ -13101,6 +13179,7 @@ fn codex_app_server_end_failure(
 fn call_codex_app_server_rate_limits_for_home(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    needs_details: CodexNeedsDetails<'_>,
 ) -> Result<CodexAppServerObservation, String> {
     let Some(program_path) = crate::command_env::executable_path("codex") else {
         return Err("Codex CLI was not found for app-server rate-limit collection.".to_string());
@@ -13164,10 +13243,11 @@ fn call_codex_app_server_rate_limits_for_home(
         "id": "ottto_account",
         "params": {"refreshToken": true}
     });
-    let read = serde_json::json!({
-        "method": "account/rateLimits/read",
-        "id": "ottto_rate_limits"
-    });
+    // Every poll reads usage and the count first; the reset-credit list
+    // follows in this session only when the cadence asks for it (design R7).
+    let read = codex_credit_grants::CodexRateLimitsRead::Routine.request("ottto_rate_limits");
+    let detail_read = codex_credit_grants::CodexRateLimitsRead::Detailed
+        .request(codex_credit_grants::DETAIL_READ_ID);
     let write_result = (|| -> Result<(), String> {
         for message in [initialize, initialized, account] {
             serde_json::to_writer(&mut stdin, &message)
@@ -13188,106 +13268,140 @@ fn call_codex_app_server_rate_limits_for_home(
     }
 
     let start = Instant::now();
+    let mut deadline = start + CODEX_APP_SERVER_TIMEOUT;
     let mut initialize_error = None;
     let mut initialize_completed = false;
     let mut disconnected = false;
     let mut account_result = None;
-    let mut rate_limits_result = None;
+    let mut rate_limits_result: Option<(Value, Option<String>)> = None;
+    let mut detail_result: Option<(Value, Option<String>)> = None;
     let mut rate_limits_requested = false;
-    while start.elapsed() < CODEX_APP_SERVER_TIMEOUT {
-        let remaining = CODEX_APP_SERVER_TIMEOUT
-            .checked_sub(start.elapsed())
-            .unwrap_or_else(|| Duration::from_millis(0));
-        match receiver.recv_timeout(remaining.min(Duration::from_millis(250))) {
-            Ok(Err(message)) => {
-                drop(stdin);
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(message);
-            }
-            Ok(Ok(message)) => {
-                let response_id = message.get("id").and_then(Value::as_str);
-                if message.get("id").and_then(Value::as_i64) == Some(1) {
-                    if let Some(error) = message.get("error") {
-                        initialize_error = Some(codex_app_server_rpc_failure("initialize", error));
-                    } else if message.get("result").is_some() {
-                        initialize_completed = true;
-                    }
-                }
-                if let (Some(id @ ("ottto_account" | "ottto_rate_limits")), Some(error)) =
-                    (response_id, message.get("error"))
-                {
-                    let phase = if id == "ottto_account" {
-                        "account"
-                    } else {
-                        "quota"
-                    };
-                    // An earlier initialize rejection is the likelier cause.
-                    let message = initialize_error
-                        .clone()
-                        .unwrap_or_else(|| codex_app_server_rpc_failure(phase, error));
-                    drop(stdin);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(message);
-                }
-                if response_id == Some("ottto_account") {
-                    account_result = message.get("result").cloned();
-                } else if response_id == Some("ottto_rate_limits") {
-                    rate_limits_result = message.get("result").cloned();
-                }
-                if account_result.is_some() && !rate_limits_requested {
-                    if serde_json::to_writer(&mut stdin, &read)
-                        .map_err(|_| "Codex app-server request serialization failed.".to_string())
-                        .and_then(|()| {
-                            stdin
-                                .write_all(b"\n")
-                                .map_err(|_| "Codex app-server request write failed.".to_string())
-                        })
-                        .and_then(|()| {
-                            stdin
-                                .flush()
-                                .map_err(|_| "Codex app-server request flush failed.".to_string())
-                        })
-                        .is_err()
-                    {
-                        drop(stdin);
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err("Codex app-server quota request failed.".to_string());
-                    }
-                    rate_limits_requested = true;
-                }
-                if account_result.is_some() && rate_limits_result.is_some() {
-                    let response_completed_at = rfc3339_from_unix_seconds(current_unix_seconds());
-                    let account = account_result.take().expect("checked account result");
-                    let rate_limits = rate_limits_result
-                        .take()
-                        .expect("checked rate-limit result");
-                    let (refreshed_credentials, credential_read_failed) =
-                        match read_codex_auth_credentials_at(codex_home, home_trust) {
-                            Ok(credentials) => (credentials, false),
-                            Err(_) => (None, true),
-                        };
-                    drop(stdin);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Ok(CodexAppServerObservation {
-                        account,
-                        rate_limits,
-                        refreshed_credentials,
-                        credential_read_failed,
-                        response_completed_at,
-                    });
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+    // The detailed read sent after the routine one in this session.
+    let mut detail_requested = false;
+    let mut detail_failed = false;
+    let mut credentials: Option<(Option<CodexAuthCredentials>, bool)> = None;
+    let read_credentials = || match read_codex_auth_credentials_at(codex_home, home_trust) {
+        Ok(credentials) => (credentials, false),
+        Err(_) => (None, true),
+    };
+    // `Ok(true)`: settled; `Ok(false)`: timed out or the server went away.
+    let outcome: Result<bool, String> = loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break Ok(false);
+        };
+        let message = match receiver.recv_timeout(remaining.min(Duration::from_millis(250))) {
+            // Output bounds still end the session; a routine reading taken
+            // before the detailed read stands (the attempt counts as failed).
+            Ok(Err(_)) if detail_requested && rate_limits_result.is_some() => break Ok(true),
+            Ok(Err(message)) => break Err(message),
+            Ok(Ok(message)) => message,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 disconnected = true;
-                break;
+                break Ok(false);
+            }
+        };
+        if message.get("id").and_then(Value::as_i64) == Some(1) {
+            if let Some(error) = message.get("error") {
+                initialize_error = Some(codex_app_server_rpc_failure("initialize", error));
+            } else if message.get("result").is_some() {
+                initialize_completed = true;
             }
         }
-    }
+        // An earlier initialize rejection is the likelier cause of a later
+        // RPC failure.
+        let rpc_failure = |phase: &str, error: &Value| {
+            initialize_error
+                .clone()
+                .unwrap_or_else(|| codex_app_server_rpc_failure(phase, error))
+        };
+        let response_id = message.get("id").and_then(Value::as_str);
+        let error = message.get("error");
+        let arrived_at = || rfc3339_from_unix_seconds(current_unix_seconds());
+        let mut send_details = false;
+        match (response_id, error) {
+            (Some("ottto_account"), Some(error)) => {
+                break Err(rpc_failure("account", error));
+            }
+            (Some("ottto_account"), None) => account_result = message.get("result").cloned(),
+            (Some("ottto_rate_limits"), Some(error))
+                if !detail_requested && codex_credit_grants::routine_param_rejected(error) =>
+            {
+                // A server that does not accept the routine parameter still
+                // answers the plain read it always accepted.
+                send_details = true;
+            }
+            (Some("ottto_rate_limits"), Some(error)) => {
+                break Err(rpc_failure("quota", error));
+            }
+            (Some("ottto_rate_limits"), None) if rate_limits_result.is_none() => {
+                rate_limits_result = message
+                    .get("result")
+                    .cloned()
+                    .map(|result| (result, arrived_at()));
+            }
+            (Some(codex_credit_grants::DETAIL_READ_ID), Some(error)) => {
+                if rate_limits_result.is_none() {
+                    break Err(rpc_failure("quota", error));
+                }
+                detail_failed = true;
+            }
+            (Some(codex_credit_grants::DETAIL_READ_ID), None) => {
+                detail_result = message
+                    .get("result")
+                    .cloned()
+                    .map(|result| (result, arrived_at()));
+            }
+            _ => {}
+        }
+        if account_result.is_some() && !rate_limits_requested {
+            if write_codex_app_server_message(&mut stdin, &read).is_err() {
+                break Err("Codex app-server quota request failed.".to_string());
+            }
+            rate_limits_requested = true;
+        }
+        if !send_details && !detail_requested {
+            if let (Some(account), Some((rate_limits, _))) =
+                (account_result.as_ref(), rate_limits_result.as_ref())
+            {
+                let (refreshed, _) = credentials.get_or_insert_with(read_credentials);
+                if !needs_details(account, rate_limits, refreshed.as_ref()) {
+                    break Ok(true);
+                }
+                send_details = true;
+            }
+        }
+        if send_details {
+            detail_requested = true;
+            let now = Instant::now();
+            deadline = now
+                + codex_credit_grants::detail_read_budget(deadline.saturating_duration_since(now));
+            if write_codex_app_server_message(&mut stdin, &detail_read).is_err() {
+                if rate_limits_result.is_some() {
+                    // The routine reading stands; the attempt counts as failed.
+                    break Ok(true);
+                }
+                break Err("Codex app-server quota request failed.".to_string());
+            }
+            continue;
+        }
+        if detail_requested
+            && account_result.is_some()
+            && (detail_result.is_some() || (detail_failed && rate_limits_result.is_some()))
+        {
+            break Ok(true);
+        }
+    };
+    // A detailed read that did not answer in time leaves the routine reading.
+    let settled = match outcome {
+        Ok(settled) => settled || (detail_requested && rate_limits_result.is_some()),
+        Err(message) => {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(message);
+        }
+    };
     let phase = if account_result.is_some() {
         "quota"
     } else if initialize_completed {
@@ -13295,12 +13409,44 @@ fn call_codex_app_server_rate_limits_for_home(
     } else {
         "initialize"
     };
-    let message =
-        codex_app_server_end_failure(phase, disconnected, initialize_error.as_deref(), &mut child);
+    let details_answered = detail_result.is_some();
+    let (Some(account), Some((rate_limits, response_completed_at)), true) = (
+        account_result,
+        detail_result.or(rate_limits_result),
+        settled,
+    ) else {
+        // Observe the child's own end before our cleanup kill.
+        let message = codex_app_server_end_failure(
+            phase,
+            disconnected,
+            initialize_error.as_deref(),
+            &mut child,
+        );
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(message);
+    };
+    let (refreshed_credentials, credential_read_failed) =
+        credentials.unwrap_or_else(read_credentials);
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
-    Err(message)
+    Ok(CodexAppServerObservation {
+        account,
+        rate_limits,
+        refreshed_credentials,
+        credential_read_failed,
+        response_completed_at,
+        details_requested: detail_requested,
+        details_answered,
+    })
+}
+
+fn write_codex_app_server_message(stdin: &mut impl Write, message: &Value) -> Result<(), ()> {
+    serde_json::to_writer(&mut *stdin, message).map_err(|_| ())?;
+    stdin.write_all(b"\n").map_err(|_| ())?;
+    stdin.flush().map_err(|_| ())
 }
 
 fn read_bounded_codex_app_server_stdout<R: BufRead>(
@@ -13360,6 +13506,7 @@ fn call_codex_app_server_rate_limits() -> Result<Value, String> {
     call_codex_app_server_rate_limits_for_home(
         &default_codex_home(),
         CodexHomeTrust::ProviderDefault,
+        &|_, _, _| false,
     )
     .map(|observation| observation.rate_limits)
 }
@@ -13545,29 +13692,25 @@ fn codex_app_server_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
             balances.insert(balance.name.clone(), balance);
         }
     }
-    if let Some(reset_credits) = value.get("rateLimitResetCredits") {
-        if let Some(remaining) = json_u64(reset_credits, &["availableCount", "available_count"]) {
-            let balance = AgentCreditBalance {
-                name: "reset_bank".to_string(),
-                status: if remaining == 0 {
-                    AgentCreditBalanceStatus::Exhausted
-                } else {
-                    AgentCreditBalanceStatus::Ok
-                },
-                freshness: AgentQuotaWindowFreshness::Fresh,
-                unit: AgentCreditBalanceUnit::Resets,
-                account_label: None,
-                remaining: Some(remaining),
-                used: None,
-                quota: None,
-                unlimited: Some(false),
-                updated_at: None,
-                ..Default::default()
-            };
-            balances.insert(balance.name.clone(), balance);
-        }
+    if let Some(remaining) = codex_credit_grants::available_count(value) {
+        let balance = AgentCreditBalance {
+            name: codex_credit_grants::RESET_BANK.to_string(),
+            status: crate::quota_credit_model::status_for_remaining(Some(remaining)),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            unit: AgentCreditBalanceUnit::Resets,
+            account_label: None,
+            remaining: Some(remaining),
+            used: None,
+            quota: None,
+            unlimited: Some(false),
+            updated_at: None,
+            ..Default::default()
+        };
+        balances.insert(balance.name.clone(), balance);
     }
-    balances.into_values().collect()
+    let mut balances = balances.into_values().collect::<Vec<_>>();
+    codex_credit_grants::stamp_codex_balance_kinds(&mut balances);
+    balances
 }
 
 /// Parse Codex's effective workspace monthly credit limit.
@@ -13767,14 +13910,17 @@ fn collect_codex_oauth_usage_at(
     for window in &mut quota_windows {
         window.observed_at = response_completed_at.clone();
     }
+    let mut credit_balances = codex_usage_credit_balances(&value);
+    codex_credit_grants::stamp_codex_balance_kinds(&mut credit_balances);
     Ok(CodexUsageProbe {
         quota_windows,
-        credit_balances: codex_usage_credit_balances(&value),
+        credit_balances,
         account: None,
         identity,
         credential_read_failed: false,
         response_completed_at: None,
         reset_credit_detail_summary: None,
+        rate_limit_pool_summary: None,
     })
 }
 
@@ -19495,7 +19641,10 @@ for line in sys.stdin:
     elif '"id":"ottto_account"' in line:
         print('{"id":"ottto_account","result":{"account":{"type":"chatgpt","email":"synthetic-account","planType":"pro"},"requiresOpenaiAuth":true}}', flush=True)
     elif "account/rateLimits/read" in line:
-        print('{"id":"ottto_rate_limits","result":{"rateLimits":{"limitId":"synthetic-limit","planType":"pro","primary":{"usedPercent":25,"windowDurationMins":300}},"rateLimitResetCredits":{"availableCount":2}}}', flush=True)
+        detailed = "ottto_rate_limits_details" in line
+        request_id = "ottto_rate_limits_details" if detailed else "ottto_rate_limits"
+        credits = ',"credits":[]' if detailed else ''
+        print('{"id":"' + request_id + '","result":{"rateLimits":{"limitId":"synthetic-limit","planType":"pro","primary":{"usedPercent":25,"windowDurationMins":300}},"rateLimitResetCredits":{"availableCount":2' + credits + '}}}', flush=True)
 "#,
         )
         .expect("fake Codex executable");
@@ -19586,6 +19735,49 @@ for line in sys.stdin:
     #[cfg(unix)]
     #[test]
     #[serial]
+    fn codex_whole_session_failure_backs_off_the_validated_binding() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, home) = synthetic_codex_collector_home("session-failure", 0o600);
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        let collect = || {
+            collect_codex_status_for_home(
+                "2026-08-26T00:00:00Z".to_string(),
+                "2026-08-26T00:15:00Z".to_string(),
+                &home,
+                CodexHomeTrust::ProviderDefault,
+            )
+        };
+
+        // A successful reading validates the binding for this home; its
+        // detailed read returned a list, so no failure is on record.
+        let (_, identity, _) = collect();
+        let binding = codex_credit_binding(&identity.expect("validated identity"));
+        assert_eq!(codex_credit_grants::last_detail_failed_at(&binding), None);
+
+        // The app-server now dies before any answer: no reading at all.
+        let executable = root.join("codex");
+        std::fs::write(&executable, "#!/bin/sh\nexit 1\n").expect("failing codex");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("failing codex mode");
+        let (snapshot, identity, _) = collect();
+        assert!(identity.is_none());
+        assert!(snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_usage_probe_failed"));
+        assert!(
+            codex_credit_grants::last_detail_failed_at(&binding).is_some(),
+            "the failed session feeds the detail back-off of the known binding"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
     fn credential_read_failure_emits_typed_diagnostic_with_fail_closed_meters() {
         let (root, home) = synthetic_codex_collector_home("unsafe-auth", 0o644);
         let _commands =
@@ -19623,6 +19815,8 @@ for line in sys.stdin:
             refreshed_credentials: None,
             credential_read_failed: false,
             response_completed_at: Some(completed_at.clone()),
+            details_requested: true,
+            details_answered: true,
         });
         assert_eq!(
             probe.response_completed_at.as_deref(),
@@ -19871,7 +20065,7 @@ for line in sys.stdin:
             .expect("fake codex mode");
         let _commands =
             EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
-        call_codex_app_server_rate_limits_for_home(&home, CodexHomeTrust::Managed)
+        call_codex_app_server_rate_limits_for_home(&home, CodexHomeTrust::Managed, &|_, _, _| false)
     }
 
     fn assert_no_provider_text(message: &str) {
@@ -27132,6 +27326,8 @@ for line in sys.stdin:
             refreshed_credentials: None,
             credential_read_failed: false,
             response_completed_at: Some("2026-10-04T19:00:00Z".to_string()),
+            details_requested: true,
+            details_answered: true,
         };
         let probe = codex_usage_probe_from_app_server_observation(observation);
         assert_eq!(probe.quota_windows.len(), 1);

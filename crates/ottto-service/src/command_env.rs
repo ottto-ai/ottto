@@ -27,16 +27,18 @@ const PROVIDER_ENV_KEYS: &[&str] = &[
 ];
 
 pub(crate) fn executable_path(program: &str) -> Option<PathBuf> {
-    executable_search_dirs_for_program(program)
-        .into_iter()
-        .find_map(|dir| {
-            let candidate = dir.join(program);
-            if candidate.is_file() {
-                Some(candidate)
-            } else {
-                None
-            }
-        })
+    first_program_in(executable_search_dirs_for_program(program), program)
+}
+
+fn first_program_in(dirs: impl IntoIterator<Item = PathBuf>, program: &str) -> Option<PathBuf> {
+    dirs.into_iter().find_map(|dir| {
+        let candidate = dir.join(program);
+        if candidate.is_file() {
+            Some(candidate)
+        } else {
+            None
+        }
+    })
 }
 
 /// Hardened Claude-only resolver. Every candidate comes from an absolute
@@ -112,11 +114,39 @@ fn executable_search_dirs_for_program(program: &str) -> Vec<PathBuf> {
     executable_search_dirs_for_program_with_home(program, env::var_os("HOME"))
 }
 
-/// App bundles that vendor the `codex` CLI under `Contents/Resources`. The
-/// standalone Codex desktop app and the ChatGPT desktop app both ship it; on a
-/// Mac where Codex is used only through a desktop app this is the only `codex`
-/// binary on disk.
+/// App bundles that vendor the `codex` CLI. The standalone Codex desktop app
+/// and the ChatGPT desktop app both ship it; on a Mac where Codex is used only
+/// through a desktop app this is the only `codex` binary on disk.
 const CODEX_DESKTOP_BUNDLES: &[&str] = &["Codex.app", "ChatGPT.app"];
+
+/// Where a desktop bundle keeps `codex`, relative to `Contents/Resources`,
+/// oldest layout first: directly in `Resources`; then the `codex-cli` folder
+/// with its `bin/codex` launcher and the `CodexCLI.app` binary it launches.
+const CODEX_BUNDLE_LAYOUTS: &[&[&str]] = &[
+    &[],
+    &["codex-cli", "bin"],
+    &["codex-cli", "CodexCLI.app", "Contents", "MacOS"],
+];
+
+/// Every desktop-bundle directory that may hold `codex`, for each
+/// applications root in order.
+fn codex_desktop_bundle_dirs(application_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for bundle in CODEX_DESKTOP_BUNDLES {
+        for root in application_roots {
+            let resources = root.join(bundle).join("Contents").join("Resources");
+            for layout in CODEX_BUNDLE_LAYOUTS {
+                push_unique(
+                    &mut dirs,
+                    layout
+                        .iter()
+                        .fold(resources.clone(), |dir, part| dir.join(part)),
+                );
+            }
+        }
+    }
+    dirs
+}
 
 fn executable_search_dirs_for_program_with_home(
     program: &str,
@@ -124,24 +154,12 @@ fn executable_search_dirs_for_program_with_home(
 ) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if program == "codex" {
-        for bundle in CODEX_DESKTOP_BUNDLES {
-            push_unique(
-                &mut dirs,
-                Path::new("/Applications")
-                    .join(bundle)
-                    .join("Contents")
-                    .join("Resources"),
-            );
-            if let Some(home) = home.as_ref().filter(|home| !home.is_empty()) {
-                push_unique(
-                    &mut dirs,
-                    PathBuf::from(home)
-                        .join("Applications")
-                        .join(bundle)
-                        .join("Contents")
-                        .join("Resources"),
-                );
-            }
+        let mut application_roots = vec![PathBuf::from("/Applications")];
+        if let Some(home) = home.as_ref().filter(|home| !home.is_empty()) {
+            application_roots.push(PathBuf::from(home).join("Applications"));
+        }
+        for dir in codex_desktop_bundle_dirs(&application_roots) {
+            push_unique(&mut dirs, dir);
         }
     }
     for dir in executable_search_dirs_from(env::var_os("PATH"), home.clone(), true) {
@@ -525,30 +543,80 @@ mod tests {
             Some(OsString::from("/Users/tester")),
         );
 
-        assert_eq!(
-            dirs.first(),
-            Some(&PathBuf::from("/Applications/Codex.app/Contents/Resources"))
-        );
-        assert_eq!(
-            dirs.get(1),
-            Some(&PathBuf::from(
-                "/Users/tester/Applications/Codex.app/Contents/Resources"
-            ))
-        );
+        let bundle_dirs = |root: &str, bundle: &str| {
+            let resources = format!("{root}/{bundle}/Contents/Resources");
+            [
+                PathBuf::from(&resources),
+                PathBuf::from(format!("{resources}/codex-cli/bin")),
+                PathBuf::from(format!("{resources}/codex-cli/CodexCLI.app/Contents/MacOS")),
+            ]
+        };
         // The ChatGPT desktop app vendors the codex CLI the same way; a Mac
         // with only ChatGPT.app installed must still resolve codex.
+        let expected = [
+            bundle_dirs("/Applications", "Codex.app"),
+            bundle_dirs("/Users/tester/Applications", "Codex.app"),
+            bundle_dirs("/Applications", "ChatGPT.app"),
+            bundle_dirs("/Users/tester/Applications", "ChatGPT.app"),
+        ]
+        .concat();
+        assert_eq!(dirs[..expected.len()], expected[..]);
+        assert!(dirs.len() > expected.len(), "PATH directories follow");
+    }
+
+    /// Resolve through the same lookup `executable_path` uses; whatever it
+    /// finds must also be runnable.
+    fn codex_resolved_in(dirs: &[PathBuf]) -> Option<PathBuf> {
+        let found = first_program_in(dirs.iter().cloned(), "codex");
+        if let Some(path) = &found {
+            assert!(
+                is_absolute_executable(path),
+                "{} is not executable",
+                path.display()
+            );
+        }
+        found
+    }
+
+    #[test]
+    fn codex_resolver_finds_old_and_new_desktop_bundle_layouts() {
+        let root = scratch_home("codex-bundle-layouts");
+        let write_codex = |dir: PathBuf| {
+            fs::create_dir_all(&dir).expect("layout dir");
+            let codex = dir.join("codex");
+            fs::write(&codex, "#!/bin/sh\n").expect("codex");
+            fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).expect("chmod codex");
+            codex
+        };
+
+        // Old layout: `Resources/codex`.
+        let old_root = root.join("old");
+        let old = write_codex(old_root.join("ChatGPT.app/Contents/Resources"));
         assert_eq!(
-            dirs.get(2),
-            Some(&PathBuf::from(
-                "/Applications/ChatGPT.app/Contents/Resources"
-            ))
+            codex_resolved_in(&codex_desktop_bundle_dirs(&[old_root])),
+            Some(old)
         );
+
+        // New layout: the `bin/codex` launcher wins over the binary it runs.
+        let new_root = root.join("new");
+        let launcher = write_codex(new_root.join("ChatGPT.app/Contents/Resources/codex-cli/bin"));
+        let binary = write_codex(
+            new_root.join("ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS"),
+        );
+        let new_dirs = codex_desktop_bundle_dirs(std::slice::from_ref(&new_root));
+        assert_eq!(codex_resolved_in(&new_dirs), Some(launcher.clone()));
+
+        // A bundle that ships only the inner app binary still resolves.
+        fs::remove_file(&launcher).expect("remove launcher");
+        assert_eq!(codex_resolved_in(&new_dirs), Some(binary));
+
+        // Nothing installed: nothing resolved from bundles.
         assert_eq!(
-            dirs.get(3),
-            Some(&PathBuf::from(
-                "/Users/tester/Applications/ChatGPT.app/Contents/Resources"
-            ))
+            codex_resolved_in(&codex_desktop_bundle_dirs(&[root.join("empty")])),
+            None
         );
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
