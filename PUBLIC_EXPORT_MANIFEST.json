@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 526,
-  "content_sha256": "7caef120d88990c7bb4d9bab521b19851e96d0d18195c7721a7e39780ba59793",
+  "candidate_file_count": 527,
+  "content_sha256": "0ac9afa7f9383b41cff2e26520b9fddc62ad08dfae8fd20a76d22c44ec43de34",
   "files": [
     {
       "executable": false,
@@ -678,8 +678,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "eb97b221b564d503f93459eaf4958096543406a6970e07804638ef7d7c161b23",
-      "size_bytes": 1334683
+      "sha256": "1817c35dbc6bd5d5d9a6cdfa3a80b1edd5bc1a2608fb75c3e42a5d0ac4fbb84e",
+      "size_bytes": 1345332
     },
     {
       "executable": false,
@@ -2441,6 +2441,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-10-codex-probe-diagnostics.md",
+      "sha256": "b15261fa6a54519dd44dd7dda123c072002cb9470fd7630e8b3160ad585920d2",
+      "size_bytes": 2663
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-10-quota-credit-model-followup.md",
       "sha256": "d82c791c277754baa55d88a4d659e266fe5ba73088e72997389b788adf833dbc",
       "size_bytes": 1553
@@ -3685,9 +3692,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-09T23:56:31+00:00",
+  "generated_at": "2026-10-10T07:40:59+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 527,
+  "output_file_count": 528,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3724,5 +3731,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b72e816b3f5cd5dbce4776d54c1211d0d1adb143"
+  "source_commit": "e84cc0895bba365ab5d2fe8813f9cc442627700f"
 }
