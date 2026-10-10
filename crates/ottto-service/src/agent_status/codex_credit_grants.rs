@@ -222,6 +222,9 @@ pub(super) struct CodexCreditRead<'a> {
     pub(super) binding: Option<&'a str>,
     /// A detailed read was sent in this session.
     pub(super) details_requested: bool,
+    /// That detailed read answered with a result (not an error, timeout,
+    /// output-bound failure or unsent request).
+    pub(super) details_answered: bool,
     /// Completion clock of the provider read.
     pub(super) observed_at: Option<&'a str>,
     pub(super) now: u64,
@@ -276,10 +279,11 @@ impl CodexCreditTracker {
         let count = available_count(rate_limits);
         let rows = reset_credit_rows(rate_limits);
         if let Some(binding) = read.binding {
-            // A list in any answer is a detailed reading; no reset section at
-            // all is a complete answer, not a failure.
+            // A list in any answer is a detailed reading. A detailed answer
+            // without any reset section is complete, not a failure; a detailed
+            // read that never answered is a failure even then.
             if read.details_requested || rows.is_some() {
-                let ok = rows.is_some() || count.is_none();
+                let ok = rows.is_some() || (count.is_none() && read.details_answered);
                 self.cadence_entry(binding)
                     .record_detail(ok, count, read.now);
             }
@@ -704,6 +708,7 @@ mod tests {
         CodexCreditRead {
             binding,
             details_requested,
+            details_answered: details_requested,
             observed_at: Some(READ_AT),
             now,
         }
@@ -1021,6 +1026,7 @@ mod tests {
         let read = CodexCreditRead {
             binding: Some(binding),
             details_requested: sent.contains(&CodexRateLimitsRead::Detailed),
+            details_answered: sent.contains(&CodexRateLimitsRead::Detailed),
             observed_at: Some(READ_AT),
             now,
         };
@@ -1093,6 +1099,7 @@ mod tests {
                 CodexCreditRead {
                     binding: Some(BINDING_A),
                     details_requested: false,
+                    details_answered: false,
                     // A later read clock: the list keeps its own.
                     observed_at: Some("2026-10-09T15:05:00Z"),
                     now,
@@ -1237,6 +1244,27 @@ mod tests {
             &count_only(3),
             now + DETAIL_RETRY_SECS
         ));
+    }
+
+    #[test]
+    fn a_failed_detailed_read_without_reset_section_keeps_the_retry_gate() {
+        // Plan credits only: neither answer carries a reset section.
+        let mut tracker = CodexCreditTracker::default();
+        let no_resets = json!({"rateLimits": {}});
+        assert!(tracker.routine_needs_details(Some(BINDING_A), &no_resets, T0));
+        // The escalated detailed read errors or times out; the routine
+        // reading stands, but the attempt is a failure.
+        tracker.attach_reset_bank_grants(
+            &mut [],
+            &no_resets,
+            CodexCreditRead {
+                details_answered: false,
+                ..read(Some(BINDING_A), true, T0)
+            },
+        );
+        assert!(!tracker.routine_needs_details(Some(BINDING_A), &no_resets, T0 + 300));
+        // Retried after 15 minutes, not an hour.
+        assert!(tracker.routine_needs_details(Some(BINDING_A), &no_resets, T0 + DETAIL_RETRY_SECS));
     }
 
     #[test]
@@ -1468,6 +1496,7 @@ mod tests {
                 CodexCreditRead {
                     binding: Some(BINDING_A),
                     details_requested,
+                    details_answered: details_requested,
                     observed_at: Some(read_at),
                     now: unix(read_at),
                 },
@@ -1715,6 +1744,10 @@ for line in sys.stdin:
             assert!(
                 observation.details_requested,
                 "the attempt counts as failed"
+            );
+            assert!(
+                !observation.details_answered,
+                "the detailed read never answered"
             );
             assert!(!has_list(observation));
             assert_eq!(available_count(&observation.rate_limits), Some(2));

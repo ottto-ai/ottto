@@ -13037,6 +13037,7 @@ fn codex_usage_probe_from_app_server_observation(
         codex_credit_grants::CodexCreditRead {
             binding: binding.as_deref(),
             details_requested: observation.details_requested,
+            details_answered: observation.details_answered,
             observed_at: observation.response_completed_at.as_deref(),
             now,
         },
@@ -13105,6 +13106,8 @@ struct CodexAppServerObservation {
     response_completed_at: Option<String>,
     /// A detailed (reset-credit list) read was sent in this session.
     details_requested: bool,
+    /// That detailed read answered with a result.
+    details_answered: bool,
 }
 
 fn codex_app_server_success_diagnostic(
@@ -13406,6 +13409,7 @@ fn call_codex_app_server_rate_limits_for_home(
     } else {
         "initialize"
     };
+    let details_answered = detail_result.is_some();
     let (Some(account), Some((rate_limits, response_completed_at)), true) = (
         account_result,
         detail_result.or(rate_limits_result),
@@ -13435,6 +13439,7 @@ fn call_codex_app_server_rate_limits_for_home(
         credential_read_failed,
         response_completed_at,
         details_requested: detail_requested,
+        details_answered,
     })
 }
 
@@ -19811,6 +19816,7 @@ for line in sys.stdin:
             credential_read_failed: false,
             response_completed_at: Some(completed_at.clone()),
             details_requested: true,
+            details_answered: true,
         });
         assert_eq!(
             probe.response_completed_at.as_deref(),
@@ -27321,6 +27327,7 @@ for line in sys.stdin:
             credential_read_failed: false,
             response_completed_at: Some("2026-10-04T19:00:00Z".to_string()),
             details_requested: true,
+            details_answered: true,
         };
         let probe = codex_usage_probe_from_app_server_observation(observation);
         assert_eq!(probe.quota_windows.len(), 1);

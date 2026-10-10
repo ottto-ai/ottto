@@ -56,7 +56,9 @@ retry.
 
 At most one detailed read is sent per session. A failed detailed read is
 retried after 15 minutes, not on every poll; a count with no cached list is
-still read at once. A whole session that fails before any reading (spawn error,
+still read at once. A detailed read that never answered (error, timeout, output
+bound, unsent) is a failure even for an account whose answers carry no reset
+section at all; only an answered one without a reset section counts as done. A whole session that fails before any reading (spawn error,
 JSON-RPC error, timeout) counts as a failed detailed read for the account last
 validated at that Codex home: the next 5-minute routine read still runs, but the
 hourly detailed read waits 15 minutes. A home that was never validated records
