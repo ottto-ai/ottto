@@ -4667,6 +4667,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
                 identity_unhealthy_roots,
                 crate::snapshots::claude_request_identity::desktop_census(index),
             )
+            .with_status_coverage(crate::claude_status_coverage::snapshot())
         });
     let mut disposition = crate::snapshots::apply_claude_reported_usage_with_identity(
         &mut scan_result.snapshots,

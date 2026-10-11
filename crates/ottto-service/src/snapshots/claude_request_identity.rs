@@ -43,6 +43,15 @@ pub(crate) const fn capture_enabled() -> bool {
     EMISSION_ENABLED || cfg!(test)
 }
 
+/// `transcript_email` (and its status-coverage feed) needs its own review and
+/// receiver acceptance on top of contract-5 emission. Flipping this is a
+/// separate, parent-owned change.
+pub(crate) const TRANSCRIPT_EMAIL_ENABLED: bool = false;
+
+pub(crate) const fn transcript_email_enabled() -> bool {
+    (EMISSION_ENABLED && TRANSCRIPT_EMAIL_ENABLED) || cfg!(test)
+}
+
 pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
 pub(crate) const MAX_AUTHORITY_KEYS: usize = 16;
 pub(crate) const MAX_PARTS_PER_ROW: usize = MAX_AUTHORITY_KEYS + 1;
@@ -59,6 +68,7 @@ pub(crate) const TELEMETRY: &str = "telemetry";
 pub(crate) const TELEMETRY_LOGIN: &str = "telemetry_login";
 pub(crate) const TRANSCRIPT_SOLE_LOGIN: &str = "transcript_sole_login";
 pub(crate) const TRANSCRIPT_ORG: &str = "transcript_org";
+pub(crate) const TRANSCRIPT_EMAIL: &str = "transcript_email";
 
 /// (login, org, full basis). Derived order is the contract order: absent before
 /// present for login and org, then the basis token bytewise.
@@ -862,6 +872,13 @@ pub(crate) struct OrgMarkers {
     overflowed: bool,
     context_digest: Option<String>,
     context_changed: bool,
+    /// Response positions of the first non-blank `session_context` email and
+    /// of the first later `session_context` naming a different one.
+    context_position: Option<u64>,
+    context_flip_position: Option<u64>,
+    /// Status-coverage key of the folder holding this file, bound when the
+    /// item is built and only for a file with a recorded email.
+    home: Option<crate::claude_status_coverage::HomeKey>,
 }
 
 /// Field check on an already-decoded, owned (non-inherited) Claude line.
@@ -887,8 +904,14 @@ pub(crate) fn note_marker_line(
             let digest = format!("{:x}", sha2::Sha256::digest(text.as_bytes()));
             let state = markers.get_or_insert_with(Box::default);
             if state.context_digest.as_deref() != Some(digest.as_str()) {
+                if state.context_digest.is_some() && state.context_flip_position.is_none() {
+                    state.context_flip_position = Some(response_position);
+                }
                 state.context_changed = state.context_digest.is_some() || !state.entries.is_empty();
                 state.context_digest = Some(digest);
+            }
+            if !text.is_empty() && state.context_position.is_none() {
+                state.context_position = Some(response_position);
             }
         }
         Some("credential_org") => {
@@ -935,6 +958,26 @@ pub(crate) enum MarkerVerdict<'m> {
 }
 
 impl OrgMarkers {
+    /// Binds the registered-folder key once the item's path is known.
+    pub(crate) fn bind_home(&mut self, transcript: &std::path::Path) {
+        if self.context_position.is_some() {
+            self.home = crate::claude_status_coverage::transcript_home_key(transcript);
+        }
+    }
+
+    /// The folder key when one unchanged email precedes the response with
+    /// `sequence` (line order; an email switch at or before it disqualifies).
+    pub(crate) fn email_home(
+        &self,
+        sequence: u64,
+    ) -> Option<&crate::claude_status_coverage::HomeKey> {
+        let precedes = self.context_position.is_some_and(|at| at <= sequence)
+            && self.context_flip_position.map_or(true, |at| at > sequence);
+        (precedes && !self.overflowed)
+            .then_some(self.home.as_ref())
+            .flatten()
+    }
+
     /// The marker governing the response with `sequence`, by line order only.
     pub(crate) fn verdict(&self, sequence: u64, desktop: bool) -> MarkerVerdict<'_> {
         if self.overflowed {
@@ -985,6 +1028,8 @@ pub(crate) struct ScanEvidence<'a> {
     pub(crate) memberships: BTreeMap<String, BTreeSet<String>>,
     /// Desktop store logins per org, present only under a valid census witness.
     pub(crate) desktop_census: Option<DesktopCensus>,
+    /// This scan's copy of the local status-coverage history.
+    status_coverage: Option<crate::claude_status_coverage::Ledger>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1045,6 +1090,31 @@ impl<'a> ScanEvidence<'a> {
             }
         }
         evidence
+    }
+
+    /// Adds this scan's status-coverage copy: the `transcript_email` window
+    /// check, and each qualified status-pass (login, org) pairing as org
+    /// membership (plan §2a.12(b)). `None` (feed off or failed) adds nothing.
+    pub(crate) fn with_status_coverage(
+        mut self,
+        coverage: Option<crate::claude_status_coverage::Ledger>,
+    ) -> Self {
+        if let Some(coverage) = &coverage {
+            for (login, org) in coverage.pairings() {
+                if !self
+                    .memberships
+                    .get(login)
+                    .is_some_and(|orgs| orgs.contains(org))
+                {
+                    self.memberships
+                        .entry(login.to_string())
+                        .or_default()
+                        .insert(org.to_string());
+                }
+            }
+        }
+        self.status_coverage = coverage;
+        self
     }
 
     /// Test-only stand-in for the unruled current-writer witness.
@@ -1123,6 +1193,9 @@ pub(crate) struct RequestFacts<'a> {
     pub(crate) marker: MarkerVerdict<'a>,
     pub(crate) desktop: bool,
     pub(crate) scan_unix_seconds: Option<u64>,
+    /// Registered-folder key when an unchanged email precedes this request.
+    pub(crate) email_home: Option<&'a crate::claude_status_coverage::HomeKey>,
+    pub(crate) session_start_unix_seconds: Option<u64>,
 }
 
 impl RequestFacts<'_> {
@@ -1325,6 +1398,13 @@ fn transcript_identity<'k>(
         .and_then(|census| census.logins_by_org.get(org))
         .filter(|logins| logins.len() == 1)
         .and_then(|logins| logins.first());
+    if let Some(login) = email_login(evidence, facts, org) {
+        return Some(IdentityRef::Tagged(KeyRef {
+            login: Some(login),
+            org: Some(org),
+            basis: TRANSCRIPT_EMAIL,
+        }));
+    }
     Some(IdentityRef::Tagged(match sole_login {
         Some(login) => KeyRef {
             login: Some(login),
@@ -1337,6 +1417,28 @@ fn transcript_identity<'k>(
             basis: TRANSCRIPT_ORG,
         },
     }))
+}
+
+/// `transcript_email`: terminal/SDK only, in a registered folder whose status
+/// coverage holds one login, under the trusted marker's org, continuously over
+/// [session start − 300 s, request]. Anything less leaves the request on the
+/// org-only basis; the status history is never filled in or extended here.
+fn email_login<'k>(
+    evidence: &'k ScanEvidence<'_>,
+    facts: &RequestFacts<'k>,
+    org: &str,
+) -> Option<&'k str> {
+    if facts.desktop || !transcript_email_enabled() {
+        return None;
+    }
+    let (login, covered_org) = evidence.status_coverage.as_ref()?.covering(
+        facts.email_home?,
+        facts
+            .session_start_unix_seconds?
+            .checked_sub(crate::claude_status_coverage::SESSION_LEAD_SECONDS)?,
+        facts.terminal_unix_seconds?,
+    )?;
+    (covered_org == org).then_some(login)
 }
 
 // --- Desktop census freshness witness ---------------------------------------
@@ -1446,6 +1548,7 @@ pub(crate) struct RequestSink<'s, 'a> {
     root: String,
     desktop: bool,
     scan_unix_seconds: Option<u64>,
+    session_start_unix_seconds: Option<u64>,
     grouping: Grouping,
 }
 
@@ -1465,6 +1568,10 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                 .and_then(|origin| origin.entrypoint.as_deref())
                 == Some("claude-desktop"),
             scan_unix_seconds: rfc3339_unix_seconds(&item.collected_at),
+            session_start_unix_seconds: item
+                .source_started_at
+                .as_deref()
+                .and_then(rfc3339_unix_seconds),
             grouping: Grouping::new(max_groups),
         })
     }
@@ -1493,6 +1600,11 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             },
             desktop: self.desktop,
             scan_unix_seconds: self.scan_unix_seconds,
+            email_home: match (item.claude_org_markers.as_deref(), sequence) {
+                (Some(markers), Some(sequence)) => markers.email_home(sequence),
+                _ => None,
+            },
+            session_start_unix_seconds: self.session_start_unix_seconds,
         };
         let identity = classify_ref(self.evidence, &facts);
         self.grouping.add(
@@ -1660,6 +1772,6 @@ fn tag_item(
     Some(tagged)
 }
 
-crate::heap_layout_bound::fields!(OrgMarkers; entries, overflowed, context_digest, context_changed);
+crate::heap_layout_bound::fields!(OrgMarkers; entries, overflowed, context_digest, context_changed, context_position, context_flip_position, home);
 crate::heap_layout_bound::fields!(OrgMarker; position, org, terminal_trusted);
 crate::heap_layout_bound::fields!(DesktopCensusWitness; completed_at_unix_seconds, process_id, inventory);

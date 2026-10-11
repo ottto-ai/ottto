@@ -1,3 +1,4 @@
+use crate::claude_status_coverage::Observation as CoverageObservation;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 #[cfg(test)]
 use ottto_core::claude_account_identifier_hash;
@@ -3981,12 +3982,19 @@ fn collect_claude_status_snapshots(
         slot_states.insert(descriptor.slot_id, capacity_exceeded_status(&captured_at));
     }
     let previous_states = read_persisted_claude_slot_collection_state();
+    let coverage_dirs = crate::claude_status_coverage::enabled().then(|| {
+        custom_descriptors
+            .iter()
+            .filter_map(|descriptor| descriptor.config_dir.clone())
+            .collect::<Vec<_>>()
+    });
     for descriptor in custom_descriptors {
         match crate::claude_browser_auth::collection_suppression(&descriptor.slot_id) {
             Some(
                 crate::claude_browser_auth::ClaudeCollectionSuppression::HideProvisionalTarget,
             ) => {
                 claude_oauth_end_slot_run(&descriptor.slot_id);
+                note_claude_status_coverage(&descriptor, &captured_at, CoverageObservation::Unavailable);
                 continue;
             }
             Some(
@@ -3994,6 +4002,7 @@ fn collect_claude_status_snapshots(
                 | crate::claude_browser_auth::ClaudeCollectionSuppression::PreserveWhileStateUnavailable,
             ) => {
                 claude_oauth_end_slot_run(&descriptor.slot_id);
+                note_claude_status_coverage(&descriptor, &captured_at, CoverageObservation::Unavailable);
                 slot_states.insert(descriptor.slot_id.clone(), descriptor.collection.clone());
                 continue;
             }
@@ -4007,6 +4016,11 @@ fn collect_claude_status_snapshots(
                 Ok(expected) => expected,
                 Err(status) => {
                     claude_oauth_end_slot_run(&descriptor.slot_id);
+                    note_claude_status_coverage(
+                        &descriptor,
+                        &captured_at,
+                        CoverageObservation::Unavailable,
+                    );
                     slot_states.insert(descriptor.slot_id, status);
                     continue;
                 }
@@ -4035,6 +4049,11 @@ fn collect_claude_status_snapshots(
         );
         if !upkeep.proceed_with_collection {
             claude_oauth_end_slot_run(&descriptor.slot_id);
+            note_claude_status_coverage(
+                &descriptor,
+                &captured_at,
+                CoverageObservation::Unavailable,
+            );
             let result_observed_at = upkeep.result_observed_at.clone();
             let paused = upkeep.paused_awaiting_claude_refresh;
             let mut status = if paused {
@@ -4063,6 +4082,15 @@ fn collect_claude_status_snapshots(
             Ok(resolved) => resolved,
             Err(failure) => {
                 claude_oauth_end_slot_run(&descriptor.slot_id);
+                note_claude_status_coverage(
+                    &descriptor,
+                    &captured_at,
+                    match failure {
+                        ClaudeSlotProbeFailure::SignedOutByCli
+                        | ClaudeSlotProbeFailure::IdentityUnknown => CoverageObservation::SignedOut,
+                        _ => CoverageObservation::Unavailable,
+                    },
+                );
                 let status = registered_claude_failure_status(
                     &descriptor,
                     failure,
@@ -4082,11 +4110,24 @@ fn collect_claude_status_snapshots(
             &captured_at,
         ) {
             claude_oauth_end_slot_run(&slot_id);
+            note_claude_status_coverage(
+                &descriptor,
+                &captured_at,
+                CoverageObservation::Unavailable,
+            );
             slot_states.insert(slot_id, status);
             continue;
         }
         let account_hash = resolved.account_identifier_hash.clone();
         let organization_hash = resolved.organization_identifier_hash.clone();
+        note_claude_status_coverage(
+            &descriptor,
+            &captured_at,
+            CoverageObservation::Qualified {
+                login: &account_hash,
+                org: &organization_hash,
+            },
+        );
         let access_token = resolved.credential.access_token.take();
         let credential_available = access_token.is_some();
         let outcome = collect_claude_oauth_usage_with_credential(
@@ -4129,6 +4170,9 @@ fn collect_claude_status_snapshots(
                 slot_states.insert(slot_id, state);
             }
         }
+    }
+    if let Some(dirs) = &coverage_dirs {
+        crate::claude_status_coverage::retain_registered(dirs.iter().map(String::as_str));
     }
     let approvals = claude_slot_approvals();
     for (slot_id, status) in &mut slot_states {
@@ -12019,6 +12063,24 @@ fn claude_oauth_account_identifier_hash_for(account: &ClaudeCliOauthAccount) -> 
     )
 }
 
+/// Status-coverage feed (plan §2a.9): this slot's already-qualified hashes, or
+/// that the pass has none. Returns nothing, so the feed cannot change status.
+fn note_claude_status_coverage(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+    captured_at: &str,
+    observation: CoverageObservation<'_>,
+) {
+    if crate::claude_status_coverage::enabled() {
+        crate::claude_status_coverage::observe(
+            &descriptor.slot_id,
+            descriptor.config_dir.as_deref(),
+            &home_dir().join(".claude"),
+            captured_at,
+            observation,
+        );
+    }
+}
+
 /// Multi-account collection never assigns full meters through organization or
 /// email fallback. Both provider UUIDs must be present and independently
 /// hashed before a window or credit can leave the machine.
@@ -17172,6 +17234,8 @@ pub(crate) fn claude_session_registrations() -> crate::claude_session_registrati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod status_coverage_feed;
 
     /// The account resolution `collect_claude_status` performs, for tests that
     /// exercise the OAuth path directly.

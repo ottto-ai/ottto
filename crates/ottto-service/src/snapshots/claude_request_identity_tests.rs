@@ -882,6 +882,8 @@ fn facts<'a>(request_id: &'a str, at: Option<u64>, marker: MarkerVerdict<'a>) ->
         marker,
         desktop: false,
         scan_unix_seconds: Some(1_000_000),
+        email_home: None,
+        session_start_unix_seconds: None,
     }
 }
 
@@ -2080,5 +2082,298 @@ fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
     parts[0].input_tokens += 1;
     parts[1].input_tokens -= 1;
     assert!(bind_owner_a(&mut items, &capability, true, "machine").0, "parts changed");
+    let _ = fs::remove_dir_all(dir);
+}
+
+// --- transcript_email over the status-coverage feed --------------------------
+
+/// Qualified status observations of `(login, org)` every cadence over
+/// `[from, to]` for the registered folder `home`.
+fn coverage(
+    home: crate::claude_status_coverage::HomeKey,
+    login: &str,
+    org: &str,
+    from: u64,
+    to: u64,
+) -> crate::claude_status_coverage::Ledger {
+    let mut ledger = crate::claude_status_coverage::Ledger::default();
+    let mut at = from;
+    while at <= to {
+        ledger.observe_at(
+            home,
+            [1; 32],
+            Some(at),
+            crate::claude_status_coverage::Observation::Qualified { login, org },
+        );
+        at += crate::claude_status_coverage::CADENCE_SECONDS;
+    }
+    ledger
+}
+
+// Released builds keep `transcript_email` and its feed compiled out.
+const _: () = assert!(!identity::TRANSCRIPT_EMAIL_ENABLED && !identity::EMISSION_ENABLED);
+
+#[test]
+fn classify_transcript_email_needs_registered_coverage_of_the_whole_window() {
+    let org_e = "e".repeat(64);
+    let org_f = "f".repeat(64);
+    let home = crate::claude_status_coverage::home_key(Path::new("/synthetic/slot"));
+    let other = crate::claude_status_coverage::home_key(Path::new("/synthetic/other"));
+    let mut with_org = complete_api_row(ROOT, "req_org", 1, 10, 1, 0);
+    with_org.request_identity = Some(org_identity(&"d".repeat(64)));
+    let login_only = complete_api_row(ROOT, "req_login", 2, 10, 1, 0);
+    let (api, trace) = reports(
+        vec![signed(with_org), signed(login_only)],
+        vec![
+            complete_trace_row(ROOT, "req_org", ""),
+            complete_trace_row(ROOT, "req_login", ""),
+        ],
+    );
+    // Covered continuously over [998_000, 1_000_100] by LOGIN_A under org e.
+    let ledger = coverage(home, LOGIN_A, &org_e, 998_000, 1_000_100);
+    let covered = ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
+        .with_status_coverage(Some(ledger.clone()));
+    let request = |start: Option<u64>, at: u64, home: Option<&'static _>, org: &'static str| {
+        let mut request = facts("req_old", Some(at), MarkerVerdict::Trusted(org));
+        request.email_home = home;
+        request.session_start_unix_seconds = start;
+        request
+    };
+    let home: &'static _ = Box::leak(Box::new(home));
+    let other: &'static _ = Box::leak(Box::new(other));
+    let org_e: &'static str = org_e.leak();
+    let org_f: &'static str = org_f.leak();
+    let email = RequestIdentity::Tagged(AuthorityKey {
+        login: Some(LOGIN_A.to_string()),
+        org: Some(org_e.to_string()),
+        basis: identity::TRANSCRIPT_EMAIL,
+    });
+    let org_only = |org: &str| {
+        RequestIdentity::Tagged(AuthorityKey {
+            login: None,
+            org: Some(org.to_string()),
+            basis: identity::TRANSCRIPT_ORG,
+        })
+    };
+    // [session start − 300 s, request] inside one same-login segment.
+    let start = 998_300;
+    assert_eq!(
+        identity::classify(&covered, &request(Some(start), 999_000, Some(home), org_e)),
+        email
+    );
+    assert_eq!(
+        identity::classify(
+            &covered,
+            &request(Some(start), 1_000_100, Some(home), org_e)
+        ),
+        email
+    );
+    for (case, facts, expected) in [
+        (
+            "coverage starts after session start - 300 s",
+            request(Some(start - 1), 999_000, Some(home), org_e),
+            org_only(org_e),
+        ),
+        (
+            "request after the last observation (never extended)",
+            request(Some(start), 1_000_101, Some(home), org_e),
+            org_only(org_e),
+        ),
+        (
+            "no recorded email before the request",
+            request(Some(start), 999_000, None, org_e),
+            org_only(org_e),
+        ),
+        (
+            "another folder's coverage",
+            request(Some(start), 999_000, Some(other), org_e),
+            org_only(org_e),
+        ),
+        (
+            "marker org differs from the covered org",
+            request(Some(start), 999_000, Some(home), org_f),
+            org_only(org_f),
+        ),
+        (
+            "unknown session start",
+            request(None, 999_000, Some(home), org_e),
+            org_only(org_e),
+        ),
+    ] {
+        assert_eq!(identity::classify(&covered, &facts), expected, "{case}");
+    }
+    // Desktop never uses the email basis.
+    let mut desktop = request(Some(start), 999_000, Some(home), org_e);
+    desktop.desktop = true;
+    assert_eq!(identity::classify(&covered, &desktop), org_only(org_e));
+    // A carried clock refuses rather than attributing.
+    let mut carried = request(Some(start), 999_000, Some(home), org_e);
+    carried.event_clock_complete = false;
+    assert_eq!(
+        identity::classify(&covered, &carried),
+        RequestIdentity::Refused(Refusal::BadClock)
+    );
+    // Feed off or failed: nothing qualifies.
+    let off = ScanEvidence::new(&api, &trace, BTreeSet::new(), None).with_status_coverage(None);
+    assert_eq!(
+        identity::classify(&off, &request(Some(start), 999_000, Some(home), org_e)),
+        org_only(org_e)
+    );
+    // A gap of more than two cadences inside the window disqualifies.
+    let mut gapped = coverage(*home, LOGIN_A, org_e, 998_000, 998_600);
+    for at in [999_201, 999_500, 999_800, 1_000_100] {
+        gapped.observe_at(
+            *home,
+            [1; 32],
+            Some(at),
+            crate::claude_status_coverage::Observation::Qualified {
+                login: LOGIN_A,
+                org: org_e,
+            },
+        );
+    }
+    let gapped = ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
+        .with_status_coverage(Some(gapped));
+    assert_eq!(
+        identity::classify(&gapped, &request(Some(start), 999_000, Some(home), org_e)),
+        org_only(org_e)
+    );
+    // Telemetry still wins over the email basis.
+    let mut telemetry = request(Some(start), 999_000, Some(home), org_e);
+    telemetry.request_id = "req_org";
+    assert_eq!(
+        identity::classify(&covered, &telemetry),
+        RequestIdentity::Tagged(AuthorityKey {
+            login: Some(OWNER_A.to_string()),
+            org: Some("d".repeat(64)),
+            basis: identity::TELEMETRY,
+        })
+    );
+}
+
+#[test]
+fn status_pairings_establish_marker_org_membership_for_the_telemetry_login() {
+    let org_e = "e".repeat(64);
+    let home = crate::claude_status_coverage::home_key(Path::new("/synthetic/slot"));
+    let login_only = complete_api_row(ROOT, "req_login", 2, 10, 1, 0);
+    let (api, trace) = reports(
+        vec![signed(login_only)],
+        vec![complete_trace_row(ROOT, "req_login", "")],
+    );
+    let request = facts("req_login", Some(999_000), MarkerVerdict::Trusted(&org_e));
+    let tagged = |org: Option<&str>| {
+        RequestIdentity::Tagged(AuthorityKey {
+            login: Some(OWNER_A.to_string()),
+            org: org.map(str::to_string),
+            basis: identity::TELEMETRY_LOGIN,
+        })
+    };
+    // Without existing evidence the marker org is not established (§2a.12).
+    let plain = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    assert_eq!(identity::classify(&plain, &request), tagged(None));
+    // The status pass's qualified (login, org) pairing establishes it (§2a.12(b)),
+    // even from a single observation: membership is not a coverage claim.
+    let paired = ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
+        .with_status_coverage(Some(coverage(home, OWNER_A, &org_e, 1, 1)));
+    assert_eq!(identity::classify(&paired, &request), tagged(Some(&org_e)));
+    // Another login's pairing establishes nothing for this one.
+    let foreign = ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
+        .with_status_coverage(Some(coverage(home, LOGIN_A, &org_e, 1, 1)));
+    assert_eq!(identity::classify(&foreign, &request), tagged(None));
+}
+
+#[test]
+fn parser_binds_the_email_folder_and_tags_transcript_email_end_to_end() {
+    let dir = temp_dir("claude-request-identity-email");
+    let slot = dir.join("slot");
+    let session = |email_first: bool, flip: bool| {
+        let mut lines = Vec::new();
+        let context_line = json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment",
+            "sessionId": ROOT, "attachment": {"type": "session_context",
+            "context": {"userEmail": "person@example.invalid"}}});
+        if email_first {
+            lines.push(context_line.clone());
+        }
+        if flip {
+            lines.push(json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment",
+                "sessionId": ROOT, "attachment": {"type": "session_context",
+                "context": {"userEmail": "other@example.invalid"}}}));
+        }
+        lines.push(json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
+            "attachment": {"type": "credential_org", "organizationUuid": ORG_1}}));
+        lines.push(json!({"timestamp": "2026-08-02T07:00:01Z", "type": "assistant", "sessionId": ROOT,
+            "requestId": "req_1", "message": {"id": "m1", "model": "claude-haiku-4-5",
+            "usage": {"input_tokens": 10, "output_tokens": 1}}}));
+        if !email_first {
+            lines.push(context_line);
+        }
+        lines
+    };
+    let parse = |folder: &Path, lines: &[Value]| {
+        let project = folder.join("projects").join("-synthetic-repo");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join(format!("{ROOT}.jsonl"));
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(|line| line.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "fp".into()).unwrap()
+    };
+    let home = crate::claude_status_coverage::home_key(&slot);
+    let email_home = |items: &[SnapshotItem]| {
+        let item = &items[0];
+        let sequence = item.claude_usage_occurrences["req_1"].sequence;
+        item.claude_org_markers
+            .as_deref()
+            .and_then(|markers| markers.email_home(sequence))
+            .copied()
+    };
+    let items = parse(&slot, &session(true, false));
+    assert_eq!(email_home(&items), Some(home));
+    let wire = serde_json::to_string(&items[0]).unwrap();
+    assert!(!wire.contains("example.invalid"), "no email on the item");
+    assert_eq!(email_home(&parse(&slot, &session(false, false))), None, "email after the request");
+    assert_eq!(email_home(&parse(&slot, &session(true, true))), None, "email switched before it");
+
+    // End to end: no telemetry, a trusted marker, the recorded email and
+    // continuous coverage for the registered folder.
+    let mut items = parse(&slot, &session(true, false));
+    let request_at = rfc3339_unix_seconds("2026-08-02T07:00:01Z").unwrap();
+    let start = rfc3339_unix_seconds(items[0].source_started_at.as_deref().unwrap()).unwrap();
+    let (api, trace) = reports(Vec::new(), Vec::new());
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None).with_status_coverage(
+        Some(coverage(home, LOGIN_A, &org_hash(ORG_1), start - 600, request_at + 300)),
+    );
+    let outcome = identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+    assert_eq!(outcome.sent, 1);
+    let item = &items[0];
+    assert_eq!(item.provenance.collector, identity::COLLECTOR);
+    assert_eq!(item.request_evidence.len(), 1);
+    assert_eq!(item.request_evidence[0].identity_basis, identity::TRANSCRIPT_EMAIL);
+    let wire = serde_json::to_value(item).unwrap();
+    assert_eq!(
+        wire["usage_buckets"][0]["model_usage"][0]["account_identifier_hash"],
+        json!(LOGIN_A)
+    );
+    // Only contract-5 fields carry it: nothing about the feed reaches the wire.
+    let text = wire.to_string();
+    let home_hex = home.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    for absent in [
+        "status_coverage",
+        "example.invalid",
+        home_hex.as_str(),
+        slot.to_str().unwrap(),
+    ] {
+        assert!(!text.contains(absent), "{absent}");
+    }
+
+    // The same request in an unregistered (loose) folder stays org-only.
+    let mut loose = parse(&dir.join("loose"), &session(true, false));
+    identity::apply_scan(&mut loose, &evidence, BTreeMap::new());
+    assert_eq!(loose[0].request_evidence[0].identity_basis, identity::TRANSCRIPT_ORG);
     let _ = fs::remove_dir_all(dir);
 }
