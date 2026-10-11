@@ -908,17 +908,20 @@ impl<'a> ScanEvidence<'a> {
                     .entry((root.as_str(), row.request_id.as_str()))
                     .and_modify(|entry| *entry = None)
                     .or_insert(Some(row));
-                if let (Some(login), Some(org)) = (
-                    row.account_identifier_hash.as_deref(),
-                    row.request_identity
-                        .as_ref()
-                        .filter(|identity| {
-                            identity.disposition == ClaudeIdentityDisposition::Complete
-                        })
-                        .and_then(|identity| organization_hash(identity).ok().flatten()),
-                ) {
-                    evidence.memberships.insert((login.to_string(), org));
-                }
+            }
+        }
+        // Only unique rows that pass the same integrity checks `classify`
+        // applies may establish a (login, org) pair.
+        for (&(root, _), row) in &evidence.requests {
+            let Some(row) = row else { continue };
+            if let (Some(login), Some(org)) = (
+                valid_login(row, root),
+                row.request_identity
+                    .as_ref()
+                    .filter(|identity| identity.disposition == ClaudeIdentityDisposition::Complete)
+                    .and_then(|identity| organization_hash(identity).ok().flatten()),
+            ) {
+                evidence.memberships.insert((login.to_string(), org));
             }
         }
         for (root, rows) in &trace.evidence {
@@ -948,6 +951,26 @@ fn organization_hash(identity: &ClaudeRequestIdentityEvidence) -> Result<Option<
             .map(Some)
             .ok_or(()),
     }
+}
+
+/// The row's login when the row itself is intact: D1's capture, count,
+/// fingerprint and account-origin checks. Ownership is checked separately.
+fn valid_login<'a>(row: &'a ClaudeLocalOtelEvidence, root: &str) -> Option<&'a str> {
+    let login = row
+        .account_identifier_hash
+        .as_deref()
+        .filter(|hash| hash_is_valid(hash))?;
+    (row.session_id == root
+        && row.capture_revision == "claude_api_request:v2"
+        && row.request_count == 1
+        && row.account_identity_checked
+        && super::claude_api_evidence_fingerprint_is_valid(row)
+        && row.request_identity.as_ref().map_or(true, |identity| {
+            identity.identity_hash_scheme == "provider-sha256:v1"
+                && identity.account.disposition == ClaudeIdentityDisposition::Complete
+                && account_origin_matches(&identity.account, login)
+        }))
+    .then_some(login)
 }
 
 /// D1's account check: each recorded origin must carry exactly this login.
@@ -1011,28 +1034,19 @@ pub(crate) fn classify(evidence: &ScanEvidence<'_>, facts: &RequestFacts<'_>) ->
         Some(None) => return Refused(Refusal::ConflictingDuplicate),
         Some(Some(row)) => *row,
         None if facts.telemetry_pending(evidence) => return Refused(Refusal::Pending),
-        None => return transcript_identity(evidence, facts).unwrap_or(Missing),
+        None => {
+            return match transcript_identity(evidence, facts) {
+                // A carried or missing clock cannot establish attribution.
+                Some(_) if facts.terminal_unix_seconds.is_none() || !facts.event_clock_complete => {
+                    Refused(Refusal::BadClock)
+                }
+                identity => identity.unwrap_or(Missing),
+            };
+        }
     };
-    let Some(login) = row
-        .account_identifier_hash
-        .as_deref()
-        .filter(|hash| hash_is_valid(hash))
-    else {
+    let Some(login) = valid_login(row, facts.root) else {
         return Refused(Refusal::InvalidEvidence);
     };
-    if row.session_id != facts.root
-        || row.capture_revision != "claude_api_request:v2"
-        || row.request_count != 1
-        || !row.account_identity_checked
-        || !super::claude_api_evidence_fingerprint_is_valid(row)
-        || row.request_identity.as_ref().is_some_and(|identity| {
-            identity.identity_hash_scheme != "provider-sha256:v1"
-                || identity.account.disposition != ClaudeIdentityDisposition::Complete
-                || !account_origin_matches(&identity.account, login)
-        })
-    {
-        return Refused(Refusal::InvalidEvidence);
-    }
     match evidence.owners.get(&(facts.root, facts.request_id)) {
         Some(None) => return Refused(Refusal::ConflictingDuplicate),
         None if facts.telemetry_pending(evidence) => return Refused(Refusal::Pending),

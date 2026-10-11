@@ -20691,6 +20691,21 @@ impl ScanIndex {
                             // Eligibility is scan-local and exact-body-bound;
                             // neither marker-only imports nor restart restore it.
                         }
+                        (Some(owner), _)
+                            if mixed.permits_request_identity(item)
+                                && item
+                                    .session_account_evidence
+                                    .as_ref()
+                                    .and_then(|evidence| {
+                                        evidence.account_identifier_hash.as_deref()
+                                    })
+                                    .map_or(true, |creator| {
+                                        creator == owner.account_identifier_hash
+                                    }) =>
+                        {
+                            // Contract 5 carries per-request identity beside an
+                            // unchanged owner; only a contradicting creator defers.
+                        }
                         (Some(_), _) => {
                             deferred.insert(session_id.clone());
                         }

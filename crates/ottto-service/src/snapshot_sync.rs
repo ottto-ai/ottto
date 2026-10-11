@@ -4574,16 +4574,28 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         .into_iter()
         .collect::<Vec<_>>();
     stats.candidate_root_count = usage_roots.len();
+    let mut identity_unhealthy_roots = BTreeSet::new();
     let usage_roots = usage_roots
         .into_iter()
         .filter(|session_id| {
-            !crate::claude_local_otel::claude_effort_sidecar_fingerprint(support_dir, session_id)
-                .is_empty()
+            let paired = !crate::claude_local_otel::claude_effort_sidecar_fingerprint(
+                support_dir,
+                session_id,
+            )
+            .is_empty()
                 && !crate::claude_local_otel::claude_trace_ownership_sidecar_fingerprint(
                     support_dir,
                     session_id,
                 )
-                .is_empty()
+                .is_empty();
+            // Contract 5 must tell absent evidence from failed evidence.
+            if !paired
+                && crate::snapshots::claude_request_identity::EMISSION_ENABLED
+                && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
+            {
+                identity_unhealthy_roots.insert(session_id.clone());
+            }
+            paired
         })
         .collect::<Vec<_>>();
     stats.paired_sidecar_root_count = usage_roots.len();
@@ -4594,7 +4606,6 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     // that family unproven, not suppress an unrelated healthy family.
     let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
-    let mut identity_unhealthy_roots = BTreeSet::new();
     let mut identity_healthy_roots = BTreeSet::new();
     for root_session_id in usage_roots {
         let mut api = api_read.take_strict_report(support_dir, &root_session_id);
@@ -4694,6 +4705,13 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         }
     }
     disposition.mixed_uploads = qualification.mixed;
+    if crate::snapshots::claude_request_identity::EMISSION_ENABLED {
+        // Request identity is not the session owner: admit only this scan's
+        // exact contract-5 bodies, never rewriting a retained owner.
+        for item in &scan_result.snapshots {
+            disposition.mixed_uploads.admit_request_identity(item);
+        }
+    }
     stats.identity_complete_session_count = scan_result
         .snapshots
         .iter()
