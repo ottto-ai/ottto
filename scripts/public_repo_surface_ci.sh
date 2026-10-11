@@ -175,7 +175,7 @@ run_step "test macOS release gate" bash scripts/test_macos_release_gate.sh
 run_step "test macOS installer channel policy" bash scripts/test_macos_installer_channel_policy.sh
 run_step "test macOS package URL scheme policy" bash scripts/test_macos_package_url_scheme_policy.sh
 run_step "test macOS package root resolution" bash scripts/test_macos_package_root_resolution.sh
-run_step "test macOS Sparkle bundle version" bash scripts/test_macos_sparkle_bundle_version.sh
+run_step "test macOS Sparkle bundle version and launch policy" bash scripts/test_macos_sparkle_bundle_version.sh
 run_step "test macOS launch smoke" bash scripts/test_macos_launch_smoke.sh
 run_step "test macOS stable release workflow policy" bash scripts/test_macos_stable_release_workflow.sh
 run_step "test macOS attestation binder" bash scripts/test_macos_attestation_bind.sh

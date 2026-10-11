@@ -3,6 +3,7 @@ pub mod adaptive_collector;
 pub mod agent_configs;
 pub mod agent_status;
 pub mod agent_status_refresh;
+mod app_bundle_version;
 pub mod backfill;
 pub mod canonical_json;
 pub mod claude_browser_auth;
@@ -1626,7 +1627,10 @@ impl LocalDaemon {
         let mut versions = BTreeMap::new();
         versions.insert(
             "app_version".to_string(),
-            RedactedValue::String("unknown".to_string()),
+            RedactedValue::String(app_bundle_version::diagnostics_app_version(
+                current_exe.as_deref(),
+                home.as_deref(),
+            )),
         );
         versions.insert(
             "cli_version".to_string(),

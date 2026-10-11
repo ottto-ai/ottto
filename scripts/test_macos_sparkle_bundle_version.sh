@@ -190,6 +190,17 @@ if [[ "$bundle_version" != "0.1.92fc2" ]]; then
   echo "Packaged Sparkle bundle version is not monotonic: $bundle_version" >&2
   exit 1
 fi
+# Launch Services applies LSMultipleInstancesProhibited across user sessions,
+# which blocks a second macOS user from opening the app. One process per user
+# is the app's own responsibility.
+if plutil -extract LSMultipleInstancesProhibited raw -o - "$info_plist" >/dev/null 2>&1; then
+  echo "Packaged Info.plist must not prohibit Ottto in other macOS user sessions" >&2
+  exit 1
+fi
+if [[ "$(plutil -extract CFBundleIdentifier raw -o - "$info_plist")" != "net.ottto.Companion" ]]; then
+  echo "Packaged bundle identifier changed" >&2
+  exit 1
+fi
 if ! jq -e '
   .quality_gates.packaged_app_launch.bundle_short_version == "0.1.92-rc2"
   and .quality_gates.packaged_app_launch.bundle_version == "0.1.92fc2"

@@ -43,6 +43,8 @@ mod sampled_jsonl;
 pub(crate) mod sampled_scan;
 #[cfg(test)]
 mod transcript_acquisition_tests;
+#[cfg(test)]
+mod usage_occurrence_retention_tests;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
 pub(crate) use pi_retry_inputs::PiRetryInputs;
 
@@ -5646,7 +5648,7 @@ fn rebuild_claude_reported_usage(
         }
         let occurrence = item.claude_usage_occurrences.get(&row.request_id);
         let mut selector = occurrence
-            .map(|occurrence| occurrence.selector.clone())
+            .map(|occurrence| SelectorCapture::clone(&occurrence.selector))
             .unwrap_or_default();
         if !row.speed.trim().is_empty() {
             let normalized_speed =
@@ -6820,7 +6822,7 @@ fn row_key_from_model_usage(row: &SnapshotModelUsage) -> RowKey {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct SelectorCapture {
     context: BTreeMap<String, String>,
     sources: BTreeMap<String, String>,
@@ -6904,7 +6906,9 @@ pub(crate) struct ClaudeTranscriptUsageOccurrence {
     sequence: u64,
     usage: UsageTotals,
     model: Option<String>,
-    selector: SelectorCapture,
+    // Shared: a page retains every occurrence until upload, and nearly all of a
+    // session's requests carry an identical selector.
+    selector: Arc<SelectorCapture>,
     reasoning_effort: Option<String>,
     timestamp: Option<String>,
     // Evaluated before response folding can retain a stamped partial. Local only.
@@ -9292,6 +9296,7 @@ impl SnapshotAccumulator {
             .into_values()
             .collect::<Vec<_>>();
         responses.sort_by_key(|response| response.sequence);
+        let mut shared_selectors = BTreeSet::<Arc<SelectorCapture>>::new();
         for response in responses {
             let Some(mut response) = response.resolve() else {
                 self.note_dropped_usage();
@@ -9328,13 +9333,21 @@ impl SnapshotAccumulator {
             }
             if let Some(request_id) = response.request_id.take() {
                 let request_id_was_new = self.claude_usage_request_ids.insert(request_id.clone());
+                let selector = match shared_selectors.get(&response.selector) {
+                    Some(shared) => Arc::clone(shared),
+                    None => {
+                        let shared = Arc::new(response.selector.clone());
+                        shared_selectors.insert(Arc::clone(&shared));
+                        shared
+                    }
+                };
                 let prior_occurrence = self.claude_usage_occurrences.insert(
                     request_id,
                     ClaudeTranscriptUsageOccurrence {
                         sequence: response.sequence,
                         usage: response.usage.clone(),
                         model: response.model.clone(),
-                        selector: response.selector.clone(),
+                        selector,
                         reasoning_effort: response.reasoning_effort.clone(),
                         timestamp: response.terminal_timestamp.clone(),
                         event_clock_complete: response.event_clock_complete,

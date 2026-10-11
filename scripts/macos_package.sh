@@ -324,6 +324,10 @@ fi
 # stale ottto:// handler behind on QA and release-runner machines.
 OTTTO_URL_TYPES_PLIST="$(ottto_macos_url_types_plist "$CHANNEL")"
 
+# Do not declare LSMultipleInstancesProhibited. Launch Services applies it
+# across user sessions, so a second macOS user could not open Ottto while
+# another user had it open. The app enforces one process per user itself, and
+# its service, socket and support files are per user.
 cat > "$APP_CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -352,8 +356,6 @@ cat > "$APP_CONTENTS/Info.plist" <<PLIST
 ${OTTTO_URL_TYPES_PLIST}
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
-  <key>LSMultipleInstancesProhibited</key>
-  <true/>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSPrincipalClass</key>
