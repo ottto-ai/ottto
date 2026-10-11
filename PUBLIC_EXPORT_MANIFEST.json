@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 548,
-  "content_sha256": "28d1f8b8ed8fb0e4b1c9e9d556baca0a724b4c7972764b5a2247fbd350ca9a70",
+  "content_sha256": "62a904d8c4d6257ee6338fc616daec14d5f86afd2691449aade51a343036e1b3",
   "files": [
     {
       "executable": false,
@@ -608,8 +608,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "92a9e91250cadca8ae7b51eb3bc02af87c714b7d2b02d6a5bd551948dc2d9a2a",
-      "size_bytes": 327491
+      "sha256": "651007ca06cb1da8737fa7d06b60981a57d6b9c3611870d53dfa6c4922e0ecf0",
+      "size_bytes": 327538
     },
     {
       "executable": false,
@@ -685,15 +685,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "27981ee5d1cdda14e8b4668e849e92e2d513187007333aee48429a2af387e0b2",
-      "size_bytes": 1421502
+      "sha256": "e370a9575f70e30cdcabe8b33e062eea6cdf38924431e4cdc05aa5fe37221a0b",
+      "size_bytes": 1425477
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/claude_credit_pools.rs",
-      "sha256": "c7a9f2e02754364c9a832e60bf512fd86db0ae838fccf05042eaf05022edfd32",
-      "size_bytes": 142635
+      "sha256": "19d1f85a43d3613011e3b07b43205e4c92992a8956fa3683fd7e2623fbb8878a",
+      "size_bytes": 145868
     },
     {
       "executable": false,
@@ -2470,8 +2470,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-10-claude-credit-pools-cadence.md",
-      "sha256": "cd161ec9de977038155cc66f9a2b9ee4c2598d6779c2aa6004d77ccd26c20f1d",
-      "size_bytes": 13557
+      "sha256": "071e443066e112b8ffeff4b952da9a780ab74f84e3c0f387da6e98322c9ef3d9",
+      "size_bytes": 13890
     },
     {
       "executable": false,
@@ -3839,7 +3839,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-11T21:21:19+00:00",
+  "generated_at": "2026-10-11T22:02:52+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 549,
   "public_roots": [
@@ -3878,5 +3878,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "74bbe3ae76dc7c1d0ce3442b85f344e02ed07458"
+  "source_commit": "fb4e67266a93573108f13f7e1310833d46f9e60c"
 }

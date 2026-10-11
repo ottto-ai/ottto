@@ -5949,7 +5949,7 @@ fn custom_claude_snapshot_from_usage(
 
 const CLAUDE_CACHE_REUSED_MESSAGE: &str =
     "Locally cached quota evidence was reused; no provider check was made.";
-/// Retain a canonical clock only on a bound cache-reuse outcome. Its deadline
+/// Retain a canonical clock only on a bound cache-reuse or rate-limited outcome. Its deadline
 /// was still ahead at the producer's check time; consumers compare it with now.
 fn safe_claude_cache_retry_after(diagnostic: &AgentStatusDiagnostic) -> Option<String> {
     let deadline = diagnostic
@@ -5995,6 +5995,13 @@ fn safe_claude_slot_check_diagnostics(
             "claude_oauth_usage_network_disabled" => "Quota network collection is disabled on this machine.",
             "claude_oauth_usage_collection_in_progress" => "Quota collection is already in progress; no duplicate provider check was made.",
             CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_CODE => CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_MESSAGE,
+            CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE => {
+                if diagnostic.message.contains(" saved-resets read") {
+                    CLAUDE_OAUTH_USAGE_RATE_LIMITED_SAVED_RESETS_MESSAGE
+                } else {
+                    CLAUDE_OAUTH_USAGE_RATE_LIMITED_USAGE_MESSAGE
+                }
+            }
             // Our own typed auth classification; only the HTTP status is kept.
             "claude_oauth_usage_auth_rejected" => {
                 if diagnostic.message.contains(" with HTTP 401 ") {
@@ -6037,7 +6044,11 @@ fn safe_claude_slot_check_diagnostics(
             AgentStatusDiagnostic::source(&diagnostic.code, diagnostic.severity.clone(), message)
                 .with_observed_at(clock)
                 .with_quota_binding(Some(account.to_string()), Some(organization.to_string()));
-        if diagnostic.code == "claude_oauth_usage_cache_reused" && safe.observed_at.is_some() {
+        if matches!(
+            diagnostic.code.as_str(),
+            "claude_oauth_usage_cache_reused" | CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE
+        ) && safe.observed_at.is_some()
+        {
             safe.retry_after = safe_claude_cache_retry_after(diagnostic);
         }
         result.push(safe);
@@ -10104,6 +10115,11 @@ fn collect_claude_oauth_usage_unstamped(
                 mirror_legacy_default,
             );
             diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed with rate limiting; any served readings remain locally cached evidence.", current_unix_seconds()));
+            diagnostics.push(claude_oauth_usage_rate_limited_diagnostic(
+                usage_read,
+                retry_after,
+                now,
+            ));
             if !cache.windows.is_empty()
                 && now.saturating_sub(cache.observed_at_epoch_seconds)
                     <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
@@ -10236,6 +10252,42 @@ const CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_CODE: &str =
     "claude_saved_reset_variant_unrecognized";
 /// Fixed, value-free text: the same words reach the slot status and upload.
 const CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_MESSAGE: &str = "Claude's saved-reset reading had no recognizable saved-reset section; this account uses the plain reading for 24 hours.";
+
+const CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE: &str = "claude_oauth_usage_rate_limited";
+/// Fixed, value-free slot-status and upload text per read; the time is in
+/// `retry_after`.
+const CLAUDE_OAUTH_USAGE_RATE_LIMITED_USAGE_MESSAGE: &str =
+    "Claude asked Ottto to wait before the next usage read; Ottto checks again after the retry time.";
+const CLAUDE_OAUTH_USAGE_RATE_LIMITED_SAVED_RESETS_MESSAGE: &str =
+    "Claude asked Ottto to wait before the next saved-resets read; Ottto checks again after the retry time.";
+
+/// A 429 on the Claude usage read: which read Claude asked Ottto to hold and
+/// until when ("Claude asked Ottto to wait until HH:MM UTC"), with the same
+/// deadline in `retry_after`. Reporting only: the Retry-After backoff, the
+/// breaker and the calls made are unchanged.
+fn claude_oauth_usage_rate_limited_diagnostic(
+    read: claude_credit_pools::ClaudeUsageRead,
+    retry_after: u64,
+    now: u64,
+) -> AgentStatusDiagnostic {
+    let until = i64::try_from(retry_after)
+        .ok()
+        .and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok())
+        .map_or_else(
+            || "later".to_string(),
+            |at| format!("{:02}:{:02} UTC", at.hour(), at.minute()),
+        );
+    let mut diagnostic = claude_quota_check_diagnostic(
+        CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE,
+        &format!(
+            "Claude asked Ottto to wait until {until} before the next {} read.",
+            read.label()
+        ),
+        now,
+    );
+    diagnostic.retry_after = rfc3339_from_unix_seconds(retry_after);
+    diagnostic
+}
 
 /// Handle one 200 response body.
 ///
@@ -30725,6 +30777,46 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
                 .retry_after
                 .is_none()
         );
+    }
+
+    /// A 429 names the read and the time Claude asked Ottto to wait until;
+    /// slot status keeps a fixed per-read text and the bound deadline.
+    #[test]
+    fn rate_limited_diagnostic_names_the_read_and_wait_time() {
+        // 2026-10-11T12:58:57Z.
+        let deadline = 1_791_723_537;
+        for (read, live, slot) in [
+            (
+                claude_credit_pools::ClaudeUsageRead::Plain,
+                "Claude asked Ottto to wait until 12:58 UTC before the next usage read.",
+                CLAUDE_OAUTH_USAGE_RATE_LIMITED_USAGE_MESSAGE,
+            ),
+            (
+                claude_credit_pools::ClaudeUsageRead::SavedResets,
+                "Claude asked Ottto to wait until 12:58 UTC before the next saved-resets read.",
+                CLAUDE_OAUTH_USAGE_RATE_LIMITED_SAVED_RESETS_MESSAGE,
+            ),
+        ] {
+            let diagnostic =
+                claude_oauth_usage_rate_limited_diagnostic(read, deadline, deadline - 3_600)
+                    .with_quota_binding(
+                        Some("account".to_string()),
+                        Some("organization".to_string()),
+                    );
+            assert_eq!(diagnostic.code, CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE);
+            assert_eq!(diagnostic.message, live);
+            assert_eq!(
+                diagnostic.retry_after.as_deref(),
+                Some("2026-10-11T12:58:57Z")
+            );
+            let safe = safe_claude_slot_check_diagnostics(&[diagnostic], "account", "organization");
+            assert_eq!(safe[0].message, slot);
+            assert_eq!(safe[0].retry_after.as_deref(), Some("2026-10-11T12:58:57Z"));
+            assert_eq!(
+                safe_claude_slot_check_diagnostics(&safe, "account", "organization"),
+                safe
+            );
+        }
     }
 
     #[test]

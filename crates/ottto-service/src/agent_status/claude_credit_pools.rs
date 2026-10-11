@@ -91,6 +91,14 @@ impl ClaudeUsageRead {
             Self::SavedResets => CLAUDE_SAVED_RESETS_QUERY,
         }
     }
+
+    /// The read named in diagnostics.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Plain => "usage",
+            Self::SavedResets => "saved-resets",
+        }
+    }
 }
 
 // The model's sections, in emission order. Each read owns some of them; a
@@ -3369,6 +3377,80 @@ mod tests {
         let usage = held.result.as_ref().expect("stale stored reading served");
         assert!(!usage.windows.is_empty());
         assert!(!usage.credit_balances.is_empty());
+    }
+
+    fn respond_429(endpoint: &str) -> Result<Value, u16> {
+        REQUESTED.lock().unwrap().push(endpoint.to_string());
+        Err(429)
+    }
+
+    /// A 429 adds the rate-limited diagnostic naming the read and the wait,
+    /// with no extra call and the existing backoff unchanged (one rate-limit
+    /// strike, the stored reading held until the Retry-After time).
+    #[test]
+    #[serial_test::serial]
+    fn rate_limited_read_names_the_read_and_wait_without_changing_backoff() {
+        for (schedule, label) in [
+            (ClaudeReadSchedule::default(), "saved-resets"),
+            (
+                ClaudeReadSchedule {
+                    saved_resets_variant_paused_until: Some(
+                        super::super::current_unix_seconds() + 3_600,
+                    ),
+                    ..Default::default()
+                },
+                "usage",
+            ),
+        ] {
+            let harness = VariantHarness::new("rate-limited");
+            harness.due(schedule);
+            REQUESTED.lock().unwrap().clear();
+            let before = super::super::current_unix_seconds();
+            let outcome = harness.collect(respond_429);
+            let after = super::super::current_unix_seconds();
+            assert_eq!(REQUESTED.lock().unwrap().len(), 1, "{label}: one call");
+            let limited = outcome
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == "claude_oauth_usage_rate_limited")
+                .collect::<Vec<_>>();
+            assert_eq!(limited.len(), 1, "{label}");
+            assert!(
+                limited[0]
+                    .message
+                    .starts_with("Claude asked Ottto to wait until "),
+                "{label}"
+            );
+            assert!(
+                limited[0]
+                    .message
+                    .ends_with(&format!(" UTC before the next {label} read.")),
+                "{label}"
+            );
+            let retry_after = limited[0]
+                .retry_after
+                .as_deref()
+                .and_then(parse_instant)
+                .map(|at| at.unix_timestamp() as u64)
+                .expect("retry_after");
+            // No Retry-After header: the existing 5-minute fallback.
+            assert!(
+                (before + 300..=after + 300).contains(&retry_after),
+                "{label}"
+            );
+            let cache =
+                super::super::read_claude_oauth_usage_cache(harness.account, harness.organization)
+                    .expect("cache written");
+            assert_eq!(cache.next_refresh_after_epoch_seconds, retry_after);
+            let breaker = super::super::read_claude_oauth_usage_breaker(
+                harness.account,
+                harness.organization,
+                &super::super::claude_oauth_usage_config_fingerprint(),
+            )
+            .expect("breaker");
+            assert_eq!(breaker.rate_limit_failures, 1, "{label}");
+            assert_eq!(harness.shape_failures(), 0);
+        }
     }
 
     #[test]

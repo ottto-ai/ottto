@@ -130,7 +130,11 @@ extra calls:
   the switch, cannot be told apart from local evidence;
 - the existing 5-minute post-success spacing, Retry-After handling, breaker and
   per-caller auth backoff are unchanged; one active binding never shortens
-  another binding's slot;
+  another binding's slot. A 429 also adds the diagnostic
+  `claude_oauth_usage_rate_limited`, naming the read and the wait ("Claude
+  asked Ottto to wait until HH:MM UTC before the next saved-resets read"),
+  with the deadline in `retry_after`; slot status keeps a fixed per-read text
+  and the deadline. It reports only: no extra call and no backoff change;
 - `CLAUDE_ACTIVITY_CADENCE_ENABLED` is a kill switch (default on): off, every
   binding uses today's 55-65 min gate with no active boost or idle slowdown.
 
