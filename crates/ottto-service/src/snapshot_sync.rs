@@ -1477,6 +1477,20 @@ fn with_source_cadence<T>(
     Some(apply(cadence))
 }
 
+fn record_finished_snapshot_cadence(
+    cadence: &mut SourceCadence,
+    now: Instant,
+    accepted: u64,
+    retryable_deferral: bool,
+) {
+    if retryable_deferral {
+        cadence.record_scan_failure(now);
+    } else {
+        cadence.record_scan_success(now, accepted);
+        cadence.record_full_sweep(now);
+    }
+}
+
 /// The negotiated wait for one source: `clamp(directive, floor, ceiling)`.
 ///
 /// The tier arithmetic — including the server's requested minimum interval — lives
@@ -4073,13 +4087,17 @@ fn finish_sync_source(
                     &server_quarantine,
                 );
             }
-            // Accepted siblings are safe to commit, but a held entity
-            // is not proof that a broad historical replay is complete. Force
-            // one clean follow-up sweep and leave the destination's backfill
-            // marker pending until every replacement entity settles.
-            index.mark_bounded_sweep_unsettled();
-            backfill_succeeded = false;
-            upload_fully_settled = false;
+            // Retryable or locally unproven entities keep replay pending.
+            // A validated permanent refusal settles transport and traversal;
+            // its separate health still discloses the rejected usage.
+            if !resolved_permanent_rejections
+                || deferred_local_authority_count > 0
+                || deferred_local_authority_entity_count > 0
+            {
+                index.mark_bounded_sweep_unsettled();
+                backfill_succeeded = false;
+                upload_fully_settled = false;
+            }
             deferred_entity_count = Some(count);
             eprintln!(
                 "local snapshot upload checkpointed accepted siblings but left {count} \
@@ -4381,23 +4399,9 @@ fn finish_sync_source(
         .keys()
         .filter(|fingerprint| current_entities.contains(*fingerprint))
         .count();
-    let retained_pending = index
-        .quarantined_snapshot_fingerprints
-        .values()
-        .filter(|record| record.disposition == SnapshotQuarantineDisposition::RetryPending)
-        .count();
-    if deferred_entity_count.is_none() && retained_pending > 0 {
-        deferred_entity_count = Some(retained_pending);
-        upload_fully_settled = false;
-        backfill_succeeded = false;
-        index.mark_bounded_sweep_unsettled();
-    }
     if deferred_entity_count.is_none() && retained_permanent > 0 {
         deferred_entity_count = Some(retained_permanent);
         resolved_permanent_rejections = true;
-        upload_fully_settled = false;
-        backfill_succeeded = false;
-        index.mark_bounded_sweep_unsettled();
     }
     index.finish_legacy_settlement_reconciliation();
     settle_context_curve_replay_state(
@@ -4424,12 +4428,12 @@ fn finish_sync_source(
     // scan. The sweep marker is stamped only for fully settled scans.
     with_source_cadence(source, |cadence| {
         let now = Instant::now();
-        if deferred_entity_count.is_some() {
-            cadence.record_scan_failure(now);
-        } else {
-            cadence.record_scan_success(now, accepted);
-            cadence.record_full_sweep(now);
-        }
+        record_finished_snapshot_cadence(
+            cadence,
+            now,
+            accepted,
+            deferred_entity_count.is_some() && !resolved_permanent_rejections,
+        );
     });
 
     // Refresh the per-source detected-uses cache the daemon health assembly
@@ -4853,8 +4857,8 @@ enum ResumableUploadResult {
     Rejected {
         count: usize,
     },
-    /// Every accepted sibling is durably checkpointed, while one or more
-    /// rejected or retryable entities remain held for a later clean sweep.
+    /// Accepted siblings are durably checkpointed; actual backend conflicts
+    /// remain held for bounded retry.
     Deferred {
         count: usize,
     },
@@ -5210,9 +5214,9 @@ where
         }
         // A conflict is not a settlement, but it IS retryable: the
         // backend is asking for this entity again later, not never.
-        // It therefore shares the quarantine ledger's bounded
-        // backoff with permanent rejections, but never consumes the permanent
-        // reconstruction-failure budget. A transient conflict remains retryable.
+        // It therefore uses the quarantine ledger's bounded backoff, but
+        // never consumes the permanent reconstruction-failure budget.
+        // A transient conflict remains retryable.
         //
         // Returning the whole page as an error here (the previous
         // behaviour) discarded the entities the backend had ALREADY
@@ -5555,20 +5559,9 @@ where
              retry while every other entity in the page settled."
         );
     }
-    // Only this frozen input's exact bodies determine its upload outcome.
-    // An unrelated retained refusal must not block a healthy cache-head probe.
-    let retry_pending = current_body_witnesses
-        .iter()
-        .filter(|(fingerprint, body)| {
-            progress
-                .quarantined_fingerprints
-                .get(*fingerprint)
-                .is_some_and(|record| {
-                    record.disposition == SnapshotQuarantineDisposition::RetryPending
-                        && record.upload_body_witness.as_deref() == Some(body.as_str())
-                })
-        })
-        .count();
+    // Only actual backend conflicts defer this upload. Local preflight holds
+    // disclose local loss through index counters, not a backend capacity error.
+    // Exact permanent refusals remain visible without another HTTP request.
     let permanent_rejected = current_body_witnesses
         .iter()
         .filter(|(fingerprint, body)| {
@@ -5580,9 +5573,9 @@ where
         .count();
     if let Some(error) = deferred_validation_error {
         Err(error)
-    } else if retry_pending > 0 {
+    } else if conflicted_entities > 0 {
         Ok(ResumableUploadResult::Deferred {
-            count: retry_pending,
+            count: conflicted_entities,
         })
     } else if permanent_rejected > 0 {
         Ok(ResumableUploadResult::Rejected {
@@ -10658,7 +10651,7 @@ mod tests {
         )
         .expect("deterministic local poison is settled by quarantine");
 
-        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+        assert_eq!(result, ResumableUploadResult::Completed);
         assert_eq!(accepted, 1);
         assert_eq!(network_uploads, vec![healthy_fingerprint.clone()]);
         assert!(progress

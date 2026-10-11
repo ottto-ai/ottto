@@ -452,6 +452,18 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
     assert_eq!(outcome, ResumableUploadResult::Rejected { count: 2 });
     assert_eq!(accepted, 0);
     assert!(ledger.accepted_fingerprints.is_empty());
+    let now = Instant::now();
+    let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
+    for _ in 0..8 {
+        cadence.record_scan_failure(now);
+    }
+    record_finished_snapshot_cadence(
+        &mut cadence,
+        now,
+        accepted,
+        matches!(outcome, ResumableUploadResult::Deferred { .. }),
+    );
+    assert_eq!(cadence.state(), ottto_protocol::LocalCollectorState::Idle);
     let status = collector_status_request(
         "h359-synthetic",
         CollectorStatus {

@@ -28,7 +28,10 @@ No rejected body enters the accepted set. A fully accounted response containing
 only accepted/unchanged/permanent-rejected items finishes transport normally;
 its health remains `backend_validation_error`, its delivered count includes
 only accepted/unchanged items, and it does not claim a clean `last_success_at`.
-An all-rejected batch therefore reports zero delivered items. Pending conflicts
+An all-rejected batch therefore reports zero delivered items. Terminal refusals
+settle traversal/backfill/replay and retain normal scan cadence; their usage
+health stays incomplete. Local preflight holds disclose local index loss rather
+than backend deferral. Pending conflicts
 report `server_error`. Accepted siblings and the terminal index are durable
 before reporting either state. Incomplete/terminal census counters stay intact.
 
