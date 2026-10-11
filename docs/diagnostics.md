@@ -127,6 +127,25 @@ source/encoding settings and distinguish idle, ordinary changes, import and
 recovery. A containing release and matching installation are required before
 calling these measurements installed evidence.
 
+## Private Codex Census Outcomes
+
+The support-root `snapshots/codex-fenced-census-v1.json` file now uses schema
+`local_fenced_codex_census:v2`: bounded completed-page scan/index aggregates plus
+producer PID/version, optional kernel start seconds/microseconds, attempt sequence
+and observation UTC. A separate `snapshots/codex-fenced-census-outcome-v1.json`
+file records only the last non-success outer/inner outcome and actual invalidation.
+The census remains limited to 8 KiB; the sidecar to 1 KiB. Healthy attempts add
+no sidecar write or unlink. Both are owner-only disposable atomic caches without
+fsync, excluded from public status, upload DTOs and diagnostics bundles.
+
+These files are structural diagnostic evidence, not health, current account,
+delivery, checkpoint or ACK proof. A separately scoped reader needs matching exact
+PID/start tuples before and after, image continuity, freshness and attempt ordering.
+Unavailable identity, equal-attempt contradiction or foreign-current writer evidence
+gives UNKNOWN; files show last persisted, never latest executed. See the
+[carrier contract](session-2026-10-11-codex-census-outcome-carrier.md) before interpreting
+either file. This adds no reader, runtime repair or installed acceptance.
+
 ## Approved Upload
 
 Upload only when the user approves the upload and accepts the retention

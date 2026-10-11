@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 543,
-  "content_sha256": "20ce2f9134870a9ac614496bc8de36d05c0b4ba762c1105833e2606632cc62e1",
+  "candidate_file_count": 544,
+  "content_sha256": "108904e67f576dbe26d4e9ddb4691ae5e4d79be13d11a7eeef1ab34a1e1a89ea",
   "files": [
     {
       "executable": false,
@@ -811,8 +811,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/codex_scan_diagnostics.rs",
-      "sha256": "5f79426d15028037a5ea93c9b13efffe89ed88046bcc9b58126a167fb4298d88",
-      "size_bytes": 37793
+      "sha256": "f133e5e3552006314f0ea39661fe8ddbe12767c232ca14135e81c737bbc7be87",
+      "size_bytes": 60705
     },
     {
       "executable": false,
@@ -1112,8 +1112,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "9d7dd27ea38c745041d498ba3489a1c0917fbafa1c3b4b8c9a64af7f80f682c1",
-      "size_bytes": 729745
+      "sha256": "b0dbd0be472f3f8d222838f029ffdf7a6fb004dbfd1178c0f899bf5da9276ee2",
+      "size_bytes": 729838
     },
     {
       "executable": false,
@@ -1343,8 +1343,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/diagnostics.md",
-      "sha256": "1c48d509a63da462a2648f65fd51043f609f0a9f0d7da1f5b78b44c2ed27446a",
-      "size_bytes": 12201
+      "sha256": "4bdbf5b3396e1b74ca148cc57ecda0bb34ad3ebfde6b5c7b19873e254ec47947",
+      "size_bytes": 13446
     },
     {
       "executable": false,
@@ -2456,8 +2456,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-09-fenced-census-diagnostics.md",
-      "sha256": "c54672abc4f04e93685ba6dcc9ae7698a8beeb62143dce2311daeeae5ecb9f0b",
-      "size_bytes": 4324
+      "sha256": "0f98ff12a6f6f36b111f96dc00d3a9fb19864d60c317695ddc5ca8bbef27b8ae",
+      "size_bytes": 4901
     },
     {
       "executable": false,
@@ -2514,6 +2514,13 @@
       "path": "docs/session-2026-10-11-claude-root-request-evidence.md",
       "sha256": "ff60ba0c0150d602399ce49504d4822904b8ad636d6a520c9a91fb49740b6d76",
       "size_bytes": 3047
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-11-codex-census-outcome-carrier.md",
+      "sha256": "2f55cddb0df927010c31ad4990c70fe037b7d9f16fb830f7e030ebd0d4e63e52",
+      "size_bytes": 5244
     },
     {
       "executable": false,
@@ -3804,9 +3811,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-11T15:40:01+00:00",
+  "generated_at": "2026-10-11T16:10:28+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 544,
+  "output_file_count": 545,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3843,5 +3850,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "251700dd64f497cb35af7a79660388affdfa1231"
+  "source_commit": "cc22affa7a7c99a085742fc4ff2dbbede8f67ba4"
 }
