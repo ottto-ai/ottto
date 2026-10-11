@@ -14,6 +14,14 @@ ottto diagnostics collect --json
 The response includes sectioned runtime, install, account, source, repair,
 update, and security facts plus a redaction report.
 
+`versions.app_version` comes only from the Ottto app's own `Info.plist`, and
+only when its bundle identifier is the Ottto app's. When the service runs
+from inside the app, it is that app's version. When Homebrew or the installer
+owns the service, it is the version of the app in `~/Applications` or
+`/Applications`, but only if every copy found there reports the same version.
+In every other case it is `unknown`. It is never taken from the service or CLI
+version, because the app and a Homebrew install can be at different versions.
+
 ## Claude Local Evidence Health
 
 Local collection includes a `claude_local_evidence` section with separate API
