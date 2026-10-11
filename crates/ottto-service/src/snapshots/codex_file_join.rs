@@ -1964,6 +1964,19 @@ pub(super) mod tests {
         );
         assert_eq!(held.ownership_incomplete_file_count, 2);
         assert!(!held.census_complete);
+        let causes = serde_json::to_value(
+            held.local_codex_diagnostics
+                .unwrap()
+                .unreadable_causes
+                .projection(held.unreadable_path_count as u64),
+        )
+        .unwrap();
+        assert_eq!(
+            causes["counts"][5], 1,
+            "one alias guard event, not two files"
+        );
+        assert_eq!(causes["unattributed"], 0);
+
         assert!(index.files.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
@@ -2291,6 +2304,18 @@ pub(super) mod tests {
             );
         }
         let counts = after.traversal.as_ref().unwrap().counts.clone();
+        let causes = serde_json::to_value(
+            counts
+                .unreadable_causes
+                .projection(counts.unreadable_path_count as u64),
+        )
+        .unwrap();
+        assert_eq!(
+            causes["counts"][6], 1,
+            "one protected-absence event for newly missing group"
+        );
+        assert_eq!(causes["unattributed"], 0);
+
         let deadline = after
             .traversal
             .as_ref()
