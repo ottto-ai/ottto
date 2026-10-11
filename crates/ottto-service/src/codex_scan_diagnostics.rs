@@ -3,12 +3,114 @@ use crate::snapshots::SnapshotQuarantineDisposition;
 use anyhow::Result;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const MAX_LOCAL_DIAGNOSTIC_BYTES: usize = 32 * 1024;
 pub(crate) const LINEAGE_SAMPLES: usize = 4;
 pub(crate) const MAX_FENCED_CENSUS_BYTES: usize = 8 * 1024;
 pub(crate) const MAX_FENCED_CENSUS_ENTRIES: usize = 32_768;
 const FENCED_CENSUS_FILE: &str = "codex-fenced-census-v1.json";
+const FENCE_OUTCOME_FILE: &str = "codex-fenced-census-outcome-v1.json";
+const MAX_FENCE_OUTCOME_BYTES: usize = 1024;
+const MAX_CENSUS_VERSION_BYTES: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessStart {
+    sec: u64,
+    usec: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn checked_process_start(
+    complete: bool,
+    expected_pid: u32,
+    returned_pid: u32,
+    sec: u64,
+    usec: u64,
+) -> Option<ProcessStart> {
+    (complete && expected_pid > 0 && returned_pid == expected_pid && sec > 0 && usec < 1_000_000)
+        .then_some(ProcessStart { sec, usec })
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_process_start() -> Option<ProcessStart> {
+    let pid = std::process::id();
+    let kernel_pid = libc::pid_t::try_from(pid).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // The native libc type owns the ABI; accept only a complete result for self.
+    let returned = unsafe {
+        libc::proc_pidinfo(
+            kernel_pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if returned != size {
+        return None;
+    }
+    // SAFETY: the kernel returned the complete size of the initialized buffer.
+    let info = unsafe { info.assume_init() };
+    checked_process_start(
+        true,
+        pid,
+        info.pbi_pid,
+        info.pbi_start_tvsec,
+        info.pbi_start_tvusec,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn acquire_process_start() -> Option<ProcessStart> {
+    None
+}
+
+fn process_start() -> Option<ProcessStart> {
+    #[cfg(test)]
+    if let Some(injected) = TEST_PROCESS_START.with(std::cell::Cell::get) {
+        return injected;
+    }
+    static START: std::sync::OnceLock<Option<ProcessStart>> = std::sync::OnceLock::new();
+    // Cache unavailability too; there is no per-attempt retry or subprocess.
+    *START.get_or_init(acquire_process_start)
+}
+
+#[cfg(not(test))]
+static CENSUS_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    // Parallel fixtures never share production attempt ordering or injected identity.
+    static TEST_CENSUS_ATTEMPT: AtomicU64 = const { AtomicU64::new(0) };
+    static TEST_PROCESS_START: std::cell::Cell<Option<Option<ProcessStart>>> = const { std::cell::Cell::new(None) };
+    static TEST_OUTCOME_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn with_attempt_counter<T>(operation: impl FnOnce(&AtomicU64) -> T) -> T {
+    #[cfg(test)]
+    {
+        TEST_CENSUS_ATTEMPT.with(operation)
+    }
+    #[cfg(not(test))]
+    {
+        operation(&CENSUS_ATTEMPT)
+    }
+}
+
+fn begin_census_attempt() {
+    with_attempt_counter(|counter| {
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        });
+    });
+}
+
+fn census_attempt() -> Option<u64> {
+    let value = with_attempt_counter(|counter| counter.load(Ordering::Relaxed));
+    // Zero means no outer boundary; saturation is unavailable, never wrap/reuse.
+    (value > 0 && value < u64::MAX).then_some(value)
+}
 
 /// Fixed projection of already-owned index metadata. None means unavailable,
 /// not zero/healthy. Never serialize the index or its keys/owner proofs here.
@@ -49,6 +151,9 @@ struct FencedCensusRecord<'a> {
     schema: &'static str,
     source: &'static str,
     producer_pid: u32,
+    producer_start_sec: Option<u64>,
+    producer_start_usec: Option<u64>,
+    attempt_sequence: Option<u64>,
     producer_version: &'a str,
     observed_at: &'a str,
     scope: &'static str,
@@ -61,6 +166,72 @@ struct FencedCensusRecord<'a> {
 
 fn fenced_census_path(support_dir: &std::path::Path) -> std::path::PathBuf {
     support_dir.join("snapshots").join(FENCED_CENSUS_FILE)
+}
+
+#[derive(Serialize)]
+struct FenceOutcomeRecord<'a> {
+    schema: &'static str,
+    producer_pid: u32,
+    producer_start_sec: Option<u64>,
+    producer_start_usec: Option<u64>,
+    producer_version: &'a str,
+    attempt_sequence: Option<u64>,
+    observed_at: Option<&'a str>,
+    phase: CensusFencePhase,
+    outcome: CensusFenceOutcome,
+    invalidation: CensusInvalidation,
+}
+
+fn fence_outcome_path(support_dir: &std::path::Path) -> std::path::PathBuf {
+    support_dir.join("snapshots").join(FENCE_OUTCOME_FILE)
+}
+
+fn encode_fence_outcome(
+    record: &FenceOutcomeRecord<'_>,
+    buffer: &mut [u8; MAX_FENCE_OUTCOME_BYTES],
+) -> std::result::Result<usize, CensusPublishFailure> {
+    if record.producer_version.len() > MAX_CENSUS_VERSION_BYTES {
+        return Err(CensusPublishFailure::EncodingFailed);
+    }
+    let mut writer = std::io::Cursor::new(buffer.as_mut_slice());
+    serde_json::to_writer(&mut writer, record).map_err(|_| CensusPublishFailure::EncodingFailed)?;
+    Ok(writer.position() as usize)
+}
+
+fn persist_non_success(
+    support_dir: &std::path::Path,
+    phase: CensusFencePhase,
+    outcome: CensusFenceOutcome,
+    invalidation: CensusInvalidation,
+) {
+    let start = process_start();
+    let version = crate::snapshots::collector_version();
+    let clock = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok();
+    let record = FenceOutcomeRecord {
+        schema: "local_fenced_codex_census_outcome:v1",
+        producer_pid: std::process::id(),
+        producer_start_sec: start.map(|value| value.sec),
+        producer_start_usec: start.map(|value| value.usec),
+        producer_version: &version,
+        attempt_sequence: census_attempt(),
+        observed_at: clock.as_deref(),
+        phase,
+        outcome,
+        invalidation,
+    };
+    let mut buffer = [0; MAX_FENCE_OUTCOME_BYTES];
+    if let Ok(len) = encode_fence_outcome(&record, &mut buffer) {
+        #[cfg(test)]
+        TEST_OUTCOME_WRITES.with(|writes| writes.set(writes.get() + 1));
+        // One best-effort non-durable write only. Failure cannot invalidate the
+        // census, alter the fence result, or recursively persist another failure.
+        let _ = ottto_core::write_owner_only_cache_file_atomic(
+            &fence_outcome_path(support_dir),
+            &buffer[..len],
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -126,10 +297,24 @@ fn invalidate_fenced_census(support_dir: &std::path::Path) -> CensusInvalidation
 /// Outer rejection still does not invalidate the previously completed record.
 pub(crate) fn observe_existing_outer_census_fence(
     source: crate::snapshots::SnapshotSource,
+    support_dir: &std::path::Path,
     fence: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    // SNAPSHOT_SYNC_LOCK serializes all production outer/inner flows in-process.
+    // Cross-process replacement/removal remains unqualified diagnostic evidence.
+    if source == crate::snapshots::SnapshotSource::Codex {
+        begin_census_attempt();
+    }
     let result = fence();
     if source == crate::snapshots::SnapshotSource::Codex {
+        if result.is_err() {
+            persist_non_success(
+                support_dir,
+                CensusFencePhase::Outer,
+                CensusFenceOutcome::Rejected,
+                CensusInvalidation::NotAttempted,
+            );
+        }
         crate::local_resource_diagnostics::codex_census_fence(
             CensusFencePhase::Outer,
             if result.is_ok() {
@@ -168,6 +353,9 @@ pub(crate) fn after_existing_census_fence(
                 Err(error) => (error.outcome(), invalidate_fenced_census(support_dir)),
             }
         };
+        if outcome != CensusFenceOutcome::Published {
+            persist_non_success(support_dir, CensusFencePhase::Inner, outcome, invalidation);
+        }
         crate::local_resource_diagnostics::codex_census_fence(
             CensusFencePhase::Inner,
             outcome,
@@ -181,6 +369,9 @@ fn write_fenced_census_record(
     support_dir: &std::path::Path,
     record: &FencedCensusRecord<'_>,
 ) -> std::result::Result<(), CensusPublishFailure> {
+    if record.producer_version.len() > MAX_CENSUS_VERSION_BYTES {
+        return Err(CensusPublishFailure::EncodingFailed);
+    }
     // Hard serialization/allocation ceiling, independent of any future fields.
     let mut buffer = [0_u8; MAX_FENCED_CENSUS_BYTES];
     let mut writer = std::io::Cursor::new(buffer.as_mut_slice());
@@ -205,10 +396,14 @@ pub(crate) fn write_fenced_census(
     let observed_at = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|_| CensusPublishFailure::ClockUnavailable)?;
+    let start = process_start();
     let record = FencedCensusRecord {
-        schema: "local_fenced_codex_census:v1",
+        schema: "local_fenced_codex_census:v2",
         source: "codex",
         producer_pid: std::process::id(),
+        producer_start_sec: start.map(|value| value.sec),
+        producer_start_usec: start.map(|value| value.usec),
+        attempt_sequence: census_attempt(),
         producer_version: &version,
         observed_at: &observed_at,
         scope: "last_completed_scan_at_destination_fence",
@@ -568,6 +763,8 @@ mod fenced_census_tests {
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
+            with_attempt_counter(|counter| counter.store(0, Ordering::Relaxed));
+            TEST_OUTCOME_WRITES.with(|writes| writes.set(0));
             let root = std::env::temp_dir().join(format!(
                 "ottto-fenced-census-{}",
                 ottto_core::generate_control_token().unwrap()
@@ -587,9 +784,12 @@ mod fenced_census_tests {
 
     fn record() -> FencedCensusRecord<'static> {
         FencedCensusRecord {
-            schema: "local_fenced_codex_census:v1",
+            schema: "local_fenced_codex_census:v2",
             source: "codex",
             producer_pid: std::process::id(),
+            producer_start_sec: process_start().map(|value| value.sec),
+            producer_start_usec: process_start().map(|value| value.usec),
+            attempt_sequence: census_attempt(),
             producer_version: "0.1.test",
             observed_at: "2026-10-09T10:00:00Z",
             scope: "last_completed_scan_at_destination_fence",
@@ -602,6 +802,388 @@ mod fenced_census_tests {
                 ..Default::default()
             },
         }
+    }
+
+    fn sidecar(fixture: &Fixture) -> serde_json::Value {
+        let bytes = std::fs::read(fence_outcome_path(fixture.path())).unwrap();
+        assert!(bytes.len() <= MAX_FENCE_OUTCOME_BYTES);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        for forbidden in [
+            "PRIVATE",
+            "path",
+            "account",
+            "credential",
+            "digest",
+            "error",
+        ] {
+            assert!(!text.contains(forbidden), "forbidden field {forbidden}");
+        }
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    struct IdentityOverride(Option<Option<ProcessStart>>);
+    impl IdentityOverride {
+        fn new(value: Option<ProcessStart>) -> Self {
+            Self(TEST_PROCESS_START.with(|injected| injected.replace(Some(value))))
+        }
+    }
+    impl Drop for IdentityOverride {
+        fn drop(&mut self) {
+            TEST_PROCESS_START.with(|injected| injected.set(self.0));
+        }
+    }
+
+    #[test]
+    fn fenced_census_outer_rejection_retains_completion_and_persists_non_success() {
+        let fixture = Fixture::new();
+        begin_census_attempt();
+        write_fenced_census_record(fixture.path(), &record()).unwrap();
+        let prior = std::fs::read(fenced_census_path(fixture.path())).unwrap();
+        let (result, _) = crate::local_resource_diagnostics::capture(|| {
+            observe_existing_outer_census_fence(SnapshotSource::Codex, fixture.path(), || {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "PRIVATE_PATH_ACCOUNT_ERROR",
+                )
+                .into())
+            })
+        });
+        assert_eq!(
+            result
+                .unwrap_err()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::read(fenced_census_path(fixture.path())).unwrap(),
+            prior
+        );
+        assert!(
+            fixture
+                .path()
+                .join("snapshots/codex-fenced-census-outcome-v1.json")
+                .is_file(),
+            "outer rejection must have a bounded non-success carrier"
+        );
+        let failed = sidecar(&fixture);
+        let prior: serde_json::Value = serde_json::from_slice(&prior).unwrap();
+        assert_eq!(failed["phase"], "outer");
+        assert_eq!(failed["outcome"], "rejected");
+        assert_eq!(failed["invalidation"], "not_attempted");
+        assert!(
+            failed["attempt_sequence"].as_u64().unwrap()
+                > prior["attempt_sequence"].as_u64().unwrap()
+        );
+        assert_eq!(TEST_OUTCOME_WRITES.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn fenced_census_healthy_attempts_never_write_or_remove_sidecar() {
+        let fixture = Fixture::new();
+        let _identity = IdentityOverride::new(Some(ProcessStart {
+            sec: 100,
+            usec: 123456,
+        }));
+        for preexisting in [false, true] {
+            if preexisting {
+                std::fs::write(
+                    fence_outcome_path(fixture.path()),
+                    b"PREVIOUS_FAILURE_BYTES",
+                )
+                .unwrap();
+            }
+            for expected in if preexisting { 4..=6 } else { 1..=3 } {
+                observe_existing_outer_census_fence(SnapshotSource::Codex, fixture.path(), || {
+                    Ok(())
+                })
+                .unwrap();
+                after_existing_census_fence(
+                    SnapshotSource::Codex,
+                    fixture.path(),
+                    || Ok(()),
+                    || write_fenced_census_record(fixture.path(), &record()),
+                )
+                .unwrap();
+                let census: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(fenced_census_path(fixture.path())).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(census["schema"], "local_fenced_codex_census:v2");
+                assert_eq!(census["attempt_sequence"], expected);
+                assert_eq!(census["producer_start_sec"], 100);
+                assert_eq!(census["producer_start_usec"], 123456);
+                assert_eq!(TEST_OUTCOME_WRITES.with(std::cell::Cell::get), 0);
+                if preexisting {
+                    assert_eq!(
+                        std::fs::read(fence_outcome_path(fixture.path())).unwrap(),
+                        b"PREVIOUS_FAILURE_BYTES"
+                    );
+                } else {
+                    assert!(!fence_outcome_path(fixture.path()).exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fenced_census_non_success_sidecar_is_private_and_reports_each_invalidation() {
+        let fixture = Fixture::new();
+        let path = fenced_census_path(fixture.path());
+        for invalidation in ["removed", "already_missing", "failed"] {
+            if invalidation == "removed" {
+                write_fenced_census_record(fixture.path(), &record()).unwrap();
+            } else if invalidation == "failed" {
+                std::fs::create_dir_all(&path).unwrap();
+            }
+            observe_existing_outer_census_fence(SnapshotSource::Codex, fixture.path(), || Ok(()))
+                .unwrap();
+            let original = census_attempt();
+            let result = after_existing_census_fence(
+                SnapshotSource::Codex,
+                fixture.path(),
+                || {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "PRIVATE_REJECTION",
+                    )
+                    .into())
+                },
+                || panic!("rejected fence must not publish"),
+            );
+            assert_eq!(
+                result
+                    .unwrap_err()
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            let value = sidecar(&fixture);
+            assert_eq!(value["schema"], "local_fenced_codex_census_outcome:v1");
+            assert_eq!(value["phase"], "inner");
+            assert_eq!(value["outcome"], "rejected");
+            assert_eq!(value["invalidation"], invalidation);
+            assert_eq!(value["attempt_sequence"].as_u64(), original);
+        }
+        assert_eq!(TEST_OUTCOME_WRITES.with(std::cell::Cell::get), 3);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = fence_outcome_path(fixture.path());
+            assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                path.parent()
+                    .unwrap()
+                    .metadata()
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn fenced_census_sidecar_write_failure_does_not_change_fence_or_invalidation() {
+        let fixture = Fixture::new();
+        write_fenced_census_record(fixture.path(), &record()).unwrap();
+        let original = std::fs::read(fenced_census_path(fixture.path())).unwrap();
+        // Rename over this directory fails. Sidecar failure never recurses.
+        std::fs::create_dir_all(fence_outcome_path(fixture.path())).unwrap();
+        let result =
+            observe_existing_outer_census_fence(SnapshotSource::Codex, fixture.path(), || {
+                Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "PRIVATE_OUTER").into())
+            });
+        assert_eq!(
+            result
+                .unwrap_err()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            std::fs::read(fenced_census_path(fixture.path())).unwrap(),
+            original
+        );
+        assert_eq!(TEST_OUTCOME_WRITES.with(std::cell::Cell::get), 1);
+        observe_existing_outer_census_fence(SnapshotSource::Codex, fixture.path(), || Ok(()))
+            .unwrap();
+        let result = after_existing_census_fence(
+            SnapshotSource::Codex,
+            fixture.path(),
+            || {
+                Err(
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "PRIVATE_INNER")
+                        .into(),
+                )
+            },
+            || panic!("rejected fence must not publish"),
+        );
+        assert_eq!(
+            result
+                .unwrap_err()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(!fenced_census_path(fixture.path()).exists());
+        observe_existing_outer_census_fence(SnapshotSource::Codex, fixture.path(), || Ok(()))
+            .unwrap();
+        after_existing_census_fence(
+            SnapshotSource::Codex,
+            fixture.path(),
+            || Ok(()),
+            || Err(CensusPublishFailure::ProjectionUnavailable),
+        )
+        .unwrap();
+        assert_eq!(TEST_OUTCOME_WRITES.with(std::cell::Cell::get), 3);
+        assert!(fence_outcome_path(fixture.path()).is_dir());
+        assert_eq!(std::fs::read_dir(fence_outcome_path(fixture.path()).parent().unwrap()).unwrap().count(), 1,
+            "failed writes clean temporary files, with no second census invalidation or recursive outcome");
+    }
+
+    #[test]
+    fn fenced_census_start_unavailable_and_attempt_exhaustion_remain_unqualified() {
+        let fixture = Fixture::new();
+        let _identity = IdentityOverride::new(None);
+        observe_existing_outer_census_fence(SnapshotSource::Codex, fixture.path(), || Ok(()))
+            .unwrap();
+        after_existing_census_fence(
+            SnapshotSource::Codex,
+            fixture.path(),
+            || Ok(()),
+            || write_fenced_census_record(fixture.path(), &record()),
+        )
+        .unwrap();
+        let census: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fenced_census_path(fixture.path())).unwrap())
+                .unwrap();
+        assert!(census["producer_start_sec"].is_null());
+        assert!(census["producer_start_usec"].is_null());
+        let _ = observe_existing_outer_census_fence(SnapshotSource::Codex, fixture.path(), || {
+            Err(anyhow::anyhow!("PRIVATE"))
+        });
+        let failed = sidecar(&fixture);
+        assert!(failed["producer_start_sec"].is_null());
+        assert!(failed["producer_start_usec"].is_null());
+        assert_eq!(failed["attempt_sequence"], 2);
+        with_attempt_counter(|counter| counter.store(u64::MAX - 1, Ordering::Relaxed));
+        begin_census_attempt();
+        assert_eq!(census_attempt(), None);
+        begin_census_attempt();
+        assert_eq!(census_attempt(), None);
+        assert_eq!(
+            with_attempt_counter(|counter| counter.load(Ordering::Relaxed)),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn fenced_census_kernel_identity_guards_and_unavailable_cache() {
+        assert_eq!(
+            checked_process_start(true, 42, 42, 100, 999999),
+            Some(ProcessStart {
+                sec: 100,
+                usec: 999999
+            })
+        );
+        for (complete, expected, returned, sec, usec) in [
+            (false, 42, 42, 100, 1),
+            (true, 42, 43, 100, 1),
+            (true, 0, 0, 100, 1),
+            (true, 42, 42, 0, 1),
+            (true, 42, 42, 100, 1000000),
+        ] {
+            assert!(checked_process_start(complete, expected, returned, sec, usec).is_none());
+        }
+        let cache = std::sync::OnceLock::new();
+        let reads = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            assert_eq!(
+                *cache.get_or_init(|| {
+                    reads.set(reads.get() + 1);
+                    checked_process_start(false, 42, 42, 100, 0)
+                }),
+                None
+            );
+        }
+        assert_eq!(reads.get(), 1);
+        #[cfg(target_os = "macos")]
+        {
+            let first = acquire_process_start()
+                .expect("own kernel identity must be available in this native fixture");
+            assert_eq!(Some(first), process_start());
+            assert_eq!(Some(first), acquire_process_start());
+        }
+    }
+
+    #[test]
+    fn fenced_census_sidecar_fixed_buffer_encoding_is_bounded_and_allocation_free() {
+        let version = "v".repeat(MAX_CENSUS_VERSION_BYTES);
+        let mut record = FenceOutcomeRecord {
+            schema: "local_fenced_codex_census_outcome:v1",
+            producer_pid: u32::MAX,
+            producer_start_sec: Some(u64::MAX),
+            producer_start_usec: Some(999999),
+            producer_version: &version,
+            attempt_sequence: Some(u64::MAX - 1),
+            observed_at: Some("2026-10-11T11:00:00.999999999Z"),
+            phase: CensusFencePhase::Inner,
+            outcome: CensusFenceOutcome::ProjectionUnavailable,
+            invalidation: CensusInvalidation::AlreadyMissing,
+        };
+        let mut buffer = [0; MAX_FENCE_OUTCOME_BYTES];
+        let (encoded, stats) =
+            crate::retry_allocation_probe::measure(|| encode_fence_outcome(&record, &mut buffer));
+        assert!(encoded.unwrap() <= MAX_FENCE_OUTCOME_BYTES);
+        assert_eq!(stats.allocations, 0);
+        assert_eq!(stats.requested_live, 0);
+        let oversized = "PRIVATE".repeat(MAX_FENCE_OUTCOME_BYTES);
+        record.producer_version = &oversized;
+        assert!(matches!(
+            encode_fence_outcome(&record, &mut buffer),
+            Err(CensusPublishFailure::EncodingFailed)
+        ));
+        record.producer_version = &version;
+        record.observed_at = Some(&oversized);
+        assert!(matches!(
+            encode_fence_outcome(&record, &mut buffer),
+            Err(CensusPublishFailure::EncodingFailed)
+        ));
+    }
+
+    #[test]
+    #[ignore = "bounded native non-success sidecar allocation and IO measurement"]
+    fn fenced_census_sidecar_native_measurement() {
+        let fixture = Fixture::new();
+        begin_census_attempt();
+        persist_non_success(
+            fixture.path(),
+            CensusFencePhase::Inner,
+            CensusFenceOutcome::Rejected,
+            CensusInvalidation::Failed,
+        );
+        let started = std::time::Instant::now();
+        let (_, stats) = crate::retry_allocation_probe::measure(|| {
+            for _ in 0..128 {
+                persist_non_success(
+                    fixture.path(),
+                    CensusFencePhase::Inner,
+                    CensusFenceOutcome::Rejected,
+                    CensusInvalidation::Failed,
+                );
+            }
+        });
+        assert_eq!(stats.requested_live, 0);
+        assert!(stats.requested_peak_with_overlap < 4096);
+        println!("CENSUS_SIDECAR iterations=128 elapsed_us={} peak_bytes={} allocations={} live_bytes={} bytes={} fsync=false",
+            started.elapsed().as_micros(), stats.requested_peak_with_overlap, stats.allocations, stats.requested_live,
+            std::fs::metadata(fence_outcome_path(fixture.path())).unwrap().len());
     }
 
     #[test]
@@ -755,6 +1337,10 @@ mod fenced_census_tests {
         assert_eq!(records[0]["counts"]["phase"], "inner");
         assert_eq!(records[0]["counts"]["outcome"], "private_write_failed");
         assert_eq!(records[0]["counts"]["invalidation"], "failed");
+        let persisted = sidecar(&fixture);
+        assert_eq!(persisted["phase"], "inner");
+        assert_eq!(persisted["outcome"], "private_write_failed");
+        assert_eq!(persisted["invalidation"], "failed");
     }
 
     #[test]
@@ -762,7 +1348,7 @@ mod fenced_census_tests {
         let fixture = Fixture::new();
         let calls = std::cell::RefCell::new(Vec::new());
         let (result, records) = crate::local_resource_diagnostics::capture(|| {
-            observe_existing_outer_census_fence(SnapshotSource::Codex, || {
+            observe_existing_outer_census_fence(SnapshotSource::Codex, fixture.path(), || {
                 calls.borrow_mut().push("outer account/source");
                 calls.borrow_mut().push("outer destination");
                 Ok(())
@@ -816,7 +1402,7 @@ mod fenced_census_tests {
         let identity = std::sync::Arc::new(());
         calls.borrow_mut().clear();
         let (result, rows) = crate::local_resource_diagnostics::capture(|| -> Result<()> {
-            observe_existing_outer_census_fence(SnapshotSource::Codex, || {
+            observe_existing_outer_census_fence(SnapshotSource::Codex, fixture.path(), || {
                 calls.borrow_mut().push("outer rejected");
                 Err(anyhow::Error::new(Original(identity.clone())).context("PRIVATE_CONTEXT"))
             })?;
@@ -916,9 +1502,10 @@ mod fenced_census_tests {
         write_fenced_census_record(fixture.path(), &record()).unwrap();
         let original = std::fs::read(fenced_census_path(fixture.path())).unwrap();
         for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+            let before = census_attempt();
             let calls = std::cell::Cell::new(0);
             let (result, rows) = crate::local_resource_diagnostics::capture(|| {
-                observe_existing_outer_census_fence(source, || {
+                observe_existing_outer_census_fence(source, fixture.path(), || {
                     calls.set(calls.get() + 1);
                     Ok(())
                 })?;
@@ -935,6 +1522,9 @@ mod fenced_census_tests {
             assert!(result.is_err());
             assert_eq!(calls.get(), 2);
             assert!(rows.is_empty());
+            assert_eq!(census_attempt(), before);
+            assert_eq!(TEST_OUTCOME_WRITES.with(std::cell::Cell::get), 0);
+            assert!(!fence_outcome_path(fixture.path()).exists());
             assert_eq!(
                 std::fs::read(fenced_census_path(fixture.path())).unwrap(),
                 original

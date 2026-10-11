@@ -8,8 +8,9 @@ working index immediately after the existing source/account/destination fence.
 The fence still runs exactly once at that site and returns its original error.
 
 One latest record is written at `snapshots/codex-fenced-census-v1.json` under the
-local support root. Its `local_fenced_codex_census:v1` schema contains producer
-PID/version, a fresh RFC3339 observation clock, scan-input generation, native
+local support root. Its current `local_fenced_codex_census:v2` schema contains producer
+PID/version, optional kernel start seconds/microseconds, process attempt sequence,
+a fresh RFC3339 observation clock, scan-input generation, native
 scan gates/loss counts, and index aggregate counters. The scope is
 `last_completed_scan_at_destination_fence`; `working_before_delivery` means the
 working index before later account filtering, upload policy/finalization,
@@ -38,17 +39,24 @@ status HTTP body, upload body or account attribution contract changes.
 Encoding uses an 8 KiB fixed buffer. The disposable record reuses the secure
 owner-only create-new temporary file and atomic rename path with mode 0600 and
 an owner-only parent, but does not request fsync. Durable credential writes
-retain their existing fsync behavior. Diagnostic write/size failures and fence
+retain their existing fsync behavior. Diagnostic write/size failures and inner fence
 rejections invalidate the prior local record best-effort without changing the
 scan result or rejection error. Unsupported non-Unix private-cache writes are
 unavailable rather than falling back to an unsafe write. The cache can disappear
 after a crash; it is not a ledger or collection prerequisite.
 
-A future reader needs one bounded read of this known file, process PID/start/
-image continuity, matching producer PID, the expected schema/scope, and an
+A non-success-only sidecar now records outer rejection (which retains the census)
+and inner failures after their existing invalidation. Healthy attempts neither
+write nor unlink this sidecar. See the [current outcome carrier contract](session-2026-10-11-codex-census-outcome-carrier.md).
+
+A future reader needs a separately bounded read of this known file and its
+sidecar (9 KiB combined), exact process PID/start-seconds/start-microseconds and
+image continuity, matching producer identity, the expected schema/scope, and an
 observation clock after both process start and an explicit fresh-observation
 floor. The logical census start can survive restarts and is not that floor.
-Process changes, old records after an account/authority change, missing/invalid/
+Attempt ordering, equal-attempt contradictions and foreign-current writer
+ambiguity follow the current carrier contract. Process changes, old records after
+an account/authority change, missing/invalid/
 oversize records or unsupported scope mean unavailable. A failed deletion can
 leave an old file, so freshness checks remain mandatory. This change adds no
 runtime reader, retry, scan trigger, repair, restart or installed acceptance.
