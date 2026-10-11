@@ -8777,6 +8777,7 @@ mod tests {
 }
 
 mod heap_layout_bound;
+mod owned_heap;
 
 #[cfg(test)]
 mod retry_allocation_probe;

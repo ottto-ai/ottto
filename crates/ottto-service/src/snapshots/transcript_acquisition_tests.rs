@@ -757,6 +757,113 @@ fn sampled_release_compiler_enables_native_tails_for_both_providers() {
 }
 
 #[test]
+fn sampled_production_large_session_append_reuses_bounded_history() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut failures = Vec::new();
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        for id in 0..1200 {
+            fixture
+                .file
+                .append(&usage(source, 100 + id as u64, id, "synthetic-model"));
+        }
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (index, _, modes, _) = production_scan_with_metrics(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            Some(cache.clone()),
+            "large-native-history",
+        );
+        assert_eq!(modes, (1, 0, 0));
+        let before = fs::metadata(&fixture.file.0).unwrap().len();
+        fixture
+            .file
+            .append(&usage(source, 1500, 1200, "synthetic-model"));
+        let after = fs::metadata(&fixture.file.0).unwrap().len();
+        let (_, tail, modes, bytes) = production_scan_with_metrics(
+            &fixture,
+            source,
+            index,
+            Some(cache),
+            "large-native-history",
+        );
+        let (_, full, _, full_bytes) = production_scan_with_metrics(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            None,
+            "independent-full-reader",
+        );
+        assert_eq!(production_body(source, tail), production_body(source, full));
+        assert_eq!(full_bytes.0, 0); // Unsampled oracle uses native production parsing.
+        eprintln!("LARGE_SESSION_TAIL source={source:?} modes={modes:?} full_bytes={after} suffix_bytes={} native_bytes={} guard_bytes={}", after - before, bytes.0, bytes.1);
+        if modes != (0, 1, 0) || bytes.0 != after - before || bytes.1 != 8192 {
+            failures.push(format!("{source:?}: {modes:?}, bytes={bytes:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+#[test]
+fn sampled_native_large_history_has_constant_step_charge_and_conservative_clones() {
+    use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let mut visits = Vec::new();
+        for count in [100, 1200, 2400] {
+            let fixture = Fixture::new(source);
+            for n in 0..count {
+                fixture.append(&usage(source, 100 + n as u64, n, "fixture-model"));
+            }
+            let ((parser, total_visits, steps, micros), actual) =
+                crate::retry_allocation_probe::measure(|| {
+                    let (mut parser, _, scope) = native_parser(&fixture, source);
+                    parser.prepare_acquisition(None, &scope, None, 100).unwrap();
+                    let start = std::time::Instant::now();
+                    let mut total_visits = 0;
+                    let mut steps = 0;
+                    loop {
+                        let done = parser.step().unwrap();
+                        let mut counter = Counter::new(31 * 1024 * 1024);
+                        parser.heap_bound(&mut counter).unwrap();
+                        total_visits += counter.visits_for_test();
+                        steps += 1;
+                        if done {
+                            break;
+                        }
+                    }
+                    (parser, total_visits, steps, start.elapsed().as_micros())
+                });
+            let charge = crate::heap_layout_bound::bound(&parser, 31 * 1024 * 1024).unwrap();
+            assert!(charge >= actual.requested_live as usize);
+            let mut counter = Counter::new(31 * 1024 * 1024);
+            parser.heap_bound(&mut counter).unwrap();
+            visits.push(counter.visits_for_test());
+            let (cloned, copy_actual) =
+                crate::retry_allocation_probe::measure(|| parser.accumulator.clone());
+            let copy_charge = crate::heap_layout_bound::bound(&cloned, 31 * 1024 * 1024).unwrap();
+            assert!(copy_charge >= copy_actual.requested_live as usize);
+            assert!(total_visits <= steps * counter.visits_for_test());
+            assert_eq!(
+                crate::heap_layout_bound::bound(&cloned, crate::transcript_cache::ENTRY_BYTES)
+                    .is_some(),
+                copy_charge <= crate::transcript_cache::ENTRY_BYTES
+            );
+            eprintln!("LARGE_SESSION_CHARGE source={source:?} records={count} visits={} total_visits={total_visits} steps={steps} parser_and_charge_us={micros} active_bytes={charge} active_requested={} clone_bytes={copy_charge} clone_requested={}", counter.visits_for_test(), actual.requested_live, copy_actual.requested_live);
+        }
+        assert!(
+            visits.windows(2).all(|n| n[0] == n[1]),
+            "{source:?} visits={visits:?}"
+        );
+    }
+}
+
+#[test]
 fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_restart() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -947,9 +1054,15 @@ fn sampled_production_unretainable_full_file_preserves_other_native_tails() {
             "mixed-files",
         );
         for n in 0..150 {
-            large
-                .file
-                .append(&usage(source, 100 + n as u64, n, &format!("model-{n}")));
+            let mut row = usage(source, 100 + n as u64, n, &format!("model-{n}"));
+            if source == SnapshotSource::ClaudeCode && n == 0 {
+                // The old fixture relied on traversing 150 response objects.
+                // Those are now incrementally charged; exceed the real entry
+                // byte cap with one valid, retained response identity instead.
+                row["message"]["id"] =
+                    Value::String("x".repeat(crate::transcript_cache::ENTRY_BYTES + 1));
+            }
+            large.file.append(&row);
         }
         let (mut parser, _, _) = native_parser(&large.file, source);
         while !parser.step().unwrap() {}

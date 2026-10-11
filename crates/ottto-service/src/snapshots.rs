@@ -6878,7 +6878,7 @@ const MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE: usize = 65_536;
 struct ClaudeResponseObservation {
     sequence: u64,
     preceding_user_timestamp: Option<String>,
-    records: Vec<ClaudeResponseRecord>,
+    records: crate::owned_heap::OwnedVec<ClaudeResponseRecord>,
     record_limit_exceeded: bool,
 }
 
@@ -6941,7 +6941,8 @@ impl ClaudeResponseObservation {
                 timestamp,
                 computed_effective_input_context,
                 tool_uses,
-            }],
+            }]
+            .into(),
             record_limit_exceeded: false,
         }
     }
@@ -6979,25 +6980,25 @@ impl ClaudeResponseObservation {
         true
     }
 
-    fn resolve(mut self) -> Option<ResolvedClaudeResponse> {
+    fn resolve(self) -> Option<ResolvedClaudeResponse> {
         if self.record_limit_exceeded {
             return None;
         }
+        let mut records = self.records.into_vec();
         // Provider time is authoritative only when it proves a complete order
         // for this response. Mixed valid/missing timestamps retain physical
         // append order, preserving the conservative legacy behavior instead
         // of moving a stamped terminal record ahead of an unstamped partial.
-        let event_clock_complete = self
-            .records
+        let event_clock_complete = records
             .iter()
             .all(|record| claude_response_provider_time(record).is_some());
         if event_clock_complete {
-            self.records.sort_by(claude_response_record_order);
+            records.sort_by(claude_response_record_order);
         } else {
-            self.records.sort_by_key(|record| record.physical_sequence);
+            records.sort_by_key(|record| record.physical_sequence);
         }
         let mut canonical_records: Vec<ClaudeResponseRecord> = Vec::new();
-        for record in self.records {
+        for record in records {
             if canonical_records.last().is_some_and(|previous| {
                 claude_response_records_share_provider_time(previous, &record)
             }) {
@@ -8183,7 +8184,7 @@ struct SnapshotAccumulator {
     codex_native_created_thread_last_nanos: Option<i128>,
     codex_native_created_thread_task_turn_id: Option<String>,
     codex_native_created_thread_first_turn_bound: bool,
-    codex_physical_signatures: Vec<String>,
+    codex_physical_signatures: crate::owned_heap::OwnedVec<String>,
     codex_physical_signatures_complete: bool,
     codex_ordinal_expected: Option<u64>,
     codex_ordinal_sequence_valid: bool,
@@ -8192,8 +8193,8 @@ struct SnapshotAccumulator {
     codex_inherited_usage_records_skipped: u64,
     codex_duplicate_usage_records_skipped: u64,
     codex_cumulative_reset_count: u64,
-    codex_context_curve_candidates: Vec<ContextCurveCandidatePoint>,
-    codex_context_curve_boundaries: Vec<ContextCurveCandidateBoundary>,
+    codex_context_curve_candidates: crate::owned_heap::OwnedVec<ContextCurveCandidatePoint>,
+    codex_context_curve_boundaries: crate::owned_heap::OwnedVec<ContextCurveCandidateBoundary>,
     codex_context_curve_exact_supported: bool,
     // Identity of the last provider usage event, used only to collapse an
     // exact repeated physical checkpoint. Cumulative totals alone are not an
@@ -8255,7 +8256,7 @@ struct SnapshotAccumulator {
     // posture, or request count enter the session projection. The map is local
     // to one complete transcript parse; its key format also provides the seam
     // for a future scan-level legacy-fork ownership ledger.
-    claude_responses: BTreeMap<String, ClaudeResponseObservation>,
+    claude_responses: crate::owned_heap::OwnedMap<String, ClaudeResponseObservation>,
     claude_response_sequence: u64,
     claude_response_record_count: usize,
     // Exact provider response ids for the once-per-response Claude usage rows
@@ -8264,7 +8265,7 @@ struct SnapshotAccumulator {
     claude_usage_request_ids: BTreeSet<String>,
     claude_usage_occurrences: BTreeMap<String, ClaudeTranscriptUsageOccurrence>,
     cache_observations: Option<CacheObservations>,
-    pub(crate) cache_requests: Vec<OwnedRequest>,
+    pub(crate) cache_requests: crate::owned_heap::OwnedVec<OwnedRequest>,
     cache_requests_complete: bool,
     claude_context_curve_identity_complete: bool,
     claude_context_curve_request_index_complete: bool,
@@ -8303,8 +8304,8 @@ struct SnapshotAccumulator {
     first_turn_context_tokens: Option<u64>,
     last_turn_context_tokens: Option<u64>,
     compaction_count: u64,
-    compaction_timestamps: Vec<String>,
-    claude_compaction_observations: Vec<ClaudeCompactionObservation>,
+    compaction_timestamps: crate::owned_heap::OwnedVec<String>,
+    claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
 }
 
 impl SnapshotAccumulator {
@@ -8365,7 +8366,7 @@ impl SnapshotAccumulator {
             codex_native_created_thread_last_nanos: None,
             codex_native_created_thread_task_turn_id: None,
             codex_native_created_thread_first_turn_bound: false,
-            codex_physical_signatures: Vec::new(),
+            codex_physical_signatures: crate::owned_heap::OwnedVec::new(),
             codex_physical_signatures_complete: true,
             codex_ordinal_expected: None,
             codex_ordinal_sequence_valid: true,
@@ -8374,8 +8375,8 @@ impl SnapshotAccumulator {
             codex_inherited_usage_records_skipped: 0,
             codex_duplicate_usage_records_skipped: 0,
             codex_cumulative_reset_count: 0,
-            codex_context_curve_candidates: Vec::new(),
-            codex_context_curve_boundaries: Vec::new(),
+            codex_context_curve_candidates: crate::owned_heap::OwnedVec::new(),
+            codex_context_curve_boundaries: crate::owned_heap::OwnedVec::new(),
             codex_context_curve_exact_supported: true,
             codex_last_usage_event_identity: None,
             codex_legacy_bootstrap_buffer: Vec::new(),
@@ -8409,13 +8410,13 @@ impl SnapshotAccumulator {
             latency_ttft_ms_count: 0,
             latency_duration_ms_max: 0,
             latency_ttft_ms_max: 0,
-            claude_responses: BTreeMap::new(),
+            claude_responses: crate::owned_heap::OwnedMap::new(),
             claude_response_sequence: 0,
             claude_response_record_count: 0,
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
             cache_observations: None,
-            cache_requests: Vec::new(),
+            cache_requests: crate::owned_heap::OwnedVec::new(),
             cache_requests_complete: true,
             claude_context_curve_identity_complete: true,
             claude_context_curve_request_index_complete: true,
@@ -8429,8 +8430,8 @@ impl SnapshotAccumulator {
             first_turn_context_tokens: None,
             last_turn_context_tokens: None,
             compaction_count: 0,
-            compaction_timestamps: Vec::new(),
-            claude_compaction_observations: Vec::new(),
+            compaction_timestamps: crate::owned_heap::OwnedVec::new(),
+            claude_compaction_observations: crate::owned_heap::OwnedVec::new(),
         }
     }
 
@@ -9005,7 +9006,7 @@ impl SnapshotAccumulator {
         Some((
             session_id,
             CodexParentOwnershipLedger {
-                signatures: self.codex_physical_signatures.clone(),
+                signatures: self.codex_physical_signatures.clone().into_vec(),
                 scan_complete: self.codex_session_meta_seen
                     && self.codex_physical_signatures_complete
                     && !self.codex_physical_signatures.is_empty(),
@@ -9232,8 +9233,11 @@ impl SnapshotAccumulator {
             }
         };
         if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE {
-            if let Some(existing) = self.claude_responses.get_mut(&key) {
-                existing.record_limit_exceeded = true;
+            if self.claude_responses.contains_key(&key) {
+                self.claude_responses
+                    .get_mut(&key)
+                    .expect("response exists")
+                    .record_limit_exceeded = true;
             } else {
                 // No response object exists to carry the one-time overflow
                 // marker into finalization. Account for this refused positive
@@ -9242,7 +9246,7 @@ impl SnapshotAccumulator {
             }
             return;
         }
-        if let Some(existing) = self.claude_responses.get_mut(&key) {
+        if let Some(mut existing) = self.claude_responses.get_mut(&key) {
             if existing.push(
                 usage,
                 model,
@@ -10054,7 +10058,7 @@ impl SnapshotAccumulator {
             } else {
                 (
                     self.compaction_count,
-                    bounded_compaction_timestamps(self.compaction_timestamps),
+                    bounded_compaction_timestamps(self.compaction_timestamps.into_vec()),
                     CompactionMetrics::default(),
                 )
             };
@@ -10121,7 +10125,7 @@ impl SnapshotAccumulator {
             cache_observations: self.cache_observations,
             cache_observations_state: None,
             cache_base_head_etag: None,
-            cache_requests: self.cache_requests,
+            cache_requests: self.cache_requests.into_vec(),
             cache_requests_complete: self.cache_requests_complete,
             avg_duration_ms: (self.latency_duration_ms_count > 0)
                 .then(|| self.latency_duration_ms_sum / self.latency_duration_ms_count),
@@ -10188,7 +10192,7 @@ impl SnapshotAccumulator {
                 None
             },
             context_curve,
-            claude_context_curve_boundaries: self.claude_compaction_observations,
+            claude_context_curve_boundaries: self.claude_compaction_observations.into_vec(),
             claude_context_curve_identity_complete: self.claude_context_curve_identity_complete,
             claude_context_curve_request_index_complete: self
                 .claude_context_curve_request_index_complete,
@@ -12063,7 +12067,7 @@ impl OwnedSourceScan {
                     }
                 };
                 let finalization_charge =
-                    crate::heap_layout_bound::bound(&parsed_file, copy_budget);
+                    crate::heap_layout_bound::completed_bound(&parsed_file, copy_budget);
                 if finalization_charge.is_none() {
                     if let Some(completed) = completed_acquisition.as_mut() {
                         completed.reduction = None;
@@ -52920,8 +52924,8 @@ pub(crate) mod cache_adapter_tests {
             assert_eq!(parser.cache_requests.len(), 3);
             // Effort and actual measured inactivity are additional verified source evidence,
             // supplied explicitly rather than inferred from response-report timestamps.
-            for (request, slot) in parser
-                .cache_requests
+            let mut requests = std::mem::take(&mut parser.cache_requests).into_vec();
+            for (request, slot) in requests
                 .iter_mut()
                 .zip(example["slots"].as_array().unwrap())
             {
@@ -52930,10 +52934,11 @@ pub(crate) mod cache_adapter_tests {
                 assert_eq!(request.slot.cache_read_tokens, slot["cache_read"].as_u64());
             }
             if source == SnapshotSource::Codex {
-                parser.cache_requests[1].idle_seconds = example["idle_seconds"]
+                requests[1].idle_seconds = example["idle_seconds"]
                     .as_f64()
                     .map(|seconds| seconds.floor() as u64);
             }
+            parser.cache_requests = requests.into();
             let wire = cache_wire_for_requests(&session, &parser.cache_requests).unwrap();
             let affected = wire
                 .operations
@@ -53326,6 +53331,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for fn(&Value, &mut SnapshotAccum
 }
 macro_rules! inline_scan_enum { ($t:ty; $($pattern:pat),*) => {
     impl crate::heap_layout_bound::HeapLayoutBound for $t {
+        const STABLE_HEAP: bool = true;
         fn heap_bound(&self,c:&mut crate::heap_layout_bound::Counter)->Option<()> {
             match self { $($pattern => c.add(0)),* }
         }
