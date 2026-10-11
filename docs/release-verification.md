@@ -191,6 +191,17 @@ must pass through the Homebrew-owned service socket, account and source
 continuity must hold, and owner, prefix, protocol, schema, and version must
 converge before stable promotion.
 
+The packaged app does not declare `LSMultipleInstancesProhibited`, so several
+macOS users can run Ottto from one shared app bundle at the same time. The app
+keeps one process per user. Each user's service, LaunchAgent, control socket and
+support files are separate. Sparkle does not coordinate updaters across
+processes. When one user's Sparkle replaces the shared bundle, other users' running
+app and service keep the old code until they relaunch. No automated gate covers
+this case. Do not describe multi-user updates as verified until a manual
+two-user check has passed and been recorded. In that check, both users open
+the app, one updates it, the other relaunches, and both keep their account and
+sources.
+
 ## Verify Installed Runtime
 
 After installation:
