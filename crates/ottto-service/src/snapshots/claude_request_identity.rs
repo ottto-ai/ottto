@@ -15,8 +15,9 @@ use super::claude_request_accounts::{local_subscription, normalize_activity};
 use super::{
     activity_bucket_from_timestamp, build_row_identity, claude_snapshot_request_id_hashes,
     codex_identity_is_uuid_shaped, rfc3339_unix_seconds, row_key_from_model_usage,
-    snapshot_fingerprint, usd_picos_string, RowKey, ScanIndex, SnapshotIdentityPart, SnapshotItem,
-    SnapshotModelUsage, SnapshotRequestEvidence, SnapshotSource, UsageTotals, USD_PICO_SCALE,
+    snapshot_fingerprint, usd_picos_string, RowKey, ScanIndex, SelectorCapture,
+    SnapshotIdentityPart, SnapshotItem, SnapshotModelUsage, SnapshotRequestEvidence,
+    SnapshotSource, UsageTotals, USD_PICO_SCALE,
 };
 use crate::claude_local_otel::{
     ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition,
@@ -28,6 +29,7 @@ use serde_json::{json, Value};
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
 
@@ -100,6 +102,8 @@ pub(crate) enum Refusal {
     IncompleteEvidence,
 }
 
+/// Owned form of `IdentityRef`, for tests and the W0 builder oracle.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RequestIdentity {
     Tagged(AuthorityKey),
@@ -108,6 +112,8 @@ pub(crate) enum RequestIdentity {
 }
 
 /// One counted request: where today's code bucketed it and what it carried.
+/// Test oracle only: production folds requests into a `Grouping` as they come.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct Contribution {
     pub(super) bucket_start: String,
@@ -258,77 +264,173 @@ fn micro_exact(picos: u128) -> bool {
 
 /// Per bucket row: amounts per authority key (`None` = untagged) and whether
 /// any untagged usage was refused or pending.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct RowGroup {
     total: Amounts,
     by_key: BTreeMap<Option<AuthorityKey>, Amounts>,
     refused: bool,
 }
 
-/// Tag `item` from its counted requests. Returns `Err` when the item must stay
-/// on today's path (it is left unchanged). On success the item carries the new
-/// collector, the tagged or fallback shape, and a fresh fingerprint.
-pub(crate) fn apply(
-    item: &mut SnapshotItem,
-    contributions: &[Contribution],
-) -> Result<Tagged, Ineligible> {
-    // Group by today's (bucket, row key), bounding distinct authority keys
-    // before any per-row structure grows past the cap.
-    let mut groups: BTreeMap<(&str, &RowKey), RowGroup> = BTreeMap::new();
-    let mut keys = BTreeSet::new();
-    let mut keys_over_cap = false;
-    for contribution in contributions {
-        let group = groups
-            .entry((contribution.bucket_start.as_str(), &contribution.row_key))
-            .or_default();
-        group
-            .total
-            .add(&contribution.usage)
-            .ok_or(Ineligible::RowsNotReproduced)?;
-        let key = match &contribution.identity {
-            RequestIdentity::Tagged(key) if !keys_over_cap => {
-                if !keys.contains(key) {
-                    if keys.len() == MAX_AUTHORITY_KEYS {
-                        keys_over_cap = true;
+/// Per-item aggregation at today's (bucket, row key) x authority-key grain,
+/// fed one request at a time so nothing grows with the request count. Groups
+/// are capped by the rows the item can carry (more could never reproduce), and
+/// each group by `MAX_AUTHORITY_KEYS` plus the untagged entry: keys past the
+/// cap fold into untagged as they arrive, before any encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Grouping {
+    groups: BTreeMap<String, BTreeMap<RowKey, RowGroup>>,
+    group_count: usize,
+    max_groups: usize,
+    keys: BTreeSet<AuthorityKey>,
+    keys_over_cap: bool,
+    failed: Option<Ineligible>,
+}
+
+impl Grouping {
+    pub(crate) fn new(max_groups: usize) -> Self {
+        Self {
+            groups: BTreeMap::new(),
+            group_count: 0,
+            max_groups,
+            keys: BTreeSet::new(),
+            keys_over_cap: false,
+            failed: None,
+        }
+    }
+
+    pub(super) fn add(
+        &mut self,
+        bucket_start: &str,
+        row_key: &RowKey,
+        usage: &UsageTotals,
+        identity: IdentityRef<'_>,
+    ) {
+        if self.failed.is_some() {
+            return;
+        }
+        if !self
+            .groups
+            .get(bucket_start)
+            .is_some_and(|rows| rows.contains_key(row_key))
+        {
+            if self.group_count == self.max_groups {
+                self.failed = Some(Ineligible::RowsNotReproduced);
+                return;
+            }
+            self.group_count += 1;
+            self.groups
+                .entry(bucket_start.to_string())
+                .or_default()
+                .insert(row_key.clone(), RowGroup::default());
+        }
+        let group = self
+            .groups
+            .get_mut(bucket_start)
+            .and_then(|rows| rows.get_mut(row_key))
+            .expect("group was just ensured");
+        if group.total.add(usage).is_none() {
+            self.failed = Some(Ineligible::RowsNotReproduced);
+            return;
+        }
+        let key = match identity {
+            IdentityRef::Tagged(key) if !self.keys_over_cap => {
+                // At most `MAX_AUTHORITY_KEYS` keys: scan before copying one.
+                if !self.keys.iter().any(|known| key.matches(known)) {
+                    if self.keys.len() == MAX_AUTHORITY_KEYS {
+                        self.keys_over_cap = true;
                     } else {
-                        keys.insert(key.clone());
+                        self.keys.insert(key.to_key());
                     }
                 }
-                (!keys_over_cap).then(|| key.clone())
+                (!self.keys_over_cap).then_some(key)
             }
-            RequestIdentity::Tagged(_) => None,
-            RequestIdentity::Missing => None,
-            RequestIdentity::Refused(_) => {
+            IdentityRef::Tagged(_) => None,
+            IdentityRef::Missing => None,
+            IdentityRef::Refused(_) => {
                 group.refused = true;
                 None
             }
         };
-        group
+        let amounts = match group
             .by_key
-            .entry(key)
-            .or_default()
-            .add(&contribution.usage)
-            .ok_or(Ineligible::RowsNotReproduced)?;
+            .iter_mut()
+            .find(|(existing, _)| match (existing, key) {
+                (None, None) => true,
+                (Some(existing), Some(key)) => key.matches(existing),
+                _ => false,
+            }) {
+            Some((_, amounts)) => amounts,
+            None => group.by_key.entry(key.map(KeyRef::to_key)).or_default(),
+        };
+        if amounts.add(usage).is_none() {
+            self.failed = Some(Ineligible::RowsNotReproduced);
+        }
     }
 
+    fn get(&self, bucket_start: &str, row_key: &RowKey) -> Option<&RowGroup> {
+        self.groups.get(bucket_start)?.get(row_key)
+    }
+
+    fn rows(&self) -> impl Iterator<Item = (&RowKey, &RowGroup)> {
+        self.groups.values().flatten()
+    }
+}
+
+/// The bucket rows an item carries: the most groups that could reproduce it.
+fn bucket_row_count(item: &SnapshotItem) -> usize {
+    item.usage_buckets
+        .iter()
+        .map(|bucket| bucket.model_usage.len())
+        .sum()
+}
+
+/// Tag `item` from materialized requests: the W0 builder oracle (tests only).
+#[cfg(test)]
+pub(crate) fn apply(
+    item: &mut SnapshotItem,
+    contributions: &[Contribution],
+) -> Result<Tagged, Ineligible> {
+    let mut grouping = Grouping::new(bucket_row_count(item));
+    for contribution in contributions {
+        grouping.add(
+            &contribution.bucket_start,
+            &contribution.row_key,
+            &contribution.usage,
+            contribution.identity.as_ref(),
+        );
+    }
+    apply_grouped(item, grouping)
+}
+
+/// Tag `item` from its aggregated requests. Returns `Err` when the item must
+/// stay on today's path (it is left unchanged). On success the item carries the
+/// new collector, the tagged or fallback shape, and a fresh fingerprint.
+pub(crate) fn apply_grouped(
+    item: &mut SnapshotItem,
+    mut grouping: Grouping,
+) -> Result<Tagged, Ineligible> {
+    if let Some(ineligible) = grouping.failed {
+        return Err(ineligible);
+    }
     // Every bucket row must be reproduced exactly, and nothing may be left over.
     let mut matched = 0_usize;
     for bucket in &item.usage_buckets {
         for row in &bucket.model_usage {
             let key = row_key_from_model_usage(row);
-            let group = groups
-                .get(&(bucket.bucket_start.as_str(), &key))
+            let group = grouping
+                .get(&bucket.bucket_start, &key)
                 .ok_or(Ineligible::RowsNotReproduced)?;
             reproduces(row, &group.total)?;
             matched += 1;
         }
     }
-    if matched != groups.len() {
+    if matched != grouping.group_count {
         return Err(Ineligible::RowsNotReproduced);
     }
+    let keys_over_cap = grouping.keys_over_cap;
     // Top-level rows must equal the per-key sum of their bucket rows.
     let mut top_groups: BTreeMap<&RowKey, Amounts> = BTreeMap::new();
-    for ((_, row_key), group) in &groups {
+    for (row_key, group) in grouping.rows() {
         top_groups
             .entry(row_key)
             .or_default()
@@ -354,7 +456,7 @@ pub(crate) fn apply(
     }
 
     // A row whose app-reported money cannot be split per request stays untagged.
-    for group in groups.values_mut() {
+    for group in grouping.groups.values_mut().flat_map(BTreeMap::values_mut) {
         let unsplittable =
             (0..5).any(|index| group.total.wire(index).is_some()) && group.total.cost_missing;
         if unsplittable && group.by_key.keys().any(Option::is_some) {
@@ -364,17 +466,17 @@ pub(crate) fn apply(
         }
     }
 
-    let evidence = groups
-        .values()
-        .flat_map(|group| group.by_key.keys().flatten())
+    let evidence = grouping
+        .rows()
+        .flat_map(|(_, group)| group.by_key.keys().flatten())
         .map(AuthorityKey::evidence)
         .collect::<BTreeSet<_>>();
     if evidence.len() > MAX_EVIDENCE_ENTRIES {
         over_cap.insert(OverCap::EvidenceEntries);
     }
-    let used_keys = groups
-        .values()
-        .flat_map(|group| group.by_key.keys().flatten())
+    let used_keys = grouping
+        .rows()
+        .flat_map(|(_, group)| group.by_key.keys().flatten())
         .collect::<BTreeSet<_>>();
     if used_keys.len() > MAX_AUTHORITY_KEYS {
         over_cap.insert(OverCap::AuthorityKeys);
@@ -391,7 +493,9 @@ pub(crate) fn apply(
         let mut rows = Vec::with_capacity(bucket.model_usage.len());
         for row in &bucket.model_usage {
             let key = row_key_from_model_usage(row);
-            let group = &groups[&(bucket.bucket_start.as_str(), &key)];
+            let group = grouping
+                .get(&bucket.bucket_start, &key)
+                .expect("every bucket row was matched");
             if group.refused {
                 refusals = refusals.saturating_add(1);
             }
@@ -410,8 +514,8 @@ pub(crate) fn apply(
     for row in &item.model_usage {
         let key = row_key_from_model_usage(row);
         let mut by_key: BTreeMap<Option<AuthorityKey>, Amounts> = BTreeMap::new();
-        for ((_, row_key), group) in &groups {
-            if **row_key == key {
+        for (row_key, group) in grouping.rows() {
+            if *row_key == key {
                 for (authority, amounts) in &group.by_key {
                     by_key
                         .entry(authority.clone())
@@ -821,10 +925,10 @@ pub(crate) fn note_marker_line(
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum MarkerVerdict {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MarkerVerdict<'m> {
     None,
-    Trusted(String),
+    Trusted(&'m str),
     Overflow,
     UntrustedFlip,
     BadOrg,
@@ -832,7 +936,7 @@ pub(crate) enum MarkerVerdict {
 
 impl OrgMarkers {
     /// The marker governing the response with `sequence`, by line order only.
-    pub(crate) fn verdict(&self, sequence: u64, desktop: bool) -> MarkerVerdict {
+    pub(crate) fn verdict(&self, sequence: u64, desktop: bool) -> MarkerVerdict<'_> {
         if self.overflowed {
             return MarkerVerdict::Overflow;
         }
@@ -847,7 +951,7 @@ impl OrgMarkers {
         match &marker.org {
             None => MarkerVerdict::BadOrg,
             Some(_) if !desktop && !marker.terminal_trusted => MarkerVerdict::UntrustedFlip,
-            Some(org) => MarkerVerdict::Trusted(org.clone()),
+            Some(org) => MarkerVerdict::Trusted(org),
         }
     }
 }
@@ -873,11 +977,12 @@ pub(crate) struct ScanEvidence<'a> {
     /// supplies none (pending is unproven; young missing requests stay missing)
     /// until SESSION rules on one. Only tests can populate this.
     pending_writer_witnesses: BTreeSet<String>,
-    /// The login of each unique telemetry row that passed `valid_login`,
-    /// checked once here (its fingerprint included) and reused by `classify`.
-    logins: BTreeMap<(&'a str, &'a str), &'a str>,
-    /// (login, org) pairs proven by complete telemetry request identity.
-    pub(crate) memberships: BTreeSet<(String, String)>,
+    /// Unique telemetry rows that failed `valid_login`. Every unique row is
+    /// checked once here (its fingerprint included); `classify` reuses the
+    /// verdict, and a passing row's login is its `account_identifier_hash`.
+    invalid_logins: BTreeSet<(&'a str, &'a str)>,
+    /// Orgs per login, proven by complete telemetry request identity.
+    pub(crate) memberships: BTreeMap<String, BTreeSet<String>>,
     /// Desktop store logins per org, present only under a valid census witness.
     pub(crate) desktop_census: Option<DesktopCensus>,
 }
@@ -914,16 +1019,20 @@ impl<'a> ScanEvidence<'a> {
         for (&key, row) in &evidence.requests {
             let Some(row) = row else { continue };
             let Some(login) = valid_login(row, key.0) else {
+                evidence.invalid_logins.insert(key);
                 continue;
             };
-            evidence.logins.insert(key, login);
             if let Some(org) = row
                 .request_identity
                 .as_ref()
                 .filter(|identity| identity.disposition == ClaudeIdentityDisposition::Complete)
                 .and_then(|identity| organization_hash(identity).ok().flatten())
             {
-                evidence.memberships.insert((login.to_string(), org));
+                evidence
+                    .memberships
+                    .entry(login.to_string())
+                    .or_default()
+                    .insert(org.to_string());
             }
         }
         for (root, rows) in &trace.evidence {
@@ -947,15 +1056,15 @@ impl<'a> ScanEvidence<'a> {
 }
 
 /// `Ok(None)` = no organization observed; `Err` = present but conflicting or invalid.
-fn organization_hash(identity: &ClaudeRequestIdentityEvidence) -> Result<Option<String>, ()> {
+fn organization_hash(identity: &ClaudeRequestIdentityEvidence) -> Result<Option<&str>, ()> {
     let org = &identity.organization;
     match org.disposition {
         ClaudeIdentityDisposition::Missing => Ok(None),
         ClaudeIdentityDisposition::Invalid | ClaudeIdentityDisposition::Conflict => Err(()),
         ClaudeIdentityDisposition::Complete => org
             .log_record_hash
-            .clone()
-            .or_else(|| org.resource_hash.clone())
+            .as_deref()
+            .or(org.resource_hash.as_deref())
             .filter(|hash| hash_is_valid(hash))
             .map(Some)
             .ok_or(()),
@@ -1011,7 +1120,7 @@ pub(crate) struct RequestFacts<'a> {
     /// Original terminal clock from the transcript; `None` for telemetry-only requests.
     pub(crate) terminal_unix_seconds: Option<u64>,
     pub(crate) event_clock_complete: bool,
-    pub(crate) marker: MarkerVerdict,
+    pub(crate) marker: MarkerVerdict<'a>,
     pub(crate) desktop: bool,
     pub(crate) scan_unix_seconds: Option<u64>,
 }
@@ -1034,8 +1143,82 @@ impl RequestFacts<'_> {
     }
 }
 
+/// A borrowed authority key: classification builds no strings; a `Grouping`
+/// copies one only when it admits a new key (at most 16 per item).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeyRef<'k> {
+    login: Option<&'k str>,
+    org: Option<&'k str>,
+    basis: &'static str,
+}
+
+impl KeyRef<'_> {
+    fn matches(&self, key: &AuthorityKey) -> bool {
+        self.basis == key.basis
+            && self.login == key.login.as_deref()
+            && self.org == key.org.as_deref()
+    }
+
+    fn to_key(self) -> AuthorityKey {
+        AuthorityKey {
+            login: self.login.map(str::to_string),
+            org: self.org.map(str::to_string),
+            basis: self.basis,
+        }
+    }
+}
+
+#[cfg(test)]
+impl AuthorityKey {
+    fn as_ref(&self) -> KeyRef<'_> {
+        KeyRef {
+            login: self.login.as_deref(),
+            org: self.org.as_deref(),
+            basis: self.basis,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdentityRef<'k> {
+    Tagged(KeyRef<'k>),
+    Missing,
+    Refused(Refusal),
+}
+
+#[cfg(test)]
+impl RequestIdentity {
+    pub(crate) fn as_ref(&self) -> IdentityRef<'_> {
+        match self {
+            RequestIdentity::Tagged(key) => IdentityRef::Tagged(key.as_ref()),
+            RequestIdentity::Missing => IdentityRef::Missing,
+            RequestIdentity::Refused(refusal) => IdentityRef::Refused(*refusal),
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<IdentityRef<'_>> for RequestIdentity {
+    fn from(identity: IdentityRef<'_>) -> Self {
+        match identity {
+            IdentityRef::Tagged(key) => RequestIdentity::Tagged(key.to_key()),
+            IdentityRef::Missing => RequestIdentity::Missing,
+            IdentityRef::Refused(refusal) => RequestIdentity::Refused(refusal),
+        }
+    }
+}
+
+/// Owned classification, for the ruling tests.
+#[cfg(test)]
 pub(crate) fn classify(evidence: &ScanEvidence<'_>, facts: &RequestFacts<'_>) -> RequestIdentity {
-    use RequestIdentity::{Missing, Refused, Tagged};
+    classify_ref(evidence, facts).into()
+}
+
+pub(crate) fn classify_ref<'k>(
+    evidence: &'k ScanEvidence<'_>,
+    facts: &RequestFacts<'k>,
+) -> IdentityRef<'k> {
+    use IdentityRef::{Missing, Refused, Tagged};
     if evidence.unhealthy_roots.contains(facts.root) {
         // Unreadable stronger evidence never falls through (W0 CLS-refused-truncated).
         return Refused(Refusal::IncompleteEvidence);
@@ -1054,8 +1237,15 @@ pub(crate) fn classify(evidence: &ScanEvidence<'_>, facts: &RequestFacts<'_>) ->
             };
         }
     };
-    let Some(&login) = evidence.logins.get(&(facts.root, facts.request_id)) else {
-        return Refused(Refusal::InvalidEvidence);
+    let login = match row.account_identifier_hash.as_deref() {
+        Some(login)
+            if !evidence
+                .invalid_logins
+                .contains(&(facts.root, facts.request_id)) =>
+        {
+            login
+        }
+        _ => return Refused(Refusal::InvalidEvidence),
     };
     match evidence.owners.get(&(facts.root, facts.request_id)) {
         Some(None) => return Refused(Refusal::ConflictingDuplicate),
@@ -1084,9 +1274,8 @@ pub(crate) fn classify(evidence: &ScanEvidence<'_>, facts: &RequestFacts<'_>) ->
             Err(()) => return Refused(Refusal::ContradictoryOrg),
         },
     };
-    let login = login.to_string();
     if let Some(org) = telemetry_org {
-        return Tagged(AuthorityKey {
+        return Tagged(KeyRef {
             login: Some(login),
             org: Some(org),
             basis: TELEMETRY,
@@ -1094,15 +1283,18 @@ pub(crate) fn classify(evidence: &ScanEvidence<'_>, facts: &RequestFacts<'_>) ->
     }
     // Login-only telemetry: a trusted marker org joins only when it is an
     // established org of that login; otherwise today's login rule.
-    let org = match &facts.marker {
+    let org = match facts.marker {
         MarkerVerdict::Trusted(org)
-            if evidence.memberships.contains(&(login.clone(), org.clone())) =>
+            if evidence
+                .memberships
+                .get(login)
+                .is_some_and(|orgs| orgs.contains(org)) =>
         {
-            Some(org.clone())
+            Some(org)
         }
         _ => None,
     };
-    Tagged(AuthorityKey {
+    Tagged(KeyRef {
         login: Some(login),
         org,
         basis: TELEMETRY_LOGIN,
@@ -1110,18 +1302,16 @@ pub(crate) fn classify(evidence: &ScanEvidence<'_>, facts: &RequestFacts<'_>) ->
 }
 
 /// Transcript bases for a request with no telemetry row (email stays off).
-fn transcript_identity(
-    evidence: &ScanEvidence<'_>,
-    facts: &RequestFacts<'_>,
-) -> Option<RequestIdentity> {
-    let org = match &facts.marker {
+fn transcript_identity<'k>(
+    evidence: &'k ScanEvidence<'_>,
+    facts: &RequestFacts<'k>,
+) -> Option<IdentityRef<'k>> {
+    let org = match facts.marker {
         MarkerVerdict::None => return None,
-        MarkerVerdict::Overflow => return Some(RequestIdentity::Refused(Refusal::MarkerOverflow)),
-        MarkerVerdict::UntrustedFlip => {
-            return Some(RequestIdentity::Refused(Refusal::UntrustedFlip))
-        }
-        MarkerVerdict::BadOrg => return Some(RequestIdentity::Refused(Refusal::ContradictoryOrg)),
-        MarkerVerdict::Trusted(org) => org.clone(),
+        MarkerVerdict::Overflow => return Some(IdentityRef::Refused(Refusal::MarkerOverflow)),
+        MarkerVerdict::UntrustedFlip => return Some(IdentityRef::Refused(Refusal::UntrustedFlip)),
+        MarkerVerdict::BadOrg => return Some(IdentityRef::Refused(Refusal::ContradictoryOrg)),
+        MarkerVerdict::Trusted(org) => org,
     };
     let sole_login = facts
         .desktop
@@ -1132,16 +1322,16 @@ fn transcript_identity(
                 .terminal_unix_seconds
                 .is_some_and(|at| census.completed_at_unix_seconds >= at)
         })
-        .and_then(|census| census.logins_by_org.get(&org))
+        .and_then(|census| census.logins_by_org.get(org))
         .filter(|logins| logins.len() == 1)
-        .and_then(|logins| logins.first().cloned());
-    Some(RequestIdentity::Tagged(match sole_login {
-        Some(login) => AuthorityKey {
+        .and_then(|logins| logins.first());
+    Some(IdentityRef::Tagged(match sole_login {
+        Some(login) => KeyRef {
             login: Some(login),
             org: Some(org),
             basis: TRANSCRIPT_SOLE_LOGIN,
         },
-        None => AuthorityKey {
+        None => KeyRef {
             login: None,
             org: Some(org),
             basis: TRANSCRIPT_ORG,
@@ -1237,17 +1427,85 @@ pub(super) fn desktop_census_at(index: &ScanIndex, now: u64) -> Option<DesktopCe
 
 // --- Scan integration -----------------------------------------------------
 
-/// Where one reported request landed in `rebuild_claude_reported_usage`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Placement {
-    pub(super) request_id: String,
-    pub(super) bucket_start: String,
-    pub(super) row_key: RowKey,
-    pub(super) usage: UsageTotals,
+/// One counted request as today's row builder placed it.
+pub(super) struct Request<'r> {
+    pub(super) request_id: &'r str,
     /// (response sequence, original event clock) of the owned transcript
     /// occurrence; `None` for an auxiliary telemetry-only request.
     pub(super) occurrence: Option<(u64, bool)>,
-    pub(super) timestamp: String,
+    pub(super) timestamp: &'r str,
+    pub(super) bucket_start: &'r str,
+    pub(super) row_key: &'r RowKey,
+    pub(super) usage: &'r UsageTotals,
+}
+
+/// Classifies one item's requests as the row builder produces them and folds
+/// each straight into a bounded `Grouping`; no request is retained.
+pub(crate) struct RequestSink<'s, 'a> {
+    evidence: &'s ScanEvidence<'a>,
+    root: String,
+    desktop: bool,
+    scan_unix_seconds: Option<u64>,
+    grouping: Grouping,
+}
+
+impl<'s, 'a> RequestSink<'s, 'a> {
+    /// `None` when the item has no request-owner root (never tagged).
+    pub(crate) fn for_item(
+        evidence: &'s ScanEvidence<'a>,
+        item: &SnapshotItem,
+        max_groups: usize,
+    ) -> Option<Self> {
+        Some(Self {
+            evidence,
+            root: owner_root(item)?.to_string(),
+            desktop: item
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.entrypoint.as_deref())
+                == Some("claude-desktop"),
+            scan_unix_seconds: rfc3339_unix_seconds(&item.collected_at),
+            grouping: Grouping::new(max_groups),
+        })
+    }
+
+    pub(super) fn add(&mut self, item: &SnapshotItem, request: Request<'_>) {
+        if self.grouping.failed.is_some() {
+            return;
+        }
+        let (sequence, event_clock_complete) = request.occurrence.unzip();
+        let facts = RequestFacts {
+            root: &self.root,
+            source_session_id: &item.source_session_id,
+            request_id: request.request_id,
+            // Auxiliary (telemetry-only) rows carry `observed_at`, which v2
+            // OTLP capture may have taken from the observer clock and does not
+            // record which; as in D1 they cannot qualify. The trace span start
+            // is event-origin but no existing rule qualifies it, and transcript
+            // clocks are not theirs to borrow.
+            terminal_unix_seconds: request
+                .occurrence
+                .and_then(|_| rfc3339_unix_seconds(request.timestamp)),
+            event_clock_complete: event_clock_complete.unwrap_or(false),
+            marker: match (item.claude_org_markers.as_deref(), sequence) {
+                (Some(markers), Some(sequence)) => markers.verdict(sequence, self.desktop),
+                _ => MarkerVerdict::None,
+            },
+            desktop: self.desktop,
+            scan_unix_seconds: self.scan_unix_seconds,
+        };
+        let identity = classify_ref(self.evidence, &facts);
+        self.grouping.add(
+            request.bucket_start,
+            request.row_key,
+            request.usage,
+            identity,
+        );
+    }
+
+    pub(crate) fn finish(self) -> Grouping {
+        self.grouping
+    }
 }
 
 /// Per-pass counts; local only.
@@ -1260,31 +1518,58 @@ pub(crate) struct ScanOutcome {
 
 const REPORTED: &str = "session_exclusive_reported_usage:v1";
 
-/// Transcript-path placements rebuilt from the owned occurrences the parser
-/// already retains. `None` when one cannot be placed the way rows were built.
-fn transcript_placements(item: &SnapshotItem, mut place: impl FnMut(Placement)) -> Option<()> {
+/// Transcript-path requests, from the owned occurrences the parser already
+/// retains, placed the way rows were built. `None` when one cannot be, or when
+/// they need more distinct buckets or row keys than the item carries (such an
+/// item can never reproduce). Each distinct bucket and row key is built once.
+fn transcript_requests(item: &SnapshotItem, mut place: impl FnMut(Request<'_>)) -> Option<()> {
     if item.claude_usage_occurrences.len() != item.claude_usage_request_ids.len() {
         return None;
     }
+    let mut buckets: BTreeMap<i64, String> = BTreeMap::new();
+    let mut rows: Vec<(&str, &SelectorCapture, Option<&str>, RowKey)> = Vec::new();
     for (request_id, occurrence) in &item.claude_usage_occurrences {
         if occurrence.usage.is_zero() {
             continue;
         }
-        let timestamp = occurrence.timestamp.clone()?;
+        let timestamp = occurrence.timestamp.as_deref()?;
         let model = occurrence.model.as_deref()?;
-        let (bucket_start, _) = activity_bucket_from_timestamp(&timestamp)?;
-        let (row_key, _, _) = build_row_identity(
-            model,
-            &occurrence.selector,
-            occurrence.reasoning_effort.as_deref(),
-        );
-        place(Placement {
-            request_id: request_id.clone(),
-            bucket_start,
-            row_key,
-            usage: occurrence.usage.clone(),
+        let hour = OffsetDateTime::parse(timestamp, &Rfc3339)
+            .ok()?
+            .unix_timestamp()
+            .div_euclid(3600);
+        if !buckets.contains_key(&hour) {
+            if buckets.len() == item.usage_buckets.len() {
+                return None;
+            }
+            buckets.insert(hour, activity_bucket_from_timestamp(timestamp)?.0);
+        }
+        let selector = &*occurrence.selector;
+        let effort = occurrence.reasoning_effort.as_deref();
+        let row = match rows.iter().position(|(m, s, e, _)| {
+            *m == model && (std::ptr::eq(*s, selector) || **s == *selector) && *e == effort
+        }) {
+            Some(row) => row,
+            None => {
+                if rows.len() == item.model_usage.len() {
+                    return None;
+                }
+                rows.push((
+                    model,
+                    selector,
+                    effort,
+                    build_row_identity(model, selector, effort).0,
+                ));
+                rows.len() - 1
+            }
+        };
+        place(Request {
+            request_id,
             occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
             timestamp,
+            bucket_start: &buckets[&hour],
+            row_key: &rows[row].3,
+            usage: &occurrence.usage,
         });
     }
     Some(())
@@ -1304,17 +1589,18 @@ fn owner_root(item: &SnapshotItem) -> Option<&str> {
 
 /// Tag every eligible Claude item of this pass. Runs before D1, which leaves
 /// new-collector items alone; ineligible items stay on today's path untouched.
+/// `reported` holds the groupings the reported rebuild produced this pass.
 pub(crate) fn apply_scan(
     snapshots: &mut [SnapshotItem],
     evidence: &ScanEvidence<'_>,
-    mut placements: BTreeMap<String, Vec<Placement>>,
+    mut reported: BTreeMap<String, Grouping>,
 ) -> ScanOutcome {
     let mut outcome = ScanOutcome::default();
     for item in snapshots {
         if item.provenance.collector != "claude_code_jsonl" {
             continue;
         }
-        match tag_item(item, evidence, &mut placements) {
+        match tag_item(item, evidence, &mut reported) {
             Some(Ok(Tagged::Sent { .. })) => outcome.sent += 1,
             Some(Ok(Tagged::Fallback { .. })) => outcome.fallback += 1,
             Some(Err(_)) | None => outcome.ineligible += 1,
@@ -1326,9 +1612,9 @@ pub(crate) fn apply_scan(
 fn tag_item(
     item: &mut SnapshotItem,
     evidence: &ScanEvidence<'_>,
-    reported: &mut BTreeMap<String, Vec<Placement>>,
+    reported: &mut BTreeMap<String, Grouping>,
 ) -> Option<Result<Tagged, Ineligible>> {
-    let root = owner_root(item)?.to_string();
+    let root = owner_root(item)?;
     if !item.claude_context_curve_request_index_complete
         || claude_snapshot_request_id_hashes(item).is_none()
         || item
@@ -1347,61 +1633,13 @@ fn tag_item(
     {
         return None;
     }
-    let desktop = item
-        .origin
-        .as_ref()
-        .and_then(|origin| origin.entrypoint.as_deref())
-        == Some("claude-desktop");
-    let scan_unix_seconds = rfc3339_unix_seconds(&item.collected_at);
-    let markers = item.claude_org_markers.as_deref();
-    // Placements are consumed: each request's row data moves into its
-    // contribution, and transcript placements are never collected at all.
-    let reported = if item.usage_accounting_contract.as_deref() == Some(REPORTED) {
-        Some(reported.remove(&item.source_session_id)?)
+    let grouping = if item.usage_accounting_contract.as_deref() == Some(REPORTED) {
+        reported.remove(&item.source_session_id)?
     } else {
-        None
+        let mut sink = RequestSink::for_item(evidence, item, bucket_row_count(item))?;
+        transcript_requests(item, |request| sink.add(item, request))?;
+        sink.finish()
     };
-    let mut contributions = Vec::with_capacity(
-        reported
-            .as_ref()
-            .map_or(item.claude_usage_occurrences.len(), Vec::len),
-    );
-    let mut contribute = |placement: Placement| {
-        contributions.push({
-            let (sequence, event_clock_complete) = placement.occurrence.unzip();
-            let facts = RequestFacts {
-                root: &root,
-                source_session_id: &item.source_session_id,
-                request_id: &placement.request_id,
-                // Auxiliary (telemetry-only) rows carry `observed_at`, which
-                // v2 OTLP capture may have taken from the observer clock and
-                // does not record which; as in D1 they cannot qualify. The
-                // trace span start is event-origin but no existing rule
-                // qualifies it, and transcript clocks are not theirs to borrow.
-                terminal_unix_seconds: placement
-                    .occurrence
-                    .and_then(|_| rfc3339_unix_seconds(&placement.timestamp)),
-                event_clock_complete: event_clock_complete.unwrap_or(false),
-                marker: match (markers, sequence) {
-                    (Some(markers), Some(sequence)) => markers.verdict(sequence, desktop),
-                    _ => MarkerVerdict::None,
-                },
-                desktop,
-                scan_unix_seconds,
-            };
-            let identity = classify(evidence, &facts);
-            Contribution {
-                bucket_start: placement.bucket_start,
-                row_key: placement.row_key,
-                usage: placement.usage,
-                identity,
-            }
-        });
-    };
-    match reported {
-        Some(placements) => placements.into_iter().for_each(&mut contribute),
-        None => transcript_placements(item, &mut contribute)?,
-    }
     // D1 leaves new-collector items alone, so the backend UTC lifecycle
     // spelling it applies to every item it qualifies happens here, inside the
     // byte cap; an ineligible item returns to D1 exactly as it arrived.
@@ -1411,7 +1649,7 @@ fn tag_item(
         item.source_last_activity_at.clone(),
     );
     normalize_activity(item);
-    let tagged = apply(item, &contributions);
+    let tagged = apply_grouped(item, grouping);
     if tagged.is_err() {
         (
             item.source_started_at,

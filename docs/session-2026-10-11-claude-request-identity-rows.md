@@ -20,22 +20,31 @@ Old collectors keep their exact bytes and hashes.
 ## Emission is off
 
 `claude_request_identity::EMISSION_ENABLED` is `false`. A released daemon
-captures no markers, records no placements and emits no contract-5 body. The
+captures no markers, classifies and groups no requests, and emits no
+contract-5 body. The
 scan hook and every new field stay inert until a compatible receiver is
 confirmed, and flipping the constant is a separate change. Tests exercise the
 same code through `capture_enabled()` (`cfg(test)`).
 
 ## How tagging works
 
-- Rows are built exactly as today. Afterwards, each counted request is
-  classified and the rows are regrouped per request. The item is tagged only
-  if that regrouping reproduces every bucket and top-level row exactly:
-  counts, and money folded the way today's rows fold it. Otherwise the item
-  stays on today's path unchanged.
-- **Transcript path:** placements come from the owned usage occurrences the
-  parser already retains.
-- **Reported path:** `rebuild_claude_reported_usage` optionally records where
-  each request landed. This does not change its output.
+- Rows are built exactly as today. Each counted request is classified as it
+  is placed and folded straight into a bounded per-item grouping, at today's
+  (bucket, row key) x authority-key grain. No request is retained.
+  - Groups are capped by the rows the item carries. More groups could never
+    reproduce, so construction stops there.
+  - Each group holds at most 16 authority keys plus the untagged entry. Keys
+    past the cap fold into untagged as they arrive, before anything is
+    encoded.
+  - The item is tagged only if the grouping reproduces every bucket and
+    top-level row exactly: counts, and money folded the way today's rows fold
+    it. Otherwise the item stays on today's path unchanged.
+- **Transcript path:** requests stream from the owned usage occurrences the
+  parser already retains. Each distinct bucket and row key is built once.
+- **Reported path:** `rebuild_claude_reported_usage` hands each request to the
+  grouping as it places it. This does not change its output.
+- An item whose request count includes auxiliary (telemetry-only) requests
+  fails the existing request-id precondition and keeps today's bytes.
 - **Classification:**
   - Telemetry wins: login plus organization from complete request identity.
     Login-only telemetry joins a trusted transcript organization only when
@@ -100,7 +109,8 @@ same code through `capture_enabled()` (`cfg(test)`).
 - The daemon's own component hashing reproduces `usage_accounting`,
   `attribution` and the identity leaf for all 63 bodies.
 - Typed rows serialize to the exact wire members.
-- From per-request contributions, the builder re-emits every tagged body:
+- From per-request contributions (a test-only oracle feeding the same
+  grouping), the builder re-emits every tagged body:
   - identical bytes for canonical bodies;
   - an identical hash leaf for intentionally reordered ones.
 - The cap rule reproduces the fallback bodies.
@@ -110,43 +120,49 @@ same code through `capture_enabled()` (`cfg(test)`).
   - the census witness;
   - money exactness and unsplittable reported money;
   - order-free hashing that still moves with the login;
-  - both usage paths end to end;
+  - both usage paths end to end, including the real reported rebuild (output
+    unchanged with or without identity) and an auxiliary-row item;
+  - a grouping that retains the same heap for 1,000 and 10,000 requests, folds
+    keys past the cap, and stops at the item's rows;
   - unqualified items keeping today's bytes.
 - Equal-input end-to-end comparison (debug build, synthetic: 2,000 responses,
   2 logins, 64 markers, parsed once). Both paths start from the same parsed
   items and the same loaded sidecar reports. The transcript is deleted first,
   so neither path can re-read it. Legacy is today's request-account
-  qualification. Enabled is contract-5 evidence, tagging, then that same
-  qualification, then admission.
+  qualification. Enabled is contract-5 evidence, streamed tagging,
+  request-account qualification over the shared request index, then
+  admission.
 
   | Measure | Legacy | Enabled |
   |---|---|---|
-  | Wall time | about 143 ms | about 187 ms |
+  | Wall time (3 runs, noisy) | 145-212 ms | 155-181 ms |
   | Sidecar fingerprint checks (api, trace) | 2,000, 2,000 | 2,000, 2,000 |
-  | Allocations | 64,226 | 113,719 |
-  | Peak requested heap | 0.52 MB | 1.98 MB |
+  | Allocations | 64,226 | 66,826 (+4%) |
+  | Peak requested heap | 518,112 B | 526,920 B (+8.6 KB) |
   | Retained heap after | 31 B | 6.4 KB |
   | Item payload | 6.7 KB | 13.8 KB |
 
   Marker capture during the parse adds about 2 ms, 573 allocations and
-  6.6 KB retained for 2,063 lines.
+  6.6 KB retained for 2,063 lines. The test asserts equal fingerprint checks,
+  peak within 64 KiB and allocations within 5% of legacy.
 
-  - Request-account qualification leaves the tagged item alone, and contract 5
-    validates each login once and reuses it. So enabled repeats no
-    fingerprint check.
-  - Tagging installs in place, without copying the item, and moves each
-    request's placement into its contribution.
-  - The remaining peak is the per-request contribution buffer (544 B per
-    request) plus the scan's own request maps. Folding contributions straight
-    into row groups would make it proportional to rows instead of requests.
-    That is a recorded follow-up.
+  - Classification builds no strings: keys are borrowed, and a grouping copies
+    one only when it admits it.
+  - Contract 5 validates each login once. Request-account qualification
+    reuses the request/owner index contract 5 already built and leaves tagged
+    items alone.
+  - Tagging installs in place, without copying the item.
+  - What remains is per item, not per request: byte-cap encoding, install,
+    the fingerprint, and the admission witness. Retained growth is the larger
+    tagged payload.
 - With emission off, released builds still pay for:
   - 8 B per `SnapshotItem` and accumulator (`claude_org_markers`, always
     `None`);
   - 40 B in `ScanIndex` for the census witness slot. Dark builds keep it
     `None`: they neither compute nor persist a witness, and they clear one
     left by an earlier build at the next Desktop sweep;
-  - an empty placement map in the reported-usage disposition and a `None`
-    check per rebuilt row;
-  - two constant-false branches.
+  - an empty grouping map in the reported-usage disposition, an `Option`
+    check per rebuilt item and per rebuilt row, and one extra call frame
+    around the reported pass;
+  - constant-false branches.
   These costs are small but not zero.

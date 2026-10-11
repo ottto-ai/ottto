@@ -6,6 +6,7 @@ use crate::snapshots::claude_request_identity::{
 };
 
 const W0_DIR: &str = "../../fixtures/session-identity";
+const D64: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 const LOGIN_A: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
 
 fn w0_path(name: &str) -> PathBuf {
@@ -869,7 +870,7 @@ fn signed(
     row
 }
 
-fn facts<'a>(request_id: &'a str, at: Option<u64>, marker: MarkerVerdict) -> RequestFacts<'a> {
+fn facts<'a>(request_id: &'a str, at: Option<u64>, marker: MarkerVerdict<'a>) -> RequestFacts<'a> {
     RequestFacts {
         root: ROOT,
         source_session_id: ROOT,
@@ -931,7 +932,7 @@ fn classify_follows_the_session_rulings() {
     assert_eq!(
         identity::classify(
             &evidence,
-            &facts("req_login", at, MarkerVerdict::Trusted(org_d.clone()))
+            &facts("req_login", at, MarkerVerdict::Trusted(&org_d))
         ),
         RequestIdentity::Tagged(AuthorityKey {
             login: login.clone(),
@@ -942,7 +943,7 @@ fn classify_follows_the_session_rulings() {
     assert_eq!(
         identity::classify(
             &evidence,
-            &facts("req_login", at, MarkerVerdict::Trusted(org_e.clone()))
+            &facts("req_login", at, MarkerVerdict::Trusted(&org_e))
         ),
         RequestIdentity::Tagged(AuthorityKey {
             login: login.clone(),
@@ -998,7 +999,7 @@ fn classify_follows_the_session_rulings() {
             &facts(
                 "req_old",
                 Some(999_000),
-                MarkerVerdict::Trusted(org_e.clone())
+                MarkerVerdict::Trusted(&org_e)
             )
         ),
         RequestIdentity::Tagged(AuthorityKey {
@@ -1022,7 +1023,7 @@ fn classify_follows_the_session_rulings() {
     assert_eq!(
         identity::classify(
             &unreadable,
-            &facts("req_old", Some(999_000), MarkerVerdict::Trusted(org_e))
+            &facts("req_old", Some(999_000), MarkerVerdict::Trusted(&org_e))
         ),
         RequestIdentity::Refused(Refusal::IncompleteEvidence)
     );
@@ -1043,7 +1044,7 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
         let mut request = facts(
             "req_old",
             Some(999_000),
-            MarkerVerdict::Trusted(org.clone()),
+            MarkerVerdict::Trusted(&org),
         );
         request.desktop = desktop;
         identity::classify(evidence, &request)
@@ -1205,21 +1206,21 @@ fn markers_govern_later_responses_and_distrust_unexplained_flips() {
     let markers = markers.unwrap();
     assert_eq!(
         markers.verdict(0, false),
-        MarkerVerdict::Trusted(org_hash(ORG_1))
+        MarkerVerdict::Trusted(&org_hash(ORG_1))
     );
     assert_eq!(
         markers.verdict(2, false),
-        MarkerVerdict::Trusted(org_hash(ORG_1))
+        MarkerVerdict::Trusted(&org_hash(ORG_1))
     );
     assert_eq!(markers.verdict(3, false), MarkerVerdict::UntrustedFlip);
     assert_eq!(
         markers.verdict(3, true),
-        MarkerVerdict::Trusted(org_hash(ORG_2)),
+        MarkerVerdict::Trusted(&org_hash(ORG_2)),
         "Desktop markers are trusted"
     );
     assert_eq!(
         markers.verdict(9, false),
-        MarkerVerdict::Trusted(org_hash(ORG_1)),
+        MarkerVerdict::Trusted(&org_hash(ORG_1)),
         "flip with a new context"
     );
     let mut none = None;
@@ -1266,7 +1267,7 @@ fn parser_captures_owned_markers_and_never_inherited_ones() {
     let sequence = items[0].claude_usage_occurrences["req_1"].sequence;
     assert_eq!(
         markers.verdict(sequence, false),
-        MarkerVerdict::Trusted(org_hash(ORG_1))
+        MarkerVerdict::Trusted(&org_hash(ORG_1))
     );
     assert!(!serde_json::to_string(&items[0])
         .unwrap()
@@ -1380,13 +1381,37 @@ fn contract5_lifecycle_matches_the_legacy_qualification_path() {
 }
 
 #[test]
-fn reported_path_tags_from_recorded_placements() {
+fn reported_path_tags_from_rebuild_groupings() {
     let (dir, root, mut items) = claude_account_family_fixture();
     items.truncate(1);
-    let item = &items[0];
-    let mut placements = Vec::new();
+    let mut item = items.remove(0);
     let mut api = Vec::new();
-    let mut bucket_rows: BTreeMap<RowKey, UsageTotals> = BTreeMap::new();
+    for request_id in item.claude_usage_occurrences.keys() {
+        let n: u64 = request_id.trim_start_matches("req_").parse().unwrap();
+        let mut row = complete_api_row(&root, request_id, n, 10, 10, 0);
+        if n % 2 == 0 {
+            row.account_identifier_hash = Some("b".repeat(64));
+        }
+        api.push(signed(row));
+    }
+    let trace = api
+        .iter()
+        .map(|row| complete_trace_row(&root, &row.request_id, ""))
+        .collect::<Vec<_>>();
+    item.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".to_string());
+    for row in item.model_usage.iter_mut().chain(
+        item.usage_buckets
+            .iter_mut()
+            .flat_map(|b| b.model_usage.iter_mut()),
+    ) {
+        row.cost_usd = Some(usd_picos_string(
+            100_000_000 * u128::from(row.request_count),
+        ));
+    }
+    let (api, trace) = reports(api, trace);
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    // What `rebuild_claude_reported_usage` feeds the sink, request by request.
+    let mut sink = identity::RequestSink::for_item(&evidence, &item, usize::MAX).unwrap();
     for (request_id, occurrence) in &item.claude_usage_occurrences {
         let (row_key, _, _) = build_row_identity(
             occurrence.model.as_deref().unwrap(),
@@ -1401,42 +1426,21 @@ fn reported_path_tags_from_recorded_placements() {
             total: Some(100_000_000),
             ..Default::default()
         };
-        bucket_rows.entry(row_key.clone()).or_default().add(&usage);
-        placements.push(identity::Placement {
-            request_id: request_id.clone(),
-            bucket_start: "2026-08-02T07:00:00Z".to_string(),
-            row_key,
-            usage,
-            occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
-            timestamp: occurrence.timestamp.clone().unwrap(),
-        });
-        let n: u64 = request_id.trim_start_matches("req_").parse().unwrap();
-        let mut row = complete_api_row(&root, request_id, n, 10, 10, 0);
-        if n % 2 == 0 {
-            row.account_identifier_hash = Some("b".repeat(64));
-        }
-        api.push(signed(row));
+        sink.add(
+            &item,
+            identity::Request {
+                request_id,
+                occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
+                timestamp: occurrence.timestamp.as_deref().unwrap(),
+                bucket_start: "2026-08-02T07:00:00Z",
+                row_key: &row_key,
+                usage: &usage,
+            },
+        );
     }
-    let trace = api
-        .iter()
-        .map(|row| complete_trace_row(&root, &row.request_id, ""))
-        .collect::<Vec<_>>();
-    let mut item = items.remove(0);
-    item.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".to_string());
-    for row in item.model_usage.iter_mut().chain(
-        item.usage_buckets
-            .iter_mut()
-            .flat_map(|b| b.model_usage.iter_mut()),
-    ) {
-        row.cost_usd = Some(usd_picos_string(
-            100_000_000 * u128::from(row.request_count),
-        ));
-    }
-    let (api, trace) = reports(api, trace);
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
-    let placements = BTreeMap::from([(item.source_session_id.clone(), placements)]);
+    let groupings = BTreeMap::from([(item.source_session_id.clone(), sink.finish())]);
     let mut items = vec![item];
-    let outcome = identity::apply_scan(&mut items, &evidence, placements);
+    let outcome = identity::apply_scan(&mut items, &evidence, groupings);
     assert_eq!(outcome.sent, 1, "{outcome:?}");
     let parts = items[0].usage_buckets[0].model_usage[0]
         .identity_parts
@@ -1446,7 +1450,132 @@ fn reported_path_tags_from_recorded_placements() {
     assert!(parts
         .iter()
         .all(|part| part.cost_usd == Some("0.0002".to_string())));
+    // A reported item without this pass's grouping stays on today's path.
+    let mut ungrouped = vec![items[0].clone()];
+    ungrouped[0].provenance.collector = "claude_code_jsonl".to_string();
+    let outcome = identity::apply_scan(&mut ungrouped, &evidence, BTreeMap::new());
+    assert_eq!(outcome.ineligible, 1, "{outcome:?}");
     let _ = fs::remove_dir_all(dir);
+}
+
+/// The real reported rebuild, with and without contract-5 evidence: its own
+/// output is unchanged, each rebuilt item gets a grouping, and tagging then
+/// conserves every count. An item that also counts an auxiliary
+/// (telemetry-only) request fails the existing request-id precondition and
+/// keeps today's bytes.
+#[test]
+fn reported_rebuild_groups_requests_without_changing_its_output() {
+    for with_aux in [false, true] {
+        let (dir, parent, items) = claude_account_family_fixture();
+        let child_agent = "a4d1585d310070d0f";
+        let mut api_rows = (1..=4)
+            .map(|n| signed(complete_api_row(&parent, &format!("req_{n}"), n, 10, 10, 0)))
+            .collect::<Vec<_>>();
+        api_rows.push(signed(complete_api_row(&parent, "req_5", 5, 10, 1, 0)));
+        let mut trace_rows = (1..=4)
+            .map(|n| complete_trace_row(&parent, &format!("req_{n}"), ""))
+            .collect::<Vec<_>>();
+        trace_rows.push(complete_trace_row(&parent, "req_5", child_agent));
+        if with_aux {
+            let mut aux = complete_api_row(&parent, "req_prompt_suggestion", 6, 3, 2, 7);
+            aux.observed_at = "2026-08-02T08:14:00Z".to_string();
+            api_rows.push(signed(aux));
+            trace_rows.push(complete_trace_row(&parent, "req_prompt_suggestion", ""));
+        }
+        let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), api_rows)]),
+            health: Default::default(),
+        };
+        let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), trace_rows)]),
+            ..Default::default()
+        };
+        let index = || {
+            let mut index = ScanIndex::default();
+            index.files.insert(
+                local_index_key(&dir.join(format!("{parent}.jsonl"))),
+                manifest_index_entry(None),
+            );
+            index.files.insert(
+                local_index_key(
+                    &dir.join(&parent)
+                        .join("subagents")
+                        .join(format!("agent-{child_agent}.jsonl")),
+                ),
+                manifest_index_entry(None),
+            );
+            index
+        };
+        let mut plain = items.clone();
+        let plain_disposition = apply_claude_reported_usage_with_index(
+            &mut plain,
+            &api,
+            &trace,
+            &mut index(),
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        assert!(plain_disposition.request_groupings.is_empty());
+        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let mut grouped = items;
+        let mut disposition = apply_claude_reported_usage_with_identity(
+            &mut grouped,
+            &api,
+            &trace,
+            &mut index(),
+            true,
+            "2026-08-02T07:10:00Z",
+            Some(&evidence),
+        );
+        assert_eq!(
+            serde_json::to_vec(&grouped).unwrap(),
+            serde_json::to_vec(&plain).unwrap()
+        );
+        assert!(grouped.iter().all(|item| {
+            item.usage_accounting_contract.as_deref()
+                == Some("session_exclusive_reported_usage:v1")
+        }));
+        assert_eq!(disposition.request_groupings.len(), 2);
+        let before = grouped.clone();
+        let outcome = identity::apply_scan(
+            &mut grouped,
+            &evidence,
+            std::mem::take(&mut disposition.request_groupings),
+        );
+        let expected = if with_aux {
+            identity::ScanOutcome {
+                sent: 1,
+                ineligible: 1,
+                ..Default::default()
+            }
+        } else {
+            identity::ScanOutcome {
+                sent: 2,
+                ..Default::default()
+            }
+        };
+        assert_eq!(outcome, expected, "with_aux={with_aux}");
+        if with_aux {
+            assert_eq!(before[0].request_count, 5);
+            assert_eq!(
+                serde_json::to_vec(&grouped[0]).unwrap(),
+                serde_json::to_vec(&before[0]).unwrap()
+            );
+        }
+        for (tagged, before) in grouped.iter().zip(&before).skip(usize::from(with_aux)) {
+            assert_eq!(tagged.provenance.collector, identity::COLLECTOR);
+            assert_eq!(tagged.request_count, before.request_count);
+            assert_eq!(tagged.input_tokens, before.input_tokens);
+            assert_eq!(tagged.request_identity_refusals, 0);
+            assert_eq!(
+                tagged.usage_buckets[0].model_usage[0]
+                    .account_identifier_hash
+                    .as_deref(),
+                Some("a".repeat(64).as_str())
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 #[test]
@@ -1494,7 +1623,8 @@ fn unreadable_sidecars_refuse_and_unqualified_items_keep_todays_bytes() {
 /// Equal-input end-to-end resource comparison (synthetic, bounded): one
 /// 2,000-response transcript over 10 hours with 2 logins and 64 marker lines,
 /// parsed once. Legacy = today's D1 qualification; enabled = contract-5
-/// evidence + tagging + D1 + admission, as the gated scan runs them, on clones
+/// evidence + streamed tagging + D1 over the shared index + admission, as the
+/// gated scan runs them, on clones
 /// of the same parsed items and the same already-loaded sidecar reports. The
 /// transcript is deleted first, so neither path can re-read it. Released
 /// builds run only the legacy path; marker capture is test-only until the flip.
@@ -1557,7 +1687,14 @@ fn equal_input_resource_comparison() {
     let enabled_path = |items: &mut Vec<SnapshotItem>| {
         let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
         let outcome = identity::apply_scan(items, &evidence, BTreeMap::new());
-        let mut qualification = claude_request_accounts::apply(items, &api, &trace);
+        let mut qualification = claude_request_accounts::apply_with_shared_index(
+            items,
+            &api,
+            &trace,
+            &BTreeMap::new(),
+            &evidence,
+        );
+        drop(evidence);
         for item in items.iter() {
             qualification.mixed.admit_request_identity(item);
         }
@@ -1607,15 +1744,116 @@ fn equal_input_resource_comparison() {
         std::mem::size_of::<Option<identity::DesktopCensusWitness>>(),
     );
     assert_ne!(legacy[0].provenance.collector, identity::COLLECTOR);
+    // D1 over the shared index is D1: same bytes and coverage on today's path.
+    let mut shared = parsed.clone();
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let shared_coverage = claude_request_accounts::apply_with_shared_index(
+        &mut shared,
+        &api,
+        &trace,
+        &BTreeMap::new(),
+        &evidence,
+    )
+    .coverage;
+    let mut own = parsed.clone();
+    let own_coverage = claude_request_accounts::apply(&mut own, &api, &trace).coverage;
+    assert_eq!(shared_coverage, own_coverage);
+    assert_eq!(
+        serde_json::to_vec(&shared).unwrap(),
+        serde_json::to_vec(&own).unwrap()
+    );
     assert_eq!(enabled[0].provenance.collector, identity::COLLECTOR);
     // Each sidecar row's fingerprint is checked once per path: contract 5
     // reuses its own login validation, and D1 leaves the tagged item alone.
     assert_eq!(legacy_checks, (2_000, 2_000));
     assert_eq!(enabled_checks, legacy_checks);
+    // Nothing per request is retained or materialized: the enabled path's peak
+    // stays within 64 KiB of legacy and its allocations within 5% (the rest is
+    // per item: byte-cap encoding, install and admission).
+    assert!(
+        enabled_alloc.requested_peak <= legacy_alloc.requested_peak + 64 * 1024,
+        "{enabled_alloc:?} vs {legacy_alloc:?}"
+    );
+    assert!(
+        enabled_alloc.allocations <= legacy_alloc.allocations + legacy_alloc.allocations / 20,
+        "{enabled_alloc:?} vs {legacy_alloc:?}"
+    );
     assert!(marker_heap < 16 * 1024, "{marker_heap}");
     assert!(enabled_payload <= identity::MAX_ITEM_BYTES);
     assert_eq!(enabled[0].request_count, 2_000, "count conservation");
     let _ = fs::remove_dir_all(dir);
+}
+
+/// Aggregation is bounded by rows and authority keys, not by requests: ten
+/// times the requests over the same rows and keys retain exactly the same
+/// heap, keys past the cap fold into untagged as they arrive, and a request
+/// outside the item's rows stops construction.
+#[test]
+fn grouping_retains_nothing_per_request() {
+    use crate::retry_allocation_probe::measure;
+    let (row_key, _, _) = build_row_identity("claude-haiku-4-5", &SelectorCapture::default(), None);
+    let usage = UsageTotals {
+        input_tokens: 3,
+        request_count: 1,
+        costs: UsageCosts {
+            observed: true,
+            reported: true,
+            total: Some(1_000_000),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let keys = (0..40_u8)
+        .map(|n| {
+            RequestIdentity::Tagged(AuthorityKey {
+                login: Some(format!("{n:064x}")),
+                org: None,
+                basis: identity::TELEMETRY,
+            })
+        })
+        .collect::<Vec<_>>();
+    let build = |requests: usize| {
+        measure(|| {
+            let mut grouping = identity::Grouping::new(2);
+            for n in 0..requests {
+                let bucket = if n % 2 == 0 {
+                    "2026-08-02T07:00:00Z"
+                } else {
+                    "2026-08-02T08:00:00Z"
+                };
+                let identity = match n % 50 {
+                    40 => RequestIdentity::Refused(Refusal::BadClock),
+                    41 => RequestIdentity::Missing,
+                    k if k < 40 => keys[k].clone(),
+                    _ => keys[0].clone(),
+                };
+                grouping.add(bucket, &row_key, &usage, identity.as_ref());
+            }
+            grouping
+        })
+    };
+    let (small, small_stats) = build(1_000);
+    let (large, large_stats) = build(10_000);
+    assert_eq!(small_stats.requested_live, large_stats.requested_live);
+    assert!(small_stats.requested_peak <= large_stats.requested_peak);
+    assert_eq!(large_stats.requested_peak, small_stats.requested_peak);
+    assert_ne!(small, large, "amounts still count every request");
+    // A third row the item does not carry: never reproducible, stop growing.
+    let mut overflow = identity::Grouping::new(2);
+    for bucket in [
+        "2026-08-02T07:00:00Z",
+        "2026-08-02T08:00:00Z",
+        "2026-08-02T09:00:00Z",
+    ] {
+        overflow.add(bucket, &row_key, &usage, keys[0].as_ref());
+    }
+    let mut item = one_row_item(&[(1, None)]);
+    let before = serde_json::to_vec(&item).unwrap();
+    assert_eq!(
+        identity::apply_grouped(&mut item, overflow),
+        Err(identity::Ineligible::RowsNotReproduced)
+    );
+    assert_eq!(serde_json::to_vec(&item).unwrap(), before);
 }
 
 // --- Review regressions ---------------------------------------------------------
@@ -1627,14 +1865,14 @@ fn transcript_bases_need_the_original_clock() {
     let mut carried = facts(
         "req_old",
         Some(999_000),
-        MarkerVerdict::Trusted("d".repeat(64)),
+        MarkerVerdict::Trusted(D64),
     );
     carried.event_clock_complete = false;
     assert_eq!(
         identity::classify(&evidence, &carried),
         RequestIdentity::Refused(Refusal::BadClock)
     );
-    let unstamped = facts("req_old", None, MarkerVerdict::Trusted("d".repeat(64)));
+    let unstamped = facts("req_old", None, MarkerVerdict::Trusted(D64));
     assert_eq!(
         identity::classify(&evidence, &unstamped),
         RequestIdentity::Refused(Refusal::BadClock)
@@ -1668,7 +1906,7 @@ fn only_intact_rows_establish_login_org_membership() {
     assert_eq!(
         identity::classify(
             &evidence,
-            &facts("req_login", Some(900_000), MarkerVerdict::Trusted(org))
+            &facts("req_login", Some(900_000), MarkerVerdict::Trusted(&org))
         ),
         RequestIdentity::Tagged(AuthorityKey {
             login: Some("a".repeat(64)),

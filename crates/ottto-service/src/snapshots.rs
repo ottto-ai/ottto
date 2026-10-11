@@ -2312,8 +2312,9 @@ struct ClaudeUsageAuthorityQuarantineRecord {
 pub struct ClaudeUsageAuthorityDisposition {
     quarantined_source_session_ids: BTreeSet<String>,
     pub(crate) mixed_uploads: claude_request_accounts::MixedUploads,
-    /// Contract-5 only: where each reported request landed, per rebuilt item.
-    pub(crate) request_placements: BTreeMap<String, Vec<claude_request_identity::Placement>>,
+    /// Contract-5 only: each rebuilt item's requests, classified and folded
+    /// into bounded row x authority-key groups during the rebuild.
+    pub(crate) request_groupings: BTreeMap<String, claude_request_identity::Grouping>,
 }
 
 impl ClaudeUsageAuthorityDisposition {
@@ -3529,6 +3530,28 @@ pub fn apply_claude_reported_usage_with_index(
     census_complete: bool,
     census_window_end: &str,
 ) -> ClaudeUsageAuthorityDisposition {
+    apply_claude_reported_usage_with_identity(
+        snapshots,
+        api_report,
+        trace_report,
+        index,
+        census_complete,
+        census_window_end,
+        None,
+    )
+}
+
+/// As above; with contract-5 evidence, each rebuilt item's requests are also
+/// classified and grouped as the rebuild places them.
+pub(crate) fn apply_claude_reported_usage_with_identity(
+    snapshots: &mut [SnapshotItem],
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    index: &mut ScanIndex,
+    census_complete: bool,
+    census_window_end: &str,
+    identity: Option<&claude_request_identity::ScanEvidence<'_>>,
+) -> ClaudeUsageAuthorityDisposition {
     apply_claude_reported_usage_with_index_and_limits(
         snapshots,
         api_report,
@@ -3538,6 +3561,7 @@ pub fn apply_claude_reported_usage_with_index(
         census_window_end,
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
         MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        identity,
     )
 }
 
@@ -3551,6 +3575,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
     census_window_end: &str,
     max_pending_occurrences: usize,
     max_duplicate_owners: usize,
+    identity: Option<&claude_request_identity::ScanEvidence<'_>>,
 ) -> ClaudeUsageAuthorityDisposition {
     accumulate_claude_usage_family_pending_with_limit(
         snapshots,
@@ -3686,7 +3711,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
             .collect();
     }
 
-    let mut request_placements = BTreeMap::new();
+    let mut request_groupings = BTreeMap::new();
     for item in snapshots.iter_mut() {
         item.usage_accounting_contract = None;
         let root_session_id = claude_snapshot_family_root(item);
@@ -3736,11 +3761,14 @@ fn apply_claude_reported_usage_with_index_and_limits(
         {
             continue;
         }
-        let mut placements = claude_request_identity::capture_enabled().then(Vec::new);
-        if rebuild_claude_reported_usage(item, rows, &excluded_request_hashes, placements.as_mut())
-        {
-            if let Some(placements) = placements {
-                request_placements.insert(item.source_session_id.clone(), placements);
+        // The rebuild mirrors each of its rows into the grouping, so groups
+        // are bounded by the rows it builds, never by the request count.
+        let mut sink = identity.and_then(|evidence| {
+            claude_request_identity::RequestSink::for_item(evidence, item, usize::MAX)
+        });
+        if rebuild_claude_reported_usage(item, rows, &excluded_request_hashes, sink.as_mut()) {
+            if let Some(sink) = sink {
+                request_groupings.insert(item.source_session_id.clone(), sink.finish());
             }
             item.usage_accounting_contract =
                 Some("session_exclusive_reported_usage:v1".to_string());
@@ -4103,7 +4131,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
     }
 
     let mut disposition = ClaudeUsageAuthorityDisposition {
-        request_placements,
+        request_groupings,
         ..ClaudeUsageAuthorityDisposition::default()
     };
     let mut demoting_members_by_root = BTreeMap::<String, BTreeSet<String>>::new();
@@ -5687,7 +5715,7 @@ fn rebuild_claude_reported_usage(
     item: &mut SnapshotItem,
     rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
     excluded_request_hashes: &BTreeSet<String>,
-    mut placements: Option<&mut Vec<claude_request_identity::Placement>>,
+    mut sink: Option<&mut claude_request_identity::RequestSink<'_, '_>>,
 ) -> bool {
     let owned_request_ids = item
         .claude_usage_request_ids
@@ -5842,16 +5870,19 @@ fn rebuild_claude_reported_usage(
         };
         let (row_key, selector_context, selector_sources) =
             build_row_identity(&model, &selector, effort.as_deref());
-        if let Some(placements) = placements.as_deref_mut() {
-            placements.push(claude_request_identity::Placement {
-                request_id: row.request_id.clone(),
-                bucket_start: bucket_start.clone(),
-                row_key: row_key.clone(),
-                usage: usage.clone(),
-                occurrence: occurrence
-                    .map(|occurrence| (occurrence.sequence, occurrence.event_clock_complete)),
-                timestamp: timestamp.clone(),
-            });
+        if let Some(sink) = sink.as_deref_mut() {
+            sink.add(
+                item,
+                claude_request_identity::Request {
+                    request_id: &row.request_id,
+                    occurrence: occurrence
+                        .map(|occurrence| (occurrence.sequence, occurrence.event_clock_complete)),
+                    timestamp: &timestamp,
+                    bucket_start: &bucket_start,
+                    row_key: &row_key,
+                    usage: &usage,
+                },
+            );
         }
         let bucket = buckets.entry(bucket_start).or_default();
         bucket.note_activity_at(&normalized_timestamp);
@@ -40677,6 +40708,7 @@ mod tests {
             "2026-08-20T11:04:00Z",
             1,
             10,
+            None,
         );
         assert_eq!(cap_child_page[0].peak_context_fill_tokens, Some(895_010));
         let mut cap_sibling_page = vec![corrective_page[1].clone()];
@@ -40692,6 +40724,7 @@ mod tests {
             "2026-08-20T11:04:00Z",
             1,
             10,
+            None,
         );
         assert!(cap_index.claude_duplicate_request_witness_overflowed);
         assert!(cap_index.claude_duplicate_request_owners.is_empty());
@@ -40715,6 +40748,7 @@ mod tests {
             "2026-08-20T11:06:00Z",
             1,
             10,
+            None,
         );
         assert!(!cap_index.claude_duplicate_request_witness_overflowed);
         assert_eq!(cap_recovery[0].peak_context_fill_tokens, None);
@@ -40736,6 +40770,7 @@ mod tests {
             "2026-08-20T11:06:00Z",
             1,
             10,
+            None,
         );
         assert_eq!(cap_restored[0].peak_context_fill_tokens, Some(895_010));
         assert_eq!(

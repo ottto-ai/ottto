@@ -4657,34 +4657,50 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         }
     }
     let census_window_end = scan_result.census_window_end.clone();
-    let mut disposition = crate::snapshots::apply_claude_reported_usage_with_index(
+    // Contract-5 evidence exists only when emission is on; the reported
+    // rebuild then classifies and groups each request as it places it.
+    let identity_evidence =
+        crate::snapshots::claude_request_identity::EMISSION_ENABLED.then(|| {
+            crate::snapshots::claude_request_identity::ScanEvidence::new(
+                &api_report,
+                &trace_report,
+                identity_unhealthy_roots,
+                crate::snapshots::claude_request_identity::desktop_census(index),
+            )
+        });
+    let mut disposition = crate::snapshots::apply_claude_reported_usage_with_identity(
         &mut scan_result.snapshots,
         &api_report,
         &trace_report,
         index,
         census_complete,
         &census_window_end,
+        identity_evidence.as_ref(),
     );
-    if crate::snapshots::claude_request_identity::EMISSION_ENABLED {
+    if let Some(evidence) = &identity_evidence {
         // Contract 5 first: D1 below leaves new-collector items untouched.
-        let evidence = crate::snapshots::claude_request_identity::ScanEvidence::new(
-            &api_report,
-            &trace_report,
-            identity_unhealthy_roots,
-            crate::snapshots::claude_request_identity::desktop_census(index),
-        );
         let _request_identity = crate::snapshots::claude_request_identity::apply_scan(
             &mut scan_result.snapshots,
-            &evidence,
-            std::mem::take(&mut disposition.request_placements),
+            evidence,
+            std::mem::take(&mut disposition.request_groupings),
         );
     }
-    let qualification = crate::snapshots::claude_request_accounts::apply_with_originals(
-        &mut scan_result.snapshots,
-        &api_report,
-        &trace_report,
-        &originals,
-    );
+    let qualification = match &identity_evidence {
+        Some(evidence) => crate::snapshots::claude_request_accounts::apply_with_shared_index(
+            &mut scan_result.snapshots,
+            &api_report,
+            &trace_report,
+            &originals,
+            evidence,
+        ),
+        None => crate::snapshots::claude_request_accounts::apply_with_originals(
+            &mut scan_result.snapshots,
+            &api_report,
+            &trace_report,
+            &originals,
+        ),
+    };
+    drop(identity_evidence);
     let _account_coverage = qualification.coverage;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {

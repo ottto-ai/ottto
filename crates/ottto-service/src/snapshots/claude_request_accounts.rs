@@ -116,6 +116,36 @@ pub(crate) fn apply_with_originals(
                 .or_insert(Some(row));
         }
     }
+    qualify_all(snapshots, api, trace, &requests, &owners, originals)
+}
+
+/// `apply_with_originals` over the request/owner index contract 5 already
+/// built from these same reports this pass, instead of building it twice.
+pub(crate) fn apply_with_shared_index(
+    snapshots: &mut [SnapshotItem],
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    originals: &BTreeMap<String, super::SessionAccountEvidence>,
+    evidence: &super::claude_request_identity::ScanEvidence<'_>,
+) -> Qualification {
+    qualify_all(
+        snapshots,
+        api,
+        trace,
+        &evidence.requests,
+        &evidence.owners,
+        originals,
+    )
+}
+
+fn qualify_all(
+    snapshots: &mut [SnapshotItem],
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    requests: &BTreeMap<(&str, &str), Option<&ClaudeLocalOtelEvidence>>,
+    owners: &BTreeMap<(&str, &str), Option<&ClaudeTraceOwnershipEvidence>>,
+    originals: &BTreeMap<String, super::SessionAccountEvidence>,
+) -> Qualification {
     let healthy = api.health.is_complete() && trace.is_complete();
     let mut result = Qualification::default();
     for item in snapshots {
@@ -146,7 +176,7 @@ pub(crate) fn apply_with_originals(
                         && comparable == **before
                 })
             });
-            let qualified = healthy && qualify_mixed(item, &requests, &owners, original);
+            let qualified = healthy && qualify_mixed(item, requests, owners, original);
             if qualified {
                 if let Some(original) = original {
                     item.session_account_evidence = Some(original.clone());
@@ -184,7 +214,7 @@ pub(crate) fn apply_with_originals(
             }
         }
         let proof = if healthy {
-            qualify(item, &requests, &owners)
+            qualify(item, requests, owners)
         } else {
             Err(Coverage::UnreadableEvidence)
         };
