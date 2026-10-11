@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 611,
-  "content_sha256": "6aa9484b0cd9e0439d3cc804d4bf7669f624fc515ba121beead3a49c0e572380",
+  "content_sha256": "cf3423a383fb5360aa2b36819546148b74a08eb4d4055e171340b3c33574cf12",
   "files": [
     {
       "executable": false,
@@ -1112,8 +1112,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "4db7f43bb32699ddc74633c90b56194df16b8acba26dea7b4d3c53a9bd78dab1",
-      "size_bytes": 731811
+      "sha256": "b0624755bcb7b484e0c87efdbf5ed5c73849f3d5cc930c6c58ae9d58bd9f3d27",
+      "size_bytes": 731590
     },
     {
       "executable": false,
@@ -1126,8 +1126,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "6add0a95339ce46d057152f6e6767237e22c6b806760a69771e9d77c56144e7f",
-      "size_bytes": 2341831
+      "sha256": "21d23f1e0d8c922d91675367354866fe4e528543043696414d8efeebf658f6eb",
+      "size_bytes": 2342763
     },
     {
       "executable": false,
@@ -1154,22 +1154,22 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_accounts.rs",
-      "sha256": "5865dfb3519a666bc81c44f3831f9ee07d5f2ace4fe260283275703861eb5ee2",
-      "size_bytes": 20434
+      "sha256": "42d56a1b10a4b3425cbda858281d70a5711bec6c2fe76a914513a1b0013b507f",
+      "size_bytes": 20445
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_identity.rs",
-      "sha256": "51198f29b23390dd0061f75e3848773c5420f08fc0d45418c10c684d0e756220",
-      "size_bytes": 51549
+      "sha256": "735b2d907761a95a2db61754078a33fbf26b0983b52202eb0d1c56e37fef1caa",
+      "size_bytes": 53753
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_identity_tests.rs",
-      "sha256": "139940d80f073114e3691fb3af3687727841d2b4570c581ba0d67a9b259cbb91",
-      "size_bytes": 64068
+      "sha256": "aeec305518df98ae7a6559139e7d8491d225adcdcca92ef14136e1eb9e8466cc",
+      "size_bytes": 69202
     },
     {
       "executable": false,
@@ -2526,8 +2526,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-11-claude-request-identity-rows.md",
-      "sha256": "20467d9d14a8924c2d8b13242814078a8fde39643b2a0aadfac70c538f8e41db",
-      "size_bytes": 5486
+      "sha256": "07afa8c26a23e8db2f2be1b8842ad5948f5a2e623d45a1abbf54b90d981237cd",
+      "size_bytes": 7837
     },
     {
       "executable": false,
@@ -4280,7 +4280,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-11T20:39:51+00:00",
+  "generated_at": "2026-10-11T21:08:43+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 612,
   "public_roots": [
@@ -4319,5 +4319,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c8ace55d8466b0ada0928897acb5a4cc48009b03"
+  "source_commit": "470bc68fd6cd10ffcf0a7f1ec582189039ece168"
 }
