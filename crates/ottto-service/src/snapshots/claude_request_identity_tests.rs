@@ -6,6 +6,8 @@ use crate::snapshots::claude_request_identity::{
 };
 
 const W0_DIR: &str = "../../fixtures/session-identity";
+/// The login `complete_api_row` reports by default.
+const OWNER_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const D64: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 const LOGIN_A: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
 
@@ -1930,14 +1932,31 @@ fn sidecar_absence_is_distinguished_from_failure() {
     let _ = fs::remove_dir_all(support);
 }
 
-#[test]
-fn bound_sessions_admit_this_scans_contract5_body_without_rewriting_the_owner() {
+/// A contract-5 body tagged from four requests (`mixed`: two logins; else all
+/// login A), with the given creator evidence, and its scan-local admission.
+fn bound_case(
+    mixed: bool,
+    creator: Option<&str>,
+) -> (
+    PathBuf,
+    Vec<SnapshotItem>,
+    claude_request_accounts::MixedUploads,
+) {
     let (dir, root, mut items) = claude_account_family_fixture();
     items.truncate(1);
+    items[0].session_account_evidence = Some(SessionAccountEvidence {
+        provider: "anthropic",
+        account_identifier_hash: creator.map(str::to_string),
+        provider_workspace_hash: creator.map(|_| "d".repeat(64)),
+        identity_hash_scheme: "provider-sha256:v1",
+        evidence_source: "claude_desktop_original:v1",
+        identity_disposition: Some(if creator.is_some() { "complete" } else { "missing" }),
+        source_created_at: None,
+    });
     let api = (1..=4)
         .map(|n| {
             let mut row = complete_api_row(&root, &format!("req_{n}"), n, 10, 10, 0);
-            if n > 2 {
+            if mixed && n > 2 {
                 row.account_identifier_hash = Some("b".repeat(64));
             }
             signed(row)
@@ -1948,55 +1967,118 @@ fn bound_sessions_admit_this_scans_contract5_body_without_rewriting_the_owner() 
         .collect::<Vec<_>>();
     let (api, trace) = reports(api, trace);
     let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
-    identity::apply_scan(&mut items, &evidence, BTreeMap::new());
-    assert!(items[0].usage_buckets[0].model_usage[0].identity_parts.is_some());
-    let owner_key = sha256_hex(&["session_owner:v1", "machine", &items[0].source_session_id]);
-    let bound = |index: &mut ScanIndex| {
+    let outcome = identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+    assert_eq!(outcome.sent, 1, "{outcome:?}");
+    let row = &items[0].usage_buckets[0].model_usage[0];
+    if mixed {
+        assert!(row.identity_parts.is_some());
+    } else {
+        assert!(row.identity_parts.is_none());
+        assert_eq!(row.account_identifier_hash.as_deref(), Some(OWNER_A));
+    }
+    let mut admitted = claude_request_accounts::MixedUploads::default();
+    admitted.admit_request_identity(&items[0]);
+    (dir, items, admitted)
+}
+
+/// Binds against retained owner A on "machine"; returns (deferred, bindings
+/// after, rows unchanged).
+fn bind_owner_a(
+    items: &mut [SnapshotItem],
+    capability: &claude_request_accounts::MixedUploads,
+    bound: bool,
+    machine: &str,
+) -> (bool, BTreeMap<String, SessionAccountBinding>, bool) {
+    let mut index = ScanIndex::default();
+    if bound {
         index.session_account_bindings.insert(
-            owner_key.clone(),
+            sha256_hex(&["session_owner:v1", "machine", &items[0].source_session_id]),
             SessionAccountBinding {
-                account_identifier_hash: "a".repeat(64),
+                account_identifier_hash: OWNER_A.to_string(),
                 workspace_identifier_hash: None,
             },
         );
-    };
-    let mut index = ScanIndex::default();
-    bound(&mut index);
-    let mut without = items.clone();
-    let deferred = index.bind_session_accounts_with_mixed(
-        SnapshotSource::ClaudeCode,
-        "machine",
-        &mut without,
-        &[],
-        &claude_request_accounts::MixedUploads::default(),
-    );
-    assert_eq!(deferred.len(), 1, "no admission: today's veto applies");
-    let mut admitted = claude_request_accounts::MixedUploads::default();
-    admitted.admit_request_identity(&items[0]);
-    let mut index = ScanIndex::default();
-    bound(&mut index);
+    }
     let before = index.session_account_bindings.clone();
+    let rows = serde_json::to_vec(items).unwrap();
     let deferred = index.bind_session_accounts_with_mixed(
         SnapshotSource::ClaudeCode,
-        "machine",
-        &mut items,
+        machine,
+        items,
         &[],
-        &admitted,
+        capability,
     );
-    assert!(deferred.is_empty());
-    assert_eq!(index.session_account_bindings, before, "owner unchanged");
-    // A body changed after admission is no longer admitted.
+    assert_eq!(
+        index.session_account_bindings, before,
+        "the owner map never changes"
+    );
+    (
+        !deferred.is_empty(),
+        index.session_account_bindings,
+        serde_json::to_vec(items).unwrap() == rows,
+    )
+}
+
+/// SESSION ruling 3: a bound session admits this scan's exact contract-5 body
+/// only when creator proof is absent or names the retained owner, for mixed
+/// AND single-identity bodies (including all-A rows that would take today's
+/// matching-owner shortcut); the owner and the rows are never rewritten, and
+/// nothing else obtains the exception.
+#[test]
+fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
+    let login_b = "b".repeat(64);
+    for mixed in [true, false] {
+        for (creator, admitted) in [(None, true), (Some(OWNER_A), true), (Some(login_b.as_str()), false)] {
+            let (dir, mut items, capability) = bound_case(mixed, creator);
+            let (deferred, _, rows_unchanged) = bind_owner_a(&mut items, &capability, true, "machine");
+            assert_eq!(deferred, !admitted, "mixed={mixed} creator={creator:?}");
+            assert!(rows_unchanged, "creator metadata never rewrites request identities");
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    // Everything below starts from an otherwise admissible all-A body.
+    let (dir, items, capability) = bound_case(false, None);
+    let none = claude_request_accounts::MixedUploads::default();
+    let defers = |mut items: Vec<SnapshotItem>, capability| {
+        bind_owner_a(&mut items, capability, true, "machine").0
+    };
+    assert!(defers(items.clone(), &none), "no or restarted capability");
     let mut changed = items.clone();
     changed[0].input_tokens += 1;
-    let mut index = ScanIndex::default();
-    bound(&mut index);
-    let deferred = index.bind_session_accounts_with_mixed(
-        SnapshotSource::ClaudeCode,
-        "machine",
-        &mut changed,
-        &[],
-        &admitted,
-    );
-    assert_eq!(deferred.len(), 1);
+    assert!(defers(changed, &capability), "body changed after admission");
+    let mut changed = items.clone();
+    changed[0].usage_buckets[0].model_usage[0].evidence_ref = Some(1);
+    assert!(defers(changed, &capability), "evidence ref changed");
+    let mut changed = items.clone();
+    changed[0].session_account_evidence.as_mut().unwrap().account_identifier_hash =
+        Some(OWNER_A.to_string());
+    assert!(defers(changed, &capability), "creator changed after admission");
+    let mut other = items.clone();
+    other[0].source_session_id = format!("{}_agent-a4d1585d310070d0f", other[0].source_session_id);
+    assert!(defers(other, &capability), "another session or child");
+    let mut forged = items.clone();
+    forged[0].provenance.collector = identity::COLLECTOR.to_string();
+    forged[0].request_evidence.clear();
+    for row in forged[0].usage_buckets.iter_mut().flat_map(|b| b.model_usage.iter_mut()) {
+        row.evidence_ref = None;
+    }
+    assert!(defers(forged, &capability), "collector-only body");
+    // Unbound (or bound on another machine): never acquires an owner here.
+    for machine in ["machine", "other-machine"] {
+        let mut unbound = items.clone();
+        let bound = machine != "machine";
+        let (deferred, bindings, _) = bind_owner_a(&mut unbound, &capability, bound, machine);
+        assert!(!deferred);
+        assert_eq!(bindings.len(), usize::from(bound), "{machine}: no owner acquired");
+    }
+    let _ = fs::remove_dir_all(dir);
+
+    // Mixed: changed parts after admission lose the exception.
+    let (dir, mut items, capability) = bound_case(true, None);
+    let parts = items[0].usage_buckets[0].model_usage[0].identity_parts.as_mut().unwrap();
+    parts[0].input_tokens += 1;
+    parts[1].input_tokens -= 1;
+    assert!(bind_owner_a(&mut items, &capability, true, "machine").0, "parts changed");
     let _ = fs::remove_dir_all(dir);
 }

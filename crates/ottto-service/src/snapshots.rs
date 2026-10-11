@@ -20730,6 +20730,27 @@ impl ScanIndex {
                         set_session_account_hash(item, Some(&owner.account_identifier_hash));
                     }
                 }
+                SnapshotSource::ClaudeCode
+                    if item.provenance.collector == claude_request_identity::COLLECTOR =>
+                {
+                    // Contract-5 row identities are request facts, never the
+                    // creator/owner: no row login, even one equal to the owner,
+                    // admits the body, and none binds an unbound session. A bound
+                    // session admits only this scan's exact qualified body, and
+                    // only when creator proof is absent or names the retained
+                    // owner; a contradicting creator defers. The owner is never
+                    // rewritten.
+                    let Some(owner) = existing else { continue };
+                    let creator = item
+                        .session_account_evidence
+                        .as_ref()
+                        .and_then(|evidence| evidence.account_identifier_hash.as_deref());
+                    if !(mixed.permits_request_identity(item)
+                        && creator.map_or(true, |creator| creator == owner.account_identifier_hash))
+                    {
+                        deferred.insert(session_id.clone());
+                    }
+                }
                 SnapshotSource::ClaudeCode => {
                     let observed = exact_session_account_hash(item);
                     match (existing, observed.as_deref()) {
@@ -20744,21 +20765,6 @@ impl ScanIndex {
                             // usage without rewriting its retained creator/owner.
                             // Eligibility is scan-local and exact-body-bound;
                             // neither marker-only imports nor restart restore it.
-                        }
-                        (Some(owner), _)
-                            if mixed.permits_request_identity(item)
-                                && item
-                                    .session_account_evidence
-                                    .as_ref()
-                                    .and_then(|evidence| {
-                                        evidence.account_identifier_hash.as_deref()
-                                    })
-                                    .map_or(true, |creator| {
-                                        creator == owner.account_identifier_hash
-                                    }) =>
-                        {
-                            // Contract 5 carries per-request identity beside an
-                            // unchanged owner; only a contradicting creator defers.
                         }
                         (Some(_), _) => {
                             deferred.insert(session_id.clone());
