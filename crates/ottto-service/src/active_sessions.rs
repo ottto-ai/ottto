@@ -731,6 +731,8 @@ mod tests {
 
     fn usage_row(model: &str, effort: Option<&str>, tokens: u64) -> SnapshotModelUsage {
         SnapshotModelUsage {
+            evidence_ref: None,
+            identity_parts: None,
             model: model.to_string(),
             input_tokens: 0,
             output_tokens: tokens,
@@ -1714,6 +1716,8 @@ mod tests {
 
     fn test_snapshot(session_id: &str, last_activity: &str) -> SnapshotItem {
         let model_usage = SnapshotModelUsage {
+            evidence_ref: None,
+            identity_parts: None,
             model: "gpt-5.6-codex".to_string(),
             input_tokens: 100,
             output_tokens: 20,
@@ -1743,6 +1747,9 @@ mod tests {
             cache_creation_cost_usd: None,
         };
         SnapshotItem {
+            request_evidence: Vec::new(),
+            request_identity_refusals: 0,
+            claude_org_markers: None,
             source_session_id: session_id.to_string(),
             snapshot_fingerprint: format!("fp-{session_id}"),
             status: "active".to_string(),

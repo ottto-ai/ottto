@@ -124,7 +124,8 @@ fn claude_p92_clock_qualification_and_all_bucket_coverage() {
                 assert!(rebuild_claude_reported_usage(
                     &mut item,
                     &rows,
-                    &BTreeSet::new()
+                    &BTreeSet::new(),
+                    None
                 ));
                 assert_eq!(
                     item.request_count, 2,

@@ -2472,6 +2472,9 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         return None;
     }
     Some(SnapshotItem {
+        request_evidence: Vec::new(),
+        request_identity_refusals: 0,
+        claude_org_markers: None,
         session_account_evidence: item.session_account_evidence.clone(),
         source_session_id: item.source_session_id.clone(),
         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
@@ -4591,6 +4594,8 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     // that family unproven, not suppress an unrelated healthy family.
     let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+    let mut identity_unhealthy_roots = BTreeSet::new();
+    let mut identity_healthy_roots = BTreeSet::new();
     for root_session_id in usage_roots {
         let mut api = api_read.take_strict_report(support_dir, &root_session_id);
         let mut trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
@@ -4604,7 +4609,13 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
             stats.trace_incomplete_root_count += 1;
         }
         if !api.health.is_complete() || !trace.is_complete() {
+            if crate::snapshots::claude_request_identity::EMISSION_ENABLED {
+                identity_unhealthy_roots.insert(root_session_id);
+            }
             continue;
+        }
+        if crate::snapshots::claude_request_identity::EMISSION_ENABLED {
+            identity_healthy_roots.insert(root_session_id.clone());
         }
         stats.complete_sidecar_root_count += 1;
         let api_request_ids = api
@@ -4647,6 +4658,21 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         census_complete,
         &census_window_end,
     );
+    if crate::snapshots::claude_request_identity::EMISSION_ENABLED {
+        // Contract 5 first: D1 below leaves new-collector items untouched.
+        let evidence = crate::snapshots::claude_request_identity::ScanEvidence::new(
+            &api_report,
+            &trace_report,
+            identity_unhealthy_roots,
+            identity_healthy_roots,
+            crate::snapshots::claude_request_identity::desktop_census(index),
+        );
+        let _request_identity = crate::snapshots::claude_request_identity::apply_scan(
+            &mut scan_result.snapshots,
+            &evidence,
+            &disposition.request_placements,
+        );
+    }
     let qualification = crate::snapshots::claude_request_accounts::apply_with_originals(
         &mut scan_result.snapshots,
         &api_report,

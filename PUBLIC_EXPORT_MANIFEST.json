@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 544,
-  "content_sha256": "108904e67f576dbe26d4e9ddb4691ae5e4d79be13d11a7eeef1ab34a1e1a89ea",
+  "candidate_file_count": 611,
+  "content_sha256": "46a2f0793de717f64efa7cbee424c8fe840650cbd707f1043ecbac029672c839",
   "files": [
     {
       "executable": false,
@@ -629,8 +629,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/active_sessions.rs",
-      "sha256": "7393d6a7b8eb270a47340296519e0a47ea45db4eca8f16362468e5e2355f4986",
-      "size_bytes": 70491
+      "sha256": "330a18bb217af7f6abeab7374accb638894c457e5ffb86c9dd48dfc0fafcef4c",
+      "size_bytes": 70745
     },
     {
       "executable": false,
@@ -720,8 +720,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/backfill.rs",
-      "sha256": "62740467dda9f72c7c1c362270326446568bcb04cff3dc06ad55dc271d3df63d",
-      "size_bytes": 40746
+      "sha256": "8ddd4823ad80f655093d35fc186304c00f268b55382f1aaa950d72a5787d2b33",
+      "size_bytes": 40868
     },
     {
       "executable": false,
@@ -846,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_posture.rs",
-      "sha256": "c7c831ab53de2656cd2de96cf7bbb5b991971ad2707c03eccac30dfeda7b4886",
-      "size_bytes": 31985
+      "sha256": "03a269a430214a6d7dc4564a2a47c9b42516dbf833a3f6054de74573e172989e",
+      "size_bytes": 32189
     },
     {
       "executable": false,
@@ -867,8 +867,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/detected_uses.rs",
-      "sha256": "bb825433f90beaf22f6036806e6ac9f48c56dbc038a571e697a336e9cfffdd7c",
-      "size_bytes": 30084
+      "sha256": "d1c9240c75d88b3d45888a6c5b44e358ae3968a96f456fe86e00f4603bb26107",
+      "size_bytes": 30272
     },
     {
       "executable": false,
@@ -1063,8 +1063,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_retention_bound.rs",
-      "sha256": "89e9795b905685776f5458ba67c847922d6bec3da435ebf6fdab19badf9267ab",
-      "size_bytes": 7053
+      "sha256": "cec8b85deaab3649948746a778055a1cf122419d33053e6e711a7fbd950c992d",
+      "size_bytes": 7537
     },
     {
       "executable": false,
@@ -1112,8 +1112,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "b0dbd0be472f3f8d222838f029ffdf7a6fb004dbfd1178c0f899bf5da9276ee2",
-      "size_bytes": 729838
+      "sha256": "d7d11025f26ce505276da571b28509148c2c6192b6b861c15525899771b137cd",
+      "size_bytes": 731023
     },
     {
       "executable": false,
@@ -1126,8 +1126,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "c1830c4a9fbf15c6d4aa6445ead6406bd0fcfc5b6c6b8ad4514a74e645e9d9e1",
-      "size_bytes": 2333893
+      "sha256": "21c719fb4d66d04f9d6320184b7aeac4f6e8660f4f62be87dc87562dd31b6a8f",
+      "size_bytes": 2340989
     },
     {
       "executable": false,
@@ -1147,15 +1147,29 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_account_tests.rs",
-      "sha256": "863648126035d92f3227095e28e5083ef0a2eff145f4768ae62fe733cc99bc61",
-      "size_bytes": 34732
+      "sha256": "3d1e8cffa73a3f4db5545301b0a787ea9bcdf3df7fa14419bafd88d707548473",
+      "size_bytes": 34758
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_accounts.rs",
-      "sha256": "0df50e635c34a02fc89e7f9a3f49430971025bae7f40f52b88f2d2565812a927",
-      "size_bytes": 19327
+      "sha256": "5068767663f74fa6017747efd9750eff2c079c9325765443bd30497ac80a4b32",
+      "size_bytes": 19338
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_request_identity.rs",
+      "sha256": "78adea389c9d42f6ed3dce73fb08ea7c60c7e313f4adc9230f86aecc1a19cf34",
+      "size_bytes": 50856
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_request_identity_tests.rs",
+      "sha256": "4f8e7a919261b2277f66519244643900f604937f8fca4d0df787bce574272df8",
+      "size_bytes": 58245
     },
     {
       "executable": false,
@@ -2511,6 +2525,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-11-claude-request-identity-rows.md",
+      "sha256": "20467d9d14a8924c2d8b13242814078a8fde39643b2a0aadfac70c538f8e41db",
+      "size_bytes": 5486
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-11-claude-root-request-evidence.md",
       "sha256": "ff60ba0c0150d602399ce49504d4822904b8ad636d6a520c9a91fb49740b6d76",
       "size_bytes": 3047
@@ -3158,6 +3179,454 @@
       "path": "fixtures/local-health/contract-matrix.v1.json",
       "sha256": "5c5332caf6d32ce9f9701aa66c9729b2df24bae485d2914bf9d459b3cdb47cf6",
       "size_bytes": 65299
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/index.json",
+      "sha256": "57dfcc509881bfa7823ac0e43d79eead0ba6ebd739b2f5c879aa30e46a8a6f61",
+      "size_bytes": 550936
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-basis-only-change.json",
+      "sha256": "690f58caf735a133fe47553a8dd2c39aa18436e3ac695a8ae74c8dad6ad682e7",
+      "size_bytes": 6275
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-cap-evidence-16.json",
+      "sha256": "bba76575e6f1f690abe7fcc10e75bee31cca1922238956878e4e5d73b76742bb",
+      "size_bytes": 27268
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-cap-evidence-17-fallback.json",
+      "sha256": "dd1565cc60541be244061c0edabbab76203be30099f614006ffbd3b65d3c6678",
+      "size_bytes": 6754
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-cap-identities-16.json",
+      "sha256": "5d8bee59ee0109ea0080aeec8f9aa7987501d09a83287597254cead3d74279c4",
+      "size_bytes": 23769
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-cap-identities-17-fallback.json",
+      "sha256": "716a9ed089c6331733b8947cf59240cd13638f784c7799bacd6d195cbea4ca3d",
+      "size_bytes": 5849
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-cap-parts-18-fallback.json",
+      "sha256": "e93c856139a02994e80e5c95f447ce0540c5d956be4b4bb7dff62db6fc1ebe6b",
+      "size_bytes": 5844
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-cost-golden-desktop.json",
+      "sha256": "ab6a76de22dd12e6fd8b744e3765f46f0b08fd738a8b63cd669910315e161e8d",
+      "size_bytes": 8761
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-cost-golden-veto.json",
+      "sha256": "61e359cefcdccf82fba4855741cebbfd9697db97dcba46dd5f90329460933f1d",
+      "size_bytes": 8506
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-cross-hour-basis-update.json",
+      "sha256": "2e1146046e651bd3c7db49e635d33d2ec7b246e6a7afe5a05786c86504c1a29c",
+      "size_bytes": 7597
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-cross-hour-sole-then-tel.json",
+      "sha256": "95a4beaff8e0741be892eadddf90374d836f6d689aeb23e3d2d2a68d589b08cf",
+      "size_bytes": 8735
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-cross-hour-tel-then-sole.json",
+      "sha256": "fa29fbef6935ea2465d05e2240c65defb11206a9f8d55f77bc58a26aa4141624",
+      "size_bytes": 8735
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-full-basis-split.json",
+      "sha256": "972a11d589d534569bf0022529196a8a2e1f95f3c2df3769dbd24598cc34dd01",
+      "size_bytes": 8740
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-identity-swap-a.json",
+      "sha256": "aa611dcb685455e6f94d08884ea161d31073c302a76ae6a28f5fc607a95520b6",
+      "size_bytes": 8021
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-identity-swap-b.json",
+      "sha256": "9df6681a409fdf1a5432261afe6ef8d0338cd8e371650ed86ed7068f18ab05fd",
+      "size_bytes": 8021
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-known-plus-missing.json",
+      "sha256": "dbfe00b8875c76b191cdf894300c6b9b758de854dc09de14c039a26016337471",
+      "size_bytes": 8008
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-known-plus-refused.json",
+      "sha256": "624ce6f43327b7949747713e87491a569527168ca1bd6bd8ceee30bf6af2ed6a",
+      "size_bytes": 8046
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-marker-overflow.json",
+      "sha256": "262964a0e294ec1422dc85c9b6bd94b6671f74c904f9117157ef6451b04175e4",
+      "size_bytes": 8048
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-org-only-desktop.json",
+      "sha256": "6881a25578780eef8ac730759d9e94f3a14ce02af7072935061eae82e22713c6",
+      "size_bytes": 8298
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-pair-fill-missing.json",
+      "sha256": "89b9e44263fd036691516ace72285897239280c844549db99f8612a8daa2af83",
+      "size_bytes": 8275
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-pair-fill-refused.json",
+      "sha256": "26be93bfe1d9dd0c3d780d2b26b1867d1692ec3399ecfc1842fde1fe754af42f",
+      "size_bytes": 8313
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-parts-swap-a.json",
+      "sha256": "3e8c65b4fade6d6bcfd33662e57a47eb8be29f30b9a423f269a710aa6937561a",
+      "size_bytes": 8463
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-parts-swap-b.json",
+      "sha256": "6e4b2e9ffc5850beb12a2160fffb6035b41c81ac89deb0ebe4212b6d76c381f5",
+      "size_bytes": 8463
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-pending-desktop.json",
+      "sha256": "d59238afb98c144391bb50a88a51f2ecb624ec2065629d16f6a9fb10cb491715",
+      "size_bytes": 8319
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-pending-p1.json",
+      "sha256": "80f79afc8e87263362fb15ee898dbc64879e072441933fe8b602e6ecccb8f971",
+      "size_bytes": 9086
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-pending-p2-resolved.json",
+      "sha256": "fe3255fe05d0556f312225cbaac3e7b9dc38eb80b1cf0e4169ec01f3ef687fe4",
+      "size_bytes": 9505
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-price-eq-all-unknown.json",
+      "sha256": "d0f69513c52f89a6bf5bcbd2cfc6d7949c3ef6821bfa0eb4619a4e7c763916a4",
+      "size_bytes": 7971
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-price-eq-one-identity.json",
+      "sha256": "26adaad7e4aaefe104d41b4d948aaf2617c2eb52a9b49bd81bed69d4cef3517d",
+      "size_bytes": 5727
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-price-eq-one-subscription.json",
+      "sha256": "86a94524e0ffbdfb875366e682119d5c89c608887831534b8f1d5046defd7f54",
+      "size_bytes": 7688
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-price-eq-reversed.json",
+      "sha256": "6f0da2dbe0126d8b848cc8548166b1c029cecc3d02f7c479d724456bfd5ee811",
+      "size_bytes": 7787
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-price-explicit-context.json",
+      "sha256": "b9a4e4242fb2dce13ee7d2fd143b8ccd4e87a728bd9bddf2dc20e0c01121236f",
+      "size_bytes": 11606
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-price-known-zero.json",
+      "sha256": "8901a481f33840b4deee5e5879d84cfe0d16c4b77cffc38faf8c8a2a9fcba4ef",
+      "size_bytes": 10728
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-price-long-short-list.json",
+      "sha256": "8c69ba3a5528444922bdceada56d86bc7dcd737cc5960dd31e1c1b893e8ca939",
+      "size_bytes": 7787
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-price-long-short-scalar.json",
+      "sha256": "bf2d492f55591b1403ce99633c2b9a3463439c5afa8aec586db01cab59f958c7",
+      "size_bytes": 7794
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-price-reported-authority.json",
+      "sha256": "21cfb12f995ed6c785c8bff7189ac8f4fa4a2f43ab3a92dc726fd53e25a47986",
+      "size_bytes": 8759
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-price-sub-cent-rounding.json",
+      "sha256": "3935da11bc3666b9212cf9c30ee82dcb6c055a01b34372be44dc2264635e46f4",
+      "size_bytes": 7738
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-price-unresolved-component.json",
+      "sha256": "8e4f6b72bdc44ceb0daf715cc5ac60b5d6a91bcdb921ba9a1067804920fa8f64",
+      "size_bytes": 7789
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-reported-unsplittable.json",
+      "sha256": "020e26e0ce2b97ec9949123a91dc0a57737c09cb247399e989aeaf804a6a4067",
+      "size_bytes": 5909
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-rev1-scalar.json",
+      "sha256": "77f742954d7f0a8df5cf4cc362510f0843a777f30267f387632e8871c927a3c9",
+      "size_bytes": 6272
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-rev2-list.json",
+      "sha256": "c528eeaeeb0159f30cf68a3b8d8b6d1c32ad7dd549be8e1f0bd54a9b030dafdb",
+      "size_bytes": 8451
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-same-hour-two-logins-parts-reordered.json",
+      "sha256": "6f1c66009eb938f89ee7b58a626abbdd0a62a911f0d96c1edca35aa3d43debba",
+      "size_bytes": 8458
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-same-hour-two-logins-reordered.json",
+      "sha256": "46d9b571c8c9d7b569a6b9e44313ec5e0a2a28a9c4ca41868d21f8b9d012ee87",
+      "size_bytes": 8458
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-same-hour-two-logins-reported.json",
+      "sha256": "fad9df9358744d1173751728e79907987bc4241bc8a215e15d3852320f57aa6f",
+      "size_bytes": 8541
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-same-hour-two-logins.json",
+      "sha256": "c2766ce192e4b51b1b5026fa837fafc3c3da706e216a7a9b5229c520887e19ca",
+      "size_bytes": 8458
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-single-login-explicit-zero-refusals.json",
+      "sha256": "6e4553a8fc239765444365454fbbf58d5c370d5e468b656fac08f930d59bce06",
+      "size_bytes": 6307
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-single-login.json",
+      "sha256": "ce4a820f7d17e9caa4afc21d173b736f58c26381cef7e1ea011921e147295f40",
+      "size_bytes": 6269
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-sole-login-body-veto.json",
+      "sha256": "7a826ba64b09f8776ebb364c4e0bcb976b92478ee7d47471e06522ebdc3c8d37",
+      "size_bytes": 8485
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-terminal-tel-and-email-same-pair.json",
+      "sha256": "6100e8703b7bbb02e497d3ee99739e81e7e6f91f10f29ee52b874c6d338fac8e",
+      "size_bytes": 8468
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-tl-no-org-pair-consistent.json",
+      "sha256": "4042ffe04e1955694c10c79ad667081d245b8ac792048e6834ea9c7bde489b13",
+      "size_bytes": 6444
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-tl-no-org-pair-contradicting.json",
+      "sha256": "9fe0f840d33648ac112f131cd7e0b4de9b3a5edbbcac8ee8df5e1d0bfabeee34",
+      "size_bytes": 6444
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/new-unknown-basis.json",
+      "sha256": "9847722cc4946e7f415b571416d959b71bbed2623403db919d96cba47bddb7a3",
+      "size_bytes": 8282
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/old-d1-single-login.json",
+      "sha256": "36a171634166d43e166493ef9fb77eb71f65252e80017f672bebe471b841278d",
+      "size_bytes": 6003
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/old-legacy-collector.json",
+      "sha256": "c56089d6a05786e70bbd7e561f6940d4d6b76e62d759b1e5c0660545d62a2c7f",
+      "size_bytes": 5766
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/old-mixed-hour-reported.json",
+      "sha256": "6aa0c358e3afae1ee15fd680b3c17f08f2692370f4f5a9405275fdd702e33068",
+      "size_bytes": 5873
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/old-mixed-hour-transcript.json",
+      "sha256": "8b3d455f64f6871912ea7e2b5b25f70ad895dbf3758e791fad5d21b93d74ce4b",
+      "size_bytes": 5790
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/p1-authority-swap.json",
+      "sha256": "e3bc116adaefa4994dd4989d16bc65ea0bb1ef9b1659aa6000e34e5218f093bf",
+      "size_bytes": 7252
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/p1-basis-only-change.json",
+      "sha256": "221d01533a5a04743cc859474c382873c47b8357f25098c932124426b9c2ae5c",
+      "size_bytes": 7264
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/p1-mixed-hour-full-basis.json",
+      "sha256": "83f271a9c4a0e5a09bbaae4ca1eb80426c3138e79b93940d6edf60768a517004",
+      "size_bytes": 8352
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/p1-mixed-hour-reordered-wire.json",
+      "sha256": "8329de5918365c251247712c87da8db7ef8b31bfeca2c6875be80adbec1023e7",
+      "size_bytes": 8352
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/p1-part-money-micro.json",
+      "sha256": "b50d1d7188ae2a8e50d8e20b8f3df4793d64511f13fcd43bba6f1c79c7dc4dbf",
+      "size_bytes": 6412
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/p1-refused-positive.json",
+      "sha256": "73dd5d4da02daaa1ecd628e3b26de385211ffea0ae531a18fbbeada64933691f",
+      "size_bytes": 7286
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/p1-single-identity-rows.json",
+      "sha256": "133d99299e266ac60ad44e618f53b5ba31afef3378665d9a7654e4d954658a83",
+      "size_bytes": 7252
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/p1-transcript-org-part.json",
+      "sha256": "27c1d9c48ab064ebd22ebf466016c115a4477b2359a56fd543d6e130cdfb6652",
+      "size_bytes": 5529
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/session-identity/rejected-cost-golden-weakest-merge.json",
+      "sha256": "cb4ba8d9af495156435fca6c2becb5b768b933287b04febbab8d22fc17ea0d64",
+      "size_bytes": 6567
     },
     {
       "executable": false,
@@ -3811,9 +4280,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-11T16:10:28+00:00",
+  "generated_at": "2026-10-11T20:08:18+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 545,
+  "output_file_count": 612,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3850,5 +4319,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "cc22affa7a7c99a085742fc4ff2dbbede8f67ba4"
+  "source_commit": "1e4da8cc92e2b7ab6a1fc47f67cdf9e9646b5e7d"
 }

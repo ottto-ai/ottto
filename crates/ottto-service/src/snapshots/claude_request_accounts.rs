@@ -341,7 +341,7 @@ fn hash_is_valid(hash: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn local_subscription(row: &super::SnapshotModelUsage) -> bool {
+pub(super) fn local_subscription(row: &super::SnapshotModelUsage) -> bool {
     matches!(row.auth_mode.as_deref(), None | Some("oauth"))
         && matches!(row.billing_channel.as_deref(), None | Some("subscription"))
         && matches!(row.billing_provider.as_deref(), None | Some("anthropic"))
