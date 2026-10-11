@@ -167,13 +167,42 @@ fn unavailable_conflict_logout_regression_replacement_and_restart_never_qualify(
     ledger.observe_at(home(), SLOT, Some(T0), Observation::SignedOut);
     assert_eq!(ledger, Ledger::default());
     assert_eq!(ledger.is_registered(&home()), None);
-    // Registration is what the last pass reported; removal drops history.
+    assert_eq!(ledger.registration(&home(), T0), Registration::Unknown);
+    // Registration is what the last pass reported; removal drops history but
+    // the loss stays known, so the folder never reads as never registered.
+    let other = home_key(Path::new("/synthetic/other"));
     let mut ledger = observed(&[0, 300]);
-    ledger.retain(BTreeSet::from([home()]));
+    ledger.retain(BTreeSet::from([home()]), Some(T0));
     assert_eq!(ledger.is_registered(&home()), Some(true));
-    ledger.retain(BTreeSet::new());
+    assert_eq!(ledger.registration(&home(), T0), Registration::Registered);
+    assert_eq!(
+        ledger.registration(&other, T0),
+        Registration::NeverRegistered
+    );
+    assert_eq!(ledger.registration(&other, T0 - 1), Registration::Unknown);
+    ledger.retain(BTreeSet::new(), Some(T0 + 600));
     assert_eq!(ledger.is_registered(&home()), Some(false));
+    assert_eq!(ledger.registration(&home(), T0), Registration::Unknown);
+    assert_eq!(
+        ledger.registration(&other, T0),
+        Registration::NeverRegistered
+    );
     assert_eq!(verdict(&ledger, 0, 300), Verdict::Unavailable);
+    // Re-registration clears the loss (the history stays empty); losing more
+    // folders than the record holds makes every unregistered folder unknown.
+    ledger.retain(BTreeSet::from([home()]), Some(T0 + 900));
+    assert_eq!(ledger.lost.len(), 0);
+    for n in 0..MAX_LOST {
+        ledger.retain(
+            BTreeSet::from([home_key(Path::new(&format!("/lost/{n}")))]),
+            Some(T0 + 900),
+        );
+    }
+    assert_eq!((ledger.lost.len(), ledger.lost_overflow), (MAX_LOST, false));
+    ledger.retain(BTreeSet::new(), Some(T0 + 900));
+    assert_eq!((ledger.lost.len(), ledger.lost_overflow), (0, true));
+    assert_eq!(ledger.registration(&other, T0), Registration::Unknown);
+    assert_eq!(ledger.registration(&home(), T0), Registration::Unknown);
 }
 
 #[test]
@@ -249,6 +278,13 @@ fn age_entry_slot_and_byte_caps_bound_the_history() {
     // Bytes: the worst case under the entry caps stays within the byte cap.
     let (full, stats) = crate::retry_allocation_probe::measure(|| {
         let mut ledger = Ledger::default();
+        // A full loss record: MAX_LOST earlier registrations removed.
+        ledger.retain(
+            (0..MAX_LOST)
+                .map(|n| home_key(Path::new(&format!("/lost/{n}"))))
+                .collect(),
+            Some(T0),
+        );
         for slot in 0..MAX_SLOTS {
             let key = home_key(Path::new(&format!("/slots/{slot}")));
             for n in 0..(MAX_SEGMENTS_PER_SLOT as u64 * 2) {
@@ -267,6 +303,7 @@ fn age_entry_slot_and_byte_caps_bound_the_history() {
             (0..MAX_SLOTS)
                 .map(|slot| home_key(Path::new(&format!("/slots/{slot}"))))
                 .collect(),
+            Some(T0),
         );
         ledger
     });
@@ -276,7 +313,8 @@ fn age_entry_slot_and_byte_caps_bound_the_history() {
             + std::mem::size_of::<SlotHistory>()
             + MAX_SEGMENTS_PER_SLOT * (std::mem::size_of::<Segment>() + 128)
             + std::mem::size_of::<HomeKey>()
-            + std::mem::size_of::<usize>());
+            + std::mem::size_of::<usize>())
+        + MAX_LOST * (std::mem::size_of::<HomeKey>() + std::mem::size_of::<usize>());
     eprintln!(
         "status coverage worst case: retained_bytes={bytes} declared_worst={worst} \
          allocations={} requested_peak={} segment_inline={} history_inline={}",
@@ -286,6 +324,7 @@ fn age_entry_slot_and_byte_caps_bound_the_history() {
         std::mem::size_of::<SlotHistory>(),
     );
     assert_eq!(full.pairings().count(), MAX_SLOTS * MAX_SEGMENTS_PER_SLOT);
+    assert_eq!((full.lost.len(), full.lost_overflow), (MAX_LOST, false));
     assert!(bytes <= worst && worst <= MAX_BYTES, "{bytes} {worst}");
 
     // One steady-state observation (extending an open segment) allocates
@@ -406,9 +445,14 @@ fn global_feed_skips_the_default_folder_tracks_registration_and_fails_closed() {
     let ledger = snapshot().expect("feed available");
     assert_eq!(ledger.is_registered(&home()), Some(true));
     assert_eq!(ledger.is_registered(&home_key(default_dir)), Some(false));
-    // Slot removal drops the folder's history.
+    // Slot removal drops the folder's history, never the knowledge of the loss.
     retain_registered(["/Users/someone/other"].into_iter(), default_dir);
     assert_eq!(snapshot_slots(), 0);
+    let ledger = snapshot().expect("feed available");
+    assert_eq!(
+        ledger.registration(&home(), u64::MAX),
+        Registration::Unknown
+    );
 
     // A poisoned lock: the producer is a no-op and the consumer sees no feed.
     observe_at("/Users/someone/.claude-slot", "2027-01-15T08:10:00Z");

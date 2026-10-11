@@ -82,12 +82,14 @@ same code through `capture_enabled()` (`cfg(test)`).
   (equal samples 300 s apart do not exclude an unseen A→B→A switch). So it
   only decides whether a request keeps its earlier meaning:
   - Not applicable (the org-only path stands): compiled out, Desktop, no
-    unchanged email before the request, or a file outside a registered slot
-    folder (including the shared default folder).
+    unchanged email before the request, the shared default folder, or a
+    folder proven never registered over the window (unregistered at every
+    pass since registration became known, before the window began, and not
+    a removed slot).
   - Otherwise the request is refused, never weakened to `transcript_org`.
     The reasons are typed locally and counted on the wire:
-    `CoverageUnavailable` (feed failed or not run since restart, unknown
-    session start, gap, unavailable sample, logout, eviction, window past
+    `CoverageUnavailable` (feed failed or not run since restart, a removed
+    slot or forgotten registration, unknown session start, gap, unavailable sample, logout, eviction, window past
     the last sample), `ContradictoryOrg` (a nearby sample names another org
     or another login), and `CoverageUnqualified` (samples span the window
     but prove nothing). Usage and money are conserved, and the positive
@@ -102,8 +104,13 @@ same code through `capture_enabled()` (`cfg(test)`).
     change, and returns nothing to the status pass.
   - A process-local ledger keeps sampled runs (freshness only): consecutive
     same-identity samples at most 600 s apart. Caps: 10 slots, 32 runs per
-    slot, 30 days, 64 KiB (worst case 62,960 B). Nothing is persisted or
+    slot, 30 days, 64 KiB (worst case 63,360 B). Nothing is persisted or
     uploaded; a restart forgets both history and registration.
+  - Removing a slot clears its history but records the loss in a bounded
+    set (at most 10 folders). The same request stays refused rather than
+    turning org-only. One more loss than the set holds, a restart, or a
+    window that began before registration was first known makes every
+    unregistered folder unknown (refused), never proven absent.
   - The ledger's (login, org) pairings prove marker-org membership for
     login-only telemetry (§2a.12(b)).
   - A status-pass fixture shows byte-identical status output (SOURCE account

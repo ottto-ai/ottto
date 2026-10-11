@@ -2107,7 +2107,8 @@ fn coverage(
         );
         at += crate::claude_status_coverage::CADENCE_SECONDS;
     }
-    ledger.retain(BTreeSet::from([home]));
+    // Registration has been known since the first sample's pass.
+    ledger.retain(BTreeSet::from([home]), Some(from));
     ledger
 }
 
@@ -2334,48 +2335,52 @@ fn status_pairings_establish_marker_org_membership_for_the_telemetry_login() {
     assert_eq!(identity::classify(&foreign, &request), tagged(None));
 }
 
+/// One synthetic session in a slot folder: an arbitrary recorded email (before
+/// or after `req_1`, optionally switched), a credential org marker and `req_1`.
+fn email_session(email_first: bool, flip: bool) -> Vec<Value> {
+    let mut lines = Vec::new();
+    // An arbitrary email: nothing joins it to the slot's sampled login.
+    let context_line = json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment",
+        "sessionId": ROOT, "attachment": {"type": "session_context",
+        "context": {"userEmail": "someone-else@example.invalid"}}});
+    if email_first {
+        lines.push(context_line.clone());
+    }
+    if flip {
+        lines.push(json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment",
+            "sessionId": ROOT, "attachment": {"type": "session_context",
+            "context": {"userEmail": "other@example.invalid"}}}));
+    }
+    lines.push(json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
+        "attachment": {"type": "credential_org", "organizationUuid": ORG_1}}));
+    lines.push(json!({"timestamp": "2026-08-02T07:00:01Z", "type": "assistant", "sessionId": ROOT,
+        "requestId": "req_1", "message": {"id": "m1", "model": "claude-haiku-4-5",
+        "usage": {"input_tokens": 10, "output_tokens": 1}}}));
+    if !email_first {
+        lines.push(context_line);
+    }
+    lines
+}
+
+fn parse_session(folder: &Path, lines: &[Value]) -> Vec<SnapshotItem> {
+    let project = folder.join("projects").join("-synthetic-repo");
+    fs::create_dir_all(&project).unwrap();
+    let path = project.join(format!("{ROOT}.jsonl"));
+    fs::write(
+        &path,
+        lines
+            .iter()
+            .map(|line| line.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "fp".into()).unwrap()
+}
+
 #[test]
 fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conserved() {
     let dir = temp_dir("claude-request-identity-email");
     let slot = dir.join("slot");
-    let session = |email_first: bool, flip: bool| {
-        let mut lines = Vec::new();
-        // An arbitrary email: nothing joins it to the slot's sampled login.
-        let context_line = json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment",
-            "sessionId": ROOT, "attachment": {"type": "session_context",
-            "context": {"userEmail": "someone-else@example.invalid"}}});
-        if email_first {
-            lines.push(context_line.clone());
-        }
-        if flip {
-            lines.push(json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment",
-                "sessionId": ROOT, "attachment": {"type": "session_context",
-                "context": {"userEmail": "other@example.invalid"}}}));
-        }
-        lines.push(json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
-            "attachment": {"type": "credential_org", "organizationUuid": ORG_1}}));
-        lines.push(json!({"timestamp": "2026-08-02T07:00:01Z", "type": "assistant", "sessionId": ROOT,
-            "requestId": "req_1", "message": {"id": "m1", "model": "claude-haiku-4-5",
-            "usage": {"input_tokens": 10, "output_tokens": 1}}}));
-        if !email_first {
-            lines.push(context_line);
-        }
-        lines
-    };
-    let parse = |folder: &Path, lines: &[Value]| {
-        let project = folder.join("projects").join("-synthetic-repo");
-        fs::create_dir_all(&project).unwrap();
-        let path = project.join(format!("{ROOT}.jsonl"));
-        fs::write(
-            &path,
-            lines
-                .iter()
-                .map(|line| line.to_string() + "\n")
-                .collect::<String>(),
-        )
-        .unwrap();
-        parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "fp".into()).unwrap()
-    };
     let home = crate::claude_status_coverage::home_key(&slot);
     let email_home = |items: &[SnapshotItem]| {
         let item = &items[0];
@@ -2385,17 +2390,17 @@ fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conse
             .and_then(|markers| markers.email_home(sequence))
             .copied()
     };
-    let items = parse(&slot, &session(true, false));
+    let items = parse_session(&slot, &email_session(true, false));
     assert_eq!(email_home(&items), Some(home));
     let wire = serde_json::to_string(&items[0]).unwrap();
     assert!(!wire.contains("example.invalid"), "no email on the item");
     assert_eq!(
-        email_home(&parse(&slot, &session(false, false))),
+        email_home(&parse_session(&slot, &email_session(false, false))),
         None,
         "email after the request"
     );
     assert_eq!(
-        email_home(&parse(&slot, &session(true, true))),
+        email_home(&parse_session(&slot, &email_session(true, true))),
         None,
         "email switched before it"
     );
@@ -2406,7 +2411,7 @@ fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conse
         rfc3339_unix_seconds(items[0].source_started_at.as_deref().unwrap()).unwrap()
     };
     let (api, trace) = reports(Vec::new(), Vec::new());
-    let mut items = parse(&slot, &session(true, false));
+    let mut items = parse_session(&slot, &email_session(true, false));
     let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None).with_status_coverage(
         Some(coverage(
             home,
@@ -2448,13 +2453,151 @@ fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conse
     // Genuinely absent or disqualified email, or an unregistered folder: the
     // earlier org-only meaning stands.
     for mut other in [
-        parse(&slot, &session(false, false)),
-        parse(&slot, &session(true, true)),
-        parse(&dir.join("loose"), &session(true, false)),
+        parse_session(&slot, &email_session(false, false)),
+        parse_session(&slot, &email_session(true, true)),
+        parse_session(&dir.join("loose"), &email_session(true, false)),
     ] {
         identity::apply_scan(&mut other, &evidence, BTreeMap::new());
         assert_eq!(other[0].request_evidence[0].identity_basis, identity::TRANSCRIPT_ORG);
         assert_eq!(other[0].request_identity_refusals, 0);
     }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
+    use crate::claude_status_coverage::{home_key, Ledger, Registration, MAX_LOST};
+    let dir = temp_dir("claude-request-identity-removed-slot");
+    let (slot, loose) = (dir.join("slot"), dir.join("loose"));
+    let home = home_key(&slot);
+    let org = org_hash(ORG_1);
+    let request_at = rfc3339_unix_seconds("2026-08-02T07:00:01Z").unwrap();
+    let start = rfc3339_unix_seconds(
+        parse_session(&slot, &email_session(true, false))[0]
+            .source_started_at
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    let from = start - crate::claude_status_coverage::SESSION_LEAD_SECONDS;
+    let (api, trace) = reports(Vec::new(), Vec::new());
+    let scan = |folder: &Path, ledger: &Ledger| {
+        let mut items = parse_session(folder, &email_session(true, false));
+        let before = items[0].clone();
+        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
+            .with_status_coverage(Some(ledger.clone()));
+        identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+        (before, items.remove(0))
+    };
+    let rows = |item: &SnapshotItem| {
+        item.usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage)
+            .map(|row| (row.request_count, row.input_tokens, row.cost_usd.clone()))
+            .collect::<Vec<_>>()
+    };
+    // Refused, never weakened: a positive refusal (which also blocks
+    // Desktop-pair fill), no login, no org-only evidence, usage and money kept.
+    let assert_refused = |case: &str, (before, item): (SnapshotItem, SnapshotItem)| {
+        assert!(item.request_identity_refusals >= 1, "{case}");
+        assert!(!serde_json::to_string(&item).unwrap().contains(LOGIN_A), "{case}");
+        assert!(
+            item.request_evidence
+                .iter()
+                .all(|evidence| evidence.identity_basis != identity::TRANSCRIPT_ORG),
+            "{case}"
+        );
+        assert_eq!(
+            (item.input_tokens, item.output_tokens, item.request_count),
+            (before.input_tokens, before.output_tokens, before.request_count),
+            "{case}"
+        );
+        assert_eq!(item.cost, before.cost, "{case}");
+        assert_eq!(rows(&item), rows(&before), "{case}");
+    };
+    let assert_org_only = |case: &str, (_, item): (SnapshotItem, SnapshotItem)| {
+        assert_eq!(item.request_evidence[0].identity_basis, identity::TRANSCRIPT_ORG, "{case}");
+        assert_eq!(item.request_identity_refusals, 0, "{case}");
+    };
+    // Unit-level reason for the same request.
+    let reason = |ledger: &Ledger, home: &crate::claude_status_coverage::HomeKey| {
+        let (api, trace) = reports(Vec::new(), Vec::new());
+        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
+            .with_status_coverage(Some(ledger.clone()));
+        let mut request = facts("req_1", Some(request_at), MarkerVerdict::Trusted(&org));
+        request.email_home = Some(home);
+        request.session_start_unix_seconds = Some(start);
+        identity::classify(&evidence, &request)
+    };
+
+    // Registered and sampled: refused as unqualified.
+    let mut ledger = coverage(home, LOGIN_A, &org, from - 300, request_at + 300);
+    assert_eq!(
+        reason(&ledger, &home),
+        RequestIdentity::Refused(Refusal::CoverageUnqualified)
+    );
+    assert_refused("registered slot", scan(&slot, &ledger));
+    assert_org_only("never-registered folder", scan(&loose, &ledger));
+
+    // The slot is removed: its history is cleared, but the SAME request stays
+    // refused instead of becoming org-only.
+    ledger.retain(BTreeSet::new(), Some(request_at + 600));
+    assert_eq!(ledger.pairings().count(), 0, "history cleared");
+    assert_eq!(ledger.registration(&home, from), Registration::Unknown);
+    assert_eq!(
+        reason(&ledger, &home),
+        RequestIdentity::Refused(Refusal::CoverageUnavailable)
+    );
+    assert_refused("removed slot", scan(&slot, &ledger));
+    assert_org_only("never-registered control after removal", scan(&loose, &ledger));
+    // Re-registered: no history, still refused; removed again: still lost.
+    ledger.retain(BTreeSet::from([home]), Some(request_at + 900));
+    assert_refused("re-registered slot", scan(&slot, &ledger));
+    ledger.retain(BTreeSet::new(), Some(request_at + 1_200));
+    assert_refused("removed again", scan(&slot, &ledger));
+
+    // Restart: no pass yet, so neither folder is known.
+    let restarted = Ledger::default();
+    assert_refused("restart, no pass", scan(&slot, &restarted));
+    assert_refused("restart, never-registered folder", scan(&loose, &restarted));
+    // First pass after the request: an earlier removal may have been missed.
+    let mut late = Ledger::default();
+    late.retain(BTreeSet::new(), Some(request_at + 60));
+    assert_refused("registration known only after the window", scan(&slot, &late));
+    assert_refused("loose folder before registration was known", scan(&loose, &late));
+    let mut undated = Ledger::default();
+    undated.retain(BTreeSet::new(), None);
+    assert_refused("registration start unknown", scan(&loose, &undated));
+
+    // Lost knowledge evicted: more removals than the record holds make every
+    // unregistered folder unknown, never proven absent.
+    let mut churn = coverage(home, LOGIN_A, &org, from - 300, request_at + 300);
+    churn.retain(BTreeSet::new(), Some(request_at + 600));
+    for n in 0..MAX_LOST {
+        let other = home_key(Path::new(&format!("/synthetic/churn/{n}")));
+        churn.retain(BTreeSet::from([other]), Some(request_at + 600));
+        churn.retain(BTreeSet::new(), Some(request_at + 600));
+    }
+    assert!(churn.retained_bytes() <= crate::claude_status_coverage::MAX_BYTES);
+    assert_eq!(churn.registration(&home_key(&loose), from), Registration::Unknown);
+    assert_refused("overflowed loss record, removed slot", scan(&slot, &churn));
+    assert_refused("overflowed loss record, loose folder", scan(&loose, &churn));
+
+    // Proven not-applicable controls keep org-only even after removal.
+    let default_home = home_key(&crate::agent_status::home_dir().join(".claude"));
+    let org_only = RequestIdentity::Tagged(AuthorityKey {
+        login: None,
+        org: Some(org.clone()),
+        basis: identity::TRANSCRIPT_ORG,
+    });
+    assert_eq!(reason(&ledger, &default_home), org_only, "shared default folder");
+    let (api2, trace2) = reports(Vec::new(), Vec::new());
+    let evidence = ScanEvidence::new(&api2, &trace2, BTreeSet::new(), None)
+        .with_status_coverage(Some(ledger.clone()));
+    let mut desktop = facts("req_1", Some(request_at), MarkerVerdict::Trusted(&org));
+    desktop.email_home = Some(&home);
+    desktop.session_start_unix_seconds = Some(start);
+    desktop.desktop = true;
+    assert_eq!(identity::classify(&evidence, &desktop), org_only, "Desktop");
     let _ = fs::remove_dir_all(dir);
 }

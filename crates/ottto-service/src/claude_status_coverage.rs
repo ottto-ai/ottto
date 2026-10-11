@@ -20,6 +20,10 @@
 //! The history is process-local on purpose. A restart or uninstall clears it,
 //! so coverage never spans an unobserved restart, and no persisted status
 //! state or local status output changes.
+//!
+//! Registration knowledge is kept the same way. A removed slot loses its
+//! history but stays known as lost (bounded by `MAX_LOST`); only unbroken
+//! knowledge proves a folder was never a slot (see `Registration`).
 
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,8 +45,12 @@ pub(crate) const MAX_SEGMENTS_PER_SLOT: usize = 32;
 /// Hard cap on retained bytes, as counted by `Ledger::retained_bytes`.
 /// Worst case under the entry caps: 10 slots × (32 B key + 80 B history +
 /// 32 runs × (64 B inline + 128 B hashes)) + 10 registered keys × 40 B
-/// = 62,960 B.
+/// + 10 lost keys × 40 B = 63,360 B.
 pub(crate) const MAX_BYTES: usize = 64 * 1024;
+
+/// Folders remembered as having lost their registration in this process.
+/// One more removal than this makes every unregistered folder unknown.
+pub(crate) const MAX_LOST: usize = MAX_SLOTS;
 
 /// Opaque registered-folder key: SHA-256 over the normalized config dir.
 pub(crate) type HomeKey = [u8; 32];
@@ -84,6 +92,29 @@ pub(crate) struct Ledger {
     /// Registered folders as of the last completed status pass; `None` until
     /// one completes in this process (after a restart nothing is known).
     registered: Option<BTreeSet<HomeKey>>,
+    /// When the first completed pass reported registration. Before it, an
+    /// unregistered folder may have been a slot this process never saw.
+    known_since: Option<u64>,
+    /// Folders registered at some pass and not at a later one. Their history
+    /// is cleared, but the loss stays known: a removed slot never reads as a
+    /// folder the basis never applied to.
+    lost: BTreeSet<HomeKey>,
+    /// More than `MAX_LOST` folders were lost: which ones is no longer known.
+    lost_overflow: bool,
+}
+
+/// Whether a folder was a registered slot, as far as this process knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Registration {
+    /// Registered at the last completed pass.
+    Registered,
+    /// Proven never registered over the window: unregistered at every pass
+    /// since registration became known, before the window began, and not
+    /// among the lost folders (whose record never overflowed).
+    NeverRegistered,
+    /// No pass yet, a removed slot, lost knowledge, or a window that began
+    /// before registration was known.
+    Unknown,
 }
 
 /// What the history says about one email-bearing request's window. None of
@@ -103,6 +134,9 @@ pub(crate) enum Verdict {
 static LEDGER: Mutex<Ledger> = Mutex::new(Ledger {
     slots: BTreeMap::new(),
     registered: None,
+    known_since: None,
+    lost: BTreeSet::new(),
+    lost_overflow: false,
 });
 
 /// The basis is compiled out with contract-5 emission.
@@ -188,8 +222,9 @@ pub(crate) fn retain_registered<'a>(
         .filter(|key| *key != default_key)
         .take(MAX_SLOTS)
         .collect::<BTreeSet<_>>();
+    let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).ok();
     if let Ok(mut ledger) = LEDGER.lock() {
-        ledger.retain(keys);
+        ledger.retain(keys, now);
     }
 }
 
@@ -224,12 +259,55 @@ pub(crate) fn clear_global_for_test() {
 }
 
 impl Ledger {
-    pub(crate) fn retain(&mut self, registered: BTreeSet<HomeKey>) {
+    /// Records one completed pass at `at`. A folder that drops out loses its
+    /// history and joins the bounded lost set; one more loss than the set
+    /// holds makes the loss record incomplete for the rest of the process.
+    pub(crate) fn retain(&mut self, registered: BTreeSet<HomeKey>, at: Option<u64>) {
         self.slots.retain(|key, _| registered.contains(key));
+        let removed = self
+            .registered
+            .iter()
+            .flatten()
+            .filter(|key| !registered.contains(*key))
+            .copied()
+            .collect::<Vec<_>>();
+        self.lost.retain(|key| !registered.contains(key));
+        for key in removed {
+            if self.lost.len() == MAX_LOST && !self.lost.contains(&key) {
+                self.lost.clear();
+                self.lost_overflow = true;
+            }
+            if !self.lost_overflow {
+                self.lost.insert(key);
+            }
+        }
+        if self.registered.is_none() {
+            self.known_since = at;
+        }
         self.registered = Some(registered);
     }
 
-    /// `None` until a status pass has completed in this process.
+    /// Classifies `home` for a window starting at `from`. Only positive,
+    /// unbroken knowledge proves `NeverRegistered`; anything forgotten,
+    /// evicted or not yet observed is `Unknown`.
+    pub(crate) fn registration(&self, home: &HomeKey, from: u64) -> Registration {
+        let Some(registered) = self.registered.as_ref() else {
+            return Registration::Unknown;
+        };
+        if registered.contains(home) {
+            Registration::Registered
+        } else if self.lost_overflow
+            || self.lost.contains(home)
+            || self.known_since.map_or(true, |since| from < since)
+        {
+            Registration::Unknown
+        } else {
+            Registration::NeverRegistered
+        }
+    }
+
+    /// The last pass's raw view: `None` until a pass has completed.
+    #[cfg(test)]
     pub(crate) fn is_registered(&self, home: &HomeKey) -> Option<bool> {
         self.registered
             .as_ref()
@@ -339,22 +417,22 @@ impl Ledger {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.registered.as_ref().map_or(0, |registered| {
-            registered.len() * (std::mem::size_of::<HomeKey>() + std::mem::size_of::<usize>())
-        }) + self
-            .slots
-            .values()
-            .map(|history| {
-                std::mem::size_of::<HomeKey>()
-                    + std::mem::size_of::<SlotHistory>()
-                    + history.segments.capacity() * std::mem::size_of::<Segment>()
-                    + history
-                        .segments
-                        .iter()
-                        .map(|segment| segment.login.capacity() + segment.org.capacity())
-                        .sum::<usize>()
-            })
-            .sum::<usize>()
+        let key_bytes = std::mem::size_of::<HomeKey>() + std::mem::size_of::<usize>();
+        (self.registered.as_ref().map_or(0, BTreeSet::len) + self.lost.len()) * key_bytes
+            + self
+                .slots
+                .values()
+                .map(|history| {
+                    std::mem::size_of::<HomeKey>()
+                        + std::mem::size_of::<SlotHistory>()
+                        + history.segments.capacity() * std::mem::size_of::<Segment>()
+                        + history
+                            .segments
+                            .iter()
+                            .map(|segment| segment.login.capacity() + segment.org.capacity())
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
     /// Classifies `[from, to]` in `home` for a request under `org`. Runs within

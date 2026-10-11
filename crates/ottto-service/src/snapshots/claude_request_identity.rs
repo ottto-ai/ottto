@@ -1430,17 +1430,18 @@ fn transcript_identity<'k>(
 /// slot's login ran continuously over [session start − 300 s, request]. So the
 /// basis only decides whether the request keeps its earlier meaning:
 /// - not applicable (`None`, the org-only path stands): the basis compiled
-///   out, Desktop, no unchanged email before the request, or a file outside a
-///   registered slot folder (including the shared default folder);
+///   out, Desktop, no unchanged email before the request, the shared default
+///   folder, or a folder proven never registered over the window;
 /// - otherwise refused, never weakened to org-only: the feed unavailable or
-///   not yet run since restart, unknown session start, a conflicting sample,
-///   no history spanning the window, or samples that span it but prove nothing.
+///   not yet run since restart, a removed slot or forgotten registration, an
+///   unknown session start, a conflicting sample, no history spanning the
+///   window, or samples that span it but prove nothing.
 fn email_refusal(
     evidence: &ScanEvidence<'_>,
     facts: &RequestFacts<'_>,
     org: &str,
 ) -> Option<Refusal> {
-    use crate::claude_status_coverage::Verdict;
+    use crate::claude_status_coverage::{Registration, Verdict};
     if facts.desktop || !transcript_email_enabled() {
         return None;
     }
@@ -1451,11 +1452,6 @@ fn email_refusal(
     let Some(coverage) = evidence.status_coverage.as_ref() else {
         return Some(Refusal::CoverageUnavailable);
     };
-    match coverage.is_registered(home) {
-        None => return Some(Refusal::CoverageUnavailable),
-        Some(false) => return None,
-        Some(true) => {}
-    }
     let window = facts
         .session_start_unix_seconds
         .and_then(|start| start.checked_sub(crate::claude_status_coverage::SESSION_LEAD_SECONDS))
@@ -1463,6 +1459,11 @@ fn email_refusal(
     let Some((from, to)) = window else {
         return Some(Refusal::CoverageUnavailable);
     };
+    match coverage.registration(home, from) {
+        Registration::Registered => {}
+        Registration::NeverRegistered => return None,
+        Registration::Unknown => return Some(Refusal::CoverageUnavailable),
+    }
     Some(match coverage.verdict(home, from, to, org) {
         Verdict::Unavailable => Refusal::CoverageUnavailable,
         Verdict::Conflicting => Refusal::ContradictoryOrg,
