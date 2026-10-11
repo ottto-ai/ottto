@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 540,
-  "content_sha256": "0378d06238423ed267b7a99727d5115271522afed43d80bbbb2c20dc2af141ad",
+  "content_sha256": "5b1f684bc281375161186813710e36f40a504923870cba9a9d38b73d6ade086f",
   "files": [
     {
       "executable": false,
@@ -734,8 +734,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_browser_auth.rs",
-      "sha256": "7e2af25a55e7d6eb832f841b8fcb8e287794be526631cf938a133dbb40ccb9d3",
-      "size_bytes": 349344
+      "sha256": "7add9861f4eb695fcb8fe74334b3c911d114c9059c823e68e59f05615b832dcf",
+      "size_bytes": 350229
     },
     {
       "executable": false,
@@ -2505,8 +2505,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-11-large-session-tail-budget.md",
-      "sha256": "95e7409fc43a1d9f7adaf0d2bc3d32a5534bcf0349bb6aa2519a38507fe1772a",
-      "size_bytes": 2364
+      "sha256": "c82b64ed27546be02609dd8855739bbf746ab19428ebdb8734dc72a127164932",
+      "size_bytes": 2974
     },
     {
       "executable": false,
@@ -3783,7 +3783,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-11T13:32:28+00:00",
+  "generated_at": "2026-10-11T14:20:18+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 541,
   "public_roots": [
@@ -3822,5 +3822,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "09da3df35451251f1d5d96ff9ec1f8241c02620a"
+  "source_commit": "2cd583c79c154c8c03000f32735912c619f09a6d"
 }

@@ -37,3 +37,12 @@ forgotten guards, nested collections, opaque/mutable refusal and aggregate
 byte-budget exhaustion. Source proof does not establish installed CPU or RSS
 savings. Containing-release acceptance must use ordinary activity and matched
 read/guard denominators with a full-reader parity witness.
+
+Hosted CI exposed an existing scheduling race in the browser-auth cancellation
+test. Its fixture marked a worker phase without holding a provider lifetime
+lock, so normal recovery could correctly finish before the blocked-retry
+assertion. The unchanged main fixture reproduces this with a scheduling delay.
+The Unix lock fixture now holds the supervisor's synthetic lifetime lock,
+preserves blocked ceremony/root assertions, then releases it and waits for
+normal recovery before asserting cancelled status and exact root reuse.
+Production authentication and the reviewed transcript-tail source are unchanged.

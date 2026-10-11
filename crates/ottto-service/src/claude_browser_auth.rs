@@ -6330,6 +6330,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg(unix)]
     fn active_cancel_reserves_root_until_worker_teardown() {
         let root = temp_dir("cancel-retry-overlap");
         let support = root.join("support");
@@ -6345,17 +6346,42 @@ mod tests {
         prepare_generic(status, operation_id).expect("prepare");
         set_phase(operation_id, ClaudeBrowserAuthPhaseV1::WaitingForProvider);
         let exact = operation_config_dir(&read_operation(operation_id).expect("operation"));
+        // The phase alone is not evidence of a live worker. Hold the same
+        // lifetime lock as its supervisor so recovery cannot finish early.
+        let provider = provider_process_guard(operation_id, false)
+            .expect("provider guard")
+            .expect("provider ownership");
         assert!(request_cancel(operation_id).expect("cancel request"));
         assert!(claim_ceremony(retry_id).is_err());
         assert!(claim_reusable_root(retry_id)
             .expect("claim check")
             .is_none());
-        fail_operation(operation_id, ClaudeBrowserAuthOutcomeV1::Cancelled);
-        // `fail_operation` preserves the earlier terminal CAS. Only verified
-        // worker teardown releases the process-wide ceremony claim.
-        release_ceremony(operation_id);
-        claim_ceremony(retry_id).expect("ceremony released after teardown");
-        let reused = claim_reusable_root("claude_setup_14141414141414141414141414141414")
+        let stopping = read_operation(operation_id).expect("stopping operation");
+        assert!(stopping.cancel_requested);
+        assert!(stopping.outcome.is_none());
+
+        drop(provider);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match claim_ceremony(retry_id) {
+                Ok(true) => break,
+                Ok(false) => panic!("retry unexpectedly owned the ceremony before teardown"),
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "recovery did not release: {error}"
+                    );
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+        assert_eq!(
+            read_operation(operation_id)
+                .expect("cancelled operation")
+                .outcome,
+            Some(ClaudeBrowserAuthOutcomeV1::Cancelled)
+        );
+        let reused = claim_reusable_root(retry_id)
             .expect("claim")
             .expect("released after teardown");
         assert_eq!(reused, exact);
