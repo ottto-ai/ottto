@@ -1,7 +1,7 @@
 //! Local-only bounded evidence. This never enters a status/upload DTO.
 use crate::snapshots::SnapshotQuarantineDisposition;
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -135,6 +135,61 @@ pub(crate) struct CensusIndexAggregates {
     pub protected_absent_valid_owner: Option<u64>,
 }
 
+/// Closed branch attribution, not an OS diagnosis or distinct-file count.
+/// Ordinals belong to fenced census v3; never reorder without a schema change.
+#[derive(Debug, Clone, Copy)]
+#[repr(usize)]
+pub(crate) enum UnreadableCause {
+    Metadata,
+    Directory,
+    OpenRead,
+    ScopeObject,
+    Reduction,
+    AliasParser,
+    ProtectedAbsence,
+    LegacyHold,
+}
+
+/// Additive persisted metadata. Old traversals default to zero known causes;
+/// their nonzero public count remains an explicit unattributed remainder.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct UnreadableCauses {
+    counts: [u64; 8],
+}
+impl UnreadableCauses {
+    pub(crate) fn record(&mut self, cause: UnreadableCause, count: u64) {
+        let slot = &mut self.counts[cause as usize];
+        *slot = slot.saturating_add(count);
+    }
+    pub(crate) fn merge(&mut self, other: Self) {
+        for (slot, incoming) in self.counts.iter_mut().zip(other.counts) {
+            *slot = slot.saturating_add(incoming);
+        }
+    }
+    pub(crate) fn projection(self, total: u64) -> UnreadableBreakdown {
+        let known = self
+            .counts
+            .iter()
+            .try_fold(0_u64, |sum, value| sum.checked_add(*value));
+        let unattributed = known.and_then(|known| total.checked_sub(known));
+        UnreadableBreakdown {
+            counts: self.counts,
+            unattributed,
+            consistent: unattributed.is_some(),
+        }
+    }
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct UnreadableBreakdown {
+    // metadata, directory, open_read, scope_object, reduction, alias_parser,
+    // protected_absence, legacy_hold; fixed order, fixed length.
+    counts: [u64; 8],
+    unattributed: Option<u64>,
+    consistent: bool,
+}
+crate::heap_layout_bound::fields!(UnreadableCauses; counts);
+
 #[derive(Default, Serialize)]
 struct CensusLossCounts {
     discovered: u64,
@@ -144,6 +199,12 @@ struct CensusLossCounts {
     recognized_usage_dropped: u64,
     dropped_usage: u64,
     over_line_cap: u64,
+    zero_snapshot_usage_evidence: u64,
+    terminal_over_line_cap: u64,
+    terminal_ownership_incomplete: u64,
+    terminal_zero_snapshot_usage_evidence: u64,
+    terminal_recognized_usage_dropped: u64,
+    terminal_dropped_usage: u64,
 }
 
 #[derive(Serialize)]
@@ -161,6 +222,7 @@ struct FencedCensusRecord<'a> {
     scan_input_generation: u64,
     gates: CensusGates,
     losses: CensusLossCounts,
+    unreadable_causes: UnreadableBreakdown,
     index: CensusIndexAggregates,
 }
 
@@ -398,7 +460,7 @@ pub(crate) fn write_fenced_census(
         .map_err(|_| CensusPublishFailure::ClockUnavailable)?;
     let start = process_start();
     let record = FencedCensusRecord {
-        schema: "local_fenced_codex_census:v2",
+        schema: "local_fenced_codex_census:v3",
         source: "codex",
         producer_pid: std::process::id(),
         producer_start_sec: start.map(|value| value.sec),
@@ -418,7 +480,17 @@ pub(crate) fn write_fenced_census(
             recognized_usage_dropped: scan.recognized_usage_drop_count as u64,
             dropped_usage: scan.dropped_usage_record_count,
             over_line_cap: scan.over_line_cap_count as u64,
+            zero_snapshot_usage_evidence: scan.zero_snapshot_usage_evidence_count as u64,
+            terminal_over_line_cap: scan.terminal_over_line_cap_count as u64,
+            terminal_ownership_incomplete: scan.terminal_ownership_incomplete_file_count as u64,
+            terminal_zero_snapshot_usage_evidence: scan.terminal_zero_snapshot_usage_evidence_count
+                as u64,
+            terminal_recognized_usage_dropped: scan.terminal_recognized_usage_drop_count as u64,
+            terminal_dropped_usage: scan.terminal_dropped_usage_record_count,
         },
+        unreadable_causes: diagnostic
+            .unreadable_causes
+            .projection(scan.unreadable_path_count as u64),
         index: index.local_codex_census_aggregates(),
     };
     write_fenced_census_record(support_dir, &record)
@@ -617,6 +689,7 @@ pub(crate) struct CodexScanDiagnostics {
     pub rollout_extents: LoaderEvidence,
     pub session_index: LoaderEvidence,
     pub gates: CensusGates,
+    pub unreadable_causes: UnreadableCauses,
     pub quarantine_count: u64,
     pub sample_offset: u64,
     pub lineage: [Option<RecoveryLineage>; LINEAGE_SAMPLES],
@@ -624,7 +697,7 @@ pub(crate) struct CodexScanDiagnostics {
 
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
-crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, gates, quarantine_count, sample_offset, lineage);
+crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, gates, unreadable_causes, quarantine_count, sample_offset, lineage);
 crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
@@ -784,7 +857,7 @@ mod fenced_census_tests {
 
     fn record() -> FencedCensusRecord<'static> {
         FencedCensusRecord {
-            schema: "local_fenced_codex_census:v2",
+            schema: "local_fenced_codex_census:v3",
             source: "codex",
             producer_pid: std::process::id(),
             producer_start_sec: process_start().map(|value| value.sec),
@@ -797,11 +870,57 @@ mod fenced_census_tests {
             scan_input_generation: 7,
             gates: CensusGates::default(),
             losses: CensusLossCounts::default(),
+            unreadable_causes: UnreadableCauses::default().projection(0),
             index: CensusIndexAggregates {
                 generation: 8,
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn fenced_census_unreadable_saturation_inconsistency_and_fixed_resource_bound() {
+        assert_eq!(std::mem::size_of::<UnreadableCauses>(), 64);
+        let mut causes = UnreadableCauses::default();
+        causes.record(UnreadableCause::Metadata, u64::MAX);
+        causes.record(UnreadableCause::Metadata, 1);
+        assert_eq!(causes.counts[0], u64::MAX);
+        assert!(causes.projection(u64::MAX).consistent);
+        causes.record(UnreadableCause::Directory, 1);
+        let inconsistent = causes.projection(u64::MAX);
+        assert!(!inconsistent.consistent);
+        assert!(inconsistent.unattributed.is_none());
+        let mut observed = record();
+        causes.counts = [u64::MAX; 8];
+        observed.unreadable_causes = causes.projection(u64::MAX);
+        observed.losses = CensusLossCounts {
+            discovered: u64::MAX,
+            ownership_incomplete: u64::MAX,
+            unreadable: u64::MAX,
+            disappeared: u64::MAX,
+            recognized_usage_dropped: u64::MAX,
+            dropped_usage: u64::MAX,
+            over_line_cap: u64::MAX,
+            zero_snapshot_usage_evidence: u64::MAX,
+            terminal_over_line_cap: u64::MAX,
+            terminal_ownership_incomplete: u64::MAX,
+            terminal_zero_snapshot_usage_evidence: u64::MAX,
+            terminal_recognized_usage_dropped: u64::MAX,
+            terminal_dropped_usage: u64::MAX,
+        };
+        let mut buffer = [0_u8; MAX_FENCED_CENSUS_BYTES];
+        let (len, stats) = crate::retry_allocation_probe::measure(|| {
+            let mut writer = std::io::Cursor::new(buffer.as_mut_slice());
+            serde_json::to_writer(&mut writer, &observed).unwrap();
+            writer.position() as usize
+        });
+        assert_eq!(stats.allocations, 0);
+        assert!(len < MAX_FENCED_CENSUS_BYTES);
+        let json: serde_json::Value = serde_json::from_slice(&buffer[..len]).unwrap();
+        assert_eq!(json["schema"], "local_fenced_codex_census:v3");
+        assert_eq!(json["losses"]["terminal_over_line_cap"], u64::MAX);
+        assert_eq!(json["losses"]["terminal_ownership_incomplete"], u64::MAX);
+        println!("CENSUS_CAUSES inline_bytes=64 histogram_heap_bytes=0 worst_test_record_bytes={len} encoding_allocations=0");
     }
 
     fn sidecar(fixture: &Fixture) -> serde_json::Value {
@@ -910,7 +1029,7 @@ mod fenced_census_tests {
                     &std::fs::read(fenced_census_path(fixture.path())).unwrap(),
                 )
                 .unwrap();
-                assert_eq!(census["schema"], "local_fenced_codex_census:v2");
+                assert_eq!(census["schema"], "local_fenced_codex_census:v3");
                 assert_eq!(census["attempt_sequence"], expected);
                 assert_eq!(census["producer_start_sec"], 100);
                 assert_eq!(census["producer_start_usec"], 123456);

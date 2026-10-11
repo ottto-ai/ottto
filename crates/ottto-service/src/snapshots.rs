@@ -1,6 +1,6 @@
 use crate::codex_scan_diagnostics::{
     self, CensusGates, CodexScanDiagnostics, FileReason, IncompleteShape, RecoveryLineage,
-    LINEAGE_SAMPLES,
+    UnreadableCause, UnreadableCauses, LINEAGE_SAMPLES,
 };
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
@@ -1471,6 +1471,7 @@ struct ScanTraversalCounts {
     directory_entry_cap_exceeded_count: usize,
     symlink_rejected_count: usize,
     unreadable_path_count: usize,
+    unreadable_causes: UnreadableCauses,
     oversized_file_count: usize,
     disappeared_file_count: usize,
     malformed_json_line_count: usize,
@@ -1516,6 +1517,12 @@ struct SettledScanResidue {
 }
 
 impl ScanTraversalCounts {
+    fn record_unreadable(&mut self, cause: UnreadableCause, count: usize) {
+        // Preserve the existing public count and operational predicates.
+        self.unreadable_path_count += count;
+        self.unreadable_causes.record(cause, count as u64);
+    }
+
     /// Loss that a later traversal can still change: a directory the walk
     /// could not enter or finish, an object it could not open or read, a root
     /// that vanished, or a line the parser rejected. These keep their retry
@@ -2779,7 +2786,9 @@ impl SourceScanResult {
         });
         if let Some(traversal) = index.traversal.as_mut() {
             traversal.counts.ownership_incomplete_file_count += keys.len();
-            traversal.counts.unreadable_path_count += 1;
+            traversal
+                .counts
+                .record_unreadable(UnreadableCause::LegacyHold, 1);
             traversal.residue.index_keys.extend(keys);
             traversal
                 .residue
@@ -11823,7 +11832,7 @@ impl OwnedSourceScan {
                             || group.members.len() > file_limit
                         {
                             census.ownership_incomplete_file_count += group.members.len();
-                            census.unreadable_path_count += 1;
+                            census.record_unreadable(UnreadableCause::AliasParser, 1);
                             residue_index_keys.extend(
                                 group
                                     .members
@@ -11866,7 +11875,7 @@ impl OwnedSourceScan {
                         !grouped_paths.contains(&local_index_key(&candidate.path))
                     });
                     if !inventory.complete {
-                        census.unreadable_path_count += 1;
+                        census.record_unreadable(UnreadableCause::AliasParser, 1);
                         census.ownership_incomplete_file_count += identified_candidates.len();
                         residue_index_keys.extend(
                             identified_candidates
@@ -11963,7 +11972,7 @@ impl OwnedSourceScan {
                             }
                             Err(_) => {
                                 census.ownership_incomplete_file_count += group.members.len();
-                                census.unreadable_path_count += 1;
+                                census.record_unreadable(UnreadableCause::AliasParser, 1);
                                 residue_index_keys.extend(
                                     group
                                         .members
@@ -11978,7 +11987,7 @@ impl OwnedSourceScan {
                     }
                     Err(_) => {
                         census.ownership_incomplete_file_count += group.members.len();
-                        census.unreadable_path_count += 1;
+                        census.record_unreadable(UnreadableCause::AliasParser, 1);
                         residue_index_keys.extend(
                             group
                                 .members
@@ -12002,7 +12011,7 @@ impl OwnedSourceScan {
                         }
                         Err(_) => {
                             census.ownership_incomplete_file_count += group.members.len();
-                            census.unreadable_path_count += 1;
+                            census.record_unreadable(UnreadableCause::OpenRead, 1);
                             residue_index_keys.extend(
                                 group
                                     .members
@@ -12022,7 +12031,7 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(_) => {
-                        census.unreadable_path_count += 1;
+                        census.record_unreadable(UnreadableCause::OpenRead, 1);
                         pending!();
                     }
                     Ok(true) => {}
@@ -12047,7 +12056,7 @@ impl OwnedSourceScan {
                             pending!();
                         }
                         Err(()) => {
-                            census.unreadable_path_count += 1;
+                            census.record_unreadable(UnreadableCause::Reduction, 1);
                             pending!();
                         }
                         Ok(true) => {}
@@ -12073,7 +12082,7 @@ impl OwnedSourceScan {
                     // identity, so replacement during fallback cannot publish.
                     let reopened = open_candidate_file(source, &mut active.candidate.clone());
                     let Ok(file) = reopened else {
-                        census.unreadable_path_count += 1;
+                        census.record_unreadable(UnreadableCause::OpenRead, 1);
                         pending!();
                     };
                     let Ok(mut parser) = sampled_scan::new_source_parser(
@@ -12087,7 +12096,7 @@ impl OwnedSourceScan {
                         context_curve_enabled,
                         index,
                     ) else {
-                        census.unreadable_path_count += 1;
+                        census.record_unreadable(UnreadableCause::Reduction, 1);
                         pending!();
                     };
                     let acquisition = active.sampling.as_mut().expect("sampled acquisition");
@@ -12101,7 +12110,7 @@ impl OwnedSourceScan {
                         debt,
                         sampled_scan::now_seconds(),
                     ) else {
-                        census.unreadable_path_count += 1;
+                        census.record_unreadable(UnreadableCause::Reduction, 1);
                         pending!();
                     };
                     acquisition.mode = mode;
@@ -12133,7 +12142,7 @@ impl OwnedSourceScan {
                         }
                         Err(_) => {
                             census.ownership_incomplete_file_count += 1;
-                            census.unreadable_path_count += 1;
+                            census.record_unreadable(UnreadableCause::AliasParser, 1);
                             residue_index_keys.insert(local_index_key(&candidate.path));
                             if let Some(owner) = parser.accumulator.source_session_id.as_ref() {
                                 residue_blocked_session_ids.insert(resolve_codex_identity(owner));
@@ -12160,7 +12169,7 @@ impl OwnedSourceScan {
                     > codex_file_join::MAX_RECEIPT_BYTES
                 {
                     census.ownership_incomplete_file_count += aliases.len().max(1);
-                    census.unreadable_path_count += 1;
+                    census.record_unreadable(UnreadableCause::AliasParser, 1);
                     residue_index_keys.insert(local_index_key(&candidate.path));
                     residue_index_keys
                         .extend(aliases.iter().map(|member| local_index_key(&member.path)));
@@ -12200,11 +12209,15 @@ impl OwnedSourceScan {
                         )
                     });
                     let mut current_path = candidate.clone();
-                    if current_scope.as_ref() != Some(&acquisition.scope)
-                        || open_candidate_file(source, &mut current_path).is_err()
-                        || current_path.opened_object_identity != candidate.opened_object_identity
-                    {
-                        census.unreadable_path_count += 1;
+                    if let Some(cause) = sampled_revalidation_cause(
+                        current_scope.as_ref() == Some(&acquisition.scope),
+                        || {
+                            drop(open_candidate_file(source, &mut current_path)?);
+                            Ok(current_path.opened_object_identity
+                                == candidate.opened_object_identity)
+                        },
+                    ) {
+                        census.record_unreadable(cause, 1);
                         pending!();
                     }
                     match parser.retain_reduction(
@@ -12214,7 +12227,7 @@ impl OwnedSourceScan {
                     ) {
                         Ok(completed) => completed,
                         Err(_) => {
-                            census.unreadable_path_count += 1;
+                            census.record_unreadable(UnreadableCause::Reduction, 1);
                             pending!();
                         }
                     }
@@ -12241,7 +12254,7 @@ impl OwnedSourceScan {
                 ) {
                     Ok(parsed) => parsed,
                     Err(_) => {
-                        census.unreadable_path_count += 1;
+                        census.record_unreadable(UnreadableCause::Reduction, 1);
                         pending!();
                     }
                 };
@@ -12264,7 +12277,7 @@ impl OwnedSourceScan {
                     // Joining authorizes a complete replacement only. Native
                     // ownership/parser loss cannot publish a partial union body.
                     census.ownership_incomplete_file_count += aliases.len();
-                    census.unreadable_path_count += 1;
+                    census.record_unreadable(UnreadableCause::AliasParser, 1);
                     residue_index_keys
                         .extend(aliases.iter().map(|member| local_index_key(&member.path)));
                     let owners = parsed_file
@@ -12661,6 +12674,10 @@ impl OwnedSourceScan {
                         census.directory_entry_cap_exceeded_count;
                     traversal.counts.symlink_rejected_count += census.symlink_rejected_count;
                     traversal.counts.unreadable_path_count += census.unreadable_path_count;
+                    traversal
+                        .counts
+                        .unreadable_causes
+                        .merge(census.unreadable_causes);
                     traversal.counts.oversized_file_count += census.oversized_file_count;
                     traversal.counts.disappeared_file_count += census.disappeared_file_count;
                     traversal.counts.malformed_json_line_count += census.malformed_json_line_count;
@@ -12733,8 +12750,10 @@ impl OwnedSourceScan {
                             let newly_missing =
                                 missing.difference(&traversal.residue.index_keys).count();
                             traversal.counts.ownership_incomplete_file_count += newly_missing;
-                            traversal.counts.unreadable_path_count +=
-                                usize::from(newly_missing > 0);
+                            traversal.counts.record_unreadable(
+                                UnreadableCause::ProtectedAbsence,
+                                usize::from(newly_missing > 0),
+                            );
                             traversal.residue.index_keys.extend(missing);
                         }
                     }
@@ -12971,6 +12990,7 @@ impl OwnedSourceScan {
                         CodexScanDiagnostics {
                             version: 1,
                             generation: index.generation,
+                            unreadable_causes: counts.unreadable_causes,
                             gates: CensusGates {
                                 discovery_done: traversal_discovery_done,
                                 traversal_healthy,
@@ -13052,7 +13072,7 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(()) => {
-                        census.unreadable_path_count += 1;
+                        census.record_unreadable(UnreadableCause::Reduction, 1);
                         pending!();
                     }
                     Ok(true) => {}
@@ -13189,7 +13209,7 @@ impl OwnedSourceScan {
             ) {
                 Ok(parser) => parser,
                 Err(_) => {
-                    census.unreadable_path_count += 1;
+                    census.record_unreadable(UnreadableCause::Reduction, 1);
                     pending!();
                 }
             };
@@ -13255,7 +13275,7 @@ impl OwnedSourceScan {
                         ) {
                             Ok(mode) => mode,
                             Err(_) => {
-                                census.unreadable_path_count += 1;
+                                census.record_unreadable(UnreadableCause::Reduction, 1);
                                 pending!();
                             }
                         };
@@ -17937,6 +17957,7 @@ struct ScanCensus {
     directory_entry_cap_exceeded_count: usize,
     symlink_rejected_count: usize,
     unreadable_path_count: usize,
+    unreadable_causes: UnreadableCauses,
     oversized_file_count: usize,
     disappeared_file_count: usize,
     malformed_json_line_count: usize,
@@ -17953,7 +17974,28 @@ struct ScanCensus {
     removed_index_keys: BTreeSet<String>,
 }
 
+/// Preserve the old scope/open/object short-circuit and its one existing open.
+fn sampled_revalidation_cause(
+    scope_matches: bool,
+    revalidate: impl FnOnce() -> std::io::Result<bool>,
+) -> Option<UnreadableCause> {
+    if !scope_matches {
+        return Some(UnreadableCause::ScopeObject);
+    }
+    match revalidate() {
+        Ok(true) => None,
+        Ok(false) => Some(UnreadableCause::ScopeObject),
+        Err(_) => Some(UnreadableCause::OpenRead),
+    }
+}
+
 impl ScanCensus {
+    fn record_unreadable(&mut self, cause: UnreadableCause, count: usize) {
+        // Preserve the existing public count and operational predicates.
+        self.unreadable_path_count += count;
+        self.unreadable_causes.record(cause, count as u64);
+    }
+
     fn add_terminal_jsonl_loss(&mut self, loss: &TerminalJsonlLoss) {
         self.over_line_cap_count = self
             .over_line_cap_count
@@ -19694,6 +19736,7 @@ fn ensure_bounded_traversal(
         directory_entry_cap_exceeded_count: census.directory_entry_cap_exceeded_count,
         symlink_rejected_count: census.symlink_rejected_count,
         unreadable_path_count: census.unreadable_path_count,
+        unreadable_causes: census.unreadable_causes,
         oversized_file_count: census.oversized_file_count,
         disappeared_file_count: census.disappeared_file_count,
         malformed_json_line_count: census.malformed_json_line_count,
@@ -19817,7 +19860,9 @@ fn advance_bounded_directory_traversal_with_budget(
                 continue;
             }
             Err(_) => {
-                traversal.counts.unreadable_path_count += 1;
+                traversal
+                    .counts
+                    .record_unreadable(UnreadableCause::Metadata, 1);
                 continue;
             }
         };
@@ -19831,7 +19876,9 @@ fn advance_bounded_directory_traversal_with_budget(
         let entries = match fs::read_dir(&directory.path) {
             Ok(entries) => entries,
             Err(_) => {
-                traversal.counts.unreadable_path_count += 1;
+                traversal
+                    .counts
+                    .record_unreadable(UnreadableCause::Directory, 1);
                 continue;
             }
         };
@@ -19862,7 +19909,9 @@ fn advance_bounded_directory_traversal_with_budget(
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => {
-                    traversal.counts.unreadable_path_count += 1;
+                    traversal
+                        .counts
+                        .record_unreadable(UnreadableCause::Directory, 1);
                     continue;
                 }
             };
@@ -19870,7 +19919,9 @@ fn advance_bounded_directory_traversal_with_budget(
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(_) => {
-                    traversal.counts.unreadable_path_count += 1;
+                    traversal
+                        .counts
+                        .record_unreadable(UnreadableCause::Metadata, 1);
                     continue;
                 }
             };
@@ -19907,7 +19958,9 @@ fn advance_bounded_directory_traversal_with_budget(
                     continue;
                 }
                 Err(_) => {
-                    traversal.counts.unreadable_path_count += 1;
+                    traversal
+                        .counts
+                        .record_unreadable(UnreadableCause::Metadata, 1);
                     continue;
                 }
             };
@@ -19978,7 +20031,7 @@ fn candidate_from_traversal_path(
         }
         Err(_) => {
             if pending.census_member {
-                census.unreadable_path_count += 1;
+                census.record_unreadable(UnreadableCause::Metadata, 1);
             }
             return None;
         }
@@ -20097,7 +20150,7 @@ fn collect_recent_jsonl_files(
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(_) => {
-            census.unreadable_path_count += 1;
+            census.record_unreadable(UnreadableCause::Metadata, 1);
             return;
         }
     };
@@ -20111,7 +20164,7 @@ fn collect_recent_jsonl_files(
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(_) => {
-            census.unreadable_path_count += 1;
+            census.record_unreadable(UnreadableCause::Directory, 1);
             return;
         }
     };
@@ -20119,7 +20172,7 @@ fn collect_recent_jsonl_files(
         let entry = match entry {
             Ok(entry) => entry,
             Err(_) => {
-                census.unreadable_path_count += 1;
+                census.record_unreadable(UnreadableCause::Directory, 1);
                 continue;
             }
         };
@@ -20127,7 +20180,7 @@ fn collect_recent_jsonl_files(
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(_) => {
-                census.unreadable_path_count += 1;
+                census.record_unreadable(UnreadableCause::Metadata, 1);
                 continue;
             }
         };
@@ -20165,7 +20218,7 @@ fn collect_recent_jsonl_files(
                 continue;
             }
             Err(_) => {
-                census.unreadable_path_count += 1;
+                census.record_unreadable(UnreadableCause::Metadata, 1);
                 continue;
             }
         };
@@ -20254,7 +20307,7 @@ fn resolve_configured_scan_root(root: &Path, census: &mut ScanCensus) -> Option<
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(_) => {
-            census.unreadable_path_count += 1;
+            census.record_unreadable(UnreadableCause::Metadata, 1);
             return None;
         }
     };
@@ -20271,7 +20324,7 @@ fn resolve_configured_scan_root(root: &Path, census: &mut ScanCensus) -> Option<
             return None;
         }
         Err(_) => {
-            census.unreadable_path_count += 1;
+            census.record_unreadable(UnreadableCause::Metadata, 1);
             return None;
         }
     };
@@ -20283,7 +20336,7 @@ fn resolve_configured_scan_root(root: &Path, census: &mut ScanCensus) -> Option<
             None
         }
         Err(_) => {
-            census.unreadable_path_count += 1;
+            census.record_unreadable(UnreadableCause::Metadata, 1);
             None
         }
     }
@@ -20335,7 +20388,7 @@ fn open_and_identify_scan_candidate(
             return None;
         }
         Err(_) => {
-            census.unreadable_path_count += 1;
+            census.record_unreadable(UnreadableCause::OpenRead, 1);
             return None;
         }
     };
@@ -53502,12 +53555,12 @@ crate::heap_layout_bound::fields!(OwnedSourceScan; resource_probe, sampling, sou
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
-crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys);
+crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys);
 crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
-crate::heap_layout_bound::fields!(ScanTraversalCounts; discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
+crate::heap_layout_bound::fields!(ScanTraversalCounts; discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, blocked_session_ids);
 crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
@@ -53583,3 +53636,229 @@ inline_scan_enum!(CodexOwnershipBoundary; Self::Undetermined,Self::AllLocal,Self
 crate::heap_layout_bound::fields!(JsonlReadReport; physical_line_count, parsed_json_line_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count);
 
 crate::heap_layout_bound::fields!(SnapshotUploadPolicy; session_titles_enabled, workspace_labels_enabled, session_artifacts_enabled, session_attribution_enabled, session_attribution_labels_enabled);
+
+#[cfg(test)]
+mod census_unreadable_tests {
+    use super::*;
+
+    fn projection(counts: &ScanTraversalCounts) -> Value {
+        serde_json::to_value(
+            counts
+                .unreadable_causes
+                .projection(counts.unreadable_path_count as u64),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unreadable_causes_conserve_pages_and_preserve_health_and_legacy_unknowns() {
+        let causes = [
+            UnreadableCause::Metadata,
+            UnreadableCause::Directory,
+            UnreadableCause::OpenRead,
+            UnreadableCause::ScopeObject,
+            UnreadableCause::Reduction,
+            UnreadableCause::AliasParser,
+            UnreadableCause::ProtectedAbsence,
+            UnreadableCause::LegacyHold,
+        ];
+        let mut traversal = ScanTraversalCounts::default();
+        for (ordinal, cause) in causes.into_iter().enumerate() {
+            let mut page = ScanCensus::default();
+            page.record_unreadable(cause, ordinal + 1);
+            traversal.unreadable_path_count += page.unreadable_path_count;
+            traversal.unreadable_causes.merge(page.unreadable_causes);
+            // Exactly the original predicate; metadata may not settle residue.
+            assert!(traversal.has_retryable_problems());
+            assert!(traversal.has_errors());
+            assert!(!traversal.settle_non_progressing_residue());
+        }
+        assert_eq!(traversal.unreadable_path_count, 36);
+        let projected = projection(&traversal);
+        assert_eq!(projected["counts"], json!([1, 2, 3, 4, 5, 6, 7, 8]));
+        assert_eq!(projected["unattributed"], 0);
+        assert_eq!(projected["consistent"], true);
+        let mut retained: ScanTraversalCounts =
+            serde_json::from_value(json!({"unreadable_path_count":37})).unwrap();
+        assert_eq!(projection(&retained)["unattributed"], 37);
+        retained.record_unreadable(UnreadableCause::Directory, 2);
+        assert_eq!(retained.unreadable_path_count, 39);
+        assert_eq!(projection(&retained)["unattributed"], 37);
+        let roundtrip: ScanTraversalCounts =
+            serde_json::from_slice(&serde_json::to_vec(&retained).unwrap()).unwrap();
+        assert_eq!(projection(&roundtrip), projection(&retained));
+    }
+
+    #[test]
+    fn unreadable_revalidation_keeps_short_circuit_and_exactly_one_existing_open() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        assert!(matches!(
+            sampled_revalidation_cause(false, || {
+                calls.set(calls.get() + 1);
+                Ok(true)
+            }),
+            Some(UnreadableCause::ScopeObject)
+        ));
+        assert_eq!(calls.get(), 0);
+        for (outcome, expected) in [
+            (Ok(true), None),
+            (Ok(false), Some(UnreadableCause::ScopeObject)),
+            (
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                Some(UnreadableCause::OpenRead),
+            ),
+        ] {
+            let before = calls.get();
+            let cause = sampled_revalidation_cause(true, || {
+                calls.set(calls.get() + 1);
+                outcome
+            });
+            assert_eq!(
+                cause.map(|value| value as usize),
+                expected.map(|value| value as usize)
+            );
+            assert_eq!(calls.get(), before + 1);
+        }
+    }
+
+    #[test]
+    fn unreadable_legacy_hold_persists_its_existing_event_without_new_public_loss() {
+        let mut index = ScanIndex::default();
+        let mut scan = scan_source_roots(
+            SnapshotSource::Codex,
+            &[],
+            &mut index,
+            "2026-10-12T00:00:00Z",
+            30,
+        )
+        .unwrap();
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            &[],
+            &mut index,
+            "2026-10-12T00:00:00Z",
+            30,
+        );
+        let original = scan.unreadable_path_count;
+        scan.hold_codex_groups(
+            &mut index,
+            &ScanIndex::default(),
+            &BTreeSet::from(["fixture-held-owner".to_string()]),
+            "synthetic legacy hold",
+        );
+        assert!(!scan.census_complete);
+        assert!(scan.scan_cap_hit);
+        assert_eq!(
+            scan.unreadable_path_count, original,
+            "the existing held-group behavior only augments the durable traversal"
+        );
+        let counts = &index.traversal.as_ref().unwrap().counts;
+        assert_eq!(counts.unreadable_path_count, 1);
+        assert_eq!(
+            projection(counts)["counts"],
+            json!([0, 0, 0, 0, 0, 0, 0, 1])
+        );
+        assert_eq!(projection(counts)["unattributed"], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_native_metadata_directory_and_open_failures_name_existing_branch() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "ottto-unreadable-causes-{}",
+            ottto_core::generate_control_token().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let path = root.join("one.jsonl");
+        fs::write(&path, b"{}\n").unwrap();
+        // Metadata fails below an inaccessible owned directory.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut census = ScanCensus::default();
+        assert!(candidate_from_traversal_path(
+            SnapshotSource::Codex,
+            ScanTraversalPath {
+                scan_root: root.clone(),
+                path: path.clone(),
+                census_member: true,
+                watcher_hint: false
+            },
+            &mut census,
+            None,
+            30,
+            &BTreeMap::new()
+        )
+        .is_none());
+        assert_eq!(
+            serde_json::to_value(
+                census
+                    .unreadable_causes
+                    .projection(census.unreadable_path_count as u64)
+            )
+            .unwrap()["counts"],
+            json!([1, 0, 0, 0, 0, 0, 0, 0])
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let candidate = candidate_from_traversal_path(
+            SnapshotSource::Codex,
+            ScanTraversalPath {
+                scan_root: root.clone(),
+                path: path.clone(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut census,
+            None,
+            30,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(open_and_identify_scan_candidate(
+            SnapshotSource::Codex,
+            candidate,
+            &mut census,
+            None,
+            30,
+            &BTreeMap::new()
+        )
+        .is_none());
+        assert_eq!(
+            serde_json::to_value(
+                census
+                    .unreadable_causes
+                    .projection(census.unreadable_path_count as u64)
+            )
+            .unwrap()["counts"],
+            json!([1, 0, 1, 0, 0, 0, 0, 0])
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o100)).unwrap();
+        let mut index = ScanIndex::default();
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-10-12T00:00:00Z",
+            30,
+        );
+        advance_bounded_directory_traversal(
+            SnapshotSource::Codex,
+            index.traversal.as_mut().unwrap(),
+            30,
+            &index.files,
+        );
+        assert_eq!(
+            projection(&index.traversal.as_ref().unwrap().counts)["counts"],
+            json!([0, 1, 0, 0, 0, 0, 0, 0])
+        );
+    }
+}

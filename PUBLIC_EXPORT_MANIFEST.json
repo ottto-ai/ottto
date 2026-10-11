@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 614,
-  "content_sha256": "aaf47b8089ccd4f5c7f8f3e4aec340652cc9353e3eee9c2673ef23c59e8dcc8a",
+  "candidate_file_count": 615,
+  "content_sha256": "05ea175c87079728f54c1541001933f0047dd99f3ab9ad4be87f59fdbf8a6061",
   "files": [
     {
       "executable": false,
@@ -832,8 +832,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/codex_scan_diagnostics.rs",
-      "sha256": "f133e5e3552006314f0ea39661fe8ddbe12767c232ca14135e81c737bbc7be87",
-      "size_bytes": 60705
+      "sha256": "6bca250884651287f6d786a59c017e1087253dcc9bf25d79c30c83e7ed3942ae",
+      "size_bytes": 65951
     },
     {
       "executable": false,
@@ -1147,8 +1147,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "a1c1476d83bc394e299e8ed48ef1938e60212f94c4bd1d9b0e4256a354953860",
-      "size_bytes": 2344466
+      "sha256": "f29101baf8b72ff0df152367794861a9a9d339d742c21c76e858b29ff34cd806",
+      "size_bytes": 2355259
     },
     {
       "executable": false,
@@ -1196,8 +1196,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join.rs",
-      "sha256": "9bf9d70dabd3ad84a34c4cf73d03b2429329393b858f882b8a3273d758923ff0",
-      "size_bytes": 129206
+      "sha256": "5afdd1814eb78f37153dd40a63f279ac294fcceea5535cafef2e0d835aaff312",
+      "size_bytes": 129983
     },
     {
       "executable": false,
@@ -1378,8 +1378,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/diagnostics.md",
-      "sha256": "4bdbf5b3396e1b74ca148cc57ecda0bb34ad3ebfde6b5c7b19873e254ec47947",
-      "size_bytes": 13446
+      "sha256": "f5129c084116758952c8f830791c68eba51a4a211415175afa6fd1d9889944fc",
+      "size_bytes": 13763
     },
     {
       "executable": false,
@@ -2491,7 +2491,7 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-09-fenced-census-diagnostics.md",
-      "sha256": "0f98ff12a6f6f36b111f96dc00d3a9fb19864d60c317695ddc5ca8bbef27b8ae",
+      "sha256": "0df93237d473832a99d3cda2764db05a0c843cef8da2aa0ce327e0c69b48bff7",
       "size_bytes": 4901
     },
     {
@@ -2561,8 +2561,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-11-codex-census-outcome-carrier.md",
-      "sha256": "2f55cddb0df927010c31ad4990c70fe037b7d9f16fb830f7e030ebd0d4e63e52",
-      "size_bytes": 5244
+      "sha256": "81e957f1890749d7b59b742bc45ce3717fdc13d0626017e87ac420ded8778e72",
+      "size_bytes": 5568
     },
     {
       "executable": false,
@@ -2584,6 +2584,13 @@
       "path": "docs/session-2026-10-11-multi-user-launch-and-app-version.md",
       "sha256": "0c666dee1ae0a292b70bfbcfb724ad5226035645cb35d78698d997db16eaa86f",
       "size_bytes": 2460
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-12-codex-unreadable-causes.md",
+      "sha256": "59910407a2d4ebacad28315a8a95ec65dca85a1711cf78840bc0c217a6619531",
+      "size_bytes": 4184
     },
     {
       "executable": false,
@@ -4301,9 +4308,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-11T22:59:16+00:00",
+  "generated_at": "2026-10-11T23:04:47+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 615,
+  "output_file_count": 616,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4340,5 +4347,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ebe2bb2e238692dd5e7dd7b413e34ec332e7f1bc"
+  "source_commit": "72ef8ebad94a773dcca4cf65aa4f3097c4e90103"
 }
