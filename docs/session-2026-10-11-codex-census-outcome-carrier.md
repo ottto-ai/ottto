@@ -78,3 +78,10 @@ A native synthetic debug measurement of the complete sidecar writer produced
 events per record and zero retained bytes. Each record was 282 bytes. Encoding
 alone used zero heap allocations. These temporary-directory measurements include
 filesystem latency and do not predict installed performance or sink availability.
+
+## October 12 additive census attribution
+
+Census v3 preserves this attempt/process/fence contract and adds bounded branch
+counts and exact existing terminal shares. The non-success sidecar remains v1
+and its 1 KiB ceiling is unchanged. See the
+[branch-attribution contract](session-2026-10-12-codex-unreadable-causes.md).
