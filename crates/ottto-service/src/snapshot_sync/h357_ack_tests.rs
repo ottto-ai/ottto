@@ -34,8 +34,24 @@ fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
         10 => 4,
         11 => 5,
         12 => 6,
-        21 | 23 => 7,
-        22 | 24 => 8,
+        15 => 13,
+        16 => 14,
+        19 => 17,
+        20 => 18,
+        21 | 23 => {
+            if item.cache_observations.is_some() {
+                13
+            } else {
+                7
+            }
+        }
+        22 | 24 => {
+            if item.cache_observations.is_some() {
+                14
+            } else {
+                8
+            }
+        }
         other => other,
     });
     SnapshotEntityRef {
@@ -582,4 +598,112 @@ fn h357_malformed_http200_is_typed_backend_response_not_network_failure() {
         upload_failure_diagnostic(&error),
         "kind=backend_response, detail=snapshot batch response could not be decoded"
     );
+}
+
+#[test]
+#[serial_test::serial(client_report)]
+fn h359_refused_cache_probe_settles_without_head_and_healthy_sibling_continues() {
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let probes = items(2);
+    let mut snapshots = probes.clone();
+    for item in &mut snapshots {
+        item.cache_observations = Some(crate::snapshots::cache_observations::CacheObservations {
+            schema_version: 1,
+            operations: Vec::new(),
+            coverage: "complete".into(),
+            omitted_observation_count: None,
+        });
+    }
+    let mut ledger = progress();
+    let rejected_fp = probes[1].snapshot_fingerprint.clone();
+    let mut calls = Vec::new();
+    bootstrap_cache_heads(
+        &probes,
+        "h359-probes",
+        &mut ledger,
+        true,
+        |batch, cas| {
+            calls.push((batch.len(), cas));
+            let rejected = batch
+                .iter()
+                .filter(|i| i.snapshot_fingerprint == rejected_fp)
+                .count();
+            let mut ack = response(&batch, rejected);
+            if cas {
+                for reference in ack
+                    .accepted_entities
+                    .iter_mut()
+                    .chain(&mut ack.unchanged_entities)
+                {
+                    reference.head_etag = Some("e".repeat(64));
+                }
+            }
+            ack.validate_entity_ack_with_head_cas(&request(batch), cas)?;
+            Ok(ack)
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(calls, [(2, false), (1, true)]);
+    assert!(!ledger
+        .accepted_cache_heads
+        .contains_key(&cache_session_key(&probes[1].source_session_id)));
+    apply_bootstrapped_cache_heads(&mut snapshots, &ledger).unwrap();
+    assert!(snapshots[0].cache_observations.is_some());
+    assert_eq!(snapshots[0].cache_base_head_etag, Some("e".repeat(64)));
+    assert!(snapshots[1].cache_observations.is_none());
+    assert!(snapshots[1].cache_base_head_etag.is_none());
+    assert_eq!(
+        snapshot_upload_body_witness(&snapshots[1]),
+        snapshot_upload_body_witness(&probes[1])
+    );
+    let mut accepted = 0;
+    let outcome = upload_resumable_batches_with_body_witness(
+        &snapshots,
+        "h359-probes",
+        &mut ledger,
+        &mut accepted,
+        |i| i.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |batch| {
+            assert_eq!(batch.len(), 1);
+            assert_ne!(batch[0].snapshot_fingerprint, rejected_fp);
+            let mut ack = response(&batch, 0);
+            for reference in ack
+                .accepted_entities
+                .iter_mut()
+                .chain(&mut ack.unchanged_entities)
+            {
+                reference.head_etag = Some("e".repeat(64));
+            }
+            ack.validate_entity_ack_with_head_cas(&request(batch), true)?;
+            Ok(ack)
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(outcome, ResumableUploadResult::Rejected { count: 1 });
+    assert_eq!(accepted, 1);
+    let mut restarted: SnapshotUploadProgress =
+        serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+    // Same refused probe completes without a request even after restart.
+    bootstrap_cache_heads(
+        &probes[1..],
+        "h359-probes",
+        &mut restarted,
+        true,
+        |_, _| panic!("unchanged refused probe cannot resend"),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let mut changed = probes[1].clone();
+    changed.context_curve.as_mut().unwrap().points[0].effective_input_tokens += 1;
+    assert!(!restarted.contains_body(&rejected_fp, &snapshot_upload_body_witness(&changed)));
+    // Missing proof without an exact refusal still fails closed.
+    let mut missing = snapshots[0].clone();
+    missing.cache_base_head_etag = None;
+    assert!(apply_bootstrapped_cache_heads(&mut [missing], &progress()).is_err());
 }

@@ -138,9 +138,54 @@ fn bootstrap_cache_heads(
             |items| upload(items, enforce_head_cas),
             |progress| persist(progress),
         )?;
-        if !matches!(outcome, ResumableUploadResult::Completed) {
+        if !matches!(
+            outcome,
+            ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. }
+        ) {
             return Err(anyhow::Error::new(SnapshotAckRejected {
                 reason: "cache head probe did not settle exact predecessor evidence",
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn cache_head_probe(item: &SnapshotItem) -> SnapshotItem {
+    let mut probe = item.clone();
+    probe.cache_observations = None;
+    probe.cache_observations_state = None;
+    probe
+}
+
+fn apply_bootstrapped_cache_heads(
+    snapshots: &mut [SnapshotItem],
+    progress: &SnapshotUploadProgress,
+) -> Result<()> {
+    for snapshot in snapshots {
+        if snapshot.cache_observations.is_none() {
+            continue;
+        }
+        if snapshot.cache_base_head_etag.is_none() {
+            let probe = cache_head_probe(snapshot);
+            if progress
+                .permanent_rejections
+                .get(&probe.snapshot_fingerprint)
+                .is_some_and(|record| record.body_witness == snapshot_upload_body_witness(&probe))
+            {
+                // A refused predecessor cannot authorize a cache patch. Carry
+                // its exact rejected body into the ordinary settlement path;
+                // other sessions still use their own proven head tokens.
+                *snapshot = probe;
+                continue;
+            }
+        }
+        snapshot.cache_base_head_etag = progress
+            .accepted_cache_heads
+            .get(&cache_session_key(&snapshot.source_session_id))
+            .cloned();
+        if snapshot.cache_base_head_etag.is_none() {
+            return Err(anyhow::Error::new(SnapshotAckRejected {
+                reason: "cache head probe lacks accepted predecessor token",
             }));
         }
     }
@@ -3889,12 +3934,7 @@ fn finish_sync_source(
         .snapshots
         .iter()
         .filter(|item| item.cache_observations.is_some() && item.cache_base_head_etag.is_none())
-        .map(|item| {
-            let mut probe = item.clone();
-            probe.cache_observations = None;
-            probe.cache_observations_state = None;
-            probe
-        })
+        .map(cache_head_probe)
         .collect::<Vec<_>>();
     if !probes.is_empty() {
         let ordinary_bootstrap = !activity_hint.snapshot_head_cas_required
@@ -3931,17 +3971,7 @@ fn finish_sync_source(
             },
             |progress| progress.save(&upload_progress_path),
         )?;
-        for snapshot in &mut scan_result.snapshots {
-            if snapshot.cache_observations.is_some() {
-                snapshot.cache_base_head_etag = upload_progress
-                    .accepted_cache_heads
-                    .get(&cache_session_key(&snapshot.source_session_id))
-                    .cloned();
-                if snapshot.cache_base_head_etag.is_none() {
-                    return Err(anyhow!("cache head probe lacks accepted predecessor token"));
-                }
-            }
-        }
+        apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)?;
     }
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);

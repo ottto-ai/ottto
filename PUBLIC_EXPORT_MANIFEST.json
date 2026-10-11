@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 546,
-  "content_sha256": "d1938765cbd0addaef29280c48afb90b7b7382817570aefd895d7f7c2b4ea62e",
+  "content_sha256": "f35a361c975b703dae090e4ff3dfaa8adb1fc8bc06c1dc5597a57f0c63bd2e37",
   "files": [
     {
       "executable": false,
@@ -1112,15 +1112,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "05e4e223bff0be38ca746e9e0d7e8324df497b86f6bbbe54e1a141c2106782ad",
-      "size_bytes": 735560
+      "sha256": "5cd849de50d0735b13860bc80294b348b70a066ad567e0c04d6d2ab18adf7757",
+      "size_bytes": 736536
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/h357_ack_tests.rs",
-      "sha256": "270f3118f0132d8e68d4f3fda2ba002fcaf6a6d47c3cc54abe7c5f67ad548690",
-      "size_bytes": 20566
+      "sha256": "f1167367f88a1756f11a996e592b93575ee30d1ab2674d3f4c2118e4d1ae21a6",
+      "size_bytes": 24877
     },
     {
       "executable": false,
@@ -2554,8 +2554,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-12-partial-snapshot-ack-settlement.md",
-      "sha256": "8e4d64546356ef0cd698638fb05ed7628c18cfc06a59b781bbeebae17ea0e1f6",
-      "size_bytes": 3910
+      "sha256": "86f89c80d74d2ebdb24a35e85fde5b04ac4fc6a40a0456e17766d45adf220d22",
+      "size_bytes": 4302
     },
     {
       "executable": false,
@@ -3825,7 +3825,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-11T21:53:01+00:00",
+  "generated_at": "2026-10-11T22:00:36+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 547,
   "public_roots": [
@@ -3864,5 +3864,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d8012ab31d5d4aba7bbc6b9a56e4aa696b2cc3c9"
+  "source_commit": "787e35cb065448168d9734b755efdb006e7815ff"
 }

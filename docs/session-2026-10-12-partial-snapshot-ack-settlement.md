@@ -35,6 +35,12 @@ than backend deferral. Pending conflicts
 report `server_error`. Accepted siblings and the terminal index are durable
 before reporting either state. Incomplete/terminal census counters stay intact.
 
+A permanently refused cache-free head probe also finishes bootstrap transport.
+Without a proven predecessor token, its additive cache patch stays withheld and
+the exact refused ordinary body enters the normal terminal settlement path.
+Healthy siblings use their own validated heads. Missing head proof without an
+exact permanent refusal still fails closed; no head authority is synthesized.
+
 Permanent metadata uses an additive field in upload-progress schema v3. The
 existing index-facing `unproven_terminal` representation uses its saturated
 counter as a terminal sentinel, not as evidence of four actual remote attempts.
