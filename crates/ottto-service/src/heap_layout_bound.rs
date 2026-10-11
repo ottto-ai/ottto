@@ -18,6 +18,10 @@ impl Counter {
             visits: 0,
         }
     }
+    #[cfg(test)]
+    pub(crate) fn visits_for_test(&self) -> usize {
+        self.visits
+    }
     pub(crate) fn add(&mut self, bytes: usize) -> Option<()> {
         self.visits = self.visits.checked_add(1)?;
         if self.visits > 4096 {
@@ -31,7 +35,42 @@ pub(crate) trait HeapLayoutBound {
     /// True only for types proved to own no heap allocation. Unknown/custom
     /// types keep recursive traversal; never infer this from size or capacity.
     const INLINE_ONLY: bool = false;
+    /// A summary stays valid without mutable access to this value.
+    /// Externally mutable or opaque graphs must never opt in.
+    const STABLE_HEAP: bool = false;
+    fn stable_heap(&self) -> bool {
+        Self::STABLE_HEAP
+    }
     fn heap_bound(&self, c: &mut Counter) -> Option<()>;
+    /// Completion-only composition. Each owned collection element has its own
+    /// ordinary 4096-visit counter, after charging its container storage. Never
+    /// call this whole-graph traversal in a parser's per-line budget check.
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        self.heap_bound(c)
+    }
+}
+pub(crate) fn completed_bound<T: HeapLayoutBound>(value: &T, limit: usize) -> Option<usize> {
+    if !layout_supported() {
+        return None;
+    }
+    let mut c = Counter::new(limit);
+    c.add(size_of_val(value))?;
+    value.completed_heap_bound(&mut c)?;
+    Some(c.bytes)
+}
+fn completed_elements<'a, T: HeapLayoutBound + 'a>(
+    elements: impl Iterator<Item = &'a T>,
+    c: &mut Counter,
+) -> Option<()> {
+    let mut bytes = 0usize;
+    for value in elements {
+        let remaining = c.limit.checked_sub(c.bytes)?.checked_sub(bytes)?;
+        // The slot is already charged; only the element's heap is new here.
+        let mut child = Counter::new(remaining);
+        value.completed_heap_bound(&mut child)?;
+        bytes = bytes.checked_add(child.bytes)?;
+    }
+    c.add(bytes)
 }
 pub(crate) fn bound<T: HeapLayoutBound>(value: &T, limit: usize) -> Option<usize> {
     if !layout_supported() {
@@ -54,6 +93,7 @@ fn compiler_layout_supported(compiler: &str) -> bool {
 }
 macro_rules! scalar { ($($t:ty),*) => { $(impl HeapLayoutBound for $t {
     const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut Counter) -> Option<()> { c.add(0) }
 })* }; }
 scalar!(
@@ -75,16 +115,21 @@ scalar!(
     ()
 );
 impl HeapLayoutBound for String {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         c.add(self.capacity())
     }
 }
 impl HeapLayoutBound for PathBuf {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         c.add(self.capacity())
     }
 }
 impl<T: HeapLayoutBound> HeapLayoutBound for Option<T> {
+    fn stable_heap(&self) -> bool {
+        self.as_ref().map_or(true, HeapLayoutBound::stable_heap)
+    }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         c.add(0)?;
         if let Some(x) = self {
@@ -92,19 +137,43 @@ impl<T: HeapLayoutBound> HeapLayoutBound for Option<T> {
         }
         Some(())
     }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        c.add(0)?;
+        if let Some(x) = self {
+            x.completed_heap_bound(c)?;
+        }
+        Some(())
+    }
 }
 impl<T: HeapLayoutBound> HeapLayoutBound for Vec<T> {
+    fn stable_heap(&self) -> bool {
+        self.iter().all(HeapLayoutBound::stable_heap)
+    }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         c.add(self.capacity().checked_mul(size_of::<T>())?)?;
         if !T::INLINE_ONLY {
             for x in self {
                 x.heap_bound(c)?;
             }
+        }
+        Some(())
+    }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        c.add(self.capacity().checked_mul(size_of::<T>())?)?;
+        if !T::INLINE_ONLY {
+            // Uncharged zero-sized unknown entries cannot bound traversal work.
+            if size_of::<T>() == 0 && !self.is_empty() {
+                return None;
+            }
+            completed_elements(self.iter(), c)?;
         }
         Some(())
     }
 }
 impl<T: HeapLayoutBound> HeapLayoutBound for VecDeque<T> {
+    fn stable_heap(&self) -> bool {
+        self.iter().all(HeapLayoutBound::stable_heap)
+    }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         c.add(self.capacity().checked_mul(size_of::<T>())?)?;
         if !T::INLINE_ONLY {
@@ -114,8 +183,18 @@ impl<T: HeapLayoutBound> HeapLayoutBound for VecDeque<T> {
         }
         Some(())
     }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        c.add(self.capacity().checked_mul(size_of::<T>())?)?;
+        if !T::INLINE_ONLY {
+            if size_of::<T>() == 0 && !self.is_empty() {
+                return None;
+            }
+            completed_elements(self.iter(), c)?;
+        }
+        Some(())
+    }
 }
-fn tree_nodes<K, V>(len: usize, c: &mut Counter) -> Option<()> {
+pub(crate) fn tree_nodes<K, V>(len: usize, c: &mut Counter) -> Option<()> {
     // Rust1.88/1.95 B=6:11 key/value slots and12 edges. Charging one full node per
     // entry plus one root overcounts unused slots and internal/leaf grouping.
     // A zero-length map may retain its empty allocated root after removal.
@@ -125,6 +204,9 @@ fn tree_nodes<K, V>(len: usize, c: &mut Counter) -> Option<()> {
     c.add(len.checked_add(1)?.checked_mul(node)?)
 }
 impl<K: HeapLayoutBound, V: HeapLayoutBound> HeapLayoutBound for BTreeMap<K, V> {
+    fn stable_heap(&self) -> bool {
+        self.iter().all(|(k, v)| k.stable_heap() && v.stable_heap())
+    }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         tree_nodes::<K, V>(self.len(), c)?;
         for (k, v) in self {
@@ -133,8 +215,16 @@ impl<K: HeapLayoutBound, V: HeapLayoutBound> HeapLayoutBound for BTreeMap<K, V> 
         }
         Some(())
     }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        tree_nodes::<K, V>(self.len(), c)?;
+        completed_elements(self.keys(), c)?;
+        completed_elements(self.values(), c)
+    }
 }
 impl<T: HeapLayoutBound> HeapLayoutBound for BTreeSet<T> {
+    fn stable_heap(&self) -> bool {
+        self.iter().all(HeapLayoutBound::stable_heap)
+    }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         tree_nodes::<T, ()>(self.len(), c)?;
         for x in self {
@@ -142,14 +232,28 @@ impl<T: HeapLayoutBound> HeapLayoutBound for BTreeSet<T> {
         }
         Some(())
     }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        tree_nodes::<T, ()>(self.len(), c)?;
+        completed_elements(self.iter(), c)
+    }
 }
 impl<T: HeapLayoutBound> HeapLayoutBound for Box<T> {
+    fn stable_heap(&self) -> bool {
+        (**self).stable_heap()
+    }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         c.add(size_of::<T>().checked_add(align_of::<T>())?)?;
         (**self).heap_bound(c)
     }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        c.add(size_of::<T>().checked_add(align_of::<T>())?)?;
+        (**self).completed_heap_bound(c)
+    }
 }
 impl<T: HeapLayoutBound> HeapLayoutBound for Arc<T> {
+    fn stable_heap(&self) -> bool {
+        (**self).stable_heap()
+    }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         c.add(
             size_of::<T>()
@@ -158,41 +262,88 @@ impl<T: HeapLayoutBound> HeapLayoutBound for Arc<T> {
         )?;
         (**self).heap_bound(c)
     }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        // Shared payload expansion remains one ordinary bounded subgraph.
+        // A mutable shared allocation cannot yield a stable completion charge.
+        self.heap_bound(c)?;
+        self.stable_heap().then_some(())
+    }
 }
 impl<T: HeapLayoutBound> HeapLayoutBound for Mutex<T> {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         self.try_lock().ok()?.heap_bound(c)
     }
+    fn completed_heap_bound(&self, _: &mut Counter) -> Option<()> {
+        None
+    }
 }
 impl<T: HeapLayoutBound, const N: usize> HeapLayoutBound for [T; N] {
+    fn stable_heap(&self) -> bool {
+        self.iter().all(HeapLayoutBound::stable_heap)
+    }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         for x in self {
             x.heap_bound(c)?;
         }
         Some(())
     }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        if T::INLINE_ONLY {
+            return c.add(0);
+        }
+        if size_of::<T>() == 0 && N != 0 {
+            return None;
+        }
+        completed_elements(self.iter(), c)
+    }
 }
 impl<A: HeapLayoutBound, B: HeapLayoutBound> HeapLayoutBound for (A, B) {
+    fn stable_heap(&self) -> bool {
+        self.0.stable_heap() && self.1.stable_heap()
+    }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         self.0.heap_bound(c)?;
         self.1.heap_bound(c)
     }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        self.0.completed_heap_bound(c)?;
+        self.1.completed_heap_bound(c)
+    }
 }
 impl<A: HeapLayoutBound, B: HeapLayoutBound, D: HeapLayoutBound> HeapLayoutBound for (A, B, D) {
+    fn stable_heap(&self) -> bool {
+        self.0.stable_heap() && self.1.stable_heap() && self.2.stable_heap()
+    }
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         self.0.heap_bound(c)?;
         self.1.heap_bound(c)?;
         self.2.heap_bound(c)
     }
+    fn completed_heap_bound(&self, c: &mut Counter) -> Option<()> {
+        self.0.completed_heap_bound(c)?;
+        self.1.completed_heap_bound(c)?;
+        self.2.completed_heap_bound(c)
+    }
 }
 macro_rules! fields {
     ($t:ty; $($(#[$field_attr:meta])* $f:ident),* $(,)?) => {
         impl crate::heap_layout_bound::HeapLayoutBound for $t {
+            fn stable_heap(&self)->bool {
+                let Self { $($(#[$field_attr])* $f),* } = self;
+                let stable = true;
+                $( $(#[$field_attr])* let stable = stable && crate::heap_layout_bound::HeapLayoutBound::stable_heap($f);)*
+                stable
+            }
             fn heap_bound(&self,c:&mut crate::heap_layout_bound::Counter)->Option<()> {
                 // Exhaustive destructuring makes a newly added owned field a
                 // compile error until admission accounts for it.
                 let Self { $($(#[$field_attr])* $f),* } = self;
                 $( $(#[$field_attr])* crate::heap_layout_bound::HeapLayoutBound::heap_bound($f,c)?;)*
+                Some(())
+            }
+            fn completed_heap_bound(&self,c:&mut crate::heap_layout_bound::Counter)->Option<()> {
+                let Self { $($(#[$field_attr])* $f),* } = self;
+                $( $(#[$field_attr])* crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound($f,c)?;)*
                 Some(())
             }
         }
@@ -201,6 +352,7 @@ macro_rules! fields {
 pub(crate) use fields;
 
 impl HeapLayoutBound for &'static str {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         c.add(0)
     }
@@ -474,6 +626,7 @@ impl<T: zeroize::Zeroize + HeapLayoutBound> HeapLayoutBound for zeroize::Zeroizi
     }
 }
 impl HeapLayoutBound for std::time::SystemTime {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         c.add(0)
     }
@@ -497,6 +650,38 @@ impl HeapLayoutBound for ottto_protocol::LocalAccountState {
 #[cfg(test)]
 mod sampled_scalar_buffer_tests {
     use super::*;
+    #[test]
+    fn sampled_completed_accounting_composes_one_diminishing_byte_budget() {
+        if !layout_supported() {
+            return;
+        }
+        let values = vec![String::from("owned"); 12000];
+        assert!(bound(&values, 1024 * 1024).is_none());
+        let expected = size_of_val(&values)
+            + values.capacity() * size_of::<String>()
+            + values.iter().map(String::capacity).sum::<usize>();
+        assert_eq!(completed_bound(&values, expected), Some(expected));
+        assert!(completed_bound(&values, expected - 1).is_none());
+        let pair = vec![
+            String::with_capacity(600_000),
+            String::with_capacity(600_000),
+        ];
+        assert!(completed_bound(&pair, 1024 * 1024).is_none());
+        let shared = Arc::new(Mutex::new(String::from("mutable")));
+        assert!(completed_bound(&vec![shared.clone()], usize::MAX).is_none());
+        assert!(completed_bound(&(shared, 1u64), usize::MAX).is_none());
+        assert!(
+            completed_bound(&Box::new(Mutex::new(String::from("mutable"))), usize::MAX).is_none()
+        );
+        assert!(completed_bound(&vec![serde_json::Value::Null], usize::MAX).is_none());
+        struct UnknownZero;
+        impl HeapLayoutBound for UnknownZero {
+            fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+                c.add(0)
+            }
+        }
+        assert!(completed_bound(&vec![UnknownZero], usize::MAX).is_none());
+    }
     // Test-only enforcement: requiring coverage never changes runtime admission.
     fn require_layout_coverage(
         supported: bool,

@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 542,
-  "content_sha256": "858856c3fadfe7feaee2682073fabb550c2b3ea5046e4d0ebc8f54002d070282",
+  "candidate_file_count": 544,
+  "content_sha256": "108904e67f576dbe26d4e9ddb4691ae5e4d79be13d11a7eeef1ab34a1e1a89ea",
   "files": [
     {
       "executable": false,
@@ -741,8 +741,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_browser_auth.rs",
-      "sha256": "7e2af25a55e7d6eb832f841b8fcb8e287794be526631cf938a133dbb40ccb9d3",
-      "size_bytes": 349344
+      "sha256": "7add9861f4eb695fcb8fe74334b3c911d114c9059c823e68e59f05615b832dcf",
+      "size_bytes": 350229
     },
     {
       "executable": false,
@@ -888,8 +888,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/heap_layout_bound.rs",
-      "sha256": "b9a8eb903f6fbc792c91efc66ffcc8430383eb41c4d29fe5e58a171b522db5b1",
-      "size_bytes": 25135
+      "sha256": "1bf1c505097191601a6825227d8d933f25ad6974fbe2b6d55270dd76907ee902",
+      "size_bytes": 32326
     },
     {
       "executable": false,
@@ -923,8 +923,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "132feb75c106f025476cb5d2483191837151f5eb93a0a932c706df60cd03bcbb",
-      "size_bytes": 346742
+      "sha256": "8277c992265b830a61e12a45727a349b5df52de0092b3a1d76e6084330d7ef26",
+      "size_bytes": 346758
     },
     {
       "executable": false,
@@ -981,6 +981,13 @@
       "path": "crates/ottto-service/src/otlp_relay.rs",
       "sha256": "2af4497c1810559ba49ad1dd432b30801fed14babb7f8184023961567c0c19e8",
       "size_bytes": 95550
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/owned_heap.rs",
+      "sha256": "0398eeccd22db48fa270c9eae7f097e9ec461c32325b3c695e40e2e54e1c21ca",
+      "size_bytes": 9252
     },
     {
       "executable": false,
@@ -1119,8 +1126,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "1dba4059b6d1f03814d86e27dc12e60573d3859f39d5e196c3055235435edbcc",
-      "size_bytes": 2333215
+      "sha256": "c1830c4a9fbf15c6d4aa6445ead6406bd0fcfc5b6c6b8ad4514a74e645e9d9e1",
+      "size_bytes": 2333893
     },
     {
       "executable": false,
@@ -1210,8 +1217,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests.rs",
-      "sha256": "0203082364b6619b8dac5cddcf6c5bfeca578a3639542ba210a7a50a4cf22445",
-      "size_bytes": 66019
+      "sha256": "24bfa29a697c583ac96b16d5cb057c5ef1073ddb3c9498f3d36a38df572ac9f6",
+      "size_bytes": 71429
     },
     {
       "executable": false,
@@ -2518,6 +2525,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-11-large-session-tail-budget.md",
+      "sha256": "c82b64ed27546be02609dd8855739bbf746ab19428ebdb8734dc72a127164932",
+      "size_bytes": 2974
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-11-managed-claude-relay-settings.md",
       "sha256": "8aff99e16f2a7d90d605d4bf4b0ee49fefebf778cedabd957dd1c53ea9e5ff0e",
       "size_bytes": 3016
@@ -3797,9 +3811,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-11T15:41:06+00:00",
+  "generated_at": "2026-10-11T16:10:28+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 543,
+  "output_file_count": 545,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3836,5 +3850,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "cabbeefa40562781498dddbb3fdbbd6ff3b9cd6d"
+  "source_commit": "cc22affa7a7c99a085742fc4ff2dbbede8f67ba4"
 }
