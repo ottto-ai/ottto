@@ -34,6 +34,19 @@ adapter module, `agent_status/claude_credit_pools.rs`.
   by field and never change the list state. A `cedar_ember` with readiness but
   no `grants` array keeps the last observed complete list (through the model's
   `GrantListSection`, with its original read time, count and status).
+- **Saved resets the reader cannot see** (contract v2.2 §11.10). When the
+  provider answers `ineligible_reason` `surface` or `cli_version`, the answer
+  is about the reader that asked, not the account, so its empty list is not
+  "no resets". The balance is sent with `grants_state: unavailable`, no
+  `grants`, `remaining` or `grant_count`, `status: unknown`, readiness as read,
+  and `grants_unavailable_cause: reader`. Any other reason (e.g. `tenure`) is
+  an ordinary list, as before. A stored section from an older daemon (the same
+  answer kept as a complete, empty list) is re-sent and served in the new
+  shape, and a reader-blind reading never takes a stored list. The field is
+  optional (omitted when absent, an unknown value decodes as absent), reaches
+  the local status snapshots under the same name, and the upload copy drops it
+  from any balance that is not saved resets with an unavailable list and no
+  `remaining` or `grant_count`.
 
 `cedar_ember` is only populated by the saved-reset read variant
 (`?cedar_ember=1&skip_spend=1`), which is enabled and self-checks every

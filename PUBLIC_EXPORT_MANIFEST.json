@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 544,
-  "content_sha256": "108904e67f576dbe26d4e9ddb4691ae5e4d79be13d11a7eeef1ab34a1e1a89ea",
+  "candidate_file_count": 548,
+  "content_sha256": "28d1f8b8ed8fb0e4b1c9e9d556baca0a724b4c7972764b5a2247fbd350ca9a70",
   "files": [
     {
       "executable": false,
@@ -608,8 +608,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "82eb11e4f3a02bd6a7aad350b1fcd6f274a4f5deef3801b711f8bd6ec84d98bc",
-      "size_bytes": 322233
+      "sha256": "92a9e91250cadca8ae7b51eb3bc02af87c714b7d2b02d6a5bd551948dc2d9a2a",
+      "size_bytes": 327491
     },
     {
       "executable": false,
@@ -685,15 +685,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "e7c588961feb4fe04696e3192076a80488a9252f3127c930e8f5b2978292f9c1",
-      "size_bytes": 1418210
+      "sha256": "27981ee5d1cdda14e8b4668e849e92e2d513187007333aee48429a2af387e0b2",
+      "size_bytes": 1421502
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/claude_credit_pools.rs",
-      "sha256": "ad9b1db5edbfc7708caa04056b48cececd0b6974e5d1aff09c8fadfd4f93fdbd",
-      "size_bytes": 133050
+      "sha256": "c7a9f2e02754364c9a832e60bf512fd86db0ae838fccf05042eaf05022edfd32",
+      "size_bytes": 142635
     },
     {
       "executable": false,
@@ -888,8 +888,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/heap_layout_bound.rs",
-      "sha256": "1bf1c505097191601a6825227d8d933f25ad6974fbe2b6d55270dd76907ee902",
-      "size_bytes": 32326
+      "sha256": "902ae584777ea5ae359d2410e564e29566ed864229d47f29551c0fb84f28cc1c",
+      "size_bytes": 32612
     },
     {
       "executable": false,
@@ -1014,8 +1014,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/quota_credit_model/tests.rs",
-      "sha256": "df66dba76cddcab8217ba4ec79a075af32998169a83ac2bcbfbbf11d9c76a9d5",
-      "size_bytes": 76352
+      "sha256": "c923b96b8cae51fd159ba9a18f8ebf4facca697869a955128e8643536aed84ce",
+      "size_bytes": 77446
     },
     {
       "executable": false,
@@ -2470,8 +2470,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-10-claude-credit-pools-cadence.md",
-      "sha256": "bf2e7a707dfbbdbc051cf616ae0536ed4a79dee10c886d03766cd8dc5c6d046d",
-      "size_bytes": 12604
+      "sha256": "cd161ec9de977038155cc66f9a2b9ee4c2598d6779c2aa6004d77ccd26c20f1d",
+      "size_bytes": 13557
     },
     {
       "executable": false,
@@ -2624,8 +2624,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/agent-status/quota-contract-v2.2/README.md",
-      "sha256": "c8addc4b60d9a4df64fe9d3bbd47bf03d3e19741aa911d73ce7ee9eef8cbd50f",
-      "size_bytes": 5798
+      "sha256": "2b282f1d72ad9924179f4e16363363d0774471f30a9711fba34f0ebbc4659511",
+      "size_bytes": 6300
     },
     {
       "executable": false,
@@ -2647,6 +2647,20 @@
       "path": "fixtures/agent-status/quota-contract-v2.2/expected/claude-usage-cedar-ineligible.wire.json",
       "sha256": "f4cfee59cee1d104d710276664b07f067c3d9a571b674fdb6868c18472964f52",
       "size_bytes": 465
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/expected/claude-usage-cedar-reader-cli-version.wire.json",
+      "sha256": "dec069ab59b8a1711515db9153273eea4266e7e61d4cbcddb7cd34eb27d7ced0",
+      "size_bytes": 397
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/expected/claude-usage-cedar-reader-surface.wire.json",
+      "sha256": "02dbcc724778e6d8dca434eded5c8393fd19125dedc5f25372672442f192debe",
+      "size_bytes": 393
     },
     {
       "executable": false,
@@ -2738,6 +2752,20 @@
       "path": "fixtures/agent-status/quota-contract-v2.2/provider/claude-usage-cedar-ineligible.json",
       "sha256": "8f04642cd24a20753c5f205e2b12755542de01170fef102a2df7a92bba3bd827",
       "size_bytes": 822
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/provider/claude-usage-cedar-reader-cli-version.json",
+      "sha256": "d3d0820f5c0878251520ba82cac971e399c8bf94af6f84034760b88f11eb457e",
+      "size_bytes": 827
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/agent-status/quota-contract-v2.2/provider/claude-usage-cedar-reader-surface.json",
+      "sha256": "86451d69fb49954e6be5c0bb483eec30980eb9bba9cc70d45fb5189cb12a10ef",
+      "size_bytes": 823
     },
     {
       "executable": false,
@@ -3811,9 +3839,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-11T16:10:28+00:00",
+  "generated_at": "2026-10-11T21:21:19+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 545,
+  "output_file_count": 549,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3850,5 +3878,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "cc22affa7a7c99a085742fc4ff2dbbede8f67ba4"
+  "source_commit": "74bbe3ae76dc7c1d0ce3442b85f344e02ed07458"
 }

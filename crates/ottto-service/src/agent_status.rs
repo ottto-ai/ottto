@@ -33076,6 +33076,82 @@ exit 0
         }
     }
 
+    fn respond_variant_reader_blind(_endpoint: &str) -> Result<Value, u16> {
+        Ok(serde_json::from_str(include_str!(
+            "../../../fixtures/agent-status/quota-contract-v2.2/provider/claude-usage-cedar-reader-surface.json"
+        ))
+        .expect("fixture"))
+    }
+
+    /// Contract v2.2 §11.10: a reader-blind saved-reset reading reaches the
+    /// local status snapshots the Companion decodes and the upload with
+    /// `grants_unavailable_cause` under the same name, and no count.
+    #[test]
+    #[serial]
+    fn reader_blind_saved_resets_reach_local_status_and_upload() {
+        let fixture = ClaudeBindingFixture::new("reader-blind");
+        fixture.sign_in(TEAM_PREMIUM);
+        fixture.register();
+        fixture.collect();
+        let team = ClaudeBindingFixture::hashes(TEAM_PREMIUM);
+        let state_dir = claude_oauth_usage_account_state_dir(&team.0, &team.1);
+        let now = current_unix_seconds();
+        claude_credit_pools::write_claude_read_schedule(
+            &state_dir,
+            &claude_credit_pools::ClaudeReadSchedule {
+                last_plain_read_at: Some(now - 3_600),
+                ..Default::default()
+            },
+        )
+        .expect("write schedule");
+        let _ = fs::remove_file(claude_oauth_usage_cache_path(&team.0, &team.1));
+        *CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = Some(respond_variant_reader_blind);
+        let snapshots = fixture.collect();
+        *CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = None;
+        let reader_blind = |balances: &Value| {
+            balances
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|balance| balance["kind"] == "saved_resets")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let local = serde_json::to_value(&snapshots).expect("local status");
+        let saved = local
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|snapshot| reader_blind(&snapshot["credit_balances"]))
+            .collect::<Vec<_>>();
+        let upload = serde_json::to_value(
+            snapshots
+                .into_iter()
+                .map(|snapshot| snapshot.redacted_for_backend())
+                .collect::<Vec<_>>(),
+        )
+        .expect("upload");
+        let uploaded = upload
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|snapshot| reader_blind(&snapshot["credit_balances"]))
+            .collect::<Vec<_>>();
+        for (label, balances) in [("local", saved), ("upload", uploaded)] {
+            assert!(!balances.is_empty(), "{label}: saved resets present");
+            for balance in balances {
+                assert_eq!(balance["grants_unavailable_cause"], "reader", "{label}");
+                assert_eq!(balance["grants_state"], "unavailable", "{label}");
+                assert_eq!(balance["status"], "unknown", "{label}");
+                assert_eq!(balance["ineligible_reason"], "surface", "{label}");
+                assert_eq!(balance["eligible"], false, "{label}");
+                for absent in ["remaining", "grant_count", "grants"] {
+                    assert!(balance.get(absent).is_none(), "{label}: {absent}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn binding_mismatch_message_names_plans_only() {
         assert_eq!(
