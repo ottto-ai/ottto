@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 539,
-  "content_sha256": "1c493f25dbe43e7da4dfbfb27d3a06561e5aca424dd6e178d20c2fd7cc8a4004",
+  "candidate_file_count": 541,
+  "content_sha256": "7c33bc1d030ca1d45b4475555dc0c48377dbb66a61fdf459edf9863fe83de1fb",
   "files": [
     {
       "executable": false,
@@ -712,6 +712,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/app_bundle_version.rs",
+      "sha256": "bdc4c50ba3012ab3f5ca53b58e43d4f4fc3abbe59f371e163d0cbe5ece8fa24b",
+      "size_bytes": 19991
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/backfill.rs",
       "sha256": "62740467dda9f72c7c1c362270326446568bcb04cff3dc06ad55dc271d3df63d",
       "size_bytes": 40746
@@ -916,8 +923,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "437546c805402a311a21111534c45f6c2fc1c58df00c7379ec5228422deaf629",
-      "size_bytes": 346608
+      "sha256": "132feb75c106f025476cb5d2483191837151f5eb93a0a932c706df60cd03bcbb",
+      "size_bytes": 346742
     },
     {
       "executable": false,
@@ -1329,8 +1336,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/diagnostics.md",
-      "sha256": "b6c6b550307fc76a37dded16b7c7ff90fd7ee03b5653eb527790375389d98003",
-      "size_bytes": 11666
+      "sha256": "1c48d509a63da462a2648f65fd51043f609f0a9f0d7da1f5b78b44c2ed27446a",
+      "size_bytes": 12201
     },
     {
       "executable": false,
@@ -1385,8 +1392,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/release-verification.md",
-      "sha256": "0aa6d12f5595593d588627e1d7202e6202406901b4c42c7d5dc33e7198500fd5",
-      "size_bytes": 11278
+      "sha256": "14601bab61290333d5bce8ce9ae6fdca8cdebb0c687e55327bf502b072f5a8ca",
+      "size_bytes": 11990
     },
     {
       "executable": false,
@@ -2511,6 +2518,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-11-multi-user-launch-and-app-version.md",
+      "sha256": "0c666dee1ae0a292b70bfbcfb724ad5226035645cb35d78698d997db16eaa86f",
+      "size_bytes": 2460
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -3450,8 +3464,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_package.sh",
-      "sha256": "7401441c984b928f4d05886a1c74bf5f458e72dce144413c7f534d3cc390f2fe",
-      "size_bytes": 37667
+      "sha256": "6aa006c38b8837b6a529bbb287a53308c1f85b9557605c9f1aa4cbbb694418ef",
+      "size_bytes": 37895
     },
     {
       "executable": true,
@@ -3569,8 +3583,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_surface_ci.sh",
-      "sha256": "f932fc5c00d5f1b3e720dd8d45174ed43d1a86c1de26b9f435f36929028fc69c",
-      "size_bytes": 7575
+      "sha256": "a415b26b78cbd06f6541977255a4bf2ecdffa7b4c0c16c57258edc63273e3c58",
+      "size_bytes": 7593
     },
     {
       "executable": false,
@@ -3681,8 +3695,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_sparkle_bundle_version.sh",
-      "sha256": "a7ab86f3a8f1218b598ff771cfd981fa3f65b1c1633c2f92f45c317f32f33281",
-      "size_bytes": 8334
+      "sha256": "6bf6348e4382e0f28c8175b645baa550177fdb9ba2c70cf26f8a419c8a5db461",
+      "size_bytes": 8880
     },
     {
       "executable": true,
@@ -3776,9 +3790,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-11T12:41:17+00:00",
+  "generated_at": "2026-10-11T14:31:43+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 540,
+  "output_file_count": 542,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3815,5 +3829,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d6570c17ef87a76b3d9f401812168a2a85a007c3"
+  "source_commit": "86f6da43268b9009b02c9eccd13a2d6bc1285942"
 }
