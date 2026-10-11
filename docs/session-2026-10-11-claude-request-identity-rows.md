@@ -53,18 +53,17 @@ same code through `capture_enabled()` (`cfg(test)`).
     get login-only attribution.
   - Duplicates, foreign owners, invalid evidence and missing original clocks
     are refused.
-  - Missing telemetry is pending only for that request's own clock, within
-    `TELEMETRY_FLUSH_WINDOW_SECONDS` (300, provisional) of the scan, and with
-    a qualified witness that the folder's telemetry writer is healthy now. A
-    complete paired-sidecar load proves only what was already written, and no
-    existing qualified current-writer witness exists, so the scan supplies
-    none: pending never fires and a young missing request is missing (SESSION
-    ruling requested). Only missing requests are open to transcript bases.
-  - Auxiliary (telemetry-only) reported rows are refused for a bad clock. Their
-    `observed_at` may be the observer clock and the v2 capture does not record
-    which, the same reason they cannot qualify today's request accounts. The
-    trace span start is event-origin, but no existing rule qualifies it
-    (SESSION ruling requested). Transcript clocks are never borrowed.
+  - Per the SESSION ruling, there is no production pending without a
+    qualified current-writer health witness, and none exists. Genuinely
+    absent telemetry is missing; present but unusable evidence is refused.
+    Only `cfg(test)` can supply a witness (pending then also needs the
+    request's own clock within `TELEMETRY_FLUSH_WINDOW_SECONDS`, 300,
+    provisional). Only missing requests are open to transcript bases.
+  - Auxiliary (telemetry-only) reported rows stay refused for a bad clock
+    (SESSION ruling). Their `observed_at` may be the observer clock and the v2
+    capture does not record which. Transcript clocks are never borrowed. A
+    reported item whose request count includes auxiliary requests fails the
+    request-id precondition and keeps today's bytes wholesale.
   - Unreadable sidecars refuse every request; they never fall through.
 - **Transcript markers** (`credential_org` attachment lines):
   - They are captured only on owned lines, after inherited-fork exclusion,
@@ -74,7 +73,33 @@ same code through `capture_enabled()` (`cfg(test)`).
     one it is untrusted and refused.
   - Each file keeps at most 64 markers. Overflow switches transcript bases off
     for that file.
-  - No email or raw text is kept. `transcript_email` stays off.
+  - No email or raw text is kept: a local digest only detects an email
+    change, with the positions of the first email and the first switch.
+- **`transcript_email`** (terminal/SDK; compiled out unless both
+  `EMISSION_ENABLED` and `TRANSCRIPT_EMAIL_ENABLED`, each `false`) needs:
+  - a trusted marker org, and one unchanged `session_context` email before
+    the request by line order;
+  - a file under a registered slot folder (never the default folder);
+  - one segment of the local status-coverage ledger for that folder covering
+    [session start − 300 s, request], with the covered org equal to the
+    marker org. The login is that segment's login. Otherwise the request
+    stays `transcript_org`.
+- **Status-coverage feed** (`claude_status_coverage.rs`, same gate):
+  - The Claude status pass reports each registered slot's already-qualified
+    login/org hashes after `claude_slot_post_resolution_gate`, or
+    unavailable/signed-out on every failure branch. It adds no read, provider
+    call or cadence change, and returns nothing to the status pass.
+  - A process-local ledger keeps segments: consecutive same-identity
+    observations at most 600 s (two cadences) apart. Caps: 10 slots, 32
+    segments per slot, 30 days, 64 KiB (worst case 62,560 B).
+  - A gap, an unavailable observation, a conflict, logout, clock regression,
+    slot replacement or removal, eviction, restart or a poisoned lock leaves
+    the interval unqualified. Nothing is filled in, persisted or uploaded.
+  - The ledger's (login, org) pairings also prove marker-org membership for
+    login-only telemetry.
+  - A status-pass fixture shows byte-identical status output (SOURCE account
+    and plans, quota, health, persisted slot state) with the feed working,
+    failed, or holding a conflicting history.
 - **`transcript_sole_login`** (Desktop only) needs all of the following:
   - a complete Desktop identity census;
   - a new additive index witness. The witness is set only on a complete,
@@ -100,6 +125,12 @@ same code through `capture_enabled()` (`cfg(test)`).
   `source_ended_at`, `source_last_activity_at`) that request-account
   qualification gives every item it handles, which leaves new-collector items
   alone. An item that cannot be tagged returns unchanged.
+- **Session owners:** request identities never bind or rewrite an owner. An
+  already-bound session admits only this scan's exact contract-5 body, and
+  only when the session creator is absent or equal to the retained owner. The
+  creator check runs before the matching-owner shortcut, so all-owner rows
+  cannot hide a different creator. An unbound session gains no owner from
+  contract-5 rows.
 
 ## Validation
 
