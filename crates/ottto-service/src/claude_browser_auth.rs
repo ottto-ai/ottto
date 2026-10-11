@@ -1008,6 +1008,42 @@ fn reject_fresh_generic_root_collision(operation_id: &str) -> Result<(), String>
     Ok(())
 }
 
+/// Exact daemon-owned provisional/retained roots also participate in explicit
+/// telemetry opt-out. The settings owner revalidates every path without links.
+pub(crate) fn managed_telemetry_roots() -> Vec<String> {
+    let state = read_state();
+    let mut roots: Vec<_> = state
+        .operations
+        .into_iter()
+        .filter_map(|operation| (!operation.config_dir.is_empty()).then_some(operation.config_dir))
+        .collect();
+    roots.extend(state.quarantined_roots.into_iter().map(|root| {
+        if root.config_dir.is_empty() {
+            managed_root()
+                .join(root.root_id)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            root.config_dir
+        }
+    }));
+    let parent = managed_root();
+    roots.retain(|root| Path::new(root).parent() == Some(parent.as_path()));
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+pub(crate) fn active_provisional_telemetry_root(config_dir: &str) -> bool {
+    let state = read_state();
+    state.operations.iter().any(|operation| {
+        state.active_operation_id.as_deref() == Some(&operation.operation_id)
+            && operation.mode == PersistedMode::Generic
+            && operation.outcome.is_none()
+            && operation.config_dir == config_dir
+    })
+}
+
 pub(crate) fn start(
     status: ClaudeAccountsStatusV1,
     mode: BrowserLoginMode,
@@ -1193,6 +1229,20 @@ fn start_inner(
 
     if !should_spawn {
         return Ok(annotate_status(status));
+    }
+
+    // Generic browser roots are provisional until provider-owned admission,
+    // so they do not appear in the registry repair pass yet. Extend only the
+    // already approved local relay settings before the login child starts.
+    if mode == BrowserLoginMode::Generic
+        || status.managed_slots.iter().any(|slot| {
+            slot.slot_id == slot_id
+                && slot.ownership == ottto_protocol::ClaudeConfigSlotOwnership::Managed
+        })
+    {
+        if let Err(error) = crate::control::provision_managed_claude_relay_settings(&config_dir) {
+            eprintln!("managed Claude settings repair skipped: {error}");
+        }
     }
 
     if mode == BrowserLoginMode::Target {
@@ -1887,7 +1937,11 @@ fn finalize_identity_mode(
         }
         collect_allowed_quota(&store, &canonical);
         if let Err(error) = consume_reusable_root_claim(operation_id) {
-            let _ = store.remove(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, &canonical);
+            crate::control::remove_claude_registration_with_relay_cleanup(
+                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                &canonical,
+            )
+            .map_err(|error| error.to_string())?;
             let _ = crate::agent_status::prune_claude_slot_collection_state(&canonical);
             clear_admission_slot(operation_id);
             return Err(error);
@@ -1910,12 +1964,11 @@ fn finalize_identity_mode(
                 &proof.organization_identifier_hash,
             ) {
                 reserve_quarantine_root(&operation, true)?;
-                store
-                    .remove(
-                        CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
-                        &operation.slot_id,
-                    )
-                    .map_err(|error| error.to_string())?;
+                crate::control::remove_claude_registration_with_relay_cleanup(
+                    CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                    &operation.slot_id,
+                )
+                .map_err(|error| error.to_string())?;
                 let _ = crate::agent_status::prune_claude_slot_collection_state(&operation.slot_id);
                 let _ = crate::claude_upkeep::prune_slot_upkeep_state(&operation.slot_id);
                 make_quarantine_reusable(&operation)?;
@@ -2681,12 +2734,11 @@ fn retire_target_candidate(
         .chain(registered.external_slots.iter())
         .any(|slot| slot.slot_id == operation.slot_id)
     {
-        store
-            .remove(
-                CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
-                &operation.slot_id,
-            )
-            .map_err(|error| error.to_string())?;
+        crate::control::remove_claude_registration_with_relay_cleanup(
+            CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+            &operation.slot_id,
+        )
+        .map_err(|error| error.to_string())?;
         let _ = crate::agent_status::prune_claude_slot_collection_state(&operation.slot_id);
         let _ = crate::claude_upkeep::prune_slot_upkeep_state(&operation.slot_id);
     }
@@ -3879,7 +3931,11 @@ mod tests {
     }
 
     fn temp_dir(label: &str) -> PathBuf {
-        crate::test_scratch::unique_path(&format!("ottto-claude-browser-auth-{label}"))
+        fs::canonicalize(std::env::temp_dir())
+            .expect("canonical scratch parent")
+            .join(crate::test_scratch::unique_name(&format!(
+                "ottto-claude-browser-auth-{label}"
+            )))
     }
 
     #[test]
@@ -7408,6 +7464,17 @@ mod tests {
         };
         transact(|state| state.operations.push(operation.clone())).expect("sidecar");
         reserve_quarantine_root(&operation, false).expect("prelaunch reservation");
+        let settings = Path::new(&config_dir).join("settings.json");
+        fs::write(&settings, "{broken").expect("unsafe settings fixture");
+        assert!(retire_target_candidate(&operation, true).is_err());
+        assert!(store
+            .load()
+            .unwrap()
+            .managed_slots
+            .iter()
+            .any(|slot| slot.slot_id == slot_id));
+        assert_eq!(fs::read_to_string(&settings).unwrap(), "{broken");
+        fs::write(&settings, r#"{"env":{"CLAUDE_CODE_ENABLE_TELEMETRY":"1","OTEL_EXPORTER_OTLP_HEADERS":"X-Ottto-Local-Relay=claude_code","OTEL_EXPORTER_OTLP_LOGS_ENDPOINT":"http://127.0.0.1:48123/v1/logs","USER_FLAG":"keep"}}"#).unwrap();
         let wrong_account = "c".repeat(64);
         let collection = ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
             account_identifier_hash: Some(wrong_account.clone()),
@@ -7439,6 +7506,9 @@ mod tests {
             Some(ClaudeBrowserAuthIdentityMismatchV1::Account)
         );
         assert!(Path::new(&config_dir).is_dir());
+        let cleared: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+        assert_eq!(cleared["env"], serde_json::json!({"USER_FLAG":"keep"}));
         let retry_id = "claude_setup_d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3";
         let reused = claim_reusable_root(retry_id)
             .expect("claim reusable")

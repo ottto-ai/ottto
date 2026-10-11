@@ -12,9 +12,9 @@ use crate::claude_local_otel::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) const COMPLETE: &str = "claude_code_jsonl:own_request_account:v1";
+pub(crate) const COMPLETE: &str = "claude_code_jsonl:own_request_account:v1";
 pub(super) const MIXED: &str = "claude_code_jsonl:own_request_account_mixed:v1";
-pub(super) const UNKNOWN: &str = "claude_code_jsonl:own_request_account_unknown:v1";
+pub(crate) const UNKNOWN: &str = "claude_code_jsonl:own_request_account_unknown:v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Coverage {
@@ -105,35 +105,7 @@ pub(crate) fn apply_with_originals(
             .split_once("_agent-")
             .is_some_and(|(root, agent)| !root.is_empty() && !agent.is_empty());
         let mut changed = false;
-        if is_child {
-            let proof = if healthy {
-                qualify(item, &requests, &owners)
-            } else {
-                Err(Coverage::UnreadableEvidence)
-            };
-            let disposition = match proof {
-                Ok(account) => {
-                    changed = set_claude_account_hash(item, Some(account.to_string()));
-                    if original_event_clocks_complete(item) {
-                        Coverage::Complete
-                    } else {
-                        Coverage::UnprovedEventClock
-                    }
-                }
-                Err(reason) => reason,
-            };
-            let collector = if disposition == Coverage::Complete {
-                COMPLETE
-            } else {
-                UNKNOWN
-            };
-            if item.provenance.collector != collector {
-                item.provenance.collector = collector.to_string();
-                changed = true;
-            }
-            changed |= normalize_activity(item);
-            result.coverage.push(disposition);
-        } else {
+        if !is_child {
             // Only genuine existing reported accounting may remove the old
             // current-owner upload veto. Never clear accounts to fit this shape.
             // Request identity is not creator identity. The preceding legacy
@@ -182,8 +154,37 @@ pub(crate) fn apply_with_originals(
                     ),
                 );
             }
-            continue;
+            if qualified {
+                continue;
+            }
         }
+        let proof = if healthy {
+            qualify(item, &requests, &owners)
+        } else {
+            Err(Coverage::UnreadableEvidence)
+        };
+        let disposition = match proof {
+            Ok(account) => {
+                changed |= set_claude_account_hash(item, Some(account.to_string()));
+                if original_event_clocks_complete(item) {
+                    Coverage::Complete
+                } else {
+                    Coverage::UnprovedEventClock
+                }
+            }
+            Err(reason) => reason,
+        };
+        let collector = if disposition == Coverage::Complete {
+            COMPLETE
+        } else {
+            UNKNOWN
+        };
+        if item.provenance.collector != collector {
+            item.provenance.collector = collector.to_string();
+            changed = true;
+        }
+        changed |= normalize_activity(item);
+        result.coverage.push(disposition);
         if changed {
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         }
@@ -353,15 +354,37 @@ fn qualify<'a>(
     requests: &BTreeMap<(&str, &str), Option<&'a ClaudeLocalOtelEvidence>>,
     owners: &BTreeMap<(&str, &str), Option<&ClaudeTraceOwnershipEvidence>>,
 ) -> Result<&'a str, Coverage> {
-    let (root, _) = item
-        .source_session_id
-        .split_once("_agent-")
-        .expect("checked child");
+    let root = if let Some((root, agent)) = item.source_session_id.split_once("_agent-") {
+        if root.is_empty() || agent.is_empty() {
+            return Err(Coverage::UnprovedRequestOwner);
+        }
+        root
+    } else {
+        let root = item.source_session_id.as_str();
+        if !super::codex_identity_is_uuid_shaped(root) || root != root.to_ascii_lowercase() {
+            return Err(Coverage::UnprovedRequestOwner);
+        }
+        root
+    };
     let accounts = request_accounts(item, root, requests, owners)?;
     if accounts.len() != 1 {
         return Err(Coverage::ConflictingAccounts);
     }
     let account = *accounts.first().ok_or(Coverage::MissingRequests)?;
+    // Top-level request login is not original creator evidence. Preserve an
+    // explicit conflict and refuse a complete creator contradicted by this login.
+    if root == item.source_session_id
+        && item
+            .session_account_evidence
+            .as_ref()
+            .is_some_and(|original| {
+                original.identity_disposition == Some("conflict")
+                    || (original.identity_disposition == Some("complete")
+                        && original.account_identifier_hash.as_deref() != Some(account))
+            })
+    {
+        return Err(Coverage::KnownAccountConflict);
+    }
     for row in item
         .model_usage
         .iter()

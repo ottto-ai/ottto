@@ -1408,6 +1408,193 @@ fn complete_claude_registry_mutation(
     )
 }
 
+// Account setup must not grant telemetry consent. Only extend an already
+// approved source's existing local relay configuration to daemon-owned roots.
+static MANAGED_CLAUDE_SETTINGS_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_managed_claude_settings() -> MutexGuard<'static, ()> {
+    MANAGED_CLAUDE_SETTINGS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn approved_managed_claude_relay_env() -> Result<Option<Vec<(&'static str, String)>>, LocalApiError>
+{
+    if source_patch_disabled(&SourceKind::ClaudeCode) {
+        return Ok(None);
+    }
+    let device = FileDeviceStore::default().load().map_err(|_| {
+        LocalApiError::LocalOperationFailed("read managed Claude source approval".into())
+    })?;
+    if !device.is_some_and(|device| device.sources.iter().any(|source| source == "claude_code")) {
+        return Ok(None);
+    }
+    let Some(body) = crate::agent_configs::claude_managed_settings::read_settings(&home_path(
+        ".claude/settings.json",
+    ))
+    .map_err(|_| {
+        LocalApiError::LocalOperationFailed("read approved Claude relay settings".into())
+    })?
+    else {
+        return Ok(None);
+    };
+    let Some(port) = crate::agent_configs::claude_managed_settings::approved_relay_port(&body)
+    else {
+        return Ok(None);
+    };
+    let Some(machine) = FileMachineStore::default().load().map_err(|_| {
+        LocalApiError::LocalOperationFailed("read managed Claude machine binding".into())
+    })?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(claude_code_relay_env_for_machine_id(
+        &machine.machine_id,
+        &crate::otlp_relay::local_relay_base_url_for_port(port),
+    )))
+}
+
+pub(crate) fn provision_managed_claude_relay_settings(
+    config_dir: &str,
+) -> Result<bool, LocalApiError> {
+    let _settings_guard = lock_managed_claude_settings();
+    let Some(env) = approved_managed_claude_relay_env()? else {
+        return Ok(false);
+    };
+    let current = FileClaudeConfigSlotSettingsStore::default()
+        .load()
+        .map_err(claude_config_slot_settings_error)?;
+    if !current.managed_slots.iter().any(|slot| {
+        slot.ownership == ottto_protocol::ClaudeConfigSlotOwnership::Managed
+            && slot.config_dir.as_deref() == Some(config_dir)
+    }) && !crate::claude_browser_auth::active_provisional_telemetry_root(config_dir)
+    {
+        return Ok(false);
+    }
+    provision_managed_claude_relay_settings_with_env(config_dir, &env)
+}
+
+fn provision_managed_claude_relay_settings_with_env(
+    config_dir: &str,
+    env: &[(&str, String)],
+) -> Result<bool, LocalApiError> {
+    validate_managed_claude_settings_root(config_dir)?;
+    crate::agent_configs::claude_managed_settings::reconcile(Path::new(config_dir), env)
+        .map(|outcome| outcome == crate::agent_configs::claude_managed_settings::Outcome::Changed)
+        .map_err(|_| {
+            LocalApiError::LocalOperationFailed(
+                "managed Claude settings could not be safely provisioned".into(),
+            )
+        })
+}
+
+fn validate_managed_claude_settings_root(config_dir: &str) -> Result<(), LocalApiError> {
+    // Lexical authority first; the settings writer then opens every component
+    // without following links. Do not use the auth-root validator here: it
+    // repairs permissions and can follow an intermediate parent link.
+    let root = Path::new(config_dir);
+    let managed_parent = default_support_dir().join(ottto_core::CLAUDE_MANAGED_ACCOUNTS_DIR_NAME);
+    if root.parent() != Some(managed_parent.as_path())
+        || ottto_core::ClaudeConfigDirSlot::registered(config_dir.to_owned()).is_err()
+    {
+        return Err(LocalApiError::LocalOperationFailed(
+            "managed Claude settings root is unavailable or unsafe".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn disable_managed_claude_relay_settings() -> Result<bool, LocalApiError> {
+    let _settings_guard = lock_managed_claude_settings();
+    use crate::agent_configs::claude_managed_settings::{disable_settings, Outcome};
+    let default_root = home_path(".claude");
+    let mut changed = disable_settings(&default_root, true).map_err(|_| {
+        LocalApiError::LocalOperationFailed("Claude relay opt-out could not be safely saved".into())
+    })? == Outcome::Changed;
+    let status = FileClaudeConfigSlotSettingsStore::default()
+        .load()
+        .map_err(claude_config_slot_settings_error)?;
+    let mut roots: BTreeSet<String> = status
+        .managed_slots
+        .iter()
+        .filter(|slot| slot.ownership == ottto_protocol::ClaudeConfigSlotOwnership::Managed)
+        .filter_map(|slot| slot.config_dir.clone())
+        .collect();
+    roots.extend(crate::claude_browser_auth::managed_telemetry_roots());
+    let mut failure = None;
+    for root in roots {
+        let result = validate_managed_claude_settings_root(&root).and_then(|()| {
+            disable_settings(Path::new(&root), false).map_err(|_| {
+                LocalApiError::LocalOperationFailed(
+                    "managed Claude relay settings could not be safely disabled".into(),
+                )
+            })
+        });
+        match result {
+            Ok(outcome) => changed |= outcome == Outcome::Changed,
+            Err(error) => failure = Some(error),
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(changed)
+}
+
+#[cfg(test)]
+fn repair_registered_managed_claude_relay_settings() -> Result<bool, LocalApiError> {
+    let _settings_guard = lock_managed_claude_settings();
+    repair_registered_managed_claude_relay_settings_locked()
+}
+
+fn repair_registered_managed_claude_relay_settings_locked() -> Result<bool, LocalApiError> {
+    let Some(env) = approved_managed_claude_relay_env()? else {
+        return Ok(false);
+    };
+    let status = FileClaudeConfigSlotSettingsStore::default()
+        .load()
+        .map_err(claude_config_slot_settings_error)?;
+    let mut changed = false;
+    let mut failure = None;
+    for slot in status
+        .managed_slots
+        .iter()
+        .filter(|slot| slot.ownership == ottto_protocol::ClaudeConfigSlotOwnership::Managed)
+    {
+        if let Some(root) = slot.config_dir.as_deref() {
+            match provision_managed_claude_relay_settings_with_env(root, &env) {
+                Ok(updated) => changed |= updated,
+                Err(error) => failure = Some(error),
+            }
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(changed)
+}
+
+fn complete_claude_setup_mutation(
+    status: ottto_protocol::ClaudeAccountsStatusV1,
+) -> ottto_protocol::ClaudeAccountsStatusV1 {
+    if !claude_setup_operation_is_terminal(&status) {
+        if let Some(root) = status
+            .managed_slots
+            .iter()
+            .find(|slot| {
+                Some(&slot.slot_id) == status.setup_operation.slot_id.as_ref()
+                    && slot.ownership == ottto_protocol::ClaudeConfigSlotOwnership::Managed
+            })
+            .and_then(|slot| slot.config_dir.as_deref())
+        {
+            if let Err(error) = provision_managed_claude_relay_settings(root) {
+                eprintln!("managed Claude settings repair skipped: {error}");
+            }
+        }
+    }
+    complete_claude_registry_mutation(status)
+}
+
 fn claude_setup_operation_is_terminal(status: &ottto_protocol::ClaudeAccountsStatusV1) -> bool {
     matches!(
         status.setup_operation.state,
@@ -1558,17 +1745,43 @@ fn remove_claude_account(
     schema_version: u16,
     slot_id: &str,
 ) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
-    let status = FileClaudeConfigSlotSettingsStore::default()
-        .remove(schema_version, slot_id)
-        .map_err(claude_config_slot_settings_error)?;
-    // Settings removal is authoritative. Collection-state cleanup is
-    // best-effort; current-slot filtering makes an orphan non-authoritative,
-    // so a cleanup I/O failure must not turn a committed removal into a false
-    // failure that cannot be retried honestly.
+    let status = remove_claude_registration_with_relay_cleanup(schema_version, slot_id)?;
+    // Registration removal is authoritative; current-slot filtering excludes
+    // orphan collection state if best-effort cleanup cannot complete.
     let _ = crate::agent_status::prune_claude_slot_collection_state(slot_id);
     let _ = crate::claude_upkeep::prune_slot_upkeep_state(slot_id);
     crate::claude_refresher::prune_slot(slot_id);
     Ok(complete_claude_registry_mutation(status))
+}
+
+pub(crate) fn remove_claude_registration_with_relay_cleanup(
+    schema_version: u16,
+    slot_id: &str,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    let settings_guard = lock_managed_claude_settings();
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    let current = store.load().map_err(claude_config_slot_settings_error)?;
+    // Preserve the store's request-validation contract before settings effects.
+    if schema_version == current.schema_version && slot_id != "default" {
+        if let Some(root) = current
+            .managed_slots
+            .iter()
+            .find(|slot| {
+                slot.slot_id == slot_id
+                    && slot.ownership == ottto_protocol::ClaudeConfigSlotOwnership::Managed
+            })
+            .and_then(|slot| slot.config_dir.as_deref())
+        {
+            validate_managed_claude_settings_root(root)?;
+            crate::agent_configs::claude_managed_settings::disable_settings(Path::new(root), false)
+                .map_err(|_| LocalApiError::LocalOperationFailed("managed Claude relay settings must be safely cleared before removing registration".into()))?;
+        }
+    }
+    let status = store
+        .remove(schema_version, slot_id)
+        .map_err(claude_config_slot_settings_error)?;
+    drop(settings_guard);
+    Ok(status)
 }
 
 fn register_claude_account_path(
@@ -1640,7 +1853,7 @@ fn prepare_claude_account(
         )
     }
     .map_err(claude_config_slot_settings_error)
-    .map(complete_claude_registry_mutation);
+    .map(complete_claude_setup_mutation);
     if result.is_err() {
         recover_failed_claude_browser_registry_mutation(
             &store,
@@ -1703,7 +1916,7 @@ fn prepare_claude_account_legacy(
                 expected_account_identifier_hash.as_deref(),
             )
             .map_err(claude_config_slot_settings_error)
-            .map(complete_claude_registry_mutation);
+            .map(complete_claude_setup_mutation);
         let terminal = result
             .as_ref()
             .is_ok_and(claude_setup_operation_is_terminal);
@@ -1923,7 +2136,7 @@ fn reconnect_claude_account_mode(
             Some(organization_hash),
         )
         .map_err(claude_config_slot_settings_error)
-        .map(complete_claude_registry_mutation);
+        .map(complete_claude_setup_mutation);
     let terminal = result
         .as_ref()
         .is_ok_and(claude_setup_operation_is_terminal);
@@ -3523,7 +3736,12 @@ fn apply_telemetry_config(
         SourceKind::Codex => reconcile_codex_source_off(),
         SourceKind::ClaudeCode => {
             let machine = daemon.status_for_trusted_client()?.machine;
-            patch_claude_code_env_with_relay_base(&machine, &relay_base_url)
+            let mut patch = patch_claude_code_env_with_relay_base(&machine, &relay_base_url)?;
+            // Explicit, backend-authorized enable also clears the default
+            // JSON opt-out written by disable. Per-root user opt-outs survive.
+            patch.changed |=
+                patch_claude_code_settings_with_relay_base(&machine, &relay_base_url)?.changed;
+            Ok(patch)
         }
         SourceKind::Pi => Err(LocalApiError::InvalidRequest(
             "telemetry control does not patch Pi local config".to_string(),
@@ -3539,7 +3757,10 @@ fn remove_telemetry_config(
         SourceKind::Codex => reconcile_codex_source_off(),
         SourceKind::ClaudeCode => {
             let _ = daemon.status_for_trusted_client()?;
-            remove_claude_code_env()
+            let changed = disable_managed_claude_relay_settings()?;
+            let mut patch = remove_claude_code_env()?;
+            patch.changed |= changed;
+            Ok(patch)
         }
         SourceKind::Pi => Err(LocalApiError::InvalidRequest(
             "telemetry control does not patch Pi local config".to_string(),
@@ -4490,6 +4711,7 @@ fn refresh_agent_status_for(
     authorization: &RequestAuthorization,
     source: Option<SourceKind>,
 ) -> Result<Vec<ottto_protocol::AgentStatusSnapshot>, LocalApiError> {
+    require_authorized_local_client(daemon, authorization)?;
     reconcile_agent_status_config_for_refresh(daemon, source.as_ref())?;
     let captured_at = current_rfc3339();
     let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
@@ -4531,12 +4753,25 @@ fn reconcile_claude_statusline_for_agent_status_refresh(
     let relay_base_url = local_relay_base_url_for_daemon(daemon);
     let support_dir = default_support_dir();
     let settings_path = home_path(".claude/settings.json");
+    let _settings_guard = lock_managed_claude_settings();
+    let managed_approval_before_repair = match approved_managed_claude_relay_env() {
+        Ok(env) => env.is_some(),
+        Err(error) => {
+            eprintln!("managed Claude settings repair skipped: {error}");
+            false
+        }
+    };
     let _ = repair_claude_statusline_for_refresh_at(
         &settings_path,
         &machine,
         &support_dir,
         &relay_base_url,
     )?;
+    if managed_approval_before_repair {
+        if let Err(error) = repair_registered_managed_claude_relay_settings_locked() {
+            eprintln!("managed Claude settings repair skipped: {error}");
+        }
+    }
     Ok(())
 }
 
@@ -10228,13 +10463,16 @@ fn patch_claude_code_settings_with_relay_base(
     machine: &MachineIdentity,
     relay_base_url: &str,
 ) -> Result<ConfigPatchResult, LocalApiError> {
+    let _settings_guard = lock_managed_claude_settings();
     let backup_root = default_support_dir();
-    patch_claude_code_settings_at_with_relay_base(
+    let mut patch = patch_claude_code_settings_at_with_relay_base(
         &home_path(".claude/settings.json"),
         machine,
         &backup_root,
         relay_base_url,
-    )
+    )?;
+    patch.changed |= repair_registered_managed_claude_relay_settings_locked()?;
+    Ok(patch)
 }
 
 fn repair_claude_statusline_for_refresh_at(
@@ -10263,6 +10501,41 @@ fn claude_statusline_refresh_repair_needed(path: &Path, support_dir: &Path) -> b
         Ok(value) if value.is_object() => value,
         _ => return false,
     };
+    let has_telemetry_settings = settings
+        .get("env")
+        .and_then(|env| env.as_object())
+        .is_some_and(|env| {
+            env.keys().any(|key| {
+                key.starts_with("OTEL_")
+                    || matches!(
+                        key.as_str(),
+                        "CLAUDE_CODE_ENABLE_TELEMETRY"
+                            | "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"
+                            | "CLAUDE_CODE_OTEL_SHUTDOWN_TIMEOUT_MS"
+                    )
+            })
+        });
+    if has_telemetry_settings
+        && std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(crate::agent_configs::claude_managed_settings::approved_relay_port)
+            .is_none()
+    {
+        return false;
+    }
+    if [
+        "CLAUDE_CODE_ENABLE_TELEMETRY",
+        "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+    ]
+    .iter()
+    .any(|key| {
+        settings
+            .get("env")
+            .and_then(|env| env.get(*key))
+            .is_some_and(|enabled| enabled != "1")
+    }) {
+        return false;
+    }
     let statusline = settings
         .get("statusLine")
         .and_then(|value| value.as_object());
@@ -10814,6 +11087,13 @@ fn claude_code_relay_env_with_base(
     machine: &MachineIdentity,
     relay_base_url: &str,
 ) -> Vec<(&'static str, String)> {
+    claude_code_relay_env_for_machine_id(&machine.machine_id, relay_base_url)
+}
+
+fn claude_code_relay_env_for_machine_id(
+    machine_id: &str,
+    relay_base_url: &str,
+) -> Vec<(&'static str, String)> {
     let relay_base = relay_base_url.trim_end_matches('/');
     vec![
         ("CLAUDE_CODE_ENABLE_TELEMETRY", "1".to_string()),
@@ -10846,8 +11126,7 @@ fn claude_code_relay_env_with_base(
         (
             "OTEL_RESOURCE_ATTRIBUTES",
             format!(
-                "service.name=claude-code,ottto.source=claude_code,ottto.machine_id={}",
-                machine.machine_id
+                "service.name=claude-code,ottto.source=claude_code,ottto.machine_id={machine_id}"
             ),
         ),
     ]
@@ -16115,11 +16394,13 @@ mod tests {
 
     fn control_test_root(name: &str) -> PathBuf {
         let counter = TELEMETRY_KEY_STORE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "ottto-control-{name}-{}-{}-{counter}",
-            std::process::id(),
-            current_millis()
-        ));
+        let root = fs::canonicalize(std::env::temp_dir())
+            .expect("canonical scratch parent")
+            .join(format!(
+                "ottto-control-{name}-{}-{}-{counter}",
+                std::process::id(),
+                current_millis()
+            ));
         let _ = fs::remove_dir_all(&root);
         create_control_test_dir(&root);
         root
@@ -26019,6 +26300,404 @@ X-API-Key = "otel_redacted"
             original_shell
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn managed_claude_relay_fixture() -> (PathBuf, Vec<EnvVarGuard>) {
+        let root = fs::canonicalize(control_test_root("managed-relay")).unwrap();
+        let guards = vec![
+            EnvVarGuard::set_path("HOME", &root),
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support")),
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &root.join("secrets")),
+            EnvVarGuard::remove("OTTTO_PATCH_CLAUDE_CODE_DISABLED"),
+        ];
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::create_dir_all(root.join("secrets")).unwrap();
+        let env: serde_json::Map<String, serde_json::Value> =
+            claude_code_relay_env_for_machine_id("machine_test", "http://127.0.0.1:48123")
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), json!(value)))
+                .collect();
+        fs::write(
+            root.join(".claude/settings.json"),
+            serde_json::to_vec(&json!({"env":env})).unwrap(),
+        )
+        .unwrap();
+        FileMachineStore::default()
+            .save(&ottto_core::LocalMachineBinding {
+                machine_id: "machine_test".into(),
+                installation_id: "install_test".into(),
+                hardware_uuid: None,
+            })
+            .unwrap();
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".into(),
+                machine_id: Some("machine_test".into()),
+                sources: vec!["claude_code".into()],
+            })
+            .unwrap();
+        (root, guards)
+    }
+
+    #[test]
+    #[serial]
+    fn managed_claude_relay_creation_reconnect_and_existing_registry_repair() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let operation_id = "claude_setup_11111111111111111111111111111111";
+        let prepared = prepare_claude_account_legacy(1, operation_id.into(), None).unwrap();
+        let dir = prepared.managed_slots[0].config_dir.clone().unwrap();
+        assert!(Path::new(&dir).join("settings.json").exists());
+        let body = fs::read_to_string(Path::new(&dir).join("settings.json")).unwrap();
+        assert!(claude_code_settings_has_relay_env_for_base(
+            &body,
+            "http://127.0.0.1:48123"
+        ));
+        assert!(!body.contains("statusLine"));
+        assert!(!provision_managed_claude_relay_settings(&dir).unwrap());
+        fs::remove_file(Path::new(&dir).join("settings.json")).unwrap();
+        assert!(repair_registered_managed_claude_relay_settings().unwrap());
+        let provisional = ottto_core::prepare_managed_claude_provisional_root(
+            "claude_setup_22222222222222222222222222222222",
+        )
+        .unwrap()
+        .1;
+        assert!(!provision_managed_claude_relay_settings(&provisional).unwrap());
+        assert!(!store
+            .load()
+            .unwrap()
+            .managed_slots
+            .iter()
+            .any(|slot| slot.config_dir.as_deref() == Some(&provisional)));
+        let external = root.join("advanced");
+        fs::create_dir(&external).unwrap();
+        store
+            .register_path(1, external.to_str().unwrap().into())
+            .unwrap();
+        repair_registered_managed_claude_relay_settings().unwrap();
+        assert!(!external.join("settings.json").exists());
+        assert!(!provision_managed_claude_relay_settings(external.to_str().unwrap()).unwrap());
+        store.stop_waiting(1, operation_id).unwrap();
+        crate::claude_browser_auth::release_ceremony(operation_id);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn managed_claude_relay_requires_existing_approval_and_preserves_optout() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let dir = ottto_core::prepare_managed_claude_provisional_root(
+            "claude_setup_33333333333333333333333333333333",
+        )
+        .unwrap()
+        .1;
+        FileClaudeConfigSlotSettingsStore::default()
+            .register_managed_path(1, dir.clone())
+            .unwrap();
+        let settings = Path::new(&dir).join("settings.json");
+        {
+            let _disabled = EnvVarGuard::set_str("OTTTO_PATCH_CLAUDE_CODE_DISABLED", "true");
+            assert!(!provision_managed_claude_relay_settings(&dir).unwrap());
+            assert!(!settings.exists());
+        }
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "test".into(),
+                machine_id: None,
+                sources: vec!["codex".into()],
+            })
+            .unwrap();
+        assert!(!provision_managed_claude_relay_settings(&dir).unwrap());
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "test".into(),
+                machine_id: None,
+                sources: vec!["claude_code".into()],
+            })
+            .unwrap();
+        let default_settings = root.join(".claude/settings.json");
+        let approved = fs::read(&default_settings).unwrap();
+        fs::write(
+            &default_settings,
+            r#"{"env":{"CLAUDE_CODE_ENABLE_TELEMETRY":"0"}}"#,
+        )
+        .unwrap();
+        assert!(!provision_managed_claude_relay_settings(&dir).unwrap());
+        assert!(!settings.exists());
+        let canonical_default: serde_json::Value = serde_json::from_slice(&approved).unwrap();
+        for (key, value) in [
+            (
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                "http://127.0.0.1:48123/collector/v1/logs",
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+                "http://localhost:48123/collector/v1/metrics",
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "http://127.0.0.1:48123/collector/v1/traces",
+            ),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example"),
+            ("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", "grpc"),
+            ("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", "grpc"),
+            ("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment=user"),
+        ] {
+            let mut customized = canonical_default.clone();
+            customized["env"][key] = json!(value);
+            let bytes = serde_json::to_vec(&customized).unwrap();
+            fs::write(&default_settings, &bytes).unwrap();
+            assert!(!provision_managed_claude_relay_settings(&dir).unwrap());
+            assert!(!settings.exists());
+            assert_eq!(fs::read(&default_settings).unwrap(), bytes);
+        }
+        fs::write(&default_settings, &approved).unwrap();
+        let opted_out =
+            r#"{"env":{"CLAUDE_CODE_ENABLE_TELEMETRY":"0"},"statusLine":{"command":"keep"}}"#;
+        fs::write(&settings, opted_out).unwrap();
+        assert!(!provision_managed_claude_relay_settings(&dir).unwrap());
+        assert_eq!(fs::read_to_string(&settings).unwrap(), opted_out);
+        fs::remove_file(&settings).unwrap();
+        assert!(provision_managed_claude_relay_settings(&dir).unwrap());
+        let canonical: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+        for (key, value) in [
+            ("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", "grpc"),
+            ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
+            ("OTEL_LOGS_EXPORTER", "console"),
+            ("CLAUDE_CODE_OTEL_SHUTDOWN_TIMEOUT_MS", "25000"),
+            ("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment=user"),
+        ] {
+            let mut customized = canonical.clone();
+            customized["env"][key] = json!(value);
+            let bytes = serde_json::to_vec(&customized).unwrap();
+            fs::write(&settings, &bytes).unwrap();
+            assert!(!provision_managed_claude_relay_settings(&dir).unwrap());
+            assert_eq!(fs::read(&settings).unwrap(), bytes);
+        }
+        fs::write(&settings, "{malformed").unwrap();
+        assert!(provision_managed_claude_relay_settings(&dir).is_err());
+        assert_eq!(fs::read_to_string(&settings).unwrap(), "{malformed");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn managed_claude_relay_disable_survives_automatic_repair_and_preserves_root_optout() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let prepared = store
+            .prepare_managed_account_target(
+                1,
+                "claude_setup_44444444444444444444444444444444".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let dir = prepared.managed_slots[0].config_dir.clone().unwrap();
+        provision_managed_claude_relay_settings(&dir).unwrap();
+        let path = Path::new(&dir).join("settings.json");
+        let mut settings: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        settings["env"]["USER_FLAG"] = json!("keep");
+        fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert!(disable_managed_claude_relay_settings().unwrap());
+        let disabled: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disabled["env"], json!({"USER_FLAG":"keep"}));
+        let default = root.join(".claude/settings.json");
+        let default_body = fs::read(&default).unwrap();
+        assert!(!claude_statusline_refresh_repair_needed(
+            &default,
+            &root.join("support")
+        ));
+        assert!(!provision_managed_claude_relay_settings(&dir).unwrap());
+        assert!(!repair_registered_managed_claude_relay_settings().unwrap());
+        assert_eq!(fs::read(&default).unwrap(), default_body);
+        assert!(!disable_managed_claude_relay_settings().unwrap());
+        // Explicit source enable restores approval; root-specific off remains.
+        patch_claude_code_settings_with_relay_base(&test_machine(), "http://127.0.0.1:48123")
+            .unwrap();
+        assert!(!repair_registered_managed_claude_relay_settings().unwrap());
+        let mut settings: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"] = json!("0");
+        fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+        disable_managed_claude_relay_settings().unwrap();
+        patch_claude_code_settings_with_relay_base(&test_machine(), "http://127.0.0.1:48123")
+            .unwrap();
+        assert!(!repair_registered_managed_claude_relay_settings().unwrap());
+        let settings: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"], "0");
+        assert_eq!(settings["env"]["USER_FLAG"], "keep");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn managed_claude_relay_refresh_authorizes_before_any_config_write() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let prepared = FileClaudeConfigSlotSettingsStore::default()
+            .prepare_managed_account_target(
+                1,
+                "claude_setup_55555555555555555555555555555555".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let dir = prepared.managed_slots[0].config_dir.as_ref().unwrap();
+        let default = root.join(".claude/settings.json");
+        let original = fs::read(&default).unwrap();
+        assert!(matches!(
+            refresh_agent_status_for(
+                &daemon(),
+                &RequestAuthorization::Untrusted,
+                Some(SourceKind::ClaudeCode)
+            ),
+            Err(LocalApiError::LocalClientNotTrusted)
+        ));
+        assert_eq!(fs::read(&default).unwrap(), original);
+        assert!(!Path::new(dir).join("settings.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn managed_claude_relay_refresh_preserves_custom_default_and_checks_prior_approval() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        fs::create_dir(root.join(".claude/projects")).unwrap();
+        let prepared = FileClaudeConfigSlotSettingsStore::default()
+            .prepare_managed_account_target(
+                1,
+                "claude_setup_88888888888888888888888888888888".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let path =
+            Path::new(prepared.managed_slots[0].config_dir.as_ref().unwrap()).join("settings.json");
+        let default = root.join(".claude/settings.json");
+        let canonical: serde_json::Value =
+            serde_json::from_slice(&fs::read(&default).unwrap()).unwrap();
+        for (key, value) in [
+            (
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                "http://127.0.0.1:48123/collector/v1/logs",
+            ),
+            ("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", "grpc"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example"),
+            ("OTEL_LOGS_EXPORTER", "none"),
+        ] {
+            let mut customized = canonical.clone();
+            customized.as_object_mut().unwrap().remove("statusLine");
+            customized["env"][key] = json!(value);
+            let bytes = serde_json::to_vec(&customized).unwrap();
+            fs::write(&default, &bytes).unwrap();
+            reconcile_claude_statusline_for_agent_status_refresh(&daemon()).unwrap();
+            assert_eq!(fs::read(&default).unwrap(), bytes);
+            assert!(!path.exists());
+        }
+        fs::write(&default, r#"{"env":{"USER_FLAG":"keep"}}"#).unwrap();
+        reconcile_claude_statusline_for_agent_status_refresh(&daemon()).unwrap();
+        assert!(!path.exists());
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&fs::read(&default).unwrap()).unwrap();
+        assert_eq!(repaired["env"]["USER_FLAG"], "keep");
+        reconcile_claude_statusline_for_agent_status_refresh(&daemon()).unwrap();
+        assert!(path.exists());
+        let bytes = fs::read(&path).unwrap();
+        reconcile_claude_statusline_for_agent_status_refresh(&daemon()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn managed_claude_relay_disable_covers_provisional_browser_roots_and_missing_default() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let operation_id = "claude_setup_66666666666666666666666666666666";
+        crate::claude_browser_auth::prepare_generic(
+            FileClaudeConfigSlotSettingsStore::default().load().unwrap(),
+            operation_id,
+        )
+        .unwrap();
+        let roots = crate::claude_browser_auth::managed_telemetry_roots();
+        assert_eq!(roots.len(), 1);
+        provision_managed_claude_relay_settings(&roots[0]).unwrap();
+        fs::remove_dir_all(root.join(".claude")).unwrap();
+        assert!(disable_managed_claude_relay_settings().unwrap());
+        let default: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(".claude/settings.json")).unwrap()).unwrap();
+        assert_eq!(default["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"], "0");
+        let provisional: serde_json::Value =
+            serde_json::from_slice(&fs::read(Path::new(&roots[0]).join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(provisional["env"], json!({}));
+        assert!(!provision_managed_claude_relay_settings(&roots[0]).unwrap());
+        crate::claude_browser_auth::release_ceremony(operation_id);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn managed_claude_relay_remove_clears_settings_before_forgetting_ownership() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let prepared = store
+            .prepare_managed_account_target(
+                1,
+                "claude_setup_77777777777777777777777777777777".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let slot = &prepared.managed_slots[0];
+        let dir = slot.config_dir.as_ref().unwrap();
+        provision_managed_claude_relay_settings(dir).unwrap();
+        let path = Path::new(dir).join("settings.json");
+        let original = fs::read(&path).unwrap();
+        assert!(remove_claude_account(999, &slot.slot_id).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        remove_claude_account(1, &slot.slot_id).unwrap();
+        assert!(Path::new(dir).is_dir());
+        let removed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(removed["env"], json!({}));
+        assert!(!provision_managed_claude_relay_settings(dir).unwrap());
+        let removed_bytes = fs::read(&path).unwrap();
+        disable_managed_claude_relay_settings().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), removed_bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn managed_claude_relay_default_user_env_disable_survives_refresh() {
+        let (root, _guards) = managed_claude_relay_fixture();
+        let path = root.join(".claude/settings.json");
+        fs::write(&path, r#"{"env":{"USER_FLAG":"keep"}}"#).unwrap();
+        disable_managed_claude_relay_settings().unwrap();
+        let off: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            off["env"],
+            json!({"USER_FLAG":"keep","CLAUDE_CODE_ENABLE_TELEMETRY":"0"})
+        );
+        fs::write(&path, r#"{"env":{"USER_FLAG":"keep","OTEL_EXPORTER_OTLP_ENDPOINT":"https://collector.example"}}"#).unwrap();
+        disable_managed_claude_relay_settings().unwrap();
+        let off: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            off["env"]["OTEL_EXPORTER_OTLP_ENDPOINT"],
+            "https://collector.example"
+        );
+        assert_eq!(off["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"], "0");
+        let before = fs::read(&path).unwrap();
+        reconcile_claude_statusline_for_agent_status_refresh(&daemon()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
