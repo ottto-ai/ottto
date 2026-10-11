@@ -65,6 +65,56 @@ impl std::fmt::Display for BatchRejected {
 
 impl std::error::Error for BatchRejected {}
 
+/// A successful HTTP exchange with an invalid ACK is a backend-response
+/// failure, never a transport failure. Only fixed validator messages are exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotAckRejected {
+    pub(crate) reason: &'static str,
+}
+
+impl SnapshotAckRejected {
+    fn from_validation(error: &anyhow::Error) -> Self {
+        let message = error.to_string();
+        const SAFE_REASONS: &[&str] = &[
+            "disabled snapshot response contains entity outcomes",
+            "legacy snapshot response accepted count mismatch",
+            "legacy snapshot response cannot durably acknowledge snapshot evidence",
+            "snapshot response uses an unsupported entity ACK contract",
+            "snapshot ACK returned head tokens for a request without the head-CAS contract",
+            "snapshot head-CAS ACK lacks an exclusive accepted head etag",
+            "snapshot head-CAS conflict lacks an exclusive head challenge",
+            "snapshot evidence has no supported body witness version",
+            "snapshot request contains conflicting snapshot evidence body witnesses",
+            "snapshot ACK lacks exact durable context curve body witness proof",
+            "snapshot ACK accepted count overflow",
+            "snapshot ACK contains invalid rejection",
+            "snapshot ACK does not cover the request exactly",
+            "snapshot ACK accepted count mismatch",
+            "snapshot ACK contains a foreign entity",
+            "snapshot ACK occurrence_count must be positive",
+            "snapshot ACK contains a duplicate outcome identity",
+            "snapshot ACK occurrence_count overflow",
+            "snapshot ACK over-counts an entity",
+            "snapshot ACK entity identity is malformed",
+            "snapshot ACK body witness proof is malformed",
+        ];
+        let reason = SAFE_REASONS
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == message)
+            .unwrap_or("snapshot ACK validation failed");
+        Self { reason }
+    }
+}
+
+impl std::fmt::Display for SnapshotAckRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.reason)
+    }
+}
+
+impl std::error::Error for SnapshotAckRejected {}
+
 /// Whether snapshot batch bodies are gzip-encoded.
 ///
 /// Default OFF, deliberately. Response compression is universal, but nothing
@@ -632,6 +682,27 @@ pub struct SnapshotEntityRejection {
     pub occurrence_count: u64,
 }
 
+impl SnapshotEntityRejection {
+    pub(crate) fn safe_reason(&self) -> &'static str {
+        match self.reason.as_str() {
+            "reserved_session_identity_separator" => "reserved_session_identity_separator",
+            "occurred_at_beyond_future_horizon" => "occurred_at_beyond_future_horizon",
+            "hour_bucket_count_above_cap" => "hour_bucket_count_above_cap",
+            "divergent_duplicate_logical_session" => "divergent_duplicate_logical_session",
+            "accepted_log_transaction_cap" => "accepted_log_transaction_cap",
+            "occurred_at_beyond_write_fence_future" => "occurred_at_beyond_write_fence_future",
+            "occurred_at_beyond_journal_retention" => "occurred_at_beyond_journal_retention",
+            "body_exceeds_max_bytes" => "body_exceeds_max_bytes",
+            "occurred_at_requires_timezone" => "occurred_at_requires_timezone",
+            "occurred_at_utc_normalization_out_of_range" => {
+                "occurred_at_utc_normalization_out_of_range"
+            }
+            "usage_accounting_authority_downgrade" => "usage_accounting_authority_downgrade",
+            _ => "other",
+        }
+    }
+}
+
 fn default_occurrence_count() -> u64 {
     1
 }
@@ -644,6 +715,15 @@ impl SnapshotBatchResponse {
     }
 
     pub fn validate_entity_ack_with_head_cas(
+        &self,
+        request: &SnapshotBatchRequest,
+        enforce_head_cas: bool,
+    ) -> Result<()> {
+        self.validate_entity_ack_with_head_cas_inner(request, enforce_head_cas)
+            .map_err(|error| anyhow::Error::new(SnapshotAckRejected::from_validation(&error)))
+    }
+
+    fn validate_entity_ack_with_head_cas_inner(
         &self,
         request: &SnapshotBatchRequest,
         enforce_head_cas: bool,
@@ -1841,7 +1921,7 @@ impl SnapshotApiClient {
                         );
                         Ok(response)
                     }
-                    Err(error) => {
+                    Err(_) => {
                         self.record_batch_http_failure(
                             request,
                             ottto_protocol::UploadReceiptOutcomeV1::Rejected,
@@ -1850,7 +1930,9 @@ impl SnapshotApiClient {
                             None,
                             retry.is_some(),
                         );
-                        Err(anyhow!("parse snapshot batch response failed: {error}"))
+                        Err(anyhow::Error::new(SnapshotAckRejected {
+                            reason: "snapshot batch response could not be decoded",
+                        }))
                     }
                 }
             }

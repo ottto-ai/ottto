@@ -14,9 +14,9 @@ use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
     LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
-    RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusReportKind,
-    SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed, CENSUS_RESIDUE_ERROR_CODE,
-    CENSUS_RESIDUE_STATUS_CONTRACT,
+    RelayTokenAuthorizationRejected, SnapshotAckRejected, SnapshotApiClient,
+    SnapshotStatusReportKind, SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
+    CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT,
 };
 use crate::snapshots::{
     apply_upload_policy, collector_version, context_curve_derivation_revision,
@@ -139,9 +139,9 @@ fn bootstrap_cache_heads(
             |progress| persist(progress),
         )?;
         if !matches!(outcome, ResumableUploadResult::Completed) {
-            return Err(anyhow!(
-                "cache head probe did not settle exact predecessor evidence"
-            ));
+            return Err(anyhow::Error::new(SnapshotAckRejected {
+                reason: "cache head probe did not settle exact predecessor evidence",
+            }));
         }
     }
     Ok(())
@@ -351,6 +351,12 @@ struct PendingCacheHeadFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PermanentSnapshotRejection {
+    body_witness: String,
+    reason: crate::upload_receipts::RejectedUsageReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotUploadProgress {
     schema_version: u16,
     #[serde(default)]
@@ -377,6 +383,10 @@ struct SnapshotUploadProgress {
     pending_cache_heads: BTreeMap<String, PendingCacheHeadFile>,
     #[serde(default)]
     quarantined_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
+    /// Exact server-permanent refusals. Same destination, entity and body only;
+    /// parser/replay epochs and premature retry timers cannot erase this fact.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    permanent_rejections: BTreeMap<String, PermanentSnapshotRejection>,
     #[serde(skip)]
     active_quarantine_witness: Option<SnapshotQuarantineWitness>,
     /// Runtime leases for quarantine entries selected this cycle. The durable
@@ -402,6 +412,7 @@ impl SnapshotUploadProgress {
             accepted_cache_heads: BTreeMap::new(),
             pending_cache_heads: BTreeMap::new(),
             quarantined_fingerprints: BTreeMap::new(),
+            permanent_rejections: BTreeMap::new(),
             active_quarantine_witness: Some(active_quarantine_witness),
             active_quarantine_retries: BTreeSet::new(),
         }
@@ -478,6 +489,13 @@ impl SnapshotUploadProgress {
                         .quarantined_fingerprints
                         .keys()
                         .all(|value| is_snapshot_fingerprint(value))
+                    && progress
+                        .permanent_rejections
+                        .iter()
+                        .all(|(fingerprint, record)| {
+                            is_snapshot_fingerprint(fingerprint)
+                                && is_snapshot_fingerprint(&record.body_witness)
+                        })
                     && progress.quarantined_fingerprints.values().all(|record| {
                         snapshot_quarantine_deadline_is_bounded(record)
                             && record
@@ -532,6 +550,21 @@ impl SnapshotUploadProgress {
                     .or_insert_with(|| record.clone());
             }
         }
+        // The server-permanent exact-body fact dominates an older index timer.
+        // Keep the index-facing disposition truthful as well as suppressing I/O.
+        for (fingerprint, record) in &mut self.quarantined_fingerprints {
+            if self
+                .permanent_rejections
+                .get(fingerprint)
+                .is_some_and(|permanent| {
+                    record.upload_body_witness.as_deref() == Some(permanent.body_witness.as_str())
+                })
+            {
+                record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+                record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+                record.retry_after_unix_seconds = 0;
+            }
+        }
         let now = current_unix_seconds();
         let active = self
             .active_quarantine_witness
@@ -540,8 +573,15 @@ impl SnapshotUploadProgress {
         let retry = self
             .quarantined_fingerprints
             .iter()
-            .filter(|(_, record)| {
-                record.disposition == SnapshotQuarantineDisposition::RetryPending
+            .filter(|(fingerprint, record)| {
+                !self
+                    .permanent_rejections
+                    .get(*fingerprint)
+                    .is_some_and(|permanent| {
+                        record.upload_body_witness.as_deref()
+                            == Some(permanent.body_witness.as_str())
+                    })
+                    && record.disposition == SnapshotQuarantineDisposition::RetryPending
                     && (&record.witness != active || record.retry_after_unix_seconds <= now)
             })
             .map(|(fingerprint, record)| {
@@ -606,6 +646,13 @@ impl SnapshotUploadProgress {
     }
 
     fn contains_body(&self, fingerprint: &str, body_witness: &str) -> bool {
+        if self
+            .permanent_rejections
+            .get(fingerprint)
+            .is_some_and(|record| record.body_witness == body_witness)
+        {
+            return true;
+        }
         if self.active_quarantine_retries.contains(fingerprint) {
             return false;
         }
@@ -626,6 +673,7 @@ impl SnapshotUploadProgress {
     }
 
     fn record_body(&mut self, fingerprint: &str, body_witness: &str) {
+        self.permanent_rejections.remove(fingerprint);
         self.accepted_fingerprints.insert(fingerprint.to_string());
         self.accepted_body_witnesses
             .insert(fingerprint.to_string(), body_witness.to_string());
@@ -708,6 +756,32 @@ impl SnapshotUploadProgress {
         self.accepted_fingerprints.remove(fingerprint);
         self.accepted_body_witnesses.remove(fingerprint);
         self.active_quarantine_retries.remove(fingerprint);
+    }
+
+    fn quarantine_permanent_body(&mut self, fingerprint: &str, body_witness: &str, reason: &str) {
+        self.quarantine_body(fingerprint, body_witness);
+        let record = self.quarantined_fingerprints.get_mut(fingerprint).unwrap();
+        record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        record.retry_after_unix_seconds = 0;
+        self.permanent_rejections.insert(
+            fingerprint.to_string(),
+            PermanentSnapshotRejection {
+                body_witness: body_witness.to_string(),
+                reason: crate::upload_receipts::RejectedUsageReason::from_wire(reason),
+            },
+        );
+    }
+
+    fn quarantine_retryable_body(&mut self, fingerprint: &str, body_witness: &str) {
+        self.quarantine_body(fingerprint, body_witness);
+        let record = self
+            .quarantined_fingerprints
+            .get_mut(fingerprint)
+            .expect("quarantine just recorded");
+        record.failed_reconstruction_count = 1;
+        record.disposition = SnapshotQuarantineDisposition::RetryPending;
+        record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
     }
 
     fn retain_current_quarantines_with_diagnostics(
@@ -1035,7 +1109,8 @@ impl SnapshotUploadProgress {
     }
 
     fn finish_cycle(&mut self, path: &Path) -> Result<()> {
-        if self.accepted_cache_states.is_empty()
+        if self.permanent_rejections.is_empty()
+            && self.accepted_cache_states.is_empty()
             && self.accepted_cache_heads.is_empty()
             && self.pending_cache_heads.is_empty()
         {
@@ -1915,6 +1990,21 @@ fn snapshot_manifest_window_days(manifest: &SnapshotSourceManifest) -> Result<u6
     let window_days = u64::try_from(window_seconds / day_seconds)
         .context("convert cached snapshot manifest window days")?;
     validated_receipt_window_days(window_days)
+}
+
+fn deferred_entity_state(permanent: bool) -> CollectorState<'static> {
+    CollectorState::Error {
+        code: if permanent {
+            "backend_validation_error"
+        } else {
+            "server_error"
+        },
+        message: if permanent {
+            "backend permanently rejected exact snapshot bodies; accepted siblings checkpointed"
+        } else {
+            "backend has unsettled snapshot entities; accepted siblings checkpointed"
+        },
+    }
 }
 
 #[derive(Debug)]
@@ -3910,7 +4000,9 @@ fn finish_sync_source(
     .and_then(|result| {
         if matches!(
             result,
-            ResumableUploadResult::Completed | ResumableUploadResult::Conflicted { .. }
+            ResumableUploadResult::Completed
+                | ResumableUploadResult::Deferred { .. }
+                | ResumableUploadResult::Rejected { .. }
         ) {
             // A setup/account switch can replace the relay binding while a
             // long historical scan is uploading. Never commit destination A's
@@ -3927,7 +4019,8 @@ fn finish_sync_source(
     withdraw_source_manifest(&upload_destination_namespace, source);
 
     let mut upload_fully_settled = true;
-    let mut deferred_entity_conflict_count = None;
+    let mut deferred_entity_count = None;
+    let mut resolved_permanent_rejections = false;
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
@@ -3954,7 +4047,18 @@ fn finish_sync_source(
                 );
             }
         }
-        Ok(ResumableUploadResult::Conflicted { count }) => {
+        Ok(
+            outcome @ (ResumableUploadResult::Deferred { .. }
+            | ResumableUploadResult::Rejected { .. }),
+        ) => {
+            let count = match outcome {
+                ResumableUploadResult::Rejected { count } => {
+                    resolved_permanent_rejections = true;
+                    count
+                }
+                ResumableUploadResult::Deferred { count } => count,
+                _ => unreachable!(),
+            };
             clear_shed_streak(source);
             if deferred_local_authority_count > 0 || deferred_local_authority_entity_count > 0 {
                 let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
@@ -3969,17 +4073,17 @@ fn finish_sync_source(
                     &server_quarantine,
                 );
             }
-            // Accepted siblings are safe to commit, but a retryable conflict
+            // Accepted siblings are safe to commit, but a held entity
             // is not proof that a broad historical replay is complete. Force
             // one clean follow-up sweep and leave the destination's backfill
             // marker pending until every replacement entity settles.
             index.mark_bounded_sweep_unsettled();
             backfill_succeeded = false;
             upload_fully_settled = false;
-            deferred_entity_conflict_count = Some(count);
+            deferred_entity_count = Some(count);
             eprintln!(
                 "local snapshot upload checkpointed accepted siblings but left {count} \
-                 conflicting entity(ies) pending for {}; a clean follow-up scan is required",
+                 unsettled entity(ies) pending for {}; a clean follow-up scan is required",
                 source.api_slug()
             );
         }
@@ -4117,6 +4221,13 @@ fn finish_sync_source(
                     ),
                 }
             }
+            if snapshot_upload_error_class(&error).is_some() {
+                eprintln!(
+                    "ottto-service: local snapshot upload did not settle for {} — {}",
+                    source.api_slug(),
+                    upload_failure_diagnostic(&error)
+                );
+            }
             // Distinguish local serializer drift, authorization failures, and
             // backend payload rejection. The resumable driver has already
             // checkpointed every accepted sibling before this terminal error.
@@ -4125,7 +4236,7 @@ fn finish_sync_source(
             {
                 (
                     CollectorState::Error {
-                        code: "local_state_error",
+                        code: "scan_error",
                         message: "local snapshot checkpoint or destination state failed",
                     },
                     "local snapshot state failed",
@@ -4135,7 +4246,7 @@ fn finish_sync_source(
             {
                 (
                     CollectorState::Error {
-                        code: "backend_response_error",
+                        code: "server_error",
                         message: "backend snapshot response did not match the request",
                     },
                     "backend snapshot response was invalid",
@@ -4262,6 +4373,32 @@ fn finish_sync_source(
     );
     index.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
     index.record_accepted_snapshot_fingerprints(&upload_progress.accepted_fingerprints);
+    // A quiet/delta-only scan still discloses current permanent refusals even
+    // though no body needed another upload. The committed census owns scope.
+    let current_entities = index.current_snapshot_fingerprints();
+    let retained_permanent = upload_progress
+        .permanent_rejections
+        .keys()
+        .filter(|fingerprint| current_entities.contains(*fingerprint))
+        .count();
+    let retained_pending = index
+        .quarantined_snapshot_fingerprints
+        .values()
+        .filter(|record| record.disposition == SnapshotQuarantineDisposition::RetryPending)
+        .count();
+    if deferred_entity_count.is_none() && retained_pending > 0 {
+        deferred_entity_count = Some(retained_pending);
+        upload_fully_settled = false;
+        backfill_succeeded = false;
+        index.mark_bounded_sweep_unsettled();
+    }
+    if deferred_entity_count.is_none() && retained_permanent > 0 {
+        deferred_entity_count = Some(retained_permanent);
+        resolved_permanent_rejections = true;
+        upload_fully_settled = false;
+        backfill_succeeded = false;
+        index.mark_bounded_sweep_unsettled();
+    }
     index.finish_legacy_settlement_reconciliation();
     settle_context_curve_replay_state(
         &mut index,
@@ -4287,7 +4424,7 @@ fn finish_sync_source(
     // scan. The sweep marker is stamped only for fully settled scans.
     with_source_cadence(source, |cadence| {
         let now = Instant::now();
-        if deferred_entity_conflict_count.is_some() {
+        if deferred_entity_count.is_some() {
             cadence.record_scan_failure(now);
         } else {
             cadence.record_scan_success(now, accepted);
@@ -4338,12 +4475,15 @@ fn finish_sync_source(
         scan_result.census_complete,
         &projected_pending_head_file_witnesses,
     );
+    upload_progress
+        .permanent_rejections
+        .retain(|fingerprint, _| current_entities.contains(fingerprint));
     upload_progress.finish_cycle(&upload_progress_path)?;
 
-    if let Some(count) = deferred_entity_conflict_count {
+    if let Some(count) = deferred_entity_count {
         // The uploader drained its frozen, scan-capped queue before returning
-        // `Conflicted`, and the index above now owns both accepted siblings and
-        // retryable conflict quarantine. Surface the conflict only after those
+        // `Deferred`, and the index above now owns both accepted siblings and
+        // entity quarantine. Surface the conflict only after those
         // facts are durable: returning earlier would recreate the per-source
         // starvation wedge, while reporting success would hide the backend's
         // capacity condition from source-level isolation and cadence handling.
@@ -4364,13 +4504,16 @@ fn finish_sync_source(
                 scan_started_at: terminal_scan_started_at,
                 counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
                     .with_snapshot_terminal_counts(&index),
-                state: CollectorState::Error {
-                    code: "server_error",
-                    message: "backend deferred conflicting snapshot entities",
-                },
+                state: deferred_entity_state(resolved_permanent_rejections),
             },
         );
-        return Err(snapshot_entity_conflict_deferred(count));
+        // Fully accounted permanent refusals finish transport successfully.
+        // Their terminal health remains incomplete and none are marked accepted.
+        return if resolved_permanent_rejections {
+            Ok(())
+        } else {
+            Err(snapshot_entity_deferred(count))
+        };
     }
 
     report_status_with_fresh_relay_token(
@@ -4705,9 +4848,14 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
 #[derive(Debug, PartialEq, Eq)]
 enum ResumableUploadResult {
     Completed,
+    /// Valid complete ACK: transport finished, but exact permanent refusals
+    /// remain terminal/incomplete usage, never accepted or automatically retried.
+    Rejected {
+        count: usize,
+    },
     /// Every accepted sibling is durably checkpointed, while one or more
-    /// retryable entity conflicts remain quarantined for a later clean sweep.
-    Conflicted {
+    /// rejected or retryable entities remain held for a later clean sweep.
+    Deferred {
         count: usize,
     },
     Disabled(Option<String>),
@@ -4805,24 +4953,24 @@ fn require_normal_write_ack_for_legacy_reconciliation(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SnapshotEntityConflictDeferred {
+struct SnapshotEntityDeferred {
     count: usize,
 }
 
-impl std::fmt::Display for SnapshotEntityConflictDeferred {
+impl std::fmt::Display for SnapshotEntityDeferred {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "snapshot upload deferred {} conflicting entity(ies)",
+            "snapshot upload deferred {} unsettled entity(ies)",
             self.count
         )
     }
 }
 
-impl std::error::Error for SnapshotEntityConflictDeferred {}
+impl std::error::Error for SnapshotEntityDeferred {}
 
-fn snapshot_entity_conflict_deferred(count: usize) -> anyhow::Error {
-    anyhow::Error::new(SnapshotEntityConflictDeferred { count })
+fn snapshot_entity_deferred(count: usize) -> anyhow::Error {
+    anyhow::Error::new(SnapshotEntityDeferred { count })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4834,9 +4982,10 @@ enum SnapshotUploadErrorClass {
 fn snapshot_upload_error_class(error: &anyhow::Error) -> Option<SnapshotUploadErrorClass> {
     if error.downcast_ref::<SnapshotLocalStateRejected>().is_some() {
         Some(SnapshotUploadErrorClass::LocalState)
-    } else if error
-        .downcast_ref::<SnapshotBatchResponseRejected>()
-        .is_some()
+    } else if error.downcast_ref::<SnapshotAckRejected>().is_some()
+        || error
+            .downcast_ref::<SnapshotBatchResponseRejected>()
+            .is_some()
     {
         Some(SnapshotUploadErrorClass::BackendResponse)
     } else {
@@ -5039,8 +5188,8 @@ where
         let rejected = response
             .rejected_entities
             .iter()
-            .map(|entity| entity.snapshot_fingerprint.as_str())
-            .collect::<BTreeSet<_>>();
+            .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
+            .collect::<BTreeMap<_, _>>();
         let conflicted = response
             .conflict_entities
             .iter()
@@ -5049,15 +5198,21 @@ where
         for index in indices {
             let item = &items[*index];
             let item_fingerprint = fingerprint(item);
-            if rejected.contains(item_fingerprint) || conflicted.contains(item_fingerprint) {
-                progress.quarantine_body(item_fingerprint, &body_witness(item));
+            if let Some(rejection) = rejected.get(item_fingerprint) {
+                progress.quarantine_permanent_body(
+                    item_fingerprint,
+                    &body_witness(item),
+                    rejection.safe_reason(),
+                );
+            } else if conflicted.contains(item_fingerprint) {
+                progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
             }
         }
         // A conflict is not a settlement, but it IS retryable: the
         // backend is asking for this entity again later, not never.
         // It therefore shares the quarantine ledger's bounded
-        // backoff with permanent rejections, so one conflicting
-        // entity defers only itself.
+        // backoff with permanent rejections, but never consumes the permanent
+        // reconstruction-failure budget. A transient conflict remains retryable.
         //
         // Returning the whole page as an error here (the previous
         // behaviour) discarded the entities the backend had ALREADY
@@ -5085,6 +5240,12 @@ where
     if entity_ack {
         for entity in &response.rejected_entities {
             record_poison_loss_once(poison_scope, &entity.snapshot_fingerprint);
+            eprintln!(
+                "local snapshot entity rejected for {poison_scope}: reason={} permanent={}; \
+                 accepted siblings checkpointed, rejected body retained in bounded quarantine",
+                entity.safe_reason(),
+                entity.permanent,
+            );
         }
     }
     *accepted = accepted.saturating_add(response.accepted);
@@ -5150,7 +5311,39 @@ where
         .accepted_fingerprints
         .retain(|value| progress.accepted_body_witnesses.contains_key(value));
     retain_counted_poison_fingerprints(poison_scope, &current_fingerprints);
-    if progress.accepted_fingerprints.len() != progress_len_before_prune {
+    // Replay and cycle retirement clear disposable quarantine records. Restore
+    // the index-facing refusal only when this frozen input proves the same body.
+    // Otherwise suppression could leave a rejected entity in the accepted census.
+    let permanent_to_restore = current_body_witnesses
+        .iter()
+        .filter(|(fingerprint, body)| {
+            progress
+                .permanent_rejections
+                .get(*fingerprint)
+                .is_some_and(|record| record.body_witness == **body)
+                && !progress
+                    .quarantined_fingerprints
+                    .get(*fingerprint)
+                    .is_some_and(|record| {
+                        record.upload_body_witness.as_deref() == Some(body.as_str())
+                            && record.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
+                    })
+        })
+        .map(|(fingerprint, body)| (fingerprint.clone(), body.clone()))
+        .collect::<Vec<_>>();
+    for (fingerprint, body) in &permanent_to_restore {
+        progress.quarantine_body(fingerprint, body);
+        let record = progress
+            .quarantined_fingerprints
+            .get_mut(fingerprint)
+            .unwrap();
+        record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        record.retry_after_unix_seconds = 0;
+    }
+    if progress.accepted_fingerprints.len() != progress_len_before_prune
+        || !permanent_to_restore.is_empty()
+    {
         persist(progress).map_err(|_| {
             anyhow::Error::new(SnapshotLocalStateRejected {
                 operation: "prune upload checkpoint",
@@ -5362,11 +5555,38 @@ where
              retry while every other entity in the page settled."
         );
     }
+    // Only this frozen input's exact bodies determine its upload outcome.
+    // An unrelated retained refusal must not block a healthy cache-head probe.
+    let retry_pending = current_body_witnesses
+        .iter()
+        .filter(|(fingerprint, body)| {
+            progress
+                .quarantined_fingerprints
+                .get(*fingerprint)
+                .is_some_and(|record| {
+                    record.disposition == SnapshotQuarantineDisposition::RetryPending
+                        && record.upload_body_witness.as_deref() == Some(body.as_str())
+                })
+        })
+        .count();
+    let permanent_rejected = current_body_witnesses
+        .iter()
+        .filter(|(fingerprint, body)| {
+            progress
+                .permanent_rejections
+                .get(*fingerprint)
+                .is_some_and(|record| record.body_witness == **body)
+        })
+        .count();
     if let Some(error) = deferred_validation_error {
         Err(error)
-    } else if conflicted_entities > 0 {
-        Ok(ResumableUploadResult::Conflicted {
-            count: conflicted_entities,
+    } else if retry_pending > 0 {
+        Ok(ResumableUploadResult::Deferred {
+            count: retry_pending,
+        })
+    } else if permanent_rejected > 0 {
+        Ok(ResumableUploadResult::Rejected {
+            count: permanent_rejected,
         })
     } else {
         Ok(ResumableUploadResult::Completed)
@@ -6403,6 +6623,9 @@ fn upload_failure_diagnostic(error: &anyhow::Error) -> String {
     if let Some(rejected) = error.downcast_ref::<SnapshotLocalStateRejected>() {
         return format!("kind=local_state, operation={}", rejected.operation);
     }
+    if let Some(rejected) = error.downcast_ref::<SnapshotAckRejected>() {
+        return format!("kind=backend_response, detail={}", rejected.reason);
+    }
     // This module's own upload-loop reasons. Matching on the literals keeps the
     // emitted text a fixed vocabulary rather than arbitrary chain content.
     let text = error
@@ -6427,11 +6650,8 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
     if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
         return diagnostics.safe_message();
     }
-    if error
-        .downcast_ref::<SnapshotEntityConflictDeferred>()
-        .is_some()
-    {
-        return "local snapshot upload deferred by entity conflict".to_string();
+    if error.downcast_ref::<SnapshotEntityDeferred>().is_some() {
+        return "local snapshot upload deferred by unsettled entities".to_string();
     }
     match snapshot_upload_error_class(error) {
         Some(SnapshotUploadErrorClass::LocalState) => {
@@ -7030,7 +7250,7 @@ mod tests {
             |progress| progress.save(&progress_path),
         )
         .unwrap();
-        assert_eq!(outcome, ResumableUploadResult::Conflicted { count: 1 });
+        assert_eq!(outcome, ResumableUploadResult::Deferred { count: 1 });
         index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
         index.save(&index_path).unwrap();
         progress.retire_pending_cache_heads(
@@ -9459,7 +9679,7 @@ mod tests {
             |state| state.save(&progress_path),
         )
         .expect("conflict remains retryable");
-        assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
+        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
         assert_eq!(accepted, 0);
 
         index.mark_bounded_sweep_unsettled();
@@ -9840,7 +10060,7 @@ mod tests {
         )
         .expect("permanent entity rejection is durably settled");
 
-        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!(result, ResumableUploadResult::Rejected { count: 1 });
         assert_eq!(accepted, 1);
         assert!(progress
             .accepted_fingerprints
@@ -9907,7 +10127,7 @@ mod tests {
         )
         .expect("a per-entity conflict is retryable, not a whole-page failure");
 
-        assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
+        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
         assert_eq!(uploaded_batches, vec![first_batch.clone(), later_batch]);
         assert_eq!(accepted, SNAPSHOT_BATCH_LIMIT as u64);
         assert_eq!(persisted.len(), 2);
@@ -9928,16 +10148,16 @@ mod tests {
             .accepted_fingerprints
             .contains(&items[SNAPSHOT_BATCH_LIMIT]));
 
-        let deferred = snapshot_entity_conflict_deferred(1);
+        let deferred = snapshot_entity_deferred(1);
         assert_eq!(
             deferred
-                .downcast_ref::<SnapshotEntityConflictDeferred>()
+                .downcast_ref::<SnapshotEntityDeferred>()
                 .map(|error| error.count),
             Some(1)
         );
         assert_eq!(
             safe_error(&deferred),
-            "local snapshot upload deferred by entity conflict"
+            "local snapshot upload deferred by unsettled entities"
         );
 
         // Model the next authoritative scan replacing the oversized canonical
@@ -10005,7 +10225,7 @@ mod tests {
         )
         .expect("an all-conflict page remains retryable");
 
-        assert_eq!(result, ResumableUploadResult::Conflicted { count: 3 });
+        assert_eq!(result, ResumableUploadResult::Deferred { count: 3 });
         assert_eq!(accepted, 0);
         assert!(progress.accepted_fingerprints.is_empty());
         assert_eq!(
@@ -10018,122 +10238,39 @@ mod tests {
         );
         assert_eq!(persisted.last(), Some(&progress));
 
-        let deferred = snapshot_entity_conflict_deferred(3);
+        let deferred = snapshot_entity_deferred(3);
         assert_eq!(
             deferred
-                .downcast_ref::<SnapshotEntityConflictDeferred>()
+                .downcast_ref::<SnapshotEntityDeferred>()
                 .map(|error| error.count),
             Some(3)
         );
     }
 
     #[test]
-    fn unchanged_conflict_is_unproven_terminal_on_fourth_failure_and_body_change_recovers() {
+    fn retryable_conflict_never_consumes_permanent_reconstruction_attempts() {
         let fingerprint = "f".repeat(64);
-        let item = BodyWitnessTestItem {
-            snapshot_fingerprint: fingerprint.clone(),
-            body_revision: "a".to_string(),
-        };
         let mut progress = test_upload_progress();
-        let mut accepted = 0;
-        let mut upload_count = 0;
-
-        for expected_failure_count in 1..=MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
-            if expected_failure_count > 1 {
-                progress
-                    .quarantined_fingerprints
-                    .get_mut(&fingerprint)
-                    .expect("retry remains accounted")
-                    .retry_after_unix_seconds = 0;
-                assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
-            }
-            let result = upload_resumable_batches_with_body_witness(
-                std::slice::from_ref(&item),
-                &unique_poison_scope(),
-                &mut progress,
-                &mut accepted,
-                |item| item.snapshot_fingerprint.as_str(),
-                |_| "a".repeat(64),
-                |batch| {
-                    upload_count += 1;
-                    Ok(entity_ack_batch(
-                        &[],
-                        &[],
-                        &[batch[0].snapshot_fingerprint.clone()],
-                    ))
-                },
-                |_| Ok(()),
-            )
-            .expect("conflict remains an explicit outcome");
-            assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
+        for _ in 0..9 {
+            progress.quarantine_retryable_body(&fingerprint, &"a".repeat(64));
             let record = &progress.quarantined_fingerprints[&fingerprint];
-            assert_eq!(record.failed_reconstruction_count, expected_failure_count);
+            assert_eq!(record.failed_reconstruction_count, 1);
             assert_eq!(
                 record.disposition,
-                if expected_failure_count == MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
-                    SnapshotQuarantineDisposition::UnprovenTerminal
-                } else {
-                    SnapshotQuarantineDisposition::RetryPending
-                }
+                SnapshotQuarantineDisposition::RetryPending
             );
+            assert!(snapshot_quarantine_deadline_is_bounded(record));
+            assert!(!progress.prepare_quarantine_retries(&BTreeMap::new()));
+            progress
+                .quarantined_fingerprints
+                .get_mut(&fingerprint)
+                .unwrap()
+                .retry_after_unix_seconds = 0;
+            assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
         }
-        assert_eq!(upload_count, 4);
-        assert!(!progress.prepare_quarantine_retries(&BTreeMap::new()));
-        let mut terminal_index = ScanIndex::default();
-        terminal_index.file_snapshot_fingerprints.insert(
-            "terminal.jsonl".to_string(),
-            BTreeSet::from([fingerprint.clone()]),
-        );
-        terminal_index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
-        assert_eq!(terminal_index.snapshot_unproven_terminal_count(), 1);
-        let disclosed = SyncCounts::default().with_snapshot_terminal_counts(&terminal_index);
-        assert_eq!(disclosed.snapshot_unproven_terminal_count, 1);
-        assert_eq!(disclosed.ownership_incomplete_file_count, 1);
-        // Terminal by disposition, so the settled share grows by the same
-        // number and the ownership-incomplete class stays matched.
-        assert_eq!(disclosed.terminal_ownership_incomplete_file_count, 1);
-
-        let fifth = upload_resumable_batches_with_body_witness(
-            std::slice::from_ref(&item),
-            &unique_poison_scope(),
-            &mut progress,
-            &mut accepted,
-            |item| item.snapshot_fingerprint.as_str(),
-            |_| "a".repeat(64),
-            |_| panic!("unchanged terminal body must not upload a fifth time"),
-            |_| Ok(()),
-        )
-        .expect("terminal suppression is a completed local pass");
-        assert_eq!(fifth, ResumableUploadResult::Completed);
-        assert_eq!(
-            progress.quarantined_fingerprints[&fingerprint].failed_reconstruction_count,
-            MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
-        );
-
-        let corrected = BodyWitnessTestItem {
-            snapshot_fingerprint: fingerprint.clone(),
-            body_revision: "b".to_string(),
-        };
-        let recovered = upload_resumable_batches_with_body_witness(
-            std::slice::from_ref(&corrected),
-            &unique_poison_scope(),
-            &mut progress,
-            &mut accepted,
-            |item| item.snapshot_fingerprint.as_str(),
-            |_| "b".repeat(64),
-            |batch| {
-                Ok(entity_ack_batch(
-                    &[batch[0].snapshot_fingerprint.clone()],
-                    &[],
-                    &[],
-                ))
-            },
-            |_| Ok(()),
-        )
-        .expect("changed body reopens and settles terminal identity");
-        assert_eq!(recovered, ResumableUploadResult::Completed);
-        assert!(!progress.quarantined_fingerprints.contains_key(&fingerprint));
-        assert!(progress.accepted_fingerprints.contains(&fingerprint));
+        assert!(!progress.contains_body(&fingerprint, &"b".repeat(64)));
+        progress.record_body(&fingerprint, &"b".repeat(64));
+        assert!(progress.quarantined_fingerprints.is_empty());
     }
 
     #[test]
@@ -10521,7 +10658,7 @@ mod tests {
         )
         .expect("deterministic local poison is settled by quarantine");
 
-        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
         assert_eq!(accepted, 1);
         assert_eq!(network_uploads, vec![healthy_fingerprint.clone()]);
         assert!(progress
@@ -11969,7 +12106,7 @@ mod tests {
             },
             |_| Ok(()),
         )
-        .expect("an empty bounded scan is a vacuous completed upload");
+        .expect("an empty bounded scan leaves its prior quarantine owed");
         assert_eq!(result, ResumableUploadResult::Completed);
         assert_eq!((upload_calls, accepted), (0, 0));
 
@@ -12079,7 +12216,7 @@ mod tests {
         )
         .expect("a normal entity conflict is a closed-machine result");
 
-        assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
+        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
         assert_eq!(observed_classes, vec![false, true]);
         assert_eq!(accepted, 1);
         assert!(progress.accepted_fingerprints.contains(&ordinary));
@@ -12091,7 +12228,7 @@ mod tests {
             quarantined.disposition,
             SnapshotQuarantineDisposition::RetryPending
         );
-        assert_eq!(quarantined.failed_reconstruction_count, 2);
+        assert_eq!(quarantined.failed_reconstruction_count, 1);
         assert!(quarantined.retry_after_unix_seconds > current_unix_seconds());
     }
 
@@ -16139,7 +16276,7 @@ mod tests {
                 |progress| progress.save(&progress_path),
             )
             .unwrap();
-            assert!(matches!(outcome, ResumableUploadResult::Completed));
+            assert_eq!(outcome, ResumableUploadResult::Rejected { count: 1 });
             server.join().unwrap();
             assert_eq!(accepted_count, 1);
             assert_eq!(progress.accepted_fingerprints.len(), 1);
@@ -17320,6 +17457,12 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, active_quarantine_witness, active_quarantine_retries);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
+
+#[cfg(test)]
+#[path = "snapshot_sync/h357_ack_tests.rs"]
+mod h357_ack_tests;
+
+crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason);
