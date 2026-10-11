@@ -53560,7 +53560,7 @@ mod census_unreadable_tests {
         let path = root.join("one.jsonl");
         fs::write(&path, b"{}\n").unwrap();
         // Metadata fails below an inaccessible owned directory.
-        fs::set_permissions(&root, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
         let mut census = ScanCensus::default();
         assert!(candidate_from_traversal_path(
             SnapshotSource::Codex,
@@ -53600,7 +53600,7 @@ mod census_unreadable_tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
         assert!(open_and_identify_scan_candidate(
             SnapshotSource::Codex,
             candidate,
@@ -53623,7 +53623,7 @@ mod census_unreadable_tests {
         let mut index = ScanIndex::default();
         ensure_bounded_traversal(
             SnapshotSource::Codex,
-            &[root.clone()],
+            std::slice::from_ref(&root),
             &mut index,
             "2026-10-12T00:00:00Z",
             30,
