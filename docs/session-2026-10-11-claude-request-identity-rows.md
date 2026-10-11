@@ -76,27 +76,36 @@ same code through `capture_enabled()` (`cfg(test)`).
   - No email or raw text is kept: a local digest only detects an email
     change, with the positions of the first email and the first switch.
 - **`transcript_email`** (terminal/SDK; compiled out unless both
-  `EMISSION_ENABLED` and `TRANSCRIPT_EMAIL_ENABLED`, each `false`) needs:
-  - a trusted marker org, and one unchanged `session_context` email before
-    the request by line order;
-  - a file under a registered slot folder (never the default folder);
-  - one segment of the local status-coverage ledger for that folder covering
-    [session start − 300 s, request], with the covered org equal to the
-    marker org. The login is that segment's login. Otherwise the request
-    stays `transcript_org`.
+  `EMISSION_ENABLED` and `TRANSCRIPT_EMAIL_ENABLED`, each `false`) **never
+  binds a login.** No qualified join from a recorded email to a login exists,
+  and sampled status coverage cannot prove that one login ran continuously
+  (equal samples 300 s apart do not exclude an unseen A→B→A switch). So it
+  only decides whether a request keeps its earlier meaning:
+  - Not applicable (the org-only path stands): compiled out, Desktop, no
+    unchanged email before the request, or a file outside a registered slot
+    folder (including the shared default folder).
+  - Otherwise the request is refused, never weakened to `transcript_org`.
+    The reasons are typed locally and counted on the wire:
+    `CoverageUnavailable` (feed failed or not run since restart, unknown
+    session start, gap, unavailable sample, logout, eviction, window past
+    the last sample), `ContradictoryOrg` (a nearby sample names another org
+    or another login), and `CoverageUnqualified` (samples span the window
+    but prove nothing). Usage and money are conserved, and the positive
+    refusal blocks Desktop-pair fill.
+  - Qualifying it needs an approved continuity witness and an approved
+    email-to-login join; neither exists, so the flag stays off.
 - **Status-coverage feed** (`claude_status_coverage.rs`, same gate):
   - The Claude status pass reports each registered slot's already-qualified
     login/org hashes after `claude_slot_post_resolution_gate`, or
-    unavailable/signed-out on every failure branch. It adds no read, provider
-    call or cadence change, and returns nothing to the status pass.
-  - A process-local ledger keeps segments: consecutive same-identity
-    observations at most 600 s (two cadences) apart. Caps: 10 slots, 32
-    segments per slot, 30 days, 64 KiB (worst case 62,560 B).
-  - A gap, an unavailable observation, a conflict, logout, clock regression,
-    slot replacement or removal, eviction, restart or a poisoned lock leaves
-    the interval unqualified. Nothing is filled in, persisted or uploaded.
-  - The ledger's (login, org) pairings also prove marker-org membership for
-    login-only telemetry.
+    unavailable/signed-out on every failure branch, plus the registered
+    folders at the end of the pass. It adds no read, provider call or cadence
+    change, and returns nothing to the status pass.
+  - A process-local ledger keeps sampled runs (freshness only): consecutive
+    same-identity samples at most 600 s apart. Caps: 10 slots, 32 runs per
+    slot, 30 days, 64 KiB (worst case 62,960 B). Nothing is persisted or
+    uploaded; a restart forgets both history and registration.
+  - The ledger's (login, org) pairings prove marker-org membership for
+    login-only telemetry (§2a.12(b)).
   - A status-pass fixture shows byte-identical status output (SOURCE account
     and plans, quota, health, persisted slot state) with the feed working,
     failed, or holding a conflicting history.

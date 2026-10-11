@@ -33,39 +33,64 @@ fn observed(offsets: &[u64]) -> Ledger {
     ledger
 }
 
-fn covered(ledger: &Ledger, from: u64, to: u64) -> Option<(String, String)> {
-    ledger
-        .covering(&home(), T0 + from, T0 + to)
-        .map(|(login, org)| (login.to_string(), org.to_string()))
+fn verdict(ledger: &Ledger, from: u64, to: u64) -> Verdict {
+    ledger.verdict(&home(), T0 + from, T0 + to, &org(0))
 }
 
 #[test]
-fn coverage_is_one_segment_of_consecutive_observations_at_most_two_cadences_apart() {
-    let ledger = observed(&[0, 300, 600, 1_200]);
-    let expected = Some((login(0), org(0)));
-    assert_eq!(covered(&ledger, 0, 1_200), expected);
-    assert_eq!(covered(&ledger, 100, 1_100), expected);
-    // Nothing before the first or after the last observation is covered: an
-    // unobserved interval is never filled in or extended.
-    assert_eq!(covered(&ledger, 0, 1_201), None);
-    assert_eq!(covered(&ledger, 0, 0), expected);
-    assert!(Ledger::default().covering(&home(), T0, T0).is_none());
-    assert!(ledger.covering(&home(), T0 + 10, T0 + 5).is_none());
-    assert!(ledger.covering(&[0; 32], T0, T0).is_none());
-
-    // A gap of more than two cadences splits coverage; exactly two does not.
-    let split = observed(&[0, 300, 901, 1_200]);
-    assert_eq!(covered(&split, 0, 300), expected);
-    assert_eq!(covered(&split, 901, 1_200), expected);
-    assert_eq!(covered(&split, 0, 1_200), None);
-    assert_eq!(covered(&split, 299, 902), None);
-    // Two equal endpoints across a gap never prove presence in between.
+fn equal_samples_are_freshness_never_continuity_or_a_login() {
+    // Samples A/O at 0, 300 and 600: a request at 450 may have run under B/O
+    // during an unseen A→B→A switch. The history therefore never qualifies
+    // the window, and its API has no way to return a login.
+    let samples = observed(&[0, 300, 600]);
+    assert_eq!(verdict(&samples, 0, 450), Verdict::Unqualified);
+    assert_eq!(verdict(&samples, 0, 600), Verdict::Unqualified);
+    assert_eq!(verdict(&samples, 300, 300), Verdict::Unqualified);
+    // A sampled A→B→A inside the window is a conflict, not coverage.
+    let mut switched = observed(&[0]);
+    for (at, n) in [(300, 1), (600, 0)] {
+        switched.observe_at(
+            home(),
+            SLOT,
+            Some(T0 + at),
+            Observation::Qualified {
+                login: &login(n),
+                org: &org(0),
+            },
+        );
+    }
+    assert_eq!(verdict(&switched, 0, 600), Verdict::Conflicting);
+    assert_eq!(
+        verdict(&switched, 0, 100),
+        Verdict::Conflicting,
+        "B within one gap"
+    );
+    // Outside the window or past the last sample: nothing spans it.
+    assert_eq!(verdict(&samples, 0, 601), Verdict::Unavailable);
+    assert_eq!(verdict(&samples, 10, 5), Verdict::Unavailable);
+    assert_eq!(
+        Ledger::default().verdict(&home(), T0, T0, &org(0)),
+        Verdict::Unavailable
+    );
+    assert_eq!(
+        samples.verdict(&[0; 32], T0, T0, &org(0)),
+        Verdict::Unavailable
+    );
+    // A sample near the window naming another organization conflicts.
+    assert_eq!(
+        samples.verdict(&home(), T0, T0 + 450, &org(1)),
+        Verdict::Conflicting
+    );
+    // A gap of more than two cadences: no run spans the window.
+    let gapped = observed(&[0, 300, 901, 1_200]);
+    assert_eq!(verdict(&gapped, 0, 1_200), Verdict::Unavailable);
+    assert_eq!(verdict(&gapped, 299, 902), Verdict::Unavailable);
     let endpoints = observed(&[0, 3_600]);
-    assert_eq!(covered(&endpoints, 0, 3_600), None);
+    assert_eq!(verdict(&endpoints, 0, 3_600), Verdict::Unavailable);
 }
 
 #[test]
-fn unavailable_conflict_logout_regression_and_replacement_end_coverage() {
+fn unavailable_conflict_logout_regression_replacement_and_restart_never_qualify() {
     let qualified = |ledger: &mut Ledger, at: u64, n: u8| {
         ledger.observe_at(
             home(),
@@ -77,27 +102,16 @@ fn unavailable_conflict_logout_regression_and_replacement_end_coverage() {
             },
         )
     };
-    let expected = Some((login(0), org(0)));
-
-    // Unavailable (failed, missing, contradictory or suppressed) splits even
-    // inside one cadence.
+    // An unavailable observation splits runs even inside one cadence.
     let mut ledger = observed(&[0, 300]);
     ledger.observe_at(home(), SLOT, Some(T0 + 400), Observation::Unavailable);
     qualified(&mut ledger, 600, 0);
-    assert_eq!(covered(&ledger, 0, 300), expected);
-    assert_eq!(covered(&ledger, 0, 600), None);
-
-    // Conflicting identity: a different login ends the segment, and the
-    // later segment belongs to that login only.
+    assert_eq!(verdict(&ledger, 0, 600), Verdict::Unavailable);
+    // A different login ends the run and conflicts near it.
     let mut ledger = observed(&[0, 300]);
     qualified(&mut ledger, 600, 1);
-    qualified(&mut ledger, 900, 0);
-    assert_eq!(covered(&ledger, 0, 300), expected);
-    assert_eq!(covered(&ledger, 600, 600), Some((login(1), org(0))));
-    assert_eq!(covered(&ledger, 0, 900), None);
-    assert_eq!(covered(&ledger, 300, 900), None);
-
-    // A malformed hash is not a qualified value.
+    assert_eq!(verdict(&ledger, 0, 300), Verdict::Conflicting);
+    // A malformed hash is not a qualified sample.
     let mut ledger = observed(&[0]);
     ledger.observe_at(
         home(),
@@ -109,9 +123,8 @@ fn unavailable_conflict_logout_regression_and_replacement_end_coverage() {
         },
     );
     qualified(&mut ledger, 600, 0);
-    assert_eq!(covered(&ledger, 0, 600), None);
-
-    // An observation without a usable time ends the segment.
+    assert_eq!(verdict(&ledger, 0, 600), Verdict::Unavailable);
+    // No usable time ends the run.
     let mut ledger = observed(&[0, 300]);
     ledger.observe_at(
         home(),
@@ -123,25 +136,18 @@ fn unavailable_conflict_logout_regression_and_replacement_end_coverage() {
         },
     );
     qualified(&mut ledger, 600, 0);
-    assert_eq!(covered(&ledger, 0, 600), None);
-
-    // Logout clears the slot's whole history.
+    assert_eq!(verdict(&ledger, 0, 600), Verdict::Unavailable);
+    // Logout clears the history.
     let mut ledger = observed(&[0, 300, 600]);
     ledger.observe_at(home(), SLOT, Some(T0 + 700), Observation::SignedOut);
-    assert_eq!(covered(&ledger, 0, 0), None);
+    assert_eq!(verdict(&ledger, 0, 0), Verdict::Unavailable);
     assert!(ledger.pairings().next().is_none());
-
-    // Clock regression clears it too.
+    // Clock regression clears it too; an equal timestamp is only a repeat.
     let mut ledger = observed(&[0, 300, 600]);
     qualified(&mut ledger, 500, 0);
-    assert_eq!(covered(&ledger, 0, 300), None);
-    assert_eq!(covered(&ledger, 500, 500), expected);
-    // An equal timestamp is a repeat, not a regression.
-    let mut ledger = observed(&[0, 300, 300]);
-    assert_eq!(covered(&ledger, 0, 300), expected);
-    qualified(&mut ledger, 600, 0);
-    assert_eq!(covered(&ledger, 0, 600), expected);
-
+    assert_eq!(verdict(&ledger, 0, 300), Verdict::Unavailable);
+    let repeat = observed(&[0, 300, 300]);
+    assert_eq!(verdict(&repeat, 0, 300), Verdict::Unqualified);
     // A replacement registration of the same folder starts over.
     let mut ledger = observed(&[0, 300]);
     ledger.observe_at(
@@ -153,20 +159,26 @@ fn unavailable_conflict_logout_regression_and_replacement_end_coverage() {
             org: &org(0),
         },
     );
-    assert_eq!(covered(&ledger, 0, 600), None);
-    assert_eq!(covered(&ledger, 600, 600), expected);
-
+    assert_eq!(verdict(&ledger, 0, 600), Verdict::Unavailable);
     // An unknown slot gains nothing from a non-qualified observation, and a
-    // restart (a new process) has no history at all.
+    // restart (a new process) knows neither history nor registration.
     let mut ledger = Ledger::default();
     ledger.observe_at(home(), SLOT, Some(T0), Observation::Unavailable);
     ledger.observe_at(home(), SLOT, Some(T0), Observation::SignedOut);
     assert_eq!(ledger, Ledger::default());
+    assert_eq!(ledger.is_registered(&home()), None);
+    // Registration is what the last pass reported; removal drops history.
+    let mut ledger = observed(&[0, 300]);
+    ledger.retain(BTreeSet::from([home()]));
+    assert_eq!(ledger.is_registered(&home()), Some(true));
+    ledger.retain(BTreeSet::new());
+    assert_eq!(ledger.is_registered(&home()), Some(false));
+    assert_eq!(verdict(&ledger, 0, 300), Verdict::Unavailable);
 }
 
 #[test]
 fn age_entry_slot_and_byte_caps_bound_the_history() {
-    // Age: nothing older than 30 days survives; a long segment is clamped.
+    // Age: nothing older than 30 days survives; a long run is clamped.
     let mut ledger = observed(&[0, 300]);
     let late = MAX_AGE_SECONDS + 10_000;
     ledger.observe_at(
@@ -178,7 +190,7 @@ fn age_entry_slot_and_byte_caps_bound_the_history() {
             org: &org(0),
         },
     );
-    assert_eq!(covered(&ledger, 0, 300), None);
+    assert_eq!(verdict(&ledger, 0, 300), Verdict::Unavailable);
     assert_eq!(ledger.pairings().count(), 1);
     let mut long = Ledger::default();
     let mut at = 0;
@@ -196,10 +208,10 @@ fn age_entry_slot_and_byte_caps_bound_the_history() {
     }
     let last = at - 600;
     let cutoff = last - MAX_AGE_SECONDS;
-    assert_eq!(covered(&long, cutoff, last), Some((login(0), org(0))));
-    assert_eq!(covered(&long, cutoff - 1, last), None);
+    assert_eq!(verdict(&long, cutoff, last), Verdict::Unqualified);
+    assert_eq!(verdict(&long, cutoff - 1, last), Verdict::Unavailable);
 
-    // Entries: the oldest segment is evicted, and its interval with it.
+    // Entries: the oldest run is evicted, and its interval with it.
     let mut ledger = Ledger::default();
     for n in 0..(MAX_SEGMENTS_PER_SLOT as u64 + 3) {
         ledger.observe_at(
@@ -213,9 +225,11 @@ fn age_entry_slot_and_byte_caps_bound_the_history() {
         );
     }
     assert_eq!(ledger.pairings().count(), MAX_SEGMENTS_PER_SLOT);
-    assert_eq!(covered(&ledger, 0, 0), None);
-    let newest = (MAX_SEGMENTS_PER_SLOT as u64 + 2) * 300;
-    assert!(covered(&ledger, newest, newest).is_some());
+    assert_eq!(
+        ledger.verdict(&home(), T0, T0, &org(0)),
+        Verdict::Unavailable,
+        "evicted"
+    );
 
     // Slots: at most one history per registered slot.
     let mut ledger = Ledger::default();
@@ -249,13 +263,20 @@ fn age_entry_slot_and_byte_caps_bound_the_history() {
                 );
             }
         }
+        ledger.retain(
+            (0..MAX_SLOTS)
+                .map(|slot| home_key(Path::new(&format!("/slots/{slot}"))))
+                .collect(),
+        );
         ledger
     });
     let bytes = full.retained_bytes();
     let worst = MAX_SLOTS
         * (std::mem::size_of::<HomeKey>()
             + std::mem::size_of::<SlotHistory>()
-            + MAX_SEGMENTS_PER_SLOT * (std::mem::size_of::<Segment>() + 128));
+            + MAX_SEGMENTS_PER_SLOT * (std::mem::size_of::<Segment>() + 128)
+            + std::mem::size_of::<HomeKey>()
+            + std::mem::size_of::<usize>());
     eprintln!(
         "status coverage worst case: retained_bytes={bytes} declared_worst={worst} \
          allocations={} requested_peak={} segment_inline={} history_inline={}",
@@ -341,7 +362,7 @@ fn transcript_paths_map_to_their_config_dir_key() {
 
 #[test]
 #[serial]
-fn global_feed_skips_the_default_folder_drops_removed_slots_and_fails_closed() {
+fn global_feed_skips_the_default_folder_tracks_registration_and_fails_closed() {
     clear_global_for_test();
     let default_dir = Path::new("/Users/someone/.claude");
     let observe_at = |dir: &str, at: &str| {
@@ -368,21 +389,32 @@ fn global_feed_skips_the_default_folder_drops_removed_slots_and_fails_closed() {
     );
     let ledger = snapshot().expect("feed available");
     assert_eq!(ledger.slots.len(), 1);
-    assert!(ledger.covering(&home(), 0, u64::MAX).is_none());
+    assert_eq!(ledger.is_registered(&home()), None, "no pass completed yet");
     let start = OffsetDateTime::parse("2027-01-15T08:00:00Z", &Rfc3339)
         .unwrap()
         .unix_timestamp() as u64;
-    assert!(ledger.covering(&home(), start, start + 300).is_some());
+    assert_eq!(
+        ledger.verdict(&home(), start, start + 300, &org(0)),
+        Verdict::Unqualified
+    );
 
+    // The pass records registered folders, never the default one.
+    retain_registered(
+        ["/Users/someone/.claude-slot", "/Users/someone/.claude"].into_iter(),
+        default_dir,
+    );
+    let ledger = snapshot().expect("feed available");
+    assert_eq!(ledger.is_registered(&home()), Some(true));
+    assert_eq!(ledger.is_registered(&home_key(default_dir)), Some(false));
     // Slot removal drops the folder's history.
-    retain_registered(["/Users/someone/other"].into_iter());
+    retain_registered(["/Users/someone/other"].into_iter(), default_dir);
     assert_eq!(snapshot_slots(), 0);
 
     // A poisoned lock: the producer is a no-op and the consumer sees no feed.
     observe_at("/Users/someone/.claude-slot", "2027-01-15T08:10:00Z");
     poison_global_for_test();
     observe_at("/Users/someone/.claude-slot", "2027-01-15T08:15:00Z");
-    retain_registered(std::iter::empty());
+    retain_registered(std::iter::empty(), default_dir);
     assert!(snapshot().is_none());
     clear_global_for_test();
 }

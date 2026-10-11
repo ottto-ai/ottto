@@ -68,7 +68,6 @@ pub(crate) const TELEMETRY: &str = "telemetry";
 pub(crate) const TELEMETRY_LOGIN: &str = "telemetry_login";
 pub(crate) const TRANSCRIPT_SOLE_LOGIN: &str = "transcript_sole_login";
 pub(crate) const TRANSCRIPT_ORG: &str = "transcript_org";
-pub(crate) const TRANSCRIPT_EMAIL: &str = "transcript_email";
 
 /// (login, org, full basis). Derived order is the contract order: absent before
 /// present for login and org, then the basis token bytewise.
@@ -110,6 +109,12 @@ pub(crate) enum Refusal {
     UntrustedFlip,
     /// Stronger evidence exists but is unreadable or incomplete.
     IncompleteEvidence,
+    /// A recorded email in a registered folder with no usable status history
+    /// for its window (feed failed, never observed, gap, restart, eviction).
+    CoverageUnavailable,
+    /// Status samples span the window but cannot prove continuity, and the
+    /// email is never joined to a login: nothing qualifies `transcript_email`.
+    CoverageUnqualified,
 }
 
 /// Owned form of `IdentityRef`, for tests and the W0 builder oracle.
@@ -1030,6 +1035,8 @@ pub(crate) struct ScanEvidence<'a> {
     pub(crate) desktop_census: Option<DesktopCensus>,
     /// This scan's copy of the local status-coverage history.
     status_coverage: Option<crate::claude_status_coverage::Ledger>,
+    /// Key of the shared default folder, where the email basis never applies.
+    default_home: Option<crate::claude_status_coverage::HomeKey>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1114,6 +1121,9 @@ impl<'a> ScanEvidence<'a> {
             }
         }
         self.status_coverage = coverage;
+        self.default_home = Some(crate::claude_status_coverage::home_key(
+            &crate::agent_status::home_dir().join(".claude"),
+        ));
         self
     }
 
@@ -1398,12 +1408,8 @@ fn transcript_identity<'k>(
         .and_then(|census| census.logins_by_org.get(org))
         .filter(|logins| logins.len() == 1)
         .and_then(|logins| logins.first());
-    if let Some(login) = email_login(evidence, facts, org) {
-        return Some(IdentityRef::Tagged(KeyRef {
-            login: Some(login),
-            org: Some(org),
-            basis: TRANSCRIPT_EMAIL,
-        }));
+    if let Some(refusal) = email_refusal(evidence, facts, org) {
+        return Some(IdentityRef::Refused(refusal));
     }
     Some(IdentityRef::Tagged(match sole_login {
         Some(login) => KeyRef {
@@ -1419,26 +1425,49 @@ fn transcript_identity<'k>(
     }))
 }
 
-/// `transcript_email`: terminal/SDK only, in a registered folder whose status
-/// coverage holds one login, under the trusted marker's org, continuously over
-/// [session start − 300 s, request]. Anything less leaves the request on the
-/// org-only basis; the status history is never filled in or extended here.
-fn email_login<'k>(
-    evidence: &'k ScanEvidence<'_>,
-    facts: &RequestFacts<'k>,
+/// `transcript_email` never binds a login. No qualified join from a recorded
+/// email to a login exists, and sampled status coverage cannot prove that the
+/// slot's login ran continuously over [session start − 300 s, request]. So the
+/// basis only decides whether the request keeps its earlier meaning:
+/// - not applicable (`None`, the org-only path stands): the basis compiled
+///   out, Desktop, no unchanged email before the request, or a file outside a
+///   registered slot folder (including the shared default folder);
+/// - otherwise refused, never weakened to org-only: the feed unavailable or
+///   not yet run since restart, unknown session start, a conflicting sample,
+///   no history spanning the window, or samples that span it but prove nothing.
+fn email_refusal(
+    evidence: &ScanEvidence<'_>,
+    facts: &RequestFacts<'_>,
     org: &str,
-) -> Option<&'k str> {
+) -> Option<Refusal> {
+    use crate::claude_status_coverage::Verdict;
     if facts.desktop || !transcript_email_enabled() {
         return None;
     }
-    let (login, covered_org) = evidence.status_coverage.as_ref()?.covering(
-        facts.email_home?,
-        facts
-            .session_start_unix_seconds?
-            .checked_sub(crate::claude_status_coverage::SESSION_LEAD_SECONDS)?,
-        facts.terminal_unix_seconds?,
-    )?;
-    (covered_org == org).then_some(login)
+    let home = facts.email_home?;
+    if evidence.default_home.as_ref() == Some(home) {
+        return None;
+    }
+    let Some(coverage) = evidence.status_coverage.as_ref() else {
+        return Some(Refusal::CoverageUnavailable);
+    };
+    match coverage.is_registered(home) {
+        None => return Some(Refusal::CoverageUnavailable),
+        Some(false) => return None,
+        Some(true) => {}
+    }
+    let window = facts
+        .session_start_unix_seconds
+        .and_then(|start| start.checked_sub(crate::claude_status_coverage::SESSION_LEAD_SECONDS))
+        .zip(facts.terminal_unix_seconds);
+    let Some((from, to)) = window else {
+        return Some(Refusal::CoverageUnavailable);
+    };
+    Some(match coverage.verdict(home, from, to, org) {
+        Verdict::Unavailable => Refusal::CoverageUnavailable,
+        Verdict::Conflicting => Refusal::ContradictoryOrg,
+        Verdict::Unqualified => Refusal::CoverageUnqualified,
+    })
 }
 
 // --- Desktop census freshness witness ---------------------------------------

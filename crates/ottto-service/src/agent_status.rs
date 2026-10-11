@@ -4172,7 +4172,10 @@ fn collect_claude_status_snapshots(
         }
     }
     if let Some(dirs) = &coverage_dirs {
-        crate::claude_status_coverage::retain_registered(dirs.iter().map(String::as_str));
+        crate::claude_status_coverage::retain_registered(
+            dirs.iter().map(String::as_str),
+            &home_dir().join(".claude"),
+        );
     }
     let approvals = claude_slot_approvals();
     for (slot_id, status) in &mut slot_states {

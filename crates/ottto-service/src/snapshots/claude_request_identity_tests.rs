@@ -2087,8 +2087,8 @@ fn bound_sessions_admit_contract5_only_with_absent_or_matching_creator() {
 
 // --- transcript_email over the status-coverage feed --------------------------
 
-/// Qualified status observations of `(login, org)` every cadence over
-/// `[from, to]` for the registered folder `home`.
+/// Qualified status samples of `(login, org)` every cadence over `[from, to]`
+/// for `home`, after a pass that reported `home` registered.
 fn coverage(
     home: crate::claude_status_coverage::HomeKey,
     login: &str,
@@ -2107,6 +2107,7 @@ fn coverage(
         );
         at += crate::claude_status_coverage::CADENCE_SECONDS;
     }
+    ledger.retain(BTreeSet::from([home]));
     ledger
 }
 
@@ -2114,40 +2115,31 @@ fn coverage(
 const _: () = assert!(!identity::TRANSCRIPT_EMAIL_ENABLED && !identity::EMISSION_ENABLED);
 
 #[test]
-fn classify_transcript_email_needs_registered_coverage_of_the_whole_window() {
-    let org_e = "e".repeat(64);
-    let org_f = "f".repeat(64);
-    let home = crate::claude_status_coverage::home_key(Path::new("/synthetic/slot"));
-    let other = crate::claude_status_coverage::home_key(Path::new("/synthetic/other"));
+fn transcript_email_never_binds_and_refuses_unqualified_coverage() {
+    use crate::claude_status_coverage::{home_key, Ledger, Observation, CADENCE_SECONDS};
+    let org_e: &'static str = "e".repeat(64).leak();
+    let org_f: &'static str = "f".repeat(64).leak();
+    let home = home_key(Path::new("/synthetic/slot"));
+    let other = home_key(Path::new("/synthetic/other"));
+    let default_home = home_key(&crate::agent_status::home_dir().join(".claude"));
     let mut with_org = complete_api_row(ROOT, "req_org", 1, 10, 1, 0);
     with_org.request_identity = Some(org_identity(&"d".repeat(64)));
-    let login_only = complete_api_row(ROOT, "req_login", 2, 10, 1, 0);
     let (api, trace) = reports(
-        vec![signed(with_org), signed(login_only)],
-        vec![
-            complete_trace_row(ROOT, "req_org", ""),
-            complete_trace_row(ROOT, "req_login", ""),
-        ],
+        vec![signed(with_org)],
+        vec![complete_trace_row(ROOT, "req_org", "")],
     );
-    // Covered continuously over [998_000, 1_000_100] by LOGIN_A under org e.
-    let ledger = coverage(home, LOGIN_A, &org_e, 998_000, 1_000_100);
-    let covered = ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
-        .with_status_coverage(Some(ledger.clone()));
-    let request = |start: Option<u64>, at: u64, home: Option<&'static _>, org: &'static str| {
+    let with = |ledger: Option<Ledger>| {
+        ScanEvidence::new(&api, &trace, BTreeSet::new(), None).with_status_coverage(ledger)
+    };
+    let request = |start: Option<u64>,
+                   at: u64,
+                   home: Option<&crate::claude_status_coverage::HomeKey>,
+                   org: &'static str| {
         let mut request = facts("req_old", Some(at), MarkerVerdict::Trusted(org));
-        request.email_home = home;
+        request.email_home = home.map(|home| -> &'static _ { Box::leak(Box::new(*home)) });
         request.session_start_unix_seconds = start;
         request
     };
-    let home: &'static _ = Box::leak(Box::new(home));
-    let other: &'static _ = Box::leak(Box::new(other));
-    let org_e: &'static str = org_e.leak();
-    let org_f: &'static str = org_f.leak();
-    let email = RequestIdentity::Tagged(AuthorityKey {
-        login: Some(LOGIN_A.to_string()),
-        org: Some(org_e.to_string()),
-        basis: identity::TRANSCRIPT_EMAIL,
-    });
     let org_only = |org: &str| {
         RequestIdentity::Tagged(AuthorityKey {
             login: None,
@@ -2155,94 +2147,154 @@ fn classify_transcript_email_needs_registered_coverage_of_the_whole_window() {
             basis: identity::TRANSCRIPT_ORG,
         })
     };
-    // [session start − 300 s, request] inside one same-login segment.
+    let refused = RequestIdentity::Refused;
+    // LOGIN_A/org e sampled every cadence over [998_000, 1_000_100]. The slot
+    // login is never selected: samples prove no continuity and the email is
+    // never joined to a login.
+    let sampled = with(Some(coverage(home, LOGIN_A, org_e, 998_000, 1_000_100)));
     let start = 998_300;
-    assert_eq!(
-        identity::classify(&covered, &request(Some(start), 999_000, Some(home), org_e)),
-        email
-    );
-    assert_eq!(
-        identity::classify(
-            &covered,
-            &request(Some(start), 1_000_100, Some(home), org_e)
-        ),
-        email
-    );
+    let classify = |evidence: &ScanEvidence<'_>, facts: RequestFacts<'_>| {
+        let identity = identity::classify(evidence, &facts);
+        assert!(
+            !matches!(&identity, RequestIdentity::Tagged(key) if key.login.is_some()),
+            "an email never binds a login: {identity:?}"
+        );
+        identity
+    };
     for (case, facts, expected) in [
         (
-            "coverage starts after session start - 300 s",
-            request(Some(start - 1), 999_000, Some(home), org_e),
-            org_only(org_e),
+            "samples span the window (unseen A→B→A possible)",
+            request(Some(start), 999_000, Some(&home), org_e),
+            refused(Refusal::CoverageUnqualified),
         ),
         (
-            "request after the last observation (never extended)",
-            request(Some(start), 1_000_101, Some(home), org_e),
-            org_only(org_e),
+            "marker org differs from the sampled org",
+            request(Some(start), 999_000, Some(&home), org_f),
+            refused(Refusal::ContradictoryOrg),
         ),
         (
-            "no recorded email before the request",
+            "request after the last sample",
+            request(Some(start), 1_000_101, Some(&home), org_e),
+            refused(Refusal::CoverageUnavailable),
+        ),
+        (
+            "window starts before the first sample",
+            request(Some(start - 1), 999_000, Some(&home), org_e),
+            refused(Refusal::CoverageUnavailable),
+        ),
+        (
+            "unknown session start",
+            request(None, 999_000, Some(&home), org_e),
+            refused(Refusal::CoverageUnavailable),
+        ),
+        // Not applicable: the independently valid org-only meaning stands.
+        (
+            "no unchanged email before the request",
             request(Some(start), 999_000, None, org_e),
             org_only(org_e),
         ),
         (
-            "another folder's coverage",
-            request(Some(start), 999_000, Some(other), org_e),
+            "unregistered folder",
+            request(Some(start), 999_000, Some(&other), org_e),
             org_only(org_e),
         ),
         (
-            "marker org differs from the covered org",
-            request(Some(start), 999_000, Some(home), org_f),
-            org_only(org_f),
-        ),
-        (
-            "unknown session start",
-            request(None, 999_000, Some(home), org_e),
+            "shared default folder",
+            request(Some(start), 999_000, Some(&default_home), org_e),
             org_only(org_e),
         ),
     ] {
-        assert_eq!(identity::classify(&covered, &facts), expected, "{case}");
+        assert_eq!(classify(&sampled, facts), expected, "{case}");
     }
-    // Desktop never uses the email basis.
-    let mut desktop = request(Some(start), 999_000, Some(home), org_e);
+    let mut desktop = request(Some(start), 999_000, Some(&home), org_e);
     desktop.desktop = true;
-    assert_eq!(identity::classify(&covered, &desktop), org_only(org_e));
-    // A carried clock refuses rather than attributing.
-    let mut carried = request(Some(start), 999_000, Some(home), org_e);
-    carried.event_clock_complete = false;
-    assert_eq!(
-        identity::classify(&covered, &carried),
-        RequestIdentity::Refused(Refusal::BadClock)
-    );
-    // Feed off or failed: nothing qualifies.
-    let off = ScanEvidence::new(&api, &trace, BTreeSet::new(), None).with_status_coverage(None);
-    assert_eq!(
-        identity::classify(&off, &request(Some(start), 999_000, Some(home), org_e)),
-        org_only(org_e)
-    );
-    // A gap of more than two cadences inside the window disqualifies.
-    let mut gapped = coverage(*home, LOGIN_A, org_e, 998_000, 998_600);
-    for at in [999_201, 999_500, 999_800, 1_000_100] {
-        gapped.observe_at(
-            *home,
+    assert_eq!(classify(&sampled, desktop), org_only(org_e), "Desktop");
+
+    // A within-cadence sampled A→B→A conflicts.
+    let mut switched = coverage(home, LOGIN_A, org_e, 998_000, 998_600);
+    for (at, login) in [(998_900, OWNER_A), (999_200, LOGIN_A), (999_500, LOGIN_A)] {
+        switched.observe_at(
+            home,
             [1; 32],
             Some(at),
-            crate::claude_status_coverage::Observation::Qualified {
+            Observation::Qualified { login, org: org_e },
+        );
+    }
+    assert_eq!(
+        classify(&with(Some(switched)), request(Some(start), 999_000, Some(&home), org_e)),
+        refused(Refusal::ContradictoryOrg)
+    );
+    // Enabled-feed failures refuse; none falls back to org-only.
+    let mut gapped = coverage(home, LOGIN_A, org_e, 998_000, 998_600);
+    for at in [999_201, 999_500, 999_800] {
+        gapped.observe_at(
+            home,
+            [1; 32],
+            Some(at),
+            Observation::Qualified {
                 login: LOGIN_A,
                 org: org_e,
             },
         );
     }
-    let gapped = ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
-        .with_status_coverage(Some(gapped));
-    assert_eq!(
-        identity::classify(&gapped, &request(Some(start), 999_000, Some(home), org_e)),
-        org_only(org_e)
-    );
-    // Telemetry still wins over the email basis.
-    let mut telemetry = request(Some(start), 999_000, Some(home), org_e);
+    let mut unavailable = coverage(home, LOGIN_A, org_e, 998_000, 1_000_100);
+    unavailable.observe_at(home, [1; 32], Some(999_100), Observation::Unavailable);
+    for at in (999_400..=1_000_100).step_by(CADENCE_SECONDS as usize) {
+        unavailable.observe_at(
+            home,
+            [1; 32],
+            Some(at),
+            Observation::Qualified {
+                login: LOGIN_A,
+                org: org_e,
+            },
+        );
+    }
+    let mut restarted = Ledger::default();
+    for at in (998_000..=1_000_100).step_by(CADENCE_SECONDS as usize) {
+        restarted.observe_at(
+            home,
+            [1; 32],
+            Some(at),
+            Observation::Qualified {
+                login: LOGIN_A,
+                org: org_e,
+            },
+        );
+    }
+    let mut evicted = coverage(home, LOGIN_A, org_e, 998_000, 998_600);
+    for n in 0..crate::claude_status_coverage::MAX_SEGMENTS_PER_SLOT as u64 {
+        evicted.observe_at(
+            home,
+            [1; 32],
+            Some(1_100_000 + n * 1_000),
+            Observation::Qualified {
+                login: LOGIN_A,
+                org: org_e,
+            },
+        );
+    }
+    for (case, ledger) in [
+        ("gap of more than two cadences", Some(gapped)),
+        ("unavailable sample inside the window", Some(unavailable)),
+        ("no completed pass since restart", Some(restarted)),
+        ("window evicted", Some(evicted)),
+        ("feed failed or absent", None),
+    ] {
+        assert_eq!(
+            classify(&with(ledger), request(Some(start), 999_000, Some(&home), org_e)),
+            refused(Refusal::CoverageUnavailable),
+            "{case}"
+        );
+    }
+    // A carried clock still refuses for the clock; telemetry still wins.
+    let mut carried = request(Some(start), 999_000, Some(&home), org_e);
+    carried.event_clock_complete = false;
+    assert_eq!(classify(&sampled, carried), refused(Refusal::BadClock));
+    let mut telemetry = request(Some(start), 999_000, Some(&home), org_e);
     telemetry.request_id = "req_org";
     assert_eq!(
-        identity::classify(&covered, &telemetry),
+        identity::classify(&sampled, &telemetry),
         RequestIdentity::Tagged(AuthorityKey {
             login: Some(OWNER_A.to_string()),
             org: Some("d".repeat(64)),
@@ -2283,14 +2335,15 @@ fn status_pairings_establish_marker_org_membership_for_the_telemetry_login() {
 }
 
 #[test]
-fn parser_binds_the_email_folder_and_tags_transcript_email_end_to_end() {
+fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conserved() {
     let dir = temp_dir("claude-request-identity-email");
     let slot = dir.join("slot");
     let session = |email_first: bool, flip: bool| {
         let mut lines = Vec::new();
+        // An arbitrary email: nothing joins it to the slot's sampled login.
         let context_line = json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment",
             "sessionId": ROOT, "attachment": {"type": "session_context",
-            "context": {"userEmail": "person@example.invalid"}}});
+            "context": {"userEmail": "someone-else@example.invalid"}}});
         if email_first {
             lines.push(context_line.clone());
         }
@@ -2336,44 +2389,72 @@ fn parser_binds_the_email_folder_and_tags_transcript_email_end_to_end() {
     assert_eq!(email_home(&items), Some(home));
     let wire = serde_json::to_string(&items[0]).unwrap();
     assert!(!wire.contains("example.invalid"), "no email on the item");
-    assert_eq!(email_home(&parse(&slot, &session(false, false))), None, "email after the request");
-    assert_eq!(email_home(&parse(&slot, &session(true, true))), None, "email switched before it");
-
-    // End to end: no telemetry, a trusted marker, the recorded email and
-    // continuous coverage for the registered folder.
-    let mut items = parse(&slot, &session(true, false));
-    let request_at = rfc3339_unix_seconds("2026-08-02T07:00:01Z").unwrap();
-    let start = rfc3339_unix_seconds(items[0].source_started_at.as_deref().unwrap()).unwrap();
-    let (api, trace) = reports(Vec::new(), Vec::new());
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None).with_status_coverage(
-        Some(coverage(home, LOGIN_A, &org_hash(ORG_1), start - 600, request_at + 300)),
-    );
-    let outcome = identity::apply_scan(&mut items, &evidence, BTreeMap::new());
-    assert_eq!(outcome.sent, 1);
-    let item = &items[0];
-    assert_eq!(item.provenance.collector, identity::COLLECTOR);
-    assert_eq!(item.request_evidence.len(), 1);
-    assert_eq!(item.request_evidence[0].identity_basis, identity::TRANSCRIPT_EMAIL);
-    let wire = serde_json::to_value(item).unwrap();
     assert_eq!(
-        wire["usage_buckets"][0]["model_usage"][0]["account_identifier_hash"],
-        json!(LOGIN_A)
+        email_home(&parse(&slot, &session(false, false))),
+        None,
+        "email after the request"
     );
-    // Only contract-5 fields carry it: nothing about the feed reaches the wire.
-    let text = wire.to_string();
+    assert_eq!(
+        email_home(&parse(&slot, &session(true, true))),
+        None,
+        "email switched before it"
+    );
+
+    // Slot samples LOGIN_A under the marker org over the whole window.
+    let request_at = rfc3339_unix_seconds("2026-08-02T07:00:01Z").unwrap();
+    let start_of = |items: &[SnapshotItem]| {
+        rfc3339_unix_seconds(items[0].source_started_at.as_deref().unwrap()).unwrap()
+    };
+    let (api, trace) = reports(Vec::new(), Vec::new());
+    let mut items = parse(&slot, &session(true, false));
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None).with_status_coverage(
+        Some(coverage(
+            home,
+            LOGIN_A,
+            &org_hash(ORG_1),
+            start_of(&items) - 600,
+            request_at + 300,
+        )),
+    );
+    let before = items[0].clone();
+    identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+    let item = &items[0];
+    // Refused, not weakened: no login, no org-only evidence, a positive
+    // refusal (which also blocks Desktop-pair fill), usage and money intact.
+    assert!(item.request_identity_refusals >= 1);
+    let text = serde_json::to_string(item).unwrap();
+    assert!(!text.contains(LOGIN_A), "the slot login is never selected");
+    assert!(item
+        .request_evidence
+        .iter()
+        .all(|evidence| evidence.identity_basis != identity::TRANSCRIPT_ORG));
+    assert_eq!(item.input_tokens, before.input_tokens);
+    assert_eq!(item.output_tokens, before.output_tokens);
+    assert_eq!(item.request_count, before.request_count);
+    assert_eq!(item.cost, before.cost);
+    let rows = |item: &SnapshotItem| {
+        item.usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage)
+            .map(|row| (row.request_count, row.input_tokens, row.cost_usd.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(item), rows(&before));
     let home_hex = home.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-    for absent in [
-        "status_coverage",
-        "example.invalid",
-        home_hex.as_str(),
-        slot.to_str().unwrap(),
-    ] {
+    for absent in ["example.invalid", home_hex.as_str(), slot.to_str().unwrap()] {
         assert!(!text.contains(absent), "{absent}");
     }
 
-    // The same request in an unregistered (loose) folder stays org-only.
-    let mut loose = parse(&dir.join("loose"), &session(true, false));
-    identity::apply_scan(&mut loose, &evidence, BTreeMap::new());
-    assert_eq!(loose[0].request_evidence[0].identity_basis, identity::TRANSCRIPT_ORG);
+    // Genuinely absent or disqualified email, or an unregistered folder: the
+    // earlier org-only meaning stands.
+    for mut other in [
+        parse(&slot, &session(false, false)),
+        parse(&slot, &session(true, true)),
+        parse(&dir.join("loose"), &session(true, false)),
+    ] {
+        identity::apply_scan(&mut other, &evidence, BTreeMap::new());
+        assert_eq!(other[0].request_evidence[0].identity_basis, identity::TRANSCRIPT_ORG);
+        assert_eq!(other[0].request_identity_refusals, 0);
+    }
     let _ = fs::remove_dir_all(dir);
 }

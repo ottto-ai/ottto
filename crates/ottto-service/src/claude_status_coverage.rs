@@ -2,10 +2,16 @@
 //!
 //! The Claude status pass already qualifies each registered slot's login and
 //! organization hashes. It reports those values here, or reports that it could
-//! not. This module keeps a bounded history of *segments*: runs of consecutive
+//! not. This module keeps a bounded history of sampled *runs*: consecutive
 //! qualified observations of one (login, org) in one registered folder, no two
-//! more than two cadences apart. A request may use its session's recorded
-//! email only when one segment covers [session start − 300 s, request].
+//! more than two cadences apart.
+//!
+//! A run is freshness, not continuity. Equal samples 300 s apart do not prove
+//! that no other login ran in between (an unseen A→B→A switch), and the email
+//! a transcript records is never joined to a login. So this history can only
+//! *disqualify*: it never selects a login, and every email-bearing request it
+//! is consulted for is refused (see `Verdict`). It also supplies §2a.12(b)
+//! org membership from each qualified (login, org) pairing.
 //!
 //! Nothing here reads a file, calls a provider, changes cadence or reaches the
 //! wire. The status pass never sees a result: a failure here (including a
@@ -23,9 +29,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 /// Status refresh cadence (`agent_status_refresh::INTERVAL`).
 pub(crate) const CADENCE_SECONDS: u64 = 300;
-/// Largest gap between consecutive observations inside one segment.
+/// Largest gap between consecutive observations inside one run (freshness).
 pub(crate) const MAX_GAP_SECONDS: u64 = 2 * CADENCE_SECONDS;
-/// Coverage must begin this long before the session starts.
+/// The window consulted begins this long before the session starts.
 pub(crate) const SESSION_LEAD_SECONDS: u64 = 300;
 /// Age cap: the longest session the basis may attribute.
 pub(crate) const MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
@@ -34,7 +40,8 @@ pub(crate) const MAX_SLOTS: usize = ottto_core::MAX_CLAUDE_ACCOUNT_SLOTS;
 pub(crate) const MAX_SEGMENTS_PER_SLOT: usize = 32;
 /// Hard cap on retained bytes, as counted by `Ledger::retained_bytes`.
 /// Worst case under the entry caps: 10 slots × (32 B key + 80 B history +
-/// 32 segments × (64 B inline + 128 B hashes)) = 62,560 B.
+/// 32 runs × (64 B inline + 128 B hashes)) + 10 registered keys × 40 B
+/// = 62,960 B.
 pub(crate) const MAX_BYTES: usize = 64 * 1024;
 
 /// Opaque registered-folder key: SHA-256 over the normalized config dir.
@@ -74,10 +81,28 @@ struct SlotHistory {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Ledger {
     slots: BTreeMap<HomeKey, SlotHistory>,
+    /// Registered folders as of the last completed status pass; `None` until
+    /// one completes in this process (after a restart nothing is known).
+    registered: Option<BTreeSet<HomeKey>>,
+}
+
+/// What the history says about one email-bearing request's window. None of
+/// these qualifies a login: the caller refuses on every one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// No run spans the window: never observed, a gap, unavailable, logout,
+    /// regression, restart, eviction, or the request is past the last sample.
+    Unavailable,
+    /// A sample near the window names another organization, or the window's
+    /// samples name more than one login.
+    Conflicting,
+    /// One run spans the window, but samples cannot prove continuity.
+    Unqualified,
 }
 
 static LEDGER: Mutex<Ledger> = Mutex::new(Ledger {
     slots: BTreeMap::new(),
+    registered: None,
 });
 
 /// The basis is compiled out with contract-5 emission.
@@ -148,16 +173,23 @@ pub(crate) fn observe(
     }
 }
 
-/// Drops the history of every folder no longer registered.
-pub(crate) fn retain_registered<'a>(config_dirs: impl Iterator<Item = &'a str>) {
+/// Records the registered folders (never the default one) at the end of a
+/// status pass and drops the history of every folder no longer registered.
+pub(crate) fn retain_registered<'a>(
+    config_dirs: impl Iterator<Item = &'a str>,
+    default_dir: &Path,
+) {
     if !enabled() {
         return;
     }
+    let default_key = home_key(default_dir);
     let keys = config_dirs
         .map(|dir| home_key(Path::new(dir)))
+        .filter(|key| *key != default_key)
+        .take(MAX_SLOTS)
         .collect::<BTreeSet<_>>();
     if let Ok(mut ledger) = LEDGER.lock() {
-        ledger.slots.retain(|key, _| keys.contains(key));
+        ledger.retain(keys);
     }
 }
 
@@ -188,10 +220,22 @@ pub(crate) fn poison_global_for_test() {
 #[cfg(test)]
 pub(crate) fn clear_global_for_test() {
     LEDGER.clear_poison();
-    with_global(|ledger| ledger.slots.clear());
+    with_global(|ledger| *ledger = Ledger::default());
 }
 
 impl Ledger {
+    pub(crate) fn retain(&mut self, registered: BTreeSet<HomeKey>) {
+        self.slots.retain(|key, _| registered.contains(key));
+        self.registered = Some(registered);
+    }
+
+    /// `None` until a status pass has completed in this process.
+    pub(crate) fn is_registered(&self, home: &HomeKey) -> Option<bool> {
+        self.registered
+            .as_ref()
+            .map(|registered| registered.contains(home))
+    }
+
     pub(crate) fn observe_at(
         &mut self,
         key: HomeKey,
@@ -295,7 +339,10 @@ impl Ledger {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.slots
+        self.registered.as_ref().map_or(0, |registered| {
+            registered.len() * (std::mem::size_of::<HomeKey>() + std::mem::size_of::<usize>())
+        }) + self
+            .slots
             .values()
             .map(|history| {
                 std::mem::size_of::<HomeKey>()
@@ -307,20 +354,35 @@ impl Ledger {
                         .map(|segment| segment.login.capacity() + segment.org.capacity())
                         .sum::<usize>()
             })
-            .sum()
+            .sum::<usize>()
     }
 
-    /// The (login, org) of the one segment covering `[from, to]` in `home`.
-    pub(crate) fn covering(&self, home: &HomeKey, from: u64, to: u64) -> Option<(&str, &str)> {
-        if from > to {
-            return None;
+    /// Classifies `[from, to]` in `home` for a request under `org`. Runs within
+    /// one freshness gap of the window count as near it. Never a login.
+    pub(crate) fn verdict(&self, home: &HomeKey, from: u64, to: u64, org: &str) -> Verdict {
+        let Some(history) = self.slots.get(home).filter(|_| from <= to) else {
+            return Verdict::Unavailable;
+        };
+        let near = history.segments.iter().filter(|segment| {
+            segment.start <= to.saturating_add(MAX_GAP_SECONDS)
+                && segment.end.saturating_add(MAX_GAP_SECONDS) >= from
+        });
+        let mut login = None;
+        for segment in near {
+            if segment.org != org || login.is_some_and(|login| login != segment.login.as_str()) {
+                return Verdict::Conflicting;
+            }
+            login = Some(segment.login.as_str());
         }
-        self.slots
-            .get(home)?
+        if history
             .segments
             .iter()
-            .find(|segment| segment.start <= from && segment.end >= to)
-            .map(|segment| (segment.login.as_str(), segment.org.as_str()))
+            .any(|segment| segment.start <= from && segment.end >= to)
+        {
+            Verdict::Unqualified
+        } else {
+            Verdict::Unavailable
+        }
     }
 
     /// Every retained (login, org) pairing the status pass qualified: the

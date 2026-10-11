@@ -212,6 +212,16 @@ fn status_coverage_feed_never_changes_source_or_quota_status_output() {
             (hash_b.clone(), org_b.clone())
         ])
     );
+    // The pass recorded the registered folders, never the default one.
+    coverage::with_global(|ledger| {
+        for slot in [&slot_a, &slot_b, &no_login] {
+            assert_eq!(ledger.is_registered(&coverage::home_key(slot)), Some(true));
+        }
+        assert_eq!(
+            ledger.is_registered(&coverage::home_key(&home.join(".claude"))),
+            Some(false)
+        );
+    });
     // SOURCE outputs are really in the fixture.
     assert!(working.0.contains(&hash_a) && working.0.contains(&hash_b));
     assert!(working.2.iter().any(|(_, plans)| plans != "[]"));
