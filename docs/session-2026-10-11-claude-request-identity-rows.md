@@ -45,9 +45,17 @@ same code through `capture_enabled()` (`cfg(test)`).
   - Duplicates, foreign owners, invalid evidence and missing original clocks
     are refused.
   - Missing telemetry is pending only for that request's own clock, within
-    `TELEMETRY_FLUSH_WINDOW_SECONDS` (300, provisional) of the scan and with
-    a healthy sidecar pair for its folder. Otherwise it is missing, and only
-    then do transcript bases apply.
+    `TELEMETRY_FLUSH_WINDOW_SECONDS` (300, provisional) of the scan, and with
+    a qualified witness that the folder's telemetry writer is healthy now. A
+    complete paired-sidecar load proves only what was already written, and no
+    existing qualified current-writer witness exists, so the scan supplies
+    none: pending never fires and a young missing request is missing (SESSION
+    ruling requested). Only missing requests are open to transcript bases.
+  - Auxiliary (telemetry-only) reported rows are refused for a bad clock. Their
+    `observed_at` may be the observer clock and the v2 capture does not record
+    which, the same reason they cannot qualify today's request accounts. The
+    trace span start is event-origin, but no existing rule qualifies it
+    (SESSION ruling requested). Transcript clocks are never borrowed.
   - Unreadable sidecars refuse every request; they never fall through.
 - **Transcript markers** (`credential_org` attachment lines):
   - They are captured only on owned lines, after inherited-fork exclusion,
@@ -79,6 +87,10 @@ same code through `capture_enabled()` (`cfg(test)`).
 
   Over any bound, the item is sent in today's shape under the new collector,
   with refusals = max(1, rows that lost identity).
+- A tagged item gets the same UTC lifecycle spelling (`source_started_at`,
+  `source_ended_at`, `source_last_activity_at`) that request-account
+  qualification gives every item it handles, which leaves new-collector items
+  alone. An item that cannot be tagged returns unchanged.
 
 ## Validation
 
@@ -100,15 +112,41 @@ same code through `capture_enabled()` (`cfg(test)`).
   - order-free hashing that still moves with the login;
   - both usage paths end to end;
   - unqualified items keeping today's bytes.
-- Equal-input observation, debug build, 2,000 responses with 64 markers:
+- Equal-input end-to-end comparison (debug build, synthetic: 2,000 responses,
+  2 logins, 64 markers, parsed once). Both paths start from the same parsed
+  items and the same loaded sidecar reports. The transcript is deleted first,
+  so neither path can re-read it. Legacy is today's request-account
+  qualification. Enabled is contract-5 evidence, tagging, then that same
+  qualification, then admission.
 
-  | Measure | Result |
-  |---|---|
-  | Marker capture | about 2 ms for 2,063 lines |
-  | Retained marker state | 6.6 KiB |
-  | Tagging | about the same cost as the parse |
+  | Measure | Legacy | Enabled |
+  |---|---|---|
+  | Wall time | about 143 ms | about 187 ms |
+  | Sidecar fingerprint checks (api, trace) | 2,000, 2,000 | 2,000, 2,000 |
+  | Allocations | 64,226 | 113,719 |
+  | Peak requested heap | 0.52 MB | 1.98 MB |
+  | Retained heap after | 31 B | 6.4 KB |
+  | Item payload | 6.7 KB | 13.8 KB |
 
-  Tagging is dominated by the same per-request sidecar fingerprint checks the
-  existing request-account qualification performs. Struct growth is 8 bytes
-  per item and accumulator. Released builds pay no runtime cost while emission
-  is off.
+  Marker capture during the parse adds about 2 ms, 573 allocations and
+  6.6 KB retained for 2,063 lines.
+
+  - Request-account qualification leaves the tagged item alone, and contract 5
+    validates each login once and reuses it. So enabled repeats no
+    fingerprint check.
+  - Tagging installs in place, without copying the item, and moves each
+    request's placement into its contribution.
+  - The remaining peak is the per-request contribution buffer (544 B per
+    request) plus the scan's own request maps. Folding contributions straight
+    into row groups would make it proportional to rows instead of requests.
+    That is a recorded follow-up.
+- With emission off, released builds still pay for:
+  - 8 B per `SnapshotItem` and accumulator (`claude_org_markers`, always
+    `None`);
+  - 40 B in `ScanIndex` for the census witness slot. Dark builds keep it
+    `None`: they neither compute nor persist a witness, and they clear one
+    left by an earlier build at the next Desktop sweep;
+  - an empty placement map in the reported-usage disposition and a `None`
+    check per rebuilt row;
+  - two constant-false branches.
+  These costs are small but not zero.

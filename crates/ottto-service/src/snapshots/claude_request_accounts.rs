@@ -219,7 +219,7 @@ pub(crate) fn apply_with_originals(
 
 // Preserve each original instant while using the backend's UTC wire spelling
 // for lifecycle fields. This changes no timestamp source or semantic hash epoch.
-fn normalize_activity(item: &mut SnapshotItem) -> bool {
+pub(super) fn normalize_activity(item: &mut SnapshotItem) -> bool {
     let mut changed = false;
     for value in [
         &mut item.source_started_at,

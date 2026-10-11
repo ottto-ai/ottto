@@ -11,7 +11,7 @@
 //! reproduces every row exactly; otherwise the item keeps today's path. It adds
 //! no transcript read, parse or retained state.
 
-use super::claude_request_accounts::local_subscription;
+use super::claude_request_accounts::{local_subscription, normalize_activity};
 use super::{
     activity_bucket_from_timestamp, build_row_identity, claude_snapshot_request_id_hashes,
     codex_identity_is_uuid_shaped, rfc3339_unix_seconds, row_key_from_model_usage,
@@ -448,16 +448,11 @@ pub(crate) fn apply(
         .filter(|identity| !matches!(identity, RowIdentity::Untagged))
         .count() as u64;
     if over_cap.is_empty() {
-        let mut tagged = item.clone();
-        install(
-            &mut tagged,
-            &evidence,
-            top_identities,
-            bucket_identities,
-            refusals,
-        );
-        if item_bytes(&tagged) <= MAX_ITEM_BYTES {
-            *item = tagged;
+        // In place: an over-size result is stripped below to the same
+        // fallback the untouched item would get, so no item copy is needed.
+        install(item, &evidence, top_identities, bucket_identities, refusals);
+        if item_bytes(item) <= MAX_ITEM_BYTES {
+            item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
             return Ok(Tagged::Sent { refusals });
         }
         over_cap.insert(OverCap::Bytes);
@@ -560,7 +555,6 @@ fn install(
         }
     }
     item.provenance.collector = COLLECTOR.to_string();
-    item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
 }
 
 fn set_row(
@@ -872,9 +866,16 @@ pub(crate) struct ScanEvidence<'a> {
     pub(crate) owners: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeTraceOwnershipEvidence>>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
-    /// Roots whose paired sidecars loaded complete in this pass: the only
-    /// writers that can still be flushing a young request.
-    pub(crate) healthy_roots: BTreeSet<String>,
+    /// Roots with a qualified witness that their telemetry writer is healthy
+    /// NOW, the precondition for `Refusal::Pending`. A complete paired-sidecar
+    /// load proves only what was already written, not a live writer, and no
+    /// existing qualified current-writer witness exists; production therefore
+    /// supplies none (pending is unproven; young missing requests stay missing)
+    /// until SESSION rules on one. Only tests can populate this.
+    pending_writer_witnesses: BTreeSet<String>,
+    /// The login of each unique telemetry row that passed `valid_login`,
+    /// checked once here (its fingerprint included) and reused by `classify`.
+    logins: BTreeMap<(&'a str, &'a str), &'a str>,
     /// (login, org) pairs proven by complete telemetry request identity.
     pub(crate) memberships: BTreeSet<(String, String)>,
     /// Desktop store logins per org, present only under a valid census witness.
@@ -892,12 +893,10 @@ impl<'a> ScanEvidence<'a> {
         api: &'a ClaudeLocalOtelLoadReport,
         trace: &'a ClaudeTraceOwnershipLoadReport,
         unhealthy_roots: BTreeSet<String>,
-        healthy_roots: BTreeSet<String>,
         desktop_census: Option<DesktopCensus>,
     ) -> Self {
         let mut evidence = Self {
             unhealthy_roots,
-            healthy_roots,
             desktop_census,
             ..Self::default()
         };
@@ -912,15 +911,18 @@ impl<'a> ScanEvidence<'a> {
         }
         // Only unique rows that pass the same integrity checks `classify`
         // applies may establish a (login, org) pair.
-        for (&(root, _), row) in &evidence.requests {
+        for (&key, row) in &evidence.requests {
             let Some(row) = row else { continue };
-            if let (Some(login), Some(org)) = (
-                valid_login(row, root),
-                row.request_identity
-                    .as_ref()
-                    .filter(|identity| identity.disposition == ClaudeIdentityDisposition::Complete)
-                    .and_then(|identity| organization_hash(identity).ok().flatten()),
-            ) {
+            let Some(login) = valid_login(row, key.0) else {
+                continue;
+            };
+            evidence.logins.insert(key, login);
+            if let Some(org) = row
+                .request_identity
+                .as_ref()
+                .filter(|identity| identity.disposition == ClaudeIdentityDisposition::Complete)
+                .and_then(|identity| organization_hash(identity).ok().flatten())
+            {
                 evidence.memberships.insert((login.to_string(), org));
             }
         }
@@ -934,6 +936,13 @@ impl<'a> ScanEvidence<'a> {
             }
         }
         evidence
+    }
+
+    /// Test-only stand-in for the unruled current-writer witness.
+    #[cfg(test)]
+    pub(crate) fn with_pending_writer_witnesses(mut self, roots: BTreeSet<String>) -> Self {
+        self.pending_writer_witnesses = roots;
+        self
     }
 }
 
@@ -1009,9 +1018,10 @@ pub(crate) struct RequestFacts<'a> {
 
 impl RequestFacts<'_> {
     /// Missing telemetry is pending only for this request's own young clock
-    /// and a healthy writer for its folder; never inferred from other requests.
+    /// and a witnessed healthy writer for its folder; never inferred from
+    /// other requests or from complete sidecar loads.
     fn telemetry_pending(&self, evidence: &ScanEvidence<'_>) -> bool {
-        if !evidence.healthy_roots.contains(self.root) {
+        if !evidence.pending_writer_witnesses.contains(self.root) {
             return false;
         }
         match (self.terminal_unix_seconds, self.scan_unix_seconds) {
@@ -1044,7 +1054,7 @@ pub(crate) fn classify(evidence: &ScanEvidence<'_>, facts: &RequestFacts<'_>) ->
             };
         }
     };
-    let Some(login) = valid_login(row, facts.root) else {
+    let Some(&login) = evidence.logins.get(&(facts.root, facts.request_id)) else {
         return Refused(Refusal::InvalidEvidence);
     };
     match evidence.owners.get(&(facts.root, facts.request_id)) {
@@ -1252,11 +1262,10 @@ const REPORTED: &str = "session_exclusive_reported_usage:v1";
 
 /// Transcript-path placements rebuilt from the owned occurrences the parser
 /// already retains. `None` when one cannot be placed the way rows were built.
-fn transcript_placements(item: &SnapshotItem) -> Option<Vec<Placement>> {
+fn transcript_placements(item: &SnapshotItem, mut place: impl FnMut(Placement)) -> Option<()> {
     if item.claude_usage_occurrences.len() != item.claude_usage_request_ids.len() {
         return None;
     }
-    let mut placements = Vec::with_capacity(item.claude_usage_occurrences.len());
     for (request_id, occurrence) in &item.claude_usage_occurrences {
         if occurrence.usage.is_zero() {
             continue;
@@ -1269,7 +1278,7 @@ fn transcript_placements(item: &SnapshotItem) -> Option<Vec<Placement>> {
             &occurrence.selector,
             occurrence.reasoning_effort.as_deref(),
         );
-        placements.push(Placement {
+        place(Placement {
             request_id: request_id.clone(),
             bucket_start,
             row_key,
@@ -1278,7 +1287,7 @@ fn transcript_placements(item: &SnapshotItem) -> Option<Vec<Placement>> {
             timestamp,
         });
     }
-    Some(placements)
+    Some(())
 }
 
 /// The request-owner root for an item, as D1 derives it.
@@ -1298,14 +1307,14 @@ fn owner_root(item: &SnapshotItem) -> Option<&str> {
 pub(crate) fn apply_scan(
     snapshots: &mut [SnapshotItem],
     evidence: &ScanEvidence<'_>,
-    placements: &BTreeMap<String, Vec<Placement>>,
+    mut placements: BTreeMap<String, Vec<Placement>>,
 ) -> ScanOutcome {
     let mut outcome = ScanOutcome::default();
     for item in snapshots {
         if item.provenance.collector != "claude_code_jsonl" {
             continue;
         }
-        match tag_item(item, evidence, placements) {
+        match tag_item(item, evidence, &mut placements) {
             Some(Ok(Tagged::Sent { .. })) => outcome.sent += 1,
             Some(Ok(Tagged::Fallback { .. })) => outcome.fallback += 1,
             Some(Err(_)) | None => outcome.ineligible += 1,
@@ -1317,7 +1326,7 @@ pub(crate) fn apply_scan(
 fn tag_item(
     item: &mut SnapshotItem,
     evidence: &ScanEvidence<'_>,
-    reported: &BTreeMap<String, Vec<Placement>>,
+    reported: &mut BTreeMap<String, Vec<Placement>>,
 ) -> Option<Result<Tagged, Ineligible>> {
     let root = owner_root(item)?.to_string();
     if !item.claude_context_curve_request_index_complete
@@ -1338,13 +1347,6 @@ fn tag_item(
     {
         return None;
     }
-    let owned;
-    let placements = if item.usage_accounting_contract.as_deref() == Some(REPORTED) {
-        reported.get(&item.source_session_id)?.as_slice()
-    } else {
-        owned = transcript_placements(item)?;
-        owned.as_slice()
-    };
     let desktop = item
         .origin
         .as_ref()
@@ -1352,14 +1354,30 @@ fn tag_item(
         == Some("claude-desktop");
     let scan_unix_seconds = rfc3339_unix_seconds(&item.collected_at);
     let markers = item.claude_org_markers.as_deref();
-    let contributions = placements
-        .iter()
-        .map(|placement| {
+    // Placements are consumed: each request's row data moves into its
+    // contribution, and transcript placements are never collected at all.
+    let reported = if item.usage_accounting_contract.as_deref() == Some(REPORTED) {
+        Some(reported.remove(&item.source_session_id)?)
+    } else {
+        None
+    };
+    let mut contributions = Vec::with_capacity(
+        reported
+            .as_ref()
+            .map_or(item.claude_usage_occurrences.len(), Vec::len),
+    );
+    let mut contribute = |placement: Placement| {
+        contributions.push({
             let (sequence, event_clock_complete) = placement.occurrence.unzip();
             let facts = RequestFacts {
                 root: &root,
                 source_session_id: &item.source_session_id,
                 request_id: &placement.request_id,
+                // Auxiliary (telemetry-only) rows carry `observed_at`, which
+                // v2 OTLP capture may have taken from the observer clock and
+                // does not record which; as in D1 they cannot qualify. The
+                // trace span start is event-origin but no existing rule
+                // qualifies it, and transcript clocks are not theirs to borrow.
                 terminal_unix_seconds: placement
                     .occurrence
                     .and_then(|_| rfc3339_unix_seconds(&placement.timestamp)),
@@ -1371,15 +1389,37 @@ fn tag_item(
                 desktop,
                 scan_unix_seconds,
             };
+            let identity = classify(evidence, &facts);
             Contribution {
-                bucket_start: placement.bucket_start.clone(),
-                row_key: placement.row_key.clone(),
-                usage: placement.usage.clone(),
-                identity: classify(evidence, &facts),
+                bucket_start: placement.bucket_start,
+                row_key: placement.row_key,
+                usage: placement.usage,
+                identity,
             }
-        })
-        .collect::<Vec<_>>();
-    Some(apply(item, &contributions))
+        });
+    };
+    match reported {
+        Some(placements) => placements.into_iter().for_each(&mut contribute),
+        None => transcript_placements(item, &mut contribute)?,
+    }
+    // D1 leaves new-collector items alone, so the backend UTC lifecycle
+    // spelling it applies to every item it qualifies happens here, inside the
+    // byte cap; an ineligible item returns to D1 exactly as it arrived.
+    let lifecycle = (
+        item.source_started_at.clone(),
+        item.source_ended_at.clone(),
+        item.source_last_activity_at.clone(),
+    );
+    normalize_activity(item);
+    let tagged = apply(item, &contributions);
+    if tagged.is_err() {
+        (
+            item.source_started_at,
+            item.source_ended_at,
+            item.source_last_activity_at,
+        ) = lifecycle;
+    }
+    Some(tagged)
 }
 
 crate::heap_layout_bound::fields!(OrgMarkers; entries, overflowed, context_digest, context_changed);

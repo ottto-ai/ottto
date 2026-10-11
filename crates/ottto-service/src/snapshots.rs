@@ -5016,9 +5016,23 @@ fn claude_trace_owner_session_id(root_session_id: &str, agent_id: &str) -> Strin
     format!("{root_session_id}_agent-{agent_id}")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of (api, trace) sidecar fingerprint checks on this thread.
+    static CLAUDE_EVIDENCE_FINGERPRINT_CHECKS: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn claude_evidence_fingerprint_checks() -> (u64, u64) {
+    CLAUDE_EVIDENCE_FINGERPRINT_CHECKS.with(std::cell::Cell::get)
+}
+
 fn claude_api_evidence_fingerprint_is_valid(
     row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
 ) -> bool {
+    #[cfg(test)]
+    CLAUDE_EVIDENCE_FINGERPRINT_CHECKS.with(|cell| cell.set((cell.get().0 + 1, cell.get().1)));
     let mut canonical = row.clone();
     canonical.fingerprint.clear();
     serde_json::to_vec(&canonical)
@@ -5031,6 +5045,8 @@ fn claude_api_evidence_fingerprint_is_valid(
 fn claude_trace_evidence_fingerprint_is_valid(
     row: &crate::claude_local_otel::ClaudeTraceOwnershipEvidence,
 ) -> bool {
+    #[cfg(test)]
+    CLAUDE_EVIDENCE_FINGERPRINT_CHECKS.with(|cell| cell.set((cell.get().0, cell.get().1 + 1)));
     let mut canonical = row.clone();
     canonical.fingerprint.clear();
     serde_json::to_vec(&canonical)
@@ -7589,10 +7605,16 @@ impl ClaudeTitleMetadata {
             );
         }
 
-        claude_request_identity::DesktopCensusWitness::retain_for_inventory(
-            &mut index.claude_desktop_census_witness,
-            store_dirs,
-        );
+        // The witness serves only contract 5; dark builds neither keep nor
+        // persist one.
+        if claude_request_identity::capture_enabled() {
+            claude_request_identity::DesktopCensusWitness::retain_for_inventory(
+                &mut index.claude_desktop_census_witness,
+                store_dirs,
+            );
+        } else {
+            index.claude_desktop_census_witness = None;
+        }
         let mut metadata = Self::default();
         let mut selection = BoundedPathSelection::new(
             index.claude_desktop_store_cursor.clone(),
@@ -7665,8 +7687,9 @@ impl ClaudeTitleMetadata {
             index.claude_desktop_census_witness = None;
         } else if sweep_complete {
             index.claude_desktop_identity_census_complete = true;
-            index.claude_desktop_census_witness =
-                now.map(|now| claude_request_identity::DesktopCensusWitness::new(now, store_dirs));
+            index.claude_desktop_census_witness = now
+                .filter(|_| claude_request_identity::capture_enabled())
+                .map(|now| claude_request_identity::DesktopCensusWitness::new(now, store_dirs));
         }
         metadata.original_identity_census_incomplete =
             !index.claude_desktop_identity_census_complete;

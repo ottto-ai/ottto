@@ -882,7 +882,7 @@ fn facts<'a>(request_id: &'a str, at: Option<u64>, marker: MarkerVerdict) -> Req
     }
 }
 
-fn healthy() -> BTreeSet<String> {
+fn root_set() -> BTreeSet<String> {
     BTreeSet::from([ROOT.to_string()])
 }
 
@@ -906,7 +906,7 @@ fn classify_follows_the_session_rulings() {
         .map(|id| complete_trace_row(ROOT, id, ""))
         .collect::<Vec<_>>();
     let (api, trace) = reports(vec![with_org, login_only, bad_org, dup.clone(), dup], trace);
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), healthy(), None);
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
     let at = Some(900_000);
     let login = Some("a".repeat(64));
     assert_eq!(
@@ -959,26 +959,36 @@ fn classify_follows_the_session_rulings() {
     );
 
     // No telemetry row: pending only for this request's own young clock with
-    // a healthy writer; otherwise missing and open to transcript evidence.
+    // a witnessed healthy writer; otherwise missing and open to transcript
+    // evidence. Production has no qualified writer witness (SESSION ruling
+    // pending), so a young missing request is missing there.
     assert_eq!(
         identity::classify(
             &evidence,
+            &facts("req_new", Some(999_900), MarkerVerdict::None)
+        ),
+        RequestIdentity::Missing
+    );
+    let witnessed = ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
+        .with_pending_writer_witnesses(root_set());
+    assert_eq!(
+        identity::classify(
+            &witnessed,
             &facts("req_new", Some(999_900), MarkerVerdict::None)
         ),
         RequestIdentity::Refused(Refusal::Pending)
     );
     assert_eq!(
         identity::classify(
-            &evidence,
+            &witnessed,
             &facts("req_old", Some(999_000), MarkerVerdict::None)
         ),
         RequestIdentity::Missing
     );
-    let unhealthy_writer = ScanEvidence::new(&api, &trace, BTreeSet::new(), BTreeSet::new(), None);
     assert_eq!(
         identity::classify(
-            &unhealthy_writer,
-            &facts("req_new", Some(999_900), MarkerVerdict::None)
+            &evidence,
+            &facts("req_old", Some(999_000), MarkerVerdict::None)
         ),
         RequestIdentity::Missing
     );
@@ -1008,7 +1018,7 @@ fn classify_follows_the_session_rulings() {
         );
     }
     // Unreadable stronger evidence never falls through to transcript bases.
-    let unreadable = ScanEvidence::new(&api, &trace, healthy(), BTreeSet::new(), None);
+    let unreadable = ScanEvidence::new(&api, &trace, root_set(), None);
     assert_eq!(
         identity::classify(
             &unreadable,
@@ -1052,7 +1062,6 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
         &api,
         &trace,
         BTreeSet::new(),
-        BTreeSet::new(),
         Some(census(999_500, &[LOGIN_A])),
     );
     assert_eq!(desktop(&fresh, true), sole);
@@ -1065,7 +1074,6 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
         &api,
         &trace,
         BTreeSet::new(),
-        BTreeSet::new(),
         Some(census(998_000, &[LOGIN_A])),
     );
     assert_eq!(
@@ -1077,11 +1085,10 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
         &api,
         &trace,
         BTreeSet::new(),
-        BTreeSet::new(),
         Some(census(999_500, &[LOGIN_A, "b"])),
     );
     assert_eq!(desktop(&two, true), org_only);
-    let none = ScanEvidence::new(&api, &trace, BTreeSet::new(), BTreeSet::new(), None);
+    let none = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
     assert_eq!(desktop(&none, true), org_only);
 }
 
@@ -1286,9 +1293,9 @@ fn transcript_path_tags_parsed_requests_from_their_own_telemetry() {
         .map(|n| complete_trace_row(&root, &format!("req_{n}"), ""))
         .collect::<Vec<_>>();
     let (api, trace) = reports(api, trace);
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), healthy(), None);
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
     let before = items[0].clone();
-    let outcome = identity::apply_scan(&mut items, &evidence, &BTreeMap::new());
+    let outcome = identity::apply_scan(&mut items, &evidence, BTreeMap::new());
     assert_eq!(
         outcome,
         identity::ScanOutcome {
@@ -1314,6 +1321,61 @@ fn transcript_path_tags_parsed_requests_from_their_own_telemetry() {
         identity::TELEMETRY_LOGIN
     );
     assert_eq!(item.request_identity_refusals, 0);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// D1 leaves new-collector items alone, so contract 5 must apply the same
+/// lifecycle spelling D1 applies; the lifecycle component may not drift.
+#[test]
+fn contract5_lifecycle_matches_the_legacy_qualification_path() {
+    let (dir, root, mut items) = claude_account_family_fixture();
+    items.truncate(1);
+    items[0].source_started_at = Some("2026-08-02T10:00:00.500+03:00".to_string());
+    items[0].source_ended_at = Some("2026-08-02T10:30:00+03:00".to_string());
+    items[0].source_last_activity_at = Some("2026-08-02T10:29:59.000-00:00".to_string());
+    let api = (1..=4)
+        .map(|n| signed(complete_api_row(&root, &format!("req_{n}"), n, 10, 10, 0)))
+        .collect::<Vec<_>>();
+    let trace = (1..=4)
+        .map(|n| complete_trace_row(&root, &format!("req_{n}"), ""))
+        .collect::<Vec<_>>();
+    let (api, trace) = reports(api, trace);
+    let original = items.clone();
+    let mut legacy = items.clone();
+    claude_request_accounts::apply(&mut legacy, &api, &trace);
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let outcome = identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+    assert_eq!(outcome.sent, 1, "{outcome:?}");
+    claude_request_accounts::apply(&mut items, &api, &trace);
+    let (old, new) = (&legacy[0], &items[0]);
+    assert_eq!(new.provenance.collector, identity::COLLECTOR);
+    assert_eq!(
+        old.source_started_at.as_deref(),
+        Some("2026-08-02T07:00:00.5Z")
+    );
+    for (old, new) in [
+        (&old.source_started_at, &new.source_started_at),
+        (&old.source_ended_at, &new.source_ended_at),
+        (&old.source_last_activity_at, &new.source_last_activity_at),
+    ] {
+        assert_eq!(old, new);
+    }
+    let lifecycle = |item: &SnapshotItem| {
+        snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, item)["lifecycle_activity"]
+            .clone()
+    };
+    assert_eq!(lifecycle(old), lifecycle(new));
+    assert_eq!(
+        new.snapshot_fingerprint,
+        snapshot_fingerprint(SnapshotSource::ClaudeCode, new)
+    );
+    // An item whose rows contract 5 cannot reproduce returns to D1 unchanged.
+    let mut untagged = original;
+    untagged[0].usage_buckets[0].model_usage[0].request_count += 1;
+    let before = serde_json::to_vec(&untagged).unwrap();
+    let outcome = identity::apply_scan(&mut untagged, &evidence, BTreeMap::new());
+    assert_eq!(outcome.ineligible, 1, "{outcome:?}");
+    assert_eq!(serde_json::to_vec(&untagged).unwrap(), before);
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -1371,10 +1433,10 @@ fn reported_path_tags_from_recorded_placements() {
         ));
     }
     let (api, trace) = reports(api, trace);
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), healthy(), None);
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
     let placements = BTreeMap::from([(item.source_session_id.clone(), placements)]);
     let mut items = vec![item];
-    let outcome = identity::apply_scan(&mut items, &evidence, &placements);
+    let outcome = identity::apply_scan(&mut items, &evidence, placements);
     assert_eq!(outcome.sent, 1, "{outcome:?}");
     let parts = items[0].usage_buckets[0].model_usage[0]
         .identity_parts
@@ -1391,9 +1453,9 @@ fn reported_path_tags_from_recorded_placements() {
 fn unreadable_sidecars_refuse_and_unqualified_items_keep_todays_bytes() {
     let (dir, _root, items) = claude_account_family_fixture();
     let (api, trace) = reports(Vec::new(), Vec::new());
-    let unreadable = ScanEvidence::new(&api, &trace, healthy(), BTreeSet::new(), None);
+    let unreadable = ScanEvidence::new(&api, &trace, root_set(), None);
     let mut refused = items.clone();
-    let outcome = identity::apply_scan(&mut refused, &unreadable, &BTreeMap::new());
+    let outcome = identity::apply_scan(&mut refused, &unreadable, BTreeMap::new());
     assert_eq!(
         outcome,
         identity::ScanOutcome {
@@ -1417,7 +1479,7 @@ fn unreadable_sidecars_refuse_and_unqualified_items_keep_todays_bytes() {
         item.claude_context_curve_request_index_complete = false;
     }
     let before = serde_json::to_vec(&unqualified).unwrap();
-    let outcome = identity::apply_scan(&mut unqualified, &unreadable, &BTreeMap::new());
+    let outcome = identity::apply_scan(&mut unqualified, &unreadable, BTreeMap::new());
     assert_eq!(
         outcome,
         identity::ScanOutcome {
@@ -1429,12 +1491,16 @@ fn unreadable_sidecars_refuse_and_unqualified_items_keep_todays_bytes() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// Equal-input resource observation (synthetic, bounded): one 2,000-response
-/// transcript over 10 hours with 2 logins and 64 marker lines. Emission is off
-/// in released builds, so production pays none of this; these are the costs a
-/// later flip would add on the same input.
+/// Equal-input end-to-end resource comparison (synthetic, bounded): one
+/// 2,000-response transcript over 10 hours with 2 logins and 64 marker lines,
+/// parsed once. Legacy = today's D1 qualification; enabled = contract-5
+/// evidence + tagging + D1 + admission, as the gated scan runs them, on clones
+/// of the same parsed items and the same already-loaded sidecar reports. The
+/// transcript is deleted first, so neither path can re-read it. Released
+/// builds run only the legacy path; marker capture is test-only until the flip.
 #[test]
-fn equal_input_resource_observation() {
+fn equal_input_resource_comparison() {
+    use crate::retry_allocation_probe::measure;
     let dir = temp_dir("claude-request-identity-resources");
     let path = dir.join(format!("{ROOT}.jsonl"));
     let mut text = String::new();
@@ -1455,21 +1521,23 @@ fn equal_input_resource_observation() {
         text.push('\n');
     }
     fs::write(&path, &text).unwrap();
+    // Parse-time capture, the only per-line work contract 5 adds.
     let started = std::time::Instant::now();
-    let mut markers = None;
-    for (position, line) in lines.iter().enumerate() {
-        identity::note_marker_line(&mut markers, line, position as u64);
-    }
+    let (markers, capture) = measure(|| {
+        let mut markers = None;
+        for (position, line) in lines.iter().enumerate() {
+            identity::note_marker_line(&mut markers, line, position as u64);
+        }
+        markers
+    });
     let capture_ns = started.elapsed().as_nanos();
     // Layout accounting is optional on unvalidated toolchains; 0 = unmeasured.
     let marker_heap =
         crate::heap_layout_bound::completed_bound(markers.as_ref().unwrap(), usize::MAX)
             .unwrap_or(0);
-    let started = std::time::Instant::now();
-    let mut items =
-        parse_claude_code_jsonl_file(&path, "2026-08-02T11:00:00Z", "fp".into()).unwrap();
-    let parse_ns = started.elapsed().as_nanos();
-    assert_eq!(items[0].request_count, 2_000);
+    let parsed = parse_claude_code_jsonl_file(&path, "2026-08-02T11:00:00Z", "fp".into()).unwrap();
+    fs::remove_file(&path).unwrap();
+    assert_eq!(parsed[0].request_count, 2_000);
     let api = (0..2_000_u64)
         .map(|n| {
             let mut row = complete_api_row(ROOT, &format!("req_{n}"), n % 60, 10 + n % 7, 1, 0);
@@ -1483,26 +1551,70 @@ fn equal_input_resource_observation() {
         .map(|n| complete_trace_row(ROOT, &format!("req_{n}"), ""))
         .collect::<Vec<_>>();
     let (api, trace) = reports(api, trace);
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), healthy(), None);
-    let old_bytes = identity::item_bytes(&items[0]);
-    let started = std::time::Instant::now();
-    let outcome = identity::apply_scan(&mut items, &evidence, &BTreeMap::new());
-    let tag_ns = started.elapsed().as_nanos();
-    let new_bytes = identity::item_bytes(&items[0]);
+    let legacy_path = |items: &mut Vec<SnapshotItem>| {
+        claude_request_accounts::apply(items, &api, &trace);
+    };
+    let enabled_path = |items: &mut Vec<SnapshotItem>| {
+        let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        let outcome = identity::apply_scan(items, &evidence, BTreeMap::new());
+        let mut qualification = claude_request_accounts::apply(items, &api, &trace);
+        for item in items.iter() {
+            qualification.mixed.admit_request_identity(item);
+        }
+        assert_eq!(outcome.sent, 1, "{outcome:?}");
+    };
+    let run = |path: &dyn Fn(&mut Vec<SnapshotItem>)| {
+        let mut items = parsed.clone();
+        let checks = claude_evidence_fingerprint_checks();
+        let started = std::time::Instant::now();
+        let ((), allocation) = measure(|| path(&mut items));
+        let elapsed = started.elapsed().as_nanos();
+        let after = claude_evidence_fingerprint_checks();
+        let payload = serde_json::to_vec(&items[0]).unwrap().len();
+        (
+            items,
+            elapsed,
+            (after.0 - checks.0, after.1 - checks.1),
+            allocation,
+            payload,
+        )
+    };
+    // Warm both once so neither pays first-touch costs alone.
+    let _ = (run(&legacy_path), run(&enabled_path));
+    let (legacy, legacy_ns, legacy_checks, legacy_alloc, legacy_payload) = run(&legacy_path);
+    let (enabled, enabled_ns, enabled_checks, enabled_alloc, enabled_payload) =
+        run(&enabled_path);
     eprintln!(
-        "request identity resources: lines={} capture_ns={capture_ns} parse_ns={parse_ns} \
-         marker_heap_bytes={marker_heap} tag_ns={tag_ns} item_bytes_old={old_bytes} \
-         item_bytes_new={new_bytes} buckets={} outcome={outcome:?} \
-         size_delta_item={} size_delta_index_witness={}",
+        "request identity resources: lines={} capture_ns={capture_ns} \
+         capture_allocations={} capture_retained={} marker_heap_bytes={marker_heap} \
+         legacy_ns={legacy_ns} enabled_ns={enabled_ns} \
+         fingerprint_checks_api_trace legacy={legacy_checks:?} enabled={enabled_checks:?} \
+         allocations legacy={} enabled={} requested_peak legacy={} enabled={} \
+         retained legacy={} enabled={} payload_bytes legacy={legacy_payload} \
+         enabled={enabled_payload} buckets={} size_of_item_field={} \
+         size_of_index_witness={}",
         lines.len(),
-        items[0].usage_buckets.len(),
+        capture.allocations,
+        capture.requested_live,
+        legacy_alloc.allocations,
+        enabled_alloc.allocations,
+        legacy_alloc.requested_peak,
+        enabled_alloc.requested_peak,
+        legacy_alloc.requested_live,
+        enabled_alloc.requested_live,
+        enabled[0].usage_buckets.len(),
         std::mem::size_of::<Option<Box<identity::OrgMarkers>>>(),
         std::mem::size_of::<Option<identity::DesktopCensusWitness>>(),
     );
-    assert_eq!(outcome.sent, 1);
+    assert_ne!(legacy[0].provenance.collector, identity::COLLECTOR);
+    assert_eq!(enabled[0].provenance.collector, identity::COLLECTOR);
+    // Each sidecar row's fingerprint is checked once per path: contract 5
+    // reuses its own login validation, and D1 leaves the tagged item alone.
+    assert_eq!(legacy_checks, (2_000, 2_000));
+    assert_eq!(enabled_checks, legacy_checks);
     assert!(marker_heap < 16 * 1024, "{marker_heap}");
-    assert!(new_bytes <= identity::MAX_ITEM_BYTES);
-    assert_eq!(items[0].request_count, 2_000, "count conservation");
+    assert!(enabled_payload <= identity::MAX_ITEM_BYTES);
+    assert_eq!(enabled[0].request_count, 2_000, "count conservation");
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -1511,7 +1623,7 @@ fn equal_input_resource_observation() {
 #[test]
 fn transcript_bases_need_the_original_clock() {
     let (api, trace) = reports(Vec::new(), Vec::new());
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), BTreeSet::new(), None);
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
     let mut carried = facts(
         "req_old",
         Some(999_000),
@@ -1547,7 +1659,7 @@ fn only_intact_rows_establish_login_org_membership() {
             complete_trace_row(ROOT, "req_login", ""),
         ],
     );
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), healthy(), None);
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
     assert!(evidence.memberships.is_empty());
     assert_eq!(
         identity::classify(&evidence, &facts("req_forged", Some(900_000), MarkerVerdict::None)),
@@ -1597,8 +1709,8 @@ fn bound_sessions_admit_this_scans_contract5_body_without_rewriting_the_owner() 
         .map(|n| complete_trace_row(&root, &format!("req_{n}"), ""))
         .collect::<Vec<_>>();
     let (api, trace) = reports(api, trace);
-    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), healthy(), None);
-    identity::apply_scan(&mut items, &evidence, &BTreeMap::new());
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    identity::apply_scan(&mut items, &evidence, BTreeMap::new());
     assert!(items[0].usage_buckets[0].model_usage[0].identity_parts.is_some());
     let owner_key = sha256_hex(&["session_owner:v1", "machine", &items[0].source_session_id]);
     let bound = |index: &mut ScanIndex| {
