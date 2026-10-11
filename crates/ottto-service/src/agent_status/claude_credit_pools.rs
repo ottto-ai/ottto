@@ -388,7 +388,7 @@ fn claude_reader_cannot_see_grants(balance: &AgentCreditBalance) -> bool {
 /// grants has an unavailable list (no grants, no `remaining`, no
 /// `grant_count`, `status` unknown) with `grants_unavailable_cause: reader`.
 /// Readiness stays as read. Idempotent; any other balance is left as is.
-fn claude_mark_reader_unavailable(balance: &mut AgentCreditBalance) {
+pub(super) fn claude_mark_reader_unavailable(balance: &mut AgentCreditBalance) {
     if !claude_reader_cannot_see_grants(balance) {
         return;
     }

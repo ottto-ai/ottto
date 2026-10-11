@@ -6103,6 +6103,9 @@ fn stale_local_claude_quota_snapshot(
         window.freshness = AgentQuotaWindowFreshness::Stale;
     }
     for balance in &mut snapshot.credit_balances {
+        // A reader-blind row kept from an older daemon (complete, 0) is shown
+        // in its §11.10 shape, never as no resets.
+        claude_credit_pools::claude_mark_reader_unavailable(balance);
         balance.freshness = AgentQuotaWindowFreshness::Stale;
     }
     snapshot
@@ -10253,9 +10256,10 @@ const CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_CODE: &str =
 /// Fixed, value-free text: the same words reach the slot status and upload.
 const CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_MESSAGE: &str = "Claude's saved-reset reading had no recognizable saved-reset section; this account uses the plain reading for 24 hours.";
 
-const CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE: &str = "claude_oauth_usage_rate_limited";
-/// Fixed, value-free slot-status and upload text per read; the time is in
-/// `retry_after`.
+/// Local status only: the upload drops it (`ottto_protocol`).
+const CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE: &str =
+    ottto_protocol::CLAUDE_OAUTH_USAGE_RATE_LIMITED_DIAGNOSTIC_CODE;
+/// Fixed, value-free slot-status text per read; the time is in `retry_after`.
 const CLAUDE_OAUTH_USAGE_RATE_LIMITED_USAGE_MESSAGE: &str =
     "Claude asked Ottto to wait before the next usage read; Ottto checks again after the retry time.";
 const CLAUDE_OAUTH_USAGE_RATE_LIMITED_SAVED_RESETS_MESSAGE: &str =
@@ -17455,6 +17459,69 @@ mod tests {
             with_expired.iter().any(claude_custom_slot_needs_attention),
             "an expired sign-in must still reach the operator"
         );
+    }
+
+    /// Contract v2.2 §11.10: a reader-blind saved-resets row an older daemon
+    /// kept as a complete, empty list is carried forward in the unavailable
+    /// shape, never as no resets.
+    #[test]
+    fn retained_slot_snapshot_shows_an_older_reader_blind_row_as_unavailable() {
+        let account_hash = "a".repeat(64);
+        let organization_hash = "b".repeat(64);
+        let now = current_unix_seconds();
+        let now_text = rfc3339_from_unix_seconds(now).expect("now");
+        let mut snapshot = local_meter_fixture(&account_hash, &organization_hash);
+        snapshot.captured_at = now_text.clone();
+        snapshot.observed_at = Some(now_text.clone());
+        snapshot.credit_balances.push(AgentCreditBalance {
+            name: "reset_bank".to_string(),
+            status: AgentCreditBalanceStatus::Exhausted,
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            unit: AgentCreditBalanceUnit::Resets,
+            remaining: Some(0),
+            observed_at: Some(now_text.clone()),
+            grant_count: Some(0),
+            grants: Some(Vec::new()),
+            grants_state: Some(ottto_protocol::CreditGrantsState::Complete),
+            grants_observed_at: Some(now_text.clone()),
+            kind: Some(ottto_protocol::CreditBalanceKind::SavedResets),
+            eligible: Some(false),
+            at_limit: Some(false),
+            ineligible_reason: Some("surface".to_string()),
+            ..Default::default()
+        });
+        let previous = ClaudeConfigSlotCollectionStatusV1 {
+            last_full_quota_read_at: Some(now_text),
+            has_account_windows: true,
+            has_scoped_limits: true,
+            has_credit_balances: true,
+            quota_snapshot: Some(snapshot),
+            ..Default::default()
+        };
+        let mut status = ClaudeConfigSlotCollectionStatusV1::default();
+        retain_previous_complete_claude_read(&mut status, previous);
+        let retained = status.quota_snapshot.expect("retained snapshot");
+        let saved = retained
+            .credit_balances
+            .iter()
+            .find(|balance| balance.kind == Some(ottto_protocol::CreditBalanceKind::SavedResets))
+            .expect("saved resets kept");
+        assert_eq!(
+            saved.grants_unavailable_cause,
+            Some(ottto_protocol::CreditGrantsUnavailableCause::Reader)
+        );
+        assert!(ottto_protocol::credit_grants_unavailable_cause_allowed(
+            saved
+        ));
+        assert_eq!(saved.status, AgentCreditBalanceStatus::Unknown);
+        assert_eq!(saved.freshness, AgentQuotaWindowFreshness::Stale);
+        assert_eq!(saved.ineligible_reason.as_deref(), Some("surface"));
+        // Every other row is kept as it was, only marked stale.
+        assert!(retained
+            .credit_balances
+            .iter()
+            .filter(|balance| balance.kind != Some(ottto_protocol::CreditBalanceKind::SavedResets))
+            .all(|balance| balance.grants_unavailable_cause.is_none()));
     }
 
     #[test]
@@ -33166,6 +33233,56 @@ exit 0
                 .iter()
                 .any(|diagnostic| diagnostic.code == "claude_saved_reset_variant_unrecognized"));
         }
+    }
+
+    fn respond_rate_limited(_endpoint: &str) -> Result<Value, u16> {
+        Err(429)
+    }
+
+    /// The 429 diagnostic is local only: local status (snapshots and the
+    /// registered slot) keeps it, the upload never carries it.
+    #[test]
+    #[serial]
+    fn rate_limited_diagnostic_stays_local_and_is_never_uploaded() {
+        let fixture = ClaudeBindingFixture::new("rate-limited-local");
+        fixture.sign_in(TEAM_PREMIUM);
+        let slot_id = fixture.register();
+        fixture.collect();
+        let team = ClaudeBindingFixture::hashes(TEAM_PREMIUM);
+        claude_credit_pools::write_claude_read_schedule(
+            &claude_oauth_usage_account_state_dir(&team.0, &team.1),
+            &claude_credit_pools::ClaudeReadSchedule {
+                last_plain_read_at: Some(current_unix_seconds() - 3_600),
+                ..Default::default()
+            },
+        )
+        .expect("write schedule");
+        let _ = fs::remove_file(claude_oauth_usage_cache_path(&team.0, &team.1));
+        *CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = Some(respond_rate_limited);
+        let snapshots = fixture.collect();
+        *CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = None;
+        let local = serde_json::to_string(&snapshots).expect("local status");
+        let slot = fixture.slot(&slot_id);
+        assert!(
+            local.contains(CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE),
+            "local snapshots keep the 429 diagnostic"
+        );
+        assert!(
+            slot.collection
+                .quota_check_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE),
+            "slot status keeps the 429 diagnostic"
+        );
+        let upload = serde_json::to_string(
+            &snapshots
+                .into_iter()
+                .map(|snapshot| snapshot.redacted_for_backend())
+                .collect::<Vec<_>>(),
+        )
+        .expect("serialize upload");
+        assert!(!upload.contains(CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE));
+        assert!(!upload.contains("Claude asked Ottto to wait"));
     }
 
     fn respond_variant_reader_blind(_endpoint: &str) -> Result<Value, u16> {

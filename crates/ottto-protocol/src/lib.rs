@@ -1273,6 +1273,7 @@ impl AgentStatusSnapshot {
         self.diagnostics = self
             .diagnostics
             .drain(..)
+            .filter(|diagnostic| !is_local_only_diagnostic(&diagnostic.code))
             .map(redact_diagnostic_for_backend)
             .collect();
 
@@ -1763,11 +1764,12 @@ pub enum CreditGrantsUnavailableCause {
 
 /// The only balance shape that may carry `grants_unavailable_cause` (quota
 /// contract v2.2 §11.10): saved resets with `grants_state: unavailable` and
-/// neither `remaining` nor `grant_count`.
+/// no `grants`, `remaining` or `grant_count`.
 pub fn credit_grants_unavailable_cause_allowed(credit: &AgentCreditBalance) -> bool {
     credit.kind == Some(CreditBalanceKind::SavedResets)
         && credit.unit == AgentCreditBalanceUnit::Resets
         && credit.grants_state == Some(CreditGrantsState::Unavailable)
+        && credit.grants.is_none()
         && credit.remaining.is_none()
         && credit.grant_count.is_none()
 }
@@ -4645,6 +4647,16 @@ fn redact_plan_observation_for_backend(
     observation.billing_identity_evidence =
         safe_optional_text(observation.billing_identity_evidence.take());
     observation
+}
+
+/// A Claude usage read Claude answered with 429: names the read and the
+/// wait. Local status only (Companion and CLI); never uploaded, so a per-429
+/// time never becomes a backend row.
+pub const CLAUDE_OAUTH_USAGE_RATE_LIMITED_DIAGNOSTIC_CODE: &str = "claude_oauth_usage_rate_limited";
+
+/// Diagnostics kept in local status and dropped from the backend upload.
+fn is_local_only_diagnostic(code: &str) -> bool {
+    code == CLAUDE_OAUTH_USAGE_RATE_LIMITED_DIAGNOSTIC_CODE
 }
 
 fn redact_diagnostic_for_backend(mut diagnostic: AgentStatusDiagnostic) -> AgentStatusDiagnostic {
@@ -8005,9 +8017,10 @@ mod tests {
 
     #[test]
     fn grants_unavailable_cause_is_dropped_from_every_other_shape() {
-        let shapes: [BalanceShape; 7] = [
+        let shapes: [BalanceShape; 8] = [
             ("remaining", |b| b.remaining = Some(0)),
             ("grant_count", |b| b.grant_count = Some(0)),
+            ("grants", |b| b.grants = Some(Vec::new())),
             ("complete", |b| {
                 b.grants_state = Some(CreditGrantsState::Complete);
                 b.grants = Some(Vec::new());

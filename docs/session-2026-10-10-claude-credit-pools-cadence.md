@@ -44,9 +44,10 @@ adapter module, `agent_status/claude_credit_pools.rs`.
   answer kept as a complete, empty list) is re-sent and served in the new
   shape, and a reader-blind reading never takes a stored list. The field is
   optional (omitted when absent, an unknown value decodes as absent), reaches
-  the local status snapshots under the same name, and the upload copy drops it
-  from any balance that is not saved resets with an unavailable list and no
-  `remaining` or `grant_count`.
+  the local status snapshots under the same name (a retained older slot
+  snapshot is shown in the new shape too), and the upload copy drops it from
+  any balance that is not saved resets with an unavailable list and no
+  `grants`, `remaining` or `grant_count`.
 
 `cedar_ember` is only populated by the saved-reset read variant
 (`?cedar_ember=1&skip_spend=1`), which is enabled and self-checks every
@@ -134,7 +135,9 @@ extra calls:
   `claude_oauth_usage_rate_limited`, naming the read and the wait ("Claude
   asked Ottto to wait until HH:MM UTC before the next saved-resets read"),
   with the deadline in `retry_after`; slot status keeps a fixed per-read text
-  and the deadline. It reports only: no extra call and no backoff change;
+  and the deadline. It is local status only (Companion and CLI): the upload
+  drops it, so a per-429 time never becomes a backend row. It reports only:
+  no extra call and no backoff change;
 - `CLAUDE_ACTIVITY_CADENCE_ENABLED` is a kill switch (default on): off, every
   binding uses today's 55-65 min gate with no active boost or idle slowdown.
 
