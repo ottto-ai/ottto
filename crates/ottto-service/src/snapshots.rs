@@ -36711,16 +36711,33 @@ mod tests {
             exact_session_account_hash(&legacy).as_deref(),
             Some(known.as_str())
         );
-        let mut untouched_root = items[0].clone();
-        let original = serde_json::to_value(&untouched_root).unwrap();
-        assert!(claude_request_accounts::apply(
-            std::slice::from_mut(&mut untouched_root),
-            &Default::default(),
-            &Default::default()
-        )
-        .coverage
-        .is_empty());
-        assert_eq!(serde_json::to_value(&untouched_root).unwrap(), original);
+        let mut unknown_root = items[0].clone();
+        let original = serde_json::to_value(&unknown_root).unwrap();
+        assert_eq!(
+            claude_request_accounts::apply(
+                std::slice::from_mut(&mut unknown_root),
+                &Default::default(),
+                &Default::default()
+            )
+            .coverage,
+            [claude_request_accounts::Coverage::MissingRequests]
+        );
+        assert_eq!(
+            unknown_root.provenance.collector,
+            claude_request_accounts::UNKNOWN
+        );
+        for field in [
+            "request_count",
+            "model_usage",
+            "usage_buckets",
+            "cost",
+            "session_account_evidence",
+        ] {
+            assert_eq!(
+                serde_json::to_value(&unknown_root).unwrap()[field],
+                original[field]
+            );
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 

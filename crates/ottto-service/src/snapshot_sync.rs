@@ -3539,8 +3539,15 @@ fn finish_sync_source(
     let mut claude_authority_disposition =
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
     if source == SnapshotSource::ClaudeCode {
-        let (disposition, census_withheld, _) =
+        let evidence_started = Instant::now();
+        let (disposition, census_withheld, stats) =
             apply_claude_local_evidence_to_scan(support_dir, &mut scan_result, &mut index);
+        if let Ok(counts) = serde_json::to_string(&stats) {
+            eprintln!(
+                "local snapshot sync: claude local evidence duration_ms={} counts={counts}",
+                evidence_started.elapsed().as_millis()
+            );
+        }
         claude_authority_disposition = disposition;
         if census_withheld {
             backfill_succeeded = false;
@@ -4503,6 +4510,8 @@ pub struct ClaudeLocalEvidenceStats {
     pub explicit_owned_start_session_count: usize,
     pub session_exclusive_reported_usage_count: usize,
     pub effort_evidence_load_failed: bool,
+    pub own_request_complete_root_count: usize,
+    pub own_request_unknown_root_count: usize,
 }
 
 pub(crate) fn apply_claude_local_evidence_to_scan(
@@ -4641,6 +4650,19 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         &originals,
     );
     let _account_coverage = qualification.coverage;
+    for item in &scan_result.snapshots {
+        if !item.source_session_id.contains("_agent-") {
+            match item.provenance.collector.as_str() {
+                crate::snapshots::claude_request_accounts::COMPLETE => {
+                    stats.own_request_complete_root_count += 1
+                }
+                crate::snapshots::claude_request_accounts::UNKNOWN => {
+                    stats.own_request_unknown_root_count += 1
+                }
+                _ => {}
+            }
+        }
+    }
     disposition.mixed_uploads = qualification.mixed;
     stats.identity_complete_session_count = scan_result
         .snapshots
