@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 614,
-  "content_sha256": "d5ef9ca252c357b5895b0e889d2ab0c07a32325dbdf6b18f2664c20f493342c1",
+  "content_sha256": "f7ae23fb553d1849b68e77b0530b1d53c346955ac7d4cc0bcd2f50b9e6f3f6b5",
   "files": [
     {
       "executable": false,
@@ -2547,8 +2547,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-11-claude-request-identity-rows.md",
-      "sha256": "ae4978f1b0c383ccfb98d2de687f764e69d60de4f8f85e8e1b4dd7ed78a90c07",
-      "size_bytes": 8925
+      "sha256": "2c06a777af08091c252b11f7a58dcb126ec72c9d997d46887c5887f5708a5e24",
+      "size_bytes": 10937
     },
     {
       "executable": false,
@@ -4301,7 +4301,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-11T22:36:42+00:00",
+  "generated_at": "2026-10-11T22:41:45+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 615,
   "public_roots": [
@@ -4340,5 +4340,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "21b7f20eb1a25cd9ee22e091faed656de8278f72"
+  "source_commit": "827d912c75c9e1600758e12cb4eaa31b2f46ab23"
 }
