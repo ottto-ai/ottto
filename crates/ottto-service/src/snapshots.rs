@@ -11847,6 +11847,9 @@ impl OwnedSourceScan {
                                 // at capture/send/checkpoint, after all page replays.
                                 let source_file_fingerprint =
                                     candidate.source_file_fingerprint.clone();
+                                if let Some(context) = sampling.as_mut() {
+                                    context.efficiency.unsampled();
+                                }
                                 active_file = Some(OwnedActiveFile {
                                     sampling: None,
                                     previous_snapshot_fingerprint: index
@@ -11922,7 +11925,18 @@ impl OwnedSourceScan {
                 }
             }
             if let Some(mut active) = active_file.take() {
-                match active.parser.step() {
+                let step = active.parser.step();
+                if let Some(context) = sampling.as_mut() {
+                    context.efficiency.progress(
+                        active
+                            .parser
+                            .reader
+                            .acquisition
+                            .as_ref()
+                            .map(|plan| plan.metrics()),
+                    );
+                }
+                match step {
                     Ok(false) => {
                         active_file = Some(active);
                         pending!();
@@ -11975,6 +11989,9 @@ impl OwnedSourceScan {
                         .as_ref()
                         .is_some_and(codex_file_join::TierReplay::has_protected_tiers)
                 }) {
+                    if let Some(context) = sampling.as_mut() {
+                        context.efficiency.replay();
+                    }
                     // Native finish compares the reopened descriptor to the captured
                     // identity, so replacement during fallback cannot publish.
                     let reopened = open_candidate_file(source, &mut active.candidate.clone());
@@ -12001,19 +12018,32 @@ impl OwnedSourceScan {
                         .files
                         .get(&acquisition.key)
                         .and_then(|entry| entry.audit_obligation(sampled_scan::now_seconds()));
-                    let Ok(mode) = parser.prepare_acquisition(
+                    let mut guard_progress = 0;
+                    let mode = match parser.prepare_acquisition_observed(
                         None,
                         &acquisition.scope,
                         debt,
                         sampled_scan::now_seconds(),
-                    ) else {
-                        census.record_unreadable(UnreadableCause::Reduction, 1);
-                        pending!();
+                        &mut guard_progress,
+                    ) {
+                        Ok(mode) => mode,
+                        Err(_) => {
+                            if let Some(context) = sampling.as_mut() {
+                                context.efficiency.preparation_failed(guard_progress);
+                            }
+                            census.record_unreadable(UnreadableCause::Reduction, 1);
+                            pending!();
+                        }
                     };
                     acquisition.mode = mode;
                     if let Some(context) = sampling.as_mut() {
                         context.priority_replays += 1;
                         context.record_mode(mode, acquisition.audit_due);
+                        if let Some(plan) = parser.reader.acquisition.as_ref() {
+                            context.efficiency.prepared(plan.metrics());
+                        } else {
+                            context.efficiency.progress(None);
+                        }
                     }
                     active.parser = parser;
                     active_file = Some(active);
@@ -12140,6 +12170,7 @@ impl OwnedSourceScan {
                         .as_deref()
                         .map(resolve_codex_identity)
                 };
+                let efficiency_qualified = completed_acquisition.is_some();
                 let mut parsed_file = match parser.finish(
                     &candidate.opened_object_identity,
                     &candidate.path,
@@ -12155,6 +12186,9 @@ impl OwnedSourceScan {
                         pending!();
                     }
                 };
+                if let Some(context) = sampling.as_mut() {
+                    context.efficiency.finish(efficiency_qualified);
+                }
                 let finalization_charge =
                     crate::heap_layout_bound::completed_bound(&parsed_file, copy_budget);
                 if finalization_charge.is_none() {
@@ -12903,7 +12937,7 @@ impl OwnedSourceScan {
                         },
                     ),
                 };
-                let sampled_acquisition = sampling.as_ref().map(|context| {
+                let sampled_acquisition = sampling.as_mut().map(|context| {
                     let audit_now = sampled_scan::now_seconds();
                     let pending = index
                         .files
@@ -12923,6 +12957,7 @@ impl OwnedSourceScan {
                         .max()
                         .unwrap_or(0);
                     crate::local_resource_diagnostics::ReadCounts {
+                        acquisition_efficiency: context.efficiency.complete(),
                         full_selections: context.full_files,
                         tail_selections: context.tail_files,
                         unchanged_selections: context.unchanged_files,
@@ -13164,14 +13199,18 @@ impl OwnedSourceScan {
                             index,
                         );
                         let old = retained.filter(|_| allow_sample);
-                        let mode = match parser.prepare_acquisition(
+                        context.efficiency.begin();
+                        let mut guard_progress = 0;
+                        let mode = match parser.prepare_acquisition_observed(
                             old,
                             &scope,
                             debt,
                             sampled_scan::now_seconds(),
+                            &mut guard_progress,
                         ) {
                             Ok(mode) => mode,
                             Err(_) => {
+                                context.efficiency.preparation_failed(guard_progress);
                                 census.record_unreadable(UnreadableCause::Reduction, 1);
                                 pending!();
                             }
@@ -13187,6 +13226,11 @@ impl OwnedSourceScan {
                             .as_ref()
                             .and_then(|plan| plan.metrics().audit_due);
                         context.record_mode(mode, audit_due);
+                        if let Some(plan) = parser.reader.acquisition.as_ref() {
+                            context.efficiency.prepared(plan.metrics());
+                        } else {
+                            context.efficiency.progress(None);
+                        }
                         file_sampling = Some(sampled_scan::Active {
                             key,
                             scope,
@@ -13194,6 +13238,11 @@ impl OwnedSourceScan {
                             audit_due,
                         });
                     }
+                }
+            }
+            if file_sampling.is_none() {
+                if let Some(context) = sampling.as_mut() {
+                    context.efficiency.unsampled();
                 }
             }
             active_file = Some(OwnedActiveFile {
