@@ -1,7 +1,7 @@
 //! Frozen whole-file reader oracle for parser representation parity.
 //! Baseline preserves the pre-streaming implementation; test-only.
 use super::super::*;
-fn read_jsonl(path: &Path) -> std::io::Result<Vec<Value>> {
+pub(super) fn read_jsonl(path: &Path) -> std::io::Result<Vec<Value>> {
     let text = fs::read_to_string(path)?;
     let mut out = Vec::new();
     for raw in text.lines() {

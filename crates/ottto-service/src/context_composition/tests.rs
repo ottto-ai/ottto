@@ -1146,7 +1146,7 @@ fn real_workspace_parity_dump() {
                 .and_then(|m| m.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
             let mut r = WorkspaceReport::new(wide_window());
-            let lines = read_jsonl(file).unwrap().len();
+            let lines = parity_baseline::read_jsonl(file).unwrap().len();
             parse(file, &mut r, file_date(mtime));
             let shell = r.category_totals(Category::ShellOutput);
             let harness = r.category_totals(Category::HarnessAttachments);

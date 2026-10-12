@@ -152,6 +152,53 @@ fn late_utf8_and_read_errors_do_not_commit_partial_facts() {
 }
 
 #[cfg(unix)]
+#[test]
+fn replacement_during_read_refuses_new_report_and_preserves_cache() {
+    use std::os::unix::ffi::OsStrExt;
+    // A FIFO provides a deterministic seam: the writer cannot open until the
+    // collector has checked the original metadata and opens the reader. The
+    // pathname is replaced before the writer closes, hence before reader EOF.
+    let directory = crate::test_scratch::private_dir("composition-read-fence");
+    let path = directory.join("fixture.jsonl");
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let scan = cache_scan(&path);
+    let signature = test_signature(&scan);
+    let cache_file = directory.join("cache.json");
+    write_cache(&cache_file, &test_cache(&scan, wide_window()));
+    let original_cache = fs::read(&cache_file).unwrap();
+    let writer_path = path.clone();
+    let old_path = directory.join("opened-fifo");
+    let moved_path = old_path.clone();
+    let writer = std::thread::spawn(move || {
+        let mut stream = fs::OpenOptions::new()
+            .write(true)
+            .open(&writer_path)
+            .unwrap();
+        stream
+            .write_all(b"{\"type\":\"attachment\",\"attachment\":{\"content\":\"valid\"}}\n")
+            .unwrap();
+        fs::rename(&writer_path, &moved_path).unwrap();
+        fs::write(&writer_path, b"replacement").unwrap();
+        drop(stream);
+    });
+    assert!(build_report_for_scan(
+        &scan,
+        &signature,
+        SnapshotSource::ClaudeCode,
+        wide_window(),
+        Instant::now() + Duration::from_secs(30)
+    )
+    .is_none());
+    writer.join().unwrap();
+    assert_eq!(fs::read(&cache_file).unwrap(), original_cache);
+    for file in [path, old_path, cache_file] {
+        fs::remove_file(file).unwrap();
+    }
+    fs::remove_dir(directory).unwrap();
+}
+
+#[cfg(unix)]
 fn cpu_seconds() -> f64 {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     assert_eq!(
@@ -173,7 +220,11 @@ fn resource_sample() {
         .into_iter()
         .find(|c| c.name == name)
         .unwrap();
-    let path = temp_path(case.name);
+    // The directory is isolated per subprocess but the basename is identical:
+    // missing provider session metadata legitimately falls back to that name.
+    // Keep the identity input equal instead of normalizing session hashes away.
+    let directory = crate::test_scratch::private_dir("composition-resource-sample");
+    let path = directory.join(format!("{}.jsonl", case.name));
     fs::write(&path, &case.bytes).unwrap();
     let mut report = WorkspaceReport::new(wide_window());
     READ_BYTES.with(|cell| cell.set(0));
@@ -216,6 +267,7 @@ fn resource_sample() {
         })
     );
     fs::remove_file(path).unwrap();
+    fs::remove_dir(directory).unwrap();
 }
 
 #[cfg(unix)]
