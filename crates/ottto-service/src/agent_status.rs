@@ -1558,6 +1558,7 @@ fn collect_codex_status_snapshots(
     for index in winning_by_binding.into_values() {
         snapshots.push(candidates[index].snapshot.clone());
     }
+    append_failed_default_codex_snapshot(&mut snapshots, &candidates);
     append_configured_codex_unavailable_snapshots(
         &mut snapshots,
         &candidates,
@@ -1660,6 +1661,42 @@ fn append_configured_codex_unavailable_snapshots(
             snapshot.credit_balances = credit_balances;
         }
         snapshots.push(snapshot);
+    }
+}
+
+/// Upload the default home's failed-probe snapshot when it kept the hashes of
+/// its last validated account ([`keep_failed_default_codex_binding`]) and no
+/// other snapshot already represents that account. Without this, a batch that
+/// has any other row never carried the default account's degraded reading.
+/// The candidate's binding stays empty, so transcript attribution is unchanged.
+fn append_failed_default_codex_snapshot(
+    snapshots: &mut Vec<AgentStatusSnapshot>,
+    candidates: &[CodexSlotCandidate],
+) {
+    for candidate in candidates {
+        if candidate.slot.ownership != CodexAccountSlotOwnershipV1::Default
+            || candidate.binding.is_some()
+            || !codex_probe_failed_only(&candidate.status, &candidate.snapshot)
+        {
+            continue;
+        }
+        let Some(kept) = candidate.snapshot.account.as_ref().and_then(|account| {
+            account
+                .account_identifier_hash
+                .as_ref()
+                .zip(account.organization_identifier_hash.as_ref())
+        }) else {
+            continue;
+        };
+        let represented = snapshots.iter().any(|snapshot| {
+            snapshot.account.as_ref().is_some_and(|account| {
+                account.account_identifier_hash.as_ref() == Some(kept.0)
+                    && account.organization_identifier_hash.as_ref() == Some(kept.1)
+            })
+        });
+        if !represented {
+            snapshots.push(candidate.snapshot.clone());
+        }
     }
 }
 
@@ -1817,11 +1854,11 @@ fn codex_source_health_snapshot(
             source_health_snapshot = healthy_anchor.snapshot.clone();
         }
     }
+    // A default login whose usage probe failed is still a working login; a
+    // signed-out or otherwise failed one is not, and keeps its own status.
+    let current_login_available = source_health_snapshot.status == AgentStatusState::Available
+        || (default_probe_failed && source_health_snapshot.status == AgentStatusState::Degraded);
     if custom_needs_attention {
-        // A default login whose usage probe failed is still a working login.
-        let current_login_available = source_health_snapshot.status == AgentStatusState::Available
-            || (default_probe_failed
-                && source_health_snapshot.status == AgentStatusState::Degraded);
         if current_login_available {
             source_health_snapshot.status = AgentStatusState::Degraded;
         }
@@ -1836,7 +1873,7 @@ fn codex_source_health_snapshot(
                 AgentDiagnosticSeverity::Warning,
                 "One or more durable Codex account connections need local attention; healthy accounts continue collecting independently.",
             ));
-    } else if usage_read_failed {
+    } else if usage_read_failed && current_login_available {
         source_health_snapshot.status = AgentStatusState::Degraded;
         source_health_snapshot
             .diagnostics
@@ -22873,6 +22910,87 @@ for line in sys.stdin:
         assert!(codex_source_health_codes(&health)
             .contains(&"codex_registered_slot_needs_attention_current_available"));
         assert!(!codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
+    }
+
+    #[test]
+    fn a_signed_out_default_is_not_hidden_behind_a_retrying_read() {
+        let mut default = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            "default_user",
+            "default_workspace",
+            1,
+        );
+        default.snapshot.status = AgentStatusState::AuthRequired;
+        default.status.state = CodexAccountSlotCollectionStateV1::NeedsLogin;
+        let failed = codex_failed_probe_candidate(
+            "/tmp/codex-health-test-signed-out-default",
+            "managed_user",
+            "managed_workspace",
+        );
+
+        let health = codex_source_health_snapshot(
+            &[default, failed],
+            "2026-08-23T00:00:00Z",
+            "2026-08-23T00:15:00Z",
+        );
+
+        assert_eq!(health.status, AgentStatusState::AuthRequired);
+        assert!(!codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
+    }
+
+    /// The default home's failed probe kept account A's hashes (and its stale
+    /// reading); a managed slot uploads account B.
+    fn failed_default_with_kept_hashes(account_hash: &str) -> CodexSlotCandidate {
+        let mut default = codex_failed_probe_candidate(
+            "/tmp/codex-upload-test-failed-default",
+            account_hash,
+            "default_workspace",
+        );
+        default.slot.slot_id = "default".to_string();
+        default.slot.ownership = CodexAccountSlotOwnershipV1::Default;
+        default.slot.registered_binding = None;
+        default.snapshot.status = AgentStatusState::Degraded;
+        let account = default.snapshot.account.as_mut().expect("account");
+        account.account_identifier_hash = Some(account_hash.to_string());
+        account.organization_identifier_hash = Some("default_workspace".to_string());
+        default
+    }
+
+    #[test]
+    fn a_failed_default_with_kept_hashes_is_uploaded_beside_other_accounts() {
+        let default = failed_default_with_kept_hashes("default_user");
+        assert!(default.binding.is_none(), "no transcript authority");
+        let expected = default.snapshot.clone();
+        let managed = codex_candidate_for_test(
+            "codex_slot_b",
+            CodexAccountSlotOwnershipV1::Managed,
+            "managed_user",
+            "managed_workspace",
+            5,
+        );
+        let mut snapshots = vec![managed.snapshot.clone()];
+        append_failed_default_codex_snapshot(&mut snapshots, &[default, managed]);
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[1], expected);
+
+        // Already represented (the same account read fresh elsewhere): no
+        // second row.
+        let mut snapshots = vec![expected.clone()];
+        append_failed_default_codex_snapshot(
+            &mut snapshots,
+            &[failed_default_with_kept_hashes("default_user")],
+        );
+        assert_eq!(snapshots.len(), 1);
+
+        // Without kept hashes nothing is added.
+        let mut unkeyed = failed_default_with_kept_hashes("default_user");
+        let account = unkeyed.snapshot.account.as_mut().expect("account");
+        account.account_identifier_hash = None;
+        account.organization_identifier_hash = None;
+        let mut snapshots = Vec::new();
+        append_failed_default_codex_snapshot(&mut snapshots, &[unkeyed]);
+        assert!(snapshots.is_empty());
     }
 
     #[test]

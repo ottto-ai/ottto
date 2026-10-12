@@ -48,6 +48,10 @@ meters. Now:
   authentication); otherwise it has no hashes, as before;
 - with kept hashes it carries that binding's last reading, marked stale, under
   the same 6-hour cap;
+- with kept hashes the snapshot is uploaded even when other accounts' rows
+  are in the batch (unless a row already represents the same account);
+  before, the default home's failed reading was sent only when the batch was
+  otherwise empty;
 - the slot's binding stays empty: kept hashes never become transcript or
   live-meter authority.
 
@@ -63,7 +67,8 @@ connection that "needs attention", which the local status reported as
 usage check failed; retrying". A sign-out, identity mismatch or other real
 connection problem still raises `codex_registered_slot_needs_attention*` as
 before; a default home whose only problem is a failed probe still counts as a
-working current login there.
+working current login there. A signed-out default login keeps its own status
+and is never reported as a retrying read.
 
 This updates the 2026-09-30 note on configured subscription availability: a
 placeholder may now carry its own binding's last reading, marked stale. It
@@ -110,7 +115,10 @@ the development machine for load.
 - health: a failed probe gives `codex_usage_read_retrying` (healthy with a
   warning, problem code `unknown`), never `needs attention`; a real sign-out
   next to a failed default probe still needs attention with the current login
-  available; a missing executable is not transient;
+  available; a signed-out default is not hidden behind a retrying read; a
+  missing executable is not transient;
+- upload batch: a failed default with kept hashes is uploaded beside another
+  account's row, not twice for the same account, and not without kept hashes;
 - the store: stale marking, the cap, binding isolation, replacement and the
   64-binding eviction;
 - the log line format and the stage and kind of every producer message.
