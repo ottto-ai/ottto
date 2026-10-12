@@ -80,10 +80,18 @@ status document):
   slot;
 - without a kept binding it has no `quota_snapshot` and its state is as
   before;
-- if another registered slot carries the same account and workspace, the
-  failed slot sends no reading and no hashes (two slots with one binding must
-  be one anchor plus declared duplicates);
+- if any other slot, the default login included, carries the same account and
+  workspace, the failed slot sends no reading and no hashes. Two registered
+  slots with one binding must be one anchor plus declared duplicates; and a
+  client builds one card per account from every slot of that account, where an
+  `unknown` slot would hide the meters another slot read fresh (for example
+  the default login of the same account);
 - any other `quota_snapshot` outside the rule is not sent.
+
+Shipped Mac apps decode this shape but do not show the reading: a
+non-actionable `unknown` slot suppresses its card's meters and actions, so the
+account reads as temporarily unavailable until the next good read. Showing the
+stale reading needs a Mac app change (follow-up, outside this repository).
 
 This is the wire shape only. Inside the daemon the slot stays
 `identity_unknown` with no binding: health, target coverage, upload and
@@ -177,13 +185,13 @@ Synthetic, no provider calls.
   plan words; after its credential names another account, no hashes and
   nothing shown;
 - local status contract: the status document the daemon emits is checked
-  against a Rust port of the Mac app's decoder rules
-  (`CodexAccountsProtocol.swift`, `CodexAccountSlotCollectionStatus.init(from:)`
-  and `CodexAccountsStatus.init(from:)`, lines cited in the test) for a failed
-  registered slot with a kept binding (`unknown`, hashes, stale reading),
-  without one (no reading), next to another slot of the same account (gives
-  way), and a failed default home; the shape before this rule is refused by
-  the same oracle;
+  against a Rust port, by behaviour, of the shipped Mac app's Codex accounts
+  rules (slot decoding, shared bindings, and the account card rule) for a
+  failed registered slot with a kept binding (`unknown`, hashes, stale
+  reading), without one (no reading), next to another registered slot of the
+  same account (gives way), next to a fresh default login of the same account
+  (gives way; the default keeps its fresh meters), and a failed default home;
+  the shape before these rules is refused by the same oracle;
 - the credential claim: equals the validated binding, is absent for an
   inconsistent credential, and an identity still needs provider
   authentication;
