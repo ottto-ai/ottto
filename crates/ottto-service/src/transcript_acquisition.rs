@@ -196,6 +196,42 @@ pub(crate) struct ReadMetrics {
     pub(crate) native_bytes: u64,
     pub(crate) sample_bytes: usize,
     pub(crate) audit_due: Option<u64>,
+    pub(crate) mode: ReadMode,
+    pub(crate) source_bytes: u64,
+    pub(crate) start_offset: u64,
+}
+
+struct GuardProgress<'a> {
+    bytes: usize,
+    observed: &'a mut usize,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for ReadMetrics {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            native_bytes,
+            sample_bytes,
+            audit_due,
+            mode,
+            source_bytes,
+            start_offset,
+        } = self;
+        let _ = (
+            native_bytes,
+            sample_bytes,
+            audit_due,
+            mode,
+            source_bytes,
+            start_offset,
+        );
+        c.add(0)
+    }
+}
+impl Drop for GuardProgress<'_> {
+    fn drop(&mut self) {
+        *self.observed = self.bytes;
+    }
 }
 
 /// FD stability is additional to the caller's existing safe-open/path/dependency
@@ -244,6 +280,7 @@ fn sample_at(file: &mut File, offset: u64, expected: &[u8], count: &mut usize) -
 impl ReadPlan {
     /// Full decisions reset only transient reduction. Durable output/ACK state is
     /// untouched. A full audit debt is cleared only after native completion below.
+    #[cfg(test)]
     pub(crate) fn prepare(
         file: &mut File,
         checkpoint: Option<&Checkpoint>,
@@ -251,9 +288,24 @@ impl ReadPlan {
         durable_debt: Option<AuditDebt>,
         now: u64,
     ) -> io::Result<Self> {
+        Self::prepare_observed(file, checkpoint, scope, durable_debt, now, &mut 0)
+    }
+
+    pub(crate) fn prepare_observed(
+        file: &mut File,
+        checkpoint: Option<&Checkpoint>,
+        scope: &Scope,
+        durable_debt: Option<AuditDebt>,
+        now: u64,
+        observed_guard_bytes: &mut usize,
+    ) -> io::Result<Self> {
+        *observed_guard_bytes = 0;
+        let mut progress = GuardProgress {
+            bytes: 0,
+            observed: observed_guard_bytes,
+        };
         let stamp = FileStamp::capture(file.metadata()?)?;
         let debt = earlier_debt(durable_debt, checkpoint.and_then(Checkpoint::audit_debt));
-        let mut guard_bytes_read = 0;
         let clock_changed = checkpoint.is_some_and(|old| now < old.last_full_verified_unix_seconds)
             || debt.is_some_and(|d| {
                 now.checked_add(AUDIT_INTERVAL_SECONDS)
@@ -278,13 +330,13 @@ impl ReadPlan {
                 ReadMode::Full(FullReason::SameSizeEdit)
             } else if stamp == old.stamp && old.samples.sealed_offset == stamp.length {
                 ReadMode::Unchanged
-            } else if !sample_at(file, 0, &old.samples.head, &mut guard_bytes_read)? {
+            } else if !sample_at(file, 0, &old.samples.head, &mut progress.bytes)? {
                 ReadMode::Full(FullReason::HeadChanged)
             } else if !sample_at(
                 file,
                 old.samples.sealed_offset - old.samples.boundary.len() as u64,
                 &old.samples.boundary,
-                &mut guard_bytes_read,
+                &mut progress.bytes,
             )? {
                 ReadMode::Full(FullReason::BoundaryChanged)
             } else {
@@ -349,7 +401,7 @@ impl ReadPlan {
             last_full_verified_unix_seconds: checkpoint
                 .map_or(now, |c| c.last_full_verified_unix_seconds),
             debt,
-            guard_bytes_read,
+            guard_bytes_read: progress.bytes,
             pending_record: None,
         })
     }
@@ -368,6 +420,9 @@ impl ReadPlan {
 
     pub(crate) fn metrics(&self) -> ReadMetrics {
         ReadMetrics {
+            mode: self.mode,
+            source_bytes: self.stamp.length,
+            start_offset: self.start_offset,
             native_bytes: self
                 .pending_record
                 .as_ref()
@@ -823,6 +878,40 @@ mod tests {
         assert_eq!(p.samples.sealed_offset, 0);
         assert!(p.observe_complete_records(b"one\ntwo\n").is_err());
         assert_eq!(p.samples.sealed_offset, 0);
+    }
+
+    #[test]
+    fn observed_guard_progress_and_partial_eof_keep_actual_file_denominator() {
+        let f = Fixture::new(b"one\n");
+        let cp = initial(&f, 0);
+        f.append(b"partial");
+        let mut file = f.open();
+        let mut guards = usize::MAX;
+        let mut plan =
+            ReadPlan::prepare_observed(&mut file, Some(&cp), &scope(), None, 1, &mut guards)
+                .unwrap();
+        assert_eq!(plan.mode(), ReadMode::Tail);
+        assert_eq!(guards, 8);
+        let mut suffix = Vec::new();
+        file.read_to_end(&mut suffix).unwrap();
+        plan.observe_record_fragment(&suffix, false).unwrap();
+        let metrics = plan.metrics();
+        assert_eq!(metrics.source_bytes, 11);
+        assert_eq!(metrics.start_offset, 4);
+        assert_eq!(metrics.native_bytes, 7);
+        assert_eq!(plan.samples.sealed_offset, 4);
+        // An error after guard progress still returns that progress without any logging.
+        let mut observed = 0;
+        let failed: io::Result<()> = (|| {
+            let mut progress = GuardProgress {
+                bytes: 0,
+                observed: &mut observed,
+            };
+            progress.bytes = 23;
+            Err(io::Error::other("synthetic failure"))
+        })();
+        assert!(failed.is_err());
+        assert_eq!(observed, 23);
     }
 
     #[test]

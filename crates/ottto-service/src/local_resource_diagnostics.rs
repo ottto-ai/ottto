@@ -185,6 +185,342 @@ pub(crate) fn codex_census_fence(
 #[derive(Serialize)]
 struct EmptyCounts {}
 
+// Process-lifetime gaps are never drained by an individual page. Drop only
+// updates atomics; there is no drop-time log, lock, allocation or syscall.
+struct AbandonedPages {
+    count: std::sync::atomic::AtomicU64,
+    overflow: std::sync::atomic::AtomicBool,
+}
+impl AbandonedPages {
+    const fn new() -> Self {
+        Self {
+            count: std::sync::atomic::AtomicU64::new(0),
+            overflow: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    fn note(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self
+            .count
+            .fetch_update(Relaxed, Relaxed, |n| n.checked_add(1))
+            .is_err()
+        {
+            self.overflow.store(true, Relaxed);
+        }
+    }
+    fn value(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = self.count.load(Relaxed);
+        (!self.overflow.load(Relaxed)).then_some(n)
+    }
+}
+static ABANDONED: [AbandonedPages; 4] = [const { AbandonedPages::new() }; 4];
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(crate) struct EfficiencyMode {
+    operations: u64,
+    full_equivalent_bytes: u64,
+    native_bytes: u64,
+    guard_bytes: u64,
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct AcquisitionEfficiency {
+    version: u8,
+    paired_totals_valid: bool,
+    page_coverage_complete: bool,
+    full: EfficiencyMode,
+    tail: EfficiencyMode,
+    unchanged: EfficiencyMode,
+    attempts: u64,
+    superseded_attempts: u64,
+    unpaired_operations: u64,
+    unpaired_observed_native_bytes: u64,
+    unpaired_observed_guard_bytes: u64,
+    unknown_progress_operations: u64,
+    unsampled_operations: u64,
+    audit_full_operations: u64,
+    abandoned_pages_at_start: Option<u64>,
+    abandoned_pages_at_emit: Option<u64>,
+}
+impl Default for AcquisitionEfficiency {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            paired_totals_valid: true,
+            page_coverage_complete: true,
+            full: EfficiencyMode::default(),
+            tail: EfficiencyMode::default(),
+            unchanged: EfficiencyMode::default(),
+            attempts: 0,
+            superseded_attempts: 0,
+            unpaired_operations: 0,
+            unpaired_observed_native_bytes: 0,
+            unpaired_observed_guard_bytes: 0,
+            unknown_progress_operations: 0,
+            unsampled_operations: 0,
+            audit_full_operations: 0,
+            abandoned_pages_at_start: None,
+            abandoned_pages_at_emit: None,
+        }
+    }
+}
+fn checked_add(total: &mut u64, n: u64, valid: &mut bool) {
+    if let Some(sum) = total.checked_add(n) {
+        *total = sum;
+    } else {
+        *valid = false;
+    }
+}
+
+#[derive(Default)]
+struct ReadOperation {
+    current: Option<crate::transcript_acquisition::ReadMetrics>,
+    native: u64,
+    guards: u64,
+    known: bool,
+}
+impl ReadOperation {
+    fn charge_current(&mut self) {
+        if let Some(m) = self.current.take() {
+            checked_add(&mut self.native, m.native_bytes, &mut self.known);
+            checked_add(&mut self.guards, m.sample_bytes as u64, &mut self.known);
+        }
+    }
+}
+
+// One operation slot follows the page's one active native file across moves
+// and protected-tier replay. This owner cannot be cloned.
+pub(crate) struct EfficiencyPage {
+    source_slot: usize,
+    totals: AcquisitionEfficiency,
+    active: Option<ReadOperation>,
+    armed: bool,
+}
+impl EfficiencyPage {
+    pub(crate) fn new(source: &str) -> Self {
+        let source_slot = match Source::from_slug(source) {
+            Source::ClaudeCode => 0,
+            Source::Codex => 1,
+            Source::Pi => 2,
+            Source::Unknown => 3,
+        };
+        Self {
+            source_slot,
+            totals: AcquisitionEfficiency {
+                abandoned_pages_at_start: ABANDONED[source_slot].value(),
+                ..AcquisitionEfficiency::default()
+            },
+            active: None,
+            armed: true,
+        }
+    }
+    pub(crate) fn begin(&mut self) {
+        self.finish(false);
+        self.active = Some(ReadOperation {
+            known: true,
+            ..ReadOperation::default()
+        });
+    }
+    pub(crate) fn prepared(&mut self, metrics: crate::transcript_acquisition::ReadMetrics) {
+        checked_add(
+            &mut self.totals.attempts,
+            1,
+            &mut self.totals.paired_totals_valid,
+        );
+        if let Some(op) = &mut self.active {
+            if op.current.is_some() {
+                op.known = false;
+                op.charge_current();
+            }
+            op.current = Some(metrics);
+        } else {
+            self.totals.page_coverage_complete = false;
+        }
+    }
+    pub(crate) fn progress(&mut self, metrics: Option<crate::transcript_acquisition::ReadMetrics>) {
+        if let Some(op) = &mut self.active {
+            match (op.current.as_ref(), metrics) {
+                (Some(old), Some(next))
+                    if old.mode == next.mode
+                        && old.source_bytes == next.source_bytes
+                        && old.start_offset == next.start_offset
+                        && next.native_bytes >= old.native_bytes =>
+                {
+                    op.current = Some(next)
+                }
+                _ => op.known = false,
+            }
+        }
+    }
+    pub(crate) fn replay(&mut self) {
+        if let Some(op) = &mut self.active {
+            op.charge_current();
+        }
+        checked_add(
+            &mut self.totals.superseded_attempts,
+            1,
+            &mut self.totals.paired_totals_valid,
+        );
+    }
+    pub(crate) fn preparation_failed(&mut self, guards: usize) {
+        checked_add(
+            &mut self.totals.attempts,
+            1,
+            &mut self.totals.paired_totals_valid,
+        );
+        if let Some(op) = &mut self.active {
+            checked_add(&mut op.guards, guards as u64, &mut op.known);
+        }
+        self.finish(false);
+    }
+    pub(crate) fn unsampled(&mut self) {
+        self.finish(false);
+        checked_add(
+            &mut self.totals.unsampled_operations,
+            1,
+            &mut self.totals.paired_totals_valid,
+        );
+        self.totals.page_coverage_complete = false;
+    }
+    pub(crate) fn finish(&mut self, qualified: bool) {
+        use crate::transcript_acquisition::ReadMode;
+        let Some(mut op) = self.active.take() else {
+            return;
+        };
+        let last = op.current;
+        op.charge_current();
+        if !op.known {
+            self.totals.paired_totals_valid = false;
+        }
+        let eligible = last.filter(|m| {
+            qualified
+                && op.known
+                && match m.mode {
+                    ReadMode::Unchanged => m.native_bytes == 0,
+                    ReadMode::Full(_) => m.start_offset == 0 && m.native_bytes == m.source_bytes,
+                    ReadMode::Tail => {
+                        m.source_bytes.checked_sub(m.start_offset) == Some(m.native_bytes)
+                    }
+                }
+        });
+        if let Some(m) = eligible {
+            let bucket = match m.mode {
+                ReadMode::Full(_) => &mut self.totals.full,
+                ReadMode::Tail => &mut self.totals.tail,
+                ReadMode::Unchanged => &mut self.totals.unchanged,
+            };
+            let baseline = if m.mode == ReadMode::Unchanged {
+                0
+            } else {
+                m.source_bytes
+            };
+            checked_add(
+                &mut bucket.operations,
+                1,
+                &mut self.totals.paired_totals_valid,
+            );
+            checked_add(
+                &mut bucket.full_equivalent_bytes,
+                baseline,
+                &mut self.totals.paired_totals_valid,
+            );
+            checked_add(
+                &mut bucket.native_bytes,
+                op.native,
+                &mut self.totals.paired_totals_valid,
+            );
+            checked_add(
+                &mut bucket.guard_bytes,
+                op.guards,
+                &mut self.totals.paired_totals_valid,
+            );
+            if matches!(m.mode, ReadMode::Full(_)) && m.audit_due.is_some() {
+                checked_add(
+                    &mut self.totals.audit_full_operations,
+                    1,
+                    &mut self.totals.paired_totals_valid,
+                );
+            }
+        } else {
+            self.totals.page_coverage_complete = false;
+            checked_add(
+                &mut self.totals.unpaired_operations,
+                1,
+                &mut self.totals.paired_totals_valid,
+            );
+            if !op.known {
+                checked_add(
+                    &mut self.totals.unknown_progress_operations,
+                    1,
+                    &mut self.totals.paired_totals_valid,
+                );
+            }
+            checked_add(
+                &mut self.totals.unpaired_observed_native_bytes,
+                op.native,
+                &mut self.totals.paired_totals_valid,
+            );
+            checked_add(
+                &mut self.totals.unpaired_observed_guard_bytes,
+                op.guards,
+                &mut self.totals.paired_totals_valid,
+            );
+        }
+    }
+    pub(crate) fn complete(&mut self) -> AcquisitionEfficiency {
+        self.finish(false);
+        self.armed = false;
+        self.totals.abandoned_pages_at_emit = ABANDONED[self.source_slot].value();
+        if self.totals.abandoned_pages_at_start != self.totals.abandoned_pages_at_emit {
+            self.totals.page_coverage_complete = false;
+        }
+        let mut native = self.totals.unpaired_observed_native_bytes;
+        let mut guards = self.totals.unpaired_observed_guard_bytes;
+        let mut baseline = 0;
+        for mode in [&self.totals.full, &self.totals.tail, &self.totals.unchanged] {
+            checked_add(
+                &mut baseline,
+                mode.full_equivalent_bytes,
+                &mut self.totals.paired_totals_valid,
+            );
+            checked_add(
+                &mut native,
+                mode.native_bytes,
+                &mut self.totals.paired_totals_valid,
+            );
+            checked_add(
+                &mut guards,
+                mode.guard_bytes,
+                &mut self.totals.paired_totals_valid,
+            );
+        }
+        if native.checked_add(guards).is_none() {
+            self.totals.paired_totals_valid = false;
+        }
+        if self.totals.abandoned_pages_at_start.is_none()
+            || self.totals.abandoned_pages_at_emit.is_none()
+        {
+            self.totals.paired_totals_valid = false;
+        }
+        self.totals
+    }
+}
+impl Drop for EfficiencyPage {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(counter) = ABANDONED.get(self.source_slot) {
+                counter.note();
+            }
+        }
+    }
+}
+// All fields are inline diagnostics; the static atomics own no heap. Exhaustive
+// field coverage keeps these counters inside existing requested-layout budgets.
+crate::heap_layout_bound::fields!(EfficiencyMode; operations, full_equivalent_bytes, native_bytes, guard_bytes);
+crate::heap_layout_bound::fields!(AcquisitionEfficiency; version, paired_totals_valid, page_coverage_complete, full, tail, unchanged, attempts, superseded_attempts, unpaired_operations, unpaired_observed_native_bytes, unpaired_observed_guard_bytes, unknown_progress_operations, unsampled_operations, audit_full_operations, abandoned_pages_at_start, abandoned_pages_at_emit);
+crate::heap_layout_bound::fields!(ReadOperation; current, native, guards, known);
+crate::heap_layout_bound::fields!(EfficiencyPage; source_slot, totals, active, armed);
+
 #[derive(Debug, Serialize)]
 pub(crate) struct CollectionCounts {
     pub(crate) scanned_files: usize,
@@ -196,6 +532,7 @@ pub(crate) struct CollectionCounts {
 }
 #[derive(Debug, Serialize)]
 pub(crate) struct ReadCounts {
+    pub(crate) acquisition_efficiency: AcquisitionEfficiency,
     pub(crate) full_selections: usize,
     pub(crate) tail_selections: usize,
     pub(crate) unchanged_selections: usize,
@@ -366,8 +703,314 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn input(
+        mode: crate::transcript_acquisition::ReadMode,
+        length: u64,
+        start: u64,
+        native: u64,
+        guards: usize,
+    ) -> crate::transcript_acquisition::ReadMetrics {
+        crate::transcript_acquisition::ReadMetrics {
+            mode,
+            source_bytes: length,
+            start_offset: start,
+            native_bytes: native,
+            sample_bytes: guards,
+            audit_due: None,
+        }
+    }
+    fn measured(
+        mode: crate::transcript_acquisition::ReadMode,
+        length: u64,
+        start: u64,
+        native: u64,
+        guards: usize,
+    ) -> AcquisitionEfficiency {
+        let mut p = EfficiencyPage::new("test");
+        p.begin();
+        p.prepared(input(mode, length, start, 0, guards));
+        p.progress(Some(input(mode, length, start, native, guards)));
+        p.finish(true);
+        p.finish(true);
+        p.complete()
+    }
+    #[test]
+    fn efficiency_completed_modes_and_negative_guard_overhead() {
+        use crate::transcript_acquisition::{FullReason, ReadMode};
+        let full = measured(ReadMode::Full(FullReason::StateMissing), 10000, 0, 10000, 0);
+        assert_eq!(full.full.operations, 1);
+        assert_eq!(full.full.full_equivalent_bytes, 10000);
+        assert_eq!(full.full.native_bytes, 10000);
+        assert!(full.paired_totals_valid);
+        let tail = measured(ReadMode::Tail, 4096, 4086, 10, 8172);
+        assert_eq!(tail.tail.operations, 1);
+        assert_eq!(tail.tail.full_equivalent_bytes, 4096);
+        assert_eq!(
+            i128::from(tail.tail.full_equivalent_bytes)
+                - i128::from(tail.tail.native_bytes)
+                - i128::from(tail.tail.guard_bytes),
+            -4086
+        );
+        let unchanged = measured(ReadMode::Unchanged, 10000, 10000, 0, 0);
+        assert_eq!(unchanged.unchanged.operations, 1);
+        assert_eq!(unchanged.unchanged.full_equivalent_bytes, 0);
+    }
+    #[test]
+    fn efficiency_replay_has_one_denominator_and_all_attempt_work() {
+        use crate::transcript_acquisition::{FullReason, ReadMode};
+        let mut p = EfficiencyPage::new("test");
+        p.begin();
+        p.prepared(input(ReadMode::Tail, 10000, 9900, 0, 8192));
+        p.progress(Some(input(ReadMode::Tail, 10000, 9900, 100, 8192)));
+        p.replay();
+        p.prepared(input(
+            ReadMode::Full(FullReason::StateMissing),
+            10000,
+            0,
+            0,
+            0,
+        ));
+        p.progress(Some(input(
+            ReadMode::Full(FullReason::StateMissing),
+            10000,
+            0,
+            10000,
+            0,
+        )));
+        p.finish(true);
+        let t = p.complete();
+        assert_eq!(t.attempts, 2);
+        assert_eq!(t.superseded_attempts, 1);
+        assert_eq!(t.tail.operations, 0);
+        assert_eq!(t.full.operations, 1);
+        assert_eq!(t.full.full_equivalent_bytes, 10000);
+        assert_eq!(t.full.native_bytes, 10100);
+        assert_eq!(t.full.guard_bytes, 8192);
+    }
+    #[test]
+    fn efficiency_failed_preparation_and_unfinished_operations_are_not_pairs() {
+        use crate::transcript_acquisition::ReadMode;
+        let mut p = EfficiencyPage::new("test");
+        p.begin();
+        p.preparation_failed(4096);
+        p.begin();
+        p.prepared(input(ReadMode::Tail, 10000, 9000, 0, 8192));
+        p.progress(Some(input(ReadMode::Tail, 10000, 9000, 200, 8192)));
+        // A new file closes the previous failed/early-return operation exactly once.
+        p.begin();
+        p.preparation_failed(0);
+        let t = p.complete();
+        assert_eq!(t.unpaired_operations, 3);
+        assert_eq!(t.unpaired_observed_native_bytes, 200);
+        assert_eq!(t.unpaired_observed_guard_bytes, 12288);
+        assert!(!t.page_coverage_complete);
+        assert_eq!(t.tail.operations, 0);
+    }
+    #[test]
+    fn efficiency_unknown_or_changed_progress_is_unavailable() {
+        use crate::transcript_acquisition::ReadMode;
+        for next in [
+            None,
+            Some(input(ReadMode::Tail, 10001, 9000, 1001, 8192)),
+            Some(input(ReadMode::Tail, 10000, 9000, 9, 8192)),
+        ] {
+            let mut p = EfficiencyPage::new("test");
+            p.begin();
+            p.prepared(input(ReadMode::Tail, 10000, 9000, 10, 8192));
+            p.progress(next);
+            p.finish(true);
+            let t = p.complete();
+            assert!(!t.paired_totals_valid);
+            assert!(!t.page_coverage_complete);
+            assert_eq!(t.unknown_progress_operations, 1);
+            assert_eq!(t.tail.operations, 0);
+        }
+    }
+    #[test]
+    fn efficiency_overflow_refuses_totals_and_abandonment_counter_saturates() {
+        use crate::transcript_acquisition::{FullReason, ReadMode};
+        let mut p = EfficiencyPage::new("test");
+        p.begin();
+        p.prepared(input(
+            ReadMode::Full(FullReason::StateMissing),
+            u64::MAX,
+            0,
+            u64::MAX,
+            1,
+        ));
+        p.finish(true);
+        assert!(!p.complete().paired_totals_valid);
+        let counter = AbandonedPages::new();
+        counter
+            .count
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(counter.value(), Some(u64::MAX));
+        counter.note();
+        assert_eq!(counter.value(), None);
+        assert_eq!(
+            counter.count.load(std::sync::atomic::Ordering::Relaxed),
+            u64::MAX
+        );
+    }
+    #[test]
+    #[serial_test::serial(efficiency_drop)]
+    fn efficiency_drop_is_silent_and_delayed_marker_is_process_lifetime() {
+        let before = ABANDONED[3].value().unwrap();
+        let (_, rows) = capture(|| {
+            let page = EfficiencyPage::new("test");
+            let moved = page;
+            drop(moved);
+            let second = EfficiencyPage::new("test");
+            drop(second);
+        });
+        assert!(rows.is_empty());
+        assert!(ABANDONED[3].value().unwrap() >= before + 2);
+        let mut later = EfficiencyPage::new("test");
+        let t = later.complete();
+        assert!(t.abandoned_pages_at_start.unwrap() >= before + 2);
+        assert_eq!(t.abandoned_pages_at_start, t.abandoned_pages_at_emit);
+        assert!(ABANDONED[3].value().unwrap() >= before + 2); // never drained
+    }
+    #[test]
+    #[serial_test::serial(efficiency_drop)]
+    fn efficiency_completed_move_disarms_drop_without_emission() {
+        let before = ABANDONED[3].value().unwrap();
+        let (_, rows) = capture(|| {
+            let page = EfficiencyPage::new("test");
+            let mut moved = page;
+            moved.complete();
+            drop(moved);
+        });
+        assert!(rows.is_empty());
+        assert_eq!(ABANDONED[3].value(), Some(before));
+    }
+    #[test]
+    #[serial_test::serial(efficiency_drop)]
+    fn efficiency_unwind_preserves_panic_and_only_marks_gap() {
+        let before = ABANDONED[3].value().unwrap();
+        let (result, rows) = capture(|| {
+            std::panic::catch_unwind(|| {
+                let mut page = EfficiencyPage::new("test");
+                page.begin();
+                std::panic::panic_any("synthetic original panic");
+            })
+        });
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<&str>(),
+            Some(&"synthetic original panic")
+        );
+        assert!(rows.is_empty());
+        assert!(ABANDONED[3].value().unwrap() >= before + 1);
+    }
+    #[test]
+    fn efficiency_unsampled_and_repeated_snapshot_are_explicit() {
+        use crate::transcript_acquisition::ReadMode;
+        let mut p = EfficiencyPage::new("test");
+        p.begin();
+        p.prepared(input(ReadMode::Tail, 10000, 9000, 50, 8192));
+        p.progress(Some(input(ReadMode::Tail, 10000, 9000, 50, 8192)));
+        p.progress(Some(input(ReadMode::Tail, 10000, 9000, 50, 8192)));
+        p.finish(false);
+        p.unsampled();
+        let t = p.complete();
+        assert_eq!(t.unpaired_observed_native_bytes, 50);
+        assert_eq!(t.unpaired_observed_guard_bytes, 8192);
+        assert_eq!(t.unsampled_operations, 1);
+        assert!(!t.page_coverage_complete);
+    }
+
+    #[test]
+    fn efficiency_inline_state_and_constant_progress_cost() {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        use crate::transcript_acquisition::ReadMode;
+        let mut page = EfficiencyPage::new("test");
+        page.begin();
+        page.prepared(input(ReadMode::Tail, 10000, 9000, 0, 8192));
+        let mut c = Counter::new(1024);
+        page.heap_bound(&mut c).unwrap();
+        assert_eq!(c.bytes, 0);
+        assert!(std::mem::size_of::<EfficiencyPage>() <= 512);
+        let start = Instant::now();
+        for _ in 0..100000 {
+            std::hint::black_box(&mut page).progress(Some(input(
+                ReadMode::Tail,
+                10000,
+                9000,
+                100,
+                8192,
+            )));
+        }
+        eprintln!("EFFICIENCY_OVERHEAD retained_page_bytes={} stack_metrics_bytes={} progress_iterations=100000 elapsed_us={}", std::mem::size_of::<EfficiencyPage>(), std::mem::size_of::<crate::transcript_acquisition::ReadMetrics>(), start.elapsed().as_micros());
+        page.finish(false);
+        page.complete();
+    }
+
+    #[test]
+    fn efficiency_worst_case_namespace_and_record_remain_bounded() {
+        let mode = EfficiencyMode {
+            operations: u64::MAX,
+            full_equivalent_bytes: u64::MAX,
+            native_bytes: u64::MAX,
+            guard_bytes: u64::MAX,
+        };
+        let efficiency = AcquisitionEfficiency {
+            version: 1,
+            paired_totals_valid: false,
+            page_coverage_complete: false,
+            full: mode,
+            tail: mode,
+            unchanged: mode,
+            attempts: u64::MAX,
+            superseded_attempts: u64::MAX,
+            unpaired_operations: u64::MAX,
+            unpaired_observed_native_bytes: u64::MAX,
+            unpaired_observed_guard_bytes: u64::MAX,
+            unknown_progress_operations: u64::MAX,
+            unsampled_operations: u64::MAX,
+            audit_full_operations: u64::MAX,
+            abandoned_pages_at_start: Some(u64::MAX),
+            abandoned_pages_at_emit: Some(u64::MAX),
+        };
+        let mut reads = max_read_counts();
+        reads.acquisition_efficiency = efficiency;
+        let record = Record {
+            schema_version: SCHEMA_VERSION,
+            process_id: u32::MAX,
+            stage: "native_collection_page",
+            source: Source::ClaudeCode,
+            observation: Observation {
+                observed_unix_ms: Some(u64::MAX),
+                wall_elapsed_us: u64::MAX,
+                shared_process_cpu_delta_us: Some(u64::MAX),
+                process_lifetime_max_rss_bytes: Some(u64::MAX),
+                process_lifetime_max_rss_before_bytes: Some(u64::MAX),
+            },
+            counts: CollectionCounts {
+                scanned_files: usize::MAX,
+                semantic_noops: usize::MAX,
+                sampled_acquisition: Some(reads),
+            },
+        };
+        let text = serde_json::to_string(&record).unwrap();
+        let namespace = serde_json::to_string(&efficiency).unwrap();
+        assert!(text.len() < 4096);
+        assert!(namespace.len() < 2048);
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy["counts"]["sampled_acquisition"]
+            .as_object_mut()
+            .unwrap()
+            .remove("acquisition_efficiency");
+        assert!(serde_json::to_string(&legacy).unwrap().len() < 2048);
+        eprintln!(
+            "EFFICIENCY_EVENT_SIZE worst_record_bytes={} namespace_bytes={}",
+            text.len(),
+            namespace.len()
+        );
+    }
+
     fn max_read_counts() -> ReadCounts {
         ReadCounts {
+            acquisition_efficiency: AcquisitionEfficiency::default(),
             full_selections: (usize::MAX / 11) * 11,
             tail_selections: usize::MAX,
             unchanged_selections: usize::MAX,
@@ -714,7 +1357,12 @@ mod tests {
         assert_eq!(records[3]["source"], "unknown");
         for record in records {
             let text = serde_json::to_string(&record).unwrap();
-            assert!(text.len() < 2048);
+            assert!(text.len() < 4096);
+            let mut legacy = record.clone();
+            if let Some(reads) = legacy["counts"]["sampled_acquisition"].as_object_mut() {
+                reads.remove("acquisition_efficiency");
+            }
+            assert!(serde_json::to_string(&legacy).unwrap().len() < 2048);
             assert!(!text.contains("secret/path"));
             assert!(!text.contains("cycle_peak"));
             assert_eq!(record["schema_version"], SCHEMA_VERSION);

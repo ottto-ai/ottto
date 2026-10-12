@@ -1770,3 +1770,128 @@ fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
         assert_eq!(production_body(source, tail), production_body(source, full));
     }
 }
+
+#[test]
+fn sampled_production_efficiency_pairs_same_full_and_tail_operations_both_providers() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        fixture
+            .file
+            .append(&json!({"type":"synthetic-padding","text":"a".repeat(16384)}));
+        let cold_len = fixture.file.0.metadata().unwrap().len();
+        let ((index, _, _), rows) = crate::local_resource_diagnostics::capture(|| {
+            production_scan(
+                &fixture,
+                source,
+                ScanIndex::default(),
+                Some(cache.clone()),
+                "efficiency-fixture",
+            )
+        });
+        let counts = &rows
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap()["counts"]["sampled_acquisition"]["acquisition_efficiency"];
+        assert_eq!(counts["full"]["operations"], 1);
+        assert_eq!(counts["full"]["full_equivalent_bytes"], cold_len);
+        assert_eq!(counts["full"]["native_bytes"], cold_len);
+        assert_eq!(counts["paired_totals_valid"], true);
+        assert_eq!(counts["page_coverage_complete"], true);
+        fixture.file.append(&usage(source, 140, 1, "fixture-model"));
+        let tail_len = fixture.file.0.metadata().unwrap().len();
+        let ((_, tail, modes), rows) = crate::local_resource_diagnostics::capture(|| {
+            production_scan(&fixture, source, index, Some(cache), "efficiency-fixture")
+        });
+        assert_eq!(modes, (0, 1, 0));
+        let reads = &rows
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap()["counts"]["sampled_acquisition"];
+        let counts = &reads["acquisition_efficiency"];
+        assert_eq!(counts["tail"]["operations"], 1);
+        assert_eq!(counts["tail"]["full_equivalent_bytes"], tail_len);
+        assert_eq!(counts["tail"]["native_bytes"], tail_len - cold_len);
+        assert_eq!(
+            counts["tail"]["guard_bytes"],
+            reads["completed_guard_bytes"]
+        );
+        assert_eq!(counts["paired_totals_valid"], true);
+        assert_eq!(counts["page_coverage_complete"], true);
+        let (_, full, _) = production_scan(
+            &fixture,
+            source,
+            ScanIndex::default(),
+            None,
+            "efficiency-fixture",
+        );
+        assert_eq!(production_body(source, tail), production_body(source, full));
+    }
+}
+
+#[test]
+fn sampled_production_efficiency_abandoned_scan_has_no_collection_event() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        let fixture = ScanFixture::new(source);
+        for n in 0..20 {
+            fixture
+                .file
+                .append(&usage(source, 100 + n as u64, n, "fixture-model"));
+        }
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            let mut scan = OwnedSourceScan::new(
+                source,
+                std::slice::from_ref(&fixture.root),
+                ScanIndex::default(),
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                true,
+            )
+            .with_sampled_acquisition(cache.clone(), Scope("abandoned-fixture".into()));
+            loop {
+                if scan.test_active_physical_lines() > 0 {
+                    drop(scan);
+                    break;
+                }
+                scan = match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => next,
+                    OwnedSourceScanStep::Complete { .. } => {
+                        panic!("fixture must reach a pending active reader")
+                    }
+                };
+            }
+        });
+        assert!(!rows
+            .iter()
+            .any(|row| row["stage"] == "native_collection_page"));
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            production_scan(
+                &fixture,
+                source,
+                ScanIndex::default(),
+                Some(cache),
+                "abandoned-fixture",
+            )
+        });
+        let counts = &rows
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap()["counts"]["sampled_acquisition"]["acquisition_efficiency"];
+        assert!(counts["abandoned_pages_at_start"].as_u64().unwrap() >= 1);
+        // Unknown abandoned bytes were not converted into completed operations.
+        assert_eq!(counts["full"]["operations"], 1);
+    }
+}

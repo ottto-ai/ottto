@@ -66,6 +66,7 @@ impl SharedCache {
 }
 
 pub(super) struct Context {
+    pub(super) efficiency: crate::local_resource_diagnostics::EfficiencyPage,
     pub(super) cache: Arc<SharedCache>,
     namespace: Scope,
     pub(super) audit_metadata_supported: bool,
@@ -82,7 +83,7 @@ pub(super) struct Context {
     pub(super) start_overdue_seconds: u64,
     pub(super) completion_overdue_seconds: u64,
 }
-crate::heap_layout_bound::fields!(Context; cache, namespace, audit_metadata_supported, audit_slots,
+crate::heap_layout_bound::fields!(Context; efficiency, cache, namespace, audit_metadata_supported, audit_slots,
     full_files, tail_files, unchanged_files, native_bytes, sample_bytes, full_reasons,
     priority_replays, audits_started, audits_completed, start_overdue_seconds,
     completion_overdue_seconds);
@@ -179,6 +180,9 @@ impl OwnedSourceScan {
                 .take(CACHE_ENTRIES + 1)
                 .count();
             self.sampling = Some(Context {
+                efficiency: crate::local_resource_diagnostics::EfficiencyPage::new(
+                    self.source.api_slug(),
+                ),
                 cache,
                 namespace,
                 audit_metadata_supported: pending <= CACHE_ENTRIES,

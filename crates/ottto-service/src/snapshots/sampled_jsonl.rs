@@ -67,12 +67,24 @@ impl OwnedJsonlParser {
 
     /// Invoked on a fresh safely-opened parser before any fill/read. Scope and
     /// durable debt must be supplied by the existing source/index authority.
+    #[cfg(test)]
     pub(super) fn prepare_acquisition(
         &mut self,
         old: Option<Retained<CachedJsonlReduction>>,
         scope: &Scope,
         debt: Option<AuditDebt>,
         now: u64,
+    ) -> Result<ReadMode> {
+        self.prepare_acquisition_observed(old, scope, debt, now, &mut 0)
+    }
+
+    pub(super) fn prepare_acquisition_observed(
+        &mut self,
+        old: Option<Retained<CachedJsonlReduction>>,
+        scope: &Scope,
+        debt: Option<AuditDebt>,
+        now: u64,
+        observed_guard_bytes: &mut usize,
     ) -> Result<ReadMode> {
         anyhow::ensure!(
             self.reader.reader.buffer().is_empty() && !self.reader.finished,
@@ -97,12 +109,13 @@ impl OwnedJsonlParser {
                             })
                         }))
         });
-        let plan = ReadPlan::prepare(
+        let plan = ReadPlan::prepare_observed(
             self.reader.reader.get_mut(),
             old.as_ref().map(|old| &old.checkpoint),
             scope,
             debt,
             now,
+            observed_guard_bytes,
         )?;
         let mode = plan.mode();
         if matches!(mode, ReadMode::Full(_)) && self.source == SnapshotSource::Codex {
