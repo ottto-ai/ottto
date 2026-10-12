@@ -130,10 +130,14 @@ calling these measurements installed evidence.
 ## Private Codex Census Outcomes
 
 The support-root `snapshots/codex-fenced-census-v1.json` file now uses schema
-`local_fenced_codex_census:v2`: bounded completed-page scan/index aggregates plus
+`local_fenced_codex_census:v3`: bounded completed-page scan/index aggregates plus
 producer PID/version, optional kernel start seconds/microseconds, attempt sequence
 and observation UTC. A separate `snapshots/codex-fenced-census-outcome-v1.json`
 file records only the last non-success outer/inner outcome and actual invalidation.
+Census v3 adds a fixed eight-category unreadable-event histogram, an explicit
+unattributed remainder for old traversals, and existing terminal-loss shares.
+Categories identify the original failing branch, not an OS diagnosis or distinct
+files; see [branch attribution](session-2026-10-12-codex-unreadable-causes.md).
 The census remains limited to 8 KiB; the sidecar to 1 KiB. Healthy attempts add
 no sidecar write or unlink. Both are owner-only disposable atomic caches without
 fsync, excluded from public status, upload DTOs and diagnostics bundles.

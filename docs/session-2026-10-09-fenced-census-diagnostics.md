@@ -8,7 +8,7 @@ working index immediately after the existing source/account/destination fence.
 The fence still runs exactly once at that site and returns its original error.
 
 One latest record is written at `snapshots/codex-fenced-census-v1.json` under the
-local support root. Its current `local_fenced_codex_census:v2` schema contains producer
+local support root. Its current `local_fenced_codex_census:v3` schema contains producer
 PID/version, optional kernel start seconds/microseconds, process attempt sequence,
 a fresh RFC3339 observation clock, scan-input generation, native
 scan gates/loss counts, and index aggregate counters. The scope is
