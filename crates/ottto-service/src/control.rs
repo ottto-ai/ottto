@@ -28839,6 +28839,214 @@ X-API-Key = "otel_redacted"
         format!("http://{address}")
     }
 
+    /// One backend request held open until the test thread answers it.
+    struct HeldSetupRunRequest {
+        path: String,
+        respond: mpsc::Sender<(u16, &'static str)>,
+    }
+
+    impl HeldSetupRunRequest {
+        fn answer(self, status: u16, body: &'static str) {
+            self.respond
+                .send((status, body))
+                .expect("backend connection waits for its answer");
+        }
+    }
+
+    /// A backend whose every response is released by the test thread, so read
+    /// and rebind interleavings are fixed by message order rather than timing.
+    fn held_setup_run_backend() -> (String, mpsc::Receiver<HeldSetupRunRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind held backend");
+        let address = listener.local_addr().expect("local address");
+        let (requests_tx, requests_rx) = mpsc::channel();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let requests_tx = requests_tx.clone();
+                thread::spawn(move || {
+                    let request = read_complete_http_request(&mut stream);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or_default()
+                        .to_string();
+                    let (respond, answer) = mpsc::channel();
+                    if requests_tx
+                        .send(HeldSetupRunRequest { path, respond })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if let Ok((status, body)) = answer.recv() {
+                        let reason = if status == 200 { "OK" } else { "Unauthorized" };
+                        write_json_response(&mut stream, status, reason, body);
+                    }
+                });
+            }
+        });
+        (format!("http://{address}"), requests_rx)
+    }
+
+    #[test]
+    #[serial]
+    fn setup_run_read_outcome_never_crosses_a_concurrent_rebind() {
+        const EXPIRED: &str = r#"{"detail":"Setup run expired"}"#;
+        const COSTS: &str = r#"{"results_state":"current"}"#;
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("setup-run-read-concurrent-rebind");
+        let secret_root = telemetry_key_store_root("setup-run-read-concurrent-rebind-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("persist relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .expect("persist relay device secret");
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_current")
+            .expect("persist setup token");
+        let (api_base_url, requests) = held_setup_run_backend();
+        let binding = |setup_run_id: &str| LocalConnectionBinding {
+            setup_run_id: setup_run_id.to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+        let (run_a, run_b) = (binding("run_a"), binding("run_b"));
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(run_a.clone()));
+        let authorization = RequestAuthorization::Token("token".to_string());
+        let next = || {
+            requests
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the read reaches the backend")
+        };
+        let held = |run: &str, endpoint: &str| {
+            let request = next();
+            assert!(
+                request
+                    .path
+                    .starts_with(&format!("/api/v1/setup-runs/{run}/local-client/{endpoint}")),
+                "expected {run} {endpoint}, got {}",
+                request.path
+            );
+            request
+        };
+        let no_more_requests = || {
+            assert!(
+                matches!(requests.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "one read makes one request and at most one refresh"
+            );
+        };
+        let run_state = || {
+            daemon
+                .status("token")
+                .expect("status")
+                .canonical_health
+                .expect("canonical health")
+                .account
+                .setup_run_state
+        };
+        let read = || agent_costs(&daemon, &authorization, AgentCostsQuery::default());
+
+        thread::scope(|scope| {
+            // A read of run A is in flight when this Mac reconnects to run B.
+            // Its refresh still targets A: the read keeps the binding the
+            // observer captured instead of looking it up again.
+            let stale_read = scope.spawn(read);
+            let stale_costs = held("run_a", "costs");
+            daemon
+                .bind_setup_run_for_authorized_client(run_b.clone())
+                .expect("reconnect to run B");
+            stale_costs.answer(401, EXPIRED);
+            held("run_a", "refresh").answer(401, EXPIRED);
+            assert!(stale_read.join().expect("read thread").is_err());
+            no_more_requests();
+            assert_eq!(
+                run_state(),
+                ottto_protocol::LocalSetupRunState::Complete,
+                "a rejection of replaced run A must not mark run B rejected"
+            );
+
+            // Same binding: a rejected read of B (one refresh) marks B rejected.
+            let b_read = scope.spawn(read);
+            held("run_b", "costs").answer(401, EXPIRED);
+            held("run_b", "refresh").answer(401, EXPIRED);
+            assert!(b_read.join().expect("read thread").is_err());
+            no_more_requests();
+            assert_eq!(run_state(), ottto_protocol::LocalSetupRunState::Rejected);
+
+            // A read of run A is in flight when this Mac reconnects to run B
+            // and a read of B is rejected; A's late success cannot clear it.
+            daemon
+                .bind_setup_run_for_authorized_client(run_a.clone())
+                .expect("bind run A for the stale read");
+            let stale_read = scope.spawn(read);
+            let stale_costs = held("run_a", "costs");
+            daemon
+                .bind_setup_run_for_authorized_client(run_b.clone())
+                .expect("reconnect to run B");
+            let b_read = scope.spawn(read);
+            held("run_b", "costs").answer(401, EXPIRED);
+            held("run_b", "refresh").answer(401, EXPIRED);
+            assert!(b_read.join().expect("read thread").is_err());
+            assert_eq!(run_state(), ottto_protocol::LocalSetupRunState::Rejected);
+            stale_costs.answer(200, COSTS);
+            stale_read
+                .join()
+                .expect("read thread")
+                .expect("run A answered");
+            no_more_requests();
+            assert_eq!(
+                run_state(),
+                ottto_protocol::LocalSetupRunState::Rejected,
+                "a success of replaced run A must not clear run B's rejection"
+            );
+
+            // Same binding: a successful read of B clears B's rejection.
+            let b_read = scope.spawn(read);
+            held("run_b", "costs").answer(200, COSTS);
+            b_read.join().expect("read thread").expect("run B answered");
+            no_more_requests();
+            assert_eq!(run_state(), ottto_protocol::LocalSetupRunState::Complete);
+
+            // Logout while a rejected read is in flight records nothing.
+            let stale_read = scope.spawn(read);
+            let stale_costs = held("run_b", "costs");
+            daemon
+                .reset_account_for_authorized_client()
+                .expect("logout");
+            stale_costs.answer(401, EXPIRED);
+            held("run_b", "refresh").answer(401, EXPIRED);
+            assert!(stale_read.join().expect("read thread").is_err());
+            no_more_requests();
+            let status = daemon.status("token").expect("status");
+            assert_ne!(
+                status
+                    .local_health_events
+                    .iter()
+                    .filter(|event| event.event_type.starts_with("SetupRunRead"))
+                    .next_back()
+                    .map(|event| event.event_type.as_str()),
+                Some("SetupRunReadRejected"),
+                "a rejection that finishes after logout must not be recorded"
+            );
+        });
+    }
+
     #[test]
     #[serial]
     fn expired_setup_run_read_refreshes_once_and_reports_reconnect_required() {
