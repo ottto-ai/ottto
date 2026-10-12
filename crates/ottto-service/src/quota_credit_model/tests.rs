@@ -2029,6 +2029,30 @@ fn expected_fixtures() -> Vec<(&'static str, Value)> {
         },
     )
     .is_empty());
+    // Contract v2.2 §11.10: the Claude adapter's reader-blind answer, an
+    // unavailable list with readiness as read and the cause it sets.
+    let reader_blind = |reason: &str| {
+        let mut balance = claude_reset_bank(
+            READ_AT,
+            ListObservation::Unavailable {
+                provider: Provider::Anthropic,
+                provider_count: None,
+            },
+        );
+        assert!(apply_readiness(
+            &mut balance,
+            ReadinessInput {
+                eligible: Field::Value(false),
+                at_limit: Field::Value(false),
+                ineligible_reason: Field::Value(reason.to_string()),
+                cooldown_until: TimeInput::Absent,
+            },
+        )
+        .is_empty());
+        balance.grants_unavailable_cause =
+            Some(ottto_protocol::CreditGrantsUnavailableCause::Reader);
+        reading(vec![balance])
+    };
     let section_balances = |read: Vec<(CreditSection, Vec<AgentCreditBalance>)>| {
         read.into_iter()
             .flat_map(|(_, balances)| balances)
@@ -2072,6 +2096,11 @@ fn expected_fixtures() -> Vec<(&'static str, Value)> {
             reading(section_balances(saved_reset_read(READ_AT))),
         ),
         ("claude-usage-cedar-ineligible", reading(vec![ineligible])),
+        ("claude-usage-cedar-reader-surface", reader_blind("surface")),
+        (
+            "claude-usage-cedar-reader-cli-version",
+            reader_blind("cli_version"),
+        ),
         ("claude-usage-cedar-refused-expiry", reading(vec![refused])),
         (
             "claude-oauth-usage-plain",
