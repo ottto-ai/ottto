@@ -628,28 +628,382 @@ fn iso_utc(ts: OffsetDateTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-fn read_jsonl(path: &Path) -> std::io::Result<Vec<Value>> {
-    let text = fs::read_to_string(path)?;
-    let mut out = Vec::new();
-    for raw in text.lines() {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<Value>(raw) {
-            out.push(value);
-        }
-    }
-    Ok(out)
+// Only small measurement/attribution facts survive between rows. Resolve them
+// after EOF: call definitions and session metadata can occur after a result,
+// and residency needs later assistant/compaction markers. This is not a tail
+// cache and does not change acquisition, category or tokenizer semantics.
+enum FactAttribution {
+    Fixed(Category, Option<String>),
+    Call(Option<String>),
 }
 
-// -------------------------------------------------------------------------
-// Claude Code parsing (ported 1:1 from the reference).
-// -------------------------------------------------------------------------
+struct CompositionFact {
+    ordinal: usize,
+    attribution: FactAttribution,
+    tokens: u64,
+    images: u64,
+    date: Date,
+    timestamp: Option<OffsetDateTime>,
+}
 
 enum LastAssistantId {
     Sentinel,
     Value(Option<String>),
+}
+
+#[derive(Default)]
+struct SessionFacts {
+    session_id: Option<String>,
+    agent_id: Option<String>,
+    sidechain: bool,
+    codex_meta_seen: bool,
+    calls: BTreeMap<String, (Option<String>, Option<String>)>,
+    assistants: Vec<usize>,
+    compactions: Vec<usize>,
+    entered: Vec<CompositionFact>,
+    minimum_timestamp: Option<OffsetDateTime>,
+}
+
+impl SessionFacts {
+    fn add(
+        &mut self,
+        ordinal: usize,
+        attribution: FactAttribution,
+        text: &str,
+        images: u64,
+        date: Date,
+        timestamp: Option<OffsetDateTime>,
+    ) {
+        self.entered.push(CompositionFact {
+            ordinal,
+            attribution,
+            tokens: estimate_text_tokens(text),
+            images: 0,
+            date,
+            timestamp,
+        });
+        if images > 0 {
+            self.image(ordinal, images, date, timestamp);
+        }
+    }
+
+    fn image(
+        &mut self,
+        ordinal: usize,
+        images: u64,
+        date: Date,
+        timestamp: Option<OffsetDateTime>,
+    ) {
+        self.entered.push(CompositionFact {
+            ordinal,
+            attribution: FactAttribution::Fixed(Category::BrowserAndImages, None),
+            tokens: images * IMAGE_NOMINAL_TOKENS,
+            images,
+            date,
+            timestamp,
+        });
+    }
+
+    fn claude_row(
+        &mut self,
+        row: &Value,
+        ordinal: usize,
+        date: Date,
+        timestamp: Option<OffsetDateTime>,
+        last: &mut LastAssistantId,
+    ) {
+        if let Some(id) = row.get("sessionId").and_then(Value::as_str) {
+            self.session_id = Some(id.to_string());
+        }
+        self.sidechain |= row.get("isSidechain").and_then(Value::as_bool) == Some(true);
+        if self.agent_id.is_none() {
+            self.agent_id = row
+                .get("agentId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        let kind = row.get("type").and_then(Value::as_str).unwrap_or("");
+        let message = row.get("message").filter(|m| m.is_object());
+        if kind == "assistant" {
+            let id = message
+                .and_then(|m| m.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if id.is_none()
+                || match last {
+                    LastAssistantId::Sentinel => true,
+                    LastAssistantId::Value(previous) => previous.as_deref() != id.as_deref(),
+                }
+            {
+                self.assistants.push(ordinal);
+            }
+            *last = LastAssistantId::Value(id);
+        }
+        if row
+            .get("isCompactSummary")
+            .map(is_truthy_json)
+            .unwrap_or(false)
+            || kind == "summary"
+            || row.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+        {
+            self.compactions.push(ordinal);
+        }
+        let content = message
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array);
+        // The old first pass sees tool_use blocks even on attachment rows.
+        if let Some(content) = content {
+            for block in content {
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    if let Some(id) = block.get("id").and_then(Value::as_str) {
+                        let name = block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let path = block
+                            .get("input")
+                            .and_then(Value::as_object)
+                            .and_then(|i| i.get("file_path"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        self.calls.insert(id.to_string(), (name, path));
+                    }
+                }
+            }
+        }
+        if kind == "attachment" {
+            let empty = Value::Object(Default::default());
+            let attachment = row.get("attachment").unwrap_or(&empty);
+            let filename = attachment.get("filename").and_then(Value::as_str);
+            let category = if filename.is_some_and(is_memory_path) {
+                Category::MemoryNotes
+            } else {
+                Category::HarnessAttachments
+            };
+            self.add(
+                ordinal,
+                FactAttribution::Fixed(category, filename.map(str::to_string)),
+                &serialize_attachment(attachment),
+                0,
+                date,
+                timestamp,
+            );
+            return;
+        }
+        if let Some(content) = content {
+            for block in content {
+                match block.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "tool_result" => {
+                        let id = block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let (text, images) = extract_blocks_text_and_images(block.get("content"));
+                        self.add(
+                            ordinal,
+                            FactAttribution::Call(id),
+                            &text,
+                            images,
+                            date,
+                            timestamp,
+                        );
+                    }
+                    "image" => self.image(ordinal, 1, date, timestamp),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn codex_row(
+        &mut self,
+        row: &Value,
+        ordinal: usize,
+        date: Date,
+        timestamp: Option<OffsetDateTime>,
+    ) {
+        if row.get("type").and_then(Value::as_str) == Some("session_meta") && !self.codex_meta_seen
+        {
+            self.codex_meta_seen = true;
+            self.session_id = row
+                .get("payload")
+                .and_then(Value::as_object)
+                .and_then(|p| {
+                    p.get("id")
+                        .and_then(Value::as_str)
+                        .or_else(|| p.get("session_id").and_then(Value::as_str))
+                })
+                .map(str::to_string);
+        }
+        let Some(payload) = row.get("payload").and_then(Value::as_object) else {
+            return;
+        };
+        let kind = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "function_call" | "custom_tool_call" | "local_shell_call" => {
+                if let Some(id) = payload.get("call_id").and_then(Value::as_str) {
+                    let name = payload
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            (kind == "local_shell_call").then(|| "local_shell".to_string())
+                        });
+                    self.calls.insert(id.to_string(), (name, None));
+                }
+                self.assistants.push(ordinal);
+            }
+            "agent_message" => self.assistants.push(ordinal),
+            "context_compacted" => self.compactions.push(ordinal),
+            _ => {}
+        }
+        match kind {
+            "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => {
+                let id = payload
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let (text, images) = codex_output_text_and_images(payload.get("output"));
+                self.add(
+                    ordinal,
+                    FactAttribution::Call(id),
+                    &text,
+                    images,
+                    date,
+                    timestamp,
+                );
+            }
+            "web_search_end" => self.add(
+                ordinal,
+                FactAttribution::Fixed(Category::WebFetchSearch, None),
+                &python_json_dumps(&Value::Object(payload.clone())),
+                0,
+                date,
+                timestamp,
+            ),
+            "mcp_tool_call_end" => {
+                let category = codex_mcp_category(payload.get("invocation"));
+                let (text, images) = codex_mcp_result_text_and_images(payload.get("result"));
+                self.add(
+                    ordinal,
+                    FactAttribution::Fixed(category, None),
+                    &text,
+                    images,
+                    date,
+                    timestamp,
+                );
+            }
+            "message" => {
+                let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
+                if role == "developer" || role == "user" {
+                    let (text, images) = extract_blocks_text_and_images(payload.get("content"));
+                    if role == "developer" {
+                        self.add(
+                            ordinal,
+                            FactAttribution::Fixed(Category::HarnessAttachments, None),
+                            &text,
+                            images,
+                            date,
+                            timestamp,
+                        );
+                    } else if images > 0 {
+                        self.image(ordinal, images, date, timestamp);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn commit(
+        self,
+        path: &Path,
+        report: &mut WorkspaceReport,
+        claude: bool,
+        include_subagents: bool,
+    ) {
+        if claude && self.sidechain && !include_subagents {
+            return;
+        }
+        let mut session_id = self.session_id.unwrap_or_else(|| basename_stem(path));
+        if claude && self.sidechain {
+            session_id = format!(
+                "{session_id} (subagent:{})",
+                self.agent_id.unwrap_or_else(|| basename(path))
+            );
+        }
+        let residency = ResidencyModel::new(self.assistants, self.compactions);
+        for fact in self.entered {
+            let (category, file_path) = match fact.attribution {
+                FactAttribution::Fixed(category, path) => (category, path),
+                FactAttribution::Call(id) => match id.as_ref().and_then(|id| self.calls.get(id)) {
+                    Some((name, path)) if claude => (
+                        cc_tool_category(
+                            name.as_deref().unwrap_or(""),
+                            path.as_deref().unwrap_or(""),
+                        ),
+                        path.clone(),
+                    ),
+                    Some((Some(name), _)) => (codex_tool_category(name), None),
+                    _ => (Category::OtherTools, None),
+                },
+            };
+            report.record(
+                &session_id,
+                category,
+                fact.tokens,
+                residency.multiplier(fact.ordinal),
+                fact.images,
+                file_path.as_deref(),
+                fact.date,
+                fact.timestamp,
+            );
+        }
+        report.note_session_start(&session_id, self.minimum_timestamp);
+    }
+}
+
+fn parse_session_reader(
+    mut reader: impl std::io::BufRead,
+    path: &Path,
+    report: &mut WorkspaceReport,
+    fallback: Date,
+    claude: bool,
+    include_subagents: bool,
+) -> std::io::Result<()> {
+    let mut facts = SessionFacts::default();
+    let mut last = LastAssistantId::Sentinel;
+    let mut bytes = Vec::new();
+    let mut ordinal = 0;
+    loop {
+        bytes.clear();
+        if reader.read_until(b'\n', &mut bytes)? == 0 {
+            break;
+        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let Ok(row) = serde_json::from_str::<Value>(text.trim()) else {
+            continue;
+        };
+        let (date, timestamp) = line_date(&row, fallback);
+        if let Some(timestamp) = timestamp {
+            facts.minimum_timestamp = Some(
+                facts
+                    .minimum_timestamp
+                    .map_or(timestamp, |old| old.min(timestamp)),
+            );
+        }
+        if claude {
+            facts.claude_row(&row, ordinal, date, timestamp, &mut last);
+        } else {
+            facts.codex_row(&row, ordinal, date, timestamp);
+        }
+        ordinal += 1;
+    }
+    // No mutation of the workspace report before successful EOF, including for
+    // excluded subagents. Preserve whole-file I/O/UTF-8 failure behavior.
+    facts.commit(path, report, claude, include_subagents);
+    Ok(())
 }
 
 pub(crate) fn parse_claude_session(
@@ -658,391 +1012,29 @@ pub(crate) fn parse_claude_session(
     fallback: Date,
     include_subagents: bool,
 ) -> std::io::Result<()> {
-    let lines = read_jsonl(path)?;
-    if lines.is_empty() {
-        return Ok(());
-    }
-
-    let mut session_id: Option<String> = None;
-    let mut is_sub = false;
-    for o in &lines {
-        if let Some(sid) = o.get("sessionId").and_then(Value::as_str) {
-            session_id = Some(sid.to_string());
-        }
-        if o.get("isSidechain")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            is_sub = true;
-        }
-    }
-    let mut session_id = session_id.unwrap_or_else(|| basename_stem(path));
-
-    if is_sub {
-        if !include_subagents {
-            return Ok(());
-        }
-        let agent_id = lines
-            .iter()
-            .find_map(|o| o.get("agentId").and_then(Value::as_str))
-            .map(str::to_string)
-            .unwrap_or_else(|| basename(path));
-        session_id = format!("{session_id} (subagent:{agent_id})");
-    }
-
-    // Pass 1: tool_use id -> (name, file_path); residency markers.
-    let mut tooluse: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
-    let mut assistant_ordinals: Vec<usize> = Vec::new();
-    let mut compaction_ordinals: Vec<usize> = Vec::new();
-    let mut last = LastAssistantId::Sentinel;
-    let mut session_min_ts: Option<OffsetDateTime> = None;
-
-    for (i, o) in lines.iter().enumerate() {
-        if let Some(ts) = parse_timestamp(o) {
-            session_min_ts = Some(match session_min_ts {
-                Some(existing) if existing <= ts => existing,
-                _ => ts,
-            });
-        }
-        let t = o.get("type").and_then(Value::as_str).unwrap_or("");
-        if t == "assistant" {
-            let mid = o
-                .get("message")
-                .filter(|m| m.is_object())
-                .and_then(|m| m.get("id"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let append = mid.is_none()
-                || match &last {
-                    LastAssistantId::Sentinel => true,
-                    LastAssistantId::Value(prev) => prev.as_deref() != mid.as_deref(),
-                };
-            if append {
-                assistant_ordinals.push(i);
-            }
-            last = LastAssistantId::Value(mid);
-        }
-        let is_compaction = o
-            .get("isCompactSummary")
-            .map(is_truthy_json)
-            .unwrap_or(false)
-            || t == "summary"
-            || o.get("subtype").and_then(Value::as_str) == Some("compact_boundary");
-        if is_compaction {
-            compaction_ordinals.push(i);
-        }
-        if let Some(content) = o
-            .get("message")
-            .and_then(Value::as_object)
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_array)
-        {
-            for b in content {
-                if b.get("type").and_then(Value::as_str) == Some("tool_use") {
-                    if let Some(tid) = b.get("id").and_then(Value::as_str) {
-                        let name = b.get("name").and_then(Value::as_str).map(str::to_string);
-                        let fp = b
-                            .get("input")
-                            .and_then(Value::as_object)
-                            .and_then(|input| input.get("file_path"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                        tooluse.insert(tid.to_string(), (name, fp));
-                    }
-                }
-            }
-        }
-    }
-    let residency = ResidencyModel::new(assistant_ordinals, compaction_ordinals);
-
-    // Pass 2: attribute entered items.
-    for (i, o) in lines.iter().enumerate() {
-        let t = o.get("type").and_then(Value::as_str).unwrap_or("");
-        let mult = residency.multiplier(i);
-        let (date, ts) = line_date(o, fallback);
-
-        if t == "attachment" {
-            let empty = Value::Object(Default::default());
-            let att = o.get("attachment").unwrap_or(&empty);
-            let fname = att.get("filename").and_then(Value::as_str);
-            let text = serialize_attachment(att);
-            let toks = estimate_text_tokens(&text);
-            match fname {
-                Some(fname) if is_memory_path(fname) => report.record(
-                    &session_id,
-                    Category::MemoryNotes,
-                    toks,
-                    mult,
-                    0,
-                    Some(fname),
-                    date,
-                    ts,
-                ),
-                other => report.record(
-                    &session_id,
-                    Category::HarnessAttachments,
-                    toks,
-                    mult,
-                    0,
-                    other,
-                    date,
-                    ts,
-                ),
-            }
-            continue;
-        }
-
-        let Some(content) = o
-            .get("message")
-            .and_then(Value::as_object)
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_array)
-        else {
-            continue;
-        };
-
-        for b in content {
-            let bt = b.get("type").and_then(Value::as_str).unwrap_or("");
-            match bt {
-                "tool_use" => {
-                    // Memory WRITES are tracked separately in the reference and
-                    // never counted as recall or in any category, so this
-                    // collector simply does not record their written content.
-                    continue;
-                }
-                "tool_result" => {
-                    let tid = b.get("tool_use_id").and_then(Value::as_str);
-                    let resolved = tid.and_then(|tid| tooluse.get(tid));
-                    let (text, images) = extract_blocks_text_and_images(b.get("content"));
-                    let toks = estimate_text_tokens(&text);
-                    match resolved {
-                        None => report.record(
-                            &session_id,
-                            Category::OtherTools,
-                            toks,
-                            mult,
-                            0,
-                            None,
-                            date,
-                            ts,
-                        ),
-                        Some((name, fp)) => {
-                            let name = name.as_deref().unwrap_or("");
-                            let fp_str = fp.as_deref().unwrap_or("");
-                            let cat = cc_tool_category(name, fp_str);
-                            report.record(&session_id, cat, toks, mult, 0, fp.as_deref(), date, ts);
-                        }
-                    }
-                    if images > 0 {
-                        report.record(
-                            &session_id,
-                            Category::BrowserAndImages,
-                            images * IMAGE_NOMINAL_TOKENS,
-                            mult,
-                            images,
-                            None,
-                            date,
-                            ts,
-                        );
-                    }
-                }
-                "image" => {
-                    report.record(
-                        &session_id,
-                        Category::BrowserAndImages,
-                        IMAGE_NOMINAL_TOKENS,
-                        mult,
-                        1,
-                        None,
-                        date,
-                        ts,
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-
-    report.note_session_start(&session_id, session_min_ts);
-    Ok(())
+    parse_session_reader(
+        std::io::BufReader::new(fs::File::open(path)?),
+        path,
+        report,
+        fallback,
+        true,
+        include_subagents,
+    )
 }
-
-// -------------------------------------------------------------------------
-// Codex parsing (ported 1:1 from the reference).
-// -------------------------------------------------------------------------
 
 pub(crate) fn parse_codex_session(
     path: &Path,
     report: &mut WorkspaceReport,
     fallback: Date,
 ) -> std::io::Result<()> {
-    let lines = read_jsonl(path)?;
-    if lines.is_empty() {
-        return Ok(());
-    }
-
-    let mut session_id: Option<String> = None;
-    for o in &lines {
-        if o.get("type").and_then(Value::as_str) == Some("session_meta") {
-            if let Some(p) = o.get("payload").and_then(Value::as_object) {
-                session_id = p
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .or_else(|| p.get("session_id").and_then(Value::as_str))
-                    .map(str::to_string);
-            }
-            break;
-        }
-    }
-    let session_id = session_id.unwrap_or_else(|| basename_stem(path));
-
-    // Pass 1: call_id -> name; residency markers.
-    let mut callmap: BTreeMap<String, Option<String>> = BTreeMap::new();
-    let mut assistant_ordinals: Vec<usize> = Vec::new();
-    let mut compaction_ordinals: Vec<usize> = Vec::new();
-    let mut session_min_ts: Option<OffsetDateTime> = None;
-
-    for (i, o) in lines.iter().enumerate() {
-        if let Some(ts) = parse_timestamp(o) {
-            session_min_ts = Some(match session_min_ts {
-                Some(existing) if existing <= ts => existing,
-                _ => ts,
-            });
-        }
-        let Some(p) = o.get("payload").and_then(Value::as_object) else {
-            continue;
-        };
-        let pt = p.get("type").and_then(Value::as_str).unwrap_or("");
-        match pt {
-            "function_call" | "custom_tool_call" | "local_shell_call" => {
-                if let Some(cid) = p.get("call_id").and_then(Value::as_str) {
-                    let name = p
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .or_else(|| (pt == "local_shell_call").then(|| "local_shell".to_string()));
-                    callmap.insert(cid.to_string(), name);
-                }
-                assistant_ordinals.push(i);
-            }
-            "agent_message" => assistant_ordinals.push(i),
-            "context_compacted" => compaction_ordinals.push(i),
-            _ => {}
-        }
-    }
-    let residency = ResidencyModel::new(assistant_ordinals, compaction_ordinals);
-
-    // Pass 2.
-    for (i, o) in lines.iter().enumerate() {
-        let Some(p) = o.get("payload").and_then(Value::as_object) else {
-            continue;
-        };
-        let pt = p.get("type").and_then(Value::as_str).unwrap_or("");
-        let mult = residency.multiplier(i);
-        let (date, ts) = line_date(o, fallback);
-
-        match pt {
-            "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => {
-                let name = p
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .and_then(|cid| callmap.get(cid))
-                    .and_then(|n| n.clone());
-                let (text, images) = codex_output_text_and_images(p.get("output"));
-                let toks = estimate_text_tokens(&text);
-                let cat = match name.as_deref() {
-                    Some(n) => codex_tool_category(n),
-                    None => Category::OtherTools,
-                };
-                report.record(&session_id, cat, toks, mult, 0, None, date, ts);
-                if images > 0 {
-                    report.record(
-                        &session_id,
-                        Category::BrowserAndImages,
-                        images * IMAGE_NOMINAL_TOKENS,
-                        mult,
-                        images,
-                        None,
-                        date,
-                        ts,
-                    );
-                }
-            }
-            "web_search_end" => {
-                let text = python_json_dumps(&Value::Object(p.clone()));
-                report.record(
-                    &session_id,
-                    Category::WebFetchSearch,
-                    estimate_text_tokens(&text),
-                    mult,
-                    0,
-                    None,
-                    date,
-                    ts,
-                );
-            }
-            "mcp_tool_call_end" => {
-                let cat = codex_mcp_category(p.get("invocation"));
-                let (text, images) = codex_mcp_result_text_and_images(p.get("result"));
-                report.record(
-                    &session_id,
-                    cat,
-                    estimate_text_tokens(&text),
-                    mult,
-                    0,
-                    None,
-                    date,
-                    ts,
-                );
-                if images > 0 {
-                    report.record(
-                        &session_id,
-                        Category::BrowserAndImages,
-                        images * IMAGE_NOMINAL_TOKENS,
-                        mult,
-                        images,
-                        None,
-                        date,
-                        ts,
-                    );
-                }
-            }
-            "message" => {
-                let role = p.get("role").and_then(Value::as_str).unwrap_or("");
-                if role == "developer" || role == "user" {
-                    let (text, images) = extract_blocks_text_and_images(p.get("content"));
-                    if role == "developer" {
-                        report.record(
-                            &session_id,
-                            Category::HarnessAttachments,
-                            estimate_text_tokens(&text),
-                            mult,
-                            0,
-                            None,
-                            date,
-                            ts,
-                        );
-                    }
-                    if images > 0 {
-                        report.record(
-                            &session_id,
-                            Category::BrowserAndImages,
-                            images * IMAGE_NOMINAL_TOKENS,
-                            mult,
-                            images,
-                            None,
-                            date,
-                            ts,
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    report.note_session_start(&session_id, session_min_ts);
-    Ok(())
+    parse_session_reader(
+        std::io::BufReader::new(fs::File::open(path)?),
+        path,
+        report,
+        fallback,
+        false,
+        true,
+    )
 }
 
 fn is_truthy_json(value: &Value) -> bool {

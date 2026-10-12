@@ -1265,3 +1265,11 @@ fn report_expired_budget_does_not_return_empty_or_partial_replacement() {
     .is_none());
     fs::remove_file(path).unwrap();
 }
+
+#[path = "parity_baseline.rs"]
+mod parity_baseline;
+
+#[path = "parity_fixtures.rs"]
+mod parity_fixtures;
+#[path = "parity_resource.rs"]
+mod parity_resource;

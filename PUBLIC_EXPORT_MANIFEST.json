@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 553,
-  "content_sha256": "98f288a1ec12ffb37f6149c912257576acd578b0c6be6edc9a1a8231db7c82b4",
+  "candidate_file_count": 557,
+  "content_sha256": "6707a432d50a2ad9bfbb3478b09e03ea5ae2eea620e3038d4030e3dcda79e7ed",
   "files": [
     {
       "executable": false,
@@ -20,8 +20,8 @@
       "executable": false,
       "mode": "0644",
       "path": ".github/workflows/ci.yml",
-      "sha256": "0d81dba3f97a8e83c0f695769ce7465b7e8d627677e3ecdb8c94421cce62ffb2",
-      "size_bytes": 3690
+      "sha256": "d55f93221e145ff26e6c7f7e0ceec33276f381d400a820c80ae9282e1d75f520",
+      "size_bytes": 4273
     },
     {
       "executable": false,
@@ -832,15 +832,36 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition.rs",
-      "sha256": "c733c449f87feeed81845b6d6036cbf05fc3108c68a88f02b8d0a8bbffe0455e",
-      "size_bytes": 66830
+      "sha256": "7689be04ccf7e26f11c339a257db5d0c08da4bfdb1fc71d30d729eccebf32496",
+      "size_bytes": 65791
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/context_composition/parity_baseline.rs",
+      "sha256": "e0a77dfcaf1dac64262272070c98f437382515c9c1d0ffe7ddad5aface8b2d26",
+      "size_bytes": 15224
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/context_composition/parity_fixtures.rs",
+      "sha256": "92b331f2ddef399c22d121628e481f5e70c2e21aaca1706765ac2a87c9194150",
+      "size_bytes": 31918
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/context_composition/parity_resource.rs",
+      "sha256": "20db263bb1c8ecfb8e27307a6cfca26a6dfa8ad1ea73942fad147b13e651ea33",
+      "size_bytes": 11017
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/tests.rs",
-      "sha256": "568c9735efa11b86b8b6f18f88917fe4f726b645571b6a9600dcd535ca5f7680",
-      "size_bytes": 53237
+      "sha256": "f3ca0beaaf40b2a39ac1be579de748d3bdcad4ac2f52786eb8180c3498159ac1",
+      "size_bytes": 53395
     },
     {
       "executable": false,
@@ -2574,6 +2595,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-12-composition-streaming-facts.md",
+      "sha256": "7eda8fb87cd3504815f9a5855991630eda1da62143d1ed123341c2c7fbf3eff1",
+      "size_bytes": 2635
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-12-partial-snapshot-ack-settlement.md",
       "sha256": "86f89c80d74d2ebdb24a35e85fde5b04ac4fc6a40a0456e17766d45adf220d22",
       "size_bytes": 4302
@@ -3876,7 +3904,7 @@
   ],
   "generated_at": "2026-10-12T18:14:49+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 554,
+  "output_file_count": 558,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
