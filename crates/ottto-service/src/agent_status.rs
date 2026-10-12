@@ -1789,6 +1789,11 @@ fn remember_codex_last_known_reading(
 /// credential still names that account ([`codex_home_kept_binding`]), so a
 /// sign-out or a re-login to another account carries nothing. Never part of
 /// an uploaded snapshot: the server owns carry-forward.
+///
+/// The container's `captured_at` is the time of the failed poll. The time
+/// the reading was taken is each window's and balance's own `observed_at`
+/// (and `grants_observed_at`), which stay the original; a display's "as of"
+/// must come from those.
 fn codex_last_known_slot_reading(
     slot: &CodexHomeSlot,
     captured_at: &str,
@@ -22101,6 +22106,10 @@ for line in sys.stdin:
         account.organization_identifier_hash = Some("kept-workspace".to_string());
         account.plan_type = Some("pro".to_string());
         account.subscription_product = Some("chatgpt_pro".to_string());
+        account.billing_channel = Some("subscription".to_string());
+        account.subscription_period_start = Some("2026-01-01T00:00:00Z".to_string());
+        account.subscription_period_end = Some("2026-02-01T00:00:00Z".to_string());
+        account.subscription_period_last_checked_at = Some("2026-01-15T00:00:00Z".to_string());
         snapshot.account = Some(account);
         snapshot.quota_windows = vec![AgentQuotaWindow {
             name: "primary".to_string(),
@@ -22129,6 +22138,11 @@ for line in sys.stdin:
         let account = uploaded.account.as_ref().expect("account");
         assert!(account.plan_type.is_none());
         assert!(account.subscription_product.is_none());
+        assert!(account.subscription_period_start.is_none());
+        assert!(account.subscription_period_end.is_none());
+        assert!(account.subscription_period_last_checked_at.is_none());
+        // The registered route is identity, not a plan fact: it stays.
+        assert_eq!(account.billing_channel.as_deref(), Some("subscription"));
         assert_eq!(
             account.account_identifier_hash.as_deref(),
             Some("kept-account")

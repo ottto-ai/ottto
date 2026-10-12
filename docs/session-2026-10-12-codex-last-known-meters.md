@@ -35,10 +35,16 @@ the CLI status) and is never uploaded.
   `codex_configured_account_unavailable`:
   - every window marked `stale` (the placeholder `unsupported` window, when
     present, stays) and every credit balance;
-  - `plan_type`, `subscription_product` and the plan observations: on a failed
-    read these come from the local credential, not from the provider.
-- A missing `codex` executable is not a transient failure: the snapshot keeps
-  its previous status and labels.
+  - `plan_type`, `subscription_product`, the plan observations and the
+    subscription period (`subscription_period_start`,
+    `subscription_period_end`, `subscription_period_last_checked_at`): on a
+    failed read these come from the local credential, not from the provider.
+  `billing_channel` stays: it is the registered route of the account, part of
+  the identity the server files the row under, not a plan fact.
+- A missing `codex` executable is not a transient failure: the local snapshot
+  keeps its previous status and labels. Its upload is still a failed read by
+  code (`codex_usage_probe_failed`), so it loses the same plan words and
+  period fields.
 
 Kept hashes never become transcript, session-attribution or live-meter
 authority: the slot's binding stays empty and the account is marked low
@@ -54,6 +60,9 @@ identity hashes without a reading):
 
 - a registered slot's local status (`quota_snapshot`) shows that reading;
 - the default home's local snapshot shows it, with the kept hashes.
+
+The registered slot's `quota_snapshot.captured_at` is the time of the failed
+poll; the time of the reading is each meter's own `observed_at`.
 
 In both cases every window and balance is marked `freshness: stale`; values and
 read clocks (`observed_at`, `grants_observed_at`, grants) are the original
@@ -126,8 +135,9 @@ Open follow-ups, for a separate decision:
 Synthetic, no provider calls.
 
 - upload: a failed Codex snapshot with stale meters and plan words is uploaded
-  with no stale window, no balance, no plan word and no plan observation, with
-  its hashes, status and failure code; a successful reading is uploaded as
+  with no stale window, no balance, no plan word, no plan observation and no
+  subscription period, with its hashes, billing channel, status and failure
+  code; a successful reading is uploaded as
   read; a failed-probe placeholder is meterless even when its binding has a
   recent reading;
 - through the synthetic collector, a managed slot whose app-server ends before

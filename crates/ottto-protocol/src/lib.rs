@@ -1217,8 +1217,11 @@ impl AgentStatusSnapshot {
             // A failed Codex usage read is uploaded as a failure only. The
             // daemon's last-known reading (stale meters) is local display; the
             // backend owns carry-forward of its own last good reading. Plan
-            // words on such a row come from the local credential, not from the
-            // provider, so they are not uploaded either.
+            // words and the subscription period on such a row come from the
+            // local credential, not from the provider, so they are not
+            // uploaded either. `billing_channel` stays: it is the registered
+            // route of the account, part of the identity the backend files
+            // the row under, not a plan fact.
             self.quota_windows
                 .retain(|window| window.freshness != AgentQuotaWindowFreshness::Stale);
             self.credit_balances.clear();
@@ -1226,6 +1229,9 @@ impl AgentStatusSnapshot {
             if let Some(account) = self.account.as_mut() {
                 account.plan_type = None;
                 account.subscription_product = None;
+                account.subscription_period_start = None;
+                account.subscription_period_end = None;
+                account.subscription_period_last_checked_at = None;
             }
         }
         if let Some(account) = self.account.as_mut() {
