@@ -902,14 +902,14 @@ mod tests {
         assert_eq!(plan.samples.sealed_offset, 4);
         // An error after guard progress still returns that progress without any logging.
         let mut observed = 0;
-        let failed: io::Result<()> = (|| {
+        let failed: io::Result<()> = {
             let mut progress = GuardProgress {
                 bytes: 0,
                 observed: &mut observed,
             };
             progress.bytes = 23;
             Err(io::Error::other("synthetic failure"))
-        })();
+        };
         assert!(failed.is_err());
         assert_eq!(observed, 23);
     }

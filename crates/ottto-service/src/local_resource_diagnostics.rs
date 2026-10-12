@@ -900,7 +900,7 @@ mod tests {
             Some(&"synthetic original panic")
         );
         assert!(rows.is_empty());
-        assert!(ABANDONED[3].value().unwrap() >= before + 1);
+        assert!(ABANDONED[3].value().unwrap() > before);
     }
     #[test]
     fn efficiency_unsampled_and_repeated_snapshot_are_explicit() {
