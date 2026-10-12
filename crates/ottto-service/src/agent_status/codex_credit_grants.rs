@@ -395,6 +395,11 @@ pub(super) fn remember_home_binding(home: &Path, binding: &str) {
     tracker().remember_home_binding(home, binding);
 }
 
+/// The binding last validated at `home`, if any.
+pub(super) fn home_binding(home: &Path) -> Option<String> {
+    tracker().home_binding.get(home).cloned()
+}
+
 /// Process-wide [`CodexCreditTracker::record_session_failure`].
 pub(super) fn record_session_failure(home: &Path, now: u64) {
     tracker().record_session_failure(home, now);
@@ -409,6 +414,13 @@ pub(super) fn last_detail_failed_at(binding: &str) -> Option<u64> {
         .get(binding)
         .and_then(|cadence| cadence.last_detail_failed)
         .map(|(at, _)| at)
+}
+
+/// Drop a binding's cadence, so a test that failed a session for a shared
+/// synthetic binding leaves no back-off for the next test.
+#[cfg(test)]
+pub(super) fn forget_binding_cadence(binding: &str) {
+    tracker().cadence.remove(binding);
 }
 
 /// Process-wide [`CodexCreditTracker::routine_needs_details`].

@@ -1200,7 +1200,40 @@ pub struct AgentStatusSnapshot {
 }
 
 impl AgentStatusSnapshot {
+    /// Whether this is a Codex snapshot of a failed usage read: the probe
+    /// failed, or a registered account could not be verified.
+    fn is_codex_failed_usage_read(&self) -> bool {
+        self.source == SourceKind::Codex
+            && self.diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic.code.as_str(),
+                    "codex_usage_probe_failed" | "codex_configured_account_unavailable"
+                )
+            })
+    }
+
     pub fn redacted_for_backend(mut self) -> Self {
+        if self.is_codex_failed_usage_read() {
+            // A failed Codex usage read is uploaded as a failure only. The
+            // daemon's last-known reading (stale meters) is local display; the
+            // backend owns carry-forward of its own last good reading. Plan
+            // words and the subscription period on such a row come from the
+            // local credential, not from the provider, so they are not
+            // uploaded either. `billing_channel` stays: it is the registered
+            // route of the account, part of the identity the backend files
+            // the row under, not a plan fact.
+            self.quota_windows
+                .retain(|window| window.freshness != AgentQuotaWindowFreshness::Stale);
+            self.credit_balances.clear();
+            self.plan_observations.clear();
+            if let Some(account) = self.account.as_mut() {
+                account.plan_type = None;
+                account.subscription_product = None;
+                account.subscription_period_start = None;
+                account.subscription_period_end = None;
+                account.subscription_period_last_checked_at = None;
+            }
+        }
         if let Some(account) = self.account.as_mut() {
             // Display text travels only on this status carrier. Raw provider
             // account and selected organization/workspace ids are identifiers,
@@ -3392,6 +3425,11 @@ pub enum CodexAccountSlotCollectionStateV1 {
     IdentityMismatch,
     ProviderUnavailable,
     DuplicateAccount,
+    /// Local status only: the slot's last read failed and its
+    /// `quota_snapshot` is the account's last-known reading, marked stale.
+    /// Every shipped local client decodes a quota snapshot on this state and
+    /// grants it no slot authority; shipped clients do not show that reading.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

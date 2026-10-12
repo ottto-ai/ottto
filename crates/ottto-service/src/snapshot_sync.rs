@@ -4693,6 +4693,7 @@ pub struct ClaudeLocalEvidenceStats {
     pub effort_evidence_load_failed: bool,
     pub own_request_complete_root_count: usize,
     pub own_request_unknown_root_count: usize,
+    pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
 }
 
 pub(crate) fn apply_claude_local_evidence_to_scan(
@@ -4867,6 +4868,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
             item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
         })
         .count();
+    stats.duplicate_census = disposition.duplicate_census;
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
     if census_withheld {
         // These revisions were fully readable, but uploading them would demote
