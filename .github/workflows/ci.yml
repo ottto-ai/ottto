@@ -6,6 +6,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      composition_buffer_probe:
+        description: Diagnostic-only five-parse buffer experiment
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -16,7 +21,7 @@ permissions:
 
 jobs:
   rust:
-    name: Rust contracts
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe && 'Composition buffer experiment' || 'Rust contracts' }}
     timeout-minutes: 40
     runs-on: macos-15
     env:
@@ -37,18 +42,23 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Connector format
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe) }}
         run: cargo fmt --manifest-path crates/Cargo.toml --all --check
 
       - name: Runtime clippy
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe) }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Connector clippy
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe) }}
         run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
       - name: Runtime tests
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe) }}
         run: cargo test --workspace --locked
 
       - name: Layout coverage receipt
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe) }}
         run: |
           set -euo pipefail
           cargo test -p ottto-service --lib --locked heap_layout_bound::sampled_scalar_buffer_tests::layout_gate_coverage_receipt -- --exact --nocapture | tee "$RUNNER_TEMP/layout-coverage-receipt.log"
@@ -56,20 +66,31 @@ jobs:
           grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/layout-coverage-receipt.log"
 
       - name: Context composition parity and resource receipt
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && !inputs.composition_buffer_probe
         run: |
           set -euo pipefail
           cargo test -p ottto-service --lib --locked context_composition::tests::parity_resource::compact_resource_receipt -- --exact --ignored --nocapture --test-threads=1 | tee "$RUNNER_TEMP/composition-resource-receipt.log"
           grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/composition-resource-receipt.log"
           grep 'COMPOSITION_RESOURCE_RECEIPT ' "$RUNNER_TEMP/composition-resource-receipt.log"
 
+      - name: Bounded buffer experiment
+        if: github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe
+        run: |
+          set -euo pipefail
+          cargo test -p ottto-service --lib --locked context_composition::tests::parity_resource::buffer_worst_case_receipt -- --exact --ignored --nocapture --test-threads=1 | tee "$RUNNER_TEMP/composition-buffer-receipt.log"
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/composition-buffer-receipt.log"
+          grep 'COMPOSITION_BUFFER_RECEIPT ' "$RUNNER_TEMP/composition-buffer-receipt.log"
+
       - name: Connector tests
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe) }}
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
 
       - name: Connector package tests
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe) }}
         run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources
 
   public-surface:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe) }}
     name: Public surface checks
     timeout-minutes: 30
     runs-on: macos-15
@@ -115,6 +136,7 @@ jobs:
           fail-on-severity: moderate
 
   rust-advisories:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe) }}
     name: Rust advisory audit
     timeout-minutes: 20
     runs-on: macos-15

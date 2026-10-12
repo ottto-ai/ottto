@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 557,
-  "content_sha256": "426bc8aa519e5b940f0f9e4ae7b55d46cd6c0db1e7ef4c0087ec9c7fbe6d8dbc",
+  "content_sha256": "83e8f1db1823e5bed223172c50e4c77942a852b900c4d77a5646886ce7ee790c",
   "files": [
     {
       "executable": false,
@@ -20,8 +20,8 @@
       "executable": false,
       "mode": "0644",
       "path": ".github/workflows/ci.yml",
-      "sha256": "de3480a9f6d09bfff547b49bd19f69209d070599ada7f059d77df5e64d5ac0f7",
-      "size_bytes": 4326
+      "sha256": "c550e0e87e2b4a79ca7dec5990ce6f8baff8505e236fefdf81ccf80a41724b6a",
+      "size_bytes": 6119
     },
     {
       "executable": false,
@@ -853,8 +853,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/parity_resource.rs",
-      "sha256": "585515b1f4ccdadc70e19c5e695afe3d2d12906db699ba9d620ca651a0d6b7b9",
-      "size_bytes": 12875
+      "sha256": "2c0974c574b47be3bd50f67d0594bfdb7ca6ce82f2b5e5c9cb5fc08fa5cc71c9",
+      "size_bytes": 17250
     },
     {
       "executable": false,
