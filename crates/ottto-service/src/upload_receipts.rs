@@ -100,11 +100,54 @@ struct RejectedUsageEvidence {
     usage_grain_digest: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum RejectedUsageReason {
+pub(crate) enum RejectedUsageReason {
     UsageAccountingAuthorityDowngrade,
+    ReservedSessionIdentitySeparator,
+    OccurredAtBeyondFutureHorizon,
+    HourBucketCountAboveCap,
+    DivergentDuplicateLogicalSession,
+    AcceptedLogTransactionCap,
+    OccurredAtBeyondWriteFenceFuture,
+    OccurredAtBeyondJournalRetention,
+    BodyExceedsMaxBytes,
+    OccurredAtRequiresTimezone,
+    OccurredAtUtcNormalizationOutOfRange,
     Other,
+}
+
+impl RejectedUsageReason {
+    pub(crate) fn from_wire(reason: &str) -> Self {
+        match reason {
+            "usage_accounting_authority_downgrade" => {
+                RejectedUsageReason::UsageAccountingAuthorityDowngrade
+            }
+            "reserved_session_identity_separator" => {
+                RejectedUsageReason::ReservedSessionIdentitySeparator
+            }
+            "occurred_at_beyond_future_horizon" => {
+                RejectedUsageReason::OccurredAtBeyondFutureHorizon
+            }
+            "hour_bucket_count_above_cap" => RejectedUsageReason::HourBucketCountAboveCap,
+            "divergent_duplicate_logical_session" => {
+                RejectedUsageReason::DivergentDuplicateLogicalSession
+            }
+            "accepted_log_transaction_cap" => RejectedUsageReason::AcceptedLogTransactionCap,
+            "occurred_at_beyond_write_fence_future" => {
+                RejectedUsageReason::OccurredAtBeyondWriteFenceFuture
+            }
+            "occurred_at_beyond_journal_retention" => {
+                RejectedUsageReason::OccurredAtBeyondJournalRetention
+            }
+            "body_exceeds_max_bytes" => RejectedUsageReason::BodyExceedsMaxBytes,
+            "occurred_at_requires_timezone" => RejectedUsageReason::OccurredAtRequiresTimezone,
+            "occurred_at_utc_normalization_out_of_range" => {
+                RejectedUsageReason::OccurredAtUtcNormalizationOutOfRange
+            }
+            _ => RejectedUsageReason::Other,
+        }
+    }
 }
 
 fn rejected_usage_evidence(
@@ -168,11 +211,7 @@ fn rejected_usage_evidence(
         schema_version: 1,
         entity_ref: format!("{:x}", Sha256::digest(entity_key.as_bytes()))[..16].into(),
         machine_ref: format!("{:x}", Sha256::digest(request.machine_id.as_bytes()))[..12].into(),
-        reason: if rejection.reason == "usage_accounting_authority_downgrade" {
-            RejectedUsageReason::UsageAccountingAuthorityDowngrade
-        } else {
-            RejectedUsageReason::Other
-        },
+        reason: RejectedUsageReason::from_wire(rejection.safe_reason()),
         permanent: rejection.permanent,
         exclusive_usage_contract: item.usage_accounting_contract.as_deref()
             == Some("session_exclusive_reported_usage:v1"),
@@ -1686,3 +1725,22 @@ mod tests {
 }
 
 crate::heap_layout_bound::fields!(UploadReceiptContext; device_label, account_binding);
+
+impl crate::heap_layout_bound::HeapLayoutBound for RejectedUsageReason {
+    fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::UsageAccountingAuthorityDowngrade
+            | Self::ReservedSessionIdentitySeparator
+            | Self::OccurredAtBeyondFutureHorizon
+            | Self::HourBucketCountAboveCap
+            | Self::DivergentDuplicateLogicalSession
+            | Self::AcceptedLogTransactionCap
+            | Self::OccurredAtBeyondWriteFenceFuture
+            | Self::OccurredAtBeyondJournalRetention
+            | Self::BodyExceedsMaxBytes
+            | Self::OccurredAtRequiresTimezone
+            | Self::OccurredAtUtcNormalizationOutOfRange
+            | Self::Other => counter.add(0),
+        }
+    }
+}
