@@ -416,6 +416,13 @@ pub(super) fn last_detail_failed_at(binding: &str) -> Option<u64> {
         .map(|(at, _)| at)
 }
 
+/// Drop a binding's cadence, so a test that failed a session for a shared
+/// synthetic binding leaves no back-off for the next test.
+#[cfg(test)]
+pub(super) fn forget_binding_cadence(binding: &str) {
+    tracker().cadence.remove(binding);
+}
+
 /// Process-wide [`CodexCreditTracker::routine_needs_details`].
 pub(super) fn routine_read_needs_details(
     binding: Option<&str>,
