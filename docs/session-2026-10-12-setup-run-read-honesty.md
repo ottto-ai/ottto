@@ -33,6 +33,21 @@ flag. Uploads use the separate relay device credential and kept working.
   value with `invalid_request` before any network call and never forwards
   `timezone=`. The protocol field stays for wire compatibility.
 
+## Refresh persistence
+
+A device-secret refresh now commits its new setup-run token and connection only
+if the persisted binding still belongs to that refresh. The commit runs under
+the setup-run binding lock that every other writer of the pair (claim, account
+switch, setup attach, terminal clear, logout reset) already holds, so a reconnect
+or logout cannot interleave with it. The persisted binding may name the
+refresh's own run or the run the backend just rebound to; anything else means
+the binding was replaced or removed while the refresh was in flight, so the
+minted token is dropped and the read fails with the existing mismatch or
+missing-connection error instead of retrying. If the connection write fails
+after the token write, the new token is deleted so the stores never pair a new
+token with an old connection; the next read refreshes again with the device
+credential. The lock is process-wide; only the daemon writes these stores.
+
 ## Compatibility
 
 No protocol, schema or persisted-format change. The canonical health values used
@@ -53,3 +68,10 @@ messages, not timing. A late rejection or success of a replaced run cannot mark
 or clear the new run; same-binding rejection and recovery still apply; logout
 mid-read records nothing; each read makes one request and at most one refresh,
 and an in-flight refresh keeps the binding the read started with.
+
+Refresh persistence is pinned the same way: a successful refresh of run A that
+finishes after a reconnect to run B leaves B's connection and token untouched
+and makes no retry; one that finishes after logout restores nothing; a
+same-binding refresh persists the new pair and retries with the new token.
+Commit-step tests with in-memory stores cover a backend rebind, a different API
+base, and token or connection write failures.

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 552,
-  "content_sha256": "2861f405a5a4d6aa66b00360ba3292b3f1c31301e2c7ceaddf6f97bc25ab4640",
+  "content_sha256": "70c8162104d28afe039a64c5dacff54ff9aa920e216a9dc8a503d29640c62458",
   "files": [
     {
       "executable": false,
@@ -853,8 +853,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "e8e62836d2222b5db6b7171050736704ffc03e2036ef8d6e00c0a74844fc4b40",
-      "size_bytes": 1227169
+      "sha256": "a5d7033518ef866240698d3dd9c4062e413252dda572a7d92b3a95f827e1c814",
+      "size_bytes": 1244060
     },
     {
       "executable": false,
@@ -2568,8 +2568,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-12-setup-run-read-honesty.md",
-      "sha256": "3d4b98073cbd50d256f761489ce4736dc062f1287a749f7f973ef79d85178ddc",
-      "size_bytes": 3310
+      "sha256": "75323f93610398b515a6f0dfcd117d96c2ef35ee77aba45a5c09bf3eaaedefc1",
+      "size_bytes": 4689
     },
     {
       "executable": false,
