@@ -46,3 +46,10 @@ Focused tests cover the status projection, transition-only recording,
 recovery, the one-refresh-per-read bound against a backend that rejects both
 the read and the refresh, the shared message, timezone refusal for all three
 commands, URL builders without `timezone=`, and the frozen CLI help contract.
+
+A concurrency regression drives `ottto costs` on worker threads against a test
+backend whose responses are released by the test thread, so ordering comes from
+messages, not timing. A late rejection or success of a replaced run cannot mark
+or clear the new run; same-binding rejection and recovery still apply; logout
+mid-read records nothing; each read makes one request and at most one refresh,
+and an in-flight refresh keeps the binding the read started with.
