@@ -1733,7 +1733,8 @@ fn codex_home_kept_binding(codex_home: &Path, home_trust: CodexHomeTrust) -> Opt
 /// account's last reading marked stale ([`codex_last_known`]) for local
 /// display; the upload copy drops the reading
 /// (`AgentStatusSnapshot::redacted_for_backend`). The slot's binding stays
-/// empty: kept hashes never become transcript or live-meter authority.
+/// empty and the account's confidence is low: kept hashes never become
+/// transcript, session-attribution or live-meter authority.
 fn keep_failed_default_codex_binding(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
@@ -1751,6 +1752,10 @@ fn keep_failed_default_codex_binding(
     };
     account.account_identifier_hash = Some(account_hash.to_string());
     account.organization_identifier_hash = Some(workspace_hash.to_string());
+    // Remembered, not validated in this read: low confidence keeps the kept
+    // hashes out of every consumer that trusts a current login (for example
+    // the current-login fallback of session attribution).
+    account.confidence = AgentStatusConfidence::Low;
     if let Some((quota_windows, credit_balances)) = codex_last_known::stale_reading(&binding, now) {
         snapshot.quota_windows = quota_windows;
         snapshot.credit_balances = credit_balances;
@@ -23183,6 +23188,8 @@ for line in sys.stdin:
             Some(workspace.as_str())
         );
         assert!(failed.binding.is_none());
+        // A remembered identity is never a trusted current login.
+        assert_eq!(kept.confidence, AgentStatusConfidence::Low);
         let mut expected_windows = fresh.snapshot.quota_windows.clone();
         let mut expected_balances = fresh.snapshot.credit_balances.clone();
         mark_quota_meters_stale(&mut expected_windows, &mut expected_balances);

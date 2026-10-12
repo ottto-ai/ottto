@@ -40,8 +40,9 @@ the CLI status) and is never uploaded.
 - A missing `codex` executable is not a transient failure: the snapshot keeps
   its previous status and labels.
 
-Kept hashes never become transcript or live-meter authority: the slot's binding
-stays empty.
+Kept hashes never become transcript, session-attribution or live-meter
+authority: the slot's binding stays empty and the account is marked low
+confidence, which the current-login fallback of session attribution rejects.
 
 ## Local last-known reading
 
