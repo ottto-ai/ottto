@@ -1794,6 +1794,9 @@ fn remember_codex_last_known_reading(
 /// the reading was taken is each window's and balance's own `observed_at`
 /// (and `grants_observed_at`), which stay the original; a display's "as of"
 /// must come from those.
+///
+/// The candidate keeps its failed state; [`codex_local_slot_status`] gives
+/// the slot the state and hashes local clients need to decode the reading.
 fn codex_last_known_slot_reading(
     slot: &CodexHomeSlot,
     captured_at: &str,
@@ -2179,16 +2182,115 @@ fn apply_codex_candidate_statuses(
         .iter()
         .find(|candidate| candidate.slot.slot_id == "default")
     {
-        status.default_slot.collection = candidate.status.clone();
+        status.default_slot.collection = codex_local_slot_status(candidate);
     }
     for descriptor in &mut status.managed_slots {
         if let Some(candidate) = candidates
             .iter()
             .find(|candidate| candidate.slot.slot_id == descriptor.slot_id)
         {
-            descriptor.collection = candidate.status.clone();
+            descriptor.collection = codex_local_slot_status(candidate);
         }
     }
+    // A local client rejects the whole status when two managed slots carry
+    // the same account and workspace and are not one anchor plus declared
+    // duplicates. A last-known slot is neither, so it gives way.
+    let mut slots_by_binding = BTreeMap::<(String, String), usize>::new();
+    for descriptor in &status.managed_slots {
+        if let Some(binding) = codex_slot_status_binding(&descriptor.collection) {
+            *slots_by_binding.entry(binding).or_default() += 1;
+        }
+    }
+    for descriptor in &mut status.managed_slots {
+        if descriptor.collection.state != CodexAccountSlotCollectionStateV1::Unknown {
+            continue;
+        }
+        let shared = codex_slot_status_binding(&descriptor.collection)
+            .is_some_and(|binding| slots_by_binding.get(&binding).copied().unwrap_or(0) > 1);
+        if !shared {
+            continue;
+        }
+        if let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.slot.slot_id == descriptor.slot_id)
+        {
+            descriptor.collection = candidate.status.clone();
+            descriptor.collection.quota_snapshot = None;
+        }
+    }
+}
+
+fn codex_slot_status_binding(
+    status: &CodexAccountSlotCollectionStatusV1,
+) -> Option<(String, String)> {
+    status
+        .account_identifier_hash
+        .clone()
+        .zip(status.workspace_identifier_hash.clone())
+}
+
+/// The slot status as local clients read it.
+///
+/// Shipped clients decode a slot's `quota_snapshot` only on state `unknown`,
+/// `fresh` or `duplicate_account`, only with both identity hashes, and only
+/// when every meter carries those hashes; one slot outside that rule fails
+/// the whole Codex accounts status. A failed read that shows its last-known
+/// reading ([`codex_last_known_slot_reading`]) is therefore sent as
+/// `unknown` with the registered hashes, which
+/// [`codex_last_known_slot_reading`] has already matched against the home's
+/// local credential. Any other snapshot outside the rule is not sent.
+///
+/// Wire shape only: the candidate's own state, binding and health are
+/// unchanged, and `unknown` gives a client no authority over the slot.
+fn codex_local_slot_status(candidate: &CodexSlotCandidate) -> CodexAccountSlotCollectionStatusV1 {
+    let mut status = candidate.status.clone();
+    if status.quota_snapshot.is_none() || codex_slot_quota_snapshot_is_admitted(&status) {
+        return status;
+    }
+    if candidate.slot.ownership == CodexAccountSlotOwnershipV1::Managed
+        && candidate.binding.is_none()
+        && codex_probe_failed_only(&candidate.status, &candidate.snapshot)
+    {
+        if let Some((account, workspace)) = candidate.slot.registered_binding.clone() {
+            let mut last_known = status.clone();
+            last_known.state = CodexAccountSlotCollectionStateV1::Unknown;
+            last_known.account_identifier_hash = Some(account);
+            last_known.workspace_identifier_hash = Some(workspace);
+            if codex_slot_quota_snapshot_is_admitted(&last_known) {
+                return last_known;
+            }
+        }
+    }
+    status.quota_snapshot = None;
+    status
+}
+
+/// Whether local clients admit this status's `quota_snapshot`.
+fn codex_slot_quota_snapshot_is_admitted(status: &CodexAccountSlotCollectionStatusV1) -> bool {
+    let Some(snapshot) = status.quota_snapshot.as_ref() else {
+        return true;
+    };
+    if !matches!(
+        status.state,
+        CodexAccountSlotCollectionStateV1::Unknown
+            | CodexAccountSlotCollectionStateV1::Fresh
+            | CodexAccountSlotCollectionStateV1::DuplicateAccount
+    ) {
+        return false;
+    }
+    let (Some(account), Some(workspace)) = (
+        status.account_identifier_hash.as_deref(),
+        status.workspace_identifier_hash.as_deref(),
+    ) else {
+        return false;
+    };
+    snapshot.quota_windows.iter().all(|window| {
+        window.account_identifier_hash.as_deref() == Some(account)
+            && window.organization_identifier_hash.as_deref() == Some(workspace)
+    }) && snapshot.credit_balances.iter().all(|balance| {
+        balance.account_identifier_hash.as_deref() == Some(account)
+            && balance.organization_identifier_hash.as_deref() == Some(workspace)
+    })
 }
 
 /// Shown when the credential does not claim an email for the account.
@@ -2603,9 +2705,8 @@ fn projected_codex_target_health(
         CodexAccountSlotCollectionStateV1::Fresh => CodexAccountTargetHealthV1::Healthy,
         CodexAccountSlotCollectionStateV1::Unverified => CodexAccountTargetHealthV1::Unverified,
         CodexAccountSlotCollectionStateV1::NeedsLogin => CodexAccountTargetHealthV1::NeedsLogin,
-        CodexAccountSlotCollectionStateV1::IdentityUnknown => {
-            CodexAccountTargetHealthV1::IdentityUnknown
-        }
+        CodexAccountSlotCollectionStateV1::IdentityUnknown
+        | CodexAccountSlotCollectionStateV1::Unknown => CodexAccountTargetHealthV1::IdentityUnknown,
         CodexAccountSlotCollectionStateV1::IdentityMismatch => {
             CodexAccountTargetHealthV1::IdentityMismatch
         }
@@ -21064,6 +21165,377 @@ for line in sys.stdin:
                 .credit_balances
                 .iter()
                 .any(|balance| balance.freshness == AgentQuotaWindowFreshness::Stale)
+    }
+
+    /// Test oracle: the rules by which the shipped Mac app decodes one slot's
+    /// `collection` of the local Codex accounts status. Ported from the Mac
+    /// app's `CodexAccountsProtocol.swift`,
+    /// `CodexAccountSlotCollectionStatus.init(from:)`; the line of each rule
+    /// is cited. A slot this refuses fails the whole status there.
+    fn mac_admits_codex_slot_collection(collection: &serde_json::Value) -> Result<(), String> {
+        let text = |value: &serde_json::Value, key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let rows = |value: &serde_json::Value, key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
+        // :355-364, the state is a closed set; a missing state is
+        // `unverified` (:478).
+        let state = text(collection, "state").unwrap_or_else(|| "unverified".to_string());
+        if ![
+            "unverified",
+            "fresh",
+            "needs_login",
+            "identity_unknown",
+            "identity_mismatch",
+            "provider_unavailable",
+            "duplicate_account",
+            "unknown",
+        ]
+        .contains(&state.as_str())
+        {
+            return Err(format!("state {state} is not decodable"));
+        }
+        // :94-97 and :896-898, an identity hash is 64 lowercase hex.
+        let strong_hash = |key: &str| -> Result<Option<String>, String> {
+            match text(collection, key) {
+                Some(hash)
+                    if hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+                {
+                    Ok(Some(hash))
+                }
+                Some(_) => Err(format!("{key} is not a strong hash")),
+                None => Ok(None),
+            }
+        };
+        let account = strong_hash("account_identifier_hash")?;
+        let workspace = strong_hash("workspace_identifier_hash")?;
+        // :504, both hashes or neither.
+        if account.is_some() != workspace.is_some() {
+            return Err("one identity hash without the other".to_string());
+        }
+        // :381, a diagnostic has a code and a message.
+        for diagnostic in rows(collection, "diagnostics") {
+            if text(&diagnostic, "code").is_none_or(|code| code.is_empty())
+                || text(&diagnostic, "message").is_none_or(|message| message.is_empty())
+            {
+                return Err("empty diagnostic".to_string());
+            }
+        }
+        let snapshot = collection
+            .get("quota_snapshot")
+            .filter(|value| !value.is_null());
+        let mut fresh_evidence = false;
+        if let Some(snapshot) = snapshot {
+            // :419, a snapshot has a capture time.
+            if text(snapshot, "captured_at").is_none_or(|at| at.is_empty()) {
+                return Err("quota_snapshot without captured_at".to_string());
+            }
+            // :508, a snapshot only on these states.
+            if !["unknown", "fresh", "duplicate_account"].contains(&state.as_str()) {
+                return Err(format!("quota_snapshot on state {state}"));
+            }
+            // :511, a snapshot only with both hashes.
+            let (Some(account), Some(workspace)) = (account.as_ref(), workspace.as_ref()) else {
+                return Err("quota_snapshot without identity hashes".to_string());
+            };
+            let same_identity = |row: &serde_json::Value| {
+                text(row, "account_identifier_hash").as_ref() == Some(account)
+                    && text(row, "organization_identifier_hash").as_ref() == Some(workspace)
+            };
+            // :514-517, every window carries the slot's hashes.
+            for window in rows(snapshot, "quota_windows") {
+                if !same_identity(&window) {
+                    return Err("window of another identity".to_string());
+                }
+                // :415, fresh evidence is an active fresh window.
+                fresh_evidence |= text(&window, "freshness").as_deref() == Some("fresh")
+                    && window.get("is_active").and_then(serde_json::Value::as_bool) != Some(false);
+            }
+            // :518-523 with :540-543, every balance carries the slot's hashes
+            // and a known status and unit.
+            for balance in rows(snapshot, "credit_balances") {
+                if !same_identity(&balance) {
+                    return Err("balance of another identity".to_string());
+                }
+                if !text(&balance, "status").is_some_and(|status| {
+                    [
+                        "ok",
+                        "low",
+                        "exhausted",
+                        "unlimited",
+                        "unsupported",
+                        "stale",
+                        "error",
+                        "unknown",
+                    ]
+                    .contains(&status.as_str())
+                }) {
+                    return Err("balance status is not decodable".to_string());
+                }
+                if text(&balance, "unit").is_some_and(|unit| {
+                    !["credits", "usd", "tokens", "resets", "unknown"].contains(&unit.as_str())
+                }) {
+                    return Err("balance unit is not decodable".to_string());
+                }
+                // :416-418; the oracle counts any fresh balance, which is
+                // looser than the app and only matters for `fresh` slots.
+                fresh_evidence |= text(&balance, "freshness").as_deref() == Some("fresh");
+            }
+        }
+        // :528-537, a fresh slot proves its reading.
+        if state == "fresh"
+            && (account.is_none()
+                || text(collection, "observed_at").is_none_or(|at| at.is_empty())
+                || !fresh_evidence)
+        {
+            return Err("fresh without identity, read time or fresh meters".to_string());
+        }
+        Ok(())
+    }
+
+    /// Test oracle for the whole status: every slot by
+    /// [`mac_admits_codex_slot_collection`], then the Mac app's
+    /// `CodexAccountsStatus.init(from:)` rules on slot ids, capacity
+    /// (`CodexAccountsProtocol.swift:790-799`) and managed slots that share
+    /// one account and workspace (`:801-815`). The setup-operation rules
+    /// (`:816-829`) are not ported; these fixtures are idle.
+    fn mac_admits_codex_accounts_status(status: &CodexAccountsStatusV1) -> Result<(), String> {
+        let status = serde_json::to_value(status).expect("status JSON");
+        let default_slot = &status["default_slot"];
+        let managed = status["managed_slots"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut slot_ids = BTreeSet::new();
+        for slot in std::iter::once(default_slot).chain(managed.iter()) {
+            let slot_id = slot["slot_id"].as_str().unwrap_or_default().to_string();
+            mac_admits_codex_slot_collection(
+                slot.get("collection").unwrap_or(&serde_json::json!({})),
+            )
+            .map_err(|error| format!("{slot_id}: {error}"))?;
+            if !slot_ids.insert(slot_id) {
+                return Err("slot ids repeat".to_string());
+            }
+        }
+        if default_slot["slot_id"] != "default"
+            || managed.iter().any(|slot| slot["slot_id"] == "default")
+        {
+            return Err("default slot id".to_string());
+        }
+        let capacity = &status["capacity"];
+        let used = capacity["used_slots"].as_u64().unwrap_or_default();
+        if capacity["max_slots"].as_u64() != Some(u64::from(ottto_core::MAX_CODEX_ACCOUNT_SLOTS))
+            || used != slot_ids.len() as u64
+            || capacity["max_slots"].as_u64()
+                != Some(used + capacity["remaining_slots"].as_u64().unwrap_or_default())
+        {
+            return Err("capacity".to_string());
+        }
+        let mut by_binding = BTreeMap::<(String, String), (usize, usize)>::new();
+        for slot in &managed {
+            let collection = &slot["collection"];
+            let (Some(account), Some(workspace)) = (
+                collection["account_identifier_hash"].as_str(),
+                collection["workspace_identifier_hash"].as_str(),
+            ) else {
+                continue;
+            };
+            let entry = by_binding
+                .entry((account.to_string(), workspace.to_string()))
+                .or_default();
+            entry.0 += 1;
+            if collection["relationship"] == "duplicate_anchor"
+                || collection["state"] == "duplicate_account"
+            {
+                entry.1 += 1;
+            }
+        }
+        if by_binding
+            .values()
+            .any(|(slots, duplicates)| *slots > 1 && slots - duplicates != 1)
+        {
+            return Err("managed slots share a binding without one anchor".to_string());
+        }
+        Ok(())
+    }
+
+    fn codex_accounts_status_for(candidates: &[CodexSlotCandidate]) -> CodexAccountsStatusV1 {
+        let mut status = empty_codex_accounts_status();
+        for candidate in candidates {
+            if candidate.slot.ownership == CodexAccountSlotOwnershipV1::Managed {
+                status.managed_slots.push(CodexAccountSlotDescriptorV1 {
+                    slot_id: candidate.slot.slot_id.clone(),
+                    ownership: CodexAccountSlotOwnershipV1::Managed,
+                    collection: Default::default(),
+                });
+            }
+        }
+        status.capacity.used_slots = 1 + status.managed_slots.len() as u8;
+        status.capacity.remaining_slots = status.capacity.max_slots - status.capacity.used_slots;
+        apply_codex_candidate_statuses(&mut status, candidates);
+        status
+    }
+
+    /// The local status of failed probes must decode on every shipped Mac
+    /// app: one refused slot fails the whole Codex accounts status there.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_local_status_of_failed_probes_decodes_on_shipped_mac_apps() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A default home whose probe fails after one good reading.
+        let (default_root, default_home) = synthetic_codex_collector_home("mac-default", 0o600);
+        let failed_default = {
+            let _commands = EnvVarGuard::set_os(
+                "OTTTO_COMMAND_SEARCH_PATH",
+                default_root.as_os_str().to_os_string(),
+            );
+            let collect = || {
+                collect_codex_home_candidate(
+                    CodexHomeSlot {
+                        slot_id: "default".to_string(),
+                        ownership: CodexAccountSlotOwnershipV1::Default,
+                        home: default_home.clone(),
+                        registered_binding: None,
+                    },
+                    "2026-08-26T00:00:00Z",
+                    "2026-08-26T00:15:00Z",
+                )
+            };
+            assert_eq!(
+                collect().status.state,
+                CodexAccountSlotCollectionStateV1::Fresh
+            );
+            fail_synthetic_codex_app_server(&default_root);
+            collect()
+        };
+        assert_eq!(failed_default.snapshot.status, AgentStatusState::Degraded);
+
+        // A managed home in the same case.
+        let (root, home) = synthetic_codex_collector_home("mac-managed", 0o600);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+            .expect("managed home mode");
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        let collect = |slot_id: &str, registered_binding| {
+            collect_codex_home_candidate(
+                CodexHomeSlot {
+                    slot_id: slot_id.to_string(),
+                    ownership: CodexAccountSlotOwnershipV1::Managed,
+                    home: home.clone(),
+                    registered_binding,
+                },
+                "2026-08-26T00:05:00Z",
+                "2026-08-26T00:20:00Z",
+            )
+        };
+        let mut fresh = collect("codex_slot_mac", None);
+        let registered = fresh.binding.clone().expect("validated binding");
+        fail_synthetic_codex_app_server(&root);
+        let failed = collect("codex_slot_mac", Some(registered.clone()));
+        assert_eq!(
+            failed.status.state,
+            CodexAccountSlotCollectionStateV1::IdentityUnknown
+        );
+        assert!(failed.status.quota_snapshot.is_some());
+
+        // What this slot looked like before the fix is what the Mac refuses.
+        let mut refused = codex_accounts_status_for(&[]);
+        refused.managed_slots.push(CodexAccountSlotDescriptorV1 {
+            slot_id: "codex_slot_mac".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Managed,
+            collection: failed.status.clone(),
+        });
+        refused.capacity.used_slots = 2;
+        refused.capacity.remaining_slots = refused.capacity.max_slots - 2;
+        assert!(mac_admits_codex_accounts_status(&refused).is_err());
+
+        // Kept binding: `unknown`, the registered hashes, the stale reading.
+        let candidates = [failed_default, failed];
+        let status = codex_accounts_status_for(&candidates);
+        mac_admits_codex_accounts_status(&status).expect("failed probes decode on the Mac");
+        let managed = &status.managed_slots[0].collection;
+        assert_eq!(managed.state, CodexAccountSlotCollectionStateV1::Unknown);
+        assert_eq!(
+            serde_json::to_value(managed).expect("slot JSON")["state"],
+            "unknown"
+        );
+        assert_eq!(
+            managed.account_identifier_hash.as_deref(),
+            Some(registered.0.as_str())
+        );
+        assert_eq!(
+            managed.workspace_identifier_hash.as_deref(),
+            Some(registered.1.as_str())
+        );
+        let reading = managed.quota_snapshot.as_ref().expect("last reading");
+        assert!(!reading.quota_windows.is_empty());
+        assert!(reading
+            .quota_windows
+            .iter()
+            .all(|window| window.freshness == AgentQuotaWindowFreshness::Stale));
+        assert!(managed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_identity_unknown"));
+        // The default home: no slot reading, no slot hashes.
+        let default = &status.default_slot.collection;
+        assert!(default.quota_snapshot.is_none());
+        assert!(default.account_identifier_hash.is_none());
+        assert_ne!(default.state, CodexAccountSlotCollectionStateV1::Unknown);
+        // The wire shape changes nothing the daemon decides from.
+        let [failed_default, failed] = candidates;
+        assert_eq!(
+            failed.status.state,
+            CodexAccountSlotCollectionStateV1::IdentityUnknown
+        );
+        assert!(failed.binding.is_none());
+
+        // Another managed slot holds the same account: the failed slot
+        // gives way instead of becoming a second anchor.
+        fresh.slot.slot_id = "codex_slot_other".to_string();
+        let shared = codex_accounts_status_for(&[failed_default, failed, fresh]);
+        mac_admits_codex_accounts_status(&shared).expect("shared binding decodes on the Mac");
+        let gave_way = &shared.managed_slots[0].collection;
+        assert_eq!(
+            gave_way.state,
+            CodexAccountSlotCollectionStateV1::IdentityUnknown
+        );
+        assert!(gave_way.quota_snapshot.is_none());
+        assert!(gave_way.account_identifier_hash.is_none());
+        assert_eq!(
+            shared.managed_slots[1].collection.state,
+            CodexAccountSlotCollectionStateV1::Fresh
+        );
+
+        // Binding not kept (the credential names another account): no
+        // reading, the state as before.
+        write_other_synthetic_codex_account(&home);
+        let switched = collect("codex_slot_mac", Some(registered.clone()));
+        let status = codex_accounts_status_for(&[switched]);
+        mac_admits_codex_accounts_status(&status).expect("unkept binding decodes on the Mac");
+        let managed = &status.managed_slots[0].collection;
+        assert!(managed.quota_snapshot.is_none());
+        assert_ne!(managed.state, CodexAccountSlotCollectionStateV1::Unknown);
+
+        codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
+            &registered.0,
+            &registered.1,
+        ));
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(default_root);
     }
 
     #[cfg(unix)]

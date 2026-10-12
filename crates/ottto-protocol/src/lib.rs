@@ -3425,6 +3425,11 @@ pub enum CodexAccountSlotCollectionStateV1 {
     IdentityMismatch,
     ProviderUnavailable,
     DuplicateAccount,
+    /// Local status only: the slot's last read failed and its
+    /// `quota_snapshot` is the account's last-known reading, marked stale.
+    /// Every shipped local client admits a quota snapshot on this state and
+    /// grants it no slot authority.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

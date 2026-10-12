@@ -64,6 +64,33 @@ identity hashes without a reading):
 The registered slot's `quota_snapshot.captured_at` is the time of the failed
 poll; the time of the reading is each meter's own `observed_at`.
 
+### Local status contract of that slot
+
+Shipped local clients decode a slot's `quota_snapshot` only on state
+`unknown`, `fresh` or `duplicate_account`, only with both identity hashes, and
+only when every meter carries those hashes. One slot outside that rule fails
+the whole Codex accounts status. So in the local status
+(`codex_local_slot_status`, applied where candidate statuses become the
+status document):
+
+- a failed registered slot that shows its last reading is sent as state
+  `unknown` (new `CodexAccountSlotCollectionStateV1::Unknown`) with the
+  registered account and workspace hashes and the stale `quota_snapshot`; its
+  diagnostics are unchanged. `unknown` gives a client no authority over the
+  slot;
+- without a kept binding it has no `quota_snapshot` and its state is as
+  before;
+- if another registered slot carries the same account and workspace, the
+  failed slot sends no reading and no hashes (two slots with one binding must
+  be one anchor plus declared duplicates);
+- any other `quota_snapshot` outside the rule is not sent.
+
+This is the wire shape only. Inside the daemon the slot stays
+`identity_unknown` with no binding: health, target coverage, upload and
+session attribution are unchanged. The default home's slot carries no slot
+reading and no slot hashes on a failed probe; its last reading is on the
+default local snapshot.
+
 In both cases every window and balance is marked `freshness: stale`; values and
 read clocks (`observed_at`, `grants_observed_at`, grants) are the original
 reading's, never re-stamped. A reading older than 6 hours
@@ -149,6 +176,14 @@ Synthetic, no provider calls.
   validated hashes kept, stale reading local only, upload without meters or
   plan words; after its credential names another account, no hashes and
   nothing shown;
+- local status contract: the status document the daemon emits is checked
+  against a Rust port of the Mac app's decoder rules
+  (`CodexAccountsProtocol.swift`, `CodexAccountSlotCollectionStatus.init(from:)`
+  and `CodexAccountsStatus.init(from:)`, lines cited in the test) for a failed
+  registered slot with a kept binding (`unknown`, hashes, stale reading),
+  without one (no reading), next to another slot of the same account (gives
+  way), and a failed default home; the shape before this rule is refused by
+  the same oracle;
 - the credential claim: equals the validated binding, is absent for an
   inconsistent credential, and an identity still needs provider
   authentication;
