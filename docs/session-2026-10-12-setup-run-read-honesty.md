@@ -18,8 +18,10 @@ flag. Uploads use the separate relay device credential and kept working.
 - While the rejection is current and the account is connected, canonical health
   reports `setup_run_state: rejected`, `setup_token_state: expired`, and a
   Warning blocker `setup_run_rejected`. Account state and source trust are
-  unchanged because uploads still work. The state is in memory and resets on
-  daemon restart until the next read.
+  unchanged because uploads still work. Replacing or removing the setup-run
+  binding (a new claim, account switch, logout or terminal scan clear) closes
+  the rejection, because it described the old run. The state is in memory and
+  resets on daemon restart until the next read.
 - An expired or cancelled setup run maps to one message: uploads continue,
   agent reads stop until the Mac is reconnected from the Ottto Apps page or with
   `ottto setup --claim-code <code>`.
