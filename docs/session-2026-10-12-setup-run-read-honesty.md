@@ -20,7 +20,9 @@ flag. Uploads use the separate relay device credential and kept working.
   Warning blocker `setup_run_rejected`. Account state and source trust are
   unchanged because uploads still work. Replacing or removing the setup-run
   binding (a new claim, account switch, logout or terminal scan clear) closes
-  the rejection, because it described the old run. The state is in memory and
+  the rejection, because it described the old run. A read records its outcome
+  only if the binding it started with is still current, so a late response
+  from a replaced run cannot re-reject the new one. The state is in memory and
   resets on daemon restart until the next read.
 - An expired or cancelled setup run maps to one message: uploads continue,
   agent reads stop until the Mac is reconnected from the Ottto Apps page or with

@@ -2970,17 +2970,23 @@ fn reject_timezone_override(timezone: Option<&str>) -> Result<(), LocalApiError>
 /// complete. Only an authentication rejection from a local-client endpoint
 /// counts; network, timeout, and other backend failures say nothing about
 /// the run and leave the recorded state unchanged.
+/// Reads run concurrently with setup and sign-in, so the outcome is recorded
+/// only against the binding the read started with.
 fn observe_setup_run_read<T>(
     daemon: &LocalDaemon,
     read: impl FnOnce() -> Result<T, LocalApiError>,
 ) -> Result<T, LocalApiError> {
+    let binding = daemon.connection_for_authorized_client().ok().flatten();
     let result = read();
+    let Some(binding) = binding else {
+        return result;
+    };
     match &result {
         Ok(_) => {
-            let _ = daemon.record_setup_run_read_accepted();
+            let _ = daemon.record_setup_run_read_accepted(&binding);
         }
         Err(error) if is_setup_run_read_rejection(error) => {
-            let _ = daemon.record_setup_run_read_rejected();
+            let _ = daemon.record_setup_run_read_rejected(&binding);
         }
         Err(_) => {}
     }

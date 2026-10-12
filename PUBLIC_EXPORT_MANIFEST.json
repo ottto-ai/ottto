@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 552,
-  "content_sha256": "97a29dbd940c8b1b1980f263b83dbc936d6e138a79334759138113b41318201e",
+  "content_sha256": "34f0e3902824c209aca8296f2ecb37686090f45e98fcc201f83689d49128612c",
   "files": [
     {
       "executable": false,
@@ -853,8 +853,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "967b1838cfc7aad86e65bb4fd445a832c93f0913cc87a6eddc64436a4c255363",
-      "size_bytes": 1217379
+      "sha256": "2c8fd10b04e6c4d5ea9bec796b4753326fdc79ae103d8dc45460c504eea2f655",
+      "size_bytes": 1217670
     },
     {
       "executable": false,
@@ -923,8 +923,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "273f998d7cebd506a12886f7b82b179befdeb8e7bf27366f567993ea39d8b78d",
-      "size_bytes": 356669
+      "sha256": "a319bc58eb2f87414cbd122fef5006aac5033543bac9ba55f3b70070d1fbe5f4",
+      "size_bytes": 357749
     },
     {
       "executable": false,
@@ -2568,8 +2568,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-12-setup-run-read-honesty.md",
-      "sha256": "a586cea68b48880d85ddba35d72849cd53a59ee9587eae772ab6faedda237635",
-      "size_bytes": 2693
+      "sha256": "170d97670c2f63c0206548fc7829b196b6ad753b34617d04d0c6292e9071c61c",
+      "size_bytes": 2847
     },
     {
       "executable": false,

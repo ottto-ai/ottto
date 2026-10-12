@@ -316,6 +316,12 @@ impl DaemonState {
         }
     }
 
+    fn binds_setup_run(&self, binding: &LocalConnectionBinding) -> bool {
+        self.connection
+            .as_ref()
+            .is_some_and(|current| setup_run_binding_matches(current, binding))
+    }
+
     /// Clear the in-memory first-seen + reconciliation maps and delete the
     /// persisted per-source state files. Called at the account reset sites so a
     /// fresh account starts with a fresh source history.
@@ -1452,9 +1458,17 @@ impl LocalDaemon {
     /// credential and keep working, so this only makes the setup-run and
     /// token states honest and adds a Warning; it never blocks source trust.
     /// Recorded on transition only, so repeated failing reads stay bounded.
-    pub fn record_setup_run_read_rejected(&self) -> Result<(), LocalApiError> {
+    /// `binding` is the setup-run binding the read started with; an outcome
+    /// that arrives after the binding was replaced describes the old run and
+    /// is dropped.
+    pub fn record_setup_run_read_rejected(
+        &self,
+        binding: &LocalConnectionBinding,
+    ) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
-        if latest_setup_run_read_rejection(&state.local_health_events).is_some() {
+        if !state.binds_setup_run(binding)
+            || latest_setup_run_read_rejection(&state.local_health_events).is_some()
+        {
             return Ok(());
         }
         push_local_health_event(
@@ -1471,10 +1485,16 @@ impl LocalDaemon {
         Ok(())
     }
 
-    /// Clear a recorded setup-run read rejection after a successful read.
-    pub fn record_setup_run_read_accepted(&self) -> Result<(), LocalApiError> {
+    /// Clear a recorded setup-run read rejection after a successful read
+    /// that started with the current `binding`.
+    pub fn record_setup_run_read_accepted(
+        &self,
+        binding: &LocalConnectionBinding,
+    ) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
-        if latest_setup_run_read_rejection(&state.local_health_events).is_none() {
+        if !state.binds_setup_run(binding)
+            || latest_setup_run_read_rejection(&state.local_health_events).is_none()
+        {
             return Ok(());
         }
         push_local_health_event(
@@ -5804,14 +5824,27 @@ mod tests {
         assert_eq!(health.sources[0].next_action.as_deref(), Some("sign_in"));
     }
 
+    fn read_binding(setup_run_id: &str) -> LocalConnectionBinding {
+        LocalConnectionBinding {
+            setup_run_id: setup_run_id.to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: None,
+            claim_code: None,
+            api_base_url: "https://api.ottto.net".to_string(),
+        }
+    }
+
     #[test]
     fn rejected_setup_run_read_reports_run_honestly_without_blocking_uploads() {
-        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let run = read_binding("run_1");
+        let daemon = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_connection(Some(run.clone()));
         daemon
             .record_verification_result(&verified_codex("2026-05-05T10:20:00Z"))
             .expect("record successful verification");
         daemon
-            .record_setup_run_read_accepted()
+            .record_setup_run_read_accepted(&run)
             .expect("accepted read without a prior rejection");
         assert!(latest_setup_run_read_rejection(
             &daemon.status(TOKEN).expect("status").local_health_events
@@ -5819,10 +5852,10 @@ mod tests {
         .is_none());
 
         daemon
-            .record_setup_run_read_rejected()
+            .record_setup_run_read_rejected(&run)
             .expect("record rejected read");
         daemon
-            .record_setup_run_read_rejected()
+            .record_setup_run_read_rejected(&run)
             .expect("record repeated rejected read");
         let status = daemon.status(TOKEN).expect("status");
         assert_eq!(
@@ -5855,7 +5888,7 @@ mod tests {
         );
 
         daemon
-            .record_setup_run_read_accepted()
+            .record_setup_run_read_accepted(&run)
             .expect("record recovered read");
         let recovered = daemon
             .status(TOKEN)
@@ -5877,67 +5910,63 @@ mod tests {
     }
 
     #[test]
-    fn replacing_or_removing_the_setup_run_binding_closes_a_read_rejection() {
-        let binding = |setup_run_id: &str| LocalConnectionBinding {
-            setup_run_id: setup_run_id.to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: None,
-            claim_code: None,
-            api_base_url: "https://api.ottto.net".to_string(),
-        };
+    fn setup_run_read_rejection_follows_the_binding_that_was_rejected() {
         let rejected = |daemon: &LocalDaemon| {
-            daemon
-                .status(TOKEN)
-                .expect("status")
-                .canonical_health
-                .expect("canonical health")
-                .account
-                .setup_run_state
-                == LocalSetupRunState::Rejected
+            latest_setup_run_read_rejection(
+                &daemon.status(TOKEN).expect("status").local_health_events,
+            )
+            .is_some()
         };
+        let old_run = read_binding("run_old");
+        let new_run = read_binding("run_new");
         let daemon = daemon()
             .with_account(account("user_1", "ron@example.com"))
-            .with_connection(Some(binding("run_old")));
+            .with_connection(Some(old_run.clone()));
 
         daemon
-            .record_setup_run_read_rejected()
+            .record_setup_run_read_rejected(&old_run)
             .expect("record rejected read");
         daemon
-            .bind_setup_run_for_authorized_client(binding("run_old"))
+            .bind_setup_run_for_authorized_client(old_run.clone())
             .expect("rebind same run");
         assert!(
             rejected(&daemon),
             "the same binding is still the rejected run"
         );
         daemon
-            .bind_setup_run_for_authorized_client(binding("run_new"))
+            .bind_setup_run_for_authorized_client(new_run.clone())
             .expect("bind replacement run");
         assert!(
             !rejected(&daemon),
             "a replacement run is not the rejected run"
         );
+        daemon
+            .record_setup_run_read_rejected(&old_run)
+            .expect("late outcome from a read of the old run");
+        assert!(
+            !rejected(&daemon),
+            "an in-flight read of the replaced run must not reject the new run"
+        );
 
         daemon
-            .record_setup_run_read_rejected()
+            .record_setup_run_read_rejected(&new_run)
             .expect("record rejected read");
+        assert!(rejected(&daemon));
         assert!(daemon
             .clear_setup_run_for_authorized_client_if_matches("run_new", "https://api.ottto.net")
             .expect("clear binding"));
-        assert!(latest_setup_run_read_rejection(
-            &daemon.status(TOKEN).expect("status").local_health_events
-        )
-        .is_none());
+        assert!(!rejected(&daemon), "a cleared binding closes its rejection");
 
         daemon
-            .record_setup_run_read_rejected()
+            .bind_setup_run_for_authorized_client(new_run.clone())
+            .expect("bind run again");
+        daemon
+            .record_setup_run_read_rejected(&new_run)
             .expect("record rejected read");
         daemon
             .reset_account_for_authorized_client()
             .expect("reset account");
-        assert!(latest_setup_run_read_rejection(
-            &daemon.status(TOKEN).expect("status").local_health_events
-        )
-        .is_none());
+        assert!(!rejected(&daemon), "logout closes the rejection");
     }
 
     #[test]
