@@ -19,6 +19,8 @@ jobs:
     name: Rust contracts
     timeout-minutes: 40
     runs-on: macos-15
+    env:
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -52,6 +54,14 @@ jobs:
           cargo test -p ottto-service --lib --locked heap_layout_bound::sampled_scalar_buffer_tests::layout_gate_coverage_receipt -- --exact --nocapture | tee "$RUNNER_TEMP/layout-coverage-receipt.log"
           # An exact filter matching zero tests must not count as a receipt.
           grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/layout-coverage-receipt.log"
+
+      - name: Context composition parity and resource receipt
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          cargo test -p ottto-service --lib --locked context_composition::tests::parity_resource::compact_resource_receipt -- --exact --ignored --nocapture --test-threads=1 | tee "$RUNNER_TEMP/composition-resource-receipt.log"
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/composition-resource-receipt.log"
+          grep 'COMPOSITION_RESOURCE_RECEIPT ' "$RUNNER_TEMP/composition-resource-receipt.log"
 
       - name: Connector tests
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked

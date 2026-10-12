@@ -1146,7 +1146,7 @@ fn real_workspace_parity_dump() {
                 .and_then(|m| m.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
             let mut r = WorkspaceReport::new(wide_window());
-            let lines = read_jsonl(file).unwrap().len();
+            let lines = parity_baseline::read_jsonl(file).unwrap().len();
             parse(file, &mut r, file_date(mtime));
             let shell = r.category_totals(Category::ShellOutput);
             let harness = r.category_totals(Category::HarnessAttachments);
@@ -1264,4 +1264,52 @@ fn report_expired_budget_does_not_return_empty_or_partial_replacement() {
     )
     .is_none());
     fs::remove_file(path).unwrap();
+}
+
+#[path = "parity_baseline.rs"]
+mod parity_baseline;
+
+#[path = "parity_fixtures.rs"]
+mod parity_fixtures;
+#[path = "parity_resource.rs"]
+mod parity_resource;
+
+struct FileReadHook {
+    path: PathBuf,
+    callback: Box<dyn FnOnce()>,
+}
+
+thread_local! {
+    static FILE_READ_HOOK: std::cell::RefCell<Option<FileReadHook>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) struct HookedFile {
+    file: fs::File,
+    callback: Option<Box<dyn FnOnce()>>,
+}
+
+impl std::io::Read for HookedFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = std::io::Read::read(&mut self.file, buffer)?;
+        if count > 0 {
+            if let Some(callback) = self.callback.take() {
+                callback();
+            }
+        }
+        Ok(count)
+    }
+}
+
+// A matched hook is taken once at open and runs after the first actual read.
+// Thread-local scope cannot affect another parallel fixture or production.
+pub(super) fn file_with_read_hook(file: fs::File, path: &Path) -> HookedFile {
+    let callback = FILE_READ_HOOK.with(|cell| {
+        let mut hook = cell.borrow_mut();
+        if hook.as_ref().is_some_and(|h| h.path == path) {
+            hook.take().map(|h| h.callback)
+        } else {
+            None
+        }
+    });
+    HookedFile { file, callback }
 }
