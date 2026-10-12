@@ -140,8 +140,6 @@ Options:
           Emit NDJSON progress events and a final event; requires --json
       --end-date <YYYY-MM-DD>
           Inclusive custom window end date
-      --timezone <TZ>
-          IANA timezone for calendar windows
       --source <SOURCE>
           Source slug to filter context to
       --app <APP>
@@ -180,8 +178,6 @@ Options:
           Emit NDJSON progress events and a final event; requires --json
       --end-date <YYYY-MM-DD>
           Inclusive custom window end date
-      --timezone <TZ>
-          IANA timezone for calendar windows
       --source <SOURCE>
           Source slug to filter costs to
       --app <APP>
@@ -329,8 +325,6 @@ Options:
           Inclusive custom window start date
       --end-date <YYYY-MM-DD>
           Inclusive custom window end date
-      --timezone <TZ>
-          IANA timezone for calendar windows
       --source <SOURCE>
           Source slug to filter sessions to
       --app <APP>

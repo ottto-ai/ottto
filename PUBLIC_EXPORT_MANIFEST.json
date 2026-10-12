@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 551,
-  "content_sha256": "837467ca1848ae56f20f25f4c13523af15892d54f0a33c53ba0e0c6f28bcc565",
+  "candidate_file_count": 552,
+  "content_sha256": "3486945569bdef44bd508b18bb1a0dd8615782beb83831718ed0ce4b2f820e5e",
   "files": [
     {
       "executable": false,
@@ -468,8 +468,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "8f27ba730f9c760f6ac98950028327c5da214ecdb1fffcea3ff0a5e6ebd62f36",
-      "size_bytes": 175717
+      "sha256": "f5caa2c109ba8cdb589bed756b3d8c89f10339d3530680ff61f7675bff890072",
+      "size_bytes": 176029
     },
     {
       "executable": false,
@@ -853,8 +853,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "768871af08eb4d5fbec5bbacb2d25a8b1c6b9eae3550b994521cc6bfe3796e35",
-      "size_bytes": 1207226
+      "sha256": "967b1838cfc7aad86e65bb4fd445a832c93f0913cc87a6eddc64436a4c255363",
+      "size_bytes": 1217379
     },
     {
       "executable": false,
@@ -923,8 +923,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "8277c992265b830a61e12a45727a349b5df52de0092b3a1d76e6084330d7ef26",
-      "size_bytes": 346758
+      "sha256": "66cee1d8bfaf45a1f7f1cbe48f43da2ceb820f5fa954a308254c840569ef22f7",
+      "size_bytes": 352925
     },
     {
       "executable": false,
@@ -2567,6 +2567,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-12-setup-run-read-honesty.md",
+      "sha256": "cb5c9b7e2f8a46eaacf67c98272491bfca88b01cd41f2369bbdc2d95ab905549",
+      "size_bytes": 2528
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -2960,8 +2967,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/help-contract.txt",
-      "sha256": "8c6fa8db51049fad816cc72469cfe0a8511f8338788355a80d77d75e340f9af5",
-      "size_bytes": 26876
+      "sha256": "ce0b5ee9d2f305d01ce814558fa96a0f7ff8757a7edfe2db80222cc4f555676b",
+      "size_bytes": 26675
     },
     {
       "executable": false,
@@ -3862,7 +3869,7 @@
   ],
   "generated_at": "2026-10-12T02:10:39+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 552,
+  "output_file_count": 553,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

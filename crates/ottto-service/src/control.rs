@@ -2892,9 +2892,12 @@ fn agent_context(
     authorization: &RequestAuthorization,
     query: AgentContextQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    let (api_base_url, connection, setup_run_token) =
-        setup_run_agent_read_context(daemon, authorization, "ottto context")?;
-    get_agent_context_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    reject_timezone_override(query.timezone.as_deref())?;
+    observe_setup_run_read(daemon, || {
+        let (api_base_url, connection, setup_run_token) =
+            setup_run_agent_read_context(daemon, authorization, "ottto context")?;
+        get_agent_context_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    })
 }
 
 fn agent_costs(
@@ -2902,9 +2905,12 @@ fn agent_costs(
     authorization: &RequestAuthorization,
     query: AgentCostsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    let (api_base_url, connection, setup_run_token) =
-        setup_run_agent_read_context(daemon, authorization, "ottto costs")?;
-    get_agent_costs_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    reject_timezone_override(query.timezone.as_deref())?;
+    observe_setup_run_read(daemon, || {
+        let (api_base_url, connection, setup_run_token) =
+            setup_run_agent_read_context(daemon, authorization, "ottto costs")?;
+        get_agent_costs_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    })
 }
 
 fn agent_sessions(
@@ -2912,9 +2918,12 @@ fn agent_sessions(
     authorization: &RequestAuthorization,
     query: AgentSessionsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    let (api_base_url, connection, setup_run_token) =
-        setup_run_agent_read_context(daemon, authorization, "ottto sessions")?;
-    get_agent_sessions_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    reject_timezone_override(query.timezone.as_deref())?;
+    observe_setup_run_read(daemon, || {
+        let (api_base_url, connection, setup_run_token) =
+            setup_run_agent_read_context(daemon, authorization, "ottto sessions")?;
+        get_agent_sessions_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    })
 }
 
 fn agent_recommendations(
@@ -2922,9 +2931,11 @@ fn agent_recommendations(
     authorization: &RequestAuthorization,
     query: AgentRecommendationsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    let (api_base_url, connection, setup_run_token) =
-        setup_run_agent_read_context(daemon, authorization, "ottto recommendations")?;
-    get_agent_recommendations_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    observe_setup_run_read(daemon, || {
+        let (api_base_url, connection, setup_run_token) =
+            setup_run_agent_read_context(daemon, authorization, "ottto recommendations")?;
+        get_agent_recommendations_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    })
 }
 
 fn agent_provider_impact(
@@ -2932,9 +2943,56 @@ fn agent_provider_impact(
     authorization: &RequestAuthorization,
     query: AgentProviderImpactQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    let (api_base_url, connection, setup_run_token) =
-        setup_run_agent_read_context(daemon, authorization, "ottto provider-impact")?;
-    get_agent_provider_impact_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    observe_setup_run_read(daemon, || {
+        let (api_base_url, connection, setup_run_token) =
+            setup_run_agent_read_context(daemon, authorization, "ottto provider-impact")?;
+        get_agent_provider_impact_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    })
+}
+
+const TIMEZONE_OVERRIDE_UNSUPPORTED: &str =
+    "--timezone is not supported. Ottto uses the timezone saved in your account settings for calendar windows.";
+
+/// Calendar windows follow the account's saved timezone; Ottto rejects an
+/// explicit `timezone=` query, so refuse it locally with that reason instead
+/// of forwarding a request that can only fail.
+fn reject_timezone_override(timezone: Option<&str>) -> Result<(), LocalApiError> {
+    if timezone.is_some_and(|value| !value.trim().is_empty()) {
+        return Err(LocalApiError::InvalidRequest(
+            TIMEZONE_OVERRIDE_UNSUPPORTED.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Run one setup-run agent read and record whether Ottto still accepts this
+/// Mac's setup run, so local status stops reporting a rejected run as
+/// complete. Only an authentication rejection from a local-client endpoint
+/// counts; network, timeout, and other backend failures say nothing about
+/// the run and leave the recorded state unchanged.
+fn observe_setup_run_read<T>(
+    daemon: &LocalDaemon,
+    read: impl FnOnce() -> Result<T, LocalApiError>,
+) -> Result<T, LocalApiError> {
+    let result = read();
+    match &result {
+        Ok(_) => {
+            let _ = daemon.record_setup_run_read_accepted();
+        }
+        Err(error) if is_setup_run_read_rejection(error) => {
+            let _ = daemon.record_setup_run_read_rejected();
+        }
+        Err(_) => {}
+    }
+    result
+}
+
+fn is_setup_run_read_rejection(error: &LocalApiError) -> bool {
+    matches!(
+        error,
+        LocalApiError::Backend(details)
+            if details.status == Some(401) && details.endpoint.contains("/local-client/")
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -2971,21 +3029,24 @@ fn cloud_command(
     operation: CloudOperation,
 ) -> Result<serde_json::Value, LocalApiError> {
     validate_cloud_operation(&operation)?;
-    let (api_base_url, connection, setup_run_token) =
-        setup_run_agent_read_context(daemon, authorization, "ottto cloud")?;
-    match cloud_request_with_base(&api_base_url, &connection, &setup_run_token, &operation) {
-        Ok(value) => Ok(value),
-        Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
-            let refreshed = refresh_setup_run_token_via_device_secret(&api_base_url, &connection)?;
-            cloud_request_with_base(
-                &api_base_url,
-                &refreshed.connection,
-                &refreshed.setup_run_token,
-                &operation,
-            )
+    observe_setup_run_read(daemon, || {
+        let (api_base_url, connection, setup_run_token) =
+            setup_run_agent_read_context(daemon, authorization, "ottto cloud")?;
+        match cloud_request_with_base(&api_base_url, &connection, &setup_run_token, &operation) {
+            Ok(value) => Ok(value),
+            Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
+                let refreshed =
+                    refresh_setup_run_token_via_device_secret(&api_base_url, &connection)?;
+                cloud_request_with_base(
+                    &api_base_url,
+                    &refreshed.connection,
+                    &refreshed.setup_run_token,
+                    &operation,
+                )
+            }
+            Err(error) => Err(error),
         }
-        Err(error) => Err(error),
-    }
+    })
 }
 
 fn validate_cloud_operation(operation: &CloudOperation) -> Result<(), LocalApiError> {
@@ -7423,6 +7484,8 @@ fn cli_error(error: LocalApiError) -> CliError {
     }
 }
 
+const SETUP_RUN_REJECTED_MESSAGE: &str = "Ottto no longer accepts this Mac's setup run. Uploads continue, but agent reads such as `ottto costs` stop until you reconnect. Reconnect this Mac from the Ottto Apps page (Open the Ottto app), or run `ottto setup --claim-code <code>` with the code shown there.";
+
 fn cli_error_message(error: &LocalApiError) -> String {
     match error {
         LocalApiError::SetupRunConnectionMissing => {
@@ -7458,6 +7521,9 @@ fn cli_error_message(error: &LocalApiError) -> String {
             }
             if body.contains("more than one active authority") {
                 return "This Mac has multiple active registrations. Choose Replace it on the browser claim page to revoke them and create one fresh device, then retry `ottto login` or `ottto setup`.".to_string();
+            }
+            if body.contains("setup run expired") || body.contains("setup run cancelled") {
+                return SETUP_RUN_REJECTED_MESSAGE.to_string();
             }
             if body.contains("expired") {
                 return "Setup run expired. Open the Ottto app from Ottto to attach an active setup run.".to_string();
@@ -15148,7 +15214,6 @@ fn agent_context_url(
     push_non_empty_query(&mut params, "range", query.range.as_deref());
     push_non_empty_query(&mut params, "start_date", query.start_date.as_deref());
     push_non_empty_query(&mut params, "end_date", query.end_date.as_deref());
-    push_non_empty_query(&mut params, "timezone", query.timezone.as_deref());
     push_non_empty_query(&mut params, "source", query.source.as_deref());
     push_non_empty_query(&mut params, "machine_id", query.machine_id.as_deref());
     push_non_empty_query(
@@ -15192,7 +15257,6 @@ fn agent_costs_url(
     push_non_empty_query(&mut params, "range", query.range.as_deref());
     push_non_empty_query(&mut params, "start_date", query.start_date.as_deref());
     push_non_empty_query(&mut params, "end_date", query.end_date.as_deref());
-    push_non_empty_query(&mut params, "timezone", query.timezone.as_deref());
     push_non_empty_query(&mut params, "source", query.source.as_deref());
     push_non_empty_query(&mut params, "machine_id", query.machine_id.as_deref());
     push_non_empty_query(
@@ -15228,7 +15292,6 @@ fn agent_sessions_url(
     push_non_empty_query(&mut params, "range", query.range.as_deref());
     push_non_empty_query(&mut params, "start_date", query.start_date.as_deref());
     push_non_empty_query(&mut params, "end_date", query.end_date.as_deref());
-    push_non_empty_query(&mut params, "timezone", query.timezone.as_deref());
     push_non_empty_query(&mut params, "source", query.source.as_deref());
     push_non_empty_query(&mut params, "model", query.model.as_deref());
     push_non_empty_query(
@@ -21006,7 +21069,7 @@ mod tests {
 
         assert_eq!(
             url,
-            "https://api.ottto.net/api/v1/setup-runs/setup_context/local-client/agent-context?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&timezone=America%2FLos_Angeles&source=claude_code&machine_id=otm_test&source_plan_profile_id=profile_123&max_tokens=4000"
+            "https://api.ottto.net/api/v1/setup-runs/setup_context/local-client/agent-context?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&source=claude_code&machine_id=otm_test&source_plan_profile_id=profile_123&max_tokens=4000"
         );
     }
 
@@ -21039,7 +21102,7 @@ mod tests {
 
         assert_eq!(
             url,
-            "https://api.ottto.net/api/v1/setup-runs/setup_costs/local-client/costs?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&timezone=America%2FLos_Angeles&source=vertex&machine_id=otm_test&source_plan_profile_id=profile_123&bucket=day&mode=full"
+            "https://api.ottto.net/api/v1/setup-runs/setup_costs/local-client/costs?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&source=vertex&machine_id=otm_test&source_plan_profile_id=profile_123&bucket=day&mode=full"
         );
     }
 
@@ -21079,7 +21142,7 @@ mod tests {
 
         assert_eq!(
             url,
-            "https://api.ottto.net/api/v1/setup-runs/setup_sessions/local-client/sessions?limit=25&cursor=next+123&range=today&start_date=2026-06-01&end_date=2026-06-05&timezone=America%2FLos_Angeles&source=codex&model=gpt-5.3+codex&billing_provider=openai&billing_channel=subscription&machine_id=otm_test&source_plan_profile_id=profile_123&min_cost=1.25&max_cost=7.5&sort_by=cost&sort_dir=desc&search=roadmap+review"
+            "https://api.ottto.net/api/v1/setup-runs/setup_sessions/local-client/sessions?limit=25&cursor=next+123&range=today&start_date=2026-06-01&end_date=2026-06-05&source=codex&model=gpt-5.3+codex&billing_provider=openai&billing_channel=subscription&machine_id=otm_test&source_plan_profile_id=profile_123&min_cost=1.25&max_cost=7.5&sort_by=cost&sort_dir=desc&search=roadmap+review"
         );
     }
 
@@ -28348,10 +28411,7 @@ X-API-Key = "otel_redacted"
             body_excerpt: Some("Setup run expired request_id=req_private".to_string()),
         }));
 
-        assert_eq!(
-            error.message,
-            "Setup run expired. Open the Ottto app from Ottto to attach an active setup run."
-        );
+        assert_eq!(error.message, SETUP_RUN_REJECTED_MESSAGE);
         assert!(!error.message.contains("/api/v1"));
         assert!(!error.message.contains("req_private"));
     }
@@ -28649,6 +28709,203 @@ X-API-Key = "otel_redacted"
         assert_eq!(error.code.exit_code(), 61);
         assert!(error.retryable);
         assert!(error.message.contains("Timed out waiting for setup"));
+    }
+
+    #[test]
+    fn agent_reads_reject_timezone_override_before_contacting_ottto() {
+        let daemon = daemon().with_account(connected_account());
+        let authorization = RequestAuthorization::Token("token".to_string());
+        let timezone = Some("America/Los_Angeles".to_string());
+        let results = [
+            agent_costs(
+                &daemon,
+                &authorization,
+                AgentCostsQuery {
+                    timezone: timezone.clone(),
+                    ..AgentCostsQuery::default()
+                },
+            ),
+            agent_sessions(
+                &daemon,
+                &authorization,
+                AgentSessionsQuery {
+                    timezone: timezone.clone(),
+                    ..AgentSessionsQuery::default()
+                },
+            ),
+            agent_context(
+                &daemon,
+                &authorization,
+                AgentContextQuery {
+                    timezone,
+                    ..AgentContextQuery::default()
+                },
+            ),
+        ];
+        for result in results {
+            let error = cli_error(result.expect_err("timezone override must be refused"));
+            assert_eq!(error.code, CliErrorCode::InvalidRequest);
+            assert!(error
+                .message
+                .contains("timezone saved in your account settings"));
+        }
+        assert!(reject_timezone_override(Some("  ")).is_ok());
+        assert!(reject_timezone_override(None).is_ok());
+    }
+
+    fn expired_setup_run_read_server(
+        calls: Arc<Mutex<Vec<String>>>,
+        accept_reads: Arc<std::sync::atomic::AtomicBool>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind expired run backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let request = read_complete_http_request(&mut stream);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_string();
+                calls.lock().expect("calls lock").push(path.clone());
+                if accept_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                    if path.contains("/local-client/refresh") {
+                        write_json_response(
+                            &mut stream,
+                            200,
+                            "OK",
+                            r#"{"setup_run_token":"otsr_recovered","expires_at":"2026-05-05T10:45:00Z"}"#,
+                        );
+                    } else {
+                        write_json_response(
+                            &mut stream,
+                            200,
+                            "OK",
+                            r#"{"results_state":"current"}"#,
+                        );
+                    }
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        401,
+                        "Unauthorized",
+                        r#"{"detail":"Setup run expired"}"#,
+                    );
+                }
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[test]
+    #[serial]
+    fn expired_setup_run_read_refreshes_once_and_reports_reconnect_required() {
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("expired-setup-run-read");
+        let secret_root = telemetry_key_store_root("expired-setup-run-read-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("persist relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .expect("persist relay device secret");
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_expired_run")
+            .expect("persist setup token");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let accept_reads = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let api_base_url = expired_setup_run_read_server(calls.clone(), accept_reads.clone());
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_expired".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url,
+        };
+        FileConnectionStore::default()
+            .save(&connection)
+            .expect("persist connection binding");
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+        let authorization = RequestAuthorization::Token("token".to_string());
+
+        for attempt in 1..=2 {
+            let error = cli_error(
+                agent_costs(&daemon, &authorization, AgentCostsQuery::default())
+                    .expect_err("an expired setup run cannot serve reads"),
+            );
+            assert!(
+                error.message.contains("Reconnect this Mac"),
+                "{}",
+                error.message
+            );
+            assert!(!error.retryable);
+            let paths = calls.lock().expect("calls lock").clone();
+            assert_eq!(
+                paths
+                    .iter()
+                    .filter(|path| path.contains("/local-client/costs"))
+                    .count(),
+                attempt,
+                "one read per command: {paths:?}"
+            );
+            assert_eq!(
+                paths
+                    .iter()
+                    .filter(|path| path.contains("/local-client/refresh"))
+                    .count(),
+                attempt,
+                "at most one refresh per command: {paths:?}"
+            );
+        }
+        let health = daemon
+            .status("token")
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(
+            health.account.setup_run_state,
+            ottto_protocol::LocalSetupRunState::Rejected
+        );
+        assert_eq!(
+            health.account.setup_token_state,
+            ottto_protocol::LocalSetupTokenState::Expired
+        );
+        assert!(health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "setup_run_rejected"));
+
+        accept_reads.store(true, std::sync::atomic::Ordering::SeqCst);
+        agent_costs(&daemon, &authorization, AgentCostsQuery::default())
+            .expect("an accepted refresh restores reads");
+        let recovered = daemon
+            .status("token")
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(
+            recovered.account.setup_run_state,
+            ottto_protocol::LocalSetupRunState::Complete
+        );
+        assert_eq!(
+            recovered.account.setup_token_state,
+            ottto_protocol::LocalSetupTokenState::Valid
+        );
     }
 
     #[test]
