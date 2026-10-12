@@ -50,6 +50,7 @@ use time::{
 
 mod claude_credit_pools;
 mod codex_credit_grants;
+mod codex_last_known;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1600,8 +1601,9 @@ fn append_configured_codex_unavailable_snapshots(
             continue;
         }
         // These are previously accepted registry bindings, not live credential
-        // proof. Never use this fallback for meters, transcript attribution,
-        // successful checks, or labels from the failed/different live identity.
+        // proof. Never use this fallback for live meters, transcript
+        // attribution, successful checks, or labels from the failed/different
+        // live identity; only this binding's own last reading, marked stale.
         let Some((account, workspace)) = candidate
             .slot
             .registered_binding
@@ -1648,8 +1650,66 @@ fn append_configured_codex_unavailable_snapshots(
                 "This previously accepted Codex account and workspace remains configured; its current identity and limits could not be verified.",
             ).with_quota_binding(Some(account.clone()), Some(workspace.clone())),
         );
+        if let Some((quota_windows, credit_balances)) = codex_last_known_meters_for_failed_probe(
+            candidate,
+            account,
+            workspace,
+            current_unix_seconds(),
+        ) {
+            snapshot.quota_windows = quota_windows;
+            snapshot.credit_balances = credit_balances;
+        }
         snapshots.push(snapshot);
     }
+}
+
+/// Keep a fresh, bound reading as its binding's last-known meters.
+fn remember_codex_last_known_reading(
+    binding: Option<&(String, String)>,
+    status: &CodexAccountSlotCollectionStatusV1,
+    snapshot: &AgentStatusSnapshot,
+    now: u64,
+) {
+    let Some((account, workspace)) =
+        binding.filter(|_| status.state == CodexAccountSlotCollectionStateV1::Fresh)
+    else {
+        return;
+    };
+    codex_last_known::record(
+        &codex_credit_grants::binding_key(account, workspace),
+        &snapshot.quota_windows,
+        &snapshot.credit_balances,
+        now,
+    );
+}
+
+/// The last reading of a registered binding whose probe failed, marked
+/// `Stale` with its original read clocks ([`codex_last_known`]). Only when
+/// the probe itself failed (not a sign-out, identity mismatch or unknown
+/// identity) and the home was last validated as this same binding, so a
+/// home that switched accounts never carries another account's meters.
+fn codex_last_known_meters_for_failed_probe(
+    candidate: &CodexSlotCandidate,
+    account: &str,
+    workspace: &str,
+    now: u64,
+) -> Option<(Vec<AgentQuotaWindow>, Vec<AgentCreditBalance>)> {
+    let probe_failed = candidate.status.state
+        == CodexAccountSlotCollectionStateV1::ProviderUnavailable
+        && candidate
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_usage_probe_failed");
+    if !probe_failed {
+        return None;
+    }
+    let binding = codex_credit_grants::binding_key(account, workspace);
+    if codex_credit_grants::home_binding(&candidate.slot.home).as_deref() != Some(binding.as_str())
+    {
+        return None;
+    }
+    codex_last_known::stale_reading(&binding, now)
 }
 
 fn codex_source_health_snapshot(
@@ -1840,6 +1900,7 @@ fn collect_codex_home_candidate(
     );
     let mut status = codex_collection_status_from_snapshot(&snapshot);
     let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut status);
+    remember_codex_last_known_reading(binding.as_ref(), &status, &snapshot, current_unix_seconds());
     let quality = codex_snapshot_quality(&snapshot, &status);
     let after = std::fs::metadata(&auth_path)
         .and_then(|metadata| metadata.modified())
@@ -6099,16 +6160,27 @@ fn stale_local_claude_quota_snapshot(
 ) -> ClaudeConfigSlotQuotaSnapshotV1 {
     let mut snapshot = snapshot.clone();
     snapshot.state = ClaudeConfigSlotQuotaSnapshotStateV1::Stale;
-    for window in &mut snapshot.quota_windows {
-        window.freshness = AgentQuotaWindowFreshness::Stale;
-    }
     for balance in &mut snapshot.credit_balances {
         // A reader-blind row kept from an older daemon (complete, 0) is shown
         // in its §11.10 shape, never as no resets.
         claude_credit_pools::claude_mark_reader_unavailable(balance);
+    }
+    mark_quota_meters_stale(&mut snapshot.quota_windows, &mut snapshot.credit_balances);
+    snapshot
+}
+
+/// Mark a kept reading's meters `Stale`. Only freshness changes: read clocks
+/// (`observed_at`, `grants_observed_at`) and values stay as read.
+fn mark_quota_meters_stale(
+    quota_windows: &mut [AgentQuotaWindow],
+    credit_balances: &mut [AgentCreditBalance],
+) {
+    for window in quota_windows {
+        window.freshness = AgentQuotaWindowFreshness::Stale;
+    }
+    for balance in credit_balances {
         balance.freshness = AgentQuotaWindowFreshness::Stale;
     }
-    snapshot
 }
 
 fn local_claude_quota_snapshot_within_retention(
@@ -13835,10 +13907,20 @@ fn collect_codex_app_server_usage_for_home(
                 .map(|identity| codex_credit_binding(&identity));
             codex_credit_grants::routine_read_needs_details(binding.as_deref(), rate_limits, now)
         };
+    let started = Instant::now();
     let observation =
         match call_codex_app_server_rate_limits_for_home(codex_home, home_trust, &needs_details) {
             Ok(observation) => observation,
             Err(message) => {
+                eprintln!(
+                    "{}",
+                    codex_probe_failure_log_line(
+                        &message,
+                        codex_home,
+                        started.elapsed(),
+                        current_unix_seconds(),
+                    )
+                );
                 // No reading at all: the detail back-off still applies to the
                 // account last validated at this home (design R7).
                 codex_credit_grants::record_session_failure(codex_home, now);
@@ -13850,6 +13932,64 @@ fn collect_codex_app_server_usage_for_home(
         codex_credit_grants::remember_home_binding(codex_home, &codex_credit_binding(identity));
     }
     Ok(probe)
+}
+
+/// One log line per failed app-server probe: wall-clock time, the session
+/// stage, the error kind, a digest of the Codex home and the elapsed time.
+/// Built from the fixed producer text only; no path, account or provider text.
+fn codex_probe_failure_log_line(
+    message: &str,
+    codex_home: &Path,
+    elapsed: Duration,
+    now: u64,
+) -> String {
+    let (stage, kind) = codex_probe_failure_stage_and_kind(message);
+    let mut digest = Sha256::new();
+    digest.update(b"ottto:codex-home-log:v1\0");
+    digest.update(codex_home.as_os_str().as_encoded_bytes());
+    let home = format!("{:x}", digest.finalize());
+    format!(
+        "codex usage probe failed: at={} stage={stage} kind={kind} home={} elapsed_ms={}",
+        rfc3339_from_unix_seconds(now).unwrap_or_else(|| "unknown".to_string()),
+        &home[..12],
+        elapsed.as_millis()
+    )
+}
+
+/// `(stage, kind)` of a failed app-server probe, from its fixed producer text
+/// (`codex_app_server_rpc_failure`, `codex_app_server_end_failure` and the
+/// session's own messages).
+fn codex_probe_failure_stage_and_kind(message: &str) -> (&'static str, &'static str) {
+    let kind = if message.contains("timed out") {
+        "timeout"
+    } else if message.contains("RPC failed") {
+        "rpc_error"
+    } else if message.contains("stdout closed") {
+        "stdout_closed"
+    } else if message.contains("stdout read failed") {
+        "read_failed"
+    } else if message.contains("exceeded") {
+        "output_bound"
+    } else if message.contains("not found")
+        || message.contains("could not be started")
+        || message.contains("was unavailable")
+    {
+        "start"
+    } else if message.contains("request") && message.contains("failed") {
+        "request_failed"
+    } else {
+        "other"
+    };
+    let stage = message
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .find_map(|word| match word {
+            "initialize" => Some("initialize"),
+            "account" => Some("account"),
+            "quota" => Some("quota"),
+            _ => None,
+        })
+        .unwrap_or(if kind == "start" { "start" } else { "session" });
+    (stage, kind)
 }
 
 fn codex_credit_binding(identity: &CodexStrongIdentity) -> String {
@@ -21487,6 +21627,318 @@ for line in sys.stdin:
             "codex_configured_account_unavailable"
         );
         assert!(snapshot.diagnostics[0].observed_at.is_none());
+    }
+
+    fn codex_fresh_reading_candidate(
+        home: &str,
+        account_hash: &str,
+        workspace_hash: &str,
+    ) -> CodexSlotCandidate {
+        let mut candidate = codex_candidate_for_test(
+            "codex_slot_last_known",
+            CodexAccountSlotOwnershipV1::Managed,
+            account_hash,
+            workspace_hash,
+            1,
+        );
+        candidate.slot.home = PathBuf::from(home);
+        candidate.snapshot.quota_windows = vec![AgentQuotaWindow {
+            name: "primary".to_string(),
+            status: AgentQuotaWindowStatus::Ok,
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            observed_at: Some("2026-09-01T09:55:00Z".to_string()),
+            window_seconds: Some(18_000),
+            used_percent: Some(40),
+            left_percent: Some(60),
+            ..Default::default()
+        }];
+        candidate.snapshot.credit_balances = vec![AgentCreditBalance {
+            name: "reset_bank".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            observed_at: Some("2026-09-01T09:55:00Z".to_string()),
+            grants_observed_at: Some("2026-09-01T09:00:00Z".to_string()),
+            remaining: Some(2),
+            ..Default::default()
+        }];
+        candidate
+    }
+
+    /// The same slot after a whole-session probe failure (here the
+    /// `initialize` deadline): no live binding, no reading.
+    fn codex_failed_probe_candidate(
+        home: &str,
+        account_hash: &str,
+        workspace_hash: &str,
+    ) -> CodexSlotCandidate {
+        let mut candidate = codex_candidate_for_test(
+            "codex_slot_last_known",
+            CodexAccountSlotOwnershipV1::Managed,
+            account_hash,
+            workspace_hash,
+            1,
+        );
+        candidate.slot.home = PathBuf::from(home);
+        candidate.binding = None;
+        candidate.status = CodexAccountSlotCollectionStatusV1 {
+            state: CodexAccountSlotCollectionStateV1::ProviderUnavailable,
+            ..Default::default()
+        };
+        candidate.snapshot.account = None;
+        candidate.snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+        candidate
+            .snapshot
+            .diagnostics
+            .push(AgentStatusDiagnostic::source(
+                "codex_usage_probe_failed",
+                AgentDiagnosticSeverity::Warning,
+                "Codex app-server initialize read timed out.",
+            ));
+        candidate
+    }
+
+    fn remember_fresh_codex_reading(candidate: &CodexSlotCandidate, now: u64) {
+        let (account, workspace) = candidate.binding.clone().expect("fresh binding");
+        codex_credit_grants::remember_home_binding(
+            &candidate.slot.home,
+            &codex_credit_grants::binding_key(&account, &workspace),
+        );
+        remember_codex_last_known_reading(
+            candidate.binding.as_ref(),
+            &candidate.status,
+            &candidate.snapshot,
+            now,
+        );
+    }
+
+    fn configured_unavailable_snapshot(candidate: CodexSlotCandidate) -> AgentStatusSnapshot {
+        let mut snapshots = Vec::new();
+        append_configured_codex_unavailable_snapshots(
+            &mut snapshots,
+            &[candidate],
+            "2026-09-01T10:00:00Z",
+            "2026-09-01T10:15:00Z",
+        );
+        assert_eq!(snapshots.len(), 1);
+        snapshots.remove(0)
+    }
+
+    #[test]
+    fn a_failed_codex_probe_sends_the_last_reading_stale_with_its_read_clocks() {
+        let home = "/tmp/codex-last-known-test-success-then-fail";
+        let fresh = codex_fresh_reading_candidate(home, "lk-account-1", "lk-workspace-1");
+        remember_fresh_codex_reading(&fresh, current_unix_seconds());
+
+        let placeholder = configured_unavailable_snapshot(codex_failed_probe_candidate(
+            home,
+            "lk-account-1",
+            "lk-workspace-1",
+        ));
+
+        let mut expected_windows = fresh.snapshot.quota_windows.clone();
+        let mut expected_balances = fresh.snapshot.credit_balances.clone();
+        for window in &mut expected_windows {
+            window.freshness = AgentQuotaWindowFreshness::Stale;
+        }
+        for balance in &mut expected_balances {
+            balance.freshness = AgentQuotaWindowFreshness::Stale;
+        }
+        // Values and read clocks are the original reading's; only freshness
+        // changes.
+        assert_eq!(placeholder.quota_windows, expected_windows);
+        assert_eq!(placeholder.credit_balances, expected_balances);
+        // Identity, state and diagnostics are the placeholder's as before.
+        let account = placeholder.account.as_ref().expect("configured account");
+        assert_eq!(
+            account.account_identifier_hash.as_deref(),
+            Some("lk-account-1")
+        );
+        assert_eq!(account.login_state, AgentLoginState::Unknown);
+        assert_eq!(placeholder.status, AgentStatusState::Degraded);
+        assert_eq!(
+            placeholder
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codex_configured_account_unavailable"]
+        );
+    }
+
+    #[test]
+    fn a_failed_codex_probe_after_the_age_cap_is_the_placeholder_as_before() {
+        let home = "/tmp/codex-last-known-test-past-cap";
+        let fresh = codex_fresh_reading_candidate(home, "lk-account-2", "lk-workspace-2");
+        let now = current_unix_seconds();
+        remember_fresh_codex_reading(&fresh, now - codex_last_known::LAST_KNOWN_MAX_AGE_SECS - 1);
+
+        let placeholder = configured_unavailable_snapshot(codex_failed_probe_candidate(
+            home,
+            "lk-account-2",
+            "lk-workspace-2",
+        ));
+        assert!(placeholder.quota_windows.is_empty());
+        assert!(placeholder.credit_balances.is_empty());
+
+        // At the cap it is still sent.
+        let failed = codex_failed_probe_candidate(home, "lk-account-2", "lk-workspace-2");
+        let at_cap = now - 1;
+        assert!(codex_last_known_meters_for_failed_probe(
+            &failed,
+            "lk-account-2",
+            "lk-workspace-2",
+            at_cap
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn a_failed_codex_probe_never_carries_another_accounts_reading() {
+        // The home last read account B; its registered account A has no
+        // reading of its own.
+        let home = "/tmp/codex-last-known-test-account-change";
+        let other = codex_fresh_reading_candidate(home, "lk-account-b", "lk-workspace-3");
+        remember_fresh_codex_reading(&other, current_unix_seconds());
+        let placeholder = configured_unavailable_snapshot(codex_failed_probe_candidate(
+            home,
+            "lk-account-a",
+            "lk-workspace-3",
+        ));
+        assert!(placeholder.quota_windows.is_empty());
+        assert!(placeholder.credit_balances.is_empty());
+
+        // A read earlier, then the home switched to B: A's reading stays
+        // with A and is not sent for this home.
+        let home = "/tmp/codex-last-known-test-switched-home";
+        let first = codex_fresh_reading_candidate(home, "lk-account-c", "lk-workspace-4");
+        remember_fresh_codex_reading(&first, current_unix_seconds());
+        let switched = codex_fresh_reading_candidate(home, "lk-account-d", "lk-workspace-4");
+        remember_fresh_codex_reading(&switched, current_unix_seconds());
+        let placeholder = configured_unavailable_snapshot(codex_failed_probe_candidate(
+            home,
+            "lk-account-c",
+            "lk-workspace-4",
+        ));
+        assert!(placeholder.quota_windows.is_empty());
+        assert!(placeholder.credit_balances.is_empty());
+    }
+
+    #[test]
+    fn only_a_failed_probe_carries_the_last_reading() {
+        let home = "/tmp/codex-last-known-test-not-a-probe-failure";
+        let fresh = codex_fresh_reading_candidate(home, "lk-account-5", "lk-workspace-5");
+        remember_fresh_codex_reading(&fresh, current_unix_seconds());
+
+        // Signed out: the placeholder stays meterless.
+        let mut signed_out = codex_failed_probe_candidate(home, "lk-account-5", "lk-workspace-5");
+        signed_out.status.state = CodexAccountSlotCollectionStateV1::NeedsLogin;
+        let placeholder = configured_unavailable_snapshot(signed_out);
+        assert!(placeholder.quota_windows.is_empty());
+
+        // Provider unavailable without a failed probe (an answer without
+        // usable meters): nothing is carried either.
+        let mut answered = codex_failed_probe_candidate(home, "lk-account-5", "lk-workspace-5");
+        answered.snapshot.diagnostics.clear();
+        let placeholder = configured_unavailable_snapshot(answered);
+        assert!(placeholder.quota_windows.is_empty());
+
+        // A reading that was not fresh is never recorded.
+        let home = "/tmp/codex-last-known-test-not-fresh";
+        let mut not_fresh = codex_fresh_reading_candidate(home, "lk-account-6", "lk-workspace-6");
+        not_fresh.status.state = CodexAccountSlotCollectionStateV1::ProviderUnavailable;
+        remember_fresh_codex_reading(&not_fresh, current_unix_seconds());
+        let placeholder = configured_unavailable_snapshot(codex_failed_probe_candidate(
+            home,
+            "lk-account-6",
+            "lk-workspace-6",
+        ));
+        assert!(placeholder.quota_windows.is_empty());
+    }
+
+    #[test]
+    fn codex_probe_failure_log_line_names_stage_kind_home_digest_and_elapsed() {
+        let line = codex_probe_failure_log_line(
+            "Codex app-server initialize read timed out.",
+            Path::new("/Users/someone/Library/Application Support/Ottto/codex-accounts/slot"),
+            Duration::from_millis(20_013),
+            1_767_225_600,
+        );
+        let home = line
+            .split(' ')
+            .find_map(|part| part.strip_prefix("home="))
+            .expect("home digest");
+        assert_eq!(home.len(), 12);
+        assert!(home.chars().all(|character| character.is_ascii_hexdigit()));
+        assert_eq!(
+            line,
+            format!(
+                "codex usage probe failed: at=2026-01-01T00:00:00Z stage=initialize kind=timeout home={home} elapsed_ms=20013"
+            )
+        );
+        assert!(!line.contains("someone"));
+        assert!(!line.contains("Ottto"));
+    }
+
+    #[test]
+    fn codex_probe_failure_stage_and_kind_cover_every_producer_message() {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let _ = child.wait();
+        let cases = [
+            (
+                codex_app_server_end_failure("initialize", false, None, &mut child),
+                ("initialize", "timeout"),
+            ),
+            (
+                codex_app_server_end_failure("account", false, None, &mut child),
+                ("account", "timeout"),
+            ),
+            (
+                codex_app_server_end_failure("quota", true, None, &mut child),
+                ("quota", "stdout_closed"),
+            ),
+            (
+                codex_app_server_rpc_failure("initialize", &serde_json::json!({"code": -32600})),
+                ("initialize", "rpc_error"),
+            ),
+            (
+                codex_app_server_rpc_failure("quota", &serde_json::json!({})),
+                ("quota", "rpc_error"),
+            ),
+            (
+                "Codex app-server quota request failed.".to_string(),
+                ("quota", "request_failed"),
+            ),
+            (
+                "Codex app-server request write failed.".to_string(),
+                ("session", "request_failed"),
+            ),
+            (
+                "Codex app-server stdout read failed.".to_string(),
+                ("session", "read_failed"),
+            ),
+            (
+                "Codex app-server output exceeded its byte limit.".to_string(),
+                ("session", "output_bound"),
+            ),
+            (
+                "Codex app-server could not be started.".to_string(),
+                ("start", "start"),
+            ),
+            (
+                "Codex CLI was not found for app-server rate-limit collection.".to_string(),
+                ("start", "start"),
+            ),
+            (
+                "Codex app-server user identity was unavailable.".to_string(),
+                ("start", "start"),
+            ),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                codex_probe_failure_stage_and_kind(&message),
+                expected,
+                "{message}"
+            );
+        }
     }
 
     #[test]

@@ -395,6 +395,11 @@ pub(super) fn remember_home_binding(home: &Path, binding: &str) {
     tracker().remember_home_binding(home, binding);
 }
 
+/// The binding last validated at `home`, if any.
+pub(super) fn home_binding(home: &Path) -> Option<String> {
+    tracker().home_binding.get(home).cloned()
+}
+
 /// Process-wide [`CodexCreditTracker::record_session_failure`].
 pub(super) fn record_session_failure(home: &Path, now: u64) {
     tracker().record_session_failure(home, now);
