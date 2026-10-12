@@ -1006,6 +1006,13 @@ fn parse_session_reader(
     Ok(())
 }
 
+fn session_file(path: &Path) -> std::io::Result<impl std::io::Read> {
+    let file = fs::File::open(path)?;
+    #[cfg(test)]
+    let file = tests::file_with_read_hook(file, path);
+    Ok(file)
+}
+
 pub(crate) fn parse_claude_session(
     path: &Path,
     report: &mut WorkspaceReport,
@@ -1013,7 +1020,7 @@ pub(crate) fn parse_claude_session(
     include_subagents: bool,
 ) -> std::io::Result<()> {
     parse_session_reader(
-        std::io::BufReader::new(fs::File::open(path)?),
+        std::io::BufReader::new(session_file(path)?),
         path,
         report,
         fallback,
@@ -1028,7 +1035,7 @@ pub(crate) fn parse_codex_session(
     fallback: Date,
 ) -> std::io::Result<()> {
     parse_session_reader(
-        std::io::BufReader::new(fs::File::open(path)?),
+        std::io::BufReader::new(session_file(path)?),
         path,
         report,
         fallback,

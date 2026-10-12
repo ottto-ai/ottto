@@ -151,36 +151,31 @@ fn late_utf8_and_read_errors_do_not_commit_partial_facts() {
     assert!(report.daily.is_empty() && report.files.is_empty() && report.sessions.is_empty());
 }
 
-#[cfg(unix)]
 #[test]
 fn replacement_during_read_refuses_new_report_and_preserves_cache() {
-    use std::os::unix::ffi::OsStrExt;
-    // A FIFO provides a deterministic seam: the writer cannot open until the
-    // collector has checked the original metadata and opens the reader. The
-    // pathname is replaced before the writer closes, hence before reader EOF.
-    let directory = crate::test_scratch::private_dir("composition-read-fence");
+    let directory = crate::test_scratch::ScratchDir::new("composition-read-fence");
     let path = directory.join("fixture.jsonl");
-    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    fs::write(
+        &path,
+        b"{\"type\":\"attachment\",\"attachment\":{\"content\":\"valid\"}}\n",
+    )
+    .unwrap();
     let scan = cache_scan(&path);
     let signature = test_signature(&scan);
     let cache_file = directory.join("cache.json");
     write_cache(&cache_file, &test_cache(&scan, wide_window()));
     let original_cache = fs::read(&cache_file).unwrap();
-    let writer_path = path.clone();
-    let old_path = directory.join("opened-fifo");
-    let moved_path = old_path.clone();
-    let writer = std::thread::spawn(move || {
-        let mut stream = fs::OpenOptions::new()
-            .write(true)
-            .open(&writer_path)
-            .unwrap();
-        stream
-            .write_all(b"{\"type\":\"attachment\",\"attachment\":{\"content\":\"valid\"}}\n")
-            .unwrap();
-        fs::rename(&writer_path, &moved_path).unwrap();
-        fs::write(&writer_path, b"replacement").unwrap();
-        drop(stream);
+    let changed_path = path.clone();
+    let old_path = directory.join("opened-file");
+    FILE_READ_HOOK.with(|cell| {
+        assert!(cell.borrow().is_none());
+        *cell.borrow_mut() = Some(FileReadHook {
+            path: path.clone(),
+            callback: Box::new(move || {
+                fs::rename(&changed_path, &old_path).unwrap();
+                fs::write(&changed_path, b"replacement").unwrap();
+            }),
+        });
     });
     assert!(build_report_for_scan(
         &scan,
@@ -190,12 +185,13 @@ fn replacement_during_read_refuses_new_report_and_preserves_cache() {
         Instant::now() + Duration::from_secs(30)
     )
     .is_none());
-    writer.join().unwrap();
+    FILE_READ_HOOK.with(|cell| {
+        assert!(
+            cell.borrow().is_none(),
+            "actual read hook must have been consumed"
+        )
+    });
     assert_eq!(fs::read(&cache_file).unwrap(), original_cache);
-    for file in [path, old_path, cache_file] {
-        fs::remove_file(file).unwrap();
-    }
-    fs::remove_dir(directory).unwrap();
 }
 
 #[cfg(unix)]

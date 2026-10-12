@@ -31,7 +31,8 @@ budget. Baseline reads use a full-file logical upper bound; successful candidate
 reads are counted at the Read boundary. These are not physical disk counters.
 
 The existing public Rust CI job, limited to two build jobs, runs the isolated
-receipt after ordinary tests. It compares complete payloads, serialized sizes,
+receipt after ordinary tests on explicit workflow dispatch only; PR and main
+checks retain ordinary parity without repeating the benchmark. It compares complete payloads, serialized sizes,
 source bytes, requested/usable heap, CPU and wall time, using the existing
 test-only allocation probe and one test subprocess per sample. No live input or
 provider call is needed. Allocation instrumentation affects timing; comparisons
