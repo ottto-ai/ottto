@@ -5949,7 +5949,7 @@ fn custom_claude_snapshot_from_usage(
 
 const CLAUDE_CACHE_REUSED_MESSAGE: &str =
     "Locally cached quota evidence was reused; no provider check was made.";
-/// Retain a canonical clock only on a bound cache-reuse outcome. Its deadline
+/// Retain a canonical clock only on a bound cache-reuse or rate-limited outcome. Its deadline
 /// was still ahead at the producer's check time; consumers compare it with now.
 fn safe_claude_cache_retry_after(diagnostic: &AgentStatusDiagnostic) -> Option<String> {
     let deadline = diagnostic
@@ -5995,6 +5995,13 @@ fn safe_claude_slot_check_diagnostics(
             "claude_oauth_usage_network_disabled" => "Quota network collection is disabled on this machine.",
             "claude_oauth_usage_collection_in_progress" => "Quota collection is already in progress; no duplicate provider check was made.",
             CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_CODE => CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_MESSAGE,
+            CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE => {
+                if diagnostic.message.contains(" saved-resets read") {
+                    CLAUDE_OAUTH_USAGE_RATE_LIMITED_SAVED_RESETS_MESSAGE
+                } else {
+                    CLAUDE_OAUTH_USAGE_RATE_LIMITED_USAGE_MESSAGE
+                }
+            }
             // Our own typed auth classification; only the HTTP status is kept.
             "claude_oauth_usage_auth_rejected" => {
                 if diagnostic.message.contains(" with HTTP 401 ") {
@@ -6037,7 +6044,11 @@ fn safe_claude_slot_check_diagnostics(
             AgentStatusDiagnostic::source(&diagnostic.code, diagnostic.severity.clone(), message)
                 .with_observed_at(clock)
                 .with_quota_binding(Some(account.to_string()), Some(organization.to_string()));
-        if diagnostic.code == "claude_oauth_usage_cache_reused" && safe.observed_at.is_some() {
+        if matches!(
+            diagnostic.code.as_str(),
+            "claude_oauth_usage_cache_reused" | CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE
+        ) && safe.observed_at.is_some()
+        {
             safe.retry_after = safe_claude_cache_retry_after(diagnostic);
         }
         result.push(safe);
@@ -6092,6 +6103,9 @@ fn stale_local_claude_quota_snapshot(
         window.freshness = AgentQuotaWindowFreshness::Stale;
     }
     for balance in &mut snapshot.credit_balances {
+        // A reader-blind row kept from an older daemon (complete, 0) is shown
+        // in its §11.10 shape, never as no resets.
+        claude_credit_pools::claude_mark_reader_unavailable(balance);
         balance.freshness = AgentQuotaWindowFreshness::Stale;
     }
     snapshot
@@ -10104,6 +10118,11 @@ fn collect_claude_oauth_usage_unstamped(
                 mirror_legacy_default,
             );
             diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed with rate limiting; any served readings remain locally cached evidence.", current_unix_seconds()));
+            diagnostics.push(claude_oauth_usage_rate_limited_diagnostic(
+                usage_read,
+                retry_after,
+                now,
+            ));
             if !cache.windows.is_empty()
                 && now.saturating_sub(cache.observed_at_epoch_seconds)
                     <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
@@ -10236,6 +10255,43 @@ const CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_CODE: &str =
     "claude_saved_reset_variant_unrecognized";
 /// Fixed, value-free text: the same words reach the slot status and upload.
 const CLAUDE_SAVED_RESET_VARIANT_UNRECOGNIZED_MESSAGE: &str = "Claude's saved-reset reading had no recognizable saved-reset section; this account uses the plain reading for 24 hours.";
+
+/// Local status only: the upload drops it (`ottto_protocol`).
+const CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE: &str =
+    ottto_protocol::CLAUDE_OAUTH_USAGE_RATE_LIMITED_DIAGNOSTIC_CODE;
+/// Fixed, value-free slot-status text per read; the time is in `retry_after`.
+const CLAUDE_OAUTH_USAGE_RATE_LIMITED_USAGE_MESSAGE: &str =
+    "Claude asked Ottto to wait before the next usage read; Ottto checks again after the retry time.";
+const CLAUDE_OAUTH_USAGE_RATE_LIMITED_SAVED_RESETS_MESSAGE: &str =
+    "Claude asked Ottto to wait before the next saved-resets read; Ottto checks again after the retry time.";
+
+/// A 429 on the Claude usage read: which read Claude asked Ottto to hold and
+/// until when ("Claude asked Ottto to wait until HH:MM UTC"), with the same
+/// deadline in `retry_after`. Reporting only: the Retry-After backoff, the
+/// breaker and the calls made are unchanged.
+fn claude_oauth_usage_rate_limited_diagnostic(
+    read: claude_credit_pools::ClaudeUsageRead,
+    retry_after: u64,
+    now: u64,
+) -> AgentStatusDiagnostic {
+    let until = i64::try_from(retry_after)
+        .ok()
+        .and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok())
+        .map_or_else(
+            || "later".to_string(),
+            |at| format!("{:02}:{:02} UTC", at.hour(), at.minute()),
+        );
+    let mut diagnostic = claude_quota_check_diagnostic(
+        CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE,
+        &format!(
+            "Claude asked Ottto to wait until {until} before the next {} read.",
+            read.label()
+        ),
+        now,
+    );
+    diagnostic.retry_after = rfc3339_from_unix_seconds(retry_after);
+    diagnostic
+}
 
 /// Handle one 200 response body.
 ///
@@ -17403,6 +17459,69 @@ mod tests {
             with_expired.iter().any(claude_custom_slot_needs_attention),
             "an expired sign-in must still reach the operator"
         );
+    }
+
+    /// Contract v2.2 §11.10: a reader-blind saved-resets row an older daemon
+    /// kept as a complete, empty list is carried forward in the unavailable
+    /// shape, never as no resets.
+    #[test]
+    fn retained_slot_snapshot_shows_an_older_reader_blind_row_as_unavailable() {
+        let account_hash = "a".repeat(64);
+        let organization_hash = "b".repeat(64);
+        let now = current_unix_seconds();
+        let now_text = rfc3339_from_unix_seconds(now).expect("now");
+        let mut snapshot = local_meter_fixture(&account_hash, &organization_hash);
+        snapshot.captured_at = now_text.clone();
+        snapshot.observed_at = Some(now_text.clone());
+        snapshot.credit_balances.push(AgentCreditBalance {
+            name: "reset_bank".to_string(),
+            status: AgentCreditBalanceStatus::Exhausted,
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            unit: AgentCreditBalanceUnit::Resets,
+            remaining: Some(0),
+            observed_at: Some(now_text.clone()),
+            grant_count: Some(0),
+            grants: Some(Vec::new()),
+            grants_state: Some(ottto_protocol::CreditGrantsState::Complete),
+            grants_observed_at: Some(now_text.clone()),
+            kind: Some(ottto_protocol::CreditBalanceKind::SavedResets),
+            eligible: Some(false),
+            at_limit: Some(false),
+            ineligible_reason: Some("surface".to_string()),
+            ..Default::default()
+        });
+        let previous = ClaudeConfigSlotCollectionStatusV1 {
+            last_full_quota_read_at: Some(now_text),
+            has_account_windows: true,
+            has_scoped_limits: true,
+            has_credit_balances: true,
+            quota_snapshot: Some(snapshot),
+            ..Default::default()
+        };
+        let mut status = ClaudeConfigSlotCollectionStatusV1::default();
+        retain_previous_complete_claude_read(&mut status, previous);
+        let retained = status.quota_snapshot.expect("retained snapshot");
+        let saved = retained
+            .credit_balances
+            .iter()
+            .find(|balance| balance.kind == Some(ottto_protocol::CreditBalanceKind::SavedResets))
+            .expect("saved resets kept");
+        assert_eq!(
+            saved.grants_unavailable_cause,
+            Some(ottto_protocol::CreditGrantsUnavailableCause::Reader)
+        );
+        assert!(ottto_protocol::credit_grants_unavailable_cause_allowed(
+            saved
+        ));
+        assert_eq!(saved.status, AgentCreditBalanceStatus::Unknown);
+        assert_eq!(saved.freshness, AgentQuotaWindowFreshness::Stale);
+        assert_eq!(saved.ineligible_reason.as_deref(), Some("surface"));
+        // Every other row is kept as it was, only marked stale.
+        assert!(retained
+            .credit_balances
+            .iter()
+            .filter(|balance| balance.kind != Some(ottto_protocol::CreditBalanceKind::SavedResets))
+            .all(|balance| balance.grants_unavailable_cause.is_none()));
     }
 
     #[test]
@@ -30727,6 +30846,46 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         );
     }
 
+    /// A 429 names the read and the time Claude asked Ottto to wait until;
+    /// slot status keeps a fixed per-read text and the bound deadline.
+    #[test]
+    fn rate_limited_diagnostic_names_the_read_and_wait_time() {
+        // 2026-10-11T12:58:57Z.
+        let deadline = 1_791_723_537;
+        for (read, live, slot) in [
+            (
+                claude_credit_pools::ClaudeUsageRead::Plain,
+                "Claude asked Ottto to wait until 12:58 UTC before the next usage read.",
+                CLAUDE_OAUTH_USAGE_RATE_LIMITED_USAGE_MESSAGE,
+            ),
+            (
+                claude_credit_pools::ClaudeUsageRead::SavedResets,
+                "Claude asked Ottto to wait until 12:58 UTC before the next saved-resets read.",
+                CLAUDE_OAUTH_USAGE_RATE_LIMITED_SAVED_RESETS_MESSAGE,
+            ),
+        ] {
+            let diagnostic =
+                claude_oauth_usage_rate_limited_diagnostic(read, deadline, deadline - 3_600)
+                    .with_quota_binding(
+                        Some("account".to_string()),
+                        Some("organization".to_string()),
+                    );
+            assert_eq!(diagnostic.code, CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE);
+            assert_eq!(diagnostic.message, live);
+            assert_eq!(
+                diagnostic.retry_after.as_deref(),
+                Some("2026-10-11T12:58:57Z")
+            );
+            let safe = safe_claude_slot_check_diagnostics(&[diagnostic], "account", "organization");
+            assert_eq!(safe[0].message, slot);
+            assert_eq!(safe[0].retry_after.as_deref(), Some("2026-10-11T12:58:57Z"));
+            assert_eq!(
+                safe_claude_slot_check_diagnostics(&safe, "account", "organization"),
+                safe
+            );
+        }
+    }
+
     #[test]
     fn claude_slot_diagnostics_keep_suppression_and_cache_distinct_without_inventing_clocks() {
         let codes = [
@@ -33073,6 +33232,132 @@ exit 0
                 .quota_check_diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "claude_saved_reset_variant_unrecognized"));
+        }
+    }
+
+    fn respond_rate_limited(_endpoint: &str) -> Result<Value, u16> {
+        Err(429)
+    }
+
+    /// The 429 diagnostic is local only: local status (snapshots and the
+    /// registered slot) keeps it, the upload never carries it.
+    #[test]
+    #[serial]
+    fn rate_limited_diagnostic_stays_local_and_is_never_uploaded() {
+        let fixture = ClaudeBindingFixture::new("rate-limited-local");
+        fixture.sign_in(TEAM_PREMIUM);
+        let slot_id = fixture.register();
+        fixture.collect();
+        let team = ClaudeBindingFixture::hashes(TEAM_PREMIUM);
+        claude_credit_pools::write_claude_read_schedule(
+            &claude_oauth_usage_account_state_dir(&team.0, &team.1),
+            &claude_credit_pools::ClaudeReadSchedule {
+                last_plain_read_at: Some(current_unix_seconds() - 3_600),
+                ..Default::default()
+            },
+        )
+        .expect("write schedule");
+        let _ = fs::remove_file(claude_oauth_usage_cache_path(&team.0, &team.1));
+        *CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = Some(respond_rate_limited);
+        let snapshots = fixture.collect();
+        *CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = None;
+        let local = serde_json::to_string(&snapshots).expect("local status");
+        let slot = fixture.slot(&slot_id);
+        assert!(
+            local.contains(CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE),
+            "local snapshots keep the 429 diagnostic"
+        );
+        assert!(
+            slot.collection
+                .quota_check_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE),
+            "slot status keeps the 429 diagnostic"
+        );
+        let upload = serde_json::to_string(
+            &snapshots
+                .into_iter()
+                .map(|snapshot| snapshot.redacted_for_backend())
+                .collect::<Vec<_>>(),
+        )
+        .expect("serialize upload");
+        assert!(!upload.contains(CLAUDE_OAUTH_USAGE_RATE_LIMITED_CODE));
+        assert!(!upload.contains("Claude asked Ottto to wait"));
+    }
+
+    fn respond_variant_reader_blind(_endpoint: &str) -> Result<Value, u16> {
+        Ok(serde_json::from_str(include_str!(
+            "../../../fixtures/agent-status/quota-contract-v2.2/provider/claude-usage-cedar-reader-surface.json"
+        ))
+        .expect("fixture"))
+    }
+
+    /// Contract v2.2 §11.10: a reader-blind saved-reset reading reaches the
+    /// local status snapshots the Companion decodes and the upload with
+    /// `grants_unavailable_cause` under the same name, and no count.
+    #[test]
+    #[serial]
+    fn reader_blind_saved_resets_reach_local_status_and_upload() {
+        let fixture = ClaudeBindingFixture::new("reader-blind");
+        fixture.sign_in(TEAM_PREMIUM);
+        fixture.register();
+        fixture.collect();
+        let team = ClaudeBindingFixture::hashes(TEAM_PREMIUM);
+        let state_dir = claude_oauth_usage_account_state_dir(&team.0, &team.1);
+        let now = current_unix_seconds();
+        claude_credit_pools::write_claude_read_schedule(
+            &state_dir,
+            &claude_credit_pools::ClaudeReadSchedule {
+                last_plain_read_at: Some(now - 3_600),
+                ..Default::default()
+            },
+        )
+        .expect("write schedule");
+        let _ = fs::remove_file(claude_oauth_usage_cache_path(&team.0, &team.1));
+        *CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = Some(respond_variant_reader_blind);
+        let snapshots = fixture.collect();
+        *CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = None;
+        let reader_blind = |balances: &Value| {
+            balances
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|balance| balance["kind"] == "saved_resets")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let local = serde_json::to_value(&snapshots).expect("local status");
+        let saved = local
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|snapshot| reader_blind(&snapshot["credit_balances"]))
+            .collect::<Vec<_>>();
+        let upload = serde_json::to_value(
+            snapshots
+                .into_iter()
+                .map(|snapshot| snapshot.redacted_for_backend())
+                .collect::<Vec<_>>(),
+        )
+        .expect("upload");
+        let uploaded = upload
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|snapshot| reader_blind(&snapshot["credit_balances"]))
+            .collect::<Vec<_>>();
+        for (label, balances) in [("local", saved), ("upload", uploaded)] {
+            assert!(!balances.is_empty(), "{label}: saved resets present");
+            for balance in balances {
+                assert_eq!(balance["grants_unavailable_cause"], "reader", "{label}");
+                assert_eq!(balance["grants_state"], "unavailable", "{label}");
+                assert_eq!(balance["status"], "unknown", "{label}");
+                assert_eq!(balance["ineligible_reason"], "surface", "{label}");
+                assert_eq!(balance["eligible"], false, "{label}");
+                for absent in ["remaining", "grant_count", "grants"] {
+                    assert!(balance.get(absent).is_none(), "{label}: {absent}");
+                }
+            }
         }
     }
 

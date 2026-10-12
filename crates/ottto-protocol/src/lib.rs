@@ -1273,6 +1273,7 @@ impl AgentStatusSnapshot {
         self.diagnostics = self
             .diagnostics
             .drain(..)
+            .filter(|diagnostic| !is_local_only_diagnostic(&diagnostic.code))
             .map(redact_diagnostic_for_backend)
             .collect();
 
@@ -1739,6 +1740,38 @@ pub struct AgentCreditBalance {
     pub ineligible_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_until: Option<Rfc3339Timestamp>,
+    /// Quota contract v2.2 §11.10: why this saved-resets balance's grants are
+    /// unavailable. Only with the shape
+    /// [`credit_grants_unavailable_cause_allowed`] accepts; absent otherwise.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_optional"
+    )]
+    pub grants_unavailable_cause: Option<CreditGrantsUnavailableCause>,
+}
+
+/// Why a saved-resets balance's grants are unavailable (quota contract v2.2
+/// §11.10). An unrecognized value decodes as `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreditGrantsUnavailableCause {
+    /// The reader that took this reading cannot see the grants (Claude
+    /// `ineligible_reason` `surface` or `cli_version`): "not visible to this
+    /// reader", never "no resets".
+    Reader,
+}
+
+/// The only balance shape that may carry `grants_unavailable_cause` (quota
+/// contract v2.2 §11.10): saved resets with `grants_state: unavailable` and
+/// no `grants`, `remaining` or `grant_count`.
+pub fn credit_grants_unavailable_cause_allowed(credit: &AgentCreditBalance) -> bool {
+    credit.kind == Some(CreditBalanceKind::SavedResets)
+        && credit.unit == AgentCreditBalanceUnit::Resets
+        && credit.grants_state == Some(CreditGrantsState::Unavailable)
+        && credit.grants.is_none()
+        && credit.remaining.is_none()
+        && credit.grant_count.is_none()
 }
 
 /// One provider credit grant inside an [`AgentCreditBalance`] (quota contract
@@ -4438,6 +4471,9 @@ fn redact_credit_balance_for_backend(mut credit: AgentCreditBalance) -> Option<A
         credit.next_expires_at = None;
         credit.latest_granted_at = None;
     }
+    if !credit_grants_unavailable_cause_allowed(&credit) {
+        credit.grants_unavailable_cause = None;
+    }
     Some(credit)
 }
 
@@ -4611,6 +4647,16 @@ fn redact_plan_observation_for_backend(
     observation.billing_identity_evidence =
         safe_optional_text(observation.billing_identity_evidence.take());
     observation
+}
+
+/// A Claude usage read Claude answered with 429: names the read and the
+/// wait. Local status only (Companion and CLI); never uploaded, so a per-429
+/// time never becomes a backend row.
+pub const CLAUDE_OAUTH_USAGE_RATE_LIMITED_DIAGNOSTIC_CODE: &str = "claude_oauth_usage_rate_limited";
+
+/// Diagnostics kept in local status and dropped from the backend upload.
+fn is_local_only_diagnostic(code: &str) -> bool {
+    code == CLAUDE_OAUTH_USAGE_RATE_LIMITED_DIAGNOSTIC_CODE
 }
 
 fn redact_diagnostic_for_backend(mut diagnostic: AgentStatusDiagnostic) -> AgentStatusDiagnostic {
@@ -7910,6 +7956,95 @@ mod tests {
         .unwrap();
         assert_eq!(missing.grants_state, None);
         assert_eq!(missing.kind, None);
+    }
+
+    fn reader_unavailable_saved_resets() -> AgentCreditBalance {
+        AgentCreditBalance {
+            name: "reset_bank".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            unit: AgentCreditBalanceUnit::Resets,
+            observed_at: Some("2026-10-01T12:00:00Z".to_string()),
+            grants_state: Some(CreditGrantsState::Unavailable),
+            kind: Some(CreditBalanceKind::SavedResets),
+            eligible: Some(false),
+            at_limit: Some(false),
+            ineligible_reason: Some("surface".to_string()),
+            grants_unavailable_cause: Some(CreditGrantsUnavailableCause::Reader),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn grants_unavailable_cause_is_optional_and_lenient() {
+        let balance = reader_unavailable_saved_resets();
+        let value = serde_json::to_value(&balance).unwrap();
+        assert_eq!(value["grants_unavailable_cause"], "reader");
+        assert_eq!(value["status"], "unknown");
+        for absent in ["remaining", "grant_count", "grants", "grants_observed_at"] {
+            assert!(value.get(absent).is_none(), "{absent}");
+        }
+        let parsed: AgentCreditBalance = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, balance);
+        // Absent: omitted, never `null`.
+        let without = AgentCreditBalance {
+            grants_unavailable_cause: None,
+            ..balance.clone()
+        };
+        let value = serde_json::to_value(&without).unwrap();
+        assert!(value.get("grants_unavailable_cause").is_none());
+        // `null`, a drifted value or another type decodes as absent.
+        for raw in [
+            serde_json::Value::Null,
+            serde_json::json!("brand_new_cause"),
+            serde_json::json!(1),
+        ] {
+            let mut value = serde_json::to_value(&balance).unwrap();
+            value["grants_unavailable_cause"] = raw.clone();
+            let parsed: AgentCreditBalance =
+                serde_json::from_value(value).expect("a drifted cause never fails the balance");
+            assert_eq!(parsed.grants_unavailable_cause, None, "{raw}");
+        }
+        // The upload copy keeps it on its one allowed shape.
+        assert_eq!(
+            redact_credit_balance_for_backend(balance.clone())
+                .unwrap()
+                .grants_unavailable_cause,
+            Some(CreditGrantsUnavailableCause::Reader)
+        );
+    }
+
+    type BalanceShape = (&'static str, fn(&mut AgentCreditBalance));
+
+    #[test]
+    fn grants_unavailable_cause_is_dropped_from_every_other_shape() {
+        let shapes: [BalanceShape; 8] = [
+            ("remaining", |b| b.remaining = Some(0)),
+            ("grant_count", |b| b.grant_count = Some(0)),
+            ("grants", |b| b.grants = Some(Vec::new())),
+            ("complete", |b| {
+                b.grants_state = Some(CreditGrantsState::Complete);
+                b.grants = Some(Vec::new());
+            }),
+            ("no state", |b| b.grants_state = None),
+            ("other kind", |b| {
+                b.kind = Some(CreditBalanceKind::UsageCredits)
+            }),
+            ("no kind", |b| b.kind = None),
+            ("other unit", |b| b.unit = AgentCreditBalanceUnit::Usd),
+        ];
+        for (label, mutate) in shapes {
+            let mut balance = reader_unavailable_saved_resets();
+            mutate(&mut balance);
+            assert!(
+                !credit_grants_unavailable_cause_allowed(&balance),
+                "{label}"
+            );
+            let redacted = redact_credit_balance_for_backend(balance).expect("balance kept");
+            assert_eq!(redacted.grants_unavailable_cause, None, "{label}");
+        }
+        assert!(credit_grants_unavailable_cause_allowed(
+            &reader_unavailable_saved_resets()
+        ));
     }
 
     #[test]
