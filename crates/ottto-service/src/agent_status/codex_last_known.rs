@@ -1,19 +1,21 @@
-//! Last-known Codex meters for a failed probe.
+//! Last-known Codex meters for a failed probe, for local display only.
 //!
 //! A Codex home whose app-server probe fails (spawn error, JSON-RPC error,
-//! timeout) has no reading of its own, so its registered account was uploaded
-//! as a placeholder with no windows and no balances. This module keeps each
-//! account binding's last fresh, bound reading in memory. A placeholder for
-//! the same binding then carries those meters marked `Stale`, with their
-//! original read clocks (`observed_at`, `grants_observed_at`) untouched, for
-//! at most [`LAST_KNOWN_MAX_AGE_SECS`].
+//! timeout) has no reading of its own. This module keeps each account
+//! binding's last fresh, bound reading in memory. The local status of the
+//! same binding then shows those meters marked `Stale`, with their original
+//! read clocks (`observed_at`, `grants_observed_at`) untouched, for at most
+//! [`LAST_KNOWN_MAX_AGE_SECS`]. The reading is never uploaded: the server
+//! keeps its own last good reading, and the upload copy strips stale meters
+//! from a failed Codex read.
 //!
 //! The reading is keyed by the credential identity (account and workspace
 //! hashes), the same key as the reset-grant cache, so a reading never moves
 //! to another account. Callers additionally require that the failed home was
-//! last validated as that binding, so a home that switched accounts gets no
-//! carry-forward. Nothing is persisted: after a daemon restart the first
-//! failure before any success sends the placeholder as before.
+//! last validated as that binding and that its local credential still names
+//! it, so a home that signed out or switched accounts shows nothing. Nothing
+//! is persisted: after a daemon restart the first failure before any success
+//! shows nothing.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -22,7 +24,7 @@ use ottto_protocol::{AgentCreditBalance, AgentQuotaWindow};
 
 use super::mark_quota_meters_stale;
 
-/// How long after its read a reading may still be sent as last-known.
+/// How long after its read a reading may still be shown as last-known.
 ///
 /// Shorter than the Claude display fallback (24 h): a Codex reading's primary
 /// window is five hours, so a reading older than one full window says little
@@ -180,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reading_past_the_age_cap_is_not_sent() {
+    fn a_reading_past_the_age_cap_is_not_shown() {
         let mut store = LastKnownCodexReadings::default();
         store.record("a:w", &[window("t")], &[balance("t")], 1_000);
         assert!(store
