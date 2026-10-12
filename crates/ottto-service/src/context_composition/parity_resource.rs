@@ -6,8 +6,6 @@ use std::io::{BufReader, Read};
 
 thread_local! {
     static READ_BYTES: Cell<u64> = const { Cell::new(0) };
-    static READ_CALLS: Cell<u64> = const { Cell::new(0) };
-    static READ_ASSEMBLY_CPU: Cell<f64> = const { Cell::new(0.0) };
 }
 
 fn wide_window() -> DateWindow {
@@ -20,7 +18,6 @@ fn wide_window() -> DateWindow {
 struct CountedFile(fs::File);
 impl Read for CountedFile {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        READ_CALLS.with(|cell| cell.set(cell.get() + 1));
         let size = self.0.read(bytes)?;
         READ_BYTES.with(|cell| cell.set(cell.get() + size as u64));
         Ok(size)
@@ -214,13 +211,7 @@ fn cpu_seconds() -> f64 {
 #[ignore = "isolated child entry point for bounded synthetic resource receipt"]
 fn resource_sample() {
     let name = std::env::var("OTTTO_COMPOSITION_SAMPLE_CASE").unwrap();
-    let mode = std::env::var("OTTTO_COMPOSITION_SAMPLE_MODE").unwrap();
-    let baseline = mode == "baseline";
-    let buffer_bytes = match mode.as_str() {
-        "baseline" | "candidate" => 8192,
-        "buffer64" => 65536,
-        _ => panic!("unsupported probe mode"),
-    };
+    let baseline = std::env::var("OTTTO_COMPOSITION_SAMPLE_MODE").unwrap() == "baseline";
     let case = parity_fixtures::cases()
         .into_iter()
         .find(|c| c.name == name)
@@ -233,8 +224,6 @@ fn resource_sample() {
     fs::write(&path, &case.bytes).unwrap();
     let mut report = WorkspaceReport::new(wide_window());
     READ_BYTES.with(|cell| cell.set(0));
-    READ_CALLS.with(|cell| cell.set(0));
-    READ_ASSEMBLY_CPU.with(|cell| cell.set(0.0));
     let ((outcome, wall_seconds, cpu_delta), heap) = crate::retry_allocation_probe::measure(|| {
         let cpu = cpu_seconds();
         let wall = Instant::now();
@@ -242,10 +231,7 @@ fn resource_sample() {
             parse_baseline(&case, &path, &mut report)
         } else {
             parse_session_reader(
-                ProfiledReader(BufReader::with_capacity(
-                    buffer_bytes,
-                    CountedFile(fs::File::open(&path).unwrap()),
-                )),
+                BufReader::new(CountedFile(fs::File::open(&path).unwrap())),
                 &path,
                 &mut report,
                 wide_window().today,
@@ -265,9 +251,7 @@ fn resource_sample() {
     println!(
         "COMPOSITION_SAMPLE {}",
         json!({
-            "case":name,"mode":mode,"buffer_bytes":if baseline {Value::Null} else {json!(buffer_bytes)},
-            "read_calls":if baseline {Value::Null} else {json!(READ_CALLS.with(Cell::get))},
-            "read_and_line_assembly_cpu_seconds":if baseline {Value::Null} else {json!(READ_ASSEMBLY_CPU.with(Cell::get))},
+            "case":name,"mode":if baseline {"baseline"} else {"candidate"},
             "error":outcome.err().map(|e|format!("{:?}",e.kind())),"payload":request,
             "parse_cpu_seconds":cpu_delta,"parse_wall_seconds":wall_seconds,
             "requested_heap_peak_bytes":heap.requested_peak,"retained_report_heap_bytes":heap.requested_live,
@@ -359,43 +343,25 @@ fn compact_resource_receipt() {
 }
 
 #[cfg(unix)]
-struct ProfiledReader<B>(B);
-#[cfg(unix)]
-impl<B: std::io::BufRead> Read for ProfiledReader<B> {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(bytes)
-    }
-}
-#[cfg(unix)]
-impl<B: std::io::BufRead> std::io::BufRead for ProfiledReader<B> {
-    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-        self.0.fill_buf()
-    }
-    fn consume(&mut self, count: usize) {
-        self.0.consume(count);
-    }
-    fn read_until(&mut self, delimiter: u8, bytes: &mut Vec<u8>) -> std::io::Result<usize> {
-        let cpu = cpu_seconds();
-        let result = self.0.read_until(delimiter, bytes);
-        let elapsed = cpu_seconds() - cpu;
-        READ_ASSEMBLY_CPU.with(|cell| cell.set(cell.get() + elapsed));
-        result
-    }
-}
-
-#[cfg(unix)]
 #[test]
-#[ignore = "explicit diagnostic dispatch only; five worst-case parses"]
-fn buffer_worst_case_receipt() {
+#[ignore = "explicit six-parse exact-reader reproduction only"]
+fn unprofiled_worst_case_receipt() {
     let case = parity_fixtures::cases()
         .into_iter()
         .find(|c| c.name == "codex-large-ignored-image")
         .unwrap();
     assert_eq!(case.bytes.len(), 2_000_339);
-    let modes = ["baseline", "candidate", "buffer64", "buffer64", "candidate"];
+    let modes = [
+        "baseline",
+        "candidate",
+        "candidate",
+        "baseline",
+        "baseline",
+        "candidate",
+    ];
     let charge = case.bytes.len() as u64 * modes.len() as u64;
-    assert_eq!(charge, 10_001_695);
-    assert!(105_677_295 + charge + 17_626_096 <= 128 * 1024 * 1024);
+    assert_eq!(charge, 12_002_034);
+    assert!(115_678_990 + charge <= 128 * 1024 * 1024);
     let mut observations = Vec::new();
     for mode in modes {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -431,21 +397,20 @@ fn buffer_worst_case_receipt() {
                 first["serialized_payload_bytes"]
             );
         }
-        if mode != "baseline" {
+        if mode == "candidate" {
             assert_eq!(result["candidate_read_bytes"], result["source_bytes"]);
         }
         observations.push(result);
     }
     println!(
-        "COMPOSITION_BUFFER_RECEIPT {}",
+        "COMPOSITION_UNPROFILED_RECEIPT {}",
         json!({
-            "scope":"diagnostic-only worst-case; unchanged 8d68 core parser with explicit 8KiB/64KiB buffering; same instrumented debug binary",
+            "scope":"exact unprofiled 8d68 resource_sample and CountedFile reader preserved verbatim; new parent invokes only six worst-case samples, same debug allocation probe",
             "released_source":"357fc17ebed5cecb97d0eb4d37ce2b2b3e1b0782",
             "candidate_source":"8d68ac37c7fd3d291d1eb412aea17adb6bdfed45",
             "all_output_fields_equal":true,"source_bytes_per_parse":case.bytes.len(),
-            "read_charge_upper_bound_bytes":charge,"previous_charge_bytes":105_677_295,
-            "reserved_final_full_parity_bytes":17_626_096,"campaign_limit_bytes":128*1024*1024,
-            "observations":observations
+            "read_charge_upper_bound_bytes":charge,"previous_charge_bytes":115_678_990,
+            "campaign_limit_bytes":128*1024*1024,"observations":observations
         })
     );
 }

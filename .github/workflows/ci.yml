@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       composition_buffer_probe:
-        description: Diagnostic-only five-parse buffer experiment
+        description: Diagnostic-only exact-reader six-parse reproduction
         type: boolean
         default: false
 
@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   rust:
-    name: ${{ github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe && 'Composition buffer experiment' || 'Rust contracts' }}
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe && 'Composition CPU reproduction' || 'Rust contracts' }}
     timeout-minutes: 40
     runs-on: macos-15
     env:
@@ -73,13 +73,13 @@ jobs:
           grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/composition-resource-receipt.log"
           grep 'COMPOSITION_RESOURCE_RECEIPT ' "$RUNNER_TEMP/composition-resource-receipt.log"
 
-      - name: Bounded buffer experiment
+      - name: Bounded exact-reader reproduction
         if: github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe
         run: |
           set -euo pipefail
-          cargo test -p ottto-service --lib --locked context_composition::tests::parity_resource::buffer_worst_case_receipt -- --exact --ignored --nocapture --test-threads=1 | tee "$RUNNER_TEMP/composition-buffer-receipt.log"
+          cargo test -p ottto-service --lib --locked context_composition::tests::parity_resource::unprofiled_worst_case_receipt -- --exact --ignored --nocapture --test-threads=1 | tee "$RUNNER_TEMP/composition-buffer-receipt.log"
           grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/composition-buffer-receipt.log"
-          grep 'COMPOSITION_BUFFER_RECEIPT ' "$RUNNER_TEMP/composition-buffer-receipt.log"
+          grep 'COMPOSITION_UNPROFILED_RECEIPT ' "$RUNNER_TEMP/composition-buffer-receipt.log"
 
       - name: Connector tests
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.composition_buffer_probe) }}
