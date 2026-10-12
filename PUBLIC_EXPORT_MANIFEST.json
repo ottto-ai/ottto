@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 553,
-  "content_sha256": "f17108997da79c0aeac7202fb05a52c5616b4ce25c5a562f80e952e978924581",
+  "content_sha256": "aaedb55b2d863990d24fe97c705c1e0cdef69b9e734c84b34ddd634418761c44",
   "files": [
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "f0396e4c71915f6f255c464f90c7377f20e9697ea6e1e0e3b4e000f35722c20b",
-      "size_bytes": 1470894
+      "sha256": "61edf5fe319a86be1ac68fd0d5987f1526caac51ff9358d44370dff3980ca547",
+      "size_bytes": 1472301
     },
     {
       "executable": false,
@@ -3874,7 +3874,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-12T10:20:18+00:00",
+  "generated_at": "2026-10-12T10:26:58+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 554,
   "public_roots": [
@@ -3913,5 +3913,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c8485f6c6b81bc5c1aa1864cb5d3dcce04ad5b2e"
+  "source_commit": "8890d3b202b7ac13731829b4e81f9d595aac360a"
 }

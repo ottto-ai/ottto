@@ -1857,7 +1857,12 @@ fn codex_source_health_snapshot(
     // A default login whose usage probe failed is still a working login; a
     // signed-out or otherwise failed one is not, and keeps its own status.
     let current_login_available = source_health_snapshot.status == AgentStatusState::Available
-        || (default_probe_failed && source_health_snapshot.status == AgentStatusState::Degraded);
+        || (default_probe_failed
+            && source_health_snapshot.status == AgentStatusState::Degraded
+            && source_health_snapshot
+                .account
+                .as_ref()
+                .is_some_and(|account| account.login_state == AgentLoginState::SignedIn));
     if custom_needs_attention {
         if current_login_available {
             source_health_snapshot.status = AgentStatusState::Degraded;
@@ -22936,6 +22941,39 @@ for line in sys.stdin:
         );
 
         assert_eq!(health.status, AgentStatusState::AuthRequired);
+        assert!(!codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
+    }
+
+    #[test]
+    fn an_unconfirmed_default_login_is_not_hidden_behind_a_retrying_read() {
+        let mut default = codex_failed_probe_candidate(
+            "/tmp/codex-health-test-unknown-default-login",
+            "default_user",
+            "default_workspace",
+        );
+        default.slot.slot_id = "default".to_string();
+        default.slot.ownership = CodexAccountSlotOwnershipV1::Default;
+        default.slot.registered_binding = None;
+        default.snapshot.status = AgentStatusState::Degraded;
+        default
+            .snapshot
+            .account
+            .as_mut()
+            .expect("account")
+            .login_state = AgentLoginState::Unknown;
+        default.status.state = CodexAccountSlotCollectionStateV1::ProviderUnavailable;
+        let failed = codex_failed_probe_candidate(
+            "/tmp/codex-health-test-unknown-default-managed",
+            "managed_user",
+            "managed_workspace",
+        );
+
+        let health = codex_source_health_snapshot(
+            &[default, failed],
+            "2026-08-23T00:00:00Z",
+            "2026-08-23T00:15:00Z",
+        );
+
         assert!(!codex_source_health_codes(&health).contains(&"codex_usage_read_retrying"));
     }
 
