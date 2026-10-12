@@ -8281,9 +8281,10 @@ impl SetupRunConnectionStore for FileConnectionStore {
 /// persists that run while the in-memory binding keeps the old id). Anything
 /// else means the binding was replaced or removed while the refresh was in
 /// flight; the minted token is dropped and nothing is written. If the
-/// connection write fails after the token write, the token is deleted so the
-/// stores never hold a new token beside an old connection; the next read
-/// refreshes again with the device credential.
+/// connection write fails after the token write, the new token is deleted
+/// (best effort) and the next read refreshes again with the device credential.
+/// The two stores are not written atomically: if that delete also fails, the
+/// new token stays beside the old connection until the next refresh.
 fn commit_refreshed_setup_run_binding_locked(
     expected: &LocalConnectionBinding,
     refreshed: &LocalConnectionBinding,
@@ -29103,8 +29104,7 @@ X-API-Key = "otel_redacted"
                 status
                     .local_health_events
                     .iter()
-                    .filter(|event| event.event_type.starts_with("SetupRunRead"))
-                    .next_back()
+                    .rfind(|event| event.event_type.starts_with("SetupRunRead"))
                     .map(|event| event.event_type.as_str()),
                 Some("SetupRunReadRejected"),
                 "a rejection that finishes after logout must not be recorded"

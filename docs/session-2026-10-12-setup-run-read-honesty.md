@@ -44,9 +44,11 @@ refresh's own run or the run the backend just rebound to; anything else means
 the binding was replaced or removed while the refresh was in flight, so the
 minted token is dropped and the read fails with the existing mismatch or
 missing-connection error instead of retrying. If the connection write fails
-after the token write, the new token is deleted so the stores never pair a new
-token with an old connection; the next read refreshes again with the device
-credential. The lock is process-wide; only the daemon writes these stores.
+after the token write, the new token is deleted (best effort) and the next read
+refreshes again with the device credential. The two stores are not written
+atomically: if that delete also fails, the new token stays beside the old
+connection until the next refresh. The lock is process-wide; only the daemon
+writes these stores.
 
 ## Compatibility
 
