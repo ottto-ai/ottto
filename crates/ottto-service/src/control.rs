@@ -2893,11 +2893,14 @@ fn agent_context(
     query: AgentContextQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    observe_setup_run_read(daemon, || {
-        let (api_base_url, connection, setup_run_token) =
-            setup_run_agent_read_context(daemon, authorization, "ottto context")?;
-        get_agent_context_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
-    })
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        "ottto context",
+        |api_base_url, connection, setup_run_token| {
+            get_agent_context_with_refresh(api_base_url, connection, setup_run_token, &query)
+        },
+    )
 }
 
 fn agent_costs(
@@ -2906,11 +2909,14 @@ fn agent_costs(
     query: AgentCostsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    observe_setup_run_read(daemon, || {
-        let (api_base_url, connection, setup_run_token) =
-            setup_run_agent_read_context(daemon, authorization, "ottto costs")?;
-        get_agent_costs_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
-    })
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        "ottto costs",
+        |api_base_url, connection, setup_run_token| {
+            get_agent_costs_with_refresh(api_base_url, connection, setup_run_token, &query)
+        },
+    )
 }
 
 fn agent_sessions(
@@ -2919,11 +2925,14 @@ fn agent_sessions(
     query: AgentSessionsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     reject_timezone_override(query.timezone.as_deref())?;
-    observe_setup_run_read(daemon, || {
-        let (api_base_url, connection, setup_run_token) =
-            setup_run_agent_read_context(daemon, authorization, "ottto sessions")?;
-        get_agent_sessions_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
-    })
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        "ottto sessions",
+        |api_base_url, connection, setup_run_token| {
+            get_agent_sessions_with_refresh(api_base_url, connection, setup_run_token, &query)
+        },
+    )
 }
 
 fn agent_recommendations(
@@ -2931,11 +2940,19 @@ fn agent_recommendations(
     authorization: &RequestAuthorization,
     query: AgentRecommendationsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    observe_setup_run_read(daemon, || {
-        let (api_base_url, connection, setup_run_token) =
-            setup_run_agent_read_context(daemon, authorization, "ottto recommendations")?;
-        get_agent_recommendations_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
-    })
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        "ottto recommendations",
+        |api_base_url, connection, setup_run_token| {
+            get_agent_recommendations_with_refresh(
+                api_base_url,
+                connection,
+                setup_run_token,
+                &query,
+            )
+        },
+    )
 }
 
 fn agent_provider_impact(
@@ -2943,11 +2960,19 @@ fn agent_provider_impact(
     authorization: &RequestAuthorization,
     query: AgentProviderImpactQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
-    observe_setup_run_read(daemon, || {
-        let (api_base_url, connection, setup_run_token) =
-            setup_run_agent_read_context(daemon, authorization, "ottto provider-impact")?;
-        get_agent_provider_impact_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
-    })
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        "ottto provider-impact",
+        |api_base_url, connection, setup_run_token| {
+            get_agent_provider_impact_with_refresh(
+                api_base_url,
+                connection,
+                setup_run_token,
+                &query,
+            )
+        },
+    )
 }
 
 const TIMEZONE_OVERRIDE_UNSUPPORTED: &str =
@@ -2971,16 +2996,22 @@ fn reject_timezone_override(timezone: Option<&str>) -> Result<(), LocalApiError>
 /// counts; network, timeout, and other backend failures say nothing about
 /// the run and leave the recorded state unchanged.
 /// Reads run concurrently with setup and sign-in, so the outcome is recorded
-/// only against the binding the read started with.
+/// against exactly the binding this read used, and dropped by the daemon if
+/// that binding has since been replaced.
 fn observe_setup_run_read<T>(
     daemon: &LocalDaemon,
-    read: impl FnOnce() -> Result<T, LocalApiError>,
+    authorization: &RequestAuthorization,
+    command: &str,
+    read: impl FnOnce(&str, &LocalConnectionBinding, &str) -> Result<T, LocalApiError>,
 ) -> Result<T, LocalApiError> {
-    let binding = daemon.connection_for_authorized_client().ok().flatten();
-    let result = read();
-    let Some(binding) = binding else {
-        return result;
-    };
+    let (api_base_url, binding) = setup_run_agent_read_binding(daemon, authorization, command)?;
+    let result = setup_run_token_for_connection(&api_base_url, &binding).and_then(|credentials| {
+        read(
+            &api_base_url,
+            &credentials.connection,
+            &credentials.setup_run_token,
+        )
+    });
     match &result {
         Ok(_) => {
             let _ = daemon.record_setup_run_read_accepted(&binding);
@@ -3035,24 +3066,30 @@ fn cloud_command(
     operation: CloudOperation,
 ) -> Result<serde_json::Value, LocalApiError> {
     validate_cloud_operation(&operation)?;
-    observe_setup_run_read(daemon, || {
-        let (api_base_url, connection, setup_run_token) =
-            setup_run_agent_read_context(daemon, authorization, "ottto cloud")?;
-        match cloud_request_with_base(&api_base_url, &connection, &setup_run_token, &operation) {
+    observe_setup_run_read(
+        daemon,
+        authorization,
+        "ottto cloud",
+        |api_base_url, connection, setup_run_token| match cloud_request_with_base(
+            api_base_url,
+            connection,
+            setup_run_token,
+            &operation,
+        ) {
             Ok(value) => Ok(value),
             Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
                 let refreshed =
-                    refresh_setup_run_token_via_device_secret(&api_base_url, &connection)?;
+                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 cloud_request_with_base(
-                    &api_base_url,
+                    api_base_url,
                     &refreshed.connection,
                     &refreshed.setup_run_token,
                     &operation,
                 )
             }
             Err(error) => Err(error),
-        }
-    })
+        },
+    )
 }
 
 fn validate_cloud_operation(operation: &CloudOperation) -> Result<(), LocalApiError> {
@@ -3255,11 +3292,11 @@ fn cloud_request_with_base(
     }
 }
 
-fn setup_run_agent_read_context(
+fn setup_run_agent_read_binding(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     command: &str,
-) -> Result<(String, LocalConnectionBinding, String), LocalApiError> {
+) -> Result<(String, LocalConnectionBinding), LocalApiError> {
     let status = status_for(daemon, authorization)?;
     if status.account.state != LocalAccountState::Connected {
         return Err(LocalApiError::InvalidRequest(format!(
@@ -3270,12 +3307,7 @@ fn setup_run_agent_read_context(
         .connection_for_authorized_client()?
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
     let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))?;
-    let credentials = setup_run_token_for_connection(&api_base_url, &connection)?;
-    Ok((
-        api_base_url,
-        credentials.connection,
-        credentials.setup_run_token,
-    ))
+    Ok((api_base_url, connection))
 }
 
 fn require_authorized_local_client(
