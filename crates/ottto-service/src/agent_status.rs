@@ -1602,9 +1602,10 @@ fn append_configured_codex_unavailable_snapshots(
             continue;
         }
         // These are previously accepted registry bindings, not live credential
-        // proof. Never use this fallback for live meters, transcript
-        // attribution, successful checks, or labels from the failed/different
-        // live identity; only this binding's own last reading, marked stale.
+        // proof. Never use this fallback for meters, transcript attribution,
+        // successful checks, or labels from the failed/different live
+        // identity. The binding's last reading is local display only
+        // (`codex_last_known_slot_reading`); the server owns carry-forward.
         let Some((account, workspace)) = candidate
             .slot
             .registered_binding
@@ -1651,15 +1652,6 @@ fn append_configured_codex_unavailable_snapshots(
                 "This previously accepted Codex account and workspace remains configured; its current identity and limits could not be verified.",
             ).with_quota_binding(Some(account.clone()), Some(workspace.clone())),
         );
-        if let Some((quota_windows, credit_balances)) = codex_last_known_meters_for_failed_probe(
-            candidate,
-            account,
-            workspace,
-            current_unix_seconds(),
-        ) {
-            snapshot.quota_windows = quota_windows;
-            snapshot.credit_balances = credit_balances;
-        }
         snapshots.push(snapshot);
     }
 }
@@ -1731,16 +1723,17 @@ fn codex_home_kept_binding(codex_home: &Path, home_trust: CodexHomeTrust) -> Opt
     let credentials = read_codex_auth_credentials_at(codex_home, home_trust)
         .ok()
         .flatten()?;
-    let claimed = validated_codex_identity(&credentials, None, None, true)?;
-    (codex_credit_binding(&claimed) == last).then_some(last)
+    let claimed = codex_credential_claimed_binding(&credentials)?;
+    (claimed == last).then_some(last)
 }
 
 /// A default home whose usage probe failed keeps the identity hashes of its
 /// last validated reading (when its credential still names that account), so
 /// the degraded snapshot stays keyed to the same account, and carries that
-/// account's last reading marked stale ([`codex_last_known`]). The slot's
-/// binding stays empty: kept hashes never become transcript or live-meter
-/// authority.
+/// account's last reading marked stale ([`codex_last_known`]) for local
+/// display; the upload copy drops the reading
+/// (`AgentStatusSnapshot::redacted_for_backend`). The slot's binding stays
+/// empty: kept hashes never become transcript or live-meter authority.
 fn keep_failed_default_codex_binding(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
@@ -1784,28 +1777,31 @@ fn remember_codex_last_known_reading(
     );
 }
 
-/// The last reading of a registered binding whose probe failed, marked
-/// `Stale` with its original read clocks ([`codex_last_known`]). Only when
-/// the probe itself failed (`codex_usage_probe_failed`; a signed-in home then
-/// has no identity hashes and is `identity_unknown`, a signed-out one
-/// `needs_login` and carries nothing) and the home was last validated as this
-/// same binding, so a home that switched accounts never carries another
-/// account's meters.
-fn codex_last_known_meters_for_failed_probe(
-    candidate: &CodexSlotCandidate,
-    account: &str,
-    workspace: &str,
+/// Local display only: the last reading of a registered slot whose probe
+/// failed, marked `Stale` with its original read clocks
+/// ([`codex_last_known`]), as the slot's quota snapshot. Only while the
+/// home was last validated as the registered binding and its local
+/// credential still names that account ([`codex_home_kept_binding`]), so a
+/// sign-out or a re-login to another account carries nothing. Never part of
+/// an uploaded snapshot: the server owns carry-forward.
+fn codex_last_known_slot_reading(
+    slot: &CodexHomeSlot,
+    captured_at: &str,
     now: u64,
-) -> Option<(Vec<AgentQuotaWindow>, Vec<AgentCreditBalance>)> {
-    if !codex_probe_failed_only(&candidate.status, &candidate.snapshot) {
-        return None;
-    }
+) -> Option<CodexAccountSlotQuotaSnapshotV1> {
+    let (account, workspace) = slot.registered_binding.as_ref()?;
     let binding = codex_credit_grants::binding_key(account, workspace);
-    if codex_credit_grants::home_binding(&candidate.slot.home).as_deref() != Some(binding.as_str())
+    if codex_home_kept_binding(&slot.home, CodexHomeTrust::Managed).as_deref()
+        != Some(binding.as_str())
     {
         return None;
     }
-    codex_last_known::stale_reading(&binding, now)
+    let (quota_windows, credit_balances) = codex_last_known::stale_reading(&binding, now)?;
+    Some(CodexAccountSlotQuotaSnapshotV1 {
+        captured_at: captured_at.to_string(),
+        quota_windows,
+        credit_balances,
+    })
 }
 
 fn codex_source_health_snapshot(
@@ -2028,11 +2024,16 @@ fn collect_codex_home_candidate(
     let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut status);
     let now = current_unix_seconds();
     remember_codex_last_known_reading(binding.as_ref(), &status, &snapshot, now);
-    if slot.ownership == CodexAccountSlotOwnershipV1::Default
-        && binding.is_none()
-        && codex_probe_failed_only(&status, &snapshot)
-    {
-        keep_failed_default_codex_binding(&slot.home, home_trust, &mut snapshot, now);
+    if binding.is_none() && codex_probe_failed_only(&status, &snapshot) {
+        match slot.ownership {
+            CodexAccountSlotOwnershipV1::Default => {
+                keep_failed_default_codex_binding(&slot.home, home_trust, &mut snapshot, now);
+            }
+            CodexAccountSlotOwnershipV1::Managed => {
+                status.quota_snapshot =
+                    codex_last_known_slot_reading(&slot, &snapshot.captured_at, now);
+            }
+        }
     }
     let quality = codex_snapshot_quality(&snapshot, &status);
     let after = std::fs::metadata(&auth_path)
@@ -13840,20 +13841,11 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
     })
 }
 
-fn validated_codex_identity(
-    credentials: &CodexAuthCredentials,
-    provider_account: Option<&Value>,
-    rate_limits: Option<&Value>,
-    provider_authenticated_active_credential: bool,
-) -> Option<CodexStrongIdentity> {
-    // Decoding a JWT never authenticates it. This flag is supplied only after
-    // the provider has successfully used the active access token for the same
-    // quota response. App-server does that after account/read refreshes the
-    // credential; the default-only legacy fallback does it when the provider
-    // accepts the access token and workspace header for its quota response.
-    if !provider_authenticated_active_credential {
-        return None;
-    }
+/// The user and workspace ids a local Codex credential claims: the access
+/// token's, agreeing with the stored account id and, when present, the id
+/// token. Decoding a JWT never authenticates it; this names what the
+/// credential says, nothing more.
+fn codex_credential_claimed_ids(credentials: &CodexAuthCredentials) -> Option<(String, String)> {
     let claims = structurally_valid_live_codex_jwt_claims(credentials.access_token.as_deref()?)?;
     let auth_claim = claims.get("https://api.openai.com/auth");
     let account_id = auth_claim
@@ -13878,6 +13870,37 @@ fn validated_codex_identity(
             return None;
         }
     }
+    Some((account_id, raw_workspace_id))
+}
+
+/// The binding key ([`codex_credit_grants::binding_key`]) a local Codex
+/// credential claims. Only a key to compare with an earlier provider-validated
+/// binding; it is never an identity and grants no authority.
+fn codex_credential_claimed_binding(credentials: &CodexAuthCredentials) -> Option<String> {
+    let (account_id, raw_workspace_id) = codex_credential_claimed_ids(credentials)?;
+    Some(codex_credit_grants::binding_key(
+        &billing_identity_hash("openai", "account", &account_id)?,
+        &billing_identity_hash("openai", "workspace", &raw_workspace_id)?,
+    ))
+}
+
+fn validated_codex_identity(
+    credentials: &CodexAuthCredentials,
+    provider_account: Option<&Value>,
+    rate_limits: Option<&Value>,
+    provider_authenticated_active_credential: bool,
+) -> Option<CodexStrongIdentity> {
+    // Decoding a JWT never authenticates it. This flag is supplied only after
+    // the provider has successfully used the active access token for the same
+    // quota response. App-server does that after account/read refreshes the
+    // credential; the default-only legacy fallback does it when the provider
+    // accepts the access token and workspace header for its quota response.
+    if !provider_authenticated_active_credential {
+        return None;
+    }
+    let (account_id, raw_workspace_id) = codex_credential_claimed_ids(credentials)?;
+    let claims = structurally_valid_live_codex_jwt_claims(credentials.access_token.as_deref()?)?;
+    let auth_claim = claims.get("https://api.openai.com/auth");
     if let Some(provider_account) = provider_account {
         let active = provider_account.get("account")?;
         if active.get("type").and_then(Value::as_str) != Some("chatgpt") {
@@ -20972,34 +20995,42 @@ for line in sys.stdin:
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Replace the synthetic home's credential with another account's.
     #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn codex_collector_failed_probe_placeholder_carries_the_last_reading_stale() {
+    fn write_other_synthetic_codex_account(home: &Path) {
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+        std::fs::write(
+            home.join("auth.json"),
+            serde_json::json!({
+                "tokens": {
+                    "access_token": synthetic_codex_access_jwt_with_profile_email(
+                        "other-user",
+                        "other-workspace",
+                        "other-account",
+                        "pro",
+                        expires_at,
+                    ),
+                    "id_token": synthetic_codex_jwt(
+                        "other-user",
+                        "other-workspace",
+                        "other-account",
+                        "pro",
+                        expires_at,
+                    )
+                },
+                "account_id": "other-workspace"
+            })
+            .to_string(),
+        )
+        .expect("other account");
+    }
+
+    /// Make the synthetic app-server end before answering `initialize`; the
+    /// login and model commands still answer, so the home stays signed in.
+    #[cfg(unix)]
+    fn fail_synthetic_codex_app_server(root: &Path) {
         use std::os::unix::fs::PermissionsExt;
 
-        let (root, home) = synthetic_codex_collector_home("last-known", 0o600);
-        let _commands =
-            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
-        let slot = |registered_binding| CodexHomeSlot {
-            slot_id: "default".to_string(),
-            ownership: CodexAccountSlotOwnershipV1::Default,
-            home: home.clone(),
-            registered_binding,
-        };
-
-        // A successful reading through the collector.
-        let fresh = collect_codex_home_candidate(
-            slot(None),
-            "2026-08-26T00:00:00Z",
-            "2026-08-26T00:15:00Z",
-        );
-        assert_eq!(fresh.status.state, CodexAccountSlotCollectionStateV1::Fresh);
-        let (account, workspace) = fresh.binding.clone().expect("validated binding");
-        assert!(!fresh.snapshot.quota_windows.is_empty());
-
-        // The app-server now ends before answering `initialize`; the login and
-        // model commands still answer, so the home stays signed in.
         let executable = root.join("codex");
         let script = std::fs::read_to_string(&executable).expect("fake Codex");
         std::fs::write(
@@ -21012,44 +21043,111 @@ for line in sys.stdin:
         .expect("failing app-server");
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
             .expect("fake Codex mode");
-        let mut failed = collect_codex_home_candidate(
-            slot(Some((account.clone(), workspace.clone()))),
-            "2026-08-26T00:05:00Z",
-            "2026-08-26T00:20:00Z",
-        );
+    }
+
+    fn has_stale_meters(snapshot: &AgentStatusSnapshot) -> bool {
+        snapshot
+            .quota_windows
+            .iter()
+            .any(|window| window.freshness == AgentQuotaWindowFreshness::Stale)
+            || snapshot
+                .credit_balances
+                .iter()
+                .any(|balance| balance.freshness == AgentQuotaWindowFreshness::Stale)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_managed_failed_probe_keeps_the_last_reading_local_and_uploads_none() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, home) = synthetic_codex_collector_home("last-known", 0o600);
+        // A managed home is private to its owner.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+            .expect("managed home mode");
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        let slot = |registered_binding| CodexHomeSlot {
+            slot_id: "codex_slot_last_known".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Managed,
+            home: home.clone(),
+            registered_binding,
+        };
+        let collect = |registered_binding| {
+            collect_codex_home_candidate(
+                slot(registered_binding),
+                "2026-08-26T00:05:00Z",
+                "2026-08-26T00:20:00Z",
+            )
+        };
+
+        // A successful reading through the collector.
+        let fresh = collect(None);
+        assert_eq!(fresh.status.state, CodexAccountSlotCollectionStateV1::Fresh);
+        let registered = fresh.binding.clone().expect("validated binding");
+        assert!(!fresh.snapshot.quota_windows.is_empty());
+
+        fail_synthetic_codex_app_server(&root);
+        let failed = collect(Some(registered.clone()));
         assert!(failed.binding.is_none());
         assert_eq!(
             failed.status.state,
             CodexAccountSlotCollectionStateV1::IdentityUnknown
         );
-        assert!(failed
-            .snapshot
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "codex_usage_probe_failed"));
 
-        // As a registered managed slot, its placeholder carries the reading.
-        failed.slot.ownership = CodexAccountSlotOwnershipV1::Managed;
-        let placeholder = configured_unavailable_snapshot(failed);
+        // Local status: the slot shows its last reading, marked stale, with
+        // the original read clocks.
         let mut expected_windows = fresh.snapshot.quota_windows.clone();
         let mut expected_balances = fresh.snapshot.credit_balances.clone();
         mark_quota_meters_stale(&mut expected_windows, &mut expected_balances);
-        assert_eq!(placeholder.quota_windows, expected_windows);
-        assert_eq!(placeholder.credit_balances, expected_balances);
-        assert!(placeholder
+        let local = failed.status.quota_snapshot.clone().expect("local reading");
+        assert_eq!(local.quota_windows, expected_windows);
+        assert_eq!(local.credit_balances, expected_balances);
+        assert!(local
             .quota_windows
             .iter()
             .all(|window| window.observed_at.is_some()));
-        let placeholder_account = placeholder.account.as_ref().expect("account");
+
+        // Past the cap nothing is shown.
+        assert!(codex_last_known_slot_reading(
+            &slot(Some(registered.clone())),
+            "2026-08-26T00:05:00Z",
+            current_unix_seconds() + codex_last_known::LAST_KNOWN_MAX_AGE_SECS + 1,
+        )
+        .is_none());
+
+        // Upload: the failure shape only, never the last reading.
+        let placeholder = configured_unavailable_snapshot(failed);
+        assert!(placeholder.quota_windows.is_empty());
+        assert!(placeholder.credit_balances.is_empty());
+        let uploaded = placeholder.redacted_for_backend();
+        assert!(uploaded.quota_windows.is_empty());
+        assert!(uploaded.credit_balances.is_empty());
         assert_eq!(
-            placeholder_account.account_identifier_hash.as_deref(),
-            Some(account.as_str())
+            uploaded
+                .account
+                .as_ref()
+                .and_then(|account| account.account_identifier_hash.as_deref()),
+            Some(registered.0.as_str())
         );
 
-        // The failed session charged the shared synthetic binding a detail
+        // The home's credential now names another account, never validated
+        // here: the registered account's reading is not shown.
+        write_other_synthetic_codex_account(&home);
+        let switched = collect(Some(registered.clone()));
+        assert!(switched.status.quota_snapshot.is_none());
+
+        // Signed out (no credential): nothing either.
+        std::fs::remove_file(home.join("auth.json")).expect("sign out");
+        let signed_out = collect(Some(registered.clone()));
+        assert!(signed_out.status.quota_snapshot.is_none());
+
+        // The failed sessions charged the shared synthetic binding a detail
         // back-off; other collector tests expect none.
         codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
-            &account, &workspace,
+            &registered.0,
+            &registered.1,
         ));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -21856,40 +21954,6 @@ for line in sys.stdin:
         assert!(snapshot.diagnostics[0].observed_at.is_none());
     }
 
-    fn codex_fresh_reading_candidate(
-        home: &str,
-        account_hash: &str,
-        workspace_hash: &str,
-    ) -> CodexSlotCandidate {
-        let mut candidate = codex_candidate_for_test(
-            "codex_slot_last_known",
-            CodexAccountSlotOwnershipV1::Managed,
-            account_hash,
-            workspace_hash,
-            1,
-        );
-        candidate.slot.home = PathBuf::from(home);
-        candidate.snapshot.quota_windows = vec![AgentQuotaWindow {
-            name: "primary".to_string(),
-            status: AgentQuotaWindowStatus::Ok,
-            freshness: AgentQuotaWindowFreshness::Fresh,
-            observed_at: Some("2026-09-01T09:55:00Z".to_string()),
-            window_seconds: Some(18_000),
-            used_percent: Some(40),
-            left_percent: Some(60),
-            ..Default::default()
-        }];
-        candidate.snapshot.credit_balances = vec![AgentCreditBalance {
-            name: "reset_bank".to_string(),
-            freshness: AgentQuotaWindowFreshness::Fresh,
-            observed_at: Some("2026-09-01T09:55:00Z".to_string()),
-            grants_observed_at: Some("2026-09-01T09:00:00Z".to_string()),
-            remaining: Some(2),
-            ..Default::default()
-        }];
-        candidate
-    }
-
     /// The same slot after a whole-session probe failure (here the
     /// `initialize` deadline): still signed in, but no identity hashes, no
     /// live binding and no reading. The state is the production
@@ -21933,20 +21997,6 @@ for line in sys.stdin:
         candidate
     }
 
-    fn remember_fresh_codex_reading(candidate: &CodexSlotCandidate, now: u64) {
-        let (account, workspace) = candidate.binding.clone().expect("fresh binding");
-        codex_credit_grants::remember_home_binding(
-            &candidate.slot.home,
-            &codex_credit_grants::binding_key(&account, &workspace),
-        );
-        remember_codex_last_known_reading(
-            candidate.binding.as_ref(),
-            &candidate.status,
-            &candidate.snapshot,
-            now,
-        );
-    }
-
     fn configured_unavailable_snapshot(candidate: CodexSlotCandidate) -> AgentStatusSnapshot {
         let mut snapshots = Vec::new();
         append_configured_codex_unavailable_snapshots(
@@ -21960,10 +22010,27 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn a_failed_codex_probe_sends_the_last_reading_stale_with_its_read_clocks() {
-        let home = "/tmp/codex-last-known-test-success-then-fail";
-        let fresh = codex_fresh_reading_candidate(home, "lk-account-1", "lk-workspace-1");
-        remember_fresh_codex_reading(&fresh, current_unix_seconds());
+    fn a_failed_codex_probe_placeholder_is_uploaded_without_meters() {
+        // The binding has a recent reading and the home was validated as it.
+        let home = "/tmp/codex-last-known-test-placeholder";
+        let binding = codex_credit_grants::binding_key("lk-account-1", "lk-workspace-1");
+        codex_credit_grants::remember_home_binding(Path::new(home), &binding);
+        codex_last_known::record(
+            &binding,
+            &[AgentQuotaWindow {
+                name: "primary".to_string(),
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                used_percent: Some(40),
+                ..Default::default()
+            }],
+            &[AgentCreditBalance {
+                name: "reset_bank".to_string(),
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                remaining: Some(2),
+                ..Default::default()
+            }],
+            current_unix_seconds(),
+        );
 
         let placeholder = configured_unavailable_snapshot(codex_failed_probe_candidate(
             home,
@@ -21971,26 +22038,10 @@ for line in sys.stdin:
             "lk-workspace-1",
         ));
 
-        let mut expected_windows = fresh.snapshot.quota_windows.clone();
-        let mut expected_balances = fresh.snapshot.credit_balances.clone();
-        for window in &mut expected_windows {
-            window.freshness = AgentQuotaWindowFreshness::Stale;
-        }
-        for balance in &mut expected_balances {
-            balance.freshness = AgentQuotaWindowFreshness::Stale;
-        }
-        // Values and read clocks are the original reading's; only freshness
-        // changes.
-        assert_eq!(placeholder.quota_windows, expected_windows);
-        assert_eq!(placeholder.credit_balances, expected_balances);
-        // Identity, state and diagnostics are the placeholder's as before.
-        let account = placeholder.account.as_ref().expect("configured account");
-        assert_eq!(
-            account.account_identifier_hash.as_deref(),
-            Some("lk-account-1")
-        );
-        assert_eq!(account.login_state, AgentLoginState::Unknown);
-        assert_eq!(placeholder.status, AgentStatusState::Degraded);
+        // The upload row is the failure shape; the server carries forward its
+        // own last good reading.
+        assert!(placeholder.quota_windows.is_empty());
+        assert!(placeholder.credit_balances.is_empty());
         assert_eq!(
             placeholder
                 .diagnostics
@@ -22002,93 +22053,113 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn a_failed_codex_probe_after_the_age_cap_is_the_placeholder_as_before() {
-        let home = "/tmp/codex-last-known-test-past-cap";
-        let fresh = codex_fresh_reading_candidate(home, "lk-account-2", "lk-workspace-2");
-        let now = current_unix_seconds();
-        remember_fresh_codex_reading(&fresh, now - codex_last_known::LAST_KNOWN_MAX_AGE_SECS - 1);
+    fn a_slot_without_a_readable_matching_credential_shows_no_last_reading() {
+        // The binding has a recent reading and the home was validated as it,
+        // but the home holds no credential now (a sign-out).
+        let home = "/tmp/codex-last-known-test-no-credential";
+        let binding = codex_credit_grants::binding_key("lk-account-2", "lk-workspace-2");
+        codex_credit_grants::remember_home_binding(Path::new(home), &binding);
+        codex_last_known::record(
+            &binding,
+            &[AgentQuotaWindow::default()],
+            &[],
+            current_unix_seconds(),
+        );
+        assert!(codex_last_known::stale_reading(&binding, current_unix_seconds()).is_some());
 
-        let placeholder = configured_unavailable_snapshot(codex_failed_probe_candidate(
-            home,
-            "lk-account-2",
-            "lk-workspace-2",
-        ));
-        assert!(placeholder.quota_windows.is_empty());
-        assert!(placeholder.credit_balances.is_empty());
-
-        // At the cap it is still sent.
-        let failed = codex_failed_probe_candidate(home, "lk-account-2", "lk-workspace-2");
-        let at_cap = now - 1;
-        assert!(codex_last_known_meters_for_failed_probe(
-            &failed,
-            "lk-account-2",
-            "lk-workspace-2",
-            at_cap
+        let slot = CodexHomeSlot {
+            slot_id: "codex_slot_last_known".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Managed,
+            home: PathBuf::from(home),
+            registered_binding: Some(("lk-account-2".to_string(), "lk-workspace-2".to_string())),
+        };
+        assert!(codex_last_known_slot_reading(
+            &slot,
+            "2026-09-01T10:00:00Z",
+            current_unix_seconds()
         )
-        .is_some());
+        .is_none());
     }
 
     #[test]
-    fn a_failed_codex_probe_never_carries_another_accounts_reading() {
-        // The home last read account B; its registered account A has no
-        // reading of its own.
-        let home = "/tmp/codex-last-known-test-account-change";
-        let other = codex_fresh_reading_candidate(home, "lk-account-b", "lk-workspace-3");
-        remember_fresh_codex_reading(&other, current_unix_seconds());
-        let placeholder = configured_unavailable_snapshot(codex_failed_probe_candidate(
-            home,
-            "lk-account-a",
-            "lk-workspace-3",
+    fn a_failed_codex_upload_never_carries_stale_meters_or_local_plan_words() {
+        let mut snapshot = base_snapshot(
+            SourceKind::Codex,
+            AgentStatusState::Degraded,
+            AgentStatusCollectionMethod::CliText,
+            "2026-09-01T10:00:00Z".to_string(),
+            "2026-09-01T10:15:00Z".to_string(),
+        );
+        let mut account = unsupported_account("openai");
+        account.login_state = AgentLoginState::SignedIn;
+        account.account_identifier_hash = Some("kept-account".to_string());
+        account.organization_identifier_hash = Some("kept-workspace".to_string());
+        account.plan_type = Some("pro".to_string());
+        account.subscription_product = Some("chatgpt_pro".to_string());
+        snapshot.account = Some(account);
+        snapshot.quota_windows = vec![AgentQuotaWindow {
+            name: "primary".to_string(),
+            freshness: AgentQuotaWindowFreshness::Stale,
+            used_percent: Some(40),
+            ..Default::default()
+        }];
+        snapshot.credit_balances = vec![AgentCreditBalance {
+            name: "reset_bank".to_string(),
+            freshness: AgentQuotaWindowFreshness::Stale,
+            remaining: Some(2),
+            ..Default::default()
+        }];
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            "codex_usage_probe_failed",
+            AgentDiagnosticSeverity::Warning,
+            "Codex app-server initialize read timed out.",
         ));
-        assert!(placeholder.quota_windows.is_empty());
-        assert!(placeholder.credit_balances.is_empty());
+        append_current_plan_observation(&mut snapshot);
+        assert!(has_stale_meters(&snapshot), "the local copy keeps them");
 
-        // A read earlier, then the home switched to B: A's reading stays
-        // with A and is not sent for this home.
-        let home = "/tmp/codex-last-known-test-switched-home";
-        let first = codex_fresh_reading_candidate(home, "lk-account-c", "lk-workspace-4");
-        remember_fresh_codex_reading(&first, current_unix_seconds());
-        let switched = codex_fresh_reading_candidate(home, "lk-account-d", "lk-workspace-4");
-        remember_fresh_codex_reading(&switched, current_unix_seconds());
-        let placeholder = configured_unavailable_snapshot(codex_failed_probe_candidate(
-            home,
-            "lk-account-c",
-            "lk-workspace-4",
-        ));
-        assert!(placeholder.quota_windows.is_empty());
-        assert!(placeholder.credit_balances.is_empty());
+        let uploaded = snapshot.clone().redacted_for_backend();
+        assert!(uploaded.quota_windows.is_empty());
+        assert!(uploaded.credit_balances.is_empty());
+        assert!(uploaded.plan_observations.is_empty());
+        let account = uploaded.account.as_ref().expect("account");
+        assert!(account.plan_type.is_none());
+        assert!(account.subscription_product.is_none());
+        assert_eq!(
+            account.account_identifier_hash.as_deref(),
+            Some("kept-account")
+        );
+        assert_eq!(
+            account.organization_identifier_hash.as_deref(),
+            Some("kept-workspace")
+        );
+        assert_eq!(uploaded.status, AgentStatusState::Degraded);
+        assert!(uploaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_usage_probe_failed"));
+
+        // A successful Codex reading is uploaded as read.
+        snapshot.diagnostics.clear();
+        mark_all_fresh(&mut snapshot);
+        let uploaded = snapshot.redacted_for_backend();
+        assert_eq!(uploaded.quota_windows.len(), 1);
+        assert_eq!(uploaded.credit_balances.len(), 1);
+        assert_eq!(
+            uploaded
+                .account
+                .as_ref()
+                .and_then(|account| account.plan_type.as_deref()),
+            Some("pro")
+        );
     }
 
-    #[test]
-    fn only_a_failed_probe_carries_the_last_reading() {
-        let home = "/tmp/codex-last-known-test-not-a-probe-failure";
-        let fresh = codex_fresh_reading_candidate(home, "lk-account-5", "lk-workspace-5");
-        remember_fresh_codex_reading(&fresh, current_unix_seconds());
-
-        // Signed out: the placeholder stays meterless.
-        let mut signed_out = codex_failed_probe_candidate(home, "lk-account-5", "lk-workspace-5");
-        signed_out.status.state = CodexAccountSlotCollectionStateV1::NeedsLogin;
-        let placeholder = configured_unavailable_snapshot(signed_out);
-        assert!(placeholder.quota_windows.is_empty());
-
-        // No failed probe (an answer without usable meters or identity):
-        // nothing is carried either.
-        let mut answered = codex_failed_probe_candidate(home, "lk-account-5", "lk-workspace-5");
-        answered.snapshot.diagnostics.clear();
-        let placeholder = configured_unavailable_snapshot(answered);
-        assert!(placeholder.quota_windows.is_empty());
-
-        // A reading that was not fresh is never recorded.
-        let home = "/tmp/codex-last-known-test-not-fresh";
-        let mut not_fresh = codex_fresh_reading_candidate(home, "lk-account-6", "lk-workspace-6");
-        not_fresh.status.state = CodexAccountSlotCollectionStateV1::ProviderUnavailable;
-        remember_fresh_codex_reading(&not_fresh, current_unix_seconds());
-        let placeholder = configured_unavailable_snapshot(codex_failed_probe_candidate(
-            home,
-            "lk-account-6",
-            "lk-workspace-6",
-        ));
-        assert!(placeholder.quota_windows.is_empty());
+    fn mark_all_fresh(snapshot: &mut AgentStatusSnapshot) {
+        for window in &mut snapshot.quota_windows {
+            window.freshness = AgentQuotaWindowFreshness::Fresh;
+        }
+        for balance in &mut snapshot.credit_balances {
+            balance.freshness = AgentQuotaWindowFreshness::Fresh;
+        }
     }
 
     #[test]
@@ -23053,8 +23124,6 @@ for line in sys.stdin:
     #[test]
     #[serial]
     fn codex_default_probe_failure_is_degraded_and_keeps_its_validated_hashes() {
-        use std::os::unix::fs::PermissionsExt;
-
         let (root, home) = synthetic_codex_collector_home("default-failure", 0o600);
         let _commands =
             EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
@@ -23075,20 +23144,24 @@ for line in sys.stdin:
         assert_eq!(fresh.status.state, CodexAccountSlotCollectionStateV1::Fresh);
         let (account, workspace) = fresh.binding.clone().expect("validated binding");
 
-        // The app-server ends before answering `initialize`; the login
-        // commands still answer.
-        let executable = root.join("codex");
-        let script = std::fs::read_to_string(&executable).expect("fake Codex");
-        std::fs::write(
-            &executable,
-            script.replace(
-                "for line in sys.stdin:",
-                "sys.exit(3)\nfor line in sys.stdin:",
-            ),
-        )
-        .expect("failing app-server");
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
-            .expect("fake Codex mode");
+        // The local credential claims exactly the validated binding; the
+        // claim is a key only and needs no provider-authentication flag.
+        let credentials = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
+            .expect("readable credential")
+            .expect("credential");
+        assert_eq!(
+            codex_credential_claimed_binding(&credentials),
+            Some(codex_credit_grants::binding_key(&account, &workspace))
+        );
+        assert!(
+            validated_codex_identity(&credentials, None, None, false).is_none(),
+            "an identity still needs provider authentication"
+        );
+        let mut inconsistent = credentials;
+        inconsistent.account_id = Some("another-workspace".to_string());
+        assert!(codex_credential_claimed_binding(&inconsistent).is_none());
+
+        fail_synthetic_codex_app_server(&root);
 
         let failed = collect();
         // Degraded with the stable failure code, never available.
@@ -23116,33 +23189,37 @@ for line in sys.stdin:
         assert_eq!(failed.snapshot.quota_windows, expected_windows);
         assert_eq!(failed.snapshot.credit_balances, expected_balances);
 
+        // Upload: degraded with the stable code and the kept hashes, but no
+        // last reading and no plan words from the local credential.
+        assert!(failed
+            .snapshot
+            .account
+            .as_ref()
+            .is_some_and(|account| account.plan_type.is_some()));
+        let uploaded = failed.snapshot.clone().redacted_for_backend();
+        assert_eq!(uploaded.status, AgentStatusState::Degraded);
+        assert!(uploaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_usage_probe_failed"));
+        assert!(!has_stale_meters(&uploaded));
+        assert!(uploaded.credit_balances.is_empty());
+        assert!(uploaded.plan_observations.is_empty());
+        let uploaded_account = uploaded.account.as_ref().expect("account");
+        assert!(uploaded_account.plan_type.is_none());
+        assert!(uploaded_account.subscription_product.is_none());
+        assert_eq!(
+            uploaded_account.account_identifier_hash.as_deref(),
+            Some(account.as_str())
+        );
+        assert_eq!(
+            uploaded_account.organization_identifier_hash.as_deref(),
+            Some(workspace.as_str())
+        );
+
         // The home now holds another account's credential: no hashes kept and
         // nothing carried.
-        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
-        std::fs::write(
-            home.join("auth.json"),
-            serde_json::json!({
-                "tokens": {
-                    "access_token": synthetic_codex_access_jwt_with_profile_email(
-                        "other-user",
-                        "other-workspace",
-                        "other-account",
-                        "pro",
-                        expires_at,
-                    ),
-                    "id_token": synthetic_codex_jwt(
-                        "other-user",
-                        "other-workspace",
-                        "other-account",
-                        "pro",
-                        expires_at,
-                    )
-                },
-                "account_id": "other-workspace"
-            })
-            .to_string(),
-        )
-        .expect("other account");
+        write_other_synthetic_codex_account(&home);
         let switched = collect();
         assert_eq!(switched.snapshot.status, AgentStatusState::Degraded);
         let switched_account = switched.snapshot.account.as_ref().expect("account");

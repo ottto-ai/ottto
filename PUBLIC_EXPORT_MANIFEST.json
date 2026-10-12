@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 553,
-  "content_sha256": "aaedb55b2d863990d24fe97c705c1e0cdef69b9e734c84b34ddd634418761c44",
+  "content_sha256": "5ad58040671a4a90dd296fb69e51fe922be06c7656f261c130ec032bdb153f97",
   "files": [
     {
       "executable": false,
@@ -608,8 +608,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "24a0d06a0109cb08b7437685a057b40fe8a70891706587e9e7b180ec9b8fada1",
-      "size_bytes": 328190
+      "sha256": "05a433a67623866342b133fa85decc7c5e3bdef3e0fb38573c6c3077b5fa158d",
+      "size_bytes": 329479
     },
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "61edf5fe319a86be1ac68fd0d5987f1526caac51ff9358d44370dff3980ca547",
-      "size_bytes": 1472301
+      "sha256": "e8f26e75ad31c57467fc37fb5f5532ce28718f6b9d247f15cdf380690378a3b5",
+      "size_bytes": 1475509
     },
     {
       "executable": false,
@@ -2561,8 +2561,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-12-codex-last-known-meters.md",
-      "sha256": "91d6690c3c38abaeefe437952ad07b03f47d2ca02b5f7c73a89a75e3a42b1e34",
-      "size_bytes": 6450
+      "sha256": "35fb24b91c6f3049b327e32cdc3699614d3e2f5f40adf916e5c2cd62e6cc9828",
+      "size_bytes": 7832
     },
     {
       "executable": false,
@@ -3874,7 +3874,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-12T10:26:58+00:00",
+  "generated_at": "2026-10-12T10:57:39+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 554,
   "public_roots": [
@@ -3913,5 +3913,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "8890d3b202b7ac13731829b4e81f9d595aac360a"
+  "source_commit": "6a6a00266edfce206507d807518ce08c23fa8ba6"
 }
