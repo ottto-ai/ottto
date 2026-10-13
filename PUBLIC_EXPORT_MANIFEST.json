@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 558,
-  "content_sha256": "a4c9209989a35a109b64c0612319bd94ea2976fdc0af0069965899714f8ea58c",
+  "content_sha256": "de5d3e47656af45e1bd8a2448fbd2c4c33a6bbaa7afbf5d687aed286ed312328",
   "files": [
     {
       "executable": false,
@@ -1175,8 +1175,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_sidecar_reduction_tests.rs",
-      "sha256": "46f63990e303ad11289206f71478a476aef3554e624bdfe0f5a18fe3aea8dde4",
-      "size_bytes": 18415
+      "sha256": "c4697bf510d81c342a6a6e85330ce41d1afa1832e353aa0a60aa0a7bfc0c5d54",
+      "size_bytes": 21472
     },
     {
       "executable": false,

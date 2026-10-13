@@ -185,21 +185,97 @@ fn enriched(fixture: &Fixture, mut run: Run) -> Run {
     // Observe the actual post-enrichment body before no-op removal or ACK.
     run
 }
+fn batch(items: &[SnapshotItem]) -> SnapshotBatchRequest {
+    let mut snapshots = items.to_vec();
+    for item in &mut snapshots {
+        item.snapshot_fingerprint = snapshot_fingerprint(SOURCE, item);
+    }
+    SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: SOURCE.api_slug().into(),
+        machine_id: "a".repeat(64),
+        collector_version: Some("0.1.synthetic".into()),
+        snapshots,
+        upload_policy: SnapshotUploadPolicy::default(),
+        client_report: crate::client_report::ClientReport::empty(),
+    }
+}
 fn exact_bodies(run: &Run) -> (Vec<u8>, Vec<(String, String)>) {
+    let request = batch(&run.result.snapshots);
     (
-        serde_json::to_vec(&run.result.snapshots).unwrap(),
-        run.result
+        serde_json::to_vec(&request).unwrap(),
+        request
             .snapshots
             .iter()
             .map(|s| {
                 (
-                    snapshot_fingerprint(SOURCE, s),
+                    s.snapshot_fingerprint.clone(),
                     snapshot_upload_body_witness(s),
                 )
             })
             .collect(),
     )
 }
+fn validate_exact_ack(request: &SnapshotBatchRequest) {
+    use crate::snapshot_client::SnapshotBatchResponse;
+    let references: Vec<_> = request
+        .snapshots
+        .iter()
+        .map(|item| {
+            let public_version = snapshot_upload_body_witness_version(item).and_then(|v| {
+                if matches!(v, 9 | 10) { return None; }
+                Some(match v {
+                11 => 5,
+                12 => 6,
+                15 => 13,
+                16 => 14,
+                19 => 17,
+                20 => 18,
+                23 => {
+                    if item.cache_observations.is_some() {
+                        13
+                    } else {
+                        7
+                    }
+                }
+                24 => {
+                    if item.cache_observations.is_some() {
+                        14
+                    } else {
+                        8
+                    }
+                }
+                _ => panic!("fixture emitted unsupported ACK witness version"),
+            })
+            });
+            json!({"source_session_id":item.source_session_id,
+            "snapshot_fingerprint":item.snapshot_fingerprint, "occurrence_count":1,
+            "body_witness_version":public_version,
+            "body_witness_digest":snapshot_upload_body_witness(item),
+                "head_etag":request.snapshots.iter().any(|s| s.cache_observations.is_some()).then(|| "e".repeat(64))})
+        })
+        .collect();
+    let response: SnapshotBatchResponse = serde_json::from_value(json!({
+        "accepted":references.len(), "sessions_reconciled":0, "session_ids":[],
+        "disabled":false, "entity_ack_contract":SNAPSHOT_ENTITY_ACK_CONTRACT,
+        "accepted_entities":references
+    }))
+    .unwrap();
+    response.validate_entity_ack(request).unwrap();
+    if response
+        .accepted_entities
+        .first()
+        .is_some_and(|r| r.body_witness_version.is_some())
+    {
+        let mut wrong = response.clone();
+        wrong.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
+        assert!(
+            wrong.validate_entity_ack(request).is_err(),
+            "a foreign body cannot settle this parse"
+        );
+    }
+}
+
 fn assert_oracle(fixture: &Fixture, cached: &Run, prior: ScanIndex) {
     let full = enriched(fixture, raw_scan(fixture, prior, None, |_| {}));
     assert_eq!(exact_bodies(cached), exact_bodies(&full));
@@ -219,6 +295,8 @@ fn settle(mut run: Run) -> ScanIndex {
         &mut run.index,
         snapshot_upload_body_witness,
     );
+    // Validate the ordinary per-entity/body ACK before recording acceptance.
+    validate_exact_ack(&batch(&run.result.snapshots));
     // The acceptance set comes only from the final enriched body, not raw parse.
     let accepted = run
         .result
@@ -234,10 +312,12 @@ fn warm(fixture: &Fixture, cache: &Arc<SharedCache>) -> ScanIndex {
         crate::heap_layout_bound::layout_supported(),
         "cache fixtures must actually exercise native retention"
     );
-    settle(enriched(
+    let index = settle(enriched(
         fixture,
         raw_scan(fixture, ScanIndex::default(), Some(cache.clone()), |_| {}),
-    ))
+    ));
+    assert!(cache.inner.lock().unwrap().resident_bound().unwrap() <= STATE_BYTES);
+    index
 }
 
 #[test]
