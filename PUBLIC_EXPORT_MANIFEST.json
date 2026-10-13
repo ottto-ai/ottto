@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 558,
-  "content_sha256": "69b6d06a2060ddc7fc67827eaa4bd18ebf316c5b9e3710d62b118b48a0216949",
+  "content_sha256": "82736f3a40eace333860651ee484fb9da59ac898e55d7b671e10f559c82cac0a",
   "files": [
     {
       "executable": false,
@@ -1175,8 +1175,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_sidecar_reduction_tests.rs",
-      "sha256": "3cb32e0961a272d7bc8b5fa8611f31bf3361d2fe986f7f5ebe147499d002fcac",
-      "size_bytes": 22425
+      "sha256": "ac76f95d9608e4907c728436cd07505e356e818ecec5a5012a6688abc8970fe0",
+      "size_bytes": 25645
     },
     {
       "executable": false,
@@ -2603,8 +2603,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-13-claude-sidecar-reduction-cache.md",
-      "sha256": "27017642f7d8ccb71b9245f31d00bd66ed6c48bfc2197b2d59500ae5285ffb50",
-      "size_bytes": 2734
+      "sha256": "7ac8e991eaa51f12435db626be0bba6d16f7a4abd1ffb911435db0e11bab1dc0",
+      "size_bytes": 3506
     },
     {
       "executable": false,

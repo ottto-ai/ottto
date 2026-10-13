@@ -314,28 +314,61 @@ fn settle(mut run: Run) -> ScanIndex {
     run.index.record_accepted_snapshot_fingerprints(&accepted);
     run.index
 }
-fn warm(fixture: &Fixture, cache: &Arc<SharedCache>) -> ScanIndex {
-    assert!(
-        crate::heap_layout_bound::layout_supported(),
-        "cache fixtures must actually exercise native retention"
-    );
+fn seed_predecessor(fixture: &Fixture, cache: &Arc<SharedCache>) -> ScanIndex {
     let index = settle(enriched(
         fixture,
         raw_scan(fixture, ScanIndex::default(), Some(cache.clone()), |_| {}),
     ));
-    assert!(cache.inner.lock().unwrap().resident_bound().unwrap() <= STATE_BYTES);
+    let bound = cache.inner.lock().unwrap().resident_bound();
+    if crate::heap_layout_bound::layout_supported() {
+        assert!(bound.unwrap() <= STATE_BYTES);
+    } else {
+        assert!(
+            bound.is_none(),
+            "unsupported layout must not acquire a charge"
+        );
+        for key in index.files.keys() {
+            assert!(
+                cache.take(key).is_none(),
+                "unsupported layout must retain no native state"
+            );
+        }
+    }
     index
+}
+// Both branches execute the real scanner. Unsupported CI verifies Full fallback;
+// only the separately compiler-bound supported run verifies actual reuse.
+fn assert_layout_mode(actual: (usize, usize, usize), reuse: (usize, usize, usize)) {
+    let expected = if crate::heap_layout_bound::layout_supported() {
+        reuse
+    } else {
+        (reuse.0 + reuse.1 + reuse.2, 0, 0)
+    };
+    assert_eq!(
+        actual,
+        expected,
+        "compiler={} layout_supported={}",
+        env!("OTTTO_SCAN_LAYOUT_RUSTC"),
+        crate::heap_layout_bound::layout_supported()
+    );
 }
 
 #[test]
 fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
-    let prior = warm(&f, &cache);
+    let prior = seed_predecessor(&f, &cache);
     f.evidence(2); // Includes req_1 from before the latest transcript response.
     let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
-    assert_eq!(cached.modes, (0, 0, 1));
-    assert_eq!(cached.native_bytes, 0);
+    assert_layout_mode(cached.modes, (0, 0, 1));
+    assert_eq!(
+        cached.native_bytes,
+        if crate::heap_layout_bound::layout_supported() {
+            0
+        } else {
+            fs::metadata(&f.path).unwrap().len()
+        }
+    );
     assert!(!cached.result.snapshots.is_empty());
     assert_eq!(
         cached.result.snapshots[0]
@@ -359,15 +392,18 @@ fn sidecar_only_late_evidence_reuses_prefix_and_matches_enriched_full() {
 fn transcript_and_sidecar_append_use_tail_without_changing_joined_body() {
     let f = Fixture::new(1);
     let cache = Arc::new(SharedCache::default());
-    let prior = warm(&f, &cache);
+    let prior = seed_predecessor(&f, &cache);
     f.append_transcript(1);
     f.evidence(2);
     let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
-    assert_eq!(cached.modes, (0, 1, 0));
+    assert_layout_mode(cached.modes, (0, 1, 0));
     assert_oracle(&f, &cached, prior);
-    assert!(cached.index.files[&local_index_key(&f.path)]
-        .audit_obligation(now_seconds())
-        .is_some());
+    assert_eq!(
+        cached.index.files[&local_index_key(&f.path)]
+            .audit_obligation(now_seconds())
+            .is_some(),
+        crate::heap_layout_bound::layout_supported()
+    );
 }
 
 #[test]
@@ -397,7 +433,7 @@ fn root_telemetry_reselects_every_child_without_invalidating_reduction() {
     let metadata = ClaudeTitleMetadata::default();
     let before: Vec<_> = paths.iter().map(|p| f.fingerprints(p, &metadata)).collect();
     let cache = Arc::new(SharedCache::default());
-    let prior = warm(&f, &cache);
+    let prior = seed_predecessor(&f, &cache);
     f.evidence(3);
     for (path, old) in paths.iter().zip(before) {
         let next = f.fingerprints(path, &metadata);
@@ -405,7 +441,7 @@ fn root_telemetry_reselects_every_child_without_invalidating_reduction() {
         assert_eq!(next.1, old.1, "no evidence is retained in native reduction");
     }
     let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
-    assert_eq!(cached.modes, (0, 0, 3));
+    assert_layout_mode(cached.modes, (0, 0, 3));
     assert_eq!(cached.result.snapshots.len(), 3);
     assert_oracle(&f, &cached, prior);
 }
@@ -414,7 +450,7 @@ fn root_telemetry_reselects_every_child_without_invalidating_reduction() {
 fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
-    let prior = warm(&f, &cache);
+    let prior = seed_predecessor(&f, &cache);
     f.write_rows(false, &f.api[..2]);
     let cached = enriched(
         &f,
@@ -422,7 +458,7 @@ fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
             f.write_rows(true, &f.trace[..2]);
         }),
     );
-    assert_eq!(cached.modes, (0, 0, 1));
+    assert_layout_mode(cached.modes, (0, 0, 1));
     assert!(cached.result.census_complete);
     // Restore the same pre-acquisition evidence boundary for the Full oracle;
     // API mtime and candidate selection material remain identical.
@@ -436,11 +472,7 @@ fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
     assert_eq!(exact_bodies(&cached), exact_bodies(&full));
     let index = settle(cached);
     let mut next = enriched(&f, raw_scan(&f, index, Some(cache), |_| {}));
-    assert_eq!(
-        next.modes,
-        (0, 0, 1),
-        "late trace still changes the next selection"
-    );
+    assert_layout_mode(next.modes, (0, 0, 1));
     finalize_scan_after_policy_with_body_witness(
         SOURCE,
         &mut next.result,
@@ -488,7 +520,7 @@ fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
     f.evidence(2);
-    let prior = warm(&f, &cache);
+    let prior = seed_predecessor(&f, &cache);
     let mut file = fs::OpenOptions::new()
         .append(true)
         .open(f.sidecar(false))
@@ -497,7 +529,7 @@ fn duplicate_evidence_reselection_runs_post_join_noop_gate() {
     file.write_all(b"\n").unwrap();
     drop(file);
     let mut cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
-    assert_eq!(cached.modes, (0, 0, 1));
+    assert_layout_mode(cached.modes, (0, 0, 1));
     assert_oracle(&f, &cached, prior);
     assert!(
         !cached.result.snapshots.is_empty(),
@@ -518,7 +550,7 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
     for retained_budget in [false, true] {
         let f = Fixture::new(1);
         let cache = Arc::new(SharedCache::default());
-        let prior = warm(&f, &cache);
+        let prior = seed_predecessor(&f, &cache);
         let cache = if retained_budget {
             Arc::new(SharedCache {
                 inner: Mutex::new(TranscriptCache::with_byte_limit(0)),
@@ -538,7 +570,7 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
 fn missing_index_cannot_be_replaced_by_warm_cache_authority() {
     let f = Fixture::new(1);
     let cache = Arc::new(SharedCache::default());
-    warm(&f, &cache);
+    seed_predecessor(&f, &cache);
     f.evidence(1);
     let cached = enriched(&f, raw_scan(&f, ScanIndex::default(), Some(cache), |_| {}));
     assert_eq!(cached.modes, (1, 0, 0));
@@ -549,7 +581,7 @@ fn missing_index_cannot_be_replaced_by_warm_cache_authority() {
 fn true_scope_change_at_completion_still_refuses_cached_publication() {
     let f = Fixture::new(1);
     let cache = Arc::new(SharedCache::default());
-    let prior = warm(&f, &cache);
+    let prior = seed_predecessor(&f, &cache);
     f.evidence(1);
     let cached = raw_scan(&f, prior, Some(cache), |scan| {
         scan.index.active_upload_context_fingerprint = Some("changed-after-start".into());
@@ -563,7 +595,7 @@ fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
     let f = Fixture::new(2);
     let cache = Arc::new(SharedCache::default());
     f.evidence(2);
-    let prior = warm(&f, &cache);
+    let prior = seed_predecessor(&f, &cache);
     let file = fs::OpenOptions::new()
         .write(true)
         .open(f.sidecar(false))
@@ -587,26 +619,24 @@ fn sidecar_cap_loss_matches_full_and_keeps_prior_authority_quarantine() {
 fn cached_context_and_hourly_audit_debt_survive_telemetry_only_cycles() {
     let f = Fixture::new(1);
     let cache = Arc::new(SharedCache::default());
-    let prior = warm(&f, &cache);
+    let prior = seed_predecessor(&f, &cache);
     f.append_transcript(1);
     f.evidence(2);
     let tail = enriched(&f, raw_scan(&f, prior, Some(cache.clone()), |_| {}));
-    assert_eq!(tail.modes, (0, 1, 0));
+    assert_layout_mode(tail.modes, (0, 1, 0));
     let prior = settle(tail);
     let key = local_index_key(&f.path);
-    let debt = prior.files[&key].audit_obligation(now_seconds()).unwrap();
+    let debt = prior.files[&key].audit_obligation(now_seconds());
+    assert_eq!(debt.is_some(), crate::heap_layout_bound::layout_supported());
     f.write_rows(
         false,
         &[f.api[0].clone(), f.api[1].clone(), f.api[0].clone()],
     );
     let unchanged = enriched(&f, raw_scan(&f, prior.clone(), Some(cache.clone()), |_| {}));
-    assert_eq!(unchanged.modes, (0, 0, 1));
+    assert_layout_mode(unchanged.modes, (0, 0, 1));
     assert_oracle(&f, &unchanged, prior);
     let prior = settle(unchanged);
-    assert_eq!(
-        prior.files[&key].audit_obligation(now_seconds()),
-        Some(debt)
-    );
+    assert_eq!(prior.files[&key].audit_obligation(now_seconds()), debt);
     // Force a legitimately due existing obligation without changing intervals.
     let mut due = prior;
     let now = now_seconds();
@@ -627,7 +657,7 @@ fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
     for conflict in [false, true] {
         let f = Fixture::new(2);
         let cache = Arc::new(SharedCache::default());
-        let prior = warm(&f, &cache);
+        let prior = seed_predecessor(&f, &cache);
         if conflict {
             f.evidence(2);
             let mut row = f.api[0].clone();
@@ -642,12 +672,64 @@ fn missing_trace_and_conflicting_evidence_keep_full_oracle_disposition() {
             f.write_rows(false, &f.api[..2]);
         }
         let cached = enriched(&f, raw_scan(&f, prior.clone(), Some(cache), |_| {}));
-        assert_eq!(cached.modes, (0, 0, 1));
+        assert_layout_mode(cached.modes, (0, 0, 1));
         assert_oracle(&f, &cached, prior);
         assert!(cached
             .result
             .snapshots
             .iter()
             .all(|s| s.usage_accounting_contract.is_none()));
+    }
+}
+
+#[test]
+fn cold_full_mid_read_sidecars_complete_but_true_scope_and_object_changes_refuse() {
+    for change in ["sidecars", "context", "object"] {
+        let f = Fixture::new(2);
+        f.write_rows(false, &f.api[..2]);
+        let empty_cache = Arc::new(SharedCache::default());
+        let candidate = raw_scan(
+            &f,
+            ScanIndex::default(),
+            Some(empty_cache),
+            |scan| match change {
+                "sidecars" => f.write_rows(true, &f.trace[..2]),
+                "context" => {
+                    scan.index.active_upload_context_fingerprint =
+                        Some("changed-after-start".into())
+                }
+                "object" => {
+                    let replacement = f.path.with_extension("replacement");
+                    fs::write(&replacement, f.lines[..2].join("\n") + "\n").unwrap();
+                    fs::rename(replacement, &f.path).unwrap();
+                }
+                _ => unreachable!(),
+            },
+        );
+        assert_eq!(
+            candidate.modes,
+            (1, 0, 0),
+            "cold acquisition is genuinely Full"
+        );
+        if change == "sidecars" {
+            let candidate = enriched(&f, candidate);
+            assert!(candidate.result.census_complete);
+            assert!(!candidate.result.snapshots.is_empty());
+            fs::remove_file(f.sidecar(true)).unwrap();
+            let full = enriched(
+                &f,
+                raw_scan(&f, ScanIndex::default(), None, |_| {
+                    f.write_rows(true, &f.trace[..2]);
+                }),
+            );
+            assert_eq!(exact_bodies(&candidate), exact_bodies(&full));
+            settle(candidate);
+        } else {
+            assert!(
+                candidate.result.snapshots.is_empty(),
+                "true dependency/object refusal remains"
+            );
+            assert!(!candidate.result.census_complete);
+        }
     }
 }
