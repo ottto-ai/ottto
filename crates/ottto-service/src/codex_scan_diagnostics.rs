@@ -1,4 +1,5 @@
 //! Local-only bounded evidence. This never enters a status/upload DTO.
+pub(crate) mod candidate_pipeline;
 use crate::snapshots::SnapshotQuarantineDisposition;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -224,6 +225,8 @@ struct FencedCensusRecord<'a> {
     losses: CensusLossCounts,
     unreadable_causes: UnreadableBreakdown,
     index: CensusIndexAggregates,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_pipeline: Option<candidate_pipeline::CandidatePipeline>,
 }
 
 fn fenced_census_path(support_dir: &std::path::Path) -> std::path::PathBuf {
@@ -460,7 +463,7 @@ pub(crate) fn write_fenced_census(
         .map_err(|_| CensusPublishFailure::ClockUnavailable)?;
     let start = process_start();
     let record = FencedCensusRecord {
-        schema: "local_fenced_codex_census:v3",
+        schema: "local_fenced_codex_census:v4",
         source: "codex",
         producer_pid: std::process::id(),
         producer_start_sec: start.map(|value| value.sec),
@@ -492,6 +495,11 @@ pub(crate) fn write_fenced_census(
             .unreadable_causes
             .projection(scan.unreadable_path_count as u64),
         index: index.local_codex_census_aggregates(),
+        candidate_pipeline: Some({
+            let mut p = diagnostic.candidate_pipeline;
+            p.binding = candidate_pipeline::binding();
+            p
+        }),
     };
     write_fenced_census_record(support_dir, &record)
 }
@@ -681,6 +689,7 @@ impl RecoveryLineage {
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(crate) struct CodexScanDiagnostics {
+    pub candidate_pipeline: candidate_pipeline::CandidatePipeline,
     pub version: u8,
     pub generation: u64,
     pub state_titles: LoaderEvidence,
@@ -697,7 +706,7 @@ pub(crate) struct CodexScanDiagnostics {
 
 // Exhaustive inventory preserves optional scan overlap admission on #493's
 // existing layout contract. Fixed arrays add no separately owned heap bytes.
-crate::heap_layout_bound::fields!(CodexScanDiagnostics; version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, gates, unreadable_causes, quarantine_count, sample_offset, lineage);
+crate::heap_layout_bound::fields!(CodexScanDiagnostics; candidate_pipeline, version, generation, state_titles, state_threads, spawn_edges, rollout_extents, session_index, gates, unreadable_causes, quarantine_count, sample_offset, lineage);
 crate::heap_layout_bound::fields!(LoaderEvidence; completed_roots, failed_roots, reason, mixed_failure_reasons, identity_conflict, first_failure_root_digest, first_failure_stage, sqlite_extended_code);
 crate::heap_layout_bound::fields!(CensusGates; discovery_done, traversal_healthy, frozen_generation, state_complete, sidecar_complete, reconciliation_complete, parent_restart, clean_followup, census_complete);
 crate::heap_layout_bound::fields!(RecoveryLineage; fingerprint_digest, file_key_digest, associated_file_count, legacy_file_association, file_reason, parsed_count, finalized, finalized_entity_count, successor_digests, previous_body_digest, final_body_digest, final_body_revision, before_current, after_current, before_disposition, after_disposition);
@@ -857,6 +866,7 @@ mod fenced_census_tests {
 
     fn record() -> FencedCensusRecord<'static> {
         FencedCensusRecord {
+            candidate_pipeline: None,
             schema: "local_fenced_codex_census:v3",
             source: "codex",
             producer_pid: std::process::id(),
@@ -876,6 +886,64 @@ mod fenced_census_tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn candidate_pipeline_maximal_encoding_and_binding_are_bounded() {
+        let mut pipeline = candidate_pipeline::CandidatePipeline::default();
+        for key in ["private-source-path-A", "private-source-path-B"] {
+            pipeline.identify(key, u64::MAX);
+            pipeline.decision(key, candidate_pipeline::Hold::Ownership);
+            pipeline.finalized(
+                key,
+                &std::collections::BTreeSet::from([key.into()]),
+                Some("private-body"),
+            );
+            pipeline.validated(
+                key,
+                "private-validated-body",
+                candidate_pipeline::Delivery::Accepted,
+            );
+        }
+        pipeline.decisions = u64::MAX;
+        pipeline.parsed = u64::MAX;
+        pipeline.finalized = u64::MAX;
+        let mut record = record();
+        record.candidate_pipeline = Some(pipeline);
+        record.schema = "local_fenced_codex_census:v4";
+        let mut buffer = [0u8; MAX_FENCED_CENSUS_BYTES];
+        let mut writer = std::io::Cursor::new(buffer.as_mut_slice());
+        serde_json::to_writer(&mut writer, &record).unwrap();
+        assert!(writer.position() < MAX_FENCED_CENSUS_BYTES as u64);
+        assert!(std::mem::size_of::<candidate_pipeline::CandidatePipeline>() <= 768);
+        if crate::heap_layout_bound::layout_supported() {
+            assert_eq!(
+                crate::heap_layout_bound::completed_bound(&pipeline, 768),
+                Some(std::mem::size_of::<candidate_pipeline::CandidatePipeline>())
+            );
+        } else {
+            assert_eq!(
+                crate::heap_layout_bound::completed_bound(&pipeline, 768),
+                None
+            );
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..10000 {
+            pipeline.identify("private-source-path-A", u64::MAX);
+        }
+        eprintln!(
+            "candidate_pipeline repeated_identify_10000_us={}",
+            start.elapsed().as_micros()
+        );
+        let text = serde_json::to_string(&record).unwrap();
+        assert!(!text.contains("private-source-path"));
+        assert!(!text.contains("private-body"));
+        assert!(!text.contains("private-validated-body"));
+        eprintln!(
+            "candidate_pipeline inline={} encoded_record={}",
+            std::mem::size_of::<candidate_pipeline::CandidatePipeline>(),
+            writer.position()
+        );
     }
 
     #[test]

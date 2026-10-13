@@ -3137,6 +3137,19 @@ pub fn finalize_scan_after_policy_with_body_witness(
             }
         }
         if let Some(diagnostic) = result.local_codex_diagnostics.as_mut() {
+            diagnostic.candidate_pipeline.group_body_change(
+                &pending.index_key,
+                pending
+                    .previous_upload_body_witness
+                    .as_ref()
+                    .zip(final_upload_body_witness.as_ref())
+                    .map(|(a, b)| a != b),
+            );
+            diagnostic.candidate_pipeline.finalized(
+                &pending.index_key,
+                &final_fingerprints,
+                final_upload_body_witness.as_deref(),
+            );
             let key_digest = codex_scan_diagnostics::digest(&pending.index_key);
             for sample in diagnostic.lineage.iter_mut().flatten() {
                 if sample.file_key_digest == Some(key_digest) {
@@ -11089,7 +11102,7 @@ impl OwnedSourceScan {
         let index = &mut owned_index;
         index.activate_quarantine_witness(source);
         let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
-        let codex_title_metadata = if source == SnapshotSource::Codex {
+        let mut codex_title_metadata = if source == SnapshotSource::Codex {
             CodexTitleMetadata::load_from_roots(roots)
         } else {
             CodexTitleMetadata::default()
@@ -11443,6 +11456,14 @@ impl OwnedSourceScan {
                 inventory.complete &= traversal.pending_directories.is_empty();
                 inventory
             });
+        if source == SnapshotSource::Codex {
+            for candidate in &identified_candidates {
+                codex_title_metadata
+                    .local_diagnostics
+                    .candidate_pipeline
+                    .identify(&local_index_key(&candidate.path), owned_index.generation);
+            }
+        }
         Self {
             resource_probe,
             sampling: None,
@@ -11562,7 +11583,7 @@ impl OwnedSourceScan {
             artifacts_enabled,
             context_curve_enabled,
             claude_effort_support_dir,
-            codex_title_metadata,
+            mut codex_title_metadata,
             claude_title_metadata,
             state_census_complete,
             sidecar_census_complete,
@@ -11621,6 +11642,12 @@ impl OwnedSourceScan {
                         .map(|header| local_index_key(&header.candidate.path))
                         .collect::<BTreeSet<_>>();
                     inventory.complete &= selected.is_subset(&inventoried);
+                    if !inventory.complete {
+                        codex_title_metadata
+                            .local_diagnostics
+                            .candidate_pipeline
+                            .header_incomplete();
+                    }
                     let mut owners = BTreeMap::<String, BTreeSet<PathBuf>>::new();
                     for header in &inventory.headers {
                         owners
@@ -12170,6 +12197,22 @@ impl OwnedSourceScan {
                 codex_parent_resolution_retry_required |=
                     parsed_file.codex_parent_resolution_pending;
                 let parse_complete = parsed_file.complete();
+                if source == SnapshotSource::Codex {
+                    use crate::codex_scan_diagnostics::candidate_pipeline::Hold;
+                    let hold = if parse_complete {
+                        Hold::None
+                    } else if parsed_file.codex_parent_resolution_pending {
+                        Hold::ParentPending
+                    } else if parsed_file.ownership_incomplete_file_count > 0 {
+                        Hold::Ownership
+                    } else {
+                        Hold::LineLoss
+                    };
+                    codex_title_metadata
+                        .local_diagnostics
+                        .candidate_pipeline
+                        .parsed(&local_index_key(&candidate.path), hold);
+                }
                 if !aliases.is_empty() && !parse_complete {
                     // Joining authorizes a complete replacement only. Native
                     // ownership/parser loss cannot publish a partial union body.
@@ -12885,7 +12928,13 @@ impl OwnedSourceScan {
                         }),
                     local_codex_diagnostics: (source == SnapshotSource::Codex).then_some(
                         CodexScanDiagnostics {
-                            version: 1,
+                            candidate_pipeline: {
+                                let mut p =
+                                    codex_title_metadata.local_diagnostics.candidate_pipeline;
+                                p.generation = index.generation;
+                                p
+                            },
+                            version: 2,
                             generation: index.generation,
                             unreadable_causes: counts.unreadable_causes,
                             gates: CensusGates {
@@ -13070,6 +13119,36 @@ impl OwnedSourceScan {
                 // earlier page had already passed. Reparse only that parent to
                 // populate bounded structural evidence.
                 decision = CandidateDecision::Parse;
+            }
+            if source == SnapshotSource::Codex {
+                use crate::codex_scan_diagnostics::candidate_pipeline::Hold;
+                let key = local_index_key(&candidate.path);
+                let pipeline = &mut codex_title_metadata.local_diagnostics.candidate_pipeline;
+                pipeline.identify(&key, index.generation);
+                let previous = index.files.get(&key);
+                pipeline.context(
+                    &key,
+                    previous.is_some(),
+                    previous.map(|entry| {
+                        entry.size_bytes != candidate.size_bytes
+                            || entry.modified_unix_seconds != candidate.modified_unix_seconds
+                            || entry
+                                .modified_unix_nanos
+                                .is_some_and(|n| n != candidate.modified_unix_nanos)
+                    }),
+                    previous.map(|entry| {
+                        entry.source_file_fingerprint != candidate.source_file_fingerprint
+                    }),
+                );
+                pipeline.decision(
+                    &key,
+                    match decision {
+                        CandidateDecision::Parse => Hold::None,
+                        CandidateDecision::Skip => Hold::Skip,
+                        CandidateDecision::Migrate => Hold::Migrate,
+                        CandidateDecision::ReconcileLegacy => Hold::ReconcileLegacy,
+                    },
+                );
             }
             match decision {
                 CandidateDecision::Skip => {
@@ -43162,6 +43241,82 @@ mod tests {
         );
         assert!(!conflict.state_census_incomplete && conflict.sidecar_census_incomplete);
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn candidate_pipeline_production_scan_preserves_body_and_checkpoint() {
+        let root = temp_dir("candidate-pipeline-real-scan");
+        let path = root.join("rollout-00000000-0000-4000-8000-000000000001.jsonl");
+        fs::write(&path,concat!(
+            "{\"timestamp\":\"2026-08-02T06:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"00000000-0000-4000-8000-000000000001\",\"source\":\"vscode\"}}\n",
+            "{\"timestamp\":\"2026-08-02T06:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":4,\"request_count\":1},\"model\":\"gpt-5.6\"}}}\n"
+        )).unwrap();
+        let run = || {
+            let mut index = ScanIndex::default();
+            let scan = scan_source_roots_with_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-08-02T06:02:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap();
+            (scan, index)
+        };
+        let (without, old_index) =
+            crate::codex_scan_diagnostics::candidate_pipeline::without_samples(run);
+        let (with, new_index) = run();
+        assert!(
+            !with.snapshots.is_empty(),
+            "fixture must exercise actual positive native accounting"
+        );
+        assert_eq!(
+            (
+                with.snapshots[0].input_tokens,
+                with.snapshots[0].output_tokens,
+                with.snapshots[0].request_count
+            ),
+            (10, 4, 1)
+        );
+        assert_eq!(
+            serde_json::to_vec(&with.snapshots).unwrap(),
+            serde_json::to_vec(&without.snapshots).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&new_index).unwrap(),
+            serde_json::to_vec(&old_index).unwrap()
+        );
+        assert!(with
+            .local_codex_diagnostics
+            .unwrap()
+            .candidate_pipeline
+            .samples
+            .iter()
+            .any(Option::is_some));
+        crate::codex_scan_diagnostics::observe_existing_outer_census_fence(
+            SnapshotSource::Codex,
+            &root,
+            || Ok(()),
+        )
+        .unwrap();
+        crate::codex_scan_diagnostics::write_fenced_census(&root, &with, &new_index).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("snapshots").join("codex-fenced-census-v1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["schema"], "local_fenced_codex_census:v4");
+        assert_eq!(
+            record["candidate_pipeline"]["binding"]["pid"],
+            record["producer_pid"]
+        );
+        assert_eq!(
+            record["candidate_pipeline"]["binding"]["attempt"],
+            record["attempt_sequence"]
+        );
+        assert_eq!(record["candidate_pipeline"]["terminal"], false);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

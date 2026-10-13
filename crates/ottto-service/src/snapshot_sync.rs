@@ -3671,6 +3671,11 @@ fn finish_sync_source(
         ensure_authority,
         || codex_scan_diagnostics::write_fenced_census(support_dir, &scan_result, &index),
     )?;
+    if let Some(diagnostic) = scan_result.local_codex_diagnostics.as_mut() {
+        diagnostic.candidate_pipeline.binding =
+            codex_scan_diagnostics::candidate_pipeline::binding();
+    }
+
     let scan_agent_status = reconciliation_agent_status(&scan_agent_status_collection);
     // State advances only after the exact paged replay census and its upload
     // both finish. Incomplete pages persist their cursor in the destination
@@ -3975,6 +3980,17 @@ fn finish_sync_source(
     }
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
+    let mut candidate_pipeline = scan_result
+        .local_codex_diagnostics
+        .map(|d| d.candidate_pipeline);
+    if let Some(p) = candidate_pipeline.as_mut() {
+        p.queue(
+            scan_result
+                .snapshots
+                .iter()
+                .map(|s| s.snapshot_fingerprint.as_str()),
+        );
+    }
     let mut accepted = 0;
     let upload_result = upload_resumable_batches_with_body_witness_partitioned(
         &scan_result.snapshots,
@@ -4036,6 +4052,73 @@ fn finish_sync_source(
             // Clear only what this accepted request carried. A failed upload
             // leaves the counters in place so the losses are reported on the
             // next batch instead of vanishing with the request that died.
+            if let Some(p) = candidate_pipeline.as_mut() {
+                use codex_scan_diagnostics::candidate_pipeline::Delivery;
+                for e in &response.accepted_entities {
+                    if !p.tracks(&e.snapshot_fingerprint) {
+                        continue;
+                    }
+                    if let Some(item) = request
+                        .snapshots
+                        .iter()
+                        .find(|item| item.snapshot_fingerprint == e.snapshot_fingerprint)
+                    {
+                        p.validated(
+                            &e.snapshot_fingerprint,
+                            &snapshot_upload_body_witness(item),
+                            Delivery::Accepted,
+                        );
+                    }
+                }
+                for e in &response.unchanged_entities {
+                    if !p.tracks(&e.snapshot_fingerprint) {
+                        continue;
+                    }
+                    if let Some(item) = request
+                        .snapshots
+                        .iter()
+                        .find(|item| item.snapshot_fingerprint == e.snapshot_fingerprint)
+                    {
+                        p.validated(
+                            &e.snapshot_fingerprint,
+                            &snapshot_upload_body_witness(item),
+                            Delivery::Unchanged,
+                        );
+                    }
+                }
+                for e in &response.rejected_entities {
+                    if !p.tracks(&e.snapshot_fingerprint) {
+                        continue;
+                    }
+                    if let Some(item) = request
+                        .snapshots
+                        .iter()
+                        .find(|item| item.snapshot_fingerprint == e.snapshot_fingerprint)
+                    {
+                        p.validated(
+                            &e.snapshot_fingerprint,
+                            &snapshot_upload_body_witness(item),
+                            Delivery::Rejected,
+                        );
+                    }
+                }
+                for e in &response.conflict_entities {
+                    if !p.tracks(&e.snapshot_fingerprint) {
+                        continue;
+                    }
+                    if let Some(item) = request
+                        .snapshots
+                        .iter()
+                        .find(|item| item.snapshot_fingerprint == e.snapshot_fingerprint)
+                    {
+                        p.validated(
+                            &e.snapshot_fingerprint,
+                            &snapshot_upload_body_witness(item),
+                            Delivery::Conflict,
+                        );
+                    }
+                }
+            }
             client_report.commit();
             Ok(response)
         },
@@ -4065,6 +4148,24 @@ fn finish_sync_source(
     let mut upload_fully_settled = true;
     let mut deferred_entity_count = None;
     let mut resolved_permanent_rejections = false;
+    if let (Some(diagnostic), Some(mut pipeline)) = (
+        scan_result.local_codex_diagnostics.as_mut(),
+        candidate_pipeline,
+    ) {
+        pipeline.terminal = true;
+        if !matches!(upload_result, Ok(ResumableUploadResult::Completed)) {
+            pipeline.deferred();
+        }
+        if upload_result
+            .as_ref()
+            .err()
+            .and_then(snapshot_upload_error_class)
+            == Some(SnapshotUploadErrorClass::LocalState)
+        {
+            pipeline.local_state_failed();
+        }
+        diagnostic.candidate_pipeline = pipeline;
+    }
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
