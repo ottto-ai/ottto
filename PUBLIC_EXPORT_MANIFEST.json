@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 556,
-  "content_sha256": "4f3a07c8c1ed9239d49a1c84c9280fb05de0ee6eaed3f83b1b192e9ee341f0f5",
+  "candidate_file_count": 558,
+  "content_sha256": "a4c9209989a35a109b64c0612319bd94ea2976fdc0af0069965899714f8ea58c",
   "files": [
     {
       "executable": false,
@@ -1174,6 +1174,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_sidecar_reduction_tests.rs",
+      "sha256": "46f63990e303ad11289206f71478a476aef3554e624bdfe0f5a18fe3aea8dde4",
+      "size_bytes": 18415
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join.rs",
       "sha256": "5afdd1814eb78f37153dd40a63f279ac294fcceea5535cafef2e0d835aaff312",
       "size_bytes": 129983
@@ -1224,8 +1231,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan.rs",
-      "sha256": "7c17d1ed956704960a978c22ca6cbf69a4c75c9b30ed640a5399724f69ab6745",
-      "size_bytes": 12304
+      "sha256": "ed56fba3563ee25f31cb600135d606c663b77e7280b50d49f84b452be2577d9c",
+      "size_bytes": 13014
     },
     {
       "executable": false,
@@ -2595,6 +2602,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-13-claude-sidecar-reduction-cache.md",
+      "sha256": "94bf032ddbfba5f6154730d67cb196468441ea2df1d8ca7e5f8cdb953e5194e3",
+      "size_bytes": 2141
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-13-codex-balance-name-constants.md",
       "sha256": "a2591b05d9355ee0bf3cdbe25c6b6e49726bcd2c18482452a80e1fe041b0c78a",
       "size_bytes": 1259
@@ -3897,7 +3911,7 @@
   ],
   "generated_at": "2026-10-13T05:36:03+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 557,
+  "output_file_count": 559,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

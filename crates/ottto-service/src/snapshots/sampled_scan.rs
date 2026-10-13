@@ -336,7 +336,26 @@ pub(super) fn reduction_dependencies(
         ]))
     } else {
         let mut scoped = candidate.clone();
-        prepare_owned_scan_candidate(source, &mut scoped, codex, claude, support);
-        Some(scoped.source_file_fingerprint)
+        // Claude API/trace evidence is joined freshly after native finish, not
+        // retained in the pre-finish transcript accumulator. Keep Desktop and
+        // child naming dependencies here; keep usage sidecars in selection.
+        let reduction_support = if source == SnapshotSource::ClaudeCode {
+            None
+        } else {
+            support
+        };
+        prepare_owned_scan_candidate(source, &mut scoped, codex, claude, reduction_support);
+        if source == SnapshotSource::ClaudeCode {
+            Some(sha256_hex(&[
+                "claude_reduction_dependencies:v1",
+                &scoped.source_file_fingerprint,
+            ]))
+        } else {
+            Some(scoped.source_file_fingerprint)
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "claude_sidecar_reduction_tests.rs"]
+mod claude_sidecar_reduction_tests;
