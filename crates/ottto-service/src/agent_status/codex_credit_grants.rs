@@ -77,8 +77,13 @@ use crate::quota_credit_model::{
     ListObservation, Provider, SectionCache, TimeInput,
 };
 
+/// The Codex plan-credit balance (name pinned by contract v2.2 §11.7 C4).
+pub(super) const PLAN_CREDITS: &str = "credits";
 /// The Codex saved-reset balance (name pinned by contract v2.2 §11.7 C4).
 pub(super) const RESET_BANK: &str = "reset_bank";
+/// The Codex workspace monthly allowance balance (name pinned by contract
+/// v2.2 §11.7 C4).
+pub(super) const WORKSPACE_MONTHLY_CREDITS: &str = "workspace_monthly_credits";
 /// Longest gap between successful detailed reads of one binding.
 pub(super) const DETAIL_INTERVAL_SECS: u64 = 3_600;
 /// Wait after a failed detailed read before the next one for the same count.
@@ -515,9 +520,9 @@ pub(super) fn codex_balance_kind(balance: &AgentCreditBalance) -> CreditBalanceK
         .and_then(|limit_id| balance.name.strip_prefix(limit_id)?.strip_prefix('_'))
         .unwrap_or(&balance.name);
     match base {
-        "credits" => CreditBalanceKind::PlanCredits,
+        PLAN_CREDITS => CreditBalanceKind::PlanCredits,
         RESET_BANK => CreditBalanceKind::SavedResets,
-        "workspace_monthly_credits" => CreditBalanceKind::WorkspaceAllowance,
+        WORKSPACE_MONTHLY_CREDITS => CreditBalanceKind::WorkspaceAllowance,
         _ => CreditBalanceKind::Unknown,
     }
 }
@@ -750,6 +755,13 @@ mod tests {
     // 2026-10-08T08:00:00Z / 2026-11-07T08:00:00Z
     const GRANTED_3: i64 = 1_791_446_400;
     const EXPIRES_3: i64 = 1_794_038_400;
+
+    #[test]
+    fn balance_names_are_the_contract_wire_names() {
+        assert_eq!(PLAN_CREDITS, "credits");
+        assert_eq!(RESET_BANK, "reset_bank");
+        assert_eq!(WORKSPACE_MONTHLY_CREDITS, "workspace_monthly_credits");
+    }
 
     #[test]
     fn complete_two_grant_list_maps_to_expected_wire() {

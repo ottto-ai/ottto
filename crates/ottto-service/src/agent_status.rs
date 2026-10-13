@@ -15033,7 +15033,7 @@ fn codex_monthly_credit_limit_from_snapshot(container: &Value) -> Option<AgentCr
     };
 
     Some(AgentCreditBalance {
-        name: "workspace_monthly_credits".to_string(),
+        name: codex_credit_grants::WORKSPACE_MONTHLY_CREDITS.to_string(),
         status,
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Credits,
@@ -15092,7 +15092,7 @@ fn codex_credit_balance_from_credits_snapshot(
         codex_credit_balance_status(remaining, unlimited, has_credits)
     };
     Some(AgentCreditBalance {
-        name: "credits".to_string(),
+        name: codex_credit_grants::PLAN_CREDITS.to_string(),
         status,
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Credits,
@@ -15380,7 +15380,7 @@ fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
         codex_credit_balance_status(remaining, unlimited, has_credits)
     };
     balances.push(AgentCreditBalance {
-        name: "credits".to_string(),
+        name: codex_credit_grants::PLAN_CREDITS.to_string(),
         status,
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Credits,
