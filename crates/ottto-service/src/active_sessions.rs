@@ -1,9 +1,12 @@
 //! Machine-local "active now" session status.
 //!
-//! A session qualifies only when its transcript's source activity advanced
-//! since the previous successful incremental scan and that activity is recent.
-//! This avoids treating a title-sidecar refresh or a historical backfill as
-//! live work. The persisted payload contains only content-free snapshot fields.
+//! A session enters the list only when its transcript's source activity
+//! advanced since the previous successful incremental scan and that activity is
+//! recent. This avoids treating a title-sidecar refresh or a historical backfill
+//! as live work. Once listed, a session stays listed by later scans until its
+//! last observed activity leaves the recent window, so a scan that saw no new
+//! activity does not empty the list. The persisted payload contains only
+//! content-free snapshot fields.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -65,6 +68,25 @@ pub fn reconcile_active_sessions(
         snapshots,
         agent_status,
         reconciled_at,
+        true,
+        crate::agent_status::claude_session_registrations,
+    )
+}
+
+/// Empties the list when the source stops collecting (policy tombstone or
+/// admin-disabled reconciliation). Recently listed sessions are not carried.
+pub fn clear_active_sessions(
+    support_dir: &Path,
+    source: SnapshotSource,
+    reconciled_at: &str,
+) -> Result<ActiveSessionReconciliation> {
+    reconcile_with_registrations(
+        support_dir,
+        source,
+        &[],
+        None,
+        reconciled_at,
+        false,
         crate::agent_status::claude_session_registrations,
     )
 }
@@ -75,6 +97,7 @@ fn reconcile_with_registrations(
     snapshots: &[SnapshotItem],
     agent_status: Option<&AgentStatusSnapshot>,
     reconciled_at: &str,
+    carry_recent: bool,
     registrations: impl FnOnce() -> crate::claude_session_registrations::Registrations,
 ) -> Result<ActiveSessionReconciliation> {
     let path = active_session_cache_path(support_dir, source);
@@ -82,6 +105,7 @@ fn reconcile_with_registrations(
     let now = OffsetDateTime::parse(reconciled_at, &Rfc3339)
         .unwrap_or_else(|_| OffsetDateTime::now_utc());
     let activity_cutoff = now - Duration::minutes(ACTIVE_ACTIVITY_WINDOW_MINUTES);
+    let activity_ceiling = now + Duration::minutes(5);
     let watermark_cutoff = now - Duration::days(WATERMARK_RETENTION_DAYS);
 
     let mut changed = BTreeMap::<String, ActiveSession>::new();
@@ -99,10 +123,7 @@ fn reconcile_with_registrations(
             .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
             .map_or(true, |value| last_activity_at > value);
 
-        if advanced
-            && last_activity_at >= activity_cutoff
-            && last_activity_at <= now + Duration::minutes(5)
-        {
+        if advanced && last_activity_at >= activity_cutoff && last_activity_at <= activity_ceiling {
             changed.insert(
                 snapshot.source_session_id.clone(),
                 active_session_from_snapshot(source, snapshot, agent_status),
@@ -141,14 +162,7 @@ fn reconcile_with_registrations(
 
     let changed_session_count = changed.len() as u64;
     let mut sessions = changed.into_values().collect::<Vec<_>>();
-    sessions.sort_by(|left, right| {
-        right
-            .source_last_activity_at
-            .cmp(&left.source_last_activity_at)
-            .then_with(|| left.source_session_id.cmp(&right.source_session_id))
-    });
-    sessions.truncate(MAX_ACTIVE_SESSIONS);
-    cache.registration_evidence.clear();
+    let previous_evidence = std::mem::take(&mut cache.registration_evidence);
     if source == SnapshotSource::ClaudeCode && !sessions.is_empty() {
         let registrations = registrations();
         for session in &mut sessions {
@@ -213,6 +227,49 @@ fn reconcile_with_registrations(
             }
         }
     }
+    // Carry still-recent sessions this scan did not re-select: an incremental
+    // scan omits unchanged transcripts, and a quiet minute is not an ended
+    // session. Carried rows keep the attribution and display provenance proven
+    // when they were selected.
+    let previous = cache
+        .reconciliation
+        .take()
+        .map(|reconciliation| reconciliation.sessions)
+        .unwrap_or_default();
+    if carry_recent {
+        let selected = sessions
+            .iter()
+            .map(|session| session.source_session_id.clone())
+            .collect::<BTreeSet<_>>();
+        for session in previous {
+            let recent = OffsetDateTime::parse(&session.source_last_activity_at, &Rfc3339)
+                .is_ok_and(|at| at >= activity_cutoff && at <= activity_ceiling);
+            if !recent || selected.contains(&session.source_session_id) {
+                continue;
+            }
+            if let Some(evidence) = previous_evidence.get(&session.source_session_id) {
+                cache
+                    .registration_evidence
+                    .entry(session.source_session_id.clone())
+                    .or_insert_with(|| evidence.clone());
+            }
+            sessions.push(session);
+        }
+    }
+    sessions.sort_by(|left, right| {
+        right
+            .source_last_activity_at
+            .cmp(&left.source_last_activity_at)
+            .then_with(|| left.source_session_id.cmp(&right.source_session_id))
+    });
+    sessions.truncate(MAX_ACTIVE_SESSIONS);
+    let listed = sessions
+        .iter()
+        .map(|session| session.source_session_id.as_str())
+        .collect::<BTreeSet<_>>();
+    cache
+        .registration_evidence
+        .retain(|session_id, _| listed.contains(session_id.as_str()));
     let reconciliation = ActiveSessionReconciliation {
         reconciled_at: reconciled_at.to_string(),
         changed_session_count,
@@ -942,6 +999,7 @@ mod tests {
             &snapshots,
             None,
             "2026-07-19T10:05:00Z",
+            true,
             registrations,
         )
         .unwrap();
@@ -999,6 +1057,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             "2026-07-19T10:05:00Z",
+            true,
             registrations,
         )
         .unwrap();
@@ -1032,10 +1091,35 @@ mod tests {
             &[snapshot],
             None,
             "2026-07-19T10:10:00Z",
+            true,
             || panic!("no registration acquisition without new activity"),
         )
         .unwrap();
         assert_eq!(unchanged.changed_session_count, 0);
+        assert_eq!(
+            unchanged.sessions[0].session_display_name.as_deref(),
+            Some("Repair process registration"),
+            "a carried row keeps its proven registration name"
+        );
+        assert_eq!(
+            read_cache(&active_session_cache_path(&dir, SnapshotSource::ClaudeCode))
+                .registration_evidence["registered-session"]
+                .name_source
+                .as_deref(),
+            Some("user"),
+            "and the provenance of that name"
+        );
+        let expired = reconcile_with_registrations(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            &[],
+            None,
+            "2026-07-19T10:30:00Z",
+            true,
+            || panic!("no registration acquisition without new activity"),
+        )
+        .unwrap();
+        assert!(expired.sessions.is_empty());
         assert!(
             read_cache(&active_session_cache_path(&dir, SnapshotSource::ClaudeCode))
                 .registration_evidence
@@ -1058,6 +1142,7 @@ mod tests {
             &[older, newer],
             None,
             "2026-07-19T10:05:00Z",
+            true,
             registrations,
         )
         .unwrap();
@@ -1092,6 +1177,7 @@ mod tests {
                 std::slice::from_ref(&snapshot),
                 None,
                 "2026-07-19T10:05:00Z",
+                true,
                 registrations,
             )
             .unwrap();
@@ -1114,6 +1200,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             "2026-07-19T10:05:00Z",
+            true,
             registrations,
         )
         .unwrap();
@@ -1134,6 +1221,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             "2026-07-19T10:05:00Z",
+            true,
             BTreeMap::new,
         )
         .unwrap();
@@ -1146,7 +1234,8 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &[],
             None,
-            "2026-07-19T10:10:00Z",
+            "2026-07-19T10:30:00Z",
+            true,
             || panic!("no registry scan for empty source"),
         )
         .unwrap();
@@ -1185,6 +1274,98 @@ mod tests {
         )
         .expect("unchanged reconciliation");
         assert_eq!(unchanged.changed_session_count, 0);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn keeps_recent_sessions_listed_until_their_activity_leaves_the_window() {
+        let dir = temp_dir("carried");
+        let busy = test_snapshot("busy", "2026-07-19T10:04:00Z");
+        let first = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            std::slice::from_ref(&busy),
+            None,
+            "2026-07-19T10:05:00Z",
+        )
+        .expect("first reconciliation");
+        assert_eq!(first.sessions.len(), 1);
+
+        // An incremental scan that re-selected nothing still lists the session.
+        let quiet = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            None,
+            "2026-07-19T10:15:00Z",
+        )
+        .expect("quiet reconciliation");
+        assert_eq!(quiet.changed_session_count, 0);
+        assert_eq!(quiet.sessions, first.sessions);
+
+        // A newly advanced session joins; the carried one stays, newest first.
+        let other = test_snapshot("other", "2026-07-19T10:16:00Z");
+        let mixed = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[busy.clone(), other],
+            None,
+            "2026-07-19T10:17:00Z",
+        )
+        .expect("mixed reconciliation");
+        assert_eq!(mixed.changed_session_count, 1);
+        let ids = mixed
+            .sessions
+            .iter()
+            .map(|session| session.source_session_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["other", "busy"]);
+
+        // Fifteen minutes after its last activity the carried session expires.
+        let later = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            None,
+            "2026-07-19T10:20:00Z",
+        )
+        .expect("later reconciliation");
+        let ids = later
+            .sessions
+            .iter()
+            .map(|session| session.source_session_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["other"]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clearing_a_withdrawn_source_does_not_carry_recent_sessions() {
+        let dir = temp_dir("cleared");
+        let snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
+        reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            std::slice::from_ref(&snapshot),
+            None,
+            "2026-07-19T10:05:00Z",
+        )
+        .expect("first reconciliation");
+
+        let cleared = clear_active_sessions(&dir, SnapshotSource::Codex, "2026-07-19T10:06:00Z")
+            .expect("cleared reconciliation");
+        assert!(cleared.sessions.is_empty());
+        let after = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            None,
+            "2026-07-19T10:07:00Z",
+        )
+        .expect("next reconciliation");
+        assert!(after.sessions.is_empty());
 
         let _ = std::fs::remove_dir_all(dir);
     }

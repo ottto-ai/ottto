@@ -3189,13 +3189,8 @@ fn prepare_sync_source(
     if receipt_window_days == 0 {
         let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
         withdraw_source_manifest(&destination_namespace, source);
-        let _ = crate::active_sessions::reconcile_active_sessions(
-            support_dir,
-            source,
-            &[],
-            None,
-            &scan_started_at,
-        );
+        let _ =
+            crate::active_sessions::clear_active_sessions(support_dir, source, &scan_started_at);
         report_status_with_fresh_relay_token(
             client,
             device,
@@ -3222,7 +3217,6 @@ fn prepare_sync_source(
         agent_status_expires_at,
         false,
     )?;
-    let scan_agent_status = reconciliation_agent_status(&scan_agent_status_collection);
     // Standalone/manual one-shot sync has no periodic daemon owner. Preserve
     // its original status upload without restoring the automatic duplicate.
     if !crate::agent_status_refresh::active() {
@@ -3248,13 +3242,8 @@ fn prepare_sync_source(
             &snapshot_upload_destination_namespace(device, device_secret),
             source,
         );
-        let _ = crate::active_sessions::reconcile_active_sessions(
-            support_dir,
-            source,
-            &[],
-            Some(scan_agent_status),
-            &scan_started_at,
-        );
+        let _ =
+            crate::active_sessions::clear_active_sessions(support_dir, source, &scan_started_at);
         report_status_with_fresh_relay_token(
             client,
             device,
@@ -3818,12 +3807,15 @@ fn finish_sync_source(
         &current_codex_bindings,
         cached_codex_login_changed,
     );
+    // Judge recency on the clock at reconciliation, not the scan start: a long
+    // scan reads transcripts that were still being written after it began, and
+    // anchoring to the start rejected that live activity as "future".
     if crate::active_sessions::reconcile_active_sessions(
         support_dir,
         source,
         &scan_result.snapshots,
         Some(&reconciliation_status),
-        &scan_started_at,
+        &current_rfc3339(),
     )
     .is_err()
     {
