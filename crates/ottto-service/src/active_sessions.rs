@@ -309,29 +309,38 @@ fn reconcile_with_registrations(
 }
 
 /// A carried row keeps the attribution proven when it was selected, unless the
-/// current status now contradicts it: a different or conflicting exact session
-/// observation, or a current-login fallback for a login that has changed.
+/// current status now contradicts it: an exact session observation naming a
+/// different account or workspace, or a current-login fallback whose login
+/// (account or workspace) has changed.
 fn withhold_contradicted_attribution(session: &mut ActiveSession, status: &AgentStatusSnapshot) {
     let Some(account_hash) = session.account_identifier_hash.as_deref() else {
         return;
     };
-    let mut exact = status
+    let workspace_hash = session.organization_identifier_hash.as_deref();
+    let observation_contradicts = status
         .plan_observations
         .iter()
         .filter(|observation| {
             observation.source_session_id.as_deref() == Some(session.source_session_id.as_str())
+                && observation
+                    .account_identifier_hash
+                    .as_deref()
+                    .is_some_and(non_empty)
         })
-        .filter_map(|observation| observation.account_identifier_hash.as_deref())
-        .filter(|hash| non_empty(hash));
-    let contradicted = exact.any(|hash| hash != account_hash)
-        || (session.account_attribution_source.as_deref()
-            == Some("current_login_at_reconciliation")
-            && status
-                .account
-                .as_ref()
-                .and_then(|account| account.account_identifier_hash.as_deref())
-                != Some(account_hash));
-    if contradicted {
+        .any(|observation| {
+            observation.account_identifier_hash.as_deref() != Some(account_hash)
+                || observation
+                    .organization_identifier_hash
+                    .as_deref()
+                    .is_some_and(|workspace| Some(workspace) != workspace_hash)
+        });
+    let login_changed = session.account_attribution_source.as_deref()
+        == Some("current_login_at_reconciliation")
+        && status.account.as_ref().map_or(true, |account| {
+            account.account_identifier_hash.as_deref() != Some(account_hash)
+                || account.organization_identifier_hash.as_deref() != workspace_hash
+        });
+    if observation_contradicts || login_changed {
         session.account_identifier_hash = None;
         session.organization_identifier_hash = None;
         session.subscription_product = None;
@@ -1543,6 +1552,35 @@ mod tests {
         assert!(withheld.sessions[0].account_attribution_source.is_none());
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn withholds_carried_login_fallback_after_a_workspace_switch() {
+        let mut session = active_session_from_snapshot(
+            SnapshotSource::Codex,
+            &test_snapshot("s1", "2026-07-19T10:04:00Z"),
+            None,
+        );
+        session.account_identifier_hash = Some("account-a".into());
+        session.organization_identifier_hash = Some("workspace-x".into());
+        session.account_attribution_source = Some("current_login_at_reconciliation".into());
+        let mut status = test_status();
+        let mut account = test_current_account("account-a");
+        account.organization_identifier_hash = Some("workspace-x".into());
+        status.account = Some(account.clone());
+
+        let mut same = session.clone();
+        withhold_contradicted_attribution(&mut same, &status);
+        assert_eq!(
+            same.organization_identifier_hash.as_deref(),
+            Some("workspace-x")
+        );
+
+        account.organization_identifier_hash = Some("workspace-y".into());
+        status.account = Some(account);
+        withhold_contradicted_attribution(&mut session, &status);
+        assert!(session.account_identifier_hash.is_none());
+        assert!(session.organization_identifier_hash.is_none());
     }
 
     #[test]

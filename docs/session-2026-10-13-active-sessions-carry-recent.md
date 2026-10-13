@@ -32,8 +32,9 @@ while Claude cards showed many. Two daemon behaviors caused it.
   privacy policy is unchanged since it was listed (the policy is stored in the
   local cache as `listed_under_policy`). It keeps its Claude registration
   provenance. It loses its account attribution when a current exact session
-  observation names a different account, or when its current-login fallback
-  no longer matches the current login.
+  observation names a different account or workspace, or when its
+  current-login fallback no longer matches the current login's account and
+  workspace.
 - `changed_session_count` keeps its meaning: sessions advanced in this scan.
 - `reconcile_active_sessions` takes the scan's `SnapshotUploadPolicy`.
 - New `active_sessions::clear_active_sessions` empties the list without
@@ -59,15 +60,20 @@ separate scan-cost issue and is not addressed here.
 
 Synthetic only. `cargo fmt --check` and
 `cargo clippy --workspace --all-targets -D warnings` clean. The full
-`ottto-service` lib suite passes (2611; `CLAUDE_CONFIG_DIR` unset, since the
+`ottto-service` lib suite passes (2612; `CLAUDE_CONFIG_DIR` unset, since the
 Claude login tests read it from the environment). New tests:
 `keeps_recent_sessions_listed_until_their_activity_leaves_the_window`,
 `rebuilds_a_listed_session_re_read_without_new_activity`,
 `does_not_carry_unread_sessions_across_an_upload_policy_change`,
 `withholds_carried_attribution_that_current_evidence_contradicts`,
+`withholds_carried_login_fallback_after_a_workspace_switch`,
 `clearing_a_withdrawn_source_does_not_carry_recent_sessions`.
 
 AutoReview (strict, Codex): the first two discovery calls returned reports the
 tool rejected as invalid. A third call found two real defects in the first
 draft: carried rows bypassed a newly disabled title/label policy, and carried
-attribution ignored contradicting evidence. Both are fixed above.
+attribution ignored contradicting evidence. Both are fixed above. The
+focused verification confirmed the policy fix and found that the attribution
+check compared only the account, not the workspace; that is fixed too
+(`withholds_carried_login_fallback_after_a_workspace_switch`). The review
+budget for this change is spent, so that last fix is covered by tests only.
