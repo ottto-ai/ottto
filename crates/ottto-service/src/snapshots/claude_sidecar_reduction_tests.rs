@@ -258,7 +258,7 @@ fn validate_exact_ack(request: &SnapshotBatchRequest) {
             json!({"source_session_id":item.source_session_id,
             "snapshot_fingerprint":item.snapshot_fingerprint, "occurrence_count":1,
             "body_witness_version":public_version,
-            "body_witness_digest":snapshot_upload_body_witness(item),
+            "body_witness_digest":public_version.map(|_| snapshot_upload_body_witness(item)),
                 "head_etag":request.snapshots.iter().any(|s| s.cache_observations.is_some()).then(|| "e".repeat(64))})
         })
         .collect();
@@ -418,7 +418,7 @@ fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
     f.write_rows(false, &f.api[..2]);
     let cached = enriched(
         &f,
-        raw_scan(&f, prior.clone(), Some(cache), |_| {
+        raw_scan(&f, prior.clone(), Some(cache.clone()), |_| {
             f.write_rows(true, &f.trace[..2]);
         }),
     );
@@ -434,6 +434,23 @@ fn mid_acquisition_telemetry_is_joined_freshly_in_both_modes() {
         }),
     );
     assert_eq!(exact_bodies(&cached), exact_bodies(&full));
+    let index = settle(cached);
+    let mut next = enriched(&f, raw_scan(&f, index, Some(cache), |_| {}));
+    assert_eq!(
+        next.modes,
+        (0, 0, 1),
+        "late trace still changes the next selection"
+    );
+    finalize_scan_after_policy_with_body_witness(
+        SOURCE,
+        &mut next.result,
+        &mut next.index,
+        snapshot_upload_body_witness,
+    );
+    assert!(
+        next.result.snapshots.is_empty(),
+        "only the final joined body may be suppressed"
+    );
 }
 
 #[test]
