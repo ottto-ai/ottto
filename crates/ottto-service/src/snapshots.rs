@@ -2255,6 +2255,7 @@ struct ClaudeUsageAuthorityQuarantineRecord {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeUsageAuthorityDisposition {
+    pub(crate) duplicate_census: ClaudeDuplicateCensusCounts,
     quarantined_source_session_ids: BTreeSet<String>,
     pub(crate) mixed_uploads: claude_request_accounts::MixedUploads,
 }
@@ -2431,6 +2432,27 @@ fn claude_duplicate_request_witness_within_bound(
         .map(BTreeSet::len)
         .try_fold(0_usize, |total, count| total.checked_add(count))
         .is_some_and(|total| total <= max_owners)
+}
+
+/// Content-free cause counters for one duplicate-census fold call, reported
+/// only in the local Claude evidence log line. They are observed alongside the
+/// fence and never read back: no gate, hash, index, or upload depends on them.
+/// `fence_after && census_invalid` is an invalid census; `fence_after` without
+/// it is the owner bound. On a terminal pass, an invalid census with no invalid
+/// current-window family came from stale unquarantined pending. Page counters
+/// name which pending check invalidated a family during this call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ClaudeDuplicateCensusCounts {
+    pub census_complete: bool,
+    pub fence_before: bool,
+    pub fence_after: bool,
+    pub census_invalid: bool,
+    pub invalid_current_window_family_count: usize,
+    pub pending_occurrence_count: usize,
+    pub page_invalidated_identity_count: usize,
+    pub page_invalidated_occurrence_mismatch_count: usize,
+    pub page_invalidated_cap_count: usize,
+    pub page_invalidated_member_changed_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3497,12 +3519,14 @@ fn apply_claude_reported_usage_with_index_and_limits(
     max_pending_occurrences: usize,
     max_duplicate_owners: usize,
 ) -> ClaudeUsageAuthorityDisposition {
-    accumulate_claude_usage_family_pending_with_limit(
+    let mut duplicate_census = accumulate_claude_usage_family_pending_with_limit(
         snapshots,
         &mut index.claude_usage_family_pending,
         census_window_end,
         max_pending_occurrences,
     );
+    duplicate_census.census_complete = census_complete;
+    duplicate_census.fence_before = index.claude_duplicate_request_witness_overflowed;
 
     let complete_families = if census_complete {
         complete_claude_usage_family_members(index)
@@ -3714,6 +3738,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
                         claude_usage_authority_preserves_pending(quarantine, witness)
                     })
             });
+    duplicate_census.census_invalid = duplicate_census_invalid;
     let detected_duplicate_request_owners = if census_complete && !duplicate_census_invalid {
         let mut owners = BTreeMap::<String, BTreeSet<(String, String)>>::new();
         for (root_session_id, pending) in &index.claude_usage_family_pending {
@@ -4152,6 +4177,11 @@ fn apply_claude_reported_usage_with_index_and_limits(
         }
         for (root_session_id, pending) in &index.claude_usage_family_pending {
             if pending.invalid || pending.census_window_end != census_window_end {
+                if pending.invalid && pending.census_window_end == census_window_end {
+                    duplicate_census.invalid_current_window_family_count = duplicate_census
+                        .invalid_current_window_family_count
+                        .saturating_add(1);
+                }
                 continue;
             }
             for (source_session_id, current_request_hashes) in &pending.member_request_id_hashes {
@@ -4311,6 +4341,8 @@ fn apply_claude_reported_usage_with_index_and_limits(
             .remove(&root_session_id);
         index.claude_usage_family_pending.remove(&root_session_id);
     }
+    duplicate_census.fence_after = index.claude_duplicate_request_witness_overflowed;
+    disposition.duplicate_census = duplicate_census;
     disposition
 }
 
@@ -4319,7 +4351,8 @@ fn accumulate_claude_usage_family_pending_with_limit(
     pending_by_root: &mut BTreeMap<String, ClaudeUsageFamilyPending>,
     census_window_end: &str,
     max_occurrences: usize,
-) {
+) -> ClaudeDuplicateCensusCounts {
+    let mut counts = ClaudeDuplicateCensusCounts::default();
     let mut retained_occurrence_count = pending_by_root
         .values()
         .flat_map(|pending| pending.member_occurrences.values())
@@ -4362,6 +4395,8 @@ fn accumulate_claude_usage_family_pending_with_limit(
         let Some(hashes) = claude_snapshot_request_id_hashes(item)
             .filter(|_| item.claude_usage_occurrences.len() == item.claude_usage_request_ids.len())
         else {
+            counts.page_invalidated_identity_count =
+                counts.page_invalidated_identity_count.saturating_add(1);
             invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
         };
@@ -4376,6 +4411,9 @@ fn accumulate_claude_usage_family_pending_with_limit(
             })
             .collect::<BTreeMap<_, _>>();
         if occurrences.keys().cloned().collect::<BTreeSet<_>>() != hashes {
+            counts.page_invalidated_occurrence_mismatch_count = counts
+                .page_invalidated_occurrence_mismatch_count
+                .saturating_add(1);
             invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
         }
@@ -4390,6 +4428,7 @@ fn accumulate_claude_usage_family_pending_with_limit(
             occurrences.len(),
             max_occurrences,
         ) else {
+            counts.page_invalidated_cap_count = counts.page_invalidated_cap_count.saturating_add(1);
             invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
         };
@@ -4398,6 +4437,9 @@ fn accumulate_claude_usage_family_pending_with_limit(
             .insert(item.source_session_id.clone(), hashes.clone())
             .is_some_and(|previous| previous != hashes)
         {
+            counts.page_invalidated_member_changed_count = counts
+                .page_invalidated_member_changed_count
+                .saturating_add(1);
             invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
         }
@@ -4406,11 +4448,16 @@ fn accumulate_claude_usage_family_pending_with_limit(
             .insert(item.source_session_id.clone(), occurrences.clone())
             .is_some_and(|previous| previous != occurrences)
         {
+            counts.page_invalidated_member_changed_count = counts
+                .page_invalidated_member_changed_count
+                .saturating_add(1);
             invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
         }
         retained_occurrence_count = next_retained_occurrence_count;
     }
+    counts.pending_occurrence_count = retained_occurrence_count;
+    counts
 }
 
 fn invalidate_claude_usage_family_pending(
@@ -8233,8 +8280,14 @@ struct SnapshotAccumulator {
     activity_call_tools: BTreeMap<String, String>,
     activity_mcp_tool_counts: BTreeMap<String, u64>,
     // Codex MCP calls keyed by the backend's qualified `mcp__<server>__<tool>`
-    // spelling. Fed by the same `mcp_tool_call_end` events as the activity map.
+    // spelling. Fed by the same `mcp_tool_call_end` events as the activity map,
+    // and by `function_call`s that name their server in `payload.namespace`.
     activity_mcp_tool_usage_counts: BTreeMap<String, u64>,
+    // Open call ids already counted as MCP, so a call is counted once whichever
+    // of its namespaced `function_call` and `mcp_tool_call_end` comes first.
+    // The value records whether the completion event (and its capability) was
+    // seen. Like `activity_call_tools`, entries end at `function_call_output`.
+    activity_mcp_call_ids: BTreeMap<String, bool>,
     activity_capability_buckets: BTreeMap<(String, String, String), u64>,
     seen_claude_capability_tool_uses: BTreeSet<String>,
     activity_skills: BTreeSet<String>,
@@ -8403,6 +8456,7 @@ impl SnapshotAccumulator {
             activity_call_tools: BTreeMap::new(),
             activity_mcp_tool_counts: BTreeMap::new(),
             activity_mcp_tool_usage_counts: BTreeMap::new(),
+            activity_mcp_call_ids: BTreeMap::new(),
             activity_capability_buckets: BTreeMap::new(),
             seen_claude_capability_tool_uses: BTreeSet::new(),
             activity_skills: BTreeSet::new(),
@@ -9064,6 +9118,15 @@ impl SnapshotAccumulator {
         *count = count.saturating_sub(1);
         if *count == 0 {
             self.activity_tool_counts.remove(&name);
+        }
+    }
+
+    fn note_activity_mcp_tool(&mut self, server: &str, tool: &str) {
+        if let Some(name) = bounded_activity_label(&format!("{server}.{tool}")) {
+            *self.activity_mcp_tool_counts.entry(name).or_default() += 1;
+        }
+        if let Some(name) = bounded_tool_usage_name(&format!("mcp__{server}__{tool}")) {
+            *self.activity_mcp_tool_usage_counts.entry(name).or_default() += 1;
         }
     }
 
@@ -16071,9 +16134,27 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             Some("function_call" | "custom_tool_call")
         ) {
             if let Some(name) = string_at(value, &["payload", "name"]) {
-                accumulator.note_activity_tool(&name);
-                if payload_type.as_deref() == Some("function_call") {
-                    if let Some(call_id) = string_at(value, &["payload", "call_id"]) {
+                let is_function_call = payload_type.as_deref() == Some("function_call");
+                let call_id = is_function_call
+                    .then(|| string_at(value, &["payload", "call_id"]))
+                    .flatten();
+                let mcp_tool = is_function_call
+                    .then(|| codex_namespaced_mcp_tool(value, &name))
+                    .flatten();
+                if call_id
+                    .as_ref()
+                    .is_some_and(|call_id| accumulator.activity_mcp_call_ids.contains_key(call_id))
+                {
+                    // Already counted as MCP by its completion event.
+                } else if let Some((server, tool)) = mcp_tool {
+                    accumulator.activity_mcp_calls += 1;
+                    accumulator.note_activity_mcp_tool(&server, &tool);
+                    if let Some(call_id) = call_id {
+                        accumulator.activity_mcp_call_ids.insert(call_id, false);
+                    }
+                } else {
+                    accumulator.note_activity_tool(&name);
+                    if let Some(call_id) = call_id {
                         accumulator.activity_call_tools.insert(call_id, name);
                     }
                 }
@@ -16087,6 +16168,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         if payload_type.as_deref() == Some("function_call_output") {
             if let Some(call_id) = string_at(value, &["payload", "call_id"]) {
                 accumulator.activity_call_tools.remove(&call_id);
+                accumulator.activity_mcp_call_ids.remove(&call_id);
             }
         }
     }
@@ -16118,33 +16200,38 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             }
             Some("web_search_end") => accumulator.activity_web_searches += 1,
             Some("mcp_tool_call_end") => {
-                accumulator.activity_mcp_calls += 1;
-                if let Some((capability_id, raw_origin)) = codex_tool_surface_capability(value) {
-                    accumulator.note_capability_call(
-                        timestamp.as_deref(),
-                        capability_id,
-                        raw_origin,
-                    );
-                }
-                if let Some(call_id) = string_at(value, &["payload", "call_id"]) {
-                    accumulator.reclassify_activity_call_as_mcp(&call_id);
-                }
-                let server = string_at(value, &["payload", "app_name"])
-                    .or_else(|| string_at(value, &["payload", "invocation", "server"]));
-                let tool = string_at(value, &["payload", "action_name"])
-                    .or_else(|| string_at(value, &["payload", "invocation", "tool"]));
-                if let (Some(server), Some(tool)) = (server, tool) {
-                    if let Some(name) = bounded_activity_label(&format!("{server}.{tool}")) {
-                        *accumulator
-                            .activity_mcp_tool_counts
-                            .entry(name)
-                            .or_default() += 1;
+                let call_id = string_at(value, &["payload", "call_id"]);
+                let prior = call_id
+                    .as_ref()
+                    .and_then(|call_id| accumulator.activity_mcp_call_ids.get(call_id).copied());
+                // `Some(true)`: a repeated completion event for a counted call.
+                if prior != Some(true) {
+                    if let Some((capability_id, raw_origin)) = codex_tool_surface_capability(value)
+                    {
+                        accumulator.note_capability_call(
+                            timestamp.as_deref(),
+                            capability_id,
+                            raw_origin,
+                        );
                     }
-                    if let Some(name) = bounded_tool_usage_name(&format!("mcp__{server}__{tool}")) {
-                        *accumulator
-                            .activity_mcp_tool_usage_counts
-                            .entry(name)
-                            .or_default() += 1;
+                    if let Some(call_id) = &call_id {
+                        accumulator
+                            .activity_mcp_call_ids
+                            .insert(call_id.clone(), true);
+                    }
+                }
+                // `Some(false)`: the namespaced function_call already counted it.
+                if prior.is_none() {
+                    if let Some(call_id) = &call_id {
+                        accumulator.reclassify_activity_call_as_mcp(call_id);
+                    }
+                    accumulator.activity_mcp_calls += 1;
+                    let server = string_at(value, &["payload", "app_name"])
+                        .or_else(|| string_at(value, &["payload", "invocation", "server"]));
+                    let tool = string_at(value, &["payload", "action_name"])
+                        .or_else(|| string_at(value, &["payload", "invocation", "tool"]));
+                    if let (Some(server), Some(tool)) = (server, tool) {
+                        accumulator.note_activity_mcp_tool(&server, &tool);
                     }
                 }
             }
@@ -16173,6 +16260,31 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             accumulator.latency_ttft_ms_max = accumulator.latency_ttft_ms_max.max(ttft_ms);
         }
     }
+}
+
+/// The explicit MCP server and tool of a Codex `function_call` that names its
+/// server in `payload.namespace` (`mcp__<server>`), as current Codex writes for
+/// MCP tools (for example `js` under `mcp__cua_repl`). The server comes only
+/// from that field: a bare name, a non-MCP namespace or a malformed one yields
+/// `None`, and so does a name already qualified for a different server.
+fn codex_namespaced_mcp_tool(value: &Value, name: &str) -> Option<(String, String)> {
+    let namespace = string_at(value, &["payload", "namespace"])?;
+    let server = namespace.strip_prefix("mcp__")?;
+    if server.is_empty() || server.contains("__") {
+        return None;
+    }
+    let tool = match name.strip_prefix("mcp__") {
+        Some(qualified) => qualified.strip_prefix(server)?.strip_prefix("__")?,
+        None => name
+            .strip_prefix(server)
+            .and_then(|rest| rest.strip_prefix("__"))
+            .unwrap_or(name),
+    };
+    let qualified = format!("mcp__{server}__{tool}");
+    (!tool.is_empty()
+        && qualified.len() <= MAX_TOOL_USAGE_NAME_LENGTH
+        && bounded_tool_usage_name(&qualified).is_some())
+    .then(|| (server.to_string(), tool.to_string()))
 }
 
 fn codex_tool_surface_capability(value: &Value) -> Option<(&'static str, &'static str)> {
@@ -24326,6 +24438,170 @@ mod tests {
         assert_ne!(labels_disabled.snapshot_fingerprint, original_fingerprint);
 
         let _ = fs::remove_file(path);
+    }
+
+    fn parse_codex_activity_fixture(name: &str, lines: &[Value]) -> SnapshotItem {
+        let path = temp_file(name);
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("write transcript");
+        let item = parse_codex_jsonl_file(&path, "2026-10-12T06:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        let _ = fs::remove_file(path);
+        item
+    }
+
+    #[test]
+    fn codex_namespaced_mcp_calls_keep_their_explicit_server_once() {
+        let call = |call_id: &str, name: &str, namespace: Option<&str>| {
+            let mut payload =
+                json!({"type":"function_call","name":name,"call_id":call_id,"arguments":"{}"});
+            if let Some(namespace) = namespace {
+                payload["namespace"] = json!(namespace);
+            }
+            json!({"timestamp":"2026-10-12T06:00:01Z","type":"response_item","payload":payload})
+        };
+        let output = |call_id: &str| json!({"timestamp":"2026-10-12T06:00:01Z","type":"response_item","payload":{"type":"function_call_output","call_id":call_id,"output":"private output"}});
+        let end = |call_id: &str, server: &str, meta: Value| json!({"timestamp":"2026-10-12T06:00:01Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":call_id,"invocation":{"server":server,"tool":"js"},"result":{"Ok":{"_meta":meta}}}});
+        let computer_use = json!({"codex/toolSurface":{"kind":"computerUse","backend":null}});
+        let ns = Some("mcp__cua_repl");
+        let lines = vec![
+            json!({"timestamp":"2026-10-12T06:00:00Z","type":"session_meta","payload":{"id":"namespace-session"}}),
+            // Bare tool name; the server is named only by the namespace.
+            call("n1", "js", ns),
+            output("n1"),
+            // Already qualified, or prefixed with the same server: not re-prefixed.
+            call("n2", "mcp__cua_repl__js", ns),
+            output("n2"),
+            call("n3", "cua_repl__js_reset", ns),
+            // Absent namespace: the bare name stays an ordinary tool; no server
+            // is inferred from the name or from the namespaced calls around it.
+            call("b1", "js", None),
+            output("b1"),
+            // Conflicting, non-MCP and malformed namespaces are not applied.
+            call("x1", "mcp__other__js", ns),
+            call("x2", "spawn_agent", Some("multi_agent_v1")),
+            call("x3", "js", Some("mcp__")),
+            call("x4", "js", Some("mcp__a__b")),
+            // Completion after the call, then a repeated completion.
+            call("o1", "js", ns),
+            end("o1", "cua_repl", computer_use.clone()),
+            end("o1", "cua_repl", computer_use),
+            output("o1"),
+            // Completion before the call, with and without a namespace.
+            end("o2", "cua_repl", json!({})),
+            call("o2", "js", ns),
+            end("o3", "node_repl", json!({})),
+            call("o3", "js", None),
+            output("o2"),
+            output("o3"),
+            call("e1", "exec_command", None),
+            output("e1"),
+            json!({"timestamp":"2026-10-12T06:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"request_count":1},"model":"gpt-5.6"}}}),
+        ];
+        let item = parse_codex_activity_fixture("codex-mcp-namespace", &lines);
+
+        let tool_usage = |name: &str, count: u64| SnapshotToolUsage {
+            name: name.to_string(),
+            count,
+        };
+        assert_eq!(
+            item.tool_usage.as_deref(),
+            Some(
+                &[
+                    tool_usage("mcp__cua_repl__js", 4),
+                    tool_usage("js", 3),
+                    tool_usage("exec_command", 1),
+                    tool_usage("mcp__cua_repl__js_reset", 1),
+                    tool_usage("mcp__node_repl__js", 1),
+                    tool_usage("mcp__other__js", 1),
+                    tool_usage("spawn_agent", 1),
+                ][..]
+            )
+        );
+        let summary = item.activity_summary.as_ref().expect("activity summary");
+        // Twelve function calls, each counted exactly once.
+        assert_eq!(summary.tool_calls, 12);
+        assert_eq!(summary.mcp_calls, 6);
+        assert_eq!(summary.shell_commands, 1);
+        fn count_of(rows: &[SnapshotActivityCount], name: &str) -> Option<u64> {
+            rows.iter()
+                .find(|row| row.name == name)
+                .map(|row| row.count)
+        }
+        assert_eq!(count_of(&summary.mcp_tool_counts, "cua_repl.js"), Some(4));
+        assert_eq!(
+            count_of(&summary.mcp_tool_counts, "cua_repl.js_reset"),
+            Some(1)
+        );
+        assert_eq!(count_of(&summary.mcp_tool_counts, "node_repl.js"), Some(1));
+        assert_eq!(summary.mcp_tool_counts.len(), 3);
+        assert_eq!(count_of(&summary.tool_counts, "js"), Some(3));
+        assert_eq!(count_of(&summary.tool_counts, "mcp__other__js"), Some(1));
+        // Capability comes only from the completion event's explicit tool
+        // surface, once per call; the namespace alone adds none.
+        assert_eq!(summary.capability_counts.len(), 1);
+        assert_eq!(summary.capability_counts[0].capability_id, "computer.use");
+        assert_eq!(summary.capability_counts[0].count, 1);
+        assert!(!serde_json::to_string(&item)
+            .expect("serialize")
+            .contains("private output"));
+
+        // Usage and accounting are independent of the namespace field.
+        let stripped = lines
+            .iter()
+            .cloned()
+            .map(|mut line| {
+                if let Some(payload) = line.get_mut("payload").and_then(Value::as_object_mut) {
+                    payload.remove("namespace");
+                }
+                line
+            })
+            .collect::<Vec<_>>();
+        let legacy = parse_codex_activity_fixture("codex-mcp-namespace-absent", &stripped);
+        assert_eq!(
+            (
+                legacy.input_tokens,
+                legacy.output_tokens,
+                legacy.cache_read_tokens,
+                legacy.reasoning_output_tokens,
+                legacy.request_count,
+            ),
+            (
+                item.input_tokens,
+                item.output_tokens,
+                item.cache_read_tokens,
+                item.reasoning_output_tokens,
+                item.request_count,
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(&legacy.model_usage).expect("model usage"),
+            serde_json::to_value(&item.model_usage).expect("model usage")
+        );
+        assert_eq!(
+            serde_json::to_value(&legacy.usage_buckets).expect("usage buckets"),
+            serde_json::to_value(&item.usage_buckets).expect("usage buckets")
+        );
+        assert_eq!(
+            serde_json::to_value(&legacy.cost).expect("cost"),
+            serde_json::to_value(&item.cost).expect("cost")
+        );
+        assert_eq!(legacy.attribution_facts, item.attribution_facts);
+        let legacy_usage = legacy.tool_usage.as_deref().expect("legacy tool usage");
+        assert!(legacy_usage
+            .iter()
+            .all(|row| row.name != "mcp__cua_repl__js_reset"));
+        assert!(legacy_usage.iter().any(|row| row.name == "js"));
     }
 
     #[test]
@@ -35975,6 +36251,383 @@ mod tests {
         assert!(index.claude_duplicate_request_owners.is_empty());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn claude_census_counts_run(
+        items: &[SnapshotItem],
+        index: &ScanIndex,
+        census_complete: bool,
+        max_pending_occurrences: usize,
+        max_duplicate_owners: usize,
+    ) -> (Vec<SnapshotItem>, ScanIndex, ClaudeDuplicateCensusCounts) {
+        let mut items = items.to_vec();
+        let mut index = index.clone();
+        let mut disposition = apply_claude_reported_usage_with_index_and_limits(
+            &mut items,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            census_complete,
+            "2026-08-02T07:10:00Z",
+            max_pending_occurrences,
+            max_duplicate_owners,
+        );
+        let counts = disposition.duplicate_census;
+        // The counters are the only disposition output of these report-free
+        // folds, and they never reach persisted index or emitted item bytes.
+        disposition.duplicate_census = ClaudeDuplicateCensusCounts::default();
+        assert_eq!(disposition, ClaudeUsageAuthorityDisposition::default());
+        let index_json = serde_json::to_string(&index).expect("serialize index");
+        let items_json = serde_json::to_string(&items).expect("serialize items");
+        for key in ["fence_after", "census_invalid", "page_invalidated"] {
+            assert!(!index_json.contains(key), "index must not carry {key}");
+            assert!(!items_json.contains(key), "items must not carry {key}");
+        }
+        (items, index, counts)
+    }
+
+    fn claude_census_counts_run_twice(
+        items: &[SnapshotItem],
+        index: &ScanIndex,
+        census_complete: bool,
+        max_pending_occurrences: usize,
+        max_duplicate_owners: usize,
+    ) -> (Vec<SnapshotItem>, ScanIndex, ClaudeDuplicateCensusCounts) {
+        let first = claude_census_counts_run(
+            items,
+            index,
+            census_complete,
+            max_pending_occurrences,
+            max_duplicate_owners,
+        );
+        let second = claude_census_counts_run(
+            items,
+            index,
+            census_complete,
+            max_pending_occurrences,
+            max_duplicate_owners,
+        );
+        assert_eq!(
+            serde_json::to_string(&first.0).expect("serialize items"),
+            serde_json::to_string(&second.0).expect("serialize items")
+        );
+        assert_eq!(
+            serde_json::to_string(&first.1).expect("serialize index"),
+            serde_json::to_string(&second.1).expect("serialize index")
+        );
+        for (left, right) in first.0.iter().zip(&second.0) {
+            assert_eq!(left.snapshot_fingerprint, right.snapshot_fingerprint);
+            assert_eq!(
+                snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, left),
+                snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, right)
+            );
+        }
+        assert_eq!(first.2, second.2);
+        first
+    }
+
+    #[test]
+    fn claude_duplicate_census_counts_separate_complete_invalid_and_owner_bound() {
+        let (root, parent, items) = claude_account_family_fixture();
+
+        // Complete valid census: fence stays clear and no cause fires.
+        let (_, _, counts) = claude_census_counts_run_twice(
+            &items,
+            &ScanIndex::default(),
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                pending_occurrence_count: 5,
+                ..Default::default()
+            }
+        );
+
+        // Invalid census from a family whose occurrence proof is incomplete.
+        let mut invalid_items = items.clone();
+        invalid_items[1].claude_usage_occurrences.clear();
+        let (_, invalid_index, counts) = claude_census_counts_run_twice(
+            &invalid_items,
+            &ScanIndex::default(),
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(invalid_index.claude_duplicate_request_witness_overflowed);
+        assert!(invalid_index.claude_duplicate_request_owners.is_empty());
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                census_invalid: true,
+                invalid_current_window_family_count: 1,
+                page_invalidated_identity_count: 1,
+                ..Default::default()
+            }
+        );
+
+        // The same page before the terminal pass: invalid, but the fence and
+        // the terminal-only family count are untouched.
+        let (_, open_index, counts) = claude_census_counts_run_twice(
+            &invalid_items,
+            &ScanIndex::default(),
+            false,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(!open_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_invalid: true,
+                page_invalidated_identity_count: 1,
+                ..Default::default()
+            }
+        );
+
+        // Invalid census from the pending-occurrence cap.
+        let (_, cap_index, counts) = claude_census_counts_run_twice(
+            &items,
+            &ScanIndex::default(),
+            true,
+            1,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(cap_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                census_invalid: true,
+                invalid_current_window_family_count: 1,
+                page_invalidated_cap_count: 1,
+                ..Default::default()
+            }
+        );
+
+        // Invalid census only through stale, unquarantined pending from an
+        // older window: no current-window family is invalid.
+        let mut stale_index = ScanIndex::default();
+        stale_index.claude_usage_family_pending.insert(
+            "stale-root".to_string(),
+            ClaudeUsageFamilyPending {
+                census_window_end: "2026-08-01T00:00:00Z".to_string(),
+                member_request_id_hashes: BTreeMap::new(),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+            },
+        );
+        let (_, stale_after, counts) = claude_census_counts_run_twice(
+            &items,
+            &stale_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(stale_after.claude_duplicate_request_witness_overflowed);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                census_invalid: true,
+                pending_occurrence_count: 5,
+                ..Default::default()
+            }
+        );
+
+        // Owner bound: a valid census whose cross-family duplicates exceed
+        // the owner limit sets the fence without any invalid cause.
+        let copy_id = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let mut copy = items[0].clone();
+        copy.source_session_id = copy_id.to_string();
+        for fact in &mut copy.attribution_facts {
+            if fact.value == parent {
+                fact.value = copy_id.to_string();
+            }
+        }
+        assert_eq!(claude_snapshot_family_root(&copy), copy_id);
+        let mut bound_items = items.clone();
+        bound_items.push(copy);
+        let (_, bound_index, counts) = claude_census_counts_run_twice(
+            &bound_items,
+            &ScanIndex::default(),
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            1,
+        );
+        assert!(bound_index.claude_duplicate_request_witness_overflowed);
+        assert!(bound_index.claude_duplicate_request_owners.is_empty());
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                pending_occurrence_count: 9,
+                ..Default::default()
+            }
+        );
+
+        // Once the copy is gone, the next valid terminal pass clears the fence.
+        let (_, cleared_index, counts) = claude_census_counts_run_twice(
+            &items,
+            &bound_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            1,
+        );
+        assert!(!cleared_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_before: true,
+                pending_occurrence_count: 5,
+                ..Default::default()
+            }
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_duplicate_census_counts_name_each_pending_invalidation_once() {
+        let (root, _, items) = claude_account_family_fixture();
+        let window = "2026-08-02T07:10:00Z";
+        let accumulate = |page: &[SnapshotItem], max_occurrences: usize| {
+            let mut pending = BTreeMap::new();
+            let counts = accumulate_claude_usage_family_pending_with_limit(
+                page,
+                &mut pending,
+                window,
+                max_occurrences,
+            );
+            (pending, counts)
+        };
+
+        let (pending, counts) = accumulate(&items, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+        assert!(pending.values().all(|family| !family.invalid));
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                pending_occurrence_count: 5,
+                ..Default::default()
+            }
+        );
+
+        // Request ids disagree with request_count. A second bad member of the
+        // already-invalid family is skipped, so each family counts once.
+        let mut identity = items.clone();
+        identity[0].request_count = 0;
+        identity[1].claude_usage_occurrences.clear();
+        let (pending, counts) = accumulate(&identity, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+        assert!(pending.values().all(|family| family.invalid));
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                page_invalidated_identity_count: 1,
+                ..Default::default()
+            }
+        );
+
+        // Occurrence keys differ from the request-id set at equal length.
+        let mut mismatch = items.clone();
+        let (_, occurrence) = mismatch[0]
+            .claude_usage_occurrences
+            .pop_first()
+            .expect("parent occurrence");
+        mismatch[0]
+            .claude_usage_occurrences
+            .insert("req_not_in_ids".to_string(), occurrence);
+        let (pending, counts) = accumulate(&mismatch, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+        assert!(pending.values().all(|family| family.invalid));
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                page_invalidated_occurrence_mismatch_count: 1,
+                ..Default::default()
+            }
+        );
+
+        // The bounded pending-occurrence cap.
+        let (pending, counts) = accumulate(&items, 4);
+        assert!(pending.values().all(|family| family.invalid));
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                page_invalidated_cap_count: 1,
+                ..Default::default()
+            }
+        );
+
+        // The same member seen again in one window with other request ids.
+        let mut changed = items[0].clone();
+        let request_id = changed
+            .claude_usage_request_ids
+            .pop_first()
+            .expect("parent request id");
+        changed.claude_usage_occurrences.remove(&request_id);
+        changed.request_count -= 1;
+        let (pending, counts) = accumulate(
+            &[items[0].clone(), changed],
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        );
+        assert!(pending.values().all(|family| family.invalid));
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                page_invalidated_member_changed_count: 1,
+                ..Default::default()
+            }
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_duplicate_census_counts_encoding_is_bounded() {
+        let max = ClaudeDuplicateCensusCounts {
+            census_complete: true,
+            fence_before: true,
+            fence_after: true,
+            census_invalid: true,
+            invalid_current_window_family_count: usize::MAX,
+            pending_occurrence_count: usize::MAX,
+            page_invalidated_identity_count: usize::MAX,
+            page_invalidated_occurrence_mismatch_count: usize::MAX,
+            page_invalidated_cap_count: usize::MAX,
+            page_invalidated_member_changed_count: usize::MAX,
+        };
+        let encoded = serde_json::to_string(&max).expect("encode counters");
+        assert!(encoded.len() <= 424, "{} bytes", encoded.len());
+
+        let stats = crate::snapshot_sync::ClaudeLocalEvidenceStats {
+            duplicate_census: max,
+            ..Default::default()
+        };
+        let line = serde_json::to_string(&stats).expect("encode stats");
+        let mut without = serde_json::to_value(&stats).expect("stats value");
+        let nested = without
+            .as_object_mut()
+            .expect("stats object")
+            .remove("duplicate_census")
+            .expect("nested counters");
+        assert_eq!(nested, serde_json::to_value(max).expect("counters value"));
+        let baseline = serde_json::to_string(&without).expect("encode baseline");
+        assert!(
+            line.len() - baseline.len() <= 424 + r#","duplicate_census":"#.len(),
+            "line grew by {} bytes",
+            line.len() - baseline.len()
+        );
     }
 
     #[test]
@@ -53347,7 +54000,7 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
