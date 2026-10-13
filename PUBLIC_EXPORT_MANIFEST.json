@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 553,
-  "content_sha256": "98f288a1ec12ffb37f6149c912257576acd578b0c6be6edc9a1a8231db7c82b4",
+  "candidate_file_count": 555,
+  "content_sha256": "9408ab825dbe6d2d1e277d0c14a88c110b0feee8d95f8aa06473493bb29cc81f",
   "files": [
     {
       "executable": false,
@@ -55,8 +55,8 @@
       "executable": false,
       "mode": "0644",
       "path": "CONTRIBUTING.md",
-      "sha256": "b0211be248275fe031ef5f4d391ce73ac2d81757e1d03c352b085f194588e368",
-      "size_bytes": 2517
+      "sha256": "3f733e0e5174c5e87cc76e87093d24d7b83e76dda5e0d9dd9273d9eabb1279cf",
+      "size_bytes": 2938
     },
     {
       "executable": false,
@@ -461,8 +461,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/Cargo.toml",
-      "sha256": "35e3dc445d9425dd82d76f64fead1162c56158d4917b765d688435c0ceed671e",
-      "size_bytes": 398
+      "sha256": "cd3742ac220dfe387904a56f20e4a8b6ff1916b9e8962b311825770f5e838c16",
+      "size_bytes": 492
     },
     {
       "executable": false,
@@ -510,8 +510,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/Cargo.toml",
-      "sha256": "139fa6c7ae9d44c9977ec364857ec9d59fd3383149e124cde1d967881111b9bf",
-      "size_bytes": 555
+      "sha256": "f6992a8ca2aae9145552b18285a7aad70cc5817b6135280427ae57e8b4bcb008",
+      "size_bytes": 738
     },
     {
       "executable": false,
@@ -594,8 +594,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/token_store.rs",
-      "sha256": "765593e70cdd182e090c45ecb84e05c379b1d108a834e30c77e79c0b5035a431",
-      "size_bytes": 38323
+      "sha256": "bed54e70d12734d5c453736317624720cb9d33aaeec6f124b2750865d42277ad",
+      "size_bytes": 39859
     },
     {
       "executable": false,
@@ -615,8 +615,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/Cargo.toml",
-      "sha256": "f20deb32d00e55c8b28d9a2738f252aeb45b856c963dad4fa525f59be27fb41f",
-      "size_bytes": 1064
+      "sha256": "75d3aa575618eb1fa06b9597d8252afab601a1571285f2ead010b5428f0325cd",
+      "size_bytes": 1138
     },
     {
       "executable": false,
@@ -902,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/keychain.rs",
-      "sha256": "581350863e8ed282fab516e601459e164e47f9ca812d884b6338e08740684f46",
-      "size_bytes": 29800
+      "sha256": "fbae2593cccf184ba0cc8ea6cc5edc230985a33a35dc5f0afdcfa2c1cfb321ea",
+      "size_bytes": 29973
     },
     {
       "executable": false,
@@ -1296,6 +1296,13 @@
       "path": "crates/ottto-service/src/xpc_shim.c",
       "sha256": "18cb4dd14250110630e8467497a667dff06642801dc2cd7e9e3b6f14ebcab3df",
       "size_bytes": 3658
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/tests/test_secret_isolation.rs",
+      "sha256": "ae3dceda8df72b07aaef408e18882f964bd65e7eb46f493062667f40714f0184",
+      "size_bytes": 2951
     },
     {
       "executable": false,
@@ -2577,6 +2584,13 @@
       "path": "docs/session-2026-10-12-partial-snapshot-ack-settlement.md",
       "sha256": "86f89c80d74d2ebdb24a35e85fde5b04ac4fc6a40a0456e17766d45adf220d22",
       "size_bytes": 4302
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-12-test-secret-isolation.md",
+      "sha256": "aff303012a74c1e8d2c8ff55516556c068aa4f4713428013de660edd32dbaab4",
+      "size_bytes": 1365
     },
     {
       "executable": false,
@@ -3874,9 +3888,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-12T18:14:49+00:00",
+  "generated_at": "2026-10-13T00:22:02+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 554,
+  "output_file_count": 556,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3913,5 +3927,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "4521b0ac907dbee7799df43f11da50cba18c556d"
+  "source_commit": "174cfb81397ee588d545f19e2425215fe364ba0b"
 }
