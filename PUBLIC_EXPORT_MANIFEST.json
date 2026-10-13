@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 558,
-  "content_sha256": "82736f3a40eace333860651ee484fb9da59ac898e55d7b671e10f559c82cac0a",
+  "content_sha256": "3fdae19f235c55d338cdec5b3569dbba79eaa18dde37b06ac5a6162cfe09a90d",
   "files": [
     {
       "executable": false,
@@ -1119,15 +1119,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "1214e9fe914db7b741f979f19a4cfa944b501d7952afd968e7d35bbed3da2fd7",
-      "size_bytes": 736668
+      "sha256": "ab68ef4b69c84744a5e3255f783dcc0121e80f8a3b9e91630303eed24d198814",
+      "size_bytes": 739690
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/h357_ack_tests.rs",
-      "sha256": "f1167367f88a1756f11a996e592b93575ee30d1ab2674d3f4c2118e4d1ae21a6",
-      "size_bytes": 24877
+      "sha256": "4b2ae43ba1ef69a2dbcc3560515c855c648a21d4f8e6100c368dc116f1830fcf",
+      "size_bytes": 63022
     },
     {
       "executable": false,
@@ -2616,6 +2616,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-14-cache-head-source-progress.md",
+      "sha256": "e4468661022fcb2250736ff9aefe80d15384ce2d05b01b16359cf11c26951fbc",
+      "size_bytes": 2249
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-account-binding.md",
       "sha256": "0df88032d9b2b33e7383a4da9f1d753b1311787f0871a52cd37794bd674a4b87",
       "size_bytes": 1708
@@ -3909,9 +3916,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-13T05:36:03+00:00",
+  "generated_at": "2026-10-13T23:27:31+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 559,
+  "output_file_count": 560,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3948,5 +3955,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "12ef846de480c8541f259dd39c4d2835253ca57b"
+  "source_commit": "ca74534adc7350ab1b21e959053f361f4b104016"
 }
