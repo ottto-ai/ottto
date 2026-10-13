@@ -28,7 +28,8 @@ impl Fixture {
             .map(str::to_owned)
             .collect();
         let fixture = Self {
-            support: dir.join("support"),
+            // Evidence is outside the scanned transcript tree, as in production.
+            support: dir.with_extension("sidecar-evidence"),
             dir,
             path,
             api: api.evidence.remove(&session).unwrap(),
@@ -111,6 +112,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
+        let _ = fs::remove_dir_all(&self.support);
     }
 }
 
@@ -144,7 +146,12 @@ fn raw_scan(
         scan = scan.with_sampled_acquisition(cache, Scope("sidecar-fixture".into()));
     }
     let mut injected = false;
+    // These fixtures contain at most three transcripts and four requests.
+    // Bound only the test driver so a scanner livelock fails explicitly.
+    let mut steps = 0;
     loop {
+        steps += 1;
+        assert!(steps <= 10_000, "small synthetic scan did not complete");
         if !injected && scan.active_file.is_some() {
             injected = true;
             after_start(&mut scan);
