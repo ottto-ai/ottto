@@ -3815,6 +3815,7 @@ fn finish_sync_source(
         source,
         &scan_result.snapshots,
         Some(&reconciliation_status),
+        upload_policy,
         &current_rfc3339(),
     )
     .is_err()

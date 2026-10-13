@@ -25,9 +25,17 @@ while Claude cards showed many. Two daemon behaviors caused it.
   sessions this scan did not re-select while their `source_last_activity_at`
   is inside the same 15-minute window (and not more than five minutes ahead).
   Entry still requires advanced activity, so title-sidecar refreshes and
-  historical backfill still do not create rows. Carried rows keep their
-  attribution and Claude registration provenance from when they were selected.
+  historical backfill still do not create rows.
+- A listed session that the scan re-read without new activity is rebuilt from
+  that snapshot, so the current upload policy and account evidence apply.
+- A listed session the scan did not re-read is carried only when the upload
+  privacy policy is unchanged since it was listed (the policy is stored in the
+  local cache as `listed_under_policy`). It keeps its Claude registration
+  provenance. It loses its account attribution when a current exact session
+  observation names a different account, or when its current-login fallback
+  no longer matches the current login.
 - `changed_session_count` keeps its meaning: sessions advanced in this scan.
+- `reconcile_active_sessions` takes the scan's `SnapshotUploadPolicy`.
 - New `active_sessions::clear_active_sessions` empties the list without
   carrying anything. The policy-tombstone and reconciliation-disabled paths in
   `snapshot_sync` use it.
@@ -50,8 +58,16 @@ separate scan-cost issue and is not addressed here.
 ## Tests
 
 Synthetic only. `cargo fmt --check` and
-`cargo clippy -p ottto-service --all-targets -D warnings` clean. Focused
-`active_sessions` (33), `snapshot_sync` (195) and `claude_credit_pools` (55)
-tests pass, including the new
-`keeps_recent_sessions_listed_until_their_activity_leaves_the_window` and
+`cargo clippy --workspace --all-targets -D warnings` clean. The full
+`ottto-service` lib suite passes (2611; `CLAUDE_CONFIG_DIR` unset, since the
+Claude login tests read it from the environment). New tests:
+`keeps_recent_sessions_listed_until_their_activity_leaves_the_window`,
+`rebuilds_a_listed_session_re_read_without_new_activity`,
+`does_not_carry_unread_sessions_across_an_upload_policy_change`,
+`withholds_carried_attribution_that_current_evidence_contradicts`,
 `clearing_a_withdrawn_source_does_not_carry_recent_sessions`.
+
+AutoReview (strict, Codex): the first two discovery calls returned reports the
+tool rejected as invalid. A third call found two real defects in the first
+draft: carried rows bypassed a newly disabled title/label policy, and carried
+attribution ignored contradicting evidence. Both are fixed above.

@@ -23,6 +23,7 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use crate::snapshots::{
     bounded_compaction_timestamps, SnapshotItem, SnapshotModelUsage, SnapshotSource,
+    SnapshotUploadPolicy,
 };
 
 const ACTIVE_ACTIVITY_WINDOW_MINUTES: i64 = 15;
@@ -40,6 +41,10 @@ struct ActiveSessionCache {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     registration_evidence:
         BTreeMap<String, crate::claude_session_registrations::RegistrationEvidence>,
+    /// Upload privacy policy the listed rows were derived under. A row is
+    /// carried without re-reading its transcript only under the same policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    listed_under_policy: Option<String>,
 }
 
 pub fn active_session_cache_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
@@ -60,15 +65,17 @@ pub fn reconcile_active_sessions(
     source: SnapshotSource,
     snapshots: &[SnapshotItem],
     agent_status: Option<&AgentStatusSnapshot>,
+    upload_policy: SnapshotUploadPolicy,
     reconciled_at: &str,
 ) -> Result<ActiveSessionReconciliation> {
+    let policy = serde_json::to_string(&upload_policy)?;
     reconcile_with_registrations(
         support_dir,
         source,
         snapshots,
         agent_status,
         reconciled_at,
-        true,
+        Some(&policy),
         crate::agent_status::claude_session_registrations,
     )
 }
@@ -86,7 +93,7 @@ pub fn clear_active_sessions(
         &[],
         None,
         reconciled_at,
-        false,
+        None,
         crate::agent_status::claude_session_registrations,
     )
 }
@@ -97,7 +104,7 @@ fn reconcile_with_registrations(
     snapshots: &[SnapshotItem],
     agent_status: Option<&AgentStatusSnapshot>,
     reconciled_at: &str,
-    carry_recent: bool,
+    carry_policy: Option<&str>,
     registrations: impl FnOnce() -> crate::claude_session_registrations::Registrations,
 ) -> Result<ActiveSessionReconciliation> {
     let path = active_session_cache_path(support_dir, source);
@@ -110,6 +117,9 @@ fn reconcile_with_registrations(
 
     let mut changed = BTreeMap::<String, ActiveSession>::new();
     let mut selected_snapshots = BTreeMap::new();
+    // Recent snapshots this scan re-read without advanced activity. A listed
+    // session among them is rebuilt under the current policy and evidence.
+    let mut observed = BTreeMap::<&str, &SnapshotItem>::new();
     for snapshot in snapshots {
         let Some(last_activity) = snapshot.source_last_activity_at.as_deref() else {
             continue;
@@ -129,6 +139,15 @@ fn reconcile_with_registrations(
                 active_session_from_snapshot(source, snapshot, agent_status),
             );
             selected_snapshots.insert(snapshot.source_session_id.clone(), snapshot);
+        } else if last_activity_at >= activity_cutoff && last_activity_at <= activity_ceiling {
+            let newer = observed
+                .get(snapshot.source_session_id.as_str())
+                .map_or(true, |seen| {
+                    seen.source_last_activity_at < snapshot.source_last_activity_at
+                });
+            if newer {
+                observed.insert(snapshot.source_session_id.as_str(), snapshot);
+            }
         }
         if advanced {
             cache.watermarks.insert(
@@ -163,6 +182,43 @@ fn reconcile_with_registrations(
     let changed_session_count = changed.len() as u64;
     let mut sessions = changed.into_values().collect::<Vec<_>>();
     let previous_evidence = std::mem::take(&mut cache.registration_evidence);
+    // Keep still-recent sessions this scan did not select: an incremental scan
+    // omits unchanged transcripts, and a quiet minute is not an ended session.
+    let previous = cache
+        .reconciliation
+        .take()
+        .map(|reconciliation| reconciliation.sessions)
+        .unwrap_or_default();
+    let carry_unobserved =
+        carry_policy.is_some_and(|policy| cache.listed_under_policy.as_deref() == Some(policy));
+    let mut carried = Vec::new();
+    if carry_policy.is_some() {
+        for mut session in previous {
+            if selected_snapshots.contains_key(&session.source_session_id) {
+                continue;
+            }
+            if let Some(snapshot) = observed.get(session.source_session_id.as_str()) {
+                sessions.push(active_session_from_snapshot(source, snapshot, agent_status));
+                selected_snapshots.insert(session.source_session_id.clone(), snapshot);
+                continue;
+            }
+            let recent = OffsetDateTime::parse(&session.source_last_activity_at, &Rfc3339)
+                .is_ok_and(|at| at >= activity_cutoff && at <= activity_ceiling);
+            if !carry_unobserved || !recent {
+                continue;
+            }
+            if let Some(status) = agent_status {
+                withhold_contradicted_attribution(&mut session, status);
+            }
+            if let Some(evidence) = previous_evidence.get(&session.source_session_id) {
+                cache
+                    .registration_evidence
+                    .insert(session.source_session_id.clone(), evidence.clone());
+            }
+            carried.push(session);
+        }
+    }
+    cache.listed_under_policy = carry_policy.map(str::to_string);
     if source == SnapshotSource::ClaudeCode && !sessions.is_empty() {
         let registrations = registrations();
         for session in &mut sessions {
@@ -227,35 +283,7 @@ fn reconcile_with_registrations(
             }
         }
     }
-    // Carry still-recent sessions this scan did not re-select: an incremental
-    // scan omits unchanged transcripts, and a quiet minute is not an ended
-    // session. Carried rows keep the attribution and display provenance proven
-    // when they were selected.
-    let previous = cache
-        .reconciliation
-        .take()
-        .map(|reconciliation| reconciliation.sessions)
-        .unwrap_or_default();
-    if carry_recent {
-        let selected = sessions
-            .iter()
-            .map(|session| session.source_session_id.clone())
-            .collect::<BTreeSet<_>>();
-        for session in previous {
-            let recent = OffsetDateTime::parse(&session.source_last_activity_at, &Rfc3339)
-                .is_ok_and(|at| at >= activity_cutoff && at <= activity_ceiling);
-            if !recent || selected.contains(&session.source_session_id) {
-                continue;
-            }
-            if let Some(evidence) = previous_evidence.get(&session.source_session_id) {
-                cache
-                    .registration_evidence
-                    .entry(session.source_session_id.clone())
-                    .or_insert_with(|| evidence.clone());
-            }
-            sessions.push(session);
-        }
-    }
+    sessions.extend(carried);
     sessions.sort_by(|left, right| {
         right
             .source_last_activity_at
@@ -278,6 +306,37 @@ fn reconcile_with_registrations(
     cache.reconciliation = Some(reconciliation.clone());
     write_cache(&path, &cache)?;
     Ok(reconciliation)
+}
+
+/// A carried row keeps the attribution proven when it was selected, unless the
+/// current status now contradicts it: a different or conflicting exact session
+/// observation, or a current-login fallback for a login that has changed.
+fn withhold_contradicted_attribution(session: &mut ActiveSession, status: &AgentStatusSnapshot) {
+    let Some(account_hash) = session.account_identifier_hash.as_deref() else {
+        return;
+    };
+    let mut exact = status
+        .plan_observations
+        .iter()
+        .filter(|observation| {
+            observation.source_session_id.as_deref() == Some(session.source_session_id.as_str())
+        })
+        .filter_map(|observation| observation.account_identifier_hash.as_deref())
+        .filter(|hash| non_empty(hash));
+    let contradicted = exact.any(|hash| hash != account_hash)
+        || (session.account_attribution_source.as_deref()
+            == Some("current_login_at_reconciliation")
+            && status
+                .account
+                .as_ref()
+                .and_then(|account| account.account_identifier_hash.as_deref())
+                != Some(account_hash));
+    if contradicted {
+        session.account_identifier_hash = None;
+        session.organization_identifier_hash = None;
+        session.subscription_product = None;
+        session.account_attribution_source = None;
+    }
 }
 
 fn active_session_from_snapshot(
@@ -943,6 +1002,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&snapshot),
             None,
+            test_policy(),
             "2026-07-19T10:05:00Z",
         )
         .expect("reconciliation");
@@ -999,7 +1059,7 @@ mod tests {
             &snapshots,
             None,
             "2026-07-19T10:05:00Z",
-            true,
+            Some("policy"),
             registrations,
         )
         .unwrap();
@@ -1057,7 +1117,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             "2026-07-19T10:05:00Z",
-            true,
+            Some("policy"),
             registrations,
         )
         .unwrap();
@@ -1085,13 +1145,14 @@ mod tests {
             .unwrap()
             .get("registration_evidence")
             .is_none());
+        // An incremental scan omits the unchanged transcript entirely.
         let unchanged = reconcile_with_registrations(
             &dir,
             SnapshotSource::ClaudeCode,
-            &[snapshot],
+            &[],
             None,
             "2026-07-19T10:10:00Z",
-            true,
+            Some("policy"),
             || panic!("no registration acquisition without new activity"),
         )
         .unwrap();
@@ -1115,7 +1176,7 @@ mod tests {
             &[],
             None,
             "2026-07-19T10:30:00Z",
-            true,
+            Some("policy"),
             || panic!("no registration acquisition without new activity"),
         )
         .unwrap();
@@ -1142,7 +1203,7 @@ mod tests {
             &[older, newer],
             None,
             "2026-07-19T10:05:00Z",
-            true,
+            Some("policy"),
             registrations,
         )
         .unwrap();
@@ -1177,7 +1238,7 @@ mod tests {
                 std::slice::from_ref(&snapshot),
                 None,
                 "2026-07-19T10:05:00Z",
-                true,
+                Some("policy"),
                 registrations,
             )
             .unwrap();
@@ -1200,7 +1261,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             "2026-07-19T10:05:00Z",
-            true,
+            Some("policy"),
             registrations,
         )
         .unwrap();
@@ -1221,7 +1282,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             "2026-07-19T10:05:00Z",
-            true,
+            Some("policy"),
             BTreeMap::new,
         )
         .unwrap();
@@ -1235,12 +1296,22 @@ mod tests {
             &[],
             None,
             "2026-07-19T10:30:00Z",
-            true,
+            Some("policy"),
             || panic!("no registry scan for empty source"),
         )
         .unwrap();
         assert!(empty.sessions.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn test_policy() -> SnapshotUploadPolicy {
+        SnapshotUploadPolicy {
+            session_titles_enabled: true,
+            workspace_labels_enabled: true,
+            session_artifacts_enabled: true,
+            session_attribution_enabled: true,
+            session_attribution_labels_enabled: true,
+        }
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -1256,6 +1327,7 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
+            test_policy(),
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1270,6 +1342,7 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
+            test_policy(),
             "2026-07-19T10:10:00Z",
         )
         .expect("unchanged reconciliation");
@@ -1287,6 +1360,7 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&busy),
             None,
+            test_policy(),
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1298,6 +1372,7 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             None,
+            test_policy(),
             "2026-07-19T10:15:00Z",
         )
         .expect("quiet reconciliation");
@@ -1311,6 +1386,7 @@ mod tests {
             SnapshotSource::Codex,
             &[busy.clone(), other],
             None,
+            test_policy(),
             "2026-07-19T10:17:00Z",
         )
         .expect("mixed reconciliation");
@@ -1328,6 +1404,7 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             None,
+            test_policy(),
             "2026-07-19T10:20:00Z",
         )
         .expect("later reconciliation");
@@ -1342,6 +1419,133 @@ mod tests {
     }
 
     #[test]
+    fn rebuilds_a_listed_session_re_read_without_new_activity() {
+        let dir = temp_dir("rebuilt");
+        let snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
+        let first = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            std::slice::from_ref(&snapshot),
+            None,
+            test_policy(),
+            "2026-07-19T10:05:00Z",
+        )
+        .expect("first reconciliation");
+        assert!(first.sessions[0].session_display_name.is_some());
+
+        // The workspace disabled titles; the re-read snapshot carries none.
+        let mut stripped = snapshot.clone();
+        stripped.session_display_name = None;
+        let policy = SnapshotUploadPolicy {
+            session_titles_enabled: false,
+            ..test_policy()
+        };
+        let rebuilt = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[stripped],
+            None,
+            policy,
+            "2026-07-19T10:08:00Z",
+        )
+        .expect("rebuilt reconciliation");
+        assert_eq!(rebuilt.changed_session_count, 0);
+        assert_eq!(rebuilt.sessions.len(), 1);
+        assert!(rebuilt.sessions[0].session_display_name.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn does_not_carry_unread_sessions_across_an_upload_policy_change() {
+        let dir = temp_dir("policy-change");
+        let snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
+        reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            std::slice::from_ref(&snapshot),
+            None,
+            test_policy(),
+            "2026-07-19T10:05:00Z",
+        )
+        .expect("first reconciliation");
+        let policy = SnapshotUploadPolicy {
+            workspace_labels_enabled: false,
+            ..test_policy()
+        };
+        let changed = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            None,
+            policy,
+            "2026-07-19T10:08:00Z",
+        )
+        .expect("policy-change reconciliation");
+        assert!(changed.sessions.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn withholds_carried_attribution_that_current_evidence_contradicts() {
+        let dir = temp_dir("carried-attribution");
+        let mut snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
+        snapshot.model_usage[0].account_identifier_hash = Some("account-a".into());
+        snapshot.usage_buckets[0].model_usage[0].account_identifier_hash = Some("account-a".into());
+        let status = test_status();
+        let first = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            std::slice::from_ref(&snapshot),
+            Some(&status),
+            test_policy(),
+            "2026-07-19T10:05:00Z",
+        )
+        .expect("first reconciliation");
+        assert_eq!(
+            first.sessions[0].account_identifier_hash.as_deref(),
+            Some("account-a")
+        );
+
+        let agreeing = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            Some(&status),
+            test_policy(),
+            "2026-07-19T10:06:00Z",
+        )
+        .expect("agreeing reconciliation");
+        assert_eq!(
+            agreeing.sessions[0].account_identifier_hash.as_deref(),
+            Some("account-a")
+        );
+
+        let mut conflicting = test_status();
+        conflicting.plan_observations.push(test_plan_observation(
+            "s1",
+            "account-b",
+            AgentStatusConfidence::High,
+        ));
+        let withheld = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            Some(&conflicting),
+            test_policy(),
+            "2026-07-19T10:07:00Z",
+        )
+        .expect("conflicting reconciliation");
+        assert_eq!(withheld.sessions.len(), 1);
+        assert!(withheld.sessions[0].account_identifier_hash.is_none());
+        assert!(withheld.sessions[0].organization_identifier_hash.is_none());
+        assert!(withheld.sessions[0].account_attribution_source.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn clearing_a_withdrawn_source_does_not_carry_recent_sessions() {
         let dir = temp_dir("cleared");
         let snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
@@ -1350,6 +1554,7 @@ mod tests {
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
+            test_policy(),
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1362,6 +1567,7 @@ mod tests {
             SnapshotSource::Codex,
             &[],
             None,
+            test_policy(),
             "2026-07-19T10:07:00Z",
         )
         .expect("next reconciliation");

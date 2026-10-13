@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 557,
-  "content_sha256": "53992412903961e23f3067a7e913b4a093b0a0450536d869af79d5beaff92860",
+  "content_sha256": "b2cdc7581931a1388350ccf58f91d1dccaff820a30d9240ba70194bdd57e52a3",
   "files": [
     {
       "executable": false,
@@ -629,8 +629,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/active_sessions.rs",
-      "sha256": "ecd94081e0c4ad8ce7d3e57f4ac7c56548b1158eb7a75fe8ab9048faeb82e701",
-      "size_bytes": 76825
+      "sha256": "872c434645a48d349ea1170f088e0a766a6f2c16d9a6af46e228afd3eced6eb6",
+      "size_bytes": 84769
     },
     {
       "executable": false,
@@ -1119,8 +1119,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "53e70d8153cc21fa4094381a0eb8cd7eacd00e17fc3567ca5c67d4953cf1bcc5",
-      "size_bytes": 736646
+      "sha256": "7cca7197d79979beb34a2eec5df649c620760e56dad60692938a1b3f783b6ca8",
+      "size_bytes": 736669
     },
     {
       "executable": false,
@@ -2596,8 +2596,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-13-active-sessions-carry-recent.md",
-      "sha256": "636a3eee08ba97c0fe20a13942f23ab676adc60efa6575ff043dfd48d0edb88c",
-      "size_bytes": 2805
+      "sha256": "a02015c51e69b292094eb5df946634af3fb4037921dd5126aab573e8b4eb1ea9",
+      "size_bytes": 3858
     },
     {
       "executable": false,
@@ -2617,8 +2617,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-surfaces.md",
-      "sha256": "fbf59e1c9cd26926808e7af0c22a163c22d98206e48d037975f512be5fc01e7d",
-      "size_bytes": 2659
+      "sha256": "3fedd140dd9fb282b477184e4b4eee85fad4375e8c9e20bcb3d84fc8444ba987",
+      "size_bytes": 2908
     },
     {
       "executable": false,
@@ -3902,7 +3902,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-13T14:35:01+00:00",
+  "generated_at": "2026-10-13T15:01:25+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 558,
   "public_roots": [
@@ -3941,5 +3941,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "0ed43b6bbb2ad37ad768414b093e565645b9c2f6"
+  "source_commit": "5728516cedf099e162b753b81b79acc4a5bc0679"
 }
