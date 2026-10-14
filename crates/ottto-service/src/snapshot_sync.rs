@@ -253,6 +253,41 @@ fn exclude_held_effective_body_witness_revision(
     index.exclude_effective_upload_body_witness_revision_for_source_files(&source_files);
 }
 
+/// Commit a `Completed` upload that left local holds. Every uploaded entity was
+/// accepted or unchanged; only the held revisions are unsettled.
+///
+/// A hold that the same traversal could still change (`progress_blocking`,
+/// which includes any RetryPending authority family) keeps the conservative
+/// partial commit and marks the sweep unsettled, so the generation needs one
+/// clean follow-up. Otherwise every hold is non-progressing: held keys keep
+/// their committed revision, every other key commits as the no-hold save
+/// would, and the traversal may settle. The caller keeps backfill and replay
+/// completion pending, and the durable hold disclosure keeps health red.
+fn commit_completed_with_local_holds(
+    index: ScanIndex,
+    committed_index: &ScanIndex,
+    upload_progress: &SnapshotUploadProgress,
+    locally_held_fingerprints: &BTreeSet<String>,
+    account_deferred_held_fingerprints: &BTreeSet<String>,
+    progress_blocking: bool,
+) -> ScanIndex {
+    if !progress_blocking {
+        return index.with_locally_held_keys_reverted(
+            committed_index,
+            locally_held_fingerprints,
+            account_deferred_held_fingerprints,
+        );
+    }
+    let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
+    accepted_fingerprints.retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
+    let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
+    server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
+    let mut index =
+        index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine);
+    index.mark_bounded_sweep_unsettled();
+    index
+}
+
 #[derive(Debug)]
 struct DeferredCacheHeadIdentity {
     source_file_fingerprint: Option<String>,
@@ -2026,6 +2061,13 @@ impl SyncCounts {
         self.terminal_ownership_incomplete_file_count = self
             .terminal_ownership_incomplete_file_count
             .saturating_add(self.snapshot_unproven_terminal_count);
+        // Account-deferred holds are retried every generation, so they are
+        // disclosed as incomplete ownership but never as settled residue: the
+        // public count exceeds the terminal share and the receipt stays
+        // unsettled for as long as any hold persists.
+        self.ownership_incomplete_file_count = self
+            .ownership_incomplete_file_count
+            .saturating_add(index.claude_account_deferred_hold_count() as u64);
         self
     }
 }
@@ -3914,6 +3956,22 @@ fn finish_sync_source(
         claude_authority_disposition.quarantined_entity_count();
     let locally_held_fingerprints =
         claude_authority_disposition.quarantined_fingerprints(&scan_result.snapshots);
+    let account_deferred_held_fingerprints =
+        claude_authority_disposition.account_deferred_fingerprints(&scan_result.snapshots);
+    // Durable before upload, so every checkpoint below carries the disclosure.
+    // Only Claude account deferrals are settled this way; other sources keep
+    // every account deferral progress-blocking.
+    let account_holds_recorded = source == SnapshotSource::ClaudeCode
+        && index.record_claude_account_deferred_holds(
+            scan_result.completed_parses(),
+            &account_deferred_held_fingerprints,
+        );
+    let progress_blocking_held_fingerprints = claude_authority_disposition
+        .progress_blocking_held_fingerprints(
+            &scan_result.snapshots,
+            &index,
+            account_holds_recorded,
+        );
     claude_authority_disposition.retain_uploadable(&mut scan_result.snapshots);
     let deferred_local_authority_count = index.claude_usage_authority_pending_count();
 
@@ -4129,18 +4187,15 @@ fn finish_sync_source(
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
             if deferred_local_authority_count > 0 || deferred_local_authority_entity_count > 0 {
-                let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
-                accepted_fingerprints
-                    .retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
-                let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
-                server_quarantine
-                    .retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
-                index = index.committable_subset(
+                index = commit_completed_with_local_holds(
+                    index,
                     &committed_index,
-                    &accepted_fingerprints,
-                    &server_quarantine,
+                    &upload_progress,
+                    &locally_held_fingerprints,
+                    &account_deferred_held_fingerprints,
+                    deferred_local_authority_count > 0
+                        || !progress_blocking_held_fingerprints.is_empty(),
                 );
-                index.mark_bounded_sweep_unsettled();
                 backfill_succeeded = false;
                 upload_fully_settled = false;
                 eprintln!(
@@ -14232,6 +14287,164 @@ mod tests {
         assert_eq!(receipt["last_error_code"], "parse_error");
         assert_eq!(receipt["consecutive_failures"], 1);
         assert!(receipt["last_success_at"].is_null());
+    }
+
+    fn claude_index_with(entries: serde_json::Value) -> ScanIndex {
+        let mut serialized = serde_json::to_value(ScanIndex::default()).expect("serialize index");
+        let object = serialized.as_object_mut().expect("index is an object");
+        for (key, value) in entries.as_object().expect("entries are an object") {
+            object.insert(key.clone(), value.clone());
+        }
+        serde_json::from_value(serialized).expect("deserialize index fixture")
+    }
+
+    /// An account-deferred hold is retried every generation. It joins the
+    /// public ownership-incomplete count but never the settled share, so even
+    /// beside settled terminal authority residue the Claude receipt stays an
+    /// unsettled `parse_error` while the hold persists.
+    #[test]
+    #[serial(source_manifests)]
+    fn account_deferred_holds_keep_the_claude_receipt_unsettled() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let held = claude_index_with(serde_json::json!({
+            "claude_account_deferred_holds": {"/opaque/deferred.jsonl": "deferred-source"},
+        }));
+        assert_eq!(held.claude_account_deferred_hold_count(), 1);
+        let counts = claude_usage_authority_census_counts(
+            "account-deferred-hold-receipt",
+            &[("unproven_terminal", 1)],
+        )
+        .with_snapshot_terminal_counts(&held);
+        assert!(counts.census_complete);
+        assert_eq!(counts.ownership_incomplete_file_count, 2);
+        assert_eq!(counts.terminal_ownership_incomplete_file_count, 1);
+
+        let receipt = captured_terminal_receipt_for_source_under_hint(
+            SnapshotSource::ClaudeCode,
+            counts,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            183,
+            RESIDUE_ADMITTING_HINT,
+        );
+        assert_eq!(receipt["last_error_code"], "parse_error");
+        assert_eq!(receipt["consecutive_failures"], 1);
+        assert!(receipt["last_success_at"].is_null());
+        assert_eq!(receipt["last_ownership_incomplete_file_count"], 2);
+        assert_eq!(receipt["last_terminal_ownership_incomplete_file_count"], 1);
+
+        // Without a hold the same terminal residue settles.
+        let settled = claude_usage_authority_census_counts(
+            "account-deferred-hold-released-receipt",
+            &[("unproven_terminal", 1)],
+        )
+        .with_snapshot_terminal_counts(&ScanIndex::default());
+        assert_eq!(
+            settled.ownership_incomplete_file_count,
+            settled.terminal_ownership_incomplete_file_count
+        );
+    }
+
+    /// A completed upload whose holds can still change in this traversal keeps
+    /// the conservative partial commit and owes a clean follow-up; one whose
+    /// holds cannot progress reverts only the held key and may settle.
+    #[test]
+    fn completed_upload_with_local_holds_settles_only_non_progressing_holds() {
+        let activity = "2026-08-02T07:00:00Z";
+        let entry = |source: &str, fingerprint: &str| {
+            serde_json::json!({
+                "size_bytes": 1,
+                "modified_unix_seconds": 2,
+                "source_file_fingerprint": source,
+                "last_snapshot_fingerprint": fingerprint,
+                "scan_identity_version": "semantic_sync:v2",
+            })
+        };
+        let committed = claude_index_with(serde_json::json!({
+            "files": {
+                "/opaque/held.jsonl": entry("held-old-source", "held-old"),
+                "/opaque/sibling.jsonl": entry("sibling-old-source", "sibling-old"),
+            },
+            "file_snapshot_fingerprints": {
+                "/opaque/held.jsonl": ["held-old"],
+                "/opaque/sibling.jsonl": ["sibling-old"],
+            },
+            "snapshot_activity_at": {"held-old": activity, "sibling-old": activity},
+        }));
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {
+                "/opaque/held.jsonl": entry("held-new-source", "held-new"),
+                "/opaque/sibling.jsonl": entry("sibling-new-source", "sibling-new"),
+            },
+            "file_snapshot_fingerprints": {
+                "/opaque/held.jsonl": ["held-new"],
+                "/opaque/sibling.jsonl": ["sibling-new"],
+            },
+            "snapshot_activity_at": {"held-new": activity, "sibling-new": activity},
+        }));
+        let held = BTreeSet::from(["held-new".to_string()]);
+        let mut upload_progress = test_upload_progress();
+        upload_progress
+            .accepted_fingerprints
+            .insert("sibling-new".to_string());
+
+        let settled = commit_completed_with_local_holds(
+            scanned.clone(),
+            &committed,
+            &upload_progress,
+            &held,
+            &BTreeSet::new(),
+            false,
+        );
+        assert!(!settled.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            settled.files["/opaque/held.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("held-old")
+        );
+        assert_eq!(
+            settled.files["/opaque/held.jsonl"].source_file_fingerprint,
+            "held-old-source"
+        );
+        assert_eq!(
+            settled.files["/opaque/sibling.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("sibling-new")
+        );
+        assert!(settled.snapshot_activity_at.contains_key("held-old"));
+        assert!(!settled.snapshot_activity_at.contains_key("held-new"));
+
+        // An account-deferred hold additionally owes a reparse every generation.
+        let deferred = commit_completed_with_local_holds(
+            scanned.clone(),
+            &committed,
+            &upload_progress,
+            &held,
+            &held,
+            false,
+        );
+        assert!(!deferred.bounded_sweep_had_unsettled_upload());
+        assert!(deferred.files["/opaque/held.jsonl"]
+            .source_file_fingerprint
+            .is_empty());
+
+        let blocked = commit_completed_with_local_holds(
+            scanned,
+            &committed,
+            &upload_progress,
+            &held,
+            &BTreeSet::new(),
+            true,
+        );
+        assert!(blocked.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            blocked.files["/opaque/held.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("held-old")
+        );
     }
 
     /// The backend's error-code set is closed and its forward tolerance covers
