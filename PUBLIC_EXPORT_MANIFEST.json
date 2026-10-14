@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 562,
-  "content_sha256": "6df82983d8c29d16742555e866603196aeaffcd58751f0721f808a3549a6db59",
+  "candidate_file_count": 563,
+  "content_sha256": "2c8a2230c6983271d5ecd28e4e5c2c68c3dddea1d44e366bfa2739e00db9e071",
   "files": [
     {
       "executable": false,
@@ -1140,8 +1140,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "84db59cd3177ecfbd46a73236a268556d95f0fa974d1a23479868e1fb7429f2f",
-      "size_bytes": 2374455
+      "sha256": "8b0971162b12d5cf5b8a6b39c3272e0b0de873cee5c03f8741344d358277a70b",
+      "size_bytes": 2380104
     },
     {
       "executable": false,
@@ -2637,6 +2637,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-14-claude-rearm-checkpoints.md",
+      "sha256": "34e1d409d2713c8c627096243a7f7454b0a6175a1d2cc42a1c994495666513ed",
+      "size_bytes": 1106
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-14-codex-full-rescan-loop.md",
       "sha256": "45329287913935abf907dbfb45c8b80cc36a81d52d061af4cc9e340cb3107101",
       "size_bytes": 3166
@@ -3937,9 +3944,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-14T07:02:21+00:00",
+  "generated_at": "2026-10-14T11:10:35+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 563,
+  "output_file_count": 564,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3976,5 +3983,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "dadf525b2325fdeeb0a83212bc9eecd5d7c62b8f"
+  "source_commit": "34ab07c7c9e95bc9efe7413625b2730c196108f1"
 }
