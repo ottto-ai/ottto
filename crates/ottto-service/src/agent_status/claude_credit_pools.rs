@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use ottto_protocol::{
-    ActiveSessionReconciliation, AgentCreditBalance, AgentCreditBalanceUnit,
+    ActiveSessionReconciliation, AgentCreditBalance, AgentCreditBalanceUnit, AgentQuotaWindow,
     AgentQuotaWindowFreshness, CreditBalanceKind, CreditGrantsUnavailableCause,
 };
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,12 @@ const PASSIVE_CLOCK_SKEW_SECONDS: u64 = 60;
 /// Longest pause between two collection passes of one caller that still
 /// counts as continuous observation of its sign-in (passes run every ~5 min).
 const CALLER_BINDING_MAX_GAP_SECONDS: u64 = 15 * 60;
+/// A window reset the stored reading predates earns one extra read this long
+/// after the reset, spread per account over the next minute (design R7
+/// amendment: reset read). The reading after it postdates the reset, so each
+/// reset is read at most once.
+const RESET_READ_DELAY_SECONDS: u64 = 60;
+const RESET_READ_SPREAD_SECONDS: u64 = 60;
 /// Persisted cadence state, next to the account's usage cache.
 pub(super) const CLAUDE_READ_SCHEDULE_FILE: &str = "read-schedule.json";
 
@@ -715,6 +721,55 @@ pub(super) fn claude_read_held(
 /// boundary instead of one pass late (a 15 min slot stays 15 min, not 20).
 pub(super) fn claude_slot_elapsed(age_seconds: u64, slot_seconds: u64) -> bool {
     age_seconds.saturating_add(SLOT_ADMISSION_SLACK_SECONDS) >= slot_seconds
+}
+
+/// How long after a window reset this binding's reset read waits: 60-120 s,
+/// spread deterministically per account (load spreading, like the slots).
+pub(super) fn claude_reset_read_delay_seconds(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ottto:claude-oauth-usage-reset-read:");
+    hasher.update(account_identifier_hash.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(organization_identifier_hash.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    RESET_READ_DELAY_SECONDS + u64::from_be_bytes(bytes) % (RESET_READ_SPREAD_SECONDS + 1)
+}
+
+/// When the reset read for a reading taken at `observed_at` is due: the first
+/// window reset after the reading plus `delay_seconds`, but never before the
+/// stored Retry-After/success spacing (`next_refresh_after`). `None` when no
+/// window of the reading resets after it.
+pub(super) fn claude_reset_read_at(
+    windows: &[AgentQuotaWindow],
+    observed_at: u64,
+    next_refresh_after: u64,
+    delay_seconds: u64,
+) -> Option<u64> {
+    windows
+        .iter()
+        .filter_map(|window| window.resets_at.as_deref().and_then(parse_instant))
+        .filter_map(|reset| u64::try_from(reset.unix_timestamp()).ok())
+        .filter(|reset| *reset > observed_at)
+        .min()
+        .map(|reset| reset.saturating_add(delay_seconds).max(next_refresh_after))
+}
+
+/// Whether a reset the stored reading predates is due its one extra read,
+/// outside the slot.
+pub(super) fn claude_reset_read_due(
+    windows: &[AgentQuotaWindow],
+    observed_at: u64,
+    next_refresh_after: u64,
+    delay_seconds: u64,
+    now: u64,
+) -> bool {
+    claude_reset_read_at(windows, observed_at, next_refresh_after, delay_seconds)
+        .is_some_and(|at| now >= at)
 }
 
 /// Whether the binding is due a new reading: never read, or its slot has
@@ -2393,6 +2448,69 @@ mod tests {
     }
 
     #[test]
+    fn a_window_reset_after_the_reading_gets_one_read_soon_after_it() {
+        let observed = 1_000_000;
+        let window = |reset: Option<u64>| AgentQuotaWindow {
+            resets_at: reset.map(rfc3339),
+            ..Default::default()
+        };
+        let windows = [
+            window(Some(observed + 5 * HOUR)),
+            window(Some(observed + 2 * HOUR)),
+            window(Some(observed - 10)),
+            window(None),
+        ];
+        let delay = claude_reset_read_delay_seconds("account-a", "org-a");
+        assert!((60..=120).contains(&delay), "delay {delay}");
+        assert_eq!(
+            claude_reset_read_at(&windows, observed, 0, delay),
+            Some(observed + 2 * HOUR + delay),
+            "the first reset after the reading, plus the delay"
+        );
+        assert_eq!(
+            claude_reset_read_at(&windows, observed, observed + 2 * HOUR + 290, delay),
+            Some(observed + 2 * HOUR + 290),
+            "never before the stored spacing"
+        );
+        let reset = observed + 2 * HOUR;
+        // Before the delay: not due. After it: due, inside any slot.
+        assert!(!claude_reset_read_due(
+            &windows,
+            observed,
+            0,
+            delay,
+            reset + delay - 1
+        ));
+        assert!(claude_reset_read_due(
+            &windows,
+            observed,
+            0,
+            delay,
+            reset + delay
+        ));
+        // Retry-After/success spacing still holds it back.
+        assert!(!claude_reset_read_due(
+            &windows,
+            observed,
+            reset + delay + 300,
+            delay,
+            reset + delay
+        ));
+        // The reading after the reset postdates it: no second read.
+        assert!(!claude_reset_read_due(
+            &windows,
+            reset + delay,
+            0,
+            delay,
+            reset + delay + 600
+        ));
+        assert_eq!(
+            claude_reset_read_at(&windows[2..], observed, 0, delay),
+            None
+        );
+    }
+
+    #[test]
     fn slot_is_admitted_at_its_elapsed_boundary() {
         // A reading a few seconds into one pass, checked a few seconds into
         // the pass one slot later.
@@ -2877,6 +2995,7 @@ mod tests {
             next_refresh_after_epoch_seconds: now + 240,
             windows: Vec::new(),
             credit_balances: vec![usage, saved.clone()],
+            account_weekly_not_offered: false,
         };
         let served = super::super::claude_oauth_usage_from_cache(cache, now);
         let saved_served = &served.credit_balances[1];

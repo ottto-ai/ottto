@@ -1,7 +1,8 @@
 //! One collection/upload owner per source, independent of transcript scans.
 //! Provider adapters still own acquisition budgets and observation timestamps.
 use crate::agent_status::{
-    collect_agent_status_collection, AgentStatusCollection, CodexHomeBinding,
+    claude_next_reset_read_at, collect_agent_status_collection, AgentStatusCollection,
+    CodexHomeBinding,
 };
 use crate::{LocalApiError, LocalDaemon};
 use ottto_protocol::SourceKind;
@@ -14,6 +15,9 @@ const INTERVAL: Duration = Duration::from_secs(300);
 const RETRY_DELAY: Duration = Duration::from_secs(60);
 const EVENT_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const MANUAL_COALESCE: Duration = Duration::from_secs(1);
+/// A reset-read pass starts this long after the read falls due, so the
+/// binding's own due check (wall clock) has passed by then.
+const RESET_READ_MARGIN: Duration = Duration::from_secs(5);
 static OWNER: Mutex<Option<Arc<Owner>>> = Mutex::new(None);
 
 struct Owner {
@@ -130,6 +134,20 @@ impl StatusLane {
             state.schedule.last_started = None;
             state.schedule.pending = true;
             self.changed.notify_all();
+        }
+    }
+    /// Bring the next pass forward to a Claude reset read due `due_in` from
+    /// `now`, when that is sooner than the regular interval. Callers pass only
+    /// a read still ahead, so an unread reset never turns into back-to-back
+    /// passes; failure delays still apply through `deadline`.
+    fn run_by(&self, now: Duration, due_in: Duration) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = now + due_in + RESET_READ_MARGIN;
+        if at < state.schedule.next_due {
+            state.schedule.next_due = at;
         }
     }
     fn stop(&self) {
@@ -399,6 +417,20 @@ fn run(lane: Arc<StatusLane>, source: SourceKind, daemon: LocalDaemon) {
                 }
                 result.is_ok()
             }, || lane.origin.elapsed());
+        if source == SourceKind::ClaudeCode {
+            let collection = lane
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .collection
+                .clone();
+            if let Some(due_in) = collection.as_deref().and_then(|collection| {
+                let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).ok()?;
+                Some(claude_next_reset_read_at(collection, now)? - now)
+            }) {
+                lane.run_by(lane.origin.elapsed(), Duration::from_secs(due_in));
+            }
+        }
         let mut state = lane
             .state
             .lock()
@@ -578,6 +610,19 @@ mod tests {
         assert_eq!(starts, vec![0, 300, 600, 900, 1200]);
         assert_eq!(lane.state.lock().unwrap().generation, 5);
         assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(1500));
+    }
+    #[test]
+    fn claude_reset_read_brings_the_next_pass_forward_only() {
+        let lane = StatusLane::new();
+        assert!(pass(&lane, 0, 7, true));
+        lane.run_by(seconds(7), seconds(60));
+        assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(72));
+        // A later reset read never pushes the regular pass back.
+        lane.run_by(seconds(8), seconds(600));
+        assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(72));
+        assert!(!pass(&lane, 71, 71, true));
+        assert!(pass(&lane, 72, 79, true));
+        assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(372));
     }
     #[test]
     fn late_tick_and_overrun_skip_catchup_without_busy_loop() {
