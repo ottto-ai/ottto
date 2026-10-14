@@ -36,6 +36,8 @@ mod codex_file_join;
 pub(crate) use codex_file_join::tests::native_join_fixture_root;
 mod context_curve;
 #[cfg(test)]
+mod launch_demand_tests;
+#[cfg(test)]
 mod launcher_recognition_tests;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
@@ -12421,19 +12423,11 @@ impl OwnedSourceScan {
                     Ok(true) => {}
                 }
                 if let Some(context) = attribution_context {
-                    let workers = active
-                        .parser
-                        .accumulator
-                        .source_session_id
-                        .as_ref()
-                        .map(|id| {
-                            vec![if source == SnapshotSource::Codex {
-                                resolve_codex_identity(id)
-                            } else {
-                                id.clone()
-                            }]
-                        })
-                        .unwrap_or_else(|| launch_workers_for_path(source, &active.candidate.path));
+                    let workers = launch_workers_for_parsed(
+                        source,
+                        active.parser.accumulator.source_session_id.as_deref(),
+                        &active.candidate.path,
+                    );
                     match context.prepare_launch_step(&workers) {
                         Ok(false) => {
                             active_file = Some(active);
@@ -13794,6 +13788,9 @@ fn launch_workers_for_candidate(
 
 // Path hints authorize only lookup demand, never transcript ownership or facts.
 fn launch_workers_for_path(source: SnapshotSource, path: &Path) -> Vec<String> {
+    if claude_subagent_has_no_launch_worker(source, path) {
+        return Vec::new();
+    }
     match source {
         SnapshotSource::Codex => codex_session_id_candidates_from_path(path),
         SnapshotSource::ClaudeCode | SnapshotSource::Pi => path
@@ -13802,6 +13799,29 @@ fn launch_workers_for_path(source: SnapshotSource, path: &Path) -> Vec<String> {
             .map(|stem| vec![stem.to_string()])
             .unwrap_or_default(),
     }
+}
+
+// Finish-time demand for the parsed file. A Claude subagent carries its
+// parent's `sessionId`, but `into_items` re-keys it from the path before any
+// launch fact lookup, so demanding that parent would only discard the prepared
+// batch for a key no consumer reads.
+fn launch_workers_for_parsed(
+    source: SnapshotSource,
+    parsed_session_id: Option<&str>,
+    path: &Path,
+) -> Vec<String> {
+    match parsed_session_id {
+        _ if claude_subagent_has_no_launch_worker(source, path) => Vec::new(),
+        Some(id) if source == SnapshotSource::Codex => vec![resolve_codex_identity(id)],
+        Some(id) => vec![id.to_owned()],
+        None => launch_workers_for_path(source, path),
+    }
+}
+
+// Same predicate as the `into_items` re-key: the re-keyed id is never a UUID,
+// and launch workers are UUID-only, so no launch event can name this file.
+fn claude_subagent_has_no_launch_worker(source: SnapshotSource, path: &Path) -> bool {
+    source == SnapshotSource::ClaudeCode && claude_subagent_identity(path).is_some()
 }
 
 fn claude_held_family_matches_launch_context(
@@ -14520,18 +14540,11 @@ impl OwnedJsonlParser {
             "incomplete parser cannot finalize a file"
         );
         if let Some(context) = attribution_context {
-            let workers = self
-                .accumulator
-                .source_session_id
-                .as_ref()
-                .map(|id| {
-                    vec![if self.source == SnapshotSource::Codex {
-                        resolve_codex_identity(id)
-                    } else {
-                        id.clone()
-                    }]
-                })
-                .unwrap_or_else(|| launch_workers_for_path(self.source, path));
+            let workers = launch_workers_for_parsed(
+                self.source,
+                self.accumulator.source_session_id.as_deref(),
+                path,
+            );
             anyhow::ensure!(
                 context.launches_prepared(&workers),
                 "launch evidence lookup incomplete"
@@ -14727,18 +14740,11 @@ fn parse_opened_jsonl_file(
         .with_context(|| format!("read JSONL {}", path.display()))?
     {}
     if let Some(context) = attribution_context {
-        let workers = parser
-            .accumulator
-            .source_session_id
-            .as_ref()
-            .map(|id| {
-                vec![if source == SnapshotSource::Codex {
-                    resolve_codex_identity(id)
-                } else {
-                    id.clone()
-                }]
-            })
-            .unwrap_or_else(|| launch_workers_for_path(source, path));
+        let workers = launch_workers_for_parsed(
+            source,
+            parser.accumulator.source_session_id.as_deref(),
+            path,
+        );
         // This compatibility reader already synchronously drains the transcript.
         // Production OwnedSourceScan prepares in its resumable step before finish.
         while !context
