@@ -2565,7 +2565,6 @@ pub struct ClaudeDuplicateCensusCounts {
     pub page_invalidated_occurrence_mismatch_count: usize,
     pub page_invalidated_cap_count: usize,
     pub page_invalidated_member_changed_count: usize,
-    pub page_superseded_member_growth_count: usize,
     pub coverage_complete: bool,
     pub coverage_missing_member_count: usize,
     pub full_rearm: bool,
@@ -4547,10 +4546,8 @@ fn accumulate_claude_usage_family_pending_with_limit(
         .flat_map(|pending| pending.member_occurrences.values())
         .map(BTreeMap::len)
         .fold(0_usize, usize::saturating_add);
-    let mut observed_this_call = BTreeSet::<(String, String)>::new();
     for item in snapshots {
         let root_session_id = claude_snapshot_family_root(item);
-        let observed_member = (root_session_id.clone(), item.source_session_id.clone());
         let prior_family_occurrence_count = pending_by_root
             .get(&root_session_id)
             .map(|pending| {
@@ -4623,34 +4620,28 @@ fn accumulate_claude_usage_family_pending_with_limit(
             invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
         };
-        // A member seen twice within one call must match exactly. Only a
-        // later page of the same window may supersede it by appending.
-        let seen_earlier_this_call = !observed_this_call.insert(observed_member);
-        let Some(grew) = claude_pending_member_reobservation(
-            pending
-                .member_request_id_hashes
-                .get(&item.source_session_id),
-            pending.member_occurrences.get(&item.source_session_id),
-            &hashes,
-            &occurrences,
-        )
-        .filter(|grew| !(*grew && seen_earlier_this_call)) else {
+        if pending
+            .member_request_id_hashes
+            .insert(item.source_session_id.clone(), hashes.clone())
+            .is_some_and(|previous| previous != hashes)
+        {
             counts.page_invalidated_member_changed_count = counts
                 .page_invalidated_member_changed_count
                 .saturating_add(1);
             invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
-        };
-        if grew {
-            counts.page_superseded_member_growth_count =
-                counts.page_superseded_member_growth_count.saturating_add(1);
         }
-        pending
-            .member_request_id_hashes
-            .insert(item.source_session_id.clone(), hashes);
-        pending
+        if pending
             .member_occurrences
-            .insert(item.source_session_id.clone(), occurrences);
+            .insert(item.source_session_id.clone(), occurrences.clone())
+            .is_some_and(|previous| previous != occurrences)
+        {
+            counts.page_invalidated_member_changed_count = counts
+                .page_invalidated_member_changed_count
+                .saturating_add(1);
+            invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
+            continue;
+        }
         retained_occurrence_count = next_retained_occurrence_count;
     }
     counts.pending_occurrence_count = retained_occurrence_count;
@@ -4671,85 +4662,6 @@ fn invalidate_claude_usage_family_pending(
     pending.member_request_id_hashes.clear();
     pending.member_occurrences.clear();
     pending.invalid = true;
-}
-
-/// Classify a same-window re-observation of one family member: `Some(false)`
-/// for a first or identical observation, `Some(true)` for proven append-only
-/// growth, and `None` for anything else, which invalidates the family.
-///
-/// The parser reads each opened file to EOF and fails a read whose object
-/// changed underneath it, so a re-observation of an appended transcript is a
-/// later prefix-extension of the same file. Growth is admitted only when it has
-/// exactly that shape: every stored request is still present at its stored
-/// response sequence; every new request is sequenced after all stored ones; and
-/// only the single last stored response may differ, by progressive usage and
-/// by filling identity fields that were absent. A partially written final
-/// response is the one shape that legitimately changes in place. Removal,
-/// reordering, a changed earlier response, or a changed identity field is not
-/// growth.
-fn claude_pending_member_reobservation(
-    stored_hashes: Option<&BTreeSet<String>>,
-    stored_occurrences: Option<&BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>>,
-    hashes: &BTreeSet<String>,
-    occurrences: &BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>,
-) -> Option<bool> {
-    let Some(stored_hashes) = stored_hashes else {
-        return match stored_occurrences {
-            None => Some(false),
-            Some(stored) => (stored == occurrences).then_some(false),
-        };
-    };
-    if stored_hashes == hashes && stored_occurrences.map_or(true, |stored| stored == occurrences) {
-        return Some(false);
-    }
-    let stored = stored_occurrences?;
-    if !hashes.is_superset(stored_hashes)
-        || stored.keys().cloned().collect::<BTreeSet<_>>() != *stored_hashes
-    {
-        return None;
-    }
-    let last_sequence = stored.values().map(|occurrence| occurrence.sequence).max();
-    let mut last_responses = stored
-        .iter()
-        .filter(|(_, occurrence)| Some(occurrence.sequence) == last_sequence);
-    let last_request = match (last_responses.next(), last_responses.next()) {
-        (Some((request_hash, _)), None) => Some(request_hash),
-        _ => None,
-    };
-    for (request_hash, before) in stored {
-        let after = occurrences.get(request_hash)?;
-        let admitted = if Some(request_hash) == last_request {
-            claude_occurrence_progressed(before, after)
-        } else {
-            before == after
-        };
-        if !admitted {
-            return None;
-        }
-    }
-    let appended_after_stored = occurrences
-        .iter()
-        .filter(|(request_hash, _)| !stored.contains_key(*request_hash))
-        .all(|(_, occurrence)| last_sequence.map_or(true, |last| occurrence.sequence > last));
-    appended_after_stored.then_some(true)
-}
-
-fn claude_occurrence_progressed(
-    before: &ClaudeTranscriptUsageOccurrenceWitness,
-    after: &ClaudeTranscriptUsageOccurrenceWitness,
-) -> bool {
-    let extends =
-        |before: &Option<String>, after: &Option<String>| before.is_none() || before == after;
-    before.sequence == after.sequence
-        && after.input_tokens >= before.input_tokens
-        && after.output_tokens >= before.output_tokens
-        && after.cache_read_tokens >= before.cache_read_tokens
-        && after.cache_creation_5m_tokens >= before.cache_creation_5m_tokens
-        && after.cache_creation_1h_tokens >= before.cache_creation_1h_tokens
-        && after.reasoning_output_tokens >= before.reasoning_output_tokens
-        && extends(&before.model, &after.model)
-        && extends(&before.speed_mode, &after.speed_mode)
-        && extends(&before.reasoning_effort, &after.reasoning_effort)
 }
 
 fn claude_pending_occurrence_count_after_replace(
@@ -21258,6 +21170,48 @@ impl ScanIndex {
         self.bounded_sweep_had_unsettled_upload
     }
 
+    #[cfg(test)]
+    pub(crate) fn accepted_snapshot_fingerprint_recorded(&self, fingerprint: &str) -> bool {
+        self.accepted_snapshot_fingerprints.contains(fingerprint)
+    }
+
+    /// A well-formed RetryPending family quarantine bound to a retained
+    /// synthetic witness whose only member is the root itself.
+    #[cfg(test)]
+    pub(crate) fn insert_retry_pending_claude_authority_for_test(&mut self, root_session_id: &str) {
+        let witness = ClaudeUsageFamilyWitness {
+            evidence_fingerprint: "e".repeat(64),
+            member_request_id_fingerprints: BTreeMap::from([(
+                root_session_id.to_string(),
+                "f".repeat(64),
+            )]),
+            member_occurrence_fingerprints: BTreeMap::new(),
+            assigned_request_id_fingerprints: BTreeMap::new(),
+            legacy_excluded_request_id_hashes: BTreeMap::new(),
+            legacy_exclusion_evidence_fingerprint: None,
+            legacy_owner_roots: BTreeSet::new(),
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let record = ClaudeUsageAuthorityQuarantineRecord {
+            contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
+            proven_witness_fingerprint: claude_usage_family_witness_fingerprint(&witness),
+            member_source_file_fingerprints: BTreeMap::from([(
+                root_session_id.to_string(),
+                "1".repeat(64),
+            )]),
+            failed_reconstruction_count: 1,
+            disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+            retry_after_unix_seconds: now.saturating_add(CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS),
+        };
+        self.claude_usage_family_witnesses
+            .insert(root_session_id.to_string(), witness);
+        self.claude_usage_authority_quarantine
+            .insert(root_session_id.to_string(), record);
+    }
+
     /// Record (or clear) the residue the completing generation disclosed, and
     /// say so once per change rather than once per cycle. The log names counts
     /// only; the index keys stay in the local index.
@@ -37411,7 +37365,6 @@ mod tests {
             page_invalidated_occurrence_mismatch_count: usize::MAX,
             page_invalidated_cap_count: usize::MAX,
             page_invalidated_member_changed_count: usize::MAX,
-            page_superseded_member_growth_count: usize::MAX,
             coverage_complete: true,
             coverage_missing_member_count: usize::MAX,
             full_rearm: true,
@@ -37419,7 +37372,7 @@ mod tests {
             full_rearm_deferred_until: Some(u64::MAX),
         };
         let encoded = serde_json::to_string(&max).expect("encode counters");
-        assert!(encoded.len() <= 648, "{} bytes", encoded.len());
+        assert!(encoded.len() <= 589, "{} bytes", encoded.len());
 
         let stats = crate::snapshot_sync::ClaudeLocalEvidenceStats {
             duplicate_census: max,
@@ -37435,7 +37388,7 @@ mod tests {
         assert_eq!(nested, serde_json::to_value(max).expect("counters value"));
         let baseline = serde_json::to_string(&without).expect("encode baseline");
         assert!(
-            line.len() - baseline.len() <= 648 + r#","duplicate_census":"#.len(),
+            line.len() - baseline.len() <= 589 + r#","duplicate_census":"#.len(),
             "line grew by {} bytes",
             line.len() - baseline.len()
         );

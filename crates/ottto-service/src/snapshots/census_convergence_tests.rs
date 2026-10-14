@@ -1,6 +1,6 @@
-//! Census convergence: non-progressing local holds, append-only family growth,
-//! duplicate-fence coverage and backoff, and count-only parse reasons. All
-//! fixtures are synthetic and content-free.
+//! Census convergence: non-progressing local holds, exact family pending
+//! re-observation, duplicate-fence coverage and backoff, and count-only parse
+//! reasons. All fixtures are synthetic and content-free.
 use super::*;
 
 const WINDOW: &str = "2026-08-02T07:10:00Z";
@@ -33,24 +33,6 @@ fn occurrences(
         .iter()
         .map(|(request, occurrence)| (request.to_string(), occurrence.clone()))
         .collect()
-}
-
-fn request_set(
-    occurrences: &BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>,
-) -> BTreeSet<String> {
-    occurrences.keys().cloned().collect()
-}
-
-fn reobserve(
-    stored: &BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>,
-    next: &BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>,
-) -> Option<bool> {
-    claude_pending_member_reobservation(
-        Some(&request_set(stored)),
-        Some(stored),
-        &request_set(next),
-        next,
-    )
 }
 
 fn current_pending(member: &str, request: &str) -> ClaudeUsageFamilyPending {
@@ -156,99 +138,13 @@ fn decision(
     decided
 }
 
-// Only a proven append-only re-observation supersedes a stored member.
+// A member re-observed in one census window must match exactly, across
+// pages as well as within one page. Even an appended transcript invalidates
+// the family: its request evidence cannot be tied to one physical member
+// without immutable member provenance, so the fence stays closed and only the
+// re-arm backoff bounds the repeated work.
 #[test]
-fn claude_member_reobservation_admits_only_proven_append_only_growth() {
-    let stored = occurrences(&[("a", occurrence(0, 5)), ("b", occurrence(1, 5))]);
-
-    assert_eq!(
-        claude_pending_member_reobservation(None, None, &request_set(&stored), &stored),
-        Some(false)
-    );
-    assert_eq!(reobserve(&stored, &stored), Some(false));
-
-    // Appended responses sequenced after every stored one.
-    let appended = occurrences(&[
-        ("a", occurrence(0, 5)),
-        ("b", occurrence(1, 5)),
-        ("c", occurrence(2, 5)),
-    ]);
-    assert_eq!(reobserve(&stored, &appended), Some(true));
-
-    // The single last stored response may progress in place: usage grows and
-    // an absent identity field is filled.
-    let mut progressed_tail = occurrence(1, 9);
-    progressed_tail.reasoning_effort = Some("high".to_string());
-    let progressed = occurrences(&[
-        ("a", occurrence(0, 5)),
-        ("b", progressed_tail),
-        ("c", occurrence(2, 5)),
-    ]);
-    assert_eq!(reobserve(&stored, &progressed), Some(true));
-
-    // A changed identity field on the tail is not growth.
-    let mut retargeted_tail = occurrence(1, 9);
-    retargeted_tail.model = Some("model-b".to_string());
-    let retargeted = occurrences(&[("a", occurrence(0, 5)), ("b", retargeted_tail)]);
-    assert_eq!(reobserve(&stored, &retargeted), None);
-
-    // Shrinking usage on the tail is not growth.
-    let shrunk = occurrences(&[("a", occurrence(0, 5)), ("b", occurrence(1, 4))]);
-    assert_eq!(reobserve(&stored, &shrunk), None);
-
-    // A tail that moved to another response ordinal is not growth.
-    let moved = occurrences(&[("a", occurrence(0, 5)), ("b", occurrence(3, 5))]);
-    assert_eq!(reobserve(&stored, &moved), None);
-
-    // Any earlier response must be byte-for-byte unchanged.
-    let earlier_changed = occurrences(&[
-        ("a", occurrence(0, 6)),
-        ("b", occurrence(1, 5)),
-        ("c", occurrence(2, 5)),
-    ]);
-    assert_eq!(reobserve(&stored, &earlier_changed), None);
-
-    // Removal and out-of-order insertion are not growth.
-    let removed = occurrences(&[("b", occurrence(1, 5)), ("c", occurrence(2, 5))]);
-    assert_eq!(reobserve(&stored, &removed), None);
-    let inserted_before_tail = occurrences(&[
-        ("a", occurrence(0, 5)),
-        ("b", occurrence(1, 5)),
-        ("c", occurrence(1, 5)),
-    ]);
-    assert_eq!(reobserve(&stored, &inserted_before_tail), None);
-
-    // Without a unique last response, no stored response may change.
-    let tied = occurrences(&[("a", occurrence(1, 5)), ("b", occurrence(1, 5))]);
-    let tied_progressed = occurrences(&[
-        ("a", occurrence(1, 5)),
-        ("b", occurrence(1, 9)),
-        ("c", occurrence(2, 5)),
-    ]);
-    assert_eq!(reobserve(&tied, &tied_progressed), None);
-    let tied_appended = occurrences(&[
-        ("a", occurrence(1, 5)),
-        ("b", occurrence(1, 5)),
-        ("c", occurrence(2, 5)),
-    ]);
-    assert_eq!(reobserve(&tied, &tied_appended), Some(true));
-
-    // Stored request ids without stored occurrences cannot prove growth.
-    assert_eq!(
-        claude_pending_member_reobservation(
-            Some(&request_set(&stored)),
-            None,
-            &request_set(&appended),
-            &appended,
-        ),
-        None
-    );
-}
-
-// Growth supersedes only across calls in one window; a same-call
-// repeat must match exactly, and the occurrence cap still binds.
-#[test]
-fn claude_family_pending_supersedes_growth_only_across_pages() {
+fn claude_family_pending_reobservation_stays_exact_within_a_window() {
     let (root, _, items) = claude_account_family_fixture();
     let full = items[0].clone();
     let mut prefix = full.clone();
@@ -260,75 +156,44 @@ fn claude_family_pending_supersedes_growth_only_across_pages() {
     prefix.request_count -= 1;
     let family_root = claude_snapshot_family_root(&full);
 
+    // An identical later page keeps the family valid.
     let mut pending = BTreeMap::new();
-    let counts = accumulate_claude_usage_family_pending_with_limit(
-        std::slice::from_ref(&prefix),
-        &mut pending,
-        WINDOW,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
-    assert_eq!(counts.pending_occurrence_count, 3);
-    let counts = accumulate_claude_usage_family_pending_with_limit(
-        std::slice::from_ref(&full),
-        &mut pending,
-        WINDOW,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
-    assert_eq!(
-        counts,
-        ClaudeDuplicateCensusCounts {
-            pending_occurrence_count: 4,
-            page_superseded_member_growth_count: 1,
-            ..Default::default()
-        }
-    );
-    let family = &pending[&family_root];
-    assert!(!family.invalid);
-    assert_eq!(family.member_occurrences[&full.source_session_id].len(), 4);
-    assert_eq!(
-        family.member_request_id_hashes[&full.source_session_id].len(),
-        4
-    );
-
-    // The reverse order is a removal and invalidates the family.
-    let mut pending = BTreeMap::new();
-    for page in [&full, &prefix] {
+    for _ in 0..2 {
         accumulate_claude_usage_family_pending_with_limit(
-            std::slice::from_ref(page),
+            std::slice::from_ref(&full),
             &mut pending,
             WINDOW,
             MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
         );
     }
-    assert!(pending[&family_root].invalid);
-
-    // Within one call, the same member must be identical.
-    let mut pending = BTreeMap::new();
-    let counts = accumulate_claude_usage_family_pending_with_limit(
-        &[prefix.clone(), full.clone()],
-        &mut pending,
-        WINDOW,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
-    assert!(pending[&family_root].invalid);
-    assert_eq!(
-        counts,
-        ClaudeDuplicateCensusCounts {
-            page_invalidated_member_changed_count: 1,
-            ..Default::default()
-        }
-    );
-    let mut pending = BTreeMap::new();
-    let counts = accumulate_claude_usage_family_pending_with_limit(
-        &[full.clone(), full.clone()],
-        &mut pending,
-        WINDOW,
-        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-    );
     assert!(!pending[&family_root].invalid);
-    assert_eq!(counts.page_superseded_member_growth_count, 0);
 
-    // A new window starts over rather than superseding.
+    // Growth or shrinkage on a later page of the same window invalidates.
+    for pages in [[&prefix, &full], [&full, &prefix]] {
+        let mut pending = BTreeMap::new();
+        accumulate_claude_usage_family_pending_with_limit(
+            std::slice::from_ref(pages[0]),
+            &mut pending,
+            WINDOW,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        );
+        let counts = accumulate_claude_usage_family_pending_with_limit(
+            std::slice::from_ref(pages[1]),
+            &mut pending,
+            WINDOW,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        );
+        assert!(pending[&family_root].invalid);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                page_invalidated_member_changed_count: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    // A new census window starts over.
     let mut pending = BTreeMap::new();
     accumulate_claude_usage_family_pending_with_limit(
         std::slice::from_ref(&prefix),
@@ -342,26 +207,9 @@ fn claude_family_pending_supersedes_growth_only_across_pages() {
         WINDOW,
         MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
     );
-    assert_eq!(counts.page_superseded_member_growth_count, 0);
+    assert!(!pending[&family_root].invalid);
+    assert_eq!(counts.page_invalidated_member_changed_count, 0);
     assert_eq!(pending[&family_root].census_window_end, WINDOW);
-
-    // Growth past the bounded occurrence cap still invalidates.
-    let mut pending = BTreeMap::new();
-    accumulate_claude_usage_family_pending_with_limit(
-        std::slice::from_ref(&prefix),
-        &mut pending,
-        WINDOW,
-        3,
-    );
-    let counts = accumulate_claude_usage_family_pending_with_limit(
-        std::slice::from_ref(&full),
-        &mut pending,
-        WINDOW,
-        3,
-    );
-    assert!(pending[&family_root].invalid);
-    assert_eq!(counts.page_invalidated_cap_count, 1);
-    assert_eq!(counts.page_superseded_member_growth_count, 0);
 
     let _ = fs::remove_dir_all(root);
 }

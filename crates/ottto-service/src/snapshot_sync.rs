@@ -288,6 +288,156 @@ fn commit_completed_with_local_holds(
     index
 }
 
+/// Local holds classified once per page, after finalization and before upload.
+/// Every upload outcome settles against this one classification.
+struct LocalHoldSettlement {
+    /// Sessions held locally on this page.
+    held_entity_count: usize,
+    /// RetryPending Claude authority families anywhere in the index.
+    retry_pending_family_count: usize,
+    held_fingerprints: BTreeSet<String>,
+    account_deferred_fingerprints: BTreeSet<String>,
+    progress_blocking: bool,
+}
+
+impl LocalHoldSettlement {
+    /// Record the durable account-hold disclosure, classify which holds a
+    /// later page could still change, and remove every held entity from the
+    /// upload. The disclosure is durable before upload, so every checkpoint
+    /// below carries it. Only Claude account deferrals are settled this way;
+    /// other sources keep every account deferral progress-blocking.
+    fn classify(
+        source: SnapshotSource,
+        index: &mut ScanIndex,
+        scan_result: &mut crate::snapshots::SourceScanResult,
+        disposition: &crate::snapshots::ClaudeUsageAuthorityDisposition,
+    ) -> Self {
+        let held_entity_count = disposition.quarantined_entity_count();
+        let held_fingerprints = disposition.quarantined_fingerprints(&scan_result.snapshots);
+        let account_deferred_fingerprints =
+            disposition.account_deferred_fingerprints(&scan_result.snapshots);
+        let account_holds_recorded = source == SnapshotSource::ClaudeCode
+            && index.record_claude_account_deferred_holds(
+                scan_result.completed_parses(),
+                &account_deferred_fingerprints,
+            );
+        let progress_blocking_held_fingerprints = disposition.progress_blocking_held_fingerprints(
+            &scan_result.snapshots,
+            index,
+            account_holds_recorded,
+        );
+        disposition.retain_uploadable(&mut scan_result.snapshots);
+        let retry_pending_family_count = index.claude_usage_authority_pending_count();
+        Self {
+            held_entity_count,
+            retry_pending_family_count,
+            held_fingerprints,
+            account_deferred_fingerprints,
+            progress_blocking: retry_pending_family_count > 0
+                || !progress_blocking_held_fingerprints.is_empty(),
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.retry_pending_family_count > 0 || self.held_entity_count > 0
+    }
+}
+
+/// The index an upload outcome commits, and whether that outcome leaves the
+/// upload fully settled. An unsettled outcome keeps backfill and context-curve
+/// replay completion pending.
+struct UploadIndexSettlement {
+    index: ScanIndex,
+    fully_settled: bool,
+}
+
+/// A persisted account hold was never uploaded, so the backfill and replay it
+/// belongs to stay pending even on a page that did not revisit it.
+fn upload_settled_without_account_holds(index: &ScanIndex, settled: bool) -> bool {
+    settled && index.claude_account_deferred_hold_count() == 0
+}
+
+/// Settle a `Completed` upload: every uploaded entity was accepted or
+/// unchanged, and only local holds can remain unsettled.
+fn settle_completed_upload(
+    index: ScanIndex,
+    committed_index: &ScanIndex,
+    upload_progress: &SnapshotUploadProgress,
+    holds: &LocalHoldSettlement,
+) -> UploadIndexSettlement {
+    if !holds.any() {
+        let fully_settled = upload_settled_without_account_holds(&index, true);
+        return UploadIndexSettlement {
+            index,
+            fully_settled,
+        };
+    }
+    let index = commit_completed_with_local_holds(
+        index,
+        committed_index,
+        upload_progress,
+        &holds.held_fingerprints,
+        &holds.account_deferred_fingerprints,
+        holds.progress_blocking,
+    );
+    eprintln!(
+        "local snapshot sync retained {} Claude usage family/families and {} revised \
+         entity/entities with unproven authority or session ownership; healthy siblings settled \
+         and the retained revisions remain pending for bounded retry",
+        holds.retry_pending_family_count, holds.held_entity_count
+    );
+    UploadIndexSettlement {
+        index,
+        fully_settled: false,
+    }
+}
+
+/// Settle a `Deferred` or `Rejected` upload. Retryable or locally unproven
+/// entities keep replay pending and owe a clean follow-up. A validated
+/// permanent refusal settles transport and traversal; its separate health
+/// still discloses the rejected usage.
+fn settle_checkpointed_upload(
+    index: ScanIndex,
+    committed_index: &ScanIndex,
+    upload_progress: &SnapshotUploadProgress,
+    holds: &LocalHoldSettlement,
+    resolved_permanent_rejections: bool,
+) -> UploadIndexSettlement {
+    let mut index = if holds.any() {
+        let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
+        accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
+        let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
+        server_quarantine.retain(|fingerprint, _| !holds.held_fingerprints.contains(fingerprint));
+        index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine)
+    } else {
+        index
+    };
+    let settled = resolved_permanent_rejections && !holds.any();
+    if !settled {
+        index.mark_bounded_sweep_unsettled();
+    }
+    let fully_settled = upload_settled_without_account_holds(&index, settled);
+    UploadIndexSettlement {
+        index,
+        fully_settled,
+    }
+}
+
+/// Fold the upload ledger into the index after any outcome that reaches the
+/// durable save.
+fn settle_index_after_upload(
+    index: &mut ScanIndex,
+    committed_index: &ScanIndex,
+    upload_progress: &SnapshotUploadProgress,
+) {
+    index.reconcile_codex_recovery_settlement(
+        committed_index,
+        &upload_progress.accepted_fingerprints,
+    );
+    index.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
+    index.record_accepted_snapshot_fingerprints(&upload_progress.accepted_fingerprints);
+}
+
 #[derive(Debug)]
 struct DeferredCacheHeadIdentity {
     source_file_fingerprint: Option<String>,
@@ -3952,28 +4102,13 @@ fn finish_sync_source(
     // consumers above, then remove only authority-demoting revisions at the
     // network boundary. They are not backend poison and are not counted as
     // accepted/quarantined upload settlement.
-    let deferred_local_authority_entity_count =
-        claude_authority_disposition.quarantined_entity_count();
-    let locally_held_fingerprints =
-        claude_authority_disposition.quarantined_fingerprints(&scan_result.snapshots);
-    let account_deferred_held_fingerprints =
-        claude_authority_disposition.account_deferred_fingerprints(&scan_result.snapshots);
-    // Durable before upload, so every checkpoint below carries the disclosure.
-    // Only Claude account deferrals are settled this way; other sources keep
-    // every account deferral progress-blocking.
-    let account_holds_recorded = source == SnapshotSource::ClaudeCode
-        && index.record_claude_account_deferred_holds(
-            scan_result.completed_parses(),
-            &account_deferred_held_fingerprints,
-        );
-    let progress_blocking_held_fingerprints = claude_authority_disposition
-        .progress_blocking_held_fingerprints(
-            &scan_result.snapshots,
-            &index,
-            account_holds_recorded,
-        );
-    claude_authority_disposition.retain_uploadable(&mut scan_result.snapshots);
-    let deferred_local_authority_count = index.claude_usage_authority_pending_count();
+    let local_holds = LocalHoldSettlement::classify(
+        source,
+        &mut index,
+        &mut scan_result,
+        &claude_authority_disposition,
+    );
+    let locally_held_fingerprints = &local_holds.held_fingerprints;
 
     let cache_head_groups = if cache_observations_enabled
         && (activity_hint.snapshot_head_cas_required
@@ -4186,24 +4321,12 @@ fn finish_sync_source(
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
-            if deferred_local_authority_count > 0 || deferred_local_authority_entity_count > 0 {
-                index = commit_completed_with_local_holds(
-                    index,
-                    &committed_index,
-                    &upload_progress,
-                    &locally_held_fingerprints,
-                    &account_deferred_held_fingerprints,
-                    deferred_local_authority_count > 0
-                        || !progress_blocking_held_fingerprints.is_empty(),
-                );
+            let settlement =
+                settle_completed_upload(index, &committed_index, &upload_progress, &local_holds);
+            index = settlement.index;
+            if !settlement.fully_settled {
                 backfill_succeeded = false;
                 upload_fully_settled = false;
-                eprintln!(
-                    "local snapshot sync retained {deferred_local_authority_count} Claude usage \
-                     family/families and {deferred_local_authority_entity_count} revised \
-                     entity/entities with unproven authority or session ownership; healthy siblings settled \
-                     and the retained revisions remain pending for bounded retry"
-                );
             }
         }
         Ok(
@@ -4219,27 +4342,15 @@ fn finish_sync_source(
                 _ => unreachable!(),
             };
             clear_shed_streak(source);
-            if deferred_local_authority_count > 0 || deferred_local_authority_entity_count > 0 {
-                let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
-                accepted_fingerprints
-                    .retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
-                let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
-                server_quarantine
-                    .retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
-                index = index.committable_subset(
-                    &committed_index,
-                    &accepted_fingerprints,
-                    &server_quarantine,
-                );
-            }
-            // Retryable or locally unproven entities keep replay pending.
-            // A validated permanent refusal settles transport and traversal;
-            // its separate health still discloses the rejected usage.
-            if !resolved_permanent_rejections
-                || deferred_local_authority_count > 0
-                || deferred_local_authority_entity_count > 0
-            {
-                index.mark_bounded_sweep_unsettled();
+            let settlement = settle_checkpointed_upload(
+                index,
+                &committed_index,
+                &upload_progress,
+                &local_holds,
+                resolved_permanent_rejections,
+            );
+            index = settlement.index;
+            if !settlement.fully_settled {
                 backfill_succeeded = false;
                 upload_fully_settled = false;
             }
@@ -4260,7 +4371,7 @@ fn finish_sync_source(
                 &committed_index,
                 &upload_progress,
                 &scan_result.snapshots,
-                &locally_held_fingerprints,
+                locally_held_fingerprints,
                 &index_path,
                 &upload_progress_path,
                 || {
@@ -4368,7 +4479,7 @@ fn finish_sync_source(
                     &committed_index,
                     &upload_progress,
                     &scan_result.snapshots,
-                    &locally_held_fingerprints,
+                    locally_held_fingerprints,
                     &index_path,
                     &upload_progress_path,
                     || {
@@ -4530,12 +4641,7 @@ fn finish_sync_source(
         }
     }
 
-    index.reconcile_codex_recovery_settlement(
-        &committed_index,
-        &upload_progress.accepted_fingerprints,
-    );
-    index.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
-    index.record_accepted_snapshot_fingerprints(&upload_progress.accepted_fingerprints);
+    settle_index_after_upload(&mut index, &committed_index, &upload_progress);
     // A quiet/delta-only scan still discloses current permanent refusals even
     // though no body needed another upload. The committed census owns scope.
     let current_entities = index.current_snapshot_fingerprints();
@@ -4620,7 +4726,7 @@ fn finish_sync_source(
     upload_progress.retire_pending_cache_heads(
         &index,
         &scan_result.snapshots,
-        &locally_held_fingerprints,
+        locally_held_fingerprints,
         scan_result.census_complete,
         &projected_pending_head_file_witnesses,
     );
@@ -16442,6 +16548,7 @@ mod tests {
     include!("retry_owned_rotation.rs");
     include!("retry_bounded_native_tests.rs");
     include!("retry_live_native_tests.rs");
+    include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     #[test]
     fn codex_union_native_transport_common_ack_crash_checkpoint_and_restart() {
         codex_union_native_transport_restart(false, false);
