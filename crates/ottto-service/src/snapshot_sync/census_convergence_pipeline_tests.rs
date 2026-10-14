@@ -32,6 +32,9 @@ struct PipelineCycle<'a> {
     /// Synthetic request-account evidence proving this session's owner.
     proven_owner_session: Option<&'a str>,
     first_page_upload: PipelineUpload,
+    /// Run the production historical replay reset for `replay_generation`
+    /// before the committed clone, as `finish_sync_source` does.
+    historical_replay: bool,
 }
 
 struct PipelinePage {
@@ -41,6 +44,8 @@ struct PipelinePage {
     fully_settled: bool,
     backfill_succeeded: bool,
     held: BTreeSet<String>,
+    /// The page's hold classification, before settlement.
+    progress_blocking: bool,
     uploaded: BTreeSet<String>,
 }
 
@@ -101,6 +106,9 @@ impl PipelineFixture {
     ) -> PipelinePage {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
         index.activate_upload_context(cycle.upload_context.to_string());
+        if cycle.historical_replay {
+            index.prepare_historical_replay(cycle.replay_generation.to_string());
+        }
         index.activate_effective_upload_body_witness_revision(
             EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
         );
@@ -221,6 +229,7 @@ impl PipelineFixture {
             fully_settled,
             backfill_succeeded: census_complete && !census_withheld && fully_settled,
             held: holds.held_fingerprints,
+            progress_blocking: holds.progress_blocking,
             uploaded,
         }
     }
@@ -257,6 +266,7 @@ impl PipelineFixture {
                 replay_generation: "replay-generation-1",
                 proven_owner_session: Some(PIPELINE_HELD_SESSION),
                 first_page_upload: PipelineUpload::Accept,
+                historical_replay: false,
             },
         );
         let last = pages.last().expect("baseline page");
@@ -275,6 +285,26 @@ impl PipelineFixture {
         let index = ScanIndex::load(&self.index_path).expect("reload scan index");
         assert_eq!(index.claude_usage_authority_pending_count(), 1);
     }
+
+    /// Seed a retained witness for `session`'s single-member family and a
+    /// terminal authority quarantine bound to its committed source revision,
+    /// as a family proven earlier and then exhausted by failed reconstruction
+    /// would leave them. Returns that revision.
+    fn seed_terminal_authority(&self, session: &str) -> String {
+        let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        let revision = index.files[&Self::key(&index, session)]
+            .source_file_fingerprint
+            .clone();
+        index.insert_unproven_terminal_claude_authority_for_test(session, &revision);
+        index.save(&self.index_path).expect("save scan index");
+        let index = ScanIndex::load(&self.index_path).expect("reload scan index");
+        assert_eq!(
+            index.bound_terminal_claude_authority_revision_for_test(session),
+            Some(revision.clone())
+        );
+        assert_eq!(index.claude_usage_authority_pending_count(), 0);
+        revision
+    }
 }
 
 impl Drop for PipelineFixture {
@@ -288,6 +318,7 @@ const PIPELINE_HOLD_CYCLE: PipelineCycle<'static> = PipelineCycle {
     replay_generation: "replay-generation-2",
     proven_owner_session: None,
     first_page_upload: PipelineUpload::Accept,
+    historical_replay: false,
 };
 
 /// A changed transcript whose new body cannot prove its persisted owner is
@@ -453,4 +484,163 @@ fn server_deferred_and_retry_pending_holds_keep_the_claude_traversal_incomplete(
         assert!(!last.backfill_succeeded);
         assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
     }
+}
+
+/// A historical replay reset clears ordinary committed Claude file entries but
+/// keeps family witnesses and authority quarantines. A bound terminal authority
+/// hold met on an earlier bounded page then has no committed entry to restore;
+/// settling it would let the terminal page read the still-present family as
+/// vanished, drop its witness and quarantine, publish a manifest without it,
+/// and complete the replay. The hold stays progress-blocking instead: the
+/// healthy sibling commits, and the traversal stays incomplete with its
+/// authority evidence, no manifest, and backfill and replay pending.
+#[test]
+#[serial(source_manifests)]
+fn replay_reset_terminal_authority_hold_keeps_the_claude_traversal_incomplete() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = PipelineFixture::new("claude-census-convergence-replay-terminal-hold");
+    let baseline = fixture.baseline();
+    let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
+    let revision = fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
+    // The account owner stays proven, so the only hold is the authority one.
+    let cycle = PipelineCycle {
+        replay_generation: "replay-generation-reset",
+        proven_owner_session: Some(PIPELINE_HELD_SESSION),
+        historical_replay: true,
+        ..PIPELINE_HOLD_CYCLE
+    };
+    // Fixture assumption: the production reset drops the held key's committed
+    // entry and keeps the family's bound authority evidence.
+    let mut reset = ScanIndex::load(&fixture.index_path).expect("load scan index");
+    reset.prepare_historical_replay(cycle.replay_generation.to_string());
+    assert!(!reset.files.contains_key(&held_key));
+    assert_eq!(
+        reset.bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
+        Some(revision.clone())
+    );
+
+    let first = fixture.page("2026-08-02T09:00:00Z", &cycle, PipelineUpload::Accept);
+    assert!(!first.scan.census_complete);
+    assert_eq!(first.held.len(), 1, "the unchanged demoted family is held");
+    // Classified as a non-progressing bound terminal demotion, not an account
+    // deferral: only the missing committed entry keeps it blocking.
+    assert!(!first.progress_blocking);
+    assert_eq!(first.index.claude_account_deferred_hold_count(), 0);
+    assert!(first.uploaded.is_disjoint(&first.held));
+    assert!(!first.fully_settled);
+    assert!(first.index.bounded_sweep_had_unsettled_upload());
+    assert!(!first.index.files.contains_key(&held_key));
+    assert_eq!(
+        first
+            .index
+            .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
+        Some(revision.clone())
+    );
+    // The healthy sibling on the same page still commits.
+    assert!(!first.uploaded.is_empty());
+    for fingerprint in &first.uploaded {
+        assert!(first
+            .index
+            .accepted_snapshot_fingerprint_recorded(fingerprint));
+        assert!(first
+            .index
+            .current_snapshot_fingerprints()
+            .contains(fingerprint));
+    }
+
+    // The terminal ordinary page of the same census window.
+    let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
+    assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
+    assert!(last.held.is_empty());
+    assert!(
+        !last.scan.census_complete,
+        "the held family owes a clean follow-up"
+    );
+    assert!(!last.backfill_succeeded);
+    assert_eq!(
+        last.index
+            .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
+        Some(revision)
+    );
+    assert!(last
+        .index
+        .context_curve_replay_needed(cycle.replay_generation));
+    assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
+    let held_body = first.held.iter().next().expect("held body");
+    assert!(!last.uploaded.contains(held_body));
+    assert!(!last.index.accepted_snapshot_fingerprint_recorded(held_body));
+    assert!(!last
+        .index
+        .current_snapshot_fingerprints()
+        .contains(held_body));
+}
+
+/// Control: without a replay reset, the same terminal authority demotion of a
+/// changed revision restores the committed entry, so the bounded traversal
+/// converges in its census window. The family keeps its witness and a terminal
+/// quarantine rebound to the held revision, the held body is never uploaded,
+/// and the published manifest is the accepted baseline fold.
+#[test]
+#[serial(source_manifests)]
+fn restorable_terminal_authority_hold_lets_a_bounded_claude_traversal_converge() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = PipelineFixture::new("claude-census-convergence-restorable-terminal-hold");
+    let baseline = fixture.baseline();
+    let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
+    let committed_revision = fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
+    fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+    let cycle = PipelineCycle {
+        proven_owner_session: Some(PIPELINE_HELD_SESSION),
+        ..PIPELINE_HOLD_CYCLE
+    };
+
+    let first = fixture.page("2026-08-02T09:00:00Z", &cycle, PipelineUpload::Accept);
+    assert!(!first.scan.census_complete);
+    assert_eq!(first.held.len(), 1, "the changed demoted revision is held");
+    assert!(!first.progress_blocking);
+    assert_eq!(first.index.claude_account_deferred_hold_count(), 0);
+    assert!(!first.index.bounded_sweep_had_unsettled_upload());
+    assert_eq!(
+        first.index.files[&held_key].last_snapshot_fingerprint,
+        baseline.files[&held_key].last_snapshot_fingerprint
+    );
+    let held_revision = first
+        .index
+        .bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION)
+        .expect("terminal quarantine bound to the held revision");
+    assert_ne!(held_revision, committed_revision);
+
+    let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
+    assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
+    assert!(last.scan.census_complete);
+    let held_body = first.held.iter().next().expect("held body");
+    for page in [&first, &last] {
+        assert!(!page.uploaded.contains(held_body));
+    }
+    let settled = &last.index;
+    assert!(!settled.accepted_snapshot_fingerprint_recorded(held_body));
+    assert!(!settled.current_snapshot_fingerprints().contains(held_body));
+    assert_eq!(
+        settled.file_snapshot_fingerprints[&held_key],
+        baseline.file_snapshot_fingerprints[&held_key]
+    );
+    assert_eq!(
+        settled.bound_terminal_claude_authority_revision_for_test(PIPELINE_HELD_SESSION),
+        Some(held_revision)
+    );
+    let (window_start, window_end) =
+        snapshot_manifest_window(&last.scan.census_window_end, 183).expect("manifest window");
+    let manifest = settled
+        .manifest_for_window(SnapshotSource::ClaudeCode, &window_start, &window_end)
+        .expect("complete activity witness");
+    assert_eq!(
+        manifest,
+        baseline
+            .manifest_for_window(SnapshotSource::ClaudeCode, &window_start, &window_end)
+            .expect("baseline manifest")
+    );
+    assert_eq!(
+        cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode),
+        Some(manifest)
+    );
 }

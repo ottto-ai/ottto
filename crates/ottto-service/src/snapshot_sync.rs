@@ -263,6 +263,11 @@ fn exclude_held_effective_body_witness_revision(
 /// their committed revision, every other key commits as the no-hold save
 /// would, and the traversal may settle. The caller keeps backfill and replay
 /// completion pending, and the durable hold disclosure keeps health red.
+///
+/// A non-progressing hold in a Claude family that retains authority evidence
+/// but has no committed entry to restore, as after a historical replay reset,
+/// still blocks: settling it would let a later page of the same traversal
+/// treat the still-present family as vanished.
 fn commit_completed_with_local_holds(
     index: ScanIndex,
     committed_index: &ScanIndex,
@@ -271,7 +276,9 @@ fn commit_completed_with_local_holds(
     account_deferred_held_fingerprints: &BTreeSet<String>,
     progress_blocking: bool,
 ) -> ScanIndex {
-    if !progress_blocking {
+    if !progress_blocking
+        && index.locally_held_keys_restorable(committed_index, locally_held_fingerprints)
+    {
         return index.with_locally_held_keys_reverted(
             committed_index,
             locally_held_fingerprints,

@@ -565,7 +565,9 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
 }
 
 // A held key keeps its committed revision, its activity and accepted
-// ledger, and reparse debt; every other key commits as scanned.
+// ledger, and reparse debt; every other key commits as scanned. A held key
+// with no committed revision in a family with retained authority evidence is
+// not restorable.
 #[test]
 fn locally_held_keys_revert_to_committed_revision_and_keep_manifest() {
     let activity = "2026-08-02T07:00:00Z";
@@ -718,6 +720,37 @@ fn locally_held_keys_revert_to_committed_revision_and_keep_manifest() {
         rearmed.files[held_key].last_snapshot_fingerprint.as_deref(),
         Some("held-old")
     );
+
+    // Dropping a never-committed held key is settleable only while its family
+    // carries no retained authority evidence; a committed held key restores.
+    assert!(scanned.locally_held_keys_restorable(&previous, &held));
+    let mut fresh_family_evidence = scanned.clone();
+    bind_authority_quarantine(
+        &mut fresh_family_evidence,
+        "fresh-held",
+        "fresh-held",
+        &hex64('a'),
+        ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+    );
+    assert!(!fresh_family_evidence.locally_held_keys_restorable(&previous, &held));
+    let mut previous_family_evidence = previous.clone();
+    bind_authority_quarantine(
+        &mut previous_family_evidence,
+        "fresh-held",
+        "fresh-held",
+        &hex64('a'),
+        ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+    );
+    assert!(!scanned.locally_held_keys_restorable(&previous_family_evidence, &held));
+    let mut committed_family_evidence = scanned.clone();
+    bind_authority_quarantine(
+        &mut committed_family_evidence,
+        "held",
+        "held",
+        &hex64('a'),
+        ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+    );
+    assert!(committed_family_evidence.locally_held_keys_restorable(&previous, &held));
 }
 
 // A bound terminal hold keeps its revision and is skipped even under a

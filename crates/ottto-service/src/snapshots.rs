@@ -21179,6 +21179,58 @@ impl ScanIndex {
     /// synthetic witness whose only member is the root itself.
     #[cfg(test)]
     pub(crate) fn insert_retry_pending_claude_authority_for_test(&mut self, root_session_id: &str) {
+        self.insert_claude_authority_for_test(
+            root_session_id,
+            &"1".repeat(64),
+            ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+        );
+    }
+
+    /// A well-formed UnprovenTerminal family quarantine bound to a retained
+    /// synthetic witness whose only member is the root itself, recording
+    /// `revision` as that member's held source revision.
+    #[cfg(test)]
+    pub(crate) fn insert_unproven_terminal_claude_authority_for_test(
+        &mut self,
+        root_session_id: &str,
+        revision: &str,
+    ) {
+        self.insert_claude_authority_for_test(
+            root_session_id,
+            revision,
+            ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+        );
+    }
+
+    /// The root member revision recorded by a terminal quarantine that is
+    /// still bound to the family's retained witness.
+    #[cfg(test)]
+    pub(crate) fn bound_terminal_claude_authority_revision_for_test(
+        &self,
+        root_session_id: &str,
+    ) -> Option<String> {
+        let record = self
+            .claude_usage_authority_quarantine
+            .get(root_session_id)?;
+        let witness = self.claude_usage_family_witnesses.get(root_session_id)?;
+        if record.disposition != ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+            || !claude_usage_authority_preserves_pending(record, witness)
+        {
+            return None;
+        }
+        record
+            .member_source_file_fingerprints
+            .get(root_session_id)
+            .cloned()
+    }
+
+    #[cfg(test)]
+    fn insert_claude_authority_for_test(
+        &mut self,
+        root_session_id: &str,
+        revision: &str,
+        disposition: ClaudeUsageAuthorityQuarantineDisposition,
+    ) {
         let witness = ClaudeUsageFamilyWitness {
             evidence_fingerprint: "e".repeat(64),
             member_request_id_fingerprints: BTreeMap::from([(
@@ -21195,17 +21247,24 @@ impl ScanIndex {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or_default();
+        let failed_reconstruction_count = match disposition {
+            ClaudeUsageAuthorityQuarantineDisposition::RetryPending => 1,
+            ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal => {
+                MAX_CLAUDE_USAGE_AUTHORITY_FAILURES
+            }
+        };
         let record = ClaudeUsageAuthorityQuarantineRecord {
             contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
             proven_witness_fingerprint: claude_usage_family_witness_fingerprint(&witness),
             member_source_file_fingerprints: BTreeMap::from([(
                 root_session_id.to_string(),
-                "1".repeat(64),
+                revision.to_string(),
             )]),
-            failed_reconstruction_count: 1,
-            disposition: ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+            failed_reconstruction_count,
+            disposition,
             retry_after_unix_seconds: now.saturating_add(CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS),
         };
+        assert!(claude_usage_authority_preserves_pending(&record, &witness));
         self.claude_usage_family_witnesses
             .insert(root_session_id.to_string(), witness);
         self.claude_usage_authority_quarantine
@@ -22316,6 +22375,54 @@ impl ScanIndex {
             .retain(|index_key, _| files.contains_key(index_key) || observed.contains(index_key));
     }
 
+    /// Keys whose scanned entity set or head names a held revision.
+    fn locally_held_keys(&self, held: &BTreeSet<String>) -> BTreeSet<String> {
+        self.files
+            .iter()
+            .filter(|(key, entry)| {
+                self.file_snapshot_fingerprints
+                    .get(*key)
+                    .is_some_and(|fingerprints| !fingerprints.is_disjoint(held))
+                    || entry
+                        .last_snapshot_fingerprint
+                        .as_ref()
+                        .is_some_and(|fingerprint| held.contains(fingerprint))
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Whether `with_locally_held_keys_reverted` keeps every held Claude
+    /// family that still carries authority evidence in the census. The revert
+    /// drops a held key that has no committed entry, and a later complete page
+    /// of the same traversal would then read its still-present family as
+    /// vanished: it drops the retained witness, resolves the quarantine, and
+    /// omits the family from the manifest. A historical replay reset clears
+    /// ordinary committed entries but keeps that evidence, so such a hold must
+    /// stay progress-blocking instead.
+    pub(crate) fn locally_held_keys_restorable(
+        &self,
+        previous: &ScanIndex,
+        held: &BTreeSet<String>,
+    ) -> bool {
+        self.locally_held_keys(held).iter().all(|key| {
+            if previous.files.contains_key(key) {
+                return true;
+            }
+            let Some((root_session_id, _)) = claude_index_path_family_member(Path::new(key)) else {
+                return true;
+            };
+            [self, previous].iter().all(|index| {
+                !index
+                    .claude_usage_family_witnesses
+                    .contains_key(&root_session_id)
+                    && !index
+                        .claude_usage_authority_quarantine
+                        .contains_key(&root_session_id)
+            })
+        })
+    }
+
     /// The commit for a `Completed` upload whose only unsettled entities are
     /// locally held, non-progressing revisions. Every uploaded entity was
     /// accepted or unchanged, so each key without a held entity commits
@@ -22325,7 +22432,8 @@ impl ScanIndex {
     /// owned-start witness, and the activity and accepted ledger for those
     /// restored entities. A held body therefore never enters the committed
     /// entity set, the manifest, or the accepted ledger, and a held key that
-    /// was never committed stays absent.
+    /// was never committed stays absent; `locally_held_keys_restorable` says
+    /// whether that absence is safe to settle.
     ///
     /// `reparse_held` names held entities whose key every later generation
     /// must reparse (account deferrals). Their restored entry carries an empty
@@ -22338,20 +22446,7 @@ impl ScanIndex {
         held: &BTreeSet<String>,
         reparse_held: &BTreeSet<String>,
     ) -> ScanIndex {
-        let held_keys = self
-            .files
-            .iter()
-            .filter(|(key, entry)| {
-                self.file_snapshot_fingerprints
-                    .get(*key)
-                    .is_some_and(|fingerprints| !fingerprints.is_disjoint(held))
-                    || entry
-                        .last_snapshot_fingerprint
-                        .as_ref()
-                        .is_some_and(|fingerprint| held.contains(fingerprint))
-            })
-            .map(|(key, _)| key.clone())
-            .collect::<BTreeSet<_>>();
+        let held_keys = self.locally_held_keys(held);
         let mut result = self.clone();
         for key in &held_keys {
             let reparse = self
