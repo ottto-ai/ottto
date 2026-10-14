@@ -1,0 +1,166 @@
+{
+  "schema_version": 6,
+  "source": "claude_code",
+  "machine_id": "machine-session-identity-w0",
+  "collector_version": "local-enriched/1",
+  "entity_ack_contract": "snapshot_entity_ack:v1",
+  "snapshots": [
+    {
+      "session_account_evidence": {
+        "provider": "anthropic",
+        "identity_hash_scheme": "provider-sha256:v1",
+        "evidence_source": "claude_desktop_original:v1",
+        "identity_disposition": "complete",
+        "account_identifier_hash": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "provider_workspace_hash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        "source_created_at": "2026-09-01T09:59:00Z"
+      },
+      "source_session_id": "w0-tl-no-org",
+      "snapshot_fingerprint": "861fabe8b68672245aadd93544663bf87f3de0678d9187689ef56ebc2e13ad03",
+      "status": "final",
+      "input_tokens": 300,
+      "output_tokens": 30,
+      "cache_read_tokens": 0,
+      "cache_creation_5m_tokens": 0,
+      "cache_creation_1h_tokens": 0,
+      "reasoning_output_tokens": 0,
+      "request_count": 3,
+      "peak_context_fill_tokens": 100,
+      "first_turn_context_tokens": 100,
+      "last_turn_context_tokens": 100,
+      "compaction_count": 0,
+      "context_curve": {
+        "contract_version": "session_context_curve:v1",
+        "parser_revision": "claude_code_jsonl:v37",
+        "ownership_revision": "claude_owned_request_start_proof:v2",
+        "sampling_revision": "deterministic_even_gap:v1",
+        "coverage": "ownership_unresolved",
+        "total_owned_request_count": 0,
+        "retained_point_count": 0,
+        "total_compaction_boundary_count": 0,
+        "retained_boundary_count": 0,
+        "points": [],
+        "boundaries": [],
+        "model_windows": []
+      },
+      "activity_summary": {
+        "capability_collection_version": "agent_capability_usage:v1",
+        "tool_calls": 0,
+        "shell_commands": 0,
+        "patch_operations": 0,
+        "changed_files": 0,
+        "lines_added": 0,
+        "lines_deleted": 0,
+        "web_searches": 0,
+        "mcp_calls": 0,
+        "subagent_spawns": 0
+      },
+      "tool_usage": [],
+      "model_usage": [
+        {
+          "model": "claude-haiku-4-5",
+          "input_tokens": 300,
+          "output_tokens": 30,
+          "cache_read_tokens": 0,
+          "cache_creation_5m_tokens": 0,
+          "cache_creation_1h_tokens": 0,
+          "reasoning_output_tokens": 0,
+          "request_count": 3,
+          "selector_context": {
+            "context_bucket": "short"
+          },
+          "selector_sources": {
+            "context_bucket": "derived_from_effective_input_volume"
+          },
+          "gateway_provider": "anthropic",
+          "model_provider": "anthropic",
+          "cost_usd": "3.00",
+          "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+          "evidence_ref": 0
+        }
+      ],
+      "usage_buckets": [
+        {
+          "bucket_start": "2026-09-01T10:00:00Z",
+          "model_usage": [
+            {
+              "model": "claude-haiku-4-5",
+              "input_tokens": 300,
+              "output_tokens": 30,
+              "cache_read_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_creation_1h_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "request_count": 3,
+              "selector_context": {
+                "context_bucket": "short"
+              },
+              "selector_sources": {
+                "context_bucket": "derived_from_effective_input_volume"
+              },
+              "gateway_provider": "anthropic",
+              "model_provider": "anthropic",
+              "cost_usd": "3.00",
+              "account_identifier_hash": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "evidence_ref": 0
+            }
+          ],
+          "first_activity_at": "2026-09-01T10:00:04Z",
+          "last_activity_at": "2026-09-01T10:00:50Z"
+        }
+      ],
+      "cost": {
+        "total_cost_usd": "3.00",
+        "evidence_source": "synthetic_reported"
+      },
+      "session_display_name": null,
+      "session_display_name_source": null,
+      "source_started_at": "2026-09-01T10:00:04Z",
+      "source_ended_at": null,
+      "source_last_activity_at": "2026-09-01T10:00:50Z",
+      "collected_at": "2026-09-01T10:05:50Z",
+      "workspace_hash": null,
+      "source_file_fingerprint": "f74d3c100e30d911b1328948b3ff53297734255f9598ef6ec3308e94b0cbf8b2",
+      "provenance": {
+        "collector": "claude_code_jsonl:own_request_identity_rows:v1",
+        "source_file_count": 1,
+        "input_token_scope": "uncached"
+      },
+      "origin": {
+        "entrypoint": "claude-desktop",
+        "is_sidechain": false,
+        "used_workflow_orchestration": false
+      },
+      "attribution_facts": [],
+      "request_evidence": [
+        {
+          "identity_basis": "telemetry_login"
+        }
+      ],
+      "semantic_envelope": {
+        "component_contract_version": "snapshot_semantic:v1",
+        "revision_contract_version": "snapshot_revision:v1",
+        "upload_policy": {
+          "session_titles_enabled": true,
+          "workspace_labels_enabled": true,
+          "session_artifacts_enabled": false,
+          "session_attribution_enabled": false,
+          "session_attribution_labels_enabled": false
+        },
+        "component_hashes": {
+          "activity_summary": "348307e04856d6c750d45c50ceda5974e7f256ad6111c437f459b1a3345ef97f",
+          "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
+          "attribution": "81be6b76d834174948ef18676e8eaa34794940b8d21068ac52f1ed9b89244864",
+          "context_posture": "0753cf7f13925f184d21bc9a005629d1fee4db3b556470a388706623afd0db0b",
+          "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
+          "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
+          "lifecycle_activity": "7c256960e95aa64afce7fdf0ab1ac9017a9445b597f7b35e4a744b287e170e7f",
+          "usage_accounting": "47dc5d7e5693673be74c71544cdf0b718c2818ae131c95e754f00d6bc9b5c41f"
+        },
+        "revision_hash": "1d80fa3cec5147848b36a8a2ce427414bdb1998980095f912ead73a9ef1fe8c6",
+        "content_hash": "cbc417b85a62bad630818985c5218ef32cd50eca5423aa8924095bcb41290a01",
+        "hash_epoch": 1
+      }
+    }
+  ]
+}

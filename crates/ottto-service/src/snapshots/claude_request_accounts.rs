@@ -34,9 +34,34 @@ pub(crate) enum Coverage {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MixedUploads {
     bodies: BTreeMap<String, (String, String)>,
+    /// Contract-5 bodies tagged in this scan, bound the same way.
+    request_identity: BTreeMap<String, (String, String)>,
 }
 
 impl MixedUploads {
+    pub(crate) fn admit_request_identity(&mut self, item: &SnapshotItem) {
+        if item.provenance.collector == super::claude_request_identity::COLLECTOR {
+            self.request_identity.insert(
+                item.source_session_id.clone(),
+                (
+                    item.snapshot_fingerprint.clone(),
+                    super::snapshot_upload_body_witness(item),
+                ),
+            );
+        }
+    }
+
+    pub(super) fn permits_request_identity(&self, item: &SnapshotItem) -> bool {
+        self.request_identity
+            .get(&item.source_session_id)
+            .is_some_and(|(semantic, body)| {
+                item.provenance.collector == super::claude_request_identity::COLLECTOR
+                    && item.snapshot_fingerprint == *semantic
+                    && snapshot_fingerprint(SnapshotSource::ClaudeCode, item) == *semantic
+                    && super::snapshot_upload_body_witness(item) == *body
+            })
+    }
+
     pub(super) fn permits(&self, item: &SnapshotItem) -> bool {
         self.bodies
             .get(&item.source_session_id)
@@ -91,6 +116,36 @@ pub(crate) fn apply_with_originals(
                 .or_insert(Some(row));
         }
     }
+    qualify_all(snapshots, api, trace, &requests, &owners, originals)
+}
+
+/// `apply_with_originals` over the request/owner index contract 5 already
+/// built from these same reports this pass, instead of building it twice.
+pub(crate) fn apply_with_shared_index(
+    snapshots: &mut [SnapshotItem],
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    originals: &BTreeMap<String, super::SessionAccountEvidence>,
+    evidence: &super::claude_request_identity::ScanEvidence<'_>,
+) -> Qualification {
+    qualify_all(
+        snapshots,
+        api,
+        trace,
+        &evidence.requests,
+        &evidence.owners,
+        originals,
+    )
+}
+
+fn qualify_all(
+    snapshots: &mut [SnapshotItem],
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    requests: &BTreeMap<(&str, &str), Option<&ClaudeLocalOtelEvidence>>,
+    owners: &BTreeMap<(&str, &str), Option<&ClaudeTraceOwnershipEvidence>>,
+    originals: &BTreeMap<String, super::SessionAccountEvidence>,
+) -> Qualification {
     let healthy = api.health.is_complete() && trace.is_complete();
     let mut result = Qualification::default();
     for item in snapshots {
@@ -121,7 +176,7 @@ pub(crate) fn apply_with_originals(
                         && comparable == **before
                 })
             });
-            let qualified = healthy && qualify_mixed(item, &requests, &owners, original);
+            let qualified = healthy && qualify_mixed(item, requests, owners, original);
             if qualified {
                 if let Some(original) = original {
                     item.session_account_evidence = Some(original.clone());
@@ -159,7 +214,7 @@ pub(crate) fn apply_with_originals(
             }
         }
         let proof = if healthy {
-            qualify(item, &requests, &owners)
+            qualify(item, requests, owners)
         } else {
             Err(Coverage::UnreadableEvidence)
         };
@@ -194,7 +249,7 @@ pub(crate) fn apply_with_originals(
 
 // Preserve each original instant while using the backend's UTC wire spelling
 // for lifecycle fields. This changes no timestamp source or semantic hash epoch.
-fn normalize_activity(item: &mut SnapshotItem) -> bool {
+pub(super) fn normalize_activity(item: &mut SnapshotItem) -> bool {
     let mut changed = false;
     for value in [
         &mut item.source_started_at,
@@ -341,7 +396,7 @@ fn hash_is_valid(hash: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn local_subscription(row: &super::SnapshotModelUsage) -> bool {
+pub(super) fn local_subscription(row: &super::SnapshotModelUsage) -> bool {
     matches!(row.auth_mode.as_deref(), None | Some("oauth"))
         && matches!(row.billing_channel.as_deref(), None | Some("subscription"))
         && matches!(row.billing_provider.as_deref(), None | Some("anthropic"))

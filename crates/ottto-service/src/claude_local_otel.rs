@@ -1032,6 +1032,24 @@ pub fn claude_effort_sidecar_fingerprint(support_dir: &Path, session_id: &str) -
     )
 }
 
+#[cfg(test)]
+pub(crate) fn claude_trace_ownership_evidence_dir(support_dir: &Path) -> PathBuf {
+    support_dir.join(TRACE_STORE_DIR)
+}
+
+/// True only when neither paired sidecar exists. Oversized, non-file or
+/// unreadable sidecars are failures, not absence.
+pub(crate) fn claude_sidecars_absent(support_dir: &Path, session_id: &str) -> bool {
+    [
+        evidence_path(support_dir, session_id),
+        trace_evidence_path(support_dir, session_id),
+    ]
+    .iter()
+    .all(|path| {
+        fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 pub fn claude_trace_ownership_sidecar_fingerprint(support_dir: &Path, session_id: &str) -> String {
     sidecar_fingerprint(
         trace_evidence_path(support_dir, session_id),

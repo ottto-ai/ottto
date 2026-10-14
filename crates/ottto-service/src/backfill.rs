@@ -477,6 +477,9 @@ mod tests {
         ended_at: Option<&str>,
     ) -> SnapshotItem {
         SnapshotItem {
+            request_evidence: Vec::new(),
+            request_identity_refusals: 0,
+            claude_org_markers: None,
             source_session_id: session_id.to_string(),
             snapshot_fingerprint: format!("fp-{session_id}"),
             status: "final".to_string(),

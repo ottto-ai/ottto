@@ -1,0 +1,161 @@
+{
+  "cache_creation_1h_tokens": 0,
+  "cache_creation_5m_tokens": 0,
+  "cache_read_tokens": 0,
+  "collected_at": "2026-08-02T09:00:00Z",
+  "compaction_count": 0,
+  "first_turn_context_tokens": 10,
+  "input_tokens": 13,
+  "last_turn_context_tokens": 10,
+  "model_usage": [
+    {
+      "cache_creation_1h_tokens": 0,
+      "cache_creation_5m_tokens": 0,
+      "cache_read_tokens": 0,
+      "gateway_provider": "anthropic",
+      "identity_parts": [
+        {
+          "cache_creation_1h_tokens": 0,
+          "cache_creation_5m_tokens": 0,
+          "cache_read_tokens": 0,
+          "evidence_ref": 0,
+          "input_tokens": 10,
+          "output_tokens": 10,
+          "reasoning_output_tokens": 0,
+          "request_count": 1,
+          "unattributed_total_tokens": 0
+        },
+        {
+          "cache_creation_1h_tokens": 0,
+          "cache_creation_5m_tokens": 0,
+          "cache_read_tokens": 0,
+          "input_tokens": 3,
+          "output_tokens": 3,
+          "reasoning_output_tokens": 0,
+          "request_count": 1,
+          "unattributed_total_tokens": 0
+        }
+      ],
+      "input_tokens": 13,
+      "model": "claude-haiku-4-5",
+      "model_provider": "anthropic",
+      "output_tokens": 13,
+      "reasoning_output_tokens": 0,
+      "request_count": 2,
+      "selector_context": {
+        "context_bucket": "short"
+      },
+      "selector_sources": {
+        "context_bucket": "derived_from_effective_input_volume"
+      }
+    }
+  ],
+  "origin": {
+    "used_workflow_orchestration": false
+  },
+  "output_tokens": 13,
+  "peak_context_fill_tokens": 10,
+  "provenance": {
+    "collector": "claude_code_jsonl:own_request_identity_rows:v1",
+    "input_token_scope": "uncached",
+    "source_file_count": 1
+  },
+  "reasoning_output_tokens": 0,
+  "request_count": 2,
+  "request_evidence": [
+    {
+      "identity_basis": "transcript_org",
+      "provider_workspace_hash": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5"
+    }
+  ],
+  "semantic_envelope": {
+    "component_contract_version": "snapshot_semantic:v1",
+    "component_hashes": {
+      "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
+      "attribution": "06de8510d9e4f88825cfa50da82388e6055ca57235a88e2378cacf616a7b434b",
+      "context_posture": "afc041e9188a563ec4ce37cab4be81ada5892ae06b0c07d9393f92495f016dae",
+      "display_identity": "e429ca317695770aab75860ce9f24f0c000cd6ea56ad8ef193e5b1150988459e",
+      "latency": "c26c44d58bffc7d0642437d593c2068e3f2806fd09715940a762bdcd1df3e878",
+      "lifecycle_activity": "e7c7be6c684a9ac89a3cb0fe101dd13ddc7c314f6c181432804321f07a959b0f",
+      "usage_accounting": "93e90d6ad1d0c5ed23030d071f5f2fba0a236df061ac29a8f9312896678b07af"
+    },
+    "content_hash": "82af6ebd19a305ddbea22c60e3795f4c10652086359c825432bae2a26ec5f33a",
+    "hash_epoch": 1,
+    "revision_contract_version": "snapshot_revision:v1",
+    "revision_hash": "b584d50a14fc6a8b5e76eaea92294c925930a05088d0b6cadb18f65ac729a01b",
+    "upload_policy": {
+      "session_artifacts_enabled": false,
+      "session_attribution_enabled": true,
+      "session_attribution_labels_enabled": true,
+      "session_titles_enabled": true,
+      "workspace_labels_enabled": true
+    }
+  },
+  "session_account_evidence": {
+    "evidence_source": "claude_desktop_original:v1",
+    "identity_disposition": "missing",
+    "identity_hash_scheme": "provider-sha256:v1",
+    "provider": "anthropic"
+  },
+  "session_display_name": null,
+  "session_display_name_source": null,
+  "snapshot_fingerprint": "befce4f5d02cc1752d9f67476549d04161682c6d3add8e687a5e06e9a057b774",
+  "source_ended_at": null,
+  "source_file_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "source_last_activity_at": "2026-08-02T07:00:03Z",
+  "source_session_id": "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+  "source_started_at": "2026-08-02T07:00:00Z",
+  "status": "final",
+  "tool_usage": [],
+  "usage_buckets": [
+    {
+      "bucket_start": "2026-08-02T07:00:00Z",
+      "first_activity_at": "2026-08-02T07:00:00Z",
+      "last_activity_at": "2026-08-02T07:00:03Z",
+      "model_usage": [
+        {
+          "cache_creation_1h_tokens": 0,
+          "cache_creation_5m_tokens": 0,
+          "cache_read_tokens": 0,
+          "gateway_provider": "anthropic",
+          "identity_parts": [
+            {
+              "cache_creation_1h_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_read_tokens": 0,
+              "evidence_ref": 0,
+              "input_tokens": 10,
+              "output_tokens": 10,
+              "reasoning_output_tokens": 0,
+              "request_count": 1,
+              "unattributed_total_tokens": 0
+            },
+            {
+              "cache_creation_1h_tokens": 0,
+              "cache_creation_5m_tokens": 0,
+              "cache_read_tokens": 0,
+              "input_tokens": 3,
+              "output_tokens": 3,
+              "reasoning_output_tokens": 0,
+              "request_count": 1,
+              "unattributed_total_tokens": 0
+            }
+          ],
+          "input_tokens": 13,
+          "model": "claude-haiku-4-5",
+          "model_provider": "anthropic",
+          "output_tokens": 13,
+          "reasoning_output_tokens": 0,
+          "request_count": 2,
+          "selector_context": {
+            "context_bucket": "short"
+          },
+          "selector_sources": {
+            "context_bucket": "derived_from_effective_input_volume"
+          }
+        }
+      ]
+    }
+  ],
+  "workspace_hash": null
+}

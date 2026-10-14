@@ -323,6 +323,8 @@ mod tests {
             selector_context.insert("plan_window_bucket".to_string(), bucket.to_string());
         }
         SnapshotModelUsage {
+            evidence_ref: None,
+            identity_parts: None,
             model: "test-model".to_string(),
             input_tokens,
             output_tokens,
@@ -369,6 +371,9 @@ mod tests {
         usage_buckets: Vec<SnapshotUsageBucket>,
     ) -> SnapshotItem {
         SnapshotItem {
+            request_evidence: Vec::new(),
+            request_identity_refusals: 0,
+            claude_org_markers: None,
             source_session_id: source_session_id.to_string(),
             snapshot_fingerprint: format!("fp-{source_session_id}"),
             status: "active".to_string(),

@@ -2864,6 +2864,9 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         return None;
     }
     Some(SnapshotItem {
+        request_evidence: Vec::new(),
+        request_identity_refusals: 0,
+        claude_org_markers: None,
         session_account_evidence: item.session_account_evidence.clone(),
         source_session_id: item.source_session_id.clone(),
         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
@@ -4977,16 +4980,28 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         .into_iter()
         .collect::<Vec<_>>();
     stats.candidate_root_count = usage_roots.len();
+    let mut identity_unhealthy_roots = BTreeSet::new();
     let usage_roots = usage_roots
         .into_iter()
         .filter(|session_id| {
-            !crate::claude_local_otel::claude_effort_sidecar_fingerprint(support_dir, session_id)
-                .is_empty()
+            let paired = !crate::claude_local_otel::claude_effort_sidecar_fingerprint(
+                support_dir,
+                session_id,
+            )
+            .is_empty()
                 && !crate::claude_local_otel::claude_trace_ownership_sidecar_fingerprint(
                     support_dir,
                     session_id,
                 )
-                .is_empty()
+                .is_empty();
+            // Contract 5 must tell absent evidence from failed evidence.
+            if !paired
+                && crate::snapshots::claude_request_identity::EMISSION_ENABLED
+                && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
+            {
+                identity_unhealthy_roots.insert(session_id.clone());
+            }
+            paired
         })
         .collect::<Vec<_>>();
     stats.paired_sidecar_root_count = usage_roots.len();
@@ -5010,6 +5025,9 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
             stats.trace_incomplete_root_count += 1;
         }
         if !api.health.is_complete() || !trace.is_complete() {
+            if crate::snapshots::claude_request_identity::EMISSION_ENABLED {
+                identity_unhealthy_roots.insert(root_session_id);
+            }
             continue;
         }
         stats.complete_sidecar_root_count += 1;
@@ -5045,20 +5063,51 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         }
     }
     let census_window_end = scan_result.census_window_end.clone();
-    let mut disposition = crate::snapshots::apply_claude_reported_usage_with_index(
+    // Contract-5 evidence exists only when emission is on; the reported
+    // rebuild then classifies and groups each request as it places it.
+    let identity_evidence =
+        crate::snapshots::claude_request_identity::EMISSION_ENABLED.then(|| {
+            crate::snapshots::claude_request_identity::ScanEvidence::new(
+                &api_report,
+                &trace_report,
+                identity_unhealthy_roots,
+                crate::snapshots::claude_request_identity::desktop_census(index),
+            )
+            .with_status_coverage(crate::claude_status_coverage::snapshot())
+        });
+    let mut disposition = crate::snapshots::apply_claude_reported_usage_with_identity(
         &mut scan_result.snapshots,
         &api_report,
         &trace_report,
         index,
         census_complete,
         &census_window_end,
+        identity_evidence.as_ref(),
     );
-    let qualification = crate::snapshots::claude_request_accounts::apply_with_originals(
-        &mut scan_result.snapshots,
-        &api_report,
-        &trace_report,
-        &originals,
-    );
+    if let Some(evidence) = &identity_evidence {
+        // Contract 5 first: D1 below leaves new-collector items untouched.
+        let _request_identity = crate::snapshots::claude_request_identity::apply_scan(
+            &mut scan_result.snapshots,
+            evidence,
+            std::mem::take(&mut disposition.request_groupings),
+        );
+    }
+    let qualification = match &identity_evidence {
+        Some(evidence) => crate::snapshots::claude_request_accounts::apply_with_shared_index(
+            &mut scan_result.snapshots,
+            &api_report,
+            &trace_report,
+            &originals,
+            evidence,
+        ),
+        None => crate::snapshots::claude_request_accounts::apply_with_originals(
+            &mut scan_result.snapshots,
+            &api_report,
+            &trace_report,
+            &originals,
+        ),
+    };
+    drop(identity_evidence);
     let _account_coverage = qualification.coverage;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
@@ -5074,6 +5123,13 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         }
     }
     disposition.mixed_uploads = qualification.mixed;
+    if crate::snapshots::claude_request_identity::EMISSION_ENABLED {
+        // Request identity is not the session owner: admit only this scan's
+        // exact contract-5 bodies, never rewriting a retained owner.
+        for item in &scan_result.snapshots {
+            disposition.mixed_uploads.admit_request_identity(item);
+        }
+    }
     stats.identity_complete_session_count = scan_result
         .snapshots
         .iter()
