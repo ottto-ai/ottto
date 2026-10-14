@@ -99,7 +99,8 @@ pub(crate) struct Ledger {
     /// is cleared, but the loss stays known: a removed slot never reads as a
     /// folder the basis never applied to.
     lost: BTreeSet<HomeKey>,
-    /// More than `MAX_LOST` folders were lost: which ones is no longer known.
+    /// More than `MAX_LOST` folders were lost, or more than `MAX_SLOTS` were
+    /// registered at once: which ones is no longer known.
     lost_overflow: bool,
 }
 
@@ -217,11 +218,13 @@ pub(crate) fn retain_registered<'a>(
         return;
     }
     let default_key = home_key(default_dir);
-    let keys = config_dirs
-        .map(|dir| home_key(Path::new(dir)))
-        .filter(|key| *key != default_key)
-        .take(MAX_SLOTS)
-        .collect::<BTreeSet<_>>();
+    // One past the cap is enough to know the record overflowed.
+    let mut keys = BTreeSet::new();
+    for key in config_dirs.map(|dir| home_key(Path::new(dir))) {
+        if key != default_key && keys.insert(key) && keys.len() > MAX_SLOTS {
+            break;
+        }
+    }
     let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).ok();
     if let Ok(mut ledger) = LEDGER.lock() {
         ledger.retain(keys, now);
@@ -261,8 +264,17 @@ pub(crate) fn clear_global_for_test() {
 impl Ledger {
     /// Records one completed pass at `at`. A folder that drops out loses its
     /// history and joins the bounded lost set; one more loss than the set
-    /// holds makes the loss record incomplete for the rest of the process.
-    pub(crate) fn retain(&mut self, registered: BTreeSet<HomeKey>, at: Option<u64>) {
+    /// holds, or more registered folders than `MAX_SLOTS`, makes the record
+    /// incomplete for the rest of the process.
+    pub(crate) fn retain(&mut self, mut registered: BTreeSet<HomeKey>, at: Option<u64>) {
+        if registered.len() > MAX_SLOTS {
+            // A registered folder past the cap is forgotten like a lost one.
+            while registered.len() > MAX_SLOTS {
+                registered.pop_last();
+            }
+            self.lost.clear();
+            self.lost_overflow = true;
+        }
         self.slots.retain(|key, _| registered.contains(key));
         let removed = self
             .registered

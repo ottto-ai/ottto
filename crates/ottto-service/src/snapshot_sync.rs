@@ -3413,6 +3413,14 @@ fn prepare_sync_source(
     let cache_observations_enabled = source != SnapshotSource::Pi
         && activity_hint.session_cache_observations_contract.as_deref()
             == Some("session_cache_observations:v1");
+    // Contract-5 marker capture and the Desktop census witness are local work
+    // only an emitting cycle uses, so they follow this cycle's permit, not the
+    // compiled switch alone. Finish recomputes the permit from the same hint.
+    let request_identity_capture = crate::snapshots::claude_request_identity::emission_permit(
+        source,
+        activity_hint.session_request_identity_contract.as_deref(),
+    )
+    .is_ok();
     // The server's scan directive was parsed and discarded before this. It is a
     // cost lever, so it may only lengthen the local cadence (see
     // `negotiated_wait`), never shorten it.
@@ -3736,7 +3744,17 @@ fn prepare_sync_source(
     } else {
         None
     };
-    let scan = crate::snapshots::OwnedSourceScan::new(
+    let mut sampled_scope = format!(
+        "sampled_scan:v1:{account_witness:?}:{upload_destination_namespace}:{}:{}",
+        index_path.display(),
+        context_curve_enabled
+    );
+    if request_identity_capture {
+        // A retained parser never crosses capture modes; the dark scope bytes
+        // are unchanged.
+        sampled_scope.push_str(":request_identity");
+    }
+    let scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
         source,
         &roots,
         index,
@@ -3752,19 +3770,13 @@ fn prepare_sync_source(
         &watcher_hints.paths,
         watcher_hints.overflowed,
         context_curve_enabled,
+        request_identity_capture,
     )
     .with_sampled_acquisition(
         daemon.transcript_cache.clone(),
         crate::transcript_acquisition::Scope(format!(
             "{:x}",
-            Sha256::digest(
-                format!(
-                    "sampled_scan:v1:{account_witness:?}:{upload_destination_namespace}:{}:{}",
-                    index_path.display(),
-                    context_curve_enabled
-                )
-                .as_bytes()
-            )
+            Sha256::digest(sampled_scope.as_bytes())
         )),
     );
     Ok(Some(SourcePreparation {
@@ -3928,8 +3940,18 @@ fn finish_sync_source(
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
     if source == SnapshotSource::ClaudeCode {
         let evidence_started = Instant::now();
-        let (disposition, census_withheld, stats) =
-            apply_claude_local_evidence_to_scan(support_dir, &mut scan_result, &mut index);
+        let (disposition, census_withheld, stats) = apply_claude_local_evidence_to_scan_with_permit(
+            support_dir,
+            &mut scan_result,
+            &mut index,
+            // This cycle's authenticated hint only; never cached across
+            // cycles, so a revoked token takes effect on the next fetch.
+            crate::snapshots::claude_request_identity::emission_permit(
+                source,
+                activity_hint.session_request_identity_contract.as_deref(),
+            )
+            .ok(),
+        );
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
                 "local snapshot sync: claude local evidence duration_ms={} counts={counts}",
@@ -4927,6 +4949,7 @@ pub struct ClaudeLocalEvidenceStats {
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
 }
 
+/// The dark path: contract-5 bodies are never built.
 pub(crate) fn apply_claude_local_evidence_to_scan(
     support_dir: &Path,
     scan_result: &mut crate::snapshots::SourceScanResult,
@@ -4936,6 +4959,21 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
+    apply_claude_local_evidence_to_scan_with_permit(support_dir, scan_result, index, None)
+}
+
+/// Contract-5 evidence is built only under this cycle's emission permit.
+pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
+    support_dir: &Path,
+    scan_result: &mut crate::snapshots::SourceScanResult,
+    index: &mut ScanIndex,
+    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
+) -> (
+    crate::snapshots::ClaudeUsageAuthorityDisposition,
+    bool,
+    ClaudeLocalEvidenceStats,
+) {
+    let emission_permitted = permit.is_some();
     let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
     // logins; only a fully qualified mixed body may undo the legacy login veto.
@@ -4996,7 +5034,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
                 .is_empty();
             // Contract 5 must tell absent evidence from failed evidence.
             if !paired
-                && crate::snapshots::claude_request_identity::EMISSION_ENABLED
+                && emission_permitted
                 && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
             {
                 identity_unhealthy_roots.insert(session_id.clone());
@@ -5025,7 +5063,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
             stats.trace_incomplete_root_count += 1;
         }
         if !api.health.is_complete() || !trace.is_complete() {
-            if crate::snapshots::claude_request_identity::EMISSION_ENABLED {
+            if emission_permitted {
                 identity_unhealthy_roots.insert(root_session_id);
             }
             continue;
@@ -5063,18 +5101,17 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         }
     }
     let census_window_end = scan_result.census_window_end.clone();
-    // Contract-5 evidence exists only when emission is on; the reported
+    // Contract-5 evidence exists only under this cycle's permit; the reported
     // rebuild then classifies and groups each request as it places it.
-    let identity_evidence =
-        crate::snapshots::claude_request_identity::EMISSION_ENABLED.then(|| {
-            crate::snapshots::claude_request_identity::ScanEvidence::new(
-                &api_report,
-                &trace_report,
-                identity_unhealthy_roots,
-                crate::snapshots::claude_request_identity::desktop_census(index),
-            )
-            .with_status_coverage(crate::claude_status_coverage::snapshot())
-        });
+    let identity_evidence = emission_permitted.then(|| {
+        crate::snapshots::claude_request_identity::ScanEvidence::new(
+            &api_report,
+            &trace_report,
+            identity_unhealthy_roots,
+            crate::snapshots::claude_request_identity::desktop_census(index),
+        )
+        .with_status_coverage(crate::claude_status_coverage::snapshot())
+    });
     let mut disposition = crate::snapshots::apply_claude_reported_usage_with_identity(
         &mut scan_result.snapshots,
         &api_report,
@@ -5123,7 +5160,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         }
     }
     disposition.mixed_uploads = qualification.mixed;
-    if crate::snapshots::claude_request_identity::EMISSION_ENABLED {
+    if emission_permitted {
         // Request identity is not the session owner: admit only this scan's
         // exact contract-5 bodies, never rewriting a retained owner.
         for item in &scan_result.snapshots {

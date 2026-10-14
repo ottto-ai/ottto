@@ -37,10 +37,11 @@ pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:
 /// emits it. Flipping this is a separate, parent-owned change.
 pub(crate) const EMISSION_ENABLED: bool = false;
 
-/// Marker capture and placement recording run only where contract 5 can be
-/// produced: never in a released build while emission is off.
-pub(crate) const fn capture_enabled() -> bool {
-    EMISSION_ENABLED || cfg!(test)
+/// Marker capture and the census witness run only in a scan whose sync cycle
+/// holds an emission permit. Outside a cycle nothing captures in a released
+/// build; tests capture by default so parser fixtures see markers.
+pub(crate) const fn capture_by_default() -> bool {
+    cfg!(test)
 }
 
 /// `transcript_email` (and its status-coverage feed) needs its own review and
@@ -50,6 +51,61 @@ pub(crate) const TRANSCRIPT_EMAIL_ENABLED: bool = false;
 
 pub(crate) const fn transcript_email_enabled() -> bool {
     (EMISSION_ENABLED && TRANSCRIPT_EMAIL_ENABLED) || cfg!(test)
+}
+
+/// `transcript_sole_login` needs the receiver's time-scoped sole-login body
+/// veto verified as deployed, on top of contract-5 emission. Until then a
+/// qualifying Desktop census still yields org-only (`transcript_org`); the
+/// email gate does not cover this basis. Flipping this is a separate,
+/// parent-owned change.
+pub(crate) const TRANSCRIPT_SOLE_LOGIN_ENABLED: bool = false;
+
+/// The activity-hint token (`session_request_identity_contract`) the server
+/// sends only to the approved cohort on the accepted-log route. It is not the
+/// collector name.
+pub(crate) const COHORT_HINT_TOKEN: &str = "own_request_identity_rows:v1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CohortDenial {
+    EmissionDisabled,
+    OtherSource,
+    NoToken,
+    UnknownToken,
+}
+
+/// Proof that this sync cycle may capture identity evidence and build
+/// contract-5 bodies. Only `emission_permit` makes one (`permit_when` takes
+/// the emission constant as an argument, for tests).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EmissionPermit(());
+
+/// The current cycle's permit, from the activity hint fetched for it with
+/// this device's credential. A missing, null or unknown token denies; nothing
+/// is persisted, so a revoked token denies from the next fetched cycle and a
+/// restart or account switch starts from that cycle's hint.
+pub(crate) fn emission_permit(
+    source: SnapshotSource,
+    hint_token: Option<&str>,
+) -> Result<EmissionPermit, CohortDenial> {
+    permit_when(EMISSION_ENABLED, source, hint_token)
+}
+
+pub(super) fn permit_when(
+    emission_enabled: bool,
+    source: SnapshotSource,
+    hint_token: Option<&str>,
+) -> Result<EmissionPermit, CohortDenial> {
+    if !emission_enabled {
+        return Err(CohortDenial::EmissionDisabled);
+    }
+    if source != SnapshotSource::ClaudeCode {
+        return Err(CohortDenial::OtherSource);
+    }
+    match hint_token {
+        None => Err(CohortDenial::NoToken),
+        Some(COHORT_HINT_TOKEN) => Ok(EmissionPermit(())),
+        Some(_) => Err(CohortDenial::UnknownToken),
+    }
 }
 
 pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
@@ -348,6 +404,12 @@ impl Grouping {
             return;
         }
         let key = match identity {
+            // Only a strictly lowercase-hex login reaches the wire; anything
+            // else is refused here, never transformed into another identity.
+            IdentityRef::Tagged(key) if !key.login.map_or(true, wire_login_is_valid) => {
+                group.refused = true;
+                None
+            }
             IdentityRef::Tagged(key) if !self.keys_over_cap => {
                 // At most `MAX_AUTHORITY_KEYS` keys: scan before copying one.
                 if !self.keys.iter().any(|known| key.matches(known)) {
@@ -1033,6 +1095,8 @@ pub(crate) struct ScanEvidence<'a> {
     pub(crate) memberships: BTreeMap<String, BTreeSet<String>>,
     /// Desktop store logins per org, present only under a valid census witness.
     pub(crate) desktop_census: Option<DesktopCensus>,
+    /// `TRANSCRIPT_SOLE_LOGIN_ENABLED`; off, a sole census login stays org-only.
+    sole_login_enabled: bool,
     /// This scan's copy of the local status-coverage history.
     status_coverage: Option<crate::claude_status_coverage::Ledger>,
     /// Key of the shared default folder, where the email basis never applies.
@@ -1055,6 +1119,7 @@ impl<'a> ScanEvidence<'a> {
         let mut evidence = Self {
             unhealthy_roots,
             desktop_census,
+            sole_login_enabled: TRANSCRIPT_SOLE_LOGIN_ENABLED,
             ..Self::default()
         };
         for (root, rows) in &api.evidence {
@@ -1133,6 +1198,13 @@ impl<'a> ScanEvidence<'a> {
         self.pending_writer_witnesses = roots;
         self
     }
+
+    /// Test-only stand-in for a verified sole-login body veto.
+    #[cfg(test)]
+    pub(crate) fn with_sole_login_enabled(mut self) -> Self {
+        self.sole_login_enabled = true;
+        self
+    }
 }
 
 /// `Ok(None)` = no organization observed; `Err` = present but conflicting or invalid.
@@ -1183,6 +1255,14 @@ fn account_origin_matches(account: &ClaudeIdentityAttributeEvidence, login: &str
         }
         ClaudeIdentityAttributeOrigin::Missing => false,
     }
+}
+
+/// The receiver's stored `account_identifier_hash` spelling.
+fn wire_login_is_valid(login: &str) -> bool {
+    (8..=128).contains(&login.len())
+        && login
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn hash_is_valid(hash: &str) -> bool {
@@ -1311,6 +1391,16 @@ pub(crate) fn classify_ref<'k>(
         Some(Some(row)) => *row,
         None if facts.telemetry_pending(evidence) => return Refused(Refusal::Pending),
         None => {
+            // A trace that already owns this request outranks the transcript:
+            // a foreign, duplicated or unpaired owner refuses and never borrows
+            // this transcript's org or sole login.
+            if let Some(owner) = evidence.owners.get(&(facts.root, facts.request_id)) {
+                return Refused(match owner {
+                    None => Refusal::ConflictingDuplicate,
+                    Some(owner) if owner_is_foreign(owner, facts) => Refusal::ForeignOwner,
+                    Some(_) => Refusal::IncompleteEvidence,
+                });
+            }
             return match transcript_identity(evidence, facts) {
                 // A carried or missing clock cannot establish attribution.
                 Some(_) if facts.terminal_unix_seconds.is_none() || !facts.event_clock_complete => {
@@ -1335,14 +1425,7 @@ pub(crate) fn classify_ref<'k>(
         None if facts.telemetry_pending(evidence) => return Refused(Refusal::Pending),
         None => return Refused(Refusal::IncompleteEvidence),
         Some(Some(owner)) => {
-            if owner.session_id != facts.root
-                || owner.capture_revision != "claude_llm_request_ownership:v1"
-                || !super::claude_trace_evidence_fingerprint_is_valid(owner)
-                || super::claude_trace_owner_session_id(facts.root, &owner.agent_id)
-                    != facts.source_session_id
-                || owner.client_request_id.is_empty()
-                || owner.client_request_id != row.client_request_id
-            {
+            if owner_is_foreign(owner, facts) || owner.client_request_id != row.client_request_id {
                 return Refused(Refusal::ForeignOwner);
             }
         }
@@ -1384,7 +1467,17 @@ pub(crate) fn classify_ref<'k>(
     })
 }
 
-/// Transcript bases for a request with no telemetry row (email stays off).
+/// The ownership checks that need no telemetry row.
+fn owner_is_foreign(owner: &ClaudeTraceOwnershipEvidence, facts: &RequestFacts<'_>) -> bool {
+    owner.session_id != facts.root
+        || owner.capture_revision != "claude_llm_request_ownership:v1"
+        || !super::claude_trace_evidence_fingerprint_is_valid(owner)
+        || super::claude_trace_owner_session_id(facts.root, &owner.agent_id)
+            != facts.source_session_id
+        || owner.client_request_id.is_empty()
+}
+
+/// Transcript bases for a request with no telemetry row or trace owner.
 fn transcript_identity<'k>(
     evidence: &'k ScanEvidence<'_>,
     facts: &RequestFacts<'k>,
@@ -1396,8 +1489,7 @@ fn transcript_identity<'k>(
         MarkerVerdict::BadOrg => return Some(IdentityRef::Refused(Refusal::ContradictoryOrg)),
         MarkerVerdict::Trusted(org) => org,
     };
-    let sole_login = facts
-        .desktop
+    let sole_login = (facts.desktop && evidence.sole_login_enabled)
         .then_some(())
         .and(evidence.desktop_census.as_ref())
         .filter(|census| {

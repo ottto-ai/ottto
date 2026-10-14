@@ -4348,16 +4348,12 @@ fn collect_claude_status_snapshots(
     custom_descriptors.sort_by(|left, right| left.slot_id.cmp(&right.slot_id));
     let (custom_descriptors, overflow_descriptors) =
         bounded_claude_custom_descriptors(custom_descriptors);
+    let coverage_dirs = crate::claude_status_coverage::enabled()
+        .then(|| claude_status_coverage_dirs(&custom_descriptors, &overflow_descriptors));
     for descriptor in overflow_descriptors {
         slot_states.insert(descriptor.slot_id, capacity_exceeded_status(&captured_at));
     }
     let previous_states = read_persisted_claude_slot_collection_state();
-    let coverage_dirs = crate::claude_status_coverage::enabled().then(|| {
-        custom_descriptors
-            .iter()
-            .filter_map(|descriptor| descriptor.config_dir.clone())
-            .collect::<Vec<_>>()
-    });
     for descriptor in custom_descriptors {
         match crate::claude_browser_auth::collection_suppression(&descriptor.slot_id) {
             Some(
@@ -5365,6 +5361,20 @@ fn coherent_claude_provider_observed_at(snapshot: &AgentStatusSnapshot) -> Strin
         .min()
         .unwrap_or(snapshot.captured_at.as_str())
         .to_string()
+}
+
+/// Every registered custom folder for the status-coverage feed. Slots past
+/// collection capacity are still registered: their transcripts must never
+/// read as never-registered.
+fn claude_status_coverage_dirs(
+    collected: &[ClaudeConfigSlotDescriptorV1],
+    overflow: &[ClaudeConfigSlotDescriptorV1],
+) -> Vec<String> {
+    collected
+        .iter()
+        .chain(overflow)
+        .filter_map(|descriptor| descriptor.config_dir.clone())
+        .collect()
 }
 
 fn bounded_claude_custom_descriptors(
@@ -20172,6 +20182,40 @@ mod tests {
             overflow[0].slot_id,
             "claude_slot_00000000000000000000000000000009"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn status_coverage_registers_slots_past_collection_capacity() {
+        use crate::claude_status_coverage::{self as coverage, Registration};
+        let default_dir = Path::new("/tmp/claude-default/.claude");
+        let registration = |dirs: &[String], dir: &str| {
+            coverage::clear_global_for_test();
+            coverage::retain_registered(dirs.iter().map(String::as_str), default_dir);
+            coverage::snapshot()
+                .expect("feed available")
+                .registration(&coverage::home_key(Path::new(dir)), u64::MAX)
+        };
+        for count in [9, 12] {
+            let (collected, overflow) =
+                bounded_claude_custom_descriptors((0..count).map(test_slot_descriptor).collect());
+            let dirs = claude_status_coverage_dirs(&collected, &overflow);
+            assert_eq!(dirs.len(), count, "overflow folders are fed too");
+            for index in 0..count {
+                // Past the ledger cap a folder may be forgotten, never proven absent.
+                assert_ne!(
+                    registration(&dirs, &format!("/tmp/claude-slot-{index}")),
+                    Registration::NeverRegistered
+                );
+            }
+            let unregistered = registration(&dirs, "/tmp/claude-slot-unregistered");
+            if count <= coverage::MAX_SLOTS {
+                assert_eq!(unregistered, Registration::NeverRegistered, "control");
+            } else {
+                assert_eq!(unregistered, Registration::Unknown);
+            }
+        }
+        coverage::clear_global_for_test();
     }
 
     /// Synthetic Claude and Codex agent-status snapshots exactly as the

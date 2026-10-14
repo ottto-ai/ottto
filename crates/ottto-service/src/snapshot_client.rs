@@ -628,6 +628,12 @@ pub struct ActivityHintResponse {
     /// which every backend accepts.
     #[serde(default)]
     pub census_residue_status_contract: Option<String>,
+    /// Per-account cohort token for contract-5 request identity rows. Only the
+    /// exact `own_request_identity_rows:v1` permits emission, and only in a
+    /// build with emission compiled in; missing / null / any other token keeps
+    /// today's bodies. Read fresh every cycle, never cached.
+    #[serde(default)]
+    pub session_request_identity_contract: Option<String>,
     pub recommended_scan_after: String,
 }
 
@@ -3117,6 +3123,31 @@ mod tests {
         assert_eq!(CENSUS_RESIDUE_ERROR_CODE, "census_residue");
     }
 
+    /// The contract-5 cohort token is read as sent: absent and null read as
+    /// none, and any other string reaches the exact-match permit unchanged.
+    #[test]
+    fn request_identity_cohort_token_defaults_off_and_is_kept_verbatim() {
+        for extra in ["", r#", "session_request_identity_contract":null"#] {
+            let hint: ActivityHintResponse =
+                serde_json::from_str(&activity_hint_json(extra)).expect("activity hint");
+            assert_eq!(hint.session_request_identity_contract, None);
+        }
+        for token in [
+            "own_request_identity_rows:v1",
+            "claude_code_jsonl:own_request_identity_rows:v1",
+            "unknown",
+        ] {
+            let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json(&format!(
+                r#", "session_request_identity_contract":"{token}""#
+            )))
+            .expect("token-bearing activity hint");
+            assert_eq!(
+                hint.session_request_identity_contract.as_deref(),
+                Some(token)
+            );
+        }
+    }
+
     /// An older daemon's terminal-status journal predates the residue fields.
     /// It must still reload — with the residue absent, not as a parse error —
     /// so a daemon upgrade never strands the last committed receipt.
@@ -4593,7 +4624,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, snapshot_head_cas_required, census_residue_status_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
