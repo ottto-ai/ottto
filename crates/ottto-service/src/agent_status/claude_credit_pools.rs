@@ -33,9 +33,9 @@ use crate::quota_credit_model::{
 /// identity, a browser re-sign-in), so a body fetched under another
 /// organization is never adopted.
 pub(super) const CLAUDE_PASSIVE_READING_ENABLED: bool = true;
-/// Kill switch for the activity-based slot (design R7). `false` falls back to
-/// today's 55-65 min gate for every binding: no active boost, no idle
-/// slowdown. Plain/saved-reset alternation is unaffected (same slot count).
+/// Kill switch for the activity-based slot (design R7). `false` uses the
+/// unused-account gate (38-42 min) for every binding: no in-use boost.
+/// Plain/saved-reset alternation is unaffected (same slot count).
 pub(super) const CLAUDE_ACTIVITY_CADENCE_ENABLED: bool = true;
 /// A saved-reset variant response without a recognizable `cedar_ember` stops
 /// the variant for that binding this long; every slot reads plain meanwhile.
@@ -54,14 +54,17 @@ const CLAUDE_PERCENT_ONLY_POOL: &str = "cinder_cove";
 /// Bound on one-time pools taken from one body.
 const ONE_TIME_POOLS_MAX: usize = 16;
 
-/// While the account was active this recently, the slot is the active slot.
-const ACTIVE_WINDOW_SECONDS: u64 = 30 * 60;
-const ACTIVE_SLOT_SECONDS: u64 = 15 * 60;
-/// Idle longer than this, the slot is the idle slot (2-3 h, spread per
-/// account like the default slot).
-const IDLE_AFTER_SECONDS: u64 = 6 * 60 * 60;
-const IDLE_SLOT_BASE_SECONDS: u64 = 2 * 60 * 60;
-const IDLE_SLOT_SPREAD_SECONDS: u64 = 60 * 60;
+/// While the account was active this recently (a session for it written on
+/// this Mac), the account is in use and its slot is the active slot.
+pub(super) const ACTIVE_WINDOW_SECONDS: u64 = 30 * 60;
+/// In-use account: one read per 5 min. A fresh local statusLine reading for
+/// the exact binding stands in for it (`agent_status`), so the provider is
+/// called only when that free local data is older than this.
+pub(super) const ACTIVE_SLOT_SECONDS: u64 = 5 * 60;
+/// Longest slot any binding can have: the unused-account gate at the top of
+/// its spread. Bounds a stored "not before" hold (`claude_read_held`).
+const LONGEST_SLOT_SECONDS: u64 = super::CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS
+    + super::CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_JITTER_SECONDS;
 /// While usage credits are off, the plain read runs about this often and the
 /// other slots take the saved-reset read.
 const PLAIN_WHILE_CREDITS_OFF_SECONDS: u64 = 6 * 60 * 60;
@@ -541,8 +544,9 @@ pub(super) struct ClaudeReadSchedule {
     /// binding (the scan itself only lists recent sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) last_activity_at: Option<u64>,
-    /// First reading of this binding: the idle clock of an account never seen
-    /// active. Never counts as activity.
+    /// First reading of this binding. Never counts as activity. Kept in the
+    /// persisted format; no slot reads it since unused accounts share one
+    /// gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) tracked_since: Option<u64>,
     /// The saved-reset variant is not used before this time: its last
@@ -627,49 +631,33 @@ pub(super) fn write_claude_read_schedule(
     )
 }
 
-/// The idle slot for one binding: 2-3 h, spread deterministically per account
-/// the same way the default 55-65 min slot is (load spreading across our own
-/// installs, not evasion).
-pub(super) fn claude_idle_slot_seconds(
-    account_identifier_hash: &str,
-    organization_identifier_hash: &str,
-) -> u64 {
-    let mut hasher = Sha256::new();
-    hasher.update(b"ottto:claude-oauth-usage-idle-cadence:");
-    hasher.update(account_identifier_hash.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(organization_identifier_hash.as_bytes());
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
-    IDLE_SLOT_BASE_SECONDS + u64::from_be_bytes(bytes) % (IDLE_SLOT_SPREAD_SECONDS + 1)
-}
-
-/// The account's read slot (design R7: active-account freshness): the active slot while the account was
-/// active in the last 30 min, the idle slot once idle more than 6 h, else the
-/// default slot (today's 55-65 min gate). With `activity_cadence` off every
-/// slot is the default slot.
+/// The account's read slot (design R7: active-account freshness): the active
+/// slot while the account was active in the last 30 min, else the default
+/// (unused-account) slot. With `activity_cadence` off every slot is the
+/// default slot.
 pub(super) fn claude_usage_slot_seconds(
     schedule: &ClaudeReadSchedule,
     latest_activity_at: Option<u64>,
     default_slot_seconds: u64,
-    idle_slot_seconds: u64,
     activity_cadence: bool,
     now: u64,
 ) -> u64 {
-    if !activity_cadence {
-        return default_slot_seconds;
-    }
-    let activity = schedule.activity_at(latest_activity_at);
-    if activity.is_some_and(|at| now.saturating_sub(at) <= ACTIVE_WINDOW_SECONDS) {
+    if activity_cadence && claude_binding_in_use(schedule, latest_activity_at, now) {
         return ACTIVE_SLOT_SECONDS;
     }
-    match activity.max(schedule.tracked_since) {
-        Some(idle_since) if now.saturating_sub(idle_since) > IDLE_AFTER_SECONDS => {
-            idle_slot_seconds
-        }
-        _ => default_slot_seconds,
-    }
+    default_slot_seconds
+}
+
+/// Whether the binding is in use on this Mac: a session for it was written in
+/// the last 30 min (the scan's latest sighting, or the one kept in `schedule`).
+pub(super) fn claude_binding_in_use(
+    schedule: &ClaudeReadSchedule,
+    latest_activity_at: Option<u64>,
+    now: u64,
+) -> bool {
+    schedule
+        .activity_at(latest_activity_at)
+        .is_some_and(|at| now.saturating_sub(at) <= ACTIVE_WINDOW_SECONDS)
 }
 
 /// Whether the binding's "not before next slot" hold applies now.
@@ -682,7 +670,7 @@ pub(super) struct ClaudeReadHold {
 
 /// The hold set by an unusable saved-reset reading, written one slot ahead.
 /// The slot can shrink after that (the account becomes active), so the bound
-/// is the longest slot any binding can have (the idle slot's maximum): a
+/// is the longest slot any binding can have (the unused-account maximum): a
 /// value further ahead can only come from the clock stepping back after it
 /// was written, and is ignored and cleared. A corrected clock therefore never
 /// holds a binding for longer than that.
@@ -693,10 +681,7 @@ pub(super) fn claude_read_held(
 ) -> ClaudeReadHold {
     match schedule.next_read_not_before {
         Some(not_before)
-            if not_before
-                > now.saturating_add(
-                    slot_seconds.max(IDLE_SLOT_BASE_SECONDS + IDLE_SLOT_SPREAD_SECONDS),
-                ) =>
+            if not_before > now.saturating_add(slot_seconds.max(LONGEST_SLOT_SECONDS)) =>
         {
             schedule.next_read_not_before = None;
             ClaudeReadHold {
@@ -2060,15 +2045,17 @@ mod tests {
         assert!(!schedule.observe_activity(None));
         assert!(!schedule.observe_activity(Some(900)));
         assert_eq!(schedule.last_activity_at, Some(1_000));
-        let slot = |now| claude_usage_slot_seconds(&schedule, None, 3_600, 7_200, true, now);
+        let slot = |now| claude_usage_slot_seconds(&schedule, None, 2_400, true, now);
         assert_eq!(slot(1_000 + 20 * 60), ACTIVE_SLOT_SECONDS);
-        assert_eq!(slot(1_000 + 31 * 60), 3_600);
-        assert_eq!(slot(1_000 + 6 * 3_600 + 1), 7_200);
-        // Kill switch: today's default gate everywhere.
+        assert_eq!(slot(1_000 + 31 * 60), 2_400);
+        // Unused, however long: the unused-account gate, never a longer slot.
+        assert_eq!(slot(1_000 + 6 * 3_600 + 1), 2_400);
+        assert_eq!(slot(1_000 + 48 * 3_600), 2_400);
+        // Kill switch: the unused-account gate everywhere.
         for now in [1_000 + 20 * 60, 1_000 + 31 * 60, 1_000 + 6 * 3_600 + 1] {
             assert_eq!(
-                claude_usage_slot_seconds(&schedule, Some(now), 3_600, 7_200, false, now),
-                3_600
+                claude_usage_slot_seconds(&schedule, Some(now), 2_400, false, now),
+                2_400
             );
         }
     }
@@ -2103,15 +2090,24 @@ mod tests {
     }
 
     #[test]
-    fn idle_slot_is_two_to_three_hours_and_stable_per_binding() {
-        for seed in 0..64 {
-            let slot = claude_idle_slot_seconds(&format!("account-{seed}"), "org");
-            assert!((2 * 3_600..=3 * 3_600).contains(&slot));
-            assert_eq!(
-                slot,
-                claude_idle_slot_seconds(&format!("account-{seed}"), "org")
-            );
-        }
+    fn in_use_and_unused_slots_are_five_and_about_forty_minutes() {
+        assert_eq!(ACTIVE_SLOT_SECONDS, 5 * 60);
+        assert_eq!(ACTIVE_WINDOW_SECONDS, 30 * 60);
+        assert_eq!(LONGEST_SLOT_SECONDS, 42 * 60);
+        let schedule = ClaudeReadSchedule::default();
+        // A session written 30 min ago still makes the account in use; 31 min
+        // ago it is unused.
+        assert!(claude_binding_in_use(
+            &schedule,
+            Some(10_000 - 30 * 60),
+            10_000
+        ));
+        assert!(!claude_binding_in_use(
+            &schedule,
+            Some(10_000 - 31 * 60),
+            10_000
+        ));
+        assert!(!claude_binding_in_use(&schedule, None, 10_000));
     }
 
     /// A stored reading holding the given sections.
@@ -2136,8 +2132,8 @@ mod tests {
         balances
     }
 
-    /// The default slot of the simulated binding (inside the 55-65 min band).
-    const DEFAULT_SLOT: u64 = 3_480;
+    /// The default slot of the simulated binding (inside the 38-42 min band).
+    const DEFAULT_SLOT: u64 = 2_460;
     /// Collection passes run every 5 min.
     const PASS: u64 = 300;
     const HOUR: u64 = 3_600;
@@ -2185,9 +2181,7 @@ mod tests {
         fn pass(&mut self, now: u64, activity: Option<u64>, passive_fetched_at: Option<u64>) {
             let since = claude_observe_caller_binding(&mut self.callers, "default", "a/o", now);
             self.schedule.observe_activity(activity);
-            let idle = claude_idle_slot_seconds("account-sim", "org-sim");
-            let slot =
-                claude_usage_slot_seconds(&self.schedule, activity, DEFAULT_SLOT, idle, true, now);
+            let slot = claude_usage_slot_seconds(&self.schedule, activity, DEFAULT_SLOT, true, now);
             if !claude_reading_due(self.last_reading_at, self.next_refresh_after, slot, now) {
                 return;
             }
@@ -2216,7 +2210,9 @@ mod tests {
             if self
                 .readings
                 .last()
-                .is_some_and(|last| !last.passive && !passive && last.at + PASS > at)
+                // Two calls within half a pass are one pass's calls (passes
+                // drift by under 20 s; in-use reads are one pass apart).
+                .is_some_and(|last| !last.passive && !passive && last.at + PASS / 2 > at)
             {
                 self.passes_with_more_than_one_call += 1;
             }
@@ -2227,7 +2223,7 @@ mod tests {
                 slot,
             });
             self.last_reading_at = Some(at);
-            self.next_refresh_after = now + 300;
+            self.next_refresh_after = now + super::super::CLAUDE_OAUTH_USAGE_REFRESH_SECONDS;
             self.schedule.after_reading(read, at, activity, now);
             let observed = rfc3339(at);
             match read {
@@ -2313,13 +2309,13 @@ mod tests {
         assert!(default
             .iter()
             .all(|gap| (DEFAULT_SLOT - 60..=DEFAULT_SLOT + PASS).contains(gap)));
-        // Active: 15 min exactly on the 5-min grid (± the pass drift), not 20.
-        let active = gaps_between(&calls, 8 * HOUR + 15 * 60, 10 * HOUR);
-        assert!(active.len() >= 6);
+        // In use: every 5-min pass (± the pass drift), not every other one.
+        let active = gaps_between(&calls, 8 * HOUR + 5 * 60, 10 * HOUR);
+        assert!(active.len() >= 20);
         assert!(
             active
                 .iter()
-                .all(|gap| (15 * 60 - 20..=15 * 60 + 20).contains(gap)),
+                .all(|gap| (5 * 60 - 20..=5 * 60 + 20).contains(gap)),
             "{active:?}"
         );
         // The active slot holds for 30 min after the last activity.
@@ -2327,12 +2323,12 @@ mod tests {
             (START + 10 * HOUR + 10 * 60..=START + 10 * HOUR + 30 * 60).contains(&call.at)
                 && call.slot == ACTIVE_SLOT_SECONDS
         }));
-        // Idle more than 6 h: 2-3 h slots (≤ one pass late).
+        // Unused for more than 6 h: still the unused-account slot.
         let idle = gaps_between(&calls, 17 * HOUR, 24 * HOUR);
         assert!(!idle.is_empty());
         assert!(idle
             .iter()
-            .all(|gap| (2 * HOUR - 60..=3 * HOUR + PASS).contains(gap)));
+            .all(|gap| (DEFAULT_SLOT - 60..=DEFAULT_SLOT + PASS).contains(gap)));
         // Waking from a 3 h sleep: one read at the first pass, then the slot.
         let woke = calls
             .iter()
@@ -2340,8 +2336,9 @@ mod tests {
             .map(|call| call.at)
             .collect::<Vec<_>>();
         assert!(woke[0] < START + 16 * HOUR + PASS);
-        assert!(woke[1] - woke[0] >= 15 * 60);
-        assert!(calls.len() <= 24 * 4);
+        assert!(woke[1] - woke[0] >= DEFAULT_SLOT - 60);
+        // 2.5 h in use at 5 min plus the unused hours at about 40 min.
+        assert!(calls.len() <= 30 + 24 * 2, "{}", calls.len());
     }
 
     #[test]
@@ -2353,11 +2350,12 @@ mod tests {
             .map(|call| call.at)
             .collect::<Vec<_>>();
         assert!(plain.len() >= 3);
-        // A due threshold, serviced at the next eligible slot.
+        // A due threshold, serviced at the next eligible slot (one unused
+        // slot, or the first pass after the simulated 3 h sleep).
         for pair in plain.windows(2) {
             let gap = pair[1] - pair[0];
             assert!(
-                (6 * HOUR..=9 * HOUR + PASS).contains(&gap),
+                (6 * HOUR..=9 * HOUR + DEFAULT_SLOT + PASS).contains(&gap),
                 "plain gap {gap}"
             );
         }
@@ -2395,7 +2393,7 @@ mod tests {
             .filter(|reading| reading.read == ClaudeUsageRead::SavedResets)
             .collect::<Vec<_>>();
         assert!(saved.iter().all(|reading| !reading.passive));
-        // Active hours: a saved-reset read every ~30 min (two 15-min slots).
+        // Active hours: a saved-reset read every ~10 min (two 5-min slots).
         let active_saved = saved
             .windows(2)
             .filter(|pair| (START + 8 * HOUR + 30 * 60..START + 10 * HOUR).contains(&pair[1].at))
@@ -2403,12 +2401,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!active_saved.is_empty());
         assert!(
-            active_saved.iter().all(|gap| *gap <= 30 * 60 + 60),
+            active_saved.iter().all(|gap| *gap <= 10 * 60 + 60),
             "{active_saved:?}"
         );
-        // Over the whole day no saved-reset gap exceeds two idle slots.
+        // Over the whole day no saved-reset gap exceeds two unused slots
+        // (plus the 3 h sleep).
         for pair in saved.windows(2) {
-            assert!(pair[1].at - pair[0].at <= 2 * 3 * HOUR + 3 * HOUR + PASS);
+            assert!(pair[1].at - pair[0].at <= 2 * (DEFAULT_SLOT + PASS) + 3 * HOUR + PASS);
         }
         // Passive bodies replace calls; never more than one reading per slot.
         assert!(simulation.calls().count() < run_day(false, &|_| None).calls().count());
@@ -2876,6 +2875,7 @@ mod tests {
             super::super::CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             REQUESTED.lock().unwrap().clear();
+            super::super::claude_explicit_refresh_requests().clear();
             Self {
                 dir,
                 _support: support,
@@ -2951,6 +2951,155 @@ mod tests {
         }
     }
 
+    impl VariantHarness {
+        fn collect_as(
+            &self,
+            caller: super::super::ClaudeOAuthUsageCaller,
+            respond: super::super::ClaudeOAuthTestResponder,
+        ) -> super::super::ClaudeOAuthUsageOutcome {
+            *super::super::CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = Some(respond);
+            let outcome = super::super::collect_claude_oauth_usage_with_access_token(
+                self.account,
+                self.organization,
+                Some("fixture-token".to_string()),
+                &caller,
+            );
+            *super::super::CLAUDE_OAUTH_TEST_RESPONSE.lock().unwrap() = None;
+            outcome
+        }
+
+        /// Let `seconds` pass for the stored reading and any Refresh request,
+        /// keeping only the plain spacing after a successful read.
+        fn age_reading(&self, seconds: u64) {
+            for request in super::super::claude_explicit_refresh_requests().iter_mut() {
+                request.requested_at -= seconds;
+            }
+            let mut cache =
+                super::super::read_claude_oauth_usage_cache(self.account, self.organization)
+                    .expect("stored reading");
+            cache.observed_at_epoch_seconds -= seconds;
+            cache.next_refresh_after_epoch_seconds =
+                cache.observed_at_epoch_seconds + super::super::CLAUDE_OAUTH_USAGE_REFRESH_SECONDS;
+            super::super::write_claude_oauth_usage_cache(&cache).unwrap();
+        }
+
+        fn requests(&self) -> usize {
+            REQUESTED.lock().unwrap().len()
+        }
+
+        /// A statusLine reading Claude Code wrote for exactly this binding.
+        fn write_statusline(&self, observed_at: u64) {
+            ottto_core::write_claude_statusline_cache(
+                &self.dir,
+                &ottto_core::ClaudeStatusLineRateLimitCache {
+                    schema_version: ottto_core::CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
+                    observed_under_account_identifier_hash: self.account.to_string(),
+                    observed_under_organization_identifier_hash: Some(
+                        self.organization.to_string(),
+                    ),
+                    observed_under_account_method: "config_dir".to_string(),
+                    observed_at_epoch_seconds: observed_at,
+                    windows: vec![ottto_core::ClaudeStatusLineRateLimitWindow {
+                        name: "five_hour".to_string(),
+                        used_percent: 12,
+                        resets_at_epoch_seconds: observed_at + 3_600,
+                    }],
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    /// The Refresh button reads an account now, at most once a minute, and
+    /// never inside a Retry-After hold.
+    #[test]
+    #[serial_test::serial]
+    fn explicit_refresh_reads_now_once_a_minute_and_never_inside_retry_after() {
+        let harness = VariantHarness::new("explicit-refresh");
+        harness.due(ClaudeReadSchedule::default());
+        harness.collect(respond_recognized);
+        assert_eq!(harness.requests(), 1);
+        // A fresh reading inside its slot: no call without a request.
+        harness.collect(respond_recognized);
+        assert_eq!(harness.requests(), 1);
+        // A request 30 s after a read waits out the minute.
+        harness.age_reading(30);
+        super::super::request_claude_explicit_refresh(Some(harness.account), None);
+        harness.collect(respond_recognized);
+        assert_eq!(harness.requests(), 1);
+        // Past the minute (still inside the slot): the request reads now.
+        harness.age_reading(90);
+        harness.collect(respond_recognized);
+        assert_eq!(harness.requests(), 2);
+        // The request is consumed by that read.
+        harness.age_reading(90);
+        harness.collect(respond_recognized);
+        assert_eq!(harness.requests(), 2);
+        // A request for another account reads nothing here.
+        super::super::request_claude_explicit_refresh(Some("account-other"), None);
+        harness.collect(respond_recognized);
+        assert_eq!(harness.requests(), 2);
+        // Retry-After on record: a request never reads inside it.
+        let now = super::super::current_unix_seconds();
+        let mut cache =
+            super::super::read_claude_oauth_usage_cache(harness.account, harness.organization)
+                .expect("stored reading");
+        cache.observed_at_epoch_seconds = now - 120;
+        cache.next_refresh_after_epoch_seconds = now + 600;
+        super::super::write_claude_oauth_usage_cache(&cache).unwrap();
+        super::super::record_claude_oauth_usage_failure(
+            super::super::ClaudeOAuthUsageFailure::RateLimited,
+            harness.account,
+            harness.organization,
+            &super::super::claude_oauth_usage_config_fingerprint(),
+            now,
+        );
+        super::super::request_claude_explicit_refresh(None, None);
+        harness.collect(respond_recognized);
+        assert_eq!(harness.requests(), 2);
+    }
+
+    /// An in-use account (default login) prefers Claude Code's free
+    /// statusLine reading: no provider call at the 5-min slot while that
+    /// reading is fresh for the exact binding; a call once it is older.
+    #[test]
+    #[serial_test::serial]
+    fn in_use_default_login_calls_only_when_the_statusline_is_stale() {
+        let harness = VariantHarness::new("statusline-in-use");
+        let _home = EnvGuard::set("HOME", &harness.dir);
+        let now = super::super::current_unix_seconds();
+        harness.due(ClaudeReadSchedule {
+            last_activity_at: Some(now - 60),
+            ..ClaudeReadSchedule::default()
+        });
+        let default = || super::super::ClaudeOAuthUsageCaller::Default;
+        harness.collect_as(default(), respond_recognized);
+        assert_eq!(harness.requests(), 1);
+        // Five minutes later the in-use slot is due, but the statusLine wrote
+        // this binding's numbers 30 s ago: no call.
+        harness.age_reading(5 * 60 + 1);
+        harness.write_statusline(now - 30);
+        assert!(super::super::claude_statusline_fresh_for_binding(
+            harness.account,
+            harness.organization,
+            super::super::current_unix_seconds(),
+        ));
+        harness.collect_as(default(), respond_recognized);
+        assert_eq!(harness.requests(), 1);
+        // A registered slot's collection does not merge the statusLine, so it
+        // keeps its 5-min reads.
+        harness.collect_as(
+            super::super::ClaudeOAuthUsageCaller::RegisteredSlot("slot-variant".to_string()),
+            respond_recognized,
+        );
+        assert_eq!(harness.requests(), 2);
+        // StatusLine older than the slot: the default login calls again.
+        harness.age_reading(5 * 60 + 1);
+        harness.write_statusline(now - 6 * 60);
+        harness.collect_as(default(), respond_recognized);
+        assert_eq!(harness.requests(), 3);
+    }
+
     fn saved_resets_of(outcome: &super::super::ClaudeOAuthUsageOutcome) -> Vec<AgentCreditBalance> {
         outcome
             .result
@@ -3008,29 +3157,30 @@ mod tests {
     }
 
     /// A retained slot snapshot uses the same gate as the cache serve path:
-    /// fresh at 90 min during a 2-3 h idle slot, stale after the default gate
-    /// otherwise.
+    /// the unused-account gate (38-42 min), also for a binding unused for
+    /// hours (there is no longer idle slot).
     #[test]
     #[serial_test::serial]
-    fn retained_snapshot_freshness_respects_the_idle_slot() {
+    fn retained_snapshot_freshness_uses_the_unused_account_gate() {
         let harness = VariantHarness::new("idle-snapshot");
         let now = OffsetDateTime::now_utc();
-        let snapshot = ottto_protocol::ClaudeConfigSlotQuotaSnapshotV1 {
+        let snapshot_at = |age: u64| ottto_protocol::ClaudeConfigSlotQuotaSnapshotV1 {
             state: ottto_protocol::ClaudeConfigSlotQuotaSnapshotStateV1::Fresh,
-            captured_at: rfc3339(now.unix_timestamp() as u64 - 90 * 60),
-            observed_at: Some(rfc3339(now.unix_timestamp() as u64 - 90 * 60)),
+            captured_at: rfc3339(now.unix_timestamp() as u64 - age),
+            observed_at: Some(rfc3339(now.unix_timestamp() as u64 - age)),
             quota_windows: Vec::new(),
             credit_balances: Vec::new(),
         };
-        let fresh = || {
+        let fresh = |age: u64| {
             super::super::local_claude_quota_snapshot_is_fresh_for_account(
-                &snapshot,
+                &snapshot_at(age),
                 harness.account,
                 harness.organization,
                 now,
             )
         };
-        assert!(!fresh(), "default gate: 90 min is past 55-65 min");
+        assert!(fresh(30 * 60), "30 min is inside the 38-42 min gate");
+        assert!(!fresh(45 * 60), "45 min is past the 38-42 min gate");
         write_claude_read_schedule(
             &harness.state_dir(),
             &ClaudeReadSchedule {
@@ -3039,7 +3189,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(fresh(), "idle 2-3 h slot: 90 min is still inside it");
+        assert!(!fresh(45 * 60), "unused for hours: the same gate");
     }
 
     #[test]
@@ -3378,7 +3528,7 @@ mod tests {
     #[test]
     fn read_hold_is_bounded_to_the_longest_slot() {
         let now = 1_000_000;
-        let slot = 900;
+        let slot = 300;
         let mut schedule = ClaudeReadSchedule {
             next_read_not_before: Some(now + slot),
             ..ClaudeReadSchedule::default()
@@ -3391,19 +3541,19 @@ mod tests {
             }
         );
         assert!(!claude_read_held(&mut schedule, slot, now + slot).active);
-        // Written under a default slot, read under a shorter active slot: still
-        // a legitimate hold.
-        schedule.next_read_not_before = Some(now + 3_600);
+        // Written under the unused-account slot, read under the shorter in-use
+        // slot: still a legitimate hold.
+        schedule.next_read_not_before = Some(now + LONGEST_SLOT_SECONDS);
         assert_eq!(
-            claude_read_held(&mut schedule, 900, now),
+            claude_read_held(&mut schedule, 300, now),
             ClaudeReadHold {
                 active: true,
                 cleared: false
             }
         );
-        // Further ahead than the longest slot (3 h): a clock that stepped back.
-        // Ignored and cleared.
-        schedule.next_read_not_before = Some(now + 4 * 3_600);
+        // Further ahead than the longest slot (42 min): a clock that stepped
+        // back. Ignored and cleared.
+        schedule.next_read_not_before = Some(now + LONGEST_SLOT_SECONDS + 1);
         assert_eq!(
             claude_read_held(&mut schedule, slot, now),
             ClaudeReadHold {
@@ -3415,7 +3565,7 @@ mod tests {
     }
 
     /// No stored reading, a rejected variant, then the account becomes active
-    /// (its slot shrinks to 15 min): the hold written under the longer slot
+    /// (its slot shrinks to 5 min): the hold written under the longer slot
     /// still holds, so no plain call follows in the same slot.
     #[test]
     #[serial_test::serial]

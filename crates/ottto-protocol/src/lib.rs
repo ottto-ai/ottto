@@ -3709,6 +3709,18 @@ pub struct AgentProviderImpactQuery {
     pub limit: Option<u16>,
 }
 
+/// Which accounts an explicit quota refresh reads. Hashes are the
+/// `account_identifier_hash` / `organization_identifier_hash` of agent status
+/// snapshots (for Codex the organization is the workspace). Both absent:
+/// every account of the requested source(s).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentQuotaRefreshTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum LocalControlCommand {
@@ -3725,8 +3737,16 @@ pub enum LocalControlCommand {
         source: Option<SourceKind>,
     },
     AuthStatus,
+    /// Agent status for one source or all. On its own it serves the daemon's
+    /// saved quota readings and starts no provider read; the daemon's own
+    /// schedule keeps them current.
     AgentStatusRefresh {
         source: Option<SourceKind>,
+        /// Explicit refresh (a user's Refresh action): read provider quota
+        /// now for the matching accounts, at most once a minute per account,
+        /// then answer as above. Holds, breakers and Retry-After still apply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quota_refresh: Option<AgentQuotaRefreshTarget>,
     },
     PersonalMeterLocalSnapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4734,6 +4754,60 @@ mod tests {
         assert_eq!(CliErrorCode::NeedsUserAction.exit_code(), 60);
         assert_eq!(CliErrorCode::TimedOut.exit_code(), 61);
         assert_eq!(CliErrorCode::Internal.exit_code(), 70);
+    }
+
+    #[test]
+    fn agent_status_refresh_keeps_its_wire_form_and_adds_an_optional_quota_refresh() {
+        let plain: LocalControlCommand = serde_json::from_value(
+            serde_json::json!({"command": "agent_status_refresh", "source": null}),
+        )
+        .unwrap();
+        assert_eq!(
+            plain,
+            LocalControlCommand::AgentStatusRefresh {
+                source: None,
+                quota_refresh: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({"command": "agent_status_refresh", "source": null})
+        );
+
+        let refresh = LocalControlCommand::AgentStatusRefresh {
+            source: Some(SourceKind::Codex),
+            quota_refresh: Some(AgentQuotaRefreshTarget {
+                account_identifier_hash: Some("account-hash".to_string()),
+                organization_identifier_hash: None,
+            }),
+        };
+        let wire = serde_json::to_value(&refresh).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "command": "agent_status_refresh",
+                "source": "codex",
+                "quota_refresh": {"account_identifier_hash": "account-hash"}
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<LocalControlCommand>(wire).unwrap(),
+            refresh
+        );
+        // An empty target refreshes every account of the source.
+        let all: LocalControlCommand = serde_json::from_value(serde_json::json!({
+            "command": "agent_status_refresh",
+            "source": null,
+            "quota_refresh": {}
+        }))
+        .unwrap();
+        assert_eq!(
+            all,
+            LocalControlCommand::AgentStatusRefresh {
+                source: None,
+                quota_refresh: Some(AgentQuotaRefreshTarget::default()),
+            }
+        );
     }
 
     #[test]

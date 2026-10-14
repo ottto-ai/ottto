@@ -533,6 +533,11 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
     if let Err(error) = ottto_service::agent_status_refresh::start(daemon.clone()) {
         eprintln!("agent status refresh unavailable: {error}");
     }
+    // The daemon owns when Codex quota is read from the provider; status reads
+    // serve the saved readings this keeps current.
+    if let Err(error) = ottto_service::agent_status::start_codex_quota_scheduler() {
+        eprintln!("Codex quota schedule unavailable: {error}");
+    }
     // Proactively rebuild upstream HTTP pools on macOS network transitions so
     // pooled sockets bound to a dead local IP never stall uploads (2026-07-17).
     match ottto_service::net_transition::spawn_network_transition_observer() {

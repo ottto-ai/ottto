@@ -865,7 +865,14 @@ fn handle_command(
             )
         }
         LocalControlCommand::AuthStatus => to_value(status_for(daemon, &authorization)?),
-        LocalControlCommand::AgentStatusRefresh { source } => {
+        LocalControlCommand::AgentStatusRefresh {
+            source,
+            quota_refresh,
+        } => {
+            if let Some(target) = quota_refresh.as_ref() {
+                require_authorized_local_client(daemon, &authorization)?;
+                request_explicit_quota_refresh(source.as_ref(), target);
+            }
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
         }
         LocalControlCommand::PersonalMeterLocalSnapshot { source } => {
@@ -2557,22 +2564,24 @@ fn load_codex_account_settings() -> Result<ottto_protocol::CodexAccountsStatusV1
 }
 
 /// How long a status read may reuse the last annotated Codex accounts status.
-/// Annotation starts one `codex app-server` per connected Codex home, and each
-/// of those asks the provider for rate limits. The companion polls this read
-/// every few seconds while an accounts surface is visible, so without reuse a
-/// Mac with four homes ran four app-servers several times a minute.
+/// Annotation serves each home's saved quota (it never starts `codex
+/// app-server`), but it still runs the local `codex login status` and model
+/// listing per home. The companion polls this read every few seconds while an
+/// accounts surface is visible, so the reuse bounds those local runs.
 const CODEX_ACCOUNTS_STATUS_READ_REUSE: Duration = Duration::from_secs(30);
 
 struct CachedCodexAccountsStatus {
     settings: ottto_protocol::CodexAccountsStatusV1,
+    /// [`crate::agent_status::saved_codex_quota_generation`] when annotated.
+    saved_quota_generation: u64,
     annotated: ottto_protocol::CodexAccountsStatusV1,
     annotated_at: Instant,
 }
 
-/// The polled read. Reuses a recent annotation while the stored settings are
-/// unchanged; any settings change (connect, remove, prepare) misses the cache.
-/// Holding the lock across annotation also collapses concurrent polls into one
-/// set of app-server runs.
+/// The polled read. Reuses a recent annotation while the stored settings and
+/// the saved quota readings are unchanged; any settings change (connect,
+/// remove, prepare) or newly saved reading misses the cache. Holding the lock
+/// across annotation also collapses concurrent polls into one annotation.
 fn load_codex_account_settings_for_status_read(
 ) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
     static CACHE: Mutex<Option<CachedCodexAccountsStatus>> = Mutex::new(None);
@@ -2582,11 +2591,12 @@ fn load_codex_account_settings_for_status_read(
     let mut cache = CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let saved_quota_generation = crate::agent_status::saved_codex_quota_generation();
     if let Some(cached) = cache.as_ref() {
         if status_read_reusable(
-            &cached.settings,
+            &(&cached.settings, cached.saved_quota_generation),
             cached.annotated_at,
-            &settings,
+            &(&settings, saved_quota_generation),
             Instant::now(),
         ) {
             return Ok(cached.annotated.clone());
@@ -2595,6 +2605,7 @@ fn load_codex_account_settings_for_status_read(
     let annotated = crate::agent_status::annotate_codex_accounts_status(settings.clone());
     *cache = Some(CachedCodexAccountsStatus {
         settings,
+        saved_quota_generation,
         annotated: annotated.clone(),
         annotated_at: Instant::now(),
     });
@@ -4729,6 +4740,28 @@ fn refresh_agent_status_for(
         upload_agent_status_snapshots_in_background(snapshots.clone());
     }
     Ok(snapshots)
+}
+
+/// Explicit quota refresh (a user's Refresh action). Codex homes are read
+/// here, each at most once a minute; Claude accounts are marked for the
+/// collection that follows, whose usage gate reads them at most once a minute
+/// and keeps every hold, breaker and Retry-After.
+fn request_explicit_quota_refresh(
+    source: Option<&SourceKind>,
+    target: &ottto_protocol::AgentQuotaRefreshTarget,
+) {
+    let account = target.account_identifier_hash.as_deref();
+    let organization = target.organization_identifier_hash.as_deref();
+    if source.map_or(true, |source| source == &SourceKind::ClaudeCode) {
+        crate::agent_status::request_claude_explicit_refresh(account, organization);
+    }
+    if source.map_or(true, |source| source == &SourceKind::Codex) {
+        let outcome = crate::agent_status::refresh_codex_quota_now(account, organization);
+        eprintln!(
+            "explicit Codex quota refresh: read={} rate_limited={}",
+            outcome.read, outcome.rate_limited
+        );
+    }
 }
 
 fn reconcile_agent_status_config_for_refresh(
