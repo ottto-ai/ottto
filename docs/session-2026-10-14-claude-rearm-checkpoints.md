@@ -37,3 +37,7 @@ The census counters add `coverage_complete`, `coverage_missing_member_count`, `f
 ### Limits
 
 A terminal-held key keeps its committed revision while the upload context advances, so its entity is re-derived only after the quarantine resolves. A held key with no committed entry in a family with retained authority evidence keeps each traversal, and so the replay, incomplete until the family changes or its proof is rebuilt. An indexed member whose file stem differs from its session id, or an indexed but unparseable member, keeps the fence closed: this fails closed, at the cost of periodic replay. A transcript that grows while a traversal is in progress invalidates its family for that census window, so the fence can stay closed across windows while a session stays active. Each closed window then costs at most one full re-arm per backoff interval. These changes do not by themselves establish lower CPU or memory use.
+
+## Security audit refresh during validation
+
+Validation discovered four RustSec advisories published on October 14, 2026 for rustls 0.23.45 (RUSTSEC-2026-0346 through RUSTSEC-2026-0349). The runtime lockfile now selects the patched 0.23.46 release through Cargo's resolver; its dependency list and all other locked package versions are unchanged. This dependency repair clears a separate security-audit gate and is not evidence that the recorded memory peaks came from TLS or that collection memory is reduced.
