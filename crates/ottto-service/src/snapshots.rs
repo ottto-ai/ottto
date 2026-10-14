@@ -19875,8 +19875,10 @@ const MAX_CLAUDE_SETTINGS_FILE_BYTES: u64 = 1024 * 1024;
 /// provenance of the file that won, so the UI can name the file each value came
 /// from instead of implying one global config.
 ///
-/// `reasoning_effort` comes from Claude Code's durable `effortLevel` setting,
-/// which `/effort` writes into the settings file. The value is reported exactly
+/// `reasoning_effort` comes from Claude Code's durable effort setting. Current
+/// Claude Code saves `/effort` per model under `modelSettings.<model>.effortLevel`;
+/// the top-level `effortLevel` is the legacy key it no longer updates. See
+/// `resolve_claude_effort` for which value wins. The value is reported exactly
 /// as configured; nothing is normalized and no default is invented when the key
 /// is absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -19920,7 +19922,14 @@ pub(crate) struct ClaudeSettingsScope<'a> {
 #[derive(Debug, Clone, Default)]
 struct ClaudeSettingsRaw {
     model: Option<(String, String)>,
-    effort_level: Option<(String, String)>,
+    /// `modelSettings` key for the highest-precedence `model`, even one too
+    /// unusual to display (such as `claude-opus-4-7[1m]`). Used only to look up
+    /// a saved effort; never reported.
+    model_key: Option<String>,
+    /// One entry per readable file, lowest precedence first. Effort is resolved
+    /// only after the winning `model` is known, because the per-model key it
+    /// selects may come from a different file.
+    effort_scopes: Vec<ClaudeEffortScope>,
     permission_mode: Option<(String, String)>,
     fast_mode: Option<(bool, String)>,
     fast_mode_per_session_opt_in: Option<(bool, String)>,
@@ -19928,12 +19937,23 @@ struct ClaudeSettingsRaw {
     sandbox_auto_allow_bash: Option<(bool, String)>,
 }
 
+/// Effort keys from one Claude Code settings file.
+#[derive(Debug, Clone, Default)]
+struct ClaudeEffortScope {
+    label: String,
+    /// Top-level `effortLevel`.
+    top_level: Option<String>,
+    /// `modelSettings.<key>.effortLevel` by canonical model key, holding the
+    /// key as written in the file and the effort.
+    by_model: BTreeMap<String, (String, String)>,
+}
+
 /// Resolve display-safe Claude Code defaults from the settings chain.
 ///
 /// `scopes` must be ordered lowest precedence first; each readable file
 /// overwrites the keys it sets, so the highest-precedence file wins per key.
 /// Only specifically-named keys are ever read: `model`, `effortLevel`,
-/// `permissions.defaultMode`, `fastMode`/`fastModePerSessionOptIn`, and
+/// `modelSettings.<model>.effortLevel`, `permissions.defaultMode`, `fastMode`/`fastModePerSessionOptIn`, and
 /// `sandbox.enabled`/`sandbox.autoAllowBashIfSandboxed`. `env`,
 /// `permissions.allow`/`ask`/`deny`, `apiKeyHelper`, `statusLine`,
 /// `sandbox.credentials`, and `sandbox.filesystem` are never read, so no path,
@@ -19973,7 +19993,9 @@ pub(crate) fn load_claude_settings_defaults(
     // if the settings file says `max` then that is what the file says, and the
     // Configuration tab's contract is to show the config file. Normalizing or
     // dropping a value here would misreport the customer's own config.
-    if let Some((effort, source)) = raw.effort_level.clone() {
+    if let Some((effort, source)) =
+        resolve_claude_effort(&raw.effort_scopes, raw.model_key.as_deref())
+    {
         insert(&mut defaults, "reasoning_effort", effort.clone(), &source);
         defaults.reasoning_effort = Some(effort);
     }
@@ -20049,13 +20071,42 @@ fn apply_claude_settings_scope(raw: &mut ClaudeSettingsRaw, label: &str, documen
     {
         raw.model = Some((model, format!("{label}.model")));
     }
-    if let Some(effort) = document
-        .get("effortLevel")
+    if let Some(model) = document
+        .get("model")
         .and_then(Value::as_str)
-        .and_then(display_safe_config_scalar)
+        .filter(|model| !model.trim().is_empty())
     {
-        raw.effort_level = Some((effort, format!("{label}.effortLevel")));
+        raw.model_key = Some(claude_model_settings_key(model));
     }
+    let mut effort = ClaudeEffortScope {
+        label: label.to_string(),
+        top_level: document
+            .get("effortLevel")
+            .and_then(Value::as_str)
+            .and_then(display_safe_config_scalar),
+        by_model: BTreeMap::new(),
+    };
+    if let Some(model_settings) = document.get("modelSettings").and_then(Value::as_object) {
+        for (key, settings) in model_settings {
+            let Some(file_key) = display_safe_config_scalar(key) else {
+                continue;
+            };
+            let Some(level) = settings
+                .get("effortLevel")
+                .and_then(Value::as_str)
+                .and_then(display_safe_config_scalar)
+            else {
+                continue;
+            };
+            // Like Claude Code, a key already in canonical form beats an alias
+            // spelling of the same model.
+            let canonical = claude_model_settings_key(&file_key);
+            if file_key == canonical || !effort.by_model.contains_key(&canonical) {
+                effort.by_model.insert(canonical, (file_key, level));
+            }
+        }
+    }
+    raw.effort_scopes.push(effort);
     if let Some(mode) = document
         .get("permissions")
         .and_then(|permissions| permissions.get("defaultMode"))
@@ -20088,6 +20139,90 @@ fn apply_claude_settings_scope(raw: &mut ClaudeSettingsRaw, label: &str, documen
             ));
         }
     }
+}
+
+/// Pick the configured effort and the key that supplied it.
+///
+/// The highest-precedence file with an answer wins. Within one file:
+/// 1. With a saved `model`, its `modelSettings` entry.
+/// 2. Without one, the file's only `modelSettings` entry. With several entries,
+///    the effort depends on which model Claude Code starts with, which the
+///    settings do not say, so nothing is reported. The legacy key is not used
+///    either: it is stale once Claude Code saves effort per model.
+/// 3. Otherwise the top-level `effortLevel`.
+fn resolve_claude_effort(
+    scopes: &[ClaudeEffortScope],
+    model_key: Option<&str>,
+) -> Option<(String, String)> {
+    for scope in scopes.iter().rev() {
+        let per_model = match model_key {
+            Some(key) => scope.by_model.get(key),
+            None if scope.by_model.len() > 1 => return None,
+            None => scope.by_model.values().next(),
+        };
+        if let Some((file_key, effort)) = per_model {
+            return Some((
+                effort.clone(),
+                format!("{}.modelSettings.{file_key}.effortLevel", scope.label),
+            ));
+        }
+        if let Some(effort) = &scope.top_level {
+            return Some((effort.clone(), format!("{}.effortLevel", scope.label)));
+        }
+    }
+    None
+}
+
+/// The `modelSettings` key Claude Code uses for a model id.
+///
+/// Mirrors Claude Code's canonical key: lowercase, without a `[1m]` context
+/// suffix, provider path or `<region>.anthropic.` prefix, release date, version,
+/// `-latest`, or `-fast` suffix. So `us.anthropic.claude-opus-4-1-20250805-v1:0`
+/// and `claude-opus-4-1[1m]` both select `claude-opus-4-1`. Aliases such as
+/// `opus` are left as written: what they resolve to depends on the Claude Code
+/// version and plan, so they only match a key saved under the alias itself.
+fn claude_model_settings_key(model: &str) -> String {
+    let lowered = model.trim().to_ascii_lowercase();
+    let mut key = lowered.as_str();
+    for suffix in ["[1m]", "[2m]"] {
+        if let Some(head) = key.strip_suffix(suffix) {
+            key = head;
+        }
+    }
+    key = key.rsplit('/').next().unwrap_or_default();
+    if let Some(index) = key.find("anthropic.claude-") {
+        let region = &key[..index];
+        if region.is_empty()
+            || region.strip_suffix('.').is_some_and(|region| {
+                !region.is_empty() && region.chars().all(|ch| ch.is_ascii_lowercase())
+            })
+        {
+            key = &key[index + "anthropic.".len()..];
+        }
+    }
+    let all_digits = |text: &str, min: usize, max: usize| {
+        (min..=max).contains(&text.len()) && text.chars().all(|ch| ch.is_ascii_digit())
+    };
+    // Bedrock version, e.g. `-v1:0`.
+    if let Some((head, version)) = key.rsplit_once("-v") {
+        let (major, minor) = version.split_once(':').unwrap_or((version, "0"));
+        if all_digits(major, 1, 3) && all_digits(minor, 1, 3) {
+            key = head;
+        }
+    }
+    // Release date, e.g. `-20250805` or Vertex `@20250805`.
+    if let Some(index) = key.rfind(['-', '@']) {
+        if all_digits(&key[index + 1..], 8, 8) {
+            key = &key[..index];
+        }
+    }
+    for suffix in ["-latest", "-fast"] {
+        if let Some(head) = key.strip_suffix(suffix) {
+            key = head;
+            break;
+        }
+    }
+    key.to_string()
 }
 
 /// Canonical display value for `permissions.defaultMode`.
@@ -36540,6 +36675,188 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Effort and its `selector_sources` key, or `None` when not reported.
+    fn claude_effort_with_source(paths: &[(String, PathBuf)]) -> Option<(String, String)> {
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        let source = defaults.selector_sources.get("reasoning_effort").cloned();
+        assert_eq!(
+            defaults.selector_context.get("reasoning_effort"),
+            defaults.reasoning_effort.as_ref()
+        );
+        defaults.reasoning_effort.zip(source)
+    }
+
+    /// Current Claude Code saves `/effort` under `modelSettings.<model>` and
+    /// leaves the top-level `effortLevel` stale. The saved model's entry wins,
+    /// matched on Claude Code's canonical key.
+    #[test]
+    fn claude_settings_defaults_read_model_settings_effort_for_saved_model() {
+        let root = temp_dir("claude-settings-model-effort");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+        for model in [
+            "claude-opus-5-5",
+            "claude-opus-5-5-20261001",
+            "claude-opus-5-5[1m]",
+            "us.anthropic.claude-opus-5-5-20261001-v1:0",
+        ] {
+            fs::write(
+                claude_dir.join("settings.json"),
+                format!(
+                    "{{\"model\": \"{model}\", \"effortLevel\": \"low\", \"modelSettings\": {{\"claude-opus-5\": {{\"effortLevel\": \"high\"}}, \"claude-opus-5-5\": {{\"effortLevel\": \"medium\"}}}}}}\n"
+                ),
+            )
+            .expect("write settings");
+            assert_eq!(
+                claude_effort_with_source(&paths),
+                Some((
+                    "medium".to_string(),
+                    "claude_code.settings.modelSettings.claude-opus-5-5.effortLevel".to_string()
+                )),
+                "model {model}"
+            );
+        }
+
+        // A saved model with no entry of its own falls back to the legacy key.
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"model\": \"claude-sonnet-5\", \"effortLevel\": \"low\", \"modelSettings\": {\"claude-opus-5-5\": {\"effortLevel\": \"medium\"}}}\n",
+        )
+        .expect("rewrite settings");
+        assert_eq!(
+            claude_effort_with_source(&paths),
+            Some((
+                "low".to_string(),
+                "claude_code.settings.effortLevel".to_string()
+            ))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Without a saved model, a single `modelSettings` entry is unambiguous.
+    /// Several entries are not: the effort depends on the model Claude Code
+    /// starts with, so nothing is reported and the stale legacy key is not
+    /// resurrected. The model itself is never invented.
+    #[test]
+    fn claude_settings_defaults_model_settings_effort_without_saved_model() {
+        let root = temp_dir("claude-settings-model-effort-unset");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"effortLevel\": \"low\", \"modelSettings\": {\"claude-opus-5-5\": {\"effortLevel\": \"high\"}, \"claude-sonnet-5\": {}}}\n",
+        )
+        .expect("write settings");
+        assert_eq!(
+            claude_effort_with_source(&paths),
+            Some((
+                "high".to_string(),
+                "claude_code.settings.modelSettings.claude-opus-5-5.effortLevel".to_string()
+            ))
+        );
+
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"effortLevel\": \"low\", \"permissions\": {\"defaultMode\": \"auto\"}, \"modelSettings\": {\"claude-opus-5\": {\"effortLevel\": \"high\"}, \"claude-opus-5-5\": {\"effortLevel\": \"medium\"}}}\n",
+        )
+        .expect("rewrite settings");
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        assert_eq!(defaults.reasoning_effort, None);
+        assert!(!defaults.selector_sources.contains_key("reasoning_effort"));
+        assert_eq!(defaults.model, None);
+        assert_eq!(defaults.approval_policy.as_deref(), Some("auto"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Scope precedence holds for per-model effort: the highest file with an
+    /// answer wins, and the winning `model` selects the key in every file.
+    #[test]
+    fn claude_settings_defaults_model_settings_effort_respects_scope_precedence() {
+        let root = temp_dir("claude-settings-model-effort-scopes");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        let managed = root.join("managed-settings.json");
+        let paths = claude_settings_chain(&claude_dir, &managed);
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"model\": \"claude-opus-5\", \"modelSettings\": {\"claude-opus-5\": {\"effortLevel\": \"high\"}, \"claude-opus-5-5\": {\"effortLevel\": \"medium\"}}}\n",
+        )
+        .expect("write user settings");
+
+        // A managed `model` selects the user file's entry for that model.
+        fs::write(&managed, "{\"model\": \"claude-opus-5-5\"}\n").expect("write managed");
+        assert_eq!(
+            claude_effort_with_source(&paths),
+            Some((
+                "medium".to_string(),
+                "claude_code.settings.modelSettings.claude-opus-5-5.effortLevel".to_string()
+            ))
+        );
+
+        // A local top-level `effortLevel` overrides the user's per-model entry.
+        fs::write(
+            claude_dir.join("settings.local.json"),
+            "{\"effortLevel\": \"xhigh\"}\n",
+        )
+        .expect("write local settings");
+        assert_eq!(
+            claude_effort_with_source(&paths),
+            Some((
+                "xhigh".to_string(),
+                "claude_code.settings_local.effortLevel".to_string()
+            ))
+        );
+
+        // A managed per-model entry overrides both.
+        fs::write(
+            &managed,
+            "{\"model\": \"claude-opus-5-5\", \"modelSettings\": {\"claude-opus-5-5\": {\"effortLevel\": \"low\"}}}\n",
+        )
+        .expect("rewrite managed");
+        assert_eq!(
+            claude_effort_with_source(&paths),
+            Some((
+                "low".to_string(),
+                "claude_code.managed_settings.modelSettings.claude-opus-5-5.effortLevel"
+                    .to_string()
+            ))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_model_settings_key_matches_claude_code_canonical_key() {
+        for (model, key) in [
+            ("claude-opus-5-5", "claude-opus-5-5"),
+            (" Claude-Opus-4-7[1m] ", "claude-opus-4-7"),
+            ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5"),
+            ("claude-opus-4-1@20250805", "claude-opus-4-1"),
+            ("us.anthropic.claude-opus-4-1-20250805-v1:0", "claude-opus-4-1"),
+            ("anthropic.claude-haiku-4-5-20251001-v1:0", "claude-haiku-4-5"),
+            (
+                "arn:aws:bedrock:us-east-1:000000000000:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "claude-sonnet-4-5",
+            ),
+            ("claude-opus-5-latest", "claude-opus-5"),
+            ("claude-3-5-sonnet-20241022", "claude-3-5-sonnet"),
+            // Aliases resolve per Claude Code version and plan; left as written.
+            ("opus", "opus"),
+            ("opus[1m]", "opus"),
+        ] {
+            assert_eq!(claude_model_settings_key(model), key, "model {model}");
+        }
     }
 
     /// The Configuration tab's contract is "what your config file says", so an

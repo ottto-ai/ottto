@@ -33388,9 +33388,9 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Claude Code's `effortLevel` is durable: `/effort` writes it to the
-    /// settings file and it persists across sessions. It maps straight through
-    /// to `reasoning_effort`.
+    /// Claude Code's legacy top-level `effortLevel` still maps straight through
+    /// to `reasoning_effort` when no `modelSettings` entry applies. Current
+    /// `/effort` saves per model; see the `modelSettings` tests in snapshots.
     #[test]
     fn claude_runtime_defaults_report_configured_effort_level() {
         let (root, paths) = claude_settings_fixture(
