@@ -3145,7 +3145,7 @@ mod tests {
         assert_eq!(harness.requests(), 2, "Refresh waits out the 429");
     }
 
-    /// Ron's rule: a status read an app starts never calls the provider. It
+    /// Product rule: a status read an app starts never calls the provider. It
     /// serves the stored reading even for a due account; the daemon's own
     /// pass reads it, and an explicit refresh is the one read such a request
     /// may make.

@@ -89,10 +89,11 @@ const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS: u64 = 40 * 60;
 /// Half-width of the deterministic spread applied to the base cadence, giving
 /// an effective gate in the 38-42 minute range.
 const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_JITTER_SECONDS: u64 = 2 * 60;
-/// Spacing after a successful read: at least 5 min to the next read of the
-/// account. Measured from the start of the collection pass that read
+/// Spacing after a successful read: 5 min to the next read of the account,
+/// pass to pass. Measured from the start of the collection pass that read
 /// ([`claude_spacing_anchor`]), so the daemon's next 5-min pass finds an
-/// in-use account due wherever in the pass its read falls. Retry-After and
+/// in-use account due wherever in the pass its read falls; two reads can
+/// therefore be up to the anchor cap closer than 5 min. Retry-After and
 /// breaker holds are stored and checked separately and are never shortened
 /// by it.
 const CLAUDE_OAUTH_USAGE_REFRESH_SECONDS: u64 = 5 * 60;

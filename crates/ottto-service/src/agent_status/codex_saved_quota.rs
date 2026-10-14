@@ -81,6 +81,9 @@ const SAVED_METERS_MAX: usize = 32;
 const SAVED_TEXT_MAX_CHARS: usize = 1024;
 /// Running-process sightings kept (the process scan reports at most 32).
 const RUNNING_HOMES_MAX: usize = 32;
+/// The schedule scans for running Codex processes itself when no collection
+/// did for this long, so a home in use is seen without the Codex lane.
+const PROCESS_SCAN_MIN_GAP_SECONDS: u64 = 5 * 60;
 
 /// Served when a home has no usable saved reading yet: first start, or its
 /// local login changed since the last read. Not a failed read. Every home a
@@ -146,6 +149,17 @@ impl LoginMark {
             _ => false,
         }
     }
+
+    /// A login the schedule reads again soon: a positively different claimed
+    /// account or workspace, or a credential file that appeared or went away.
+    /// File metadata alone never is: every read rewrites `auth.json`, and a
+    /// credential that names no account cannot be told apart from itself.
+    fn is_new_login(&self, current: &Self) -> bool {
+        match (&self.binding, &current.binding) {
+            (Some(own), Some(current)) => own != current,
+            _ => self.auth.is_some() != current.auth.is_some(),
+        }
+    }
 }
 
 pub(super) fn login_mark(home: &Path, home_trust: CodexHomeTrust) -> LoginMark {
@@ -172,8 +186,8 @@ pub(super) struct SavedCodexQuota {
     #[serde(default)]
     last_attempt_at_epoch_seconds: u64,
     /// The login that attempt read: as it was right after the read, or as it
-    /// was before when the login changed during the read (so the new login is
-    /// read again soon).
+    /// was before when the account changed during the read (so the new
+    /// account is read again soon).
     #[serde(default)]
     last_attempt_login: LoginMark,
     /// The last attempt's failure, while it is newer than `reading`.
@@ -579,19 +593,24 @@ fn probe_binding(probe: &CodexUsageProbe) -> Option<String> {
 }
 
 /// Whether a read ran under one login from start to end. The read itself
-/// rewrites `auth.json` (it refreshes the token), so the claimed account and
-/// workspace decide. A credential that named none before the read (an expired
-/// token) and names one after it is the same login when the read validated
-/// exactly that account.
+/// rewrites `auth.json` (it refreshes the token), so only a positively
+/// different account or workspace is a change. A credential that named none
+/// before the read (an expired token) and names one after it is the same
+/// login when the read validated exactly that account. A credential that
+/// names none after the read is the same login unless the read validated
+/// another account than the one named before it.
 fn read_kept_its_login(
     before: &LoginMark,
     after: &LoginMark,
     result: &Result<CodexUsageProbe, String>,
 ) -> bool {
-    before.same_login(after)
-        || (before.binding.is_none()
-            && after.binding.is_some()
-            && result.as_ref().ok().and_then(probe_binding) == after.binding)
+    let validated = result.as_ref().ok().and_then(probe_binding);
+    match (&before.binding, &after.binding) {
+        (Some(before), Some(after)) => before == after,
+        (None, Some(_)) => validated == after.binding,
+        (Some(before), None) => validated.map_or(true, |validated| &validated == before),
+        (None, None) => true,
+    }
 }
 
 /// `admit` decides at `now` (the trigger's clock), under the home's lock.
@@ -615,7 +634,7 @@ fn read_and_save_at(
     let after = login_mark(home, home_trust);
     // A login that changed while the read ran leaves the reading unsaved: it
     // cannot be told which login it belongs to. The attempt then records the
-    // login it started under, so the new login is read again after a minute.
+    // login it started under, so a new account is read again after a minute.
     // Otherwise it records the login after the read, whose own `auth.json`
     // rewrite is not a change.
     let kept = read_kept_its_login(&before, &after, &result);
@@ -683,7 +702,7 @@ pub(super) fn scheduled_read_due(
         return true;
     }
     let elapsed = now.saturating_sub(last);
-    if !saved.last_attempt_login.same_login(current_login)
+    if saved.last_attempt_login.is_new_login(current_login)
         && elapsed >= LOGIN_CHANGED_MIN_GAP_SECONDS
     {
         return true;
@@ -710,9 +729,13 @@ fn running_homes() -> MutexGuard<'static, BTreeMap<PathBuf, u64>> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Record homes where a running Codex process holds a rollout (from the
-/// collection's process scan).
+/// When a process scan last ran (local unix seconds).
+static PROCESS_SCANNED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Record homes where a running Codex process holds a rollout (from a
+/// process scan).
 pub(super) fn note_running_homes<'a>(homes: impl Iterator<Item = &'a Path>, now: u64) {
+    PROCESS_SCANNED_AT.store(now, Ordering::Relaxed);
     let mut running = running_homes();
     for home in homes {
         running.insert(home.to_path_buf(), now);
@@ -937,8 +960,35 @@ fn scheduled_round_for(
     )
 }
 
+/// Whether the schedule scans for running Codex processes itself: no scan
+/// ran in the last 5 minutes (the Codex lane, which scans on each pass, may
+/// be off: source disabled or the device unpaired).
+fn process_scan_due(scanned_at: u64, now: u64) -> bool {
+    scanned_at == 0
+        || scanned_at > now.saturating_add(CLOCK_SKEW_SECONDS)
+        || now.saturating_sub(scanned_at) >= PROCESS_SCAN_MIN_GAP_SECONDS
+}
+
+/// Scan for running Codex processes when due, so a home in use is read every
+/// 5 minutes whether or not the Codex lane runs.
+fn scan_running_homes_if_due(now: u64) {
+    if !process_scan_due(PROCESS_SCANNED_AT.load(Ordering::Relaxed), now) {
+        return;
+    }
+    #[cfg(not(test))]
+    let running = crate::codex_process_homes::running_codex_homes();
+    // Tests never see this machine's Codex processes (or read their homes).
+    #[cfg(test)]
+    let running = Vec::<crate::codex_process_homes::CodexProcessHome>::new();
+    note_running_homes(
+        running.iter().map(|process| process.auth_home.as_path()),
+        now,
+    );
+}
+
 /// One scheduler pass: read every due home. Returns how many were read.
 pub(super) fn scheduled_round(support_dir: &Path, now: u64) -> usize {
+    scan_running_homes_if_due(now);
     let homes = scheduled_homes(support_dir, now);
     if homes.is_empty() {
         return 0;
@@ -1251,10 +1301,32 @@ mod tests {
             false,
             10_000 + 600
         ));
-        // Without a claimed account, the file metadata decides.
+        // Without a claimed account on either side, a rewritten file is not
+        // a new login (every read rewrites it): the interval holds.
         let opaque = saved_with(10_000, mark(None, 1));
-        assert!(scheduled_read_due(
+        assert!(!scheduled_read_due(
             Some(&opaque),
+            &mark(None, 2),
+            false,
+            10_000 + 600
+        ));
+        // Nor is a credential that stops naming its account (an expired
+        // token), or starts to.
+        assert!(!scheduled_read_due(
+            Some(&saved),
+            &mark(None, 1),
+            false,
+            10_000 + 600
+        ));
+        assert!(!scheduled_read_due(
+            Some(&opaque),
+            &mark(Some("a:w"), 2),
+            false,
+            10_000 + 600
+        ));
+        // A credential written into a signed-out home is.
+        assert!(scheduled_read_due(
+            Some(&saved_with(10_000, LoginMark::default())),
             &mark(None, 2),
             false,
             10_000 + 60
@@ -1505,12 +1577,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A read that rewrites a credential naming no account, before or after
+    /// (no account id, no current id_token): the rewrite is the read's own,
+    /// so the reading is kept and the next read waits the full interval.
     #[test]
-    fn a_login_that_changes_during_the_read_leaves_the_reading_unsaved() {
-        let root = scratch("login-race");
+    fn a_read_that_rewrites_an_unnamed_credential_keeps_its_reading() {
+        let root = scratch("unnamed-rewrite");
         let home = opaque_home(&root);
         let now = current_unix_seconds();
         let before = login_mark(&home, CodexHomeTrust::Managed);
+        assert_eq!(before.binding, None);
         let result = read_and_save_at(
             &root,
             &home,
@@ -1518,26 +1594,57 @@ mod tests {
             now,
             |_, _| true,
             || {
-                write_opaque_auth(&home, "another-login-written-during-the-read");
+                write_opaque_auth(&home, "token-refreshed-by-the-read");
                 Ok(probe("account-a", "workspace-a", &rfc3339(now)))
             },
         );
-        assert!(
-            matches!(result, Some(Ok(_))),
-            "the caller still gets its read"
-        );
+        assert!(matches!(result, Some(Ok(_))));
+        let after = login_mark(&home, CodexHomeTrust::Managed);
+        assert_eq!(after.binding, None);
+        assert_ne!(after, before, "the read rewrote auth.json");
         let saved = read_saved_at(&root, &home).unwrap();
-        assert!(saved.reading.is_none(), "no login can be named for it");
-        assert_eq!(saved.last_attempt_login, before);
-        assert_eq!(
-            served_error(&root, &home, now),
-            Some(CODEX_QUOTA_NOT_READ_YET.to_string())
-        );
-        // The changed login is read again after a minute.
-        let current = login_mark(&home, CodexHomeTrust::Managed);
-        assert!(!scheduled_read_due(Some(&saved), &current, false, now + 59));
-        assert!(scheduled_read_due(Some(&saved), &current, false, now + 61));
+        assert!(saved.reading.is_some(), "the reading is kept");
+        assert_eq!(saved.last_attempt_login, after);
+        assert!(serve_saved_at(&root, &home, CodexHomeTrust::Managed, now).is_ok());
+        for in_use in [true, false] {
+            let interval = refresh_interval_seconds(in_use);
+            assert!(!scheduled_read_due(Some(&saved), &after, in_use, now + 61));
+            assert!(!scheduled_read_due(
+                Some(&saved),
+                &after,
+                in_use,
+                now + interval - 1
+            ));
+            assert!(scheduled_read_due(
+                Some(&saved),
+                &after,
+                in_use,
+                now + interval
+            ));
+        }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Only a positively different account or workspace makes a read lose
+    /// its login.
+    #[test]
+    fn only_a_different_named_account_discards_a_read() {
+        let named = |binding: &str| mark(Some(binding), 1);
+        let unnamed = mark(None, 2);
+        let read = Ok(probe("a", "w", &rfc3339(10_000)));
+        let failed = Err("Codex app-server quota read timed out.".to_string());
+        assert!(read_kept_its_login(&named("a:w"), &named("a:w"), &read));
+        assert!(!read_kept_its_login(&named("a:w"), &named("b:w"), &read));
+        assert!(read_kept_its_login(&unnamed, &mark(None, 3), &read));
+        assert!(read_kept_its_login(&unnamed, &mark(None, 3), &failed));
+        assert!(read_kept_its_login(&named("a:w"), &unnamed, &read));
+        assert!(read_kept_its_login(&named("a:w"), &unnamed, &failed));
+        assert!(!read_kept_its_login(&named("b:w"), &unnamed, &read));
+        // An expired token that the read renewed: kept only when the read
+        // validated the account the renewed credential names.
+        assert!(read_kept_its_login(&unnamed, &named("a:w"), &read));
+        assert!(!read_kept_its_login(&unnamed, &named("b:w"), &read));
+        assert!(!read_kept_its_login(&unnamed, &named("a:w"), &failed));
     }
 
     #[test]
@@ -1717,6 +1824,16 @@ mod tests {
             homes_in_use(&with_process, &[], now),
             [false, false, false, false]
         );
+    }
+
+    #[test]
+    fn the_schedule_scans_for_processes_when_no_scan_ran_for_five_minutes() {
+        assert!(process_scan_due(0, 10_000));
+        assert!(!process_scan_due(10_000, 10_000));
+        assert!(!process_scan_due(10_000, 10_000 + 5 * 60 - 1));
+        assert!(process_scan_due(10_000, 10_000 + 5 * 60));
+        // A clock that stepped back never stops the scans.
+        assert!(process_scan_due(10_000 + 3_600, 10_000));
     }
 
     #[test]
