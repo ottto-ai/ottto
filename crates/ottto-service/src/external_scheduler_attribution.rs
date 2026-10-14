@@ -5,6 +5,8 @@
 //! and privacy-safe repository hashes. Raw plist/crontab/script text and paths
 //! never enter a session fact.
 
+mod live_owner;
+
 use crate::context_footprint::resolve_repository_identity;
 use crate::session_attribution::{normalize_template_material, opaque_hmac_id};
 use crate::snapshots::SnapshotSource;
@@ -31,20 +33,18 @@ const MAX_PROMPT_SIGNATURE_CHARS: usize = 96;
 const MIN_PROMPT_SIGNATURE_CHARS: usize = 24;
 #[cfg(target_os = "macos")]
 const MAX_CRONTAB_BYTES: usize = 256 * 1_024;
-#[cfg(target_os = "macos")]
 const MAX_LIVE_CANDIDATES: usize = 4;
-#[cfg(target_os = "macos")]
-const MAX_ANCESTOR_DEPTH: usize = 8;
-#[cfg(target_os = "macos")]
-const MAX_PROCESS_TABLE_BYTES: usize = 1024 * 1024;
 #[cfg(target_os = "macos")]
 const LOCAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const LIVE_OWNER_WRITE_WINDOW: Duration = Duration::from_secs(10 * 60);
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(crate) struct ExternalSchedulerInventory {
     definitions: Vec<ExternalSchedulerDefinition>,
+    /// Process facts for live-owner proof, gathered at most once per scan.
+    /// Each scan gets a fresh inventory value and so a fresh `live`.
+    live: Mutex<live_owner::LiveScan>,
 }
 
 #[derive(Clone)]
@@ -101,7 +101,7 @@ struct CachedInventory {
     loaded_at: Instant,
     home: PathBuf,
     key_fingerprint: String,
-    inventory: ExternalSchedulerInventory,
+    definitions: Vec<ExternalSchedulerDefinition>,
     launchd_files: BTreeMap<PathBuf, CachedDefinitionFile>,
     crontab_digest: Option<String>,
     crontab_definitions: Vec<ExternalSchedulerDefinition>,
@@ -120,6 +120,7 @@ pub(crate) struct ExternalSchedulerSession<'a> {
     pub(crate) normalized_template: Option<&'a str>,
     pub(crate) repository_hash: Option<&'a str>,
     pub(crate) source_started_at: Option<&'a str>,
+    pub(crate) source_session_id: &'a str,
     pub(crate) transcript_path: &'a Path,
 }
 
@@ -167,7 +168,7 @@ impl ExternalSchedulerInventory {
                         && cached.key_fingerprint == key_fingerprint
                         && cached.loaded_at.elapsed() < INVENTORY_TTL
                     {
-                        return cached.inventory.clone();
+                        return Self::from_definitions(cached.definitions.clone());
                     }
                     if cached.home == home && cached.key_fingerprint == key_fingerprint {
                         (
@@ -192,19 +193,25 @@ impl ExternalSchedulerInventory {
         definitions.extend(crontab_definitions.clone());
         definitions.sort_by(|left, right| left.opaque_id.cmp(&right.opaque_id));
         definitions.dedup_by(|left, right| left.opaque_id == right.opaque_id);
-        let inventory = Self { definitions };
         if let Ok(mut guard) = cache.lock() {
             *guard = Some(CachedInventory {
                 loaded_at: Instant::now(),
                 home: home.to_path_buf(),
                 key_fingerprint,
-                inventory: inventory.clone(),
+                definitions: definitions.clone(),
                 launchd_files,
                 crontab_digest,
                 crontab_definitions,
             });
         }
-        inventory
+        Self::from_definitions(definitions)
+    }
+
+    fn from_definitions(definitions: Vec<ExternalSchedulerDefinition>) -> Self {
+        Self {
+            definitions,
+            live: Mutex::default(),
+        }
     }
 
     pub(crate) fn correlate(
@@ -317,7 +324,7 @@ impl ExternalSchedulerInventory {
         })
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn candidate_launchd_labels(&self, session: &ExternalSchedulerSession<'_>) -> Vec<&str> {
         self.definitions
             .iter()
@@ -790,95 +797,82 @@ fn live_launchd_labels(
     }
     #[cfg(target_os = "macos")]
     {
-        let candidate_labels = inventory.candidate_launchd_labels(session);
+        inventory.live_owner_labels(
+            session,
+            &live_owner::NativeHost,
+            live_owner::proven_owners(),
+            SystemTime::now(),
+        )
+    }
+}
+
+impl ExternalSchedulerInventory {
+    /// Labels of launchd jobs proven to run this session: remembered from an
+    /// earlier scan, or found now in a running candidate job's process tree.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn live_owner_labels(
+        &self,
+        session: &ExternalSchedulerSession<'_>,
+        host: &impl live_owner::ProcessHost,
+        proven: &Mutex<live_owner::ProvenOwners>,
+        now: SystemTime,
+    ) -> BTreeSet<String> {
+        let remembered = proven
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .labels(session.source, session.source_session_id);
+        if !remembered.is_empty() {
+            return remembered;
+        }
+        let candidate_labels = self.candidate_launchd_labels(session);
         if candidate_labels.is_empty() {
             return BTreeSet::new();
         }
-        let Ok(metadata) = fs::metadata(session.transcript_path) else {
-            return BTreeSet::new();
-        };
-        let modified = metadata.modified().ok();
-        let now = SystemTime::now();
+        let modified = fs::metadata(session.transcript_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
         if !transcript_may_have_live_owner(modified, now) {
             return BTreeSet::new();
         }
-        let version = (metadata.len(), modified);
-        {
-            let mut checks = live_owner_checks()
+        let query = live_owner::OwnerQuery {
+            source: session.source,
+            source_session_id: session.source_session_id,
+            transcript_path: session.transcript_path,
+        };
+        // `launchctl` runs outside the lock, so a slow command never stalls
+        // another thread on this scan; what runs under it is kernel reads and
+        // small registry files. Serial scans still ask once per label.
+        let unknown = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unknown_labels(&candidate_labels);
+        let looked_up = unknown
+            .into_iter()
+            .map(|label| {
+                let job = live_owner::running_job(host, &label);
+                (label, job)
+            })
+            .collect::<Vec<_>>();
+        let labels = {
+            let mut live = self
+                .live
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            checks.retain(|_, check| transcript_may_have_live_owner(check.version.1, now));
-            if let Some(check) = checks.get(session.transcript_path) {
-                if check.version == version {
-                    return check.labels.clone();
-                }
-            }
-        }
-        // The lock is released while the commands run so a slow `lsof` never
-        // stalls another scan thread.
-        let labels = live_launchd_labels_uncached(candidate_labels, session.transcript_path);
-        let mut checks = live_owner_checks()
+            live.record_jobs(looked_up);
+            live.owner_labels(host, &query, &candidate_labels)
+        };
+        proven
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if checks.len() < MAX_LIVE_OWNER_CHECKS {
-            checks.insert(
-                session.transcript_path.to_path_buf(),
-                LiveOwnerCheck {
-                    version,
-                    labels: labels.clone(),
-                },
-            );
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remember(session.source, session.source_session_id, &labels);
         labels
     }
 }
 
-/// The last live-owner answer for each recently written transcript, keyed by
-/// the file version it was computed for. A scan that finds the same size and
-/// modification time reuses it instead of running `lsof`, `ps`, and `launchctl`
-/// again: nothing was written, so no new owner can have appeared.
-#[cfg(target_os = "macos")]
-struct LiveOwnerCheck {
-    version: (u64, Option<SystemTime>),
-    labels: BTreeSet<String>,
-}
-
-#[cfg(target_os = "macos")]
-const MAX_LIVE_OWNER_CHECKS: usize = 1024;
-
-#[cfg(target_os = "macos")]
-fn live_owner_checks() -> &'static Mutex<BTreeMap<PathBuf, LiveOwnerCheck>> {
-    static CHECKS: OnceLock<Mutex<BTreeMap<PathBuf, LiveOwnerCheck>>> = OnceLock::new();
-    CHECKS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-#[cfg(target_os = "macos")]
-fn live_launchd_labels_uncached(
-    candidate_labels: Vec<&str>,
-    transcript_path: &Path,
-) -> BTreeSet<String> {
-    let owner_pids = transcript_owner_pids(transcript_path);
-    if owner_pids.is_empty() {
-        return BTreeSet::new();
-    }
-    let parent_map = process_parent_map();
-    let ancestors = owner_pids
-        .into_iter()
-        .flat_map(|pid| process_ancestors(pid, &parent_map))
-        .collect::<BTreeSet<_>>();
-    candidate_labels
-        .into_iter()
-        .filter_map(|label| launchd_job_pid(label).map(|pid| (label, pid)))
-        .filter(|(_, pid)| ancestors.contains(pid))
-        .map(|(label, _)| label.to_string())
-        .collect()
-}
-
-/// Providers append to a transcript and close it, so only a transcript written
-/// moments ago can still be open in a scheduled job's process tree. Every scan
-/// reparses every transcript, and `lsof` costs about a third of a CPU second,
-/// so checking untouched history made each scan spend a minute of CPU on a Mac
-/// with a few hundred scheduled sessions.
+/// Only a session written in the last few minutes can still be running, so
+/// untouched history never costs a process check. A session proven earlier
+/// keeps its owner without this gate.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn transcript_may_have_live_owner(modified: Option<SystemTime>, now: SystemTime) -> bool {
     match modified {
@@ -888,57 +882,6 @@ fn transcript_may_have_live_owner(modified: Option<SystemTime>, now: SystemTime)
             .unwrap_or(true),
         None => false,
     }
-}
-
-#[cfg(target_os = "macos")]
-fn transcript_owner_pids(path: &Path) -> BTreeSet<u32> {
-    let Some(path) = path.to_str() else {
-        return BTreeSet::new();
-    };
-    bounded_command_stdout("/usr/sbin/lsof", &["-t", "--", path], 4096)
-        .and_then(|value| String::from_utf8(value).ok())
-        .map(|value| {
-            value
-                .lines()
-                .filter_map(|line| line.trim().parse::<u32>().ok())
-                .take(8)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-#[cfg(target_os = "macos")]
-fn process_parent_map() -> BTreeMap<u32, u32> {
-    bounded_command_stdout("/bin/ps", &["-axo", "pid=,ppid="], MAX_PROCESS_TABLE_BYTES)
-        .and_then(|value| String::from_utf8(value).ok())
-        .map(|value| {
-            value
-                .lines()
-                .filter_map(|line| {
-                    let mut values = line.split_whitespace();
-                    Some((
-                        values.next()?.parse::<u32>().ok()?,
-                        values.next()?.parse::<u32>().ok()?,
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-#[cfg(target_os = "macos")]
-fn process_ancestors(mut pid: u32, parents: &BTreeMap<u32, u32>) -> BTreeSet<u32> {
-    let mut values = BTreeSet::new();
-    for _ in 0..MAX_ANCESTOR_DEPTH {
-        if pid == 0 || !values.insert(pid) {
-            break;
-        }
-        let Some(parent) = parents.get(&pid).copied() else {
-            break;
-        };
-        pid = parent;
-    }
-    values
 }
 
 #[cfg(target_os = "macos")]
@@ -1100,14 +1043,13 @@ mod tests {
                 calendar: vec![CalendarConstraint::default()],
             },
         };
-        let inventory = ExternalSchedulerInventory {
-            definitions: vec![definition],
-        };
+        let inventory = ExternalSchedulerInventory::from_definitions(vec![definition]);
         let session = ExternalSchedulerSession {
             source: SnapshotSource::Codex,
             normalized_template: Some(&prompt),
             repository_hash: Some("repository"),
             source_started_at: Some("2026-07-19T03:00:00Z"),
+            source_session_id: "session",
             transcript_path: Path::new("/missing"),
         };
         let matched = inventory
@@ -1125,6 +1067,7 @@ mod tests {
             normalized_template: Some("repeat this every day"),
             repository_hash: None,
             source_started_at: Some("2026-07-19T03:00:00Z"),
+            source_session_id: "session",
             transcript_path: Path::new("/missing"),
         };
         assert!(inventory
@@ -1166,14 +1109,13 @@ mod tests {
             repository_hash: Some("repository".to_string()),
             schedule: ScheduleConstraint::default(),
         };
-        let inventory = ExternalSchedulerInventory {
-            definitions: vec![definition],
-        };
+        let inventory = ExternalSchedulerInventory::from_definitions(vec![definition]);
         let session = ExternalSchedulerSession {
             source: SnapshotSource::Codex,
             normalized_template: None,
             repository_hash: Some("repository"),
             source_started_at: Some("2026-07-19T03:00:00Z"),
+            source_session_id: "session",
             transcript_path: Path::new("/missing"),
         };
         assert!(inventory
@@ -1205,12 +1147,13 @@ mod tests {
                 },
             })
             .collect();
-        let inventory = ExternalSchedulerInventory { definitions };
+        let inventory = ExternalSchedulerInventory::from_definitions(definitions);
         let session = ExternalSchedulerSession {
             source: SnapshotSource::Codex,
             normalized_template: Some("inspect the landing queue safely"),
             repository_hash: Some("repository"),
             source_started_at: Some("2026-07-19T03:00:00Z"),
+            source_session_id: "session",
             transcript_path: Path::new("/missing"),
         };
         assert!(inventory
@@ -1234,7 +1177,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ExternalSchedulerInventory; definitions);
+crate::heap_layout_bound::fields!(ExternalSchedulerInventory; definitions, live);
 
 crate::heap_layout_bound::fields!(ExternalSchedulerDefinition; scheduler_kind, opaque_id, launchd_label, provider_source, prompt_signature, repository_hash, schedule);
 
