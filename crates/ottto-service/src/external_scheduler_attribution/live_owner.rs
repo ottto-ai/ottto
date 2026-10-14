@@ -51,6 +51,17 @@ pub(super) struct ClaudeSessionClaim {
     pub(super) proc_start: String,
 }
 
+/// What reading a process found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProcessRead {
+    Running(ProcessRecord),
+    /// No such process runs.
+    Gone,
+    /// The process runs but its record is off limits, for example because
+    /// another user owns it.
+    Unreadable,
+}
+
 /// The children of a process. `complete` is false when the listing may have
 /// been cut short.
 pub(super) struct ChildList {
@@ -68,12 +79,20 @@ pub(super) struct OpenFileList {
 /// What the live check reads from the operating system.
 pub(super) trait ProcessHost {
     fn launchd_job_pid(&self, label: &str) -> Option<u32>;
-    fn process(&self, pid: u32) -> Option<ProcessRecord>;
+    fn read_process(&self, pid: u32) -> ProcessRead;
     fn children(&self, pid: u32) -> ChildList;
     fn open_files(&self, pid: u32) -> OpenFileList;
     fn claude_sessions(&self, registry: &Path) -> Vec<ClaudeSessionClaim>;
     /// The effective user the daemon runs as.
     fn user_id(&self) -> u32;
+
+    /// The record of a running process the daemon may read.
+    fn process(&self, pid: u32) -> Option<ProcessRecord> {
+        match self.read_process(pid) {
+            ProcessRead::Running(record) => Some(record),
+            ProcessRead::Gone | ProcessRead::Unreadable => None,
+        }
+    }
 }
 
 /// The session a live owner is sought for.
@@ -317,12 +336,11 @@ fn ancestors(
 /// Open files across a running job's process tree. The root must still be the
 /// job's own process. Any other process counts only when it is still the
 /// listed parent's child and started no earlier than that parent, so a reused
-/// pid is skipped. A process owned by another user cannot hold the user's
-/// transcript, so only its children are walked. A failed or cut-short listing,
-/// or a process that changed while it was listed, leaves the result
-/// incomplete.
+/// pid is skipped, and so is a process that exited. A process the daemon may
+/// not read (another user's) hides its own subtree, as does a failed or
+/// cut-short listing or a process that changed while it was listed; each
+/// leaves the result incomplete.
 fn tree_open_files(host: &impl ProcessHost, job: RunningJob) -> TreeOpenFiles {
-    let user = host.user_id();
     let mut files = TreeOpenFiles {
         paths: BTreeSet::new(),
         complete: true,
@@ -337,7 +355,15 @@ fn tree_open_files(host: &impl ProcessHost, job: RunningJob) -> TreeOpenFiles {
             files.complete = false;
             break;
         }
-        let before = host.process(pid).filter(|record| match parent {
+        let before = match host.read_process(pid) {
+            ProcessRead::Running(record) => Some(record),
+            ProcessRead::Gone => None,
+            ProcessRead::Unreadable => {
+                files.complete = false;
+                continue;
+            }
+        };
+        let before = before.filter(|record| match parent {
             None => job.is_own_process(record),
             Some((parent, parent_started)) => {
                 record.parent == parent && record.started_unix_seconds >= parent_started
@@ -351,20 +377,20 @@ fn tree_open_files(host: &impl ProcessHost, job: RunningJob) -> TreeOpenFiles {
             continue;
         };
         let children = host.children(pid);
-        let open = (before.uid == user).then(|| host.open_files(pid));
-        match host.process(pid) {
-            Some(after) if after == before => {}
+        let open = host.open_files(pid);
+        match host.read_process(pid) {
+            ProcessRead::Running(after) if after == before => {}
             // Exited meanwhile: it holds nothing now.
-            None if parent.is_some() => continue,
+            ProcessRead::Gone if parent.is_some() => continue,
             _ => {
                 files.complete = false;
                 continue;
             }
         }
-        if !children.complete || open.as_ref().is_some_and(|open| !open.complete) {
+        if !children.complete || !open.complete {
             files.complete = false;
         }
-        for path in open.map(|open| open.paths).unwrap_or_default() {
+        for path in open.paths {
             if files.paths.len() >= MAX_TREE_OPEN_PATHS {
                 files.complete = false;
                 break;
@@ -384,14 +410,19 @@ fn tree_open_files(host: &impl ProcessHost, job: RunningJob) -> TreeOpenFiles {
 
 /// Whole entries in a `PROC_PIDLISTFDS` result of `written` bytes, or `None`
 /// when the listing proves nothing. libproc reports a failure (no permission,
-/// process gone) as 0 rather than -1, and a process without any descriptor
-/// cannot be told apart from that. A partial entry is a short write, and a
-/// full buffer may have been cut short.
+/// process gone) as 0 rather than -1 and sets `errno`, so 0 counts as no
+/// descriptors only while `errno` stayed clear. A partial entry is a short
+/// write, and a full buffer may have been cut short.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn listed_descriptor_count(written: i32, entry_size: usize, capacity: usize) -> Option<usize> {
+fn listed_descriptor_count(
+    written: i32,
+    errno: i32,
+    entry_size: usize,
+    capacity: usize,
+) -> Option<usize> {
     let written = usize::try_from(written)
         .ok()
-        .filter(|written| *written > 0)?;
+        .filter(|written| *written > 0 || errno == 0)?;
     if entry_size == 0 || written % entry_size != 0 {
         return None;
     }
@@ -489,7 +520,8 @@ pub(super) struct NativeHost;
 #[cfg(target_os = "macos")]
 mod native {
     use super::{
-        ChildList, ClaudeSessionClaim, NativeHost, OpenFileList, ProcessHost, ProcessRecord,
+        ChildList, ClaudeSessionClaim, NativeHost, OpenFileList, ProcessHost, ProcessRead,
+        ProcessRecord,
     };
     use std::path::{Path, PathBuf};
 
@@ -523,10 +555,15 @@ mod native {
             super::super::launchd_job_pid(label)
         }
 
-        fn process(&self, pid: u32) -> Option<ProcessRecord> {
-            let kernel_pid = libc::pid_t::try_from(pid).ok()?;
+        fn read_process(&self, pid: u32) -> ProcessRead {
+            let Ok(kernel_pid) = libc::pid_t::try_from(pid) else {
+                return ProcessRead::Gone;
+            };
             let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-            let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+            let Ok(size) = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()) else {
+                return ProcessRead::Unreadable;
+            };
+            clear_errno();
             // SAFETY: the buffer is writable for `size` bytes; the kernel
             // writes at most that many and reports how many it wrote.
             let returned = unsafe {
@@ -539,11 +576,20 @@ mod native {
                 )
             };
             if returned != size {
-                return None;
+                // Another user's process is denied (EPERM) rather than
+                // missing (ESRCH), and its subtree must not read as empty.
+                return if returned == 0 && errno() == libc::ESRCH {
+                    ProcessRead::Gone
+                } else {
+                    ProcessRead::Unreadable
+                };
             }
             // SAFETY: the kernel filled the complete zero-initialized buffer.
             let info = unsafe { info.assume_init() };
-            (info.pbi_pid == pid && info.pbi_start_tvsec > 0).then_some(ProcessRecord {
+            if info.pbi_pid != pid || info.pbi_start_tvsec == 0 {
+                return ProcessRead::Unreadable;
+            }
+            ProcessRead::Running(ProcessRecord {
                 parent: info.pbi_ppid,
                 started_unix_seconds: info.pbi_start_tvsec,
                 uid: info.pbi_uid,
@@ -596,6 +642,7 @@ mod native {
             let Ok(bytes) = libc::c_int::try_from(MAX_FILE_DESCRIPTORS * entry) else {
                 return incomplete;
             };
+            clear_errno();
             // SAFETY: the vector's spare capacity is writable for `bytes`
             // bytes; the kernel reports how many bytes of whole entries it wrote.
             let written = unsafe {
@@ -607,7 +654,8 @@ mod native {
                     bytes,
                 )
             };
-            let Some(count) = super::listed_descriptor_count(written, entry, MAX_FILE_DESCRIPTORS)
+            let Some(count) =
+                super::listed_descriptor_count(written, errno(), entry, MAX_FILE_DESCRIPTORS)
             else {
                 return incomplete;
             };
@@ -648,12 +696,23 @@ mod native {
         }
     }
 
+    fn clear_errno() {
+        // SAFETY: `__error` returns this thread's `errno`, valid for writes.
+        unsafe { *libc::__error() = 0 };
+    }
+
+    fn errno() -> i32 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+
     /// The path of a vnode descriptor: `None` when the kernel would not
-    /// describe it, `Some(None)` when it has no path (for example unlinked).
-    fn vnode_path(pid: libc::pid_t, fd: i32) -> Option<Option<PathBuf>> {
+    /// describe it, `Some(None)` when it holds no path now (unlinked, or
+    /// closed since it was listed).
+    pub(super) fn vnode_path(pid: libc::pid_t, fd: i32) -> Option<Option<PathBuf>> {
         use std::os::unix::ffi::OsStrExt;
         let mut info = std::mem::MaybeUninit::<VnodeFdInfoWithPath>::zeroed();
         let size = libc::c_int::try_from(std::mem::size_of::<VnodeFdInfoWithPath>()).ok()?;
+        clear_errno();
         // SAFETY: the buffer is writable for `size` bytes and the kernel
         // reports how many it wrote; only a complete result is read.
         let returned = unsafe {
@@ -666,7 +725,9 @@ mod native {
             )
         };
         if returned != size {
-            return None;
+            // EBADF: the descriptor was closed, or reused for something
+            // other than a file, after it was listed.
+            return (returned == 0 && errno() == libc::EBADF).then_some(None);
         }
         // SAFETY: the kernel filled the complete zero-initialized buffer.
         let info = unsafe { info.assume_init() };
@@ -725,14 +786,20 @@ mod tests {
             self.calls.borrow_mut().push("launchctl");
             self.jobs.get(label).copied()
         }
-        fn process(&self, pid: u32) -> Option<ProcessRecord> {
+        fn read_process(&self, pid: u32) -> ProcessRead {
             self.calls.borrow_mut().push("process");
             let mut reads = self.reads.borrow_mut();
             let read = reads.entry(pid).or_default();
             *read += 1;
-            match self.replaced.get(&pid) {
+            let record = match self.replaced.get(&pid) {
                 Some((after, record)) if *read > *after => *record,
                 _ => self.processes.borrow().get(&pid).copied(),
+            };
+            // As on macOS, another user's process is there but off limits.
+            match record {
+                Some(record) if record.uid == USER => ProcessRead::Running(record),
+                Some(_) => ProcessRead::Unreadable,
+                None => ProcessRead::Gone,
             }
         }
         fn children(&self, pid: u32) -> ChildList {
@@ -1017,6 +1084,22 @@ mod tests {
     }
 
     #[test]
+    fn claude_ancestor_at_the_job_pid_must_be_the_job_itself() {
+        let fixture = ClaudeFixture::new("claude-session", &[(700, &witness())]);
+        let query = query(SnapshotSource::ClaudeCode, &fixture.transcript);
+        // The job pid passes `launchctl` and the running check (two reads),
+        // then reads as a different process while the owner's chain is
+        // walked, one the chain itself would accept.
+        for other in [record(1, JOB_STARTED - 1), record(450, JOB_STARTED)] {
+            let mut host = job_tree();
+            host.replaced.insert(500, (2, Some(other)));
+            assert!(LiveScan::default()
+                .owner_labels(&host, &query, &[JOB])
+                .is_empty());
+        }
+    }
+
+    #[test]
     fn users_own_claude_session_outside_the_job_proves_nothing() {
         let fixture = ClaudeFixture::new("claude-session", &[(900, &witness())]);
         let inventory = scan_inventory(SnapshotSource::ClaudeCode, &[JOB]);
@@ -1141,10 +1224,12 @@ mod tests {
     }
 
     #[test]
-    fn another_users_process_in_the_tree_is_skipped_up_front() {
+    fn another_users_process_in_the_tree_hides_its_subtree() {
         let rollout = PathBuf::from("/h/.codex/sessions/rollout-a.jsonl");
+        let query = query(SnapshotSource::Codex, &rollout);
+        // A root helper under the job, whose children could hold the
+        // rollout too.
         let mut host = codex_job_tree(&rollout);
-        // A root helper under the job; listing it would fail.
         host.set(
             650,
             ProcessRecord {
@@ -1153,16 +1238,33 @@ mod tests {
             },
         );
         host.children.insert(500, vec![600, 650]);
-        host.failed_listings.insert(650);
+        assert!(LiveScan::default()
+            .owner_labels(&host, &query, &[JOB])
+            .is_empty());
+        assert!(!host.listed.borrow().contains(&650));
+        // Control: a listed child that has exited holds nothing.
+        let mut exited = codex_job_tree(&rollout);
+        exited.children.insert(500, vec![600, 650]);
         assert_eq!(
-            LiveScan::default().owner_labels(
-                &host,
-                &query(SnapshotSource::Codex, &rollout),
-                &[JOB]
-            ),
+            LiveScan::default().owner_labels(&exited, &query, &[JOB]),
             BTreeSet::from([JOB.to_string()])
         );
-        assert!(!host.listed.borrow().contains(&650));
+        // A process that turns into another user's while it is listed
+        // (a setuid exec) leaves its children unread.
+        let mut setuid = codex_job_tree(&rollout);
+        setuid.replaced.insert(
+            600,
+            (
+                1,
+                Some(ProcessRecord {
+                    uid: 0,
+                    ..record(500, JOB_STARTED)
+                }),
+            ),
+        );
+        assert!(LiveScan::default()
+            .owner_labels(&setuid, &query, &[JOB])
+            .is_empty());
     }
 
     #[test]
@@ -1333,12 +1435,15 @@ mod tests {
 
     #[test]
     fn a_failed_or_partial_descriptor_listing_proves_nothing() {
-        // libproc reports failure as 0, sometimes -1.
-        assert_eq!(listed_descriptor_count(0, 8, 2048), None);
-        assert_eq!(listed_descriptor_count(-1, 8, 2048), None);
-        assert_eq!(listed_descriptor_count(8 * 3 + 4, 8, 2048), None);
-        assert_eq!(listed_descriptor_count(8 * 2048, 8, 2048), None);
-        assert_eq!(listed_descriptor_count(8 * 3, 8, 2048), Some(3));
+        // libproc reports failure as 0 with errno set, sometimes -1.
+        assert_eq!(listed_descriptor_count(0, libc::EPERM, 8, 2048), None);
+        assert_eq!(listed_descriptor_count(-1, libc::EPERM, 8, 2048), None);
+        assert_eq!(listed_descriptor_count(-1, 0, 8, 2048), None);
+        assert_eq!(listed_descriptor_count(8 * 3 + 4, 0, 8, 2048), None);
+        assert_eq!(listed_descriptor_count(8 * 2048, 0, 8, 2048), None);
+        assert_eq!(listed_descriptor_count(8 * 3, 0, 8, 2048), Some(3));
+        // A process that closed every descriptor.
+        assert_eq!(listed_descriptor_count(0, 0, 8, 2048), Some(0));
     }
 
     #[test]
@@ -1380,16 +1485,44 @@ mod tests {
         let held = scratch.join("rollout-held.jsonl");
         let file = std::fs::File::create(&held).expect("held file");
         let resolved = std::fs::canonicalize(&held).expect("resolved");
+        // Other test threads open and close files meanwhile; a descriptor
+        // closed between the listing and its path read is skipped.
         let open = host.open_files(pid);
         assert!(open.complete);
         assert!(open.paths.contains(&resolved));
+        {
+            use std::os::fd::AsRawFd;
+            let kernel_pid = libc::pid_t::try_from(pid).expect("pid");
+            let closed = std::fs::File::open(&held).expect("closed file");
+            let fd = closed.as_raw_fd();
+            assert_eq!(
+                native::vnode_path(kernel_pid, fd),
+                Some(Some(resolved.clone()))
+            );
+            drop(closed);
+            // Closed reads as holding nothing, not as a failure, unless
+            // another thread reused the number for a file of its own.
+            let after = native::vnode_path(kernel_pid, fd);
+            assert!(
+                after
+                    .as_ref()
+                    .is_some_and(|path| path.as_ref() != Some(&resolved)),
+                "{after:?}"
+            );
+        }
         drop(file);
 
-        // launchd's descriptors are off limits to a normal user, and the
-        // denied listing must not pass for an empty one.
+        // launchd is another user's process to a normal user: its record and
+        // descriptors are off limits, and neither reads as gone or empty.
         if host.user_id() != 0 {
+            assert_eq!(host.read_process(1), ProcessRead::Unreadable);
             assert!(!host.open_files(1).complete);
         }
+        let gone = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .and_then(|mut child| child.wait().map(|_| child.id()))
+            .expect("exited child");
+        assert_eq!(host.read_process(gone), ProcessRead::Gone);
 
         let mut child = std::process::Command::new("/bin/sleep")
             .arg("5")
