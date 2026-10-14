@@ -4743,9 +4743,11 @@ fn refresh_agent_status_for(
 }
 
 /// Explicit quota refresh (a user's Refresh action). Codex homes are read
-/// here, each at most once a minute; Claude accounts are marked for the
-/// collection that follows, whose usage gate reads them at most once a minute
-/// and keeps every hold, breaker and Retry-After.
+/// here, each at most once a minute (one `codex app-server` run per matching
+/// home, up to its timeout, before the reply). Claude accounts are marked for
+/// the collection that follows, whose usage gate reads them at most once a
+/// minute and keeps every hold, breaker and Retry-After; the lane's next own
+/// pass answers a mark that collection missed (one already in flight).
 fn request_explicit_quota_refresh(
     source: Option<&SourceKind>,
     target: &ottto_protocol::AgentQuotaRefreshTarget,
@@ -4754,6 +4756,7 @@ fn request_explicit_quota_refresh(
     let organization = target.organization_identifier_hash.as_deref();
     if source.map_or(true, |source| source == &SourceKind::ClaudeCode) {
         crate::agent_status::request_claude_explicit_refresh(account, organization);
+        crate::agent_status_refresh::request(&SourceKind::ClaudeCode);
     }
     if source.map_or(true, |source| source == &SourceKind::Codex) {
         let outcome = crate::agent_status::refresh_codex_quota_now(account, organization);

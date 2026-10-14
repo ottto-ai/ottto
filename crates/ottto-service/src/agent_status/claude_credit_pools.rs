@@ -2258,20 +2258,24 @@ mod tests {
 
     const START: u64 = 1_791_000_000;
 
-    /// 24 h of 5-min passes, each a few seconds into its 5-min mark: idle start,
-    /// active 08:00-10:00 (the scan reports activity only while it advances),
-    /// then idle; the machine sleeps 13:00-16:00 (no passes).
+    /// 24 h of 5-min passes: idle start, active 08:00-10:00 (the scan reports
+    /// activity only while it advances), then idle; the machine sleeps
+    /// 13:00-16:00 (no passes).
     fn run_day(usage_credits_off: bool, passive: &dyn Fn(u64) -> Option<u64>) -> Simulation {
         let mut simulation = Simulation::new(usage_credits_off);
         let mut tick = 0;
+        let mut latency = 0;
         while tick * PASS < 24 * HOUR {
             let offset = tick * PASS;
             tick += 1;
             if (13 * HOUR..16 * HOUR).contains(&offset) {
                 continue;
             }
-            // Pass start drifts by a few seconds, as real passes do.
-            let now = START + offset + (tick * 7) % 20;
+            // The lane times each pass from the previous pass's start, and a
+            // pass wakes up to a couple of seconds late, so starts drift
+            // later, never closer than 5 min.
+            latency += (tick * 7) % 3;
+            let now = START + offset + latency;
             let activity = (8 * HOUR..10 * HOUR).contains(&offset).then_some(now);
             simulation.pass(now, activity, passive(now));
         }
@@ -2818,6 +2822,11 @@ mod tests {
         Err(500)
     }
 
+    fn respond_rate_limited(endpoint: &str) -> Result<Value, u16> {
+        REQUESTED.lock().unwrap().push(endpoint.to_string());
+        Err(429)
+    }
+
     fn respond_cedar_null(endpoint: &str) -> Result<Value, u16> {
         Ok(respond_with(endpoint, Value::Null))
     }
@@ -2883,6 +2892,7 @@ mod tests {
             super::super::claude_explicit_refresh_requests().clear();
             super::super::claude_explicit_refresh_attempts().clear();
             super::super::claude_transient_failures().clear();
+            super::super::claude_rate_limit_holds().clear();
             Self {
                 dir,
                 _support: support,
@@ -3103,6 +3113,89 @@ mod tests {
         super::super::request_claude_explicit_refresh(None, None);
         harness.collect(respond_recognized);
         assert_eq!(harness.requests(), 3);
+    }
+
+    /// A 429 with a short Retry-After inside the success spacing: an explicit
+    /// refresh still waits it out when the persisted breaker cannot say so
+    /// (for example after a configuration change).
+    #[test]
+    #[serial_test::serial]
+    fn explicit_refresh_never_reads_inside_a_rate_limit_even_without_the_breaker() {
+        let harness = VariantHarness::new("explicit-429");
+        harness.due(ClaudeReadSchedule::default());
+        harness.collect(respond_recognized);
+        assert_eq!(harness.requests(), 1);
+        harness.due_keeping_reading();
+        harness.collect(respond_rate_limited);
+        assert_eq!(harness.requests(), 2);
+        let now = super::super::current_unix_seconds();
+        let mut cache =
+            super::super::read_claude_oauth_usage_cache(harness.account, harness.organization)
+                .expect("stored reading");
+        cache.observed_at_epoch_seconds = now - 120;
+        cache.next_refresh_after_epoch_seconds = now + 60;
+        super::super::write_claude_oauth_usage_cache(&cache).unwrap();
+        std::fs::remove_file(super::super::claude_oauth_usage_breaker_path(
+            harness.account,
+            harness.organization,
+        ))
+        .expect("the 429 recorded a breaker");
+        super::super::request_claude_explicit_refresh(Some(harness.account), None);
+        harness.collect(respond_recognized);
+        assert_eq!(harness.requests(), 2, "Refresh waits out the 429");
+    }
+
+    /// Ron's rule: a status read an app starts never calls the provider. It
+    /// serves the stored reading even for a due account; the daemon's own
+    /// pass reads it, and an explicit refresh is the one read such a request
+    /// may make.
+    #[test]
+    #[serial_test::serial]
+    fn an_app_status_read_serves_the_stored_reading_and_never_calls_anthropic() {
+        let harness = VariantHarness::new("app-status-read");
+        harness.due(ClaudeReadSchedule::default());
+        let now = super::super::current_unix_seconds();
+        let app = |respond| super::super::with_claude_pass(true, now, || harness.collect(respond));
+        // Due with nothing stored: no request, and no reading to show yet.
+        assert!(app(respond_recognized).result.is_err());
+        assert_eq!(harness.requests(), 0);
+        // The daemon's pass reads it.
+        let daemon =
+            super::super::with_claude_pass(false, now, || harness.collect(respond_recognized));
+        assert!(daemon.result.is_ok());
+        assert_eq!(harness.requests(), 1);
+        // Due again: the app is served the stored reading, no request.
+        harness.due_keeping_reading();
+        assert!(app(respond_recognized).result.is_ok());
+        assert_eq!(harness.requests(), 1);
+        // An explicit refresh reads now, even in the app's request.
+        super::super::request_claude_explicit_refresh(Some(harness.account), None);
+        assert!(app(respond_recognized).result.is_ok());
+        assert_eq!(harness.requests(), 2);
+    }
+
+    /// At least 5 minutes between reads of one account, measured from the
+    /// start of the pass that read: the daemon's next 5-min pass finds the
+    /// account due wherever in the pass the read fell.
+    #[test]
+    #[serial_test::serial]
+    fn a_read_is_spaced_five_minutes_from_the_start_of_its_pass() {
+        let harness = VariantHarness::new("spacing");
+        harness.due(ClaudeReadSchedule::default());
+        let now = super::super::current_unix_seconds();
+        super::super::with_claude_pass(false, now - 3, || harness.collect(respond_recognized));
+        assert_eq!(harness.requests(), 1);
+        let next = |harness: &VariantHarness| {
+            super::super::read_claude_oauth_usage_cache(harness.account, harness.organization)
+                .expect("stored reading")
+                .next_refresh_after_epoch_seconds
+        };
+        assert_eq!(super::super::CLAUDE_OAUTH_USAGE_REFRESH_SECONDS, 5 * 60);
+        assert_eq!(next(&harness), now - 3 + 5 * 60);
+        // Outside a pass (a setup check), from the read itself.
+        harness.due(ClaudeReadSchedule::default());
+        harness.collect(respond_recognized);
+        assert!(next(&harness) >= now + 5 * 60);
     }
 
     /// An in-use account (default login) prefers Claude Code's free

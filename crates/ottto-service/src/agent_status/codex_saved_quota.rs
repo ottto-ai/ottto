@@ -13,21 +13,26 @@
 //!   session that belongs to it was written, in the last 30 min): every 5 min;
 //! - otherwise every 15 min;
 //! - a failed read waits the same interval before the next attempt;
-//! - a changed local login (`auth.json` changed since the last read) is read
-//!   again after at least 1 min;
+//! - a changed local login (the credential names another account or
+//!   workspace than at the last read) is read again after at least 1 min;
 //! - an explicit refresh reads now, at most once a minute per home.
 //!
-//! A saved reading is served only while the home's local credential still
-//! names the same account and workspace (or, when the credential cannot be
-//! decoded, while `auth.json` is unchanged since the read), so a reading never
-//! moves to another login. A reading carries identity hashes only.
+//! Every home is scheduled whether or not the device uploads Codex status:
+//! the companion shows these readings locally.
+//!
+//! A login is the account and workspace the home's credential names, not the
+//! `auth.json` file: each provider read refreshes the token, so Codex rewrites
+//! that file on every read. Only a credential that names no account falls back
+//! to the file's metadata. A saved reading or failure is served only while the
+//! home's login is the one it was read under, so it never moves to another
+//! login. A reading carries identity hashes only.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use ottto_core::{default_support_dir, CodexHomeTrust, FileCodexAccountSlotSettingsStore};
 use ottto_protocol::{
@@ -58,8 +63,6 @@ pub(super) const EXPLICIT_REFRESH_MIN_GAP_SECONDS: u64 = 60;
 const LOGIN_CHANGED_MIN_GAP_SECONDS: u64 = 60;
 /// How often the scheduler looks for due homes. Reads start at most this late.
 const SCHEDULER_TICK: Duration = Duration::from_secs(15);
-/// The upload-grant check behind automatic reads is re-read this often.
-const SOURCE_ENABLED_RECHECK: Duration = Duration::from_secs(5 * 60);
 /// A served reading older than this (two unused intervals: the schedule
 /// failed to run) is labelled stale.
 const SERVED_FRESH_MAX_AGE_SECONDS: u64 = 2 * UNUSED_REFRESH_SECONDS;
@@ -68,6 +71,7 @@ const SERVED_MAX_AGE_SECONDS: u64 = codex_last_known::LAST_KNOWN_MAX_AGE_SECS;
 /// A local clock this far behind a stored time means the clock stepped back.
 const CLOCK_SKEW_SECONDS: u64 = 60;
 
+const CODEX_QUOTA_DIR: &str = "codex-quota";
 const CODEX_QUOTA_STATE_DIR: &str = "codex-quota/homes";
 const SAVED_QUOTA_FILE: &str = "saved-quota.json";
 const SAVED_QUOTA_SCHEMA_VERSION: u16 = 1;
@@ -79,9 +83,27 @@ const SAVED_TEXT_MAX_CHARS: usize = 1024;
 const RUNNING_HOMES_MAX: usize = 32;
 
 /// Served when a home has no usable saved reading yet: first start, or its
-/// local login changed since the last read. Not a failed read.
+/// local login changed since the last read. Not a failed read. Every home a
+/// status read shows is on the schedule, which reads it within a minute.
 pub(super) const CODEX_QUOTA_NOT_READ_YET: &str =
     "Codex quota for this account has not been read since its login was last seen; the daemon reads it shortly.";
+
+/// A status read that has no reading to serve: the message, and when it was
+/// true (a saved failure keeps the time of the read that failed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CodexQuotaFailure {
+    pub(super) message: String,
+    pub(super) at_epoch_seconds: u64,
+}
+
+impl CodexQuotaFailure {
+    fn not_read_yet(now: u64) -> Self {
+        Self {
+            message: CODEX_QUOTA_NOT_READ_YET.to_string(),
+            at_epoch_seconds: now,
+        }
+    }
+}
 
 /// Local metadata of a home's `auth.json`: the witness that the login a
 /// reading belongs to has not been rewritten since.
@@ -102,6 +124,41 @@ fn auth_witness(home: &Path) -> Option<AuthWitness> {
     })
 }
 
+/// A home's local login: the account and workspace binding its credential
+/// claims, and `auth.json`'s metadata for a credential that claims none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct LoginMark {
+    /// [`codex_credit_grants::binding_key`] of the claimed identity hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth: Option<AuthWitness>,
+}
+
+impl LoginMark {
+    /// The same login: the same claimed account and workspace. The file
+    /// metadata decides only when neither side claims one (a token rewrite
+    /// for the same account is not a new login).
+    fn same_login(&self, other: &Self) -> bool {
+        match (&self.binding, &other.binding) {
+            (Some(own), Some(other)) => own == other,
+            (None, None) => self.auth == other.auth,
+            _ => false,
+        }
+    }
+}
+
+pub(super) fn login_mark(home: &Path, home_trust: CodexHomeTrust) -> LoginMark {
+    LoginMark {
+        binding: read_codex_auth_credentials_at(home, home_trust)
+            .ok()
+            .flatten()
+            .as_ref()
+            .and_then(codex_credential_claimed_binding),
+        auth: auth_witness(home),
+    }
+}
+
 /// One home's saved quota and read history.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct SavedCodexQuota {
@@ -114,9 +171,11 @@ pub(super) struct SavedCodexQuota {
     /// Last provider read attempt, successful or not (local unix seconds).
     #[serde(default)]
     last_attempt_at_epoch_seconds: u64,
-    /// `auth.json` as it was right after that attempt.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_attempt_auth: Option<AuthWitness>,
+    /// The login that attempt read: as it was right after the read, or as it
+    /// was before when the login changed during the read (so the new login is
+    /// read again soon).
+    #[serde(default)]
+    last_attempt_login: LoginMark,
     /// The last attempt's failure, while it is newer than `reading`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_failure: Option<SavedCodexFailure>,
@@ -127,8 +186,9 @@ pub(super) struct SavedCodexQuota {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct SavedCodexReading {
     observed_at_epoch_seconds: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    auth: Option<AuthWitness>,
+    /// The login right after the read.
+    #[serde(default)]
+    login: LoginMark,
     /// Provider-validated identity at read time; absent when the read could
     /// not bind the meters to an account (they are then never shown).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,12 +212,14 @@ pub(super) struct SavedCodexReading {
     credential_read_failed: bool,
 }
 
-/// A failed read: its time and the collector's fixed failure text (never
-/// provider text).
+/// A failed read: its time, the login it read and the collector's fixed
+/// failure text (never provider text).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct SavedCodexFailure {
     at_epoch_seconds: u64,
     message: String,
+    #[serde(default)]
+    login: LoginMark,
 }
 
 impl SavedCodexQuota {
@@ -167,7 +229,7 @@ impl SavedCodexQuota {
             home_key: home_key(home),
             reading: None,
             last_attempt_at_epoch_seconds: 0,
-            last_attempt_auth: None,
+            last_attempt_login: LoginMark::default(),
             last_failure: None,
             consecutive_failures: 0,
         }
@@ -210,10 +272,10 @@ fn truncate_chars(value: &mut String, max: usize) {
 }
 
 impl SavedCodexReading {
-    fn from_probe(probe: &CodexUsageProbe, observed_at: u64, auth: Option<AuthWitness>) -> Self {
+    fn from_probe(probe: &CodexUsageProbe, observed_at: u64, login: LoginMark) -> Self {
         Self {
             observed_at_epoch_seconds: observed_at,
-            auth,
+            login,
             identity: probe
                 .identity
                 .as_ref()
@@ -313,13 +375,27 @@ fn read_saved_at(support_dir: &Path, home: &Path) -> Option<SavedCodexQuota> {
         .then_some(saved)
 }
 
+/// The state directories above the per-home ones, owner-only like the leaf.
+fn restrict_state_dirs(support_dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for dir in [CODEX_QUOTA_DIR, CODEX_QUOTA_STATE_DIR] {
+        let dir = support_dir.join(dir);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 fn write_saved_at(support_dir: &Path, home: &Path, saved: &SavedCodexQuota) {
     let mut saved = saved.clone();
     saved.bound();
     let Ok(body) = serde_json::to_vec(&saved) else {
         return;
     };
-    match ottto_core::write_owner_only_file_atomic(&saved_path(support_dir, home), &body) {
+    let written = restrict_state_dirs(support_dir).and_then(|()| {
+        ottto_core::write_owner_only_cache_file_atomic(&saved_path(support_dir, home), &body)
+    });
+    match written {
         Ok(()) => {
             GENERATION.fetch_add(1, Ordering::SeqCst);
         }
@@ -329,10 +405,10 @@ fn write_saved_at(support_dir: &Path, home: &Path, saved: &SavedCodexQuota) {
 
 /// The last attempt per saved file, kept in memory too: a file that cannot be
 /// written must not make every scheduler tick read the provider again.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Attempt {
     at: u64,
-    auth: Option<AuthWitness>,
+    login: LoginMark,
 }
 
 const ATTEMPTS_MAX: usize = 64;
@@ -364,28 +440,33 @@ fn note_attempt(support_dir: &Path, home: &Path, attempt: Attempt) {
 /// the one on disk.
 fn saved_with_attempt(support_dir: &Path, home: &Path) -> Option<SavedCodexQuota> {
     let saved = read_saved_at(support_dir, home);
-    let Some(attempt) = attempts().get(&saved_path(support_dir, home)).copied() else {
+    let Some(attempt) = attempts().get(&saved_path(support_dir, home)).cloned() else {
         return saved;
     };
     let mut saved = saved.unwrap_or_else(|| SavedCodexQuota::new(home));
     if attempt.at > saved.last_attempt_at_epoch_seconds {
         saved.last_attempt_at_epoch_seconds = attempt.at;
-        saved.last_attempt_auth = attempt.auth;
+        saved.last_attempt_login = attempt.login;
     }
     Some(saved)
 }
+
+/// Home locks kept while no read holds them; beyond this, idle ones go.
+const HOME_LOCKS_IDLE_MAX: usize = 64;
 
 /// One lock per home: provider reads of one home never overlap, and a saved
 /// file's read-modify-write is never interleaved.
 fn home_lock(home: &Path) -> Arc<Mutex<()>> {
     static LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-    LOCKS
+    let mut locks = LOCKS
         .get_or_init(Default::default)
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .entry(home_key(home))
-        .or_default()
-        .clone()
+        .unwrap_or_else(PoisonError::into_inner);
+    if locks.len() > HOME_LOCKS_IDLE_MAX {
+        // Removed and process-only homes: nobody else holds their lock.
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+    locks.entry(home_key(home)).or_default().clone()
 }
 
 fn lock(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
@@ -397,8 +478,14 @@ pub(super) fn serve_saved(
     home: &Path,
     home_trust: CodexHomeTrust,
     now: u64,
-) -> Result<CodexUsageProbe, String> {
+) -> Result<CodexUsageProbe, CodexQuotaFailure> {
     serve_saved_at(&saved_quota_support_dir(), home, home_trust, now)
+}
+
+/// Whether a saved time may be served at `now`: not in the future, not past
+/// the last-known cap.
+fn servable_at(at: u64, now: u64) -> bool {
+    at <= now.saturating_add(CLOCK_SKEW_SECONDS) && now.saturating_sub(at) <= SERVED_MAX_AGE_SECONDS
 }
 
 fn serve_saved_at(
@@ -406,31 +493,36 @@ fn serve_saved_at(
     home: &Path,
     home_trust: CodexHomeTrust,
     now: u64,
-) -> Result<CodexUsageProbe, String> {
-    let not_read = || Err(CODEX_QUOTA_NOT_READ_YET.to_string());
+) -> Result<CodexUsageProbe, CodexQuotaFailure> {
+    let not_read = || Err(CodexQuotaFailure::not_read_yet(now));
     let Some(saved) = read_saved_at(support_dir, home) else {
         return not_read();
     };
-    // A failed read newer than the reading is served as that failure, exactly
-    // as the read itself reported it; the collector's last-known display
-    // handles it from there.
+    let current = login_mark(home, home_trust);
+    // A failed read newer than the reading is served as that failure, with
+    // its own time, exactly as the read itself reported it, while the home
+    // still has the login it read; the collector's last-known display handles
+    // it from there.
     if let Some(failure) = saved.last_failure.as_ref() {
         if saved.reading.as_ref().map_or(true, |reading| {
             failure.at_epoch_seconds >= reading.observed_at_epoch_seconds
-        }) {
-            return Err(failure.message.clone());
+        }) && failure.login.same_login(&current)
+            && servable_at(failure.at_epoch_seconds, now)
+        {
+            return Err(CodexQuotaFailure {
+                message: failure.message.clone(),
+                at_epoch_seconds: failure.at_epoch_seconds,
+            });
         }
     }
     let Some(reading) = saved.reading.as_ref() else {
         return not_read();
     };
-    if !reading_matches_login(&saved, reading, home, home_trust) {
+    if !reading_matches_login(&saved, reading, &current) {
         return not_read();
     }
     let observed_at = reading.observed_at_epoch_seconds;
-    if observed_at > now.saturating_add(CLOCK_SKEW_SECONDS)
-        || now.saturating_sub(observed_at) > SERVED_MAX_AGE_SECONDS
-    {
+    if !servable_at(observed_at, now) {
         return not_read();
     }
     let mut probe = reading.to_probe();
@@ -444,21 +536,14 @@ fn serve_saved_at(
 fn reading_matches_login(
     saved: &SavedCodexQuota,
     reading: &SavedCodexReading,
-    home: &Path,
-    home_trust: CodexHomeTrust,
+    current: &LoginMark,
 ) -> bool {
-    let Ok(Some(credentials)) = read_codex_auth_credentials_at(home, home_trust) else {
-        return false;
-    };
-    match (
-        saved.binding(),
-        codex_credential_claimed_binding(&credentials),
-    ) {
-        (Some(saved), Some(claimed)) => saved == claimed,
+    match (saved.binding(), current.binding.as_ref()) {
+        (Some(saved), Some(claimed)) => &saved == claimed,
         // The credential cannot name a binding (for example its access token
         // expired) or the reading had none: only an unchanged auth file keeps
         // the reading.
-        _ => reading.auth.is_some() && reading.auth == auth_witness(home),
+        _ => reading.login.auth.is_some() && reading.login.auth == current.auth,
     }
 }
 
@@ -473,16 +558,47 @@ pub(super) fn read_provider_and_save(
     read_and_save_at(
         &saved_quota_support_dir(),
         home,
+        home_trust,
         current_unix_seconds(),
         admit,
         || read_codex_usage_from_provider(home, home_trust),
     )
 }
 
+/// The account and workspace binding a read validated with the provider.
+fn probe_binding(probe: &CodexUsageProbe) -> Option<String> {
+    let identity = probe
+        .identity
+        .as_ref()
+        .map(CodexIdentityHashes::from)
+        .or_else(|| probe.saved_identity.clone())?;
+    Some(codex_credit_grants::binding_key(
+        &identity.account_identifier_hash,
+        &identity.workspace_identifier_hash,
+    ))
+}
+
+/// Whether a read ran under one login from start to end. The read itself
+/// rewrites `auth.json` (it refreshes the token), so the claimed account and
+/// workspace decide. A credential that named none before the read (an expired
+/// token) and names one after it is the same login when the read validated
+/// exactly that account.
+fn read_kept_its_login(
+    before: &LoginMark,
+    after: &LoginMark,
+    result: &Result<CodexUsageProbe, String>,
+) -> bool {
+    before.same_login(after)
+        || (before.binding.is_none()
+            && after.binding.is_some()
+            && result.as_ref().ok().and_then(probe_binding) == after.binding)
+}
+
 /// `admit` decides at `now` (the trigger's clock), under the home's lock.
 fn read_and_save_at(
     support_dir: &Path,
     home: &Path,
+    home_trust: CodexHomeTrust,
     now: u64,
     admit: impl FnOnce(Option<&SavedCodexQuota>, u64) -> bool,
     read: impl FnOnce() -> Result<CodexUsageProbe, String>,
@@ -493,26 +609,30 @@ fn read_and_save_at(
     if !admit(saved.as_ref(), now) {
         return None;
     }
-    // The login the read starts under. A login that changes while the read
-    // runs leaves the reading unsaved: it cannot be told which login it
-    // belongs to, and the changed login is read again after a minute.
-    let auth = auth_witness(home);
+    let before = login_mark(home, home_trust);
     let result = read();
-    let finished_at = current_unix_seconds();
-    let login_unchanged = auth_witness(home) == auth;
+    let finished_at = current_unix_seconds().max(now);
+    let after = login_mark(home, home_trust);
+    // A login that changed while the read ran leaves the reading unsaved: it
+    // cannot be told which login it belongs to. The attempt then records the
+    // login it started under, so the new login is read again after a minute.
+    // Otherwise it records the login after the read, whose own `auth.json`
+    // rewrite is not a change.
+    let kept = read_kept_its_login(&before, &after, &result);
+    let login = if kept { after } else { before };
     note_attempt(
         support_dir,
         home,
         Attempt {
             at: finished_at,
-            auth,
+            login: login.clone(),
         },
     );
     let mut next = saved.unwrap_or_else(|| SavedCodexQuota::new(home));
     next.last_attempt_at_epoch_seconds = finished_at;
-    next.last_attempt_auth = auth;
+    next.last_attempt_login = login.clone();
     match &result {
-        Ok(_) if !login_unchanged => {}
+        Ok(_) if !kept => {}
         Ok(probe) => {
             let observed_at = probe
                 .response_completed_at
@@ -521,7 +641,7 @@ fn read_and_save_at(
                 .and_then(|at| u64::try_from(at.unix_timestamp()).ok())
                 .filter(|at| *at <= finished_at.saturating_add(CLOCK_SKEW_SECONDS))
                 .unwrap_or(finished_at);
-            next.reading = Some(SavedCodexReading::from_probe(probe, observed_at, auth));
+            next.reading = Some(SavedCodexReading::from_probe(probe, observed_at, login));
             next.last_failure = None;
             next.consecutive_failures = 0;
         }
@@ -529,6 +649,7 @@ fn read_and_save_at(
             next.last_failure = Some(SavedCodexFailure {
                 at_epoch_seconds: finished_at,
                 message: message.clone(),
+                login,
             });
             next.consecutive_failures = next.consecutive_failures.saturating_add(1);
         }
@@ -550,7 +671,7 @@ pub(super) fn refresh_interval_seconds(in_use: bool) -> u64 {
 /// so a failed read waits a full interval too.
 pub(super) fn scheduled_read_due(
     saved: Option<&SavedCodexQuota>,
-    current_auth: Option<AuthWitness>,
+    current_login: &LoginMark,
     in_use: bool,
     now: u64,
 ) -> bool {
@@ -562,7 +683,9 @@ pub(super) fn scheduled_read_due(
         return true;
     }
     let elapsed = now.saturating_sub(last);
-    if saved.last_attempt_auth != current_auth && elapsed >= LOGIN_CHANGED_MIN_GAP_SECONDS {
+    if !saved.last_attempt_login.same_login(current_login)
+        && elapsed >= LOGIN_CHANGED_MIN_GAP_SECONDS
+    {
         return true;
     }
     elapsed >= refresh_interval_seconds(in_use)
@@ -604,6 +727,13 @@ pub(super) fn note_running_homes<'a>(homes: impl Iterator<Item = &'a Path>, now:
         };
         running.remove(&oldest);
     }
+}
+
+/// Tests that run whole scheduler rounds start without sightings left by
+/// other tests' process scans.
+#[cfg(test)]
+pub(super) fn forget_running_homes() {
+    running_homes().clear();
 }
 
 fn recent(at: u64, now: u64) -> bool {
@@ -684,33 +814,39 @@ pub(super) fn homes_in_use(
 }
 
 /// The homes the schedule keeps: the default home, every accepted managed
-/// slot, and recently seen process homes. With automatic reads off (the
-/// device does not collect Codex status) only the managed slots the user set
-/// up stay scheduled.
-fn scheduled_homes(support_dir: &Path, automatic: bool, now: u64) -> Vec<ScheduledHome> {
+/// slot, and recently seen process homes. Read from the stored settings on
+/// every tick, so a removed slot leaves the schedule at once. The device's
+/// upload grant does not matter: the companion shows these readings locally.
+fn scheduled_homes(support_dir: &Path, now: u64) -> Vec<ScheduledHome> {
     let status = FileCodexAccountSlotSettingsStore::default()
         .load()
         .unwrap_or_else(|_| empty_codex_accounts_status());
     let running = running_homes().clone();
-    let mut homes = codex_home_slots(&status)
+    scheduled_homes_from(support_dir, codex_home_slots(&status), &running, now)
+}
+
+fn scheduled_homes_from(
+    support_dir: &Path,
+    slots: Vec<CodexHomeSlot>,
+    running: &BTreeMap<PathBuf, u64>,
+    now: u64,
+) -> Vec<ScheduledHome> {
+    let mut homes = slots
         .into_iter()
-        .filter(|slot| automatic || slot.ownership == CodexAccountSlotOwnershipV1::Managed)
-        .map(|slot: CodexHomeSlot| scheduled_home(support_dir, &running, slot))
+        .map(|slot| scheduled_home(support_dir, running, slot))
         .collect::<Vec<_>>();
-    if automatic {
-        for (home, seen_at) in running {
-            if recent(seen_at, now) && !homes.iter().any(|known| known.home == home) {
-                homes.push(scheduled_home(
-                    support_dir,
-                    &BTreeMap::from([(home.clone(), seen_at)]),
-                    CodexHomeSlot {
-                        slot_id: "process_home".to_string(),
-                        ownership: CodexAccountSlotOwnershipV1::Managed,
-                        home,
-                        registered_binding: None,
-                    },
-                ));
-            }
+    for (home, seen_at) in running {
+        if recent(*seen_at, now) && !homes.iter().any(|known| &known.home == home) {
+            homes.push(scheduled_home(
+                support_dir,
+                running,
+                CodexHomeSlot {
+                    slot_id: "process_home".to_string(),
+                    ownership: CodexAccountSlotOwnershipV1::Managed,
+                    home: home.clone(),
+                    registered_binding: None,
+                },
+            ));
         }
     }
     homes
@@ -736,15 +872,16 @@ fn scheduled_home(
     }
 }
 
-/// Read every home `due` selects, in parallel (one thread per home, as the
-/// collection does). Returns how many provider reads ran.
+/// Read every home `due` selects with `read`, in parallel (one thread per
+/// home, as the collection does). Returns how many provider reads ran.
 fn read_homes(
     support_dir: &Path,
     homes: Vec<ScheduledHome>,
     now: u64,
     due: impl Fn(Option<&SavedCodexQuota>, &ScheduledHome, u64) -> bool + Sync,
+    read: impl Fn(&ScheduledHome) -> Result<CodexUsageProbe, String> + Sync,
 ) -> usize {
-    let due = &due;
+    let (due, read) = (&due, &read);
     thread::scope(|scope| {
         homes
             .into_iter()
@@ -753,9 +890,10 @@ fn read_homes(
                     read_and_save_at(
                         support_dir,
                         &home.home,
+                        home.trust,
                         now,
                         |saved, now| due(saved, &home, now),
-                        || read_codex_usage_from_provider(&home.home, home.trust),
+                        || read(&home),
                     )
                     .is_some()
                 })
@@ -768,31 +906,51 @@ fn read_homes(
     })
 }
 
-/// One scheduler pass: read every due home. Returns how many were read.
-pub(super) fn scheduled_round(support_dir: &Path, automatic: bool, now: u64) -> usize {
-    let homes = scheduled_homes(support_dir, automatic, now);
-    if homes.is_empty() {
-        return 0;
-    }
-    let sessions = crate::active_sessions::read_active_session_reconciliation(
-        &default_support_dir(),
-        crate::snapshots::SnapshotSource::Codex,
-    )
-    .map(|reconciliation| reconciliation.sessions)
-    .unwrap_or_default();
-    let in_use = homes_in_use(&homes, &sessions, now);
+/// One scheduler pass over `homes`: read every due one. Returns how many were
+/// read.
+fn scheduled_round_for(
+    support_dir: &Path,
+    homes: Vec<ScheduledHome>,
+    sessions: &[ActiveSession],
+    now: u64,
+    read: impl Fn(&ScheduledHome) -> Result<CodexUsageProbe, String> + Sync,
+) -> usize {
+    let in_use = homes_in_use(&homes, sessions, now);
     let in_use_by_home = homes
         .iter()
         .zip(in_use)
         .map(|(home, in_use)| (home.home.clone(), in_use))
         .collect::<BTreeMap<_, _>>();
-    read_homes(support_dir, homes, now, |saved, home, now| {
-        scheduled_read_due(
-            saved,
-            auth_witness(&home.home),
-            in_use_by_home.get(&home.home).copied().unwrap_or(false),
-            now,
-        )
+    read_homes(
+        support_dir,
+        homes,
+        now,
+        |saved, home, now| {
+            scheduled_read_due(
+                saved,
+                &login_mark(&home.home, home.trust),
+                in_use_by_home.get(&home.home).copied().unwrap_or(false),
+                now,
+            )
+        },
+        read,
+    )
+}
+
+/// One scheduler pass: read every due home. Returns how many were read.
+pub(super) fn scheduled_round(support_dir: &Path, now: u64) -> usize {
+    let homes = scheduled_homes(support_dir, now);
+    if homes.is_empty() {
+        return 0;
+    }
+    let sessions = crate::active_sessions::read_active_session_reconciliation(
+        support_dir,
+        crate::snapshots::SnapshotSource::Codex,
+    )
+    .map(|reconciliation| reconciliation.sessions)
+    .unwrap_or_default();
+    scheduled_round_for(support_dir, homes, &sessions, now, |home| {
+        read_codex_usage_from_provider(&home.home, home.trust)
     })
 }
 
@@ -814,7 +972,7 @@ pub(crate) fn refresh_codex_quota_now(
 ) -> CodexExplicitRefresh {
     let support_dir = saved_quota_support_dir();
     let now = current_unix_seconds();
-    let homes = scheduled_homes(&support_dir, true, now)
+    let homes = scheduled_homes(&support_dir, now)
         .into_iter()
         .filter(|home| {
             (account_identifier_hash.is_none() && workspace_identifier_hash.is_none())
@@ -829,9 +987,13 @@ pub(crate) fn refresh_codex_quota_now(
         })
         .collect::<Vec<_>>();
     let matching = homes.len();
-    let read = read_homes(&support_dir, homes, now, |saved, _, now| {
-        explicit_refresh_allowed(saved, now)
-    });
+    let read = read_homes(
+        &support_dir,
+        homes,
+        now,
+        |saved, _, now| explicit_refresh_allowed(saved, now),
+        |home| read_codex_usage_from_provider(&home.home, home.trust),
+    );
     if read > 0 {
         crate::agent_status_refresh::request(&SourceKind::Codex);
     }
@@ -897,7 +1059,6 @@ pub(crate) fn stop_codex_quota_scheduler() {
 
 fn run_scheduler(scheduler: &Scheduler) {
     let support_dir = saved_quota_support_dir();
-    let mut automatic = None::<(Instant, bool)>;
     loop {
         if *scheduler
             .stopped
@@ -906,23 +1067,11 @@ fn run_scheduler(scheduler: &Scheduler) {
         {
             return;
         }
-        // The same grant the collection lane polls by; re-read every 5 min.
-        let enabled = match automatic {
-            Some((checked, enabled)) if checked.elapsed() < SOURCE_ENABLED_RECHECK => enabled,
-            _ => {
-                let enabled = crate::snapshot_sync::agent_status_source_enabled(&SourceKind::Codex);
-                automatic = Some((Instant::now(), enabled));
-                enabled
-            }
-        };
-        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            scheduled_round(&support_dir, enabled, current_unix_seconds())
-        }))
-        .unwrap_or(0);
-        if read > 0 {
-            // The lane rebuilds and uploads status from the new readings.
-            crate::agent_status_refresh::request(&SourceKind::Codex);
-        }
+        // New readings reach the upload with the lane's next timer pass; a
+        // status read serves them at once.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scheduled_round(&support_dir, current_unix_seconds())
+        }));
         let stopped = scheduler
             .stopped
             .lock()
@@ -986,6 +1135,12 @@ mod tests {
         }
     }
 
+    fn served_error(root: &Path, home: &Path, now: u64) -> Option<String> {
+        serve_saved_at(root, home, CodexHomeTrust::Managed, now)
+            .err()
+            .map(|failure| failure.message)
+    }
+
     fn rfc3339(at: u64) -> String {
         OffsetDateTime::from_unix_timestamp(at as i64)
             .unwrap()
@@ -1013,11 +1168,22 @@ mod tests {
         std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    fn saved_with(attempt_at: u64, auth: Option<AuthWitness>) -> SavedCodexQuota {
+    fn saved_with(attempt_at: u64, login: LoginMark) -> SavedCodexQuota {
         SavedCodexQuota {
             last_attempt_at_epoch_seconds: attempt_at,
-            last_attempt_auth: auth,
+            last_attempt_login: login,
             ..SavedCodexQuota::new(Path::new("/unused"))
+        }
+    }
+
+    fn mark(binding: Option<&str>, modified_secs: u64) -> LoginMark {
+        LoginMark {
+            binding: binding.map(str::to_string),
+            auth: Some(AuthWitness {
+                modified_secs,
+                modified_nanos: 0,
+                len: 10,
+            }),
         }
     }
 
@@ -1025,12 +1191,9 @@ mod tests {
     fn schedule_intervals_are_five_minutes_in_use_and_fifteen_unused() {
         assert_eq!(refresh_interval_seconds(true), 5 * 60);
         assert_eq!(refresh_interval_seconds(false), 15 * 60);
-        let auth = Some(AuthWitness {
-            modified_secs: 1,
-            modified_nanos: 0,
-            len: 10,
-        });
-        let saved = saved_with(10_000, auth);
+        let login = mark(Some("a:w"), 1);
+        let auth = &login;
+        let saved = saved_with(10_000, login.clone());
         // In use: due at 5 min, not before.
         assert!(!scheduled_read_due(
             Some(&saved),
@@ -1065,24 +1228,42 @@ mod tests {
 
     #[test]
     fn a_changed_login_is_read_again_after_a_minute_only() {
-        let before = Some(AuthWitness {
-            modified_secs: 1,
-            modified_nanos: 0,
-            len: 10,
-        });
-        let after = Some(AuthWitness {
-            modified_secs: 2,
-            modified_nanos: 0,
-            len: 12,
-        });
-        let saved = saved_with(10_000, before);
-        assert!(!scheduled_read_due(Some(&saved), after, false, 10_000 + 59));
-        assert!(scheduled_read_due(Some(&saved), after, false, 10_000 + 60));
+        let saved = saved_with(10_000, mark(Some("a:w"), 1));
+        let other_account = mark(Some("b:w"), 2);
+        assert!(!scheduled_read_due(
+            Some(&saved),
+            &other_account,
+            false,
+            10_000 + 59
+        ));
+        assert!(scheduled_read_due(
+            Some(&saved),
+            &other_account,
+            false,
+            10_000 + 60
+        ));
+        // A token rewrite for the same account (Codex refreshing it) is not a
+        // new login: the interval holds.
+        let rewritten = mark(Some("a:w"), 2);
+        assert!(!scheduled_read_due(
+            Some(&saved),
+            &rewritten,
+            false,
+            10_000 + 600
+        ));
+        // Without a claimed account, the file metadata decides.
+        let opaque = saved_with(10_000, mark(None, 1));
+        assert!(scheduled_read_due(
+            Some(&opaque),
+            &mark(None, 2),
+            false,
+            10_000 + 60
+        ));
         // A signed-out home (no auth file before or after) keeps the interval.
-        let signed_out = saved_with(10_000, None);
+        let signed_out = saved_with(10_000, LoginMark::default());
         assert!(!scheduled_read_due(
             Some(&signed_out),
-            None,
+            &LoginMark::default(),
             false,
             10_000 + 600
         ));
@@ -1090,22 +1271,23 @@ mod tests {
 
     #[test]
     fn a_failed_read_waits_a_full_interval() {
-        let mut saved = saved_with(10_000, None);
+        let mut saved = saved_with(10_000, LoginMark::default());
         saved.last_failure = Some(SavedCodexFailure {
             at_epoch_seconds: 10_000,
             message: "Codex app-server quota read timed out.".to_string(),
+            login: LoginMark::default(),
         });
         saved.consecutive_failures = 3;
         // Never sooner than the interval: the failure adds no retry.
         assert!(!scheduled_read_due(
             Some(&saved),
-            None,
+            &LoginMark::default(),
             true,
             10_000 + 5 * 60 - 1
         ));
         assert!(!scheduled_read_due(
             Some(&saved),
-            None,
+            &LoginMark::default(),
             false,
             10_000 + 15 * 60 - 1
         ));
@@ -1114,7 +1296,7 @@ mod tests {
     #[test]
     fn explicit_refresh_reads_at_most_once_a_minute() {
         assert!(explicit_refresh_allowed(None, 10_000));
-        let saved = saved_with(10_000, None);
+        let saved = saved_with(10_000, LoginMark::default());
         assert!(!explicit_refresh_allowed(Some(&saved), 10_000));
         assert!(!explicit_refresh_allowed(Some(&saved), 10_059));
         assert!(explicit_refresh_allowed(Some(&saved), 10_060));
@@ -1126,6 +1308,7 @@ mod tests {
             let _ = read_and_save_at(
                 &root,
                 &home,
+                CodexHomeTrust::Managed,
                 current_unix_seconds() + at,
                 explicit_refresh_allowed,
                 || {
@@ -1147,6 +1330,7 @@ mod tests {
         let read = read_and_save_at(
             &root,
             &home,
+            CodexHomeTrust::Managed,
             now,
             |_, _| true,
             || Ok(probe("account-a", "workspace-a", &rfc3339(now))),
@@ -1184,7 +1368,7 @@ mod tests {
             AgentQuotaWindowFreshness::Stale
         );
         assert_eq!(
-            serve_saved_at(&root, &home, CodexHomeTrust::Managed, now + 7 * 3_600).err(),
+            served_error(&root, &home, now + 7 * 3_600),
             Some(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
         let _ = std::fs::remove_dir_all(root);
@@ -1198,6 +1382,7 @@ mod tests {
         let _ = read_and_save_at(
             &root,
             &home,
+            CodexHomeTrust::Managed,
             now,
             |_, _| true,
             || Ok(probe("account-a", "workspace-a", &rfc3339(now))),
@@ -1205,7 +1390,7 @@ mod tests {
         assert!(serve_saved_at(&root, &home, CodexHomeTrust::Managed, now).is_ok());
         write_opaque_auth(&home, "a-different-and-longer-login");
         assert_eq!(
-            serve_saved_at(&root, &home, CodexHomeTrust::Managed, now).err(),
+            served_error(&root, &home, now),
             Some(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
         let _ = std::fs::remove_dir_all(root);
@@ -1219,19 +1404,104 @@ mod tests {
         let _ = read_and_save_at(
             &root,
             &home,
+            CodexHomeTrust::Managed,
             now,
             |_, _| true,
             || Ok(probe("account-a", "workspace-a", &rfc3339(now))),
         );
         let failure = "Codex app-server quota read timed out.".to_string();
-        let _ = read_and_save_at(&root, &home, now, |_, _| true, || Err(failure.clone()));
-        assert_eq!(
-            serve_saved_at(&root, &home, CodexHomeTrust::Managed, now).err(),
-            Some(failure)
+        let _ = read_and_save_at(
+            &root,
+            &home,
+            CodexHomeTrust::Managed,
+            now,
+            |_, _| true,
+            || Err(failure.clone()),
         );
         let saved = read_saved_at(&root, &home).unwrap();
         assert!(saved.reading.is_some(), "the last good reading is kept");
         assert_eq!(saved.consecutive_failures, 1);
+        let failed_at = saved.last_failure.as_ref().unwrap().at_epoch_seconds;
+        // Served later with the failed read's own time, not as a new failure.
+        assert_eq!(
+            serve_saved_at(&root, &home, CodexHomeTrust::Managed, now + 600).err(),
+            Some(CodexQuotaFailure {
+                message: failure,
+                at_epoch_seconds: failed_at,
+            })
+        );
+        // Not past the last-known cap.
+        assert_eq!(
+            served_error(&root, &home, failed_at + 7 * 3_600),
+            Some(CODEX_QUOTA_NOT_READ_YET.to_string())
+        );
+        // Never for another login.
+        write_opaque_auth(&home, "a-different-and-longer-login");
+        assert_eq!(
+            served_error(&root, &home, now),
+            Some(CODEX_QUOTA_NOT_READ_YET.to_string())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The whole schedule over four homes: a home tied to a session or a
+    /// running process is read every 5 minutes, the others every 15, and a
+    /// removed slot is no longer read; its sessions then count for the
+    /// default home.
+    #[test]
+    fn a_schedule_round_reads_homes_in_use_every_five_minutes_and_drops_removed_ones() {
+        let root = scratch("round");
+        let homes = ["default", "busy", "process", "idle"].map(|name| {
+            let home = root.join(name);
+            crate::test_scratch::create_private_dir(&home).unwrap();
+            write_opaque_auth(&home, name);
+            home
+        });
+        let slot = |index: usize| CodexHomeSlot {
+            slot_id: format!("slot-{index}"),
+            ownership: if index == 0 {
+                CodexAccountSlotOwnershipV1::Default
+            } else {
+                CodexAccountSlotOwnershipV1::Managed
+            },
+            home: homes[index].clone(),
+            registered_binding: None,
+        };
+        let reads = Mutex::new(Vec::<String>::new());
+        // A little ahead of the clock, so every attempt is stamped `at`.
+        let start = current_unix_seconds() + 30;
+        let round = |slots: &[usize], at: u64| {
+            reads.lock().unwrap().clear();
+            let running = BTreeMap::from([(homes[2].clone(), at - 60)]);
+            let sessions = [session(Some(("busy", "w")), at - 60)];
+            let scheduled = scheduled_homes_from(
+                &root,
+                slots.iter().map(|index| slot(*index)).collect(),
+                &running,
+                at,
+            );
+            scheduled_round_for(&root, scheduled, &sessions, at, |home| {
+                let name = home.home.file_name().unwrap().to_str().unwrap().to_string();
+                reads.lock().unwrap().push(name.clone());
+                Ok(probe(&name, "w", &rfc3339(at)))
+            });
+            let mut read = reads.lock().unwrap().clone();
+            read.sort();
+            read
+        };
+        let all = [0, 1, 2, 3];
+        assert_eq!(round(&all, start), ["busy", "default", "idle", "process"]);
+        assert!(round(&all, start + 5 * 60 - 1).is_empty());
+        assert_eq!(round(&all, start + 5 * 60), ["busy", "process"]);
+        assert_eq!(round(&all, start + 10 * 60), ["busy", "process"]);
+        assert_eq!(
+            round(&all, start + 15 * 60),
+            ["busy", "default", "idle", "process"]
+        );
+        // "busy" is removed: never read again, and its session now counts for
+        // the default home, which is read at the in-use interval.
+        assert_eq!(round(&[0, 2, 3], start + 20 * 60), ["default", "process"]);
+        assert!(round(&[0, 2, 3], start + 24 * 60).is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1240,10 +1510,11 @@ mod tests {
         let root = scratch("login-race");
         let home = opaque_home(&root);
         let now = current_unix_seconds();
-        let before = auth_witness(&home);
+        let before = login_mark(&home, CodexHomeTrust::Managed);
         let result = read_and_save_at(
             &root,
             &home,
+            CodexHomeTrust::Managed,
             now,
             |_, _| true,
             || {
@@ -1257,15 +1528,15 @@ mod tests {
         );
         let saved = read_saved_at(&root, &home).unwrap();
         assert!(saved.reading.is_none(), "no login can be named for it");
-        assert_eq!(saved.last_attempt_auth, before);
+        assert_eq!(saved.last_attempt_login, before);
         assert_eq!(
-            serve_saved_at(&root, &home, CodexHomeTrust::Managed, now).err(),
+            served_error(&root, &home, now),
             Some(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
         // The changed login is read again after a minute.
-        let current = auth_witness(&home);
-        assert!(!scheduled_read_due(Some(&saved), current, false, now + 59));
-        assert!(scheduled_read_due(Some(&saved), current, false, now + 61));
+        let current = login_mark(&home, CodexHomeTrust::Managed);
+        assert!(!scheduled_read_due(Some(&saved), &current, false, now + 59));
+        assert!(scheduled_read_due(Some(&saved), &current, false, now + 61));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1282,19 +1553,43 @@ mod tests {
             Ok(probe("account-a", "workspace-a", &rfc3339(now)))
         };
         let due = |saved: Option<&SavedCodexQuota>, now: u64| {
-            scheduled_read_due(saved, auth_witness(&home), false, now)
+            scheduled_read_due(
+                saved,
+                &login_mark(&home, CodexHomeTrust::Managed),
+                false,
+                now,
+            )
         };
-        assert!(read_and_save_at(&root, &home, now, due, read).is_some());
+        assert!(read_and_save_at(&root, &home, CodexHomeTrust::Managed, now, due, read).is_some());
         assert!(read_saved_at(&root, &home).is_none(), "nothing was written");
         // Later ticks inside the interval do not read again.
         for tick in [15, 60, 14 * 60] {
-            assert!(read_and_save_at(&root, &home, now + tick, due, read).is_none());
+            assert!(
+                read_and_save_at(&root, &home, CodexHomeTrust::Managed, now + tick, due, read)
+                    .is_none()
+            );
         }
-        assert!(read_and_save_at(&root, &home, now + 15 * 60 + 1, due, read).is_some());
+        assert!(read_and_save_at(
+            &root,
+            &home,
+            CodexHomeTrust::Managed,
+            now + 15 * 60 + 1,
+            due,
+            read
+        )
+        .is_some());
         assert_eq!(reads.get(), 2);
         let explicit =
             |saved: Option<&SavedCodexQuota>, now: u64| explicit_refresh_allowed(saved, now);
-        assert!(read_and_save_at(&root, &home, current_unix_seconds(), explicit, read).is_none());
+        assert!(read_and_save_at(
+            &root,
+            &home,
+            CodexHomeTrust::Managed,
+            now + 15 * 60 + 30,
+            explicit,
+            read
+        )
+        .is_none());
         assert_eq!(reads.get(), 2);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1326,6 +1621,7 @@ mod tests {
         let _ = read_and_save_at(
             &root,
             &home,
+            CodexHomeTrust::Managed,
             now,
             |_, _| true,
             || {
