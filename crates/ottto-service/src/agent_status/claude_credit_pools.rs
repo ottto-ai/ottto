@@ -2882,6 +2882,7 @@ mod tests {
             REQUESTED.lock().unwrap().clear();
             super::super::claude_explicit_refresh_requests().clear();
             super::super::claude_explicit_refresh_attempts().clear();
+            super::super::claude_transient_failures().clear();
             Self {
                 dir,
                 _support: support,
@@ -2983,6 +2984,9 @@ mod tests {
             for attempt in super::super::claude_explicit_refresh_attempts().iter_mut() {
                 attempt.at -= seconds;
             }
+            for failure in super::super::claude_transient_failures().iter_mut() {
+                failure.at -= seconds;
+            }
             let mut cache =
                 super::super::read_claude_oauth_usage_cache(self.account, self.organization)
                     .expect("stored reading");
@@ -3017,6 +3021,28 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// A server error records no backoff of its own: the binding still waits
+    /// a minute before the next provider request, whatever asks for it.
+    #[test]
+    #[serial_test::serial]
+    fn a_server_error_waits_a_minute_before_the_next_request() {
+        let harness = VariantHarness::new("server-error");
+        harness.due(ClaudeReadSchedule::default());
+        harness.collect(respond_server_error);
+        assert_eq!(harness.requests(), 1);
+        for _ in 0..3 {
+            harness.collect(respond_server_error);
+        }
+        super::super::request_claude_explicit_refresh(Some(harness.account), None);
+        harness.collect(respond_server_error);
+        assert_eq!(harness.requests(), 1);
+        for failure in super::super::claude_transient_failures().iter_mut() {
+            failure.at -= super::super::CLAUDE_TRANSIENT_FAILURE_RETRY_SECONDS;
+        }
+        harness.collect(respond_recognized);
+        assert_eq!(harness.requests(), 2);
     }
 
     /// The Refresh button reads an account now, at most once a minute, and

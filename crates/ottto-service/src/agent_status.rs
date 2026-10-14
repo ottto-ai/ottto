@@ -10623,6 +10623,29 @@ fn collect_claude_oauth_usage_unstamped(
             current_unix_seconds(),
         );
     }
+    if claude_transient_failure_held(account_identifier_hash, organization_identifier_hash, now) {
+        let result = match read_claude_oauth_usage_cache_with_legacy_migration(
+            account_identifier_hash,
+            organization_identifier_hash,
+            mirror_legacy_default,
+        )
+        .filter(|cache| {
+            !cache.windows.is_empty()
+                && now.saturating_sub(cache.observed_at_epoch_seconds)
+                    <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
+        }) {
+            Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
+            None => Err(
+                "The latest Claude OAuth quota request failed; it is retried after a minute."
+                    .to_string(),
+            ),
+        };
+        return ClaudeOAuthUsageOutcome::from(result).with_check_outcome(
+            "claude_oauth_usage_check_suppressed",
+            "The latest Claude OAuth quota request failed moments ago; no provider request was made, and any served readings are last-known local readings.",
+            current_unix_seconds(),
+        );
+    }
     let authorization = format!("Bearer {token}");
     let user_agent = ottto_user_agent();
     // Same endpoint, same slot: the saved-reset variant replaces the plain
@@ -10775,7 +10798,15 @@ fn collect_claude_oauth_usage_unstamped(
                     now,
                     mirror_legacy_default,
                 ),
-                None => Vec::new(),
+                None => {
+                    set_claude_binding_time(
+                        &mut claude_transient_failures(),
+                        account_identifier_hash,
+                        organization_identifier_hash,
+                        current_unix_seconds(),
+                    );
+                    Vec::new()
+                }
             };
             diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed; any served readings remain locally cached evidence.", current_unix_seconds()));
             if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
@@ -11478,7 +11509,6 @@ fn claude_statusline_fresh_for_binding(
 const CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS: u64 = 2 * 60;
 const CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS: u64 = 60;
 const CLAUDE_EXPLICIT_REFRESH_REQUESTS_MAX: usize = 16;
-const CLAUDE_EXPLICIT_REFRESH_ATTEMPTS_MAX: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClaudeExplicitRefreshRequest {
@@ -11527,14 +11557,12 @@ fn claude_explicit_refresh_requested(
     reading_observed_at: u64,
     now: u64,
 ) -> bool {
-    let last = claude_explicit_refresh_attempts()
-        .iter()
-        .filter(|attempt| {
-            attempt.account_identifier_hash == account_identifier_hash
-                && attempt.organization_identifier_hash == organization_identifier_hash
-        })
-        .map(|attempt| attempt.at)
-        .fold(reading_observed_at, u64::max);
+    let last = claude_binding_time(
+        &claude_explicit_refresh_attempts(),
+        account_identifier_hash,
+        organization_identifier_hash,
+    )
+    .map_or(reading_observed_at, |at| at.max(reading_observed_at));
     if now.saturating_sub(last) < CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS
         && last <= now.saturating_add(60)
     {
@@ -11556,19 +11584,55 @@ fn claude_explicit_refresh_requested(
     })
 }
 
-/// The last time each binding answered an explicit refresh, whatever the
-/// read's outcome: a failed read consumes the request and still counts for
-/// the once-a-minute limit.
+/// A per-binding time kept in memory (bounded): the last explicit refresh a
+/// binding answered, or its last transient read failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ClaudeExplicitRefreshAttempt {
+struct ClaudeBindingTime {
     account_identifier_hash: String,
     organization_identifier_hash: String,
     at: u64,
 }
 
-fn claude_explicit_refresh_attempts(
-) -> std::sync::MutexGuard<'static, Vec<ClaudeExplicitRefreshAttempt>> {
-    static ATTEMPTS: Mutex<Vec<ClaudeExplicitRefreshAttempt>> = Mutex::new(Vec::new());
+const CLAUDE_BINDING_TIMES_MAX: usize = 64;
+
+fn claude_binding_time(
+    times: &[ClaudeBindingTime],
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> Option<u64> {
+    times
+        .iter()
+        .find(|time| {
+            time.account_identifier_hash == account_identifier_hash
+                && time.organization_identifier_hash == organization_identifier_hash
+        })
+        .map(|time| time.at)
+}
+
+fn set_claude_binding_time(
+    times: &mut Vec<ClaudeBindingTime>,
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    at: u64,
+) {
+    times.retain(|time| {
+        time.account_identifier_hash != account_identifier_hash
+            || time.organization_identifier_hash != organization_identifier_hash
+    });
+    times.push(ClaudeBindingTime {
+        account_identifier_hash: account_identifier_hash.to_string(),
+        organization_identifier_hash: organization_identifier_hash.to_string(),
+        at,
+    });
+    let excess = times.len().saturating_sub(CLAUDE_BINDING_TIMES_MAX);
+    times.drain(..excess);
+}
+
+/// The last time each binding answered an explicit refresh, whatever the
+/// read's outcome: a failed read consumes the request and still counts for
+/// the once-a-minute limit.
+fn claude_explicit_refresh_attempts() -> std::sync::MutexGuard<'static, Vec<ClaudeBindingTime>> {
+    static ATTEMPTS: Mutex<Vec<ClaudeBindingTime>> = Mutex::new(Vec::new());
     ATTEMPTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -11579,20 +11643,42 @@ fn note_claude_explicit_refresh_attempt(
     organization_identifier_hash: &str,
     now: u64,
 ) {
-    let mut attempts = claude_explicit_refresh_attempts();
-    attempts.retain(|attempt| {
-        attempt.account_identifier_hash != account_identifier_hash
-            || attempt.organization_identifier_hash != organization_identifier_hash
-    });
-    attempts.push(ClaudeExplicitRefreshAttempt {
-        account_identifier_hash: account_identifier_hash.to_string(),
-        organization_identifier_hash: organization_identifier_hash.to_string(),
-        at: now,
-    });
-    let excess = attempts
-        .len()
-        .saturating_sub(CLAUDE_EXPLICIT_REFRESH_ATTEMPTS_MAX);
-    attempts.drain(..excess);
+    set_claude_binding_time(
+        &mut claude_explicit_refresh_attempts(),
+        account_identifier_hash,
+        organization_identifier_hash,
+        now,
+    );
+}
+
+/// A read that failed without a status the provider asks us to act on (a
+/// server error or a network failure) records no backoff of its own. The
+/// binding then waits [`CLAUDE_TRANSIENT_FAILURE_RETRY_SECONDS`] before the
+/// next provider request, so repeated status passes do not retry it at once.
+/// Every other hold, breaker and Retry-After still applies on top.
+const CLAUDE_TRANSIENT_FAILURE_RETRY_SECONDS: u64 = 60;
+
+fn claude_transient_failures() -> std::sync::MutexGuard<'static, Vec<ClaudeBindingTime>> {
+    static FAILURES: Mutex<Vec<ClaudeBindingTime>> = Mutex::new(Vec::new());
+    FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn claude_transient_failure_held(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: u64,
+) -> bool {
+    claude_binding_time(
+        &claude_transient_failures(),
+        account_identifier_hash,
+        organization_identifier_hash,
+    )
+    .is_some_and(|at| {
+        at <= now.saturating_add(60)
+            && now.saturating_sub(at) < CLAUDE_TRANSIENT_FAILURE_RETRY_SECONDS
+    })
 }
 
 impl From<Result<ClaudeOAuthUsage, String>> for ClaudeOAuthUsageOutcome {
