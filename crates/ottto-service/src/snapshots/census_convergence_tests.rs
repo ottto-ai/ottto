@@ -1,6 +1,6 @@
-//! Census convergence: non-progressing local holds, exact family pending
-//! re-observation, duplicate-fence coverage and backoff, and count-only parse
-//! reasons. All fixtures are synthetic and content-free.
+// Census convergence: non-progressing local holds, exact family pending
+// re-observation, duplicate-fence coverage and backoff, and count-only parse
+// reasons. All fixtures are synthetic and content-free.
 use super::*;
 
 const WINDOW: &str = "2026-08-02T07:10:00Z";
