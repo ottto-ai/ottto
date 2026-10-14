@@ -736,6 +736,49 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// A cycle without the cohort permit builds today's bodies exactly; only a
+/// permitted cycle reaches contract 5.
+#[test]
+fn claude_contract5_bodies_need_this_cycles_cohort_permit() {
+    use crate::snapshots::claude_request_identity::{self as identity, CohortGrant};
+    let (dir, root, api, trace) = h296_root_evidence();
+    let support = dir.join("support");
+    let digest = format!("{:x}", Sha256::digest(root.source_session_id.as_bytes()));
+    for (kind, rows) in [
+        ("claude-code-effort", api.evidence[&root.source_session_id].iter().map(|row| serde_json::to_value(row).unwrap()).collect::<Vec<_>>()),
+        ("claude-code-trace-ownership", trace.evidence[&root.source_session_id].iter().map(|row| serde_json::to_value(row).unwrap()).collect::<Vec<_>>()),
+    ] {
+        let path = support.join("local-otel").join(kind).join(format!("{digest}.jsonl"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, rows.iter().map(|row| row.to_string()+"\n").collect::<String>()).unwrap();
+    }
+    let run = |permit: Option<identity::EmissionPermit>| {
+        let mut index = ScanIndex::default();
+        let mut scan = scan_source_roots_with_test_limit(SnapshotSource::ClaudeCode, std::slice::from_ref(&dir), &mut index, "2026-08-02T07:10:00Z", 7, 100, false).unwrap();
+        crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(&support, &mut scan, &mut index, permit);
+        scan.snapshots
+    };
+    let collector = |items: &[SnapshotItem]| items.iter().find(|item| item.source_session_id == root.source_session_id).unwrap().provenance.collector.clone();
+    let account = [7u8; 32];
+    let other = [8u8; 32];
+    let grant = CohortGrant { contract: identity::COLLECTOR, account_witness: &account };
+    let dark = serde_json::to_vec(&run(None)).unwrap();
+    for denied in [
+        identity::emission_permit(Some(grant), &account).ok(),
+        identity::permit_when(true, None, &account).ok(),
+        identity::permit_when(true, Some(grant), &other).ok(),
+        identity::permit_when(true, Some(CohortGrant { contract: "malformed", account_witness: &account }), &account).ok(),
+    ] {
+        assert!(denied.is_none());
+        let items = run(denied);
+        assert_eq!(collector(&items), claude_request_accounts::COMPLETE);
+        assert_eq!(serde_json::to_vec(&items).unwrap(), dark, "denied cycles keep today's bytes");
+    }
+    let permitted = run(identity::permit_when(true, Some(grant), &account).ok());
+    assert_eq!(collector(&permitted), identity::COLLECTOR);
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn claude_h296_root_requires_original_clocks_in_every_hour_before_fold() {
     let (dir, root, _) = claude_account_family_fixture();

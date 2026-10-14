@@ -1063,12 +1063,22 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
         org: Some(org.clone()),
         basis: identity::TRANSCRIPT_ORG,
     });
-    let fresh = ScanEvidence::new(
+    // Production suppresses the basis until the receiver's time-scoped veto
+    // is verified: a qualifying census still yields org-only.
+    let suppressed = ScanEvidence::new(
         &api,
         &trace,
         BTreeSet::new(),
         Some(census(999_500, &[LOGIN_A])),
     );
+    assert_eq!(desktop(&suppressed, true), org_only, "sole login suppressed");
+    let fresh = ScanEvidence::new(
+        &api,
+        &trace,
+        BTreeSet::new(),
+        Some(census(999_500, &[LOGIN_A])),
+    )
+    .with_sole_login_enabled();
     assert_eq!(desktop(&fresh, true), sole);
     assert_eq!(
         desktop(&fresh, false),
@@ -1080,7 +1090,8 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
         &trace,
         BTreeSet::new(),
         Some(census(998_000, &[LOGIN_A])),
-    );
+    )
+    .with_sole_login_enabled();
     assert_eq!(
         desktop(&stale, true),
         org_only,
@@ -1091,10 +1102,124 @@ fn classify_sole_login_needs_desktop_and_a_census_after_the_request() {
         &trace,
         BTreeSet::new(),
         Some(census(999_500, &[LOGIN_A, "b"])),
-    );
+    )
+    .with_sole_login_enabled();
     assert_eq!(desktop(&two, true), org_only);
-    let none = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let none = ScanEvidence::new(&api, &trace, BTreeSet::new(), None).with_sole_login_enabled();
     assert_eq!(desktop(&none, true), org_only);
+}
+
+/// SESSION ruling: a trace owner outranks the transcript. A request whose
+/// owner is foreign, duplicated or unpaired is refused and never borrows this
+/// transcript's org or sole login, even where both would otherwise qualify.
+#[test]
+fn trace_owned_requests_refuse_before_any_transcript_basis() {
+    let org = "d".repeat(64);
+    let child = format!("{ROOT}_agent-child");
+    let mut forged = complete_trace_row(ROOT, "req_forged", "");
+    forged.fingerprint = format!("sha256:{}", "0".repeat(64));
+    let trace = vec![
+        complete_trace_row(ROOT, "req_paired", ""),
+        complete_trace_row(ROOT, "req_sibling", "child"),
+        complete_trace_row(ROOT, "req_unpaired", ""),
+        complete_trace_row(ROOT, "req_dup", ""),
+        complete_trace_row(ROOT, "req_dup", ""),
+        forged,
+    ];
+    let (api, trace) = reports(vec![complete_api_row(ROOT, "req_paired", 1, 10, 1, 0)], trace);
+    let census = DesktopCensus {
+        completed_at_unix_seconds: 999_500,
+        logins_by_org: BTreeMap::from([(org.clone(), BTreeSet::from([LOGIN_A.to_string()]))]),
+    };
+    let evidence =
+        ScanEvidence::new(&api, &trace, BTreeSet::new(), Some(census)).with_sole_login_enabled();
+    let classify = |request_id: &str, source_session_id: &str| {
+        let mut request = facts(request_id, Some(999_000), MarkerVerdict::Trusted(&org));
+        request.source_session_id = source_session_id;
+        request.desktop = true;
+        identity::classify(&evidence, &request)
+    };
+    let refused = RequestIdentity::Refused;
+    // Foreign: another child's request, a parent's request seen from a
+    // child, or an owner record that fails its own integrity checks.
+    assert_eq!(classify("req_sibling", ROOT), refused(Refusal::ForeignOwner));
+    assert_eq!(classify("req_unpaired", &child), refused(Refusal::ForeignOwner));
+    assert_eq!(classify("req_forged", ROOT), refused(Refusal::ForeignOwner));
+    // Incomplete: the owner is this session but its telemetry row is missing.
+    assert_eq!(classify("req_unpaired", ROOT), refused(Refusal::IncompleteEvidence));
+    assert_eq!(classify("req_sibling", &child), refused(Refusal::IncompleteEvidence));
+    assert_eq!(classify("req_dup", ROOT), refused(Refusal::ConflictingDuplicate));
+    // Controls: a valid paired owner keeps telemetry; no owner keeps the
+    // transcript bases.
+    assert_eq!(
+        classify("req_paired", ROOT),
+        RequestIdentity::Tagged(AuthorityKey {
+            login: Some(OWNER_A.to_string()),
+            org: None,
+            basis: identity::TELEMETRY_LOGIN,
+        })
+    );
+    assert_eq!(
+        classify("req_none", ROOT),
+        RequestIdentity::Tagged(AuthorityKey {
+            login: Some(LOGIN_A.to_string()),
+            org: Some(org.clone()),
+            basis: identity::TRANSCRIPT_SOLE_LOGIN,
+        })
+    );
+    let mut terminal = facts("req_none", Some(999_000), MarkerVerdict::Trusted(&org));
+    terminal.desktop = false;
+    assert_eq!(
+        identity::classify(&evidence, &terminal),
+        RequestIdentity::Tagged(AuthorityKey {
+            login: None,
+            org: Some(org.clone()),
+            basis: identity::TRANSCRIPT_ORG,
+        })
+    );
+}
+
+#[test]
+fn contract5_permit_needs_emission_and_a_grant_for_this_account() {
+    use identity::{CohortDenial, CohortGrant};
+    let account = [1u8; 32];
+    let other = [2u8; 32];
+    let grant = |contract, account_witness| {
+        Some(CohortGrant {
+            contract,
+            account_witness,
+        })
+    };
+    assert!(identity::permit_when(true, grant(identity::COLLECTOR, &account), &account).is_ok());
+    for (offered, denial) in [
+        (None, CohortDenial::NoGrant),
+        (grant("", &account), CohortDenial::UnknownContract),
+        (
+            grant("claude_code_jsonl:own_request_identity_rows:v2", &account),
+            CohortDenial::UnknownContract,
+        ),
+        (
+            grant(" claude_code_jsonl:own_request_identity_rows:v1", &account),
+            CohortDenial::UnknownContract,
+        ),
+        // An account switch after the grant never carries it over.
+        (grant(identity::COLLECTOR, &other), CohortDenial::OtherAccount),
+    ] {
+        assert_eq!(
+            identity::permit_when(true, offered, &account),
+            Err(denial),
+            "{offered:?}"
+        );
+    }
+    assert_eq!(
+        identity::permit_when(false, grant(identity::COLLECTOR, &account), &account),
+        Err(CohortDenial::EmissionDisabled)
+    );
+    // This build: even a valid grant is denied while emission is off.
+    assert_eq!(
+        identity::emission_permit(grant(identity::COLLECTOR, &account), &account),
+        Err(CohortDenial::EmissionDisabled)
+    );
 }
 
 #[test]
@@ -1175,6 +1300,50 @@ fn desktop_census_witness_is_bound_to_completion_process_and_inventory() {
         .remove("claude_desktop_census_witness");
     let old: ScanIndex = serde_json::from_value(old).unwrap();
     assert_eq!(old.claude_desktop_census_witness, None);
+}
+
+#[test]
+fn desktop_census_witness_follows_the_store_inventory_through_retry_backoff() {
+    const NOW: u64 = 1_800_000_000; // 2027-01-15T08:00:00Z
+    let swept = BTreeSet::from([PathBuf::from("/synthetic/store-a")]);
+    let backed_off = |store_dirs: &BTreeSet<PathBuf>| {
+        let mut index = ScanIndex {
+            claude_desktop_identity_census_complete: true,
+            claude_desktop_census_witness: Some(identity::DesktopCensusWitness::new(
+                NOW - 30,
+                &swept,
+            )),
+            claude_desktop_store_retry_not_before_unix_seconds: Some(NOW + 30),
+            ..ScanIndex::default()
+        };
+        let metadata = ClaudeTitleMetadata::load_from_store_dirs_with_index(
+            store_dirs,
+            &mut index,
+            "2027-01-15T08:00:00Z",
+        );
+        assert!(metadata.sidecar_census_incomplete);
+        assert_eq!(
+            index.claude_desktop_store_retry_not_before_unix_seconds,
+            Some(NOW + 30),
+            "still inside the backoff: no sweep ran"
+        );
+        index
+    };
+    let unchanged = backed_off(&swept);
+    assert!(unchanged.claude_desktop_census_witness.is_some());
+    assert!(identity::desktop_census_at(&unchanged, NOW).is_some(), "control");
+    for changed in [
+        BTreeSet::from([
+            PathBuf::from("/synthetic/store-a"),
+            PathBuf::from("/synthetic/store-b"),
+        ]),
+        BTreeSet::from([PathBuf::from("/synthetic/store-b")]),
+        BTreeSet::new(),
+    ] {
+        let index = backed_off(&changed);
+        assert_eq!(index.claude_desktop_census_witness, None, "{changed:?}");
+        assert_eq!(identity::desktop_census_at(&index, NOW), None, "{changed:?}");
+    }
 }
 
 // --- Markers ----------------------------------------------------------------
@@ -2112,8 +2281,13 @@ fn coverage(
     ledger
 }
 
-// Released builds keep `transcript_email` and its feed compiled out.
-const _: () = assert!(!identity::TRANSCRIPT_EMAIL_ENABLED && !identity::EMISSION_ENABLED);
+// Released builds keep `transcript_email` and its feed compiled out, and
+// `transcript_sole_login` suppressed independently of the email gate.
+const _: () = assert!(
+    !identity::TRANSCRIPT_EMAIL_ENABLED
+        && !identity::EMISSION_ENABLED
+        && !identity::TRANSCRIPT_SOLE_LOGIN_ENABLED
+);
 
 #[test]
 fn transcript_email_never_binds_and_refuses_unqualified_coverage() {

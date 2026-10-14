@@ -26,6 +26,11 @@ scan hook and every new field stay inert until a compatible receiver is
 confirmed, and flipping the constant is a separate change. Tests exercise the
 same code through `capture_enabled()` (`cfg(test)`).
 
+Flipping the constant alone still emits nothing: each sync cycle also needs
+an account-bound cohort grant (`emission_permit`), and no seam supplies one
+yet. See
+[the activation-readiness note](session-2026-10-14-claude-request-identity-activation-readiness.md).
+
 ## How tagging works
 
 - Rows are built exactly as today. Each counted request is classified as it
@@ -53,12 +58,18 @@ same code through `capture_enabled()` (`cfg(test)`).
     get login-only attribution.
   - Duplicates, foreign owners, invalid evidence and missing original clocks
     are refused.
+  - A request with no telemetry row but a trace owner is refused before any
+    transcript basis: a foreign owner (another child, a parent's request seen
+    from a child, or an owner record failing its integrity checks), a
+    duplicated owner, or this session's owner without its telemetry row. It
+    never borrows the transcript's organization or sole login.
   - Per the SESSION ruling, there is no production pending without a
     qualified current-writer health witness, and none exists. Genuinely
     absent telemetry is missing; present but unusable evidence is refused.
     Only `cfg(test)` can supply a witness (pending then also needs the
     request's own clock within `TELEMETRY_FLUSH_WINDOW_SECONDS`, 300,
-    provisional). Only missing requests are open to transcript bases.
+    provisional). Only missing requests with no trace owner are open to
+    transcript bases.
   - Auxiliary (telemetry-only) reported rows stay refused for a bad clock
     (SESSION ruling). Their `observed_at` may be the observer clock and the v2
     capture does not record which. Transcript clocks are never borrowed. A
@@ -108,19 +119,27 @@ same code through `capture_enabled()` (`cfg(test)`).
     uploaded; a restart forgets both history and registration.
   - Removing a slot clears its history but records the loss in a bounded
     set (at most 10 folders). The same request stays refused rather than
-    turning org-only. One more loss than the set holds, a restart, or a
-    window that began before registration was first known makes every
-    unregistered folder unknown (refused), never proven absent.
+    turning org-only. One more loss than the set holds, more registered
+    folders than the 10 the ledger keeps, a restart, or a window that began
+    before registration was first known makes every unregistered folder
+    unknown (refused), never proven absent.
+  - Slots past the status pass's collection capacity are still reported as
+    registered folders. Scan roots and descriptors read the same registry
+    string, and the folder key is lexical.
   - The ledger's (login, org) pairings prove marker-org membership for
     login-only telemetry (§2a.12(b)).
   - A status-pass fixture shows byte-identical status output (SOURCE account
     and plans, quota, health, persisted slot state) with the feed working,
     failed, or holding a conflicting history.
 - **`transcript_sole_login`** (Desktop only) needs all of the following:
+  - `TRANSCRIPT_SOLE_LOGIN_ENABLED`, a separate constant that is `false`
+    until the receiver's time-scoped sole-login veto is verified as deployed.
+    Off, a qualifying census yields `transcript_org`;
   - a complete Desktop identity census;
   - a new additive index witness. The witness is set only on a complete,
     error-free store sweep and is bound to process, store inventory and clock.
-    It is absent (unknown) for older indexes;
+    It is absent (unknown) for older indexes. A changed store inventory
+    drops it on every pass, including passes inside the retry backoff;
   - a census completed after the request;
   - exactly one native login for that organization.
 - **Caps:**
@@ -207,7 +226,7 @@ same code through `capture_enabled()` (`cfg(test)`).
     `None`);
   - 40 B in `ScanIndex` for the census witness slot. Dark builds keep it
     `None`: they neither compute nor persist a witness, and they clear one
-    left by an earlier build at the next Desktop sweep;
+    left by an earlier build at the next Desktop pass;
   - an empty grouping map in the reported-usage disposition, an `Option`
     check per rebuilt item and per rebuilt row, and one extra call frame
     around the reported pass;

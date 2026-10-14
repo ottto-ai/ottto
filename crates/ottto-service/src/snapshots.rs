@@ -7945,6 +7945,17 @@ impl ClaudeTitleMetadata {
             }
             (None, Some(_)) => true,
         };
+        // The witness serves only contract 5; dark builds neither keep nor
+        // persist one. Reconciled before the backoff return: a store inventory
+        // that changed during backoff never keeps the old census's witness.
+        if claude_request_identity::capture_enabled() {
+            claude_request_identity::DesktopCensusWitness::retain_for_inventory(
+                &mut index.claude_desktop_census_witness,
+                store_dirs,
+            );
+        } else {
+            index.claude_desktop_census_witness = None;
+        }
         if !retry_due {
             return Self::from_durable_index_with_metadata(
                 index,
@@ -7957,16 +7968,6 @@ impl ClaudeTitleMetadata {
             );
         }
 
-        // The witness serves only contract 5; dark builds neither keep nor
-        // persist one.
-        if claude_request_identity::capture_enabled() {
-            claude_request_identity::DesktopCensusWitness::retain_for_inventory(
-                &mut index.claude_desktop_census_witness,
-                store_dirs,
-            );
-        } else {
-            index.claude_desktop_census_witness = None;
-        }
         let mut metadata = Self::default();
         let mut selection = BoundedPathSelection::new(
             index.claude_desktop_store_cursor.clone(),

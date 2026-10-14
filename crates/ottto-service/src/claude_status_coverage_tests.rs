@@ -378,6 +378,38 @@ fn age_entry_slot_and_byte_caps_bound_the_history() {
 }
 
 #[test]
+fn registered_folders_past_the_cap_are_never_proven_unregistered() {
+    let keys = (0..=MAX_SLOTS)
+        .map(|n| home_key(Path::new(&format!("/slot/{n}"))))
+        .collect::<BTreeSet<_>>();
+    let absent = home_key(Path::new("/never-registered"));
+    let mut ledger = Ledger::default();
+    ledger.retain(keys.iter().copied().take(MAX_SLOTS).collect(), Some(T0));
+    assert_eq!(
+        ledger.registration(&absent, T0),
+        Registration::NeverRegistered,
+        "control: within the cap absence is proven"
+    );
+    let mut ledger = Ledger::default();
+    ledger.retain(keys.clone(), Some(T0));
+    assert!(ledger.retained_bytes() <= MAX_BYTES);
+    assert_eq!(
+        ledger.registered.as_ref().map(BTreeSet::len),
+        Some(MAX_SLOTS)
+    );
+    for key in &keys {
+        assert_ne!(ledger.registration(key, T0), Registration::NeverRegistered);
+    }
+    assert_eq!(ledger.registration(&absent, T0), Registration::Unknown);
+    // A later pass back inside the cap cannot restore proof of absence.
+    ledger.retain(keys.into_iter().take(1).collect(), Some(T0 + 300));
+    assert_eq!(
+        ledger.registration(&absent, T0 + 300),
+        Registration::Unknown
+    );
+}
+
+#[test]
 fn transcript_paths_map_to_their_config_dir_key() {
     let slot = home_key(Path::new("/Users/someone/.claude-slot"));
     assert_eq!(home_key(Path::new("/Users/someone/.claude-slot/")), slot);
