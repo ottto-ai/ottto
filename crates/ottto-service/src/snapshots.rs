@@ -22112,6 +22112,14 @@ impl ScanIndex {
             }
         }
         for (key, working) in &self.files {
+            // A cleared source witness is outstanding reparse work, not a new
+            // accepted body. Reverting an unsettled entry must keep that debt;
+            // otherwise a partial save can undo a census/fence correction.
+            if working.source_file_fingerprint.is_empty() {
+                if let Some(retained) = result.files.get_mut(key) {
+                    retained.source_file_fingerprint.clear();
+                }
+            }
             if let Some(due) = working.unverified_deadline() {
                 if let Some(retained) = result.files.get_mut(key) {
                     retained.set_unverified_deadline(
@@ -52742,6 +52750,127 @@ mod tests {
         let committable =
             fresh.committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new());
         assert!(committable.files.is_empty());
+    }
+
+    #[test]
+    fn partial_commit_preserves_rearm_debt_without_accepting_held_revision() {
+        let key = "/opaque/rearmed.jsonl".to_string();
+        let mut previous = ScanIndex::default();
+        let mut entry = manifest_index_entry(Some("old-entity"));
+        entry.last_upload_body_witness = Some("old-body".to_string());
+        previous.files.insert(key.clone(), entry);
+        previous
+            .file_snapshot_fingerprints
+            .insert(key.clone(), BTreeSet::from(["old-entity".to_string()]));
+        previous
+            .accepted_snapshot_fingerprints
+            .insert("old-entity".to_string());
+
+        let mut scanned = previous.clone();
+        let working = scanned.files.get_mut(&key).unwrap();
+        working.source_file_fingerprint.clear();
+        working.last_snapshot_fingerprint = Some("held-entity".to_string());
+        working.last_upload_body_witness = Some("held-body".to_string());
+        working.size_bytes = 42;
+        scanned
+            .file_snapshot_fingerprints
+            .insert(key.clone(), BTreeSet::from(["held-entity".to_string()]));
+        scanned.claude_duplicate_request_witness_overflowed = true;
+
+        let checkpoint = scanned.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+        let saved: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        let retained = &saved.files[&key];
+        assert!(retained.source_file_fingerprint.is_empty());
+        assert_eq!(retained.size_bytes, previous.files[&key].size_bytes);
+        assert_eq!(
+            retained.last_snapshot_fingerprint.as_deref(),
+            Some("old-entity")
+        );
+        assert_eq!(
+            retained.last_upload_body_witness.as_deref(),
+            Some("old-body")
+        );
+        assert_eq!(
+            saved.file_snapshot_fingerprints[&key],
+            previous.file_snapshot_fingerprints[&key]
+        );
+        assert_eq!(
+            saved.accepted_snapshot_fingerprints,
+            previous.accepted_snapshot_fingerprints
+        );
+        assert!(saved.claude_duplicate_request_witness_overflowed);
+
+        // Without an explicit re-arm, the unaccepted entry still retains its
+        // complete old source/body checkpoint; this change grants no receipt.
+        scanned.files.get_mut(&key).unwrap().source_file_fingerprint = "changed-source".into();
+        let ordinary = scanned.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+        assert_eq!(
+            ordinary.files[&key].source_file_fingerprint,
+            previous.files[&key].source_file_fingerprint
+        );
+    }
+
+    #[test]
+    fn partial_commit_reparses_unchanged_rearmed_file_after_held_sibling() {
+        let key = "/opaque/rearmed.jsonl".to_string();
+        let mut previous = ScanIndex::default();
+        let mut entry = manifest_index_entry(Some("old-entity"));
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        previous.files.insert(key.clone(), entry.clone());
+        previous
+            .file_snapshot_fingerprints
+            .insert(key.clone(), BTreeSet::from(["old-entity".to_string()]));
+        previous
+            .snapshot_activity_at
+            .insert("old-entity".into(), "2026-10-14T10:00:00Z".into());
+        let mut candidate = test_candidate(PathBuf::from(&key));
+        candidate.size_bytes = entry.size_bytes;
+        candidate.modified_unix_seconds = entry.modified_unix_seconds;
+        candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap();
+        candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
+        assert_eq!(
+            previous.candidate_decision_at(&candidate, 0),
+            CandidateDecision::Skip
+        );
+
+        let sibling = "/opaque/held.jsonl".to_string();
+        previous
+            .files
+            .insert(sibling.clone(), manifest_index_entry(Some("old-sibling")));
+        previous
+            .file_snapshot_fingerprints
+            .insert(sibling.clone(), BTreeSet::from(["old-sibling".into()]));
+        let mut scanned = previous.clone();
+        scanned
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        scanned
+            .files
+            .get_mut(&sibling)
+            .unwrap()
+            .last_snapshot_fingerprint = Some("held-sibling".into());
+        scanned
+            .file_snapshot_fingerprints
+            .insert(sibling.clone(), BTreeSet::from(["held-sibling".into()]));
+        let checkpoint = scanned.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+        let saved: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        assert_eq!(
+            saved.candidate_decision_at(&candidate, 0),
+            CandidateDecision::Parse
+        );
+        assert_eq!(
+            saved.files[&sibling].last_snapshot_fingerprint.as_deref(),
+            Some("old-sibling")
+        );
+        assert_eq!(
+            saved.file_snapshot_fingerprints[&key],
+            previous.file_snapshot_fingerprints[&key]
+        );
     }
 
     #[test]
