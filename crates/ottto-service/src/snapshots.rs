@@ -52823,7 +52823,7 @@ mod tests {
             .insert(key.clone(), BTreeSet::from(["old-entity".to_string()]));
         previous
             .snapshot_activity_at
-            .insert("old-entity".into(), "2026-10-14T10:00:00Z".into());
+            .insert("old-entity".into(), Some("2026-10-14T10:00:00Z".into()));
         let mut candidate = test_candidate(PathBuf::from(&key));
         candidate.size_bytes = entry.size_bytes;
         candidate.modified_unix_seconds = entry.modified_unix_seconds;
