@@ -137,6 +137,7 @@ fn status_coverage_feed_never_changes_source_or_quota_status_output() {
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
         claude_oauth_stamp_account_identity(&mut usage, account_hash, Some(organization_hash));
         write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
@@ -147,6 +148,7 @@ fn status_coverage_feed_never_changes_source_or_quota_status_output() {
             next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
             windows: usage.windows,
             credit_balances: usage.credit_balances,
+            account_weekly_not_offered: false,
         })
         .expect("write usage cache");
     }

@@ -37247,6 +37247,7 @@ mod tests {
             "2026-08-02T07:10:00Z",
             max_pending_occurrences,
             max_duplicate_owners,
+            None,
         );
         let counts = disposition.duplicate_census;
         // The counters are the only disposition output of these report-free
