@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 637,
-  "content_sha256": "45e2f6ddb2c391682a42434f8d0b1620a0183f06175e2da0d42f2b126ef48a55",
+  "content_sha256": "ccdad61f42bbd6e6952f739b8f205e99703a42cf6b2b00bfcaf5503492b5c102",
   "files": [
     {
       "executable": false,
@@ -909,8 +909,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/external_scheduler_attribution/live_owner.rs",
-      "sha256": "96948a8f0812f31025d8cc7f7043a6714ca0298b15af906390559585eedbed23",
-      "size_bytes": 54400
+      "sha256": "547b93392c54ef3522b8d7bd0f460a869867c411009ed46d1a3fee5752a24096",
+      "size_bytes": 59712
     },
     {
       "executable": false,
@@ -4462,7 +4462,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-14T16:43:11+00:00",
+  "generated_at": "2026-10-14T17:01:13+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 638,
   "public_roots": [
@@ -4501,5 +4501,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d6056f6636e9f7f3d06289c0103c6e1b62eea670"
+  "source_commit": "7f23b547cc451417f1e520e0a205d186917715ab"
 }
