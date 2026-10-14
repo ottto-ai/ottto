@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 565,
-  "content_sha256": "20ea75b9406a34d2f3011ee02a28bb6b464d3768bfbf8f2407d8497f8c75b652",
+  "content_sha256": "ad438affb58e40947b60af3c21464017410522b859d5e50e6bd4aae95cd7f983",
   "files": [
     {
       "executable": false,
@@ -62,7 +62,7 @@
       "executable": false,
       "mode": "0644",
       "path": "Cargo.lock",
-      "sha256": "b4768b579c99b8ab4a418d6804f875e0c0146e6dd92f4b5bc3d21de424effc44",
+      "sha256": "a7f2e4a7ab2bdb19303cddeff090e5c151ab6ec40cc21c07e55c38a49c2d0f3f",
       "size_bytes": 43398
     },
     {
@@ -2652,8 +2652,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-14-claude-rearm-checkpoints.md",
-      "sha256": "6e564ad273332e91db3e8d58b2809054d6ba4643a9dec9915efc589d9751f8b3",
-      "size_bytes": 7107
+      "sha256": "ee6f47b983292638db3ebb7394effcb9568b7e0580bafa2f1c6732127c06fe74",
+      "size_bytes": 7619
     },
     {
       "executable": false,
@@ -3958,7 +3958,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-14T13:39:02+00:00",
+  "generated_at": "2026-10-14T13:48:52+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 566,
   "public_roots": [
@@ -3997,5 +3997,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "3854d23f2dbf74a0249a43fa38eeae0ba6fd3bf3"
+  "source_commit": "808d9595afb98d5fe1d2815905f0c0535e5f4d26"
 }
