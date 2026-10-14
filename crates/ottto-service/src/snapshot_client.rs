@@ -690,6 +690,7 @@ impl SnapshotEntityRejection {
             "hour_bucket_count_above_cap" => "hour_bucket_count_above_cap",
             "divergent_duplicate_logical_session" => "divergent_duplicate_logical_session",
             "accepted_log_transaction_cap" => "accepted_log_transaction_cap",
+            "accepted_log_stale_older_upload" => "accepted_log_stale_older_upload",
             "occurred_at_beyond_write_fence_future" => "occurred_at_beyond_write_fence_future",
             "occurred_at_beyond_journal_retention" => "occurred_at_beyond_journal_retention",
             "body_exceeds_max_bytes" => "body_exceeds_max_bytes",
@@ -2960,6 +2961,22 @@ mod tests {
     use super::*;
     use crate::snapshots::{CODEX_SNAPSHOT_PARSER_VERSION, SNAPSHOT_SCHEMA_VERSION};
     use std::io::Read;
+
+    #[test]
+    fn stale_older_rejection_reason_is_safe_but_unknown_reasons_are_not() {
+        let mut rejection = SnapshotEntityRejection {
+            source_session_id: "synthetic".into(),
+            snapshot_fingerprint: "a".repeat(64),
+            reason: "accepted_log_stale_older_upload".into(),
+            detail: "private detail".into(),
+            permanent: false,
+            occurrence_count: 1,
+        };
+        assert_eq!(rejection.safe_reason(), "accepted_log_stale_older_upload");
+        assert!(!rejection.permanent);
+        rejection.reason = "future-private-reason".into();
+        assert_eq!(rejection.safe_reason(), "other");
+    }
 
     fn activity_hint_json(extra: &str) -> String {
         format!(

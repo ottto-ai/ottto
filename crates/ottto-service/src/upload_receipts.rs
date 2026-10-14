@@ -114,6 +114,7 @@ pub(crate) enum RejectedUsageReason {
     BodyExceedsMaxBytes,
     OccurredAtRequiresTimezone,
     OccurredAtUtcNormalizationOutOfRange,
+    AcceptedLogStaleOlderUpload,
     Other,
 }
 
@@ -134,6 +135,7 @@ impl RejectedUsageReason {
                 RejectedUsageReason::DivergentDuplicateLogicalSession
             }
             "accepted_log_transaction_cap" => RejectedUsageReason::AcceptedLogTransactionCap,
+            "accepted_log_stale_older_upload" => RejectedUsageReason::AcceptedLogStaleOlderUpload,
             "occurred_at_beyond_write_fence_future" => {
                 RejectedUsageReason::OccurredAtBeyondWriteFenceFuture
             }
@@ -1396,6 +1398,62 @@ mod tests {
     }
 
     #[test]
+    fn stale_older_reason_is_retained_only_as_rejected_receipt_evidence() {
+        let request = proof_request("claude_code", false);
+        let item = &request.snapshots[0];
+        let mut ack = proof_response(&request, false);
+        ack.accepted = 0;
+        ack.sessions_reconciled = 0;
+        ack.accepted_entities.clear();
+        ack.rejected_entities.push(SnapshotEntityRejection {
+            source_session_id: item.source_session_id.clone(),
+            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+            occurrence_count: 1,
+            reason: "accepted_log_stale_older_upload".into(),
+            detail: "must-not-persist".into(),
+            permanent: true,
+        });
+        let proof = evidence(&request, &ack, false).unwrap();
+        assert_eq!(proof.outcome_occurrences["rejected"], 1);
+        assert_eq!(
+            proof
+                .outcome_occurrences
+                .get("accepted")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        let entity = &proof.entities[0];
+        assert_eq!(entity.outcome, "rejected");
+        assert_eq!(entity.snapshot_fingerprint, item.snapshot_fingerprint);
+        let usage = entity.rejection_usage.as_ref().unwrap();
+        assert_eq!(
+            usage.reason,
+            RejectedUsageReason::AcceptedLogStaleOlderUpload
+        );
+        assert!(usage.permanent);
+        let bytes = serde_json::to_string(entity).unwrap();
+        assert!(bytes.contains("accepted_log_stale_older_upload"));
+        assert!(!bytes.contains("must-not-persist"));
+        let restored: ValidatedReceiptEntity = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(restored.rejection_usage.unwrap().reason, usage.reason);
+        // A reason token does not authorize an invalid entity partition.
+        ack.rejected_entities[0].snapshot_fingerprint = "f".repeat(64);
+        assert!(evidence(&request, &ack, false).is_none());
+    }
+
+    #[test]
+    fn unknown_rejection_reasons_still_map_to_other_and_old_other_decodes() {
+        assert_eq!(
+            RejectedUsageReason::from_wire("future-private-reason"),
+            RejectedUsageReason::Other
+        );
+        let old: RejectedUsageReason = serde_json::from_str("\"other\"").unwrap();
+        assert_eq!(old, RejectedUsageReason::Other);
+        assert_eq!(serde_json::to_string(&old).unwrap(), "\"other\"");
+    }
+
+    #[test]
     fn rejected_usage_is_content_free_and_detects_changed_floors_and_grain() {
         let mut request = proof_request("claude_code", false);
         let item = &mut request.snapshots[0];
@@ -1740,6 +1798,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for RejectedUsageReason {
             | Self::BodyExceedsMaxBytes
             | Self::OccurredAtRequiresTimezone
             | Self::OccurredAtUtcNormalizationOutOfRange
+            | Self::AcceptedLogStaleOlderUpload
             | Self::Other => counter.add(0),
         }
     }
