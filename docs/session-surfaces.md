@@ -22,6 +22,22 @@ This surface says where the session ran. It is separate from account login
 probing: `codex app-server` proves a usable CLI identity, not that the Codex
 macOS app is currently open.
 
+## Which sessions are listed
+
+A session enters `active_session_reconciliation.sessions` when a scan sees its
+transcript activity advance and that activity is less than 15 minutes old.
+Later scans keep it listed until its last observed activity is more than 15
+minutes old, even when they read no new activity for it. A scan that re-reads
+a listed session rebuilds its row under the current upload policy and account
+evidence. A row that was not re-read is kept only under the same upload policy,
+and loses its account attribution if current evidence (account or workspace)
+contradicts it.
+Recency is judged on
+the clock when the scan finishes, so a long scan does not reject activity it
+read after it started. `changed_session_count` still counts only the sessions
+whose activity advanced in the latest scan. A source that stops collecting
+(policy tombstone or reconciliation disabled) empties the list.
+
 ## Account attribution
 
 `active_session_reconciliation.sessions[]` attributes a recent session to an

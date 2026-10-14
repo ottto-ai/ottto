@@ -737,7 +737,10 @@ pub struct SourceHealth {
     pub reconciliation_enabled: Option<bool>,
 }
 
-/// Bounded machine-local status from one completed incremental transcript scan.
+/// Bounded machine-local status from the latest completed incremental
+/// transcript scan. `sessions` lists every session with recent activity, kept
+/// across scans until that activity ages out; `changed_session_count` counts
+/// only the sessions whose activity advanced in the latest scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveSessionReconciliation {
     pub reconciled_at: Rfc3339Timestamp,
