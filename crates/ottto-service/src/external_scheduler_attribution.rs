@@ -839,13 +839,29 @@ impl ExternalSchedulerInventory {
             source_session_id: session.source_session_id,
             transcript_path: session.transcript_path,
         };
-        // One lock for the whole check keeps each `launchctl` read and each
-        // tree listing to once per scan.
-        let labels = self
+        // `launchctl` runs outside the lock, so a slow command never stalls
+        // another thread on this scan; what runs under it is kernel reads and
+        // small registry files. Serial scans still ask once per label.
+        let unknown = self
             .live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .owner_labels(host, &query, &candidate_labels);
+            .unknown_labels(&candidate_labels);
+        let looked_up = unknown
+            .into_iter()
+            .map(|label| {
+                let job = live_owner::running_job(host, &label);
+                (label, job)
+            })
+            .collect::<Vec<_>>();
+        let labels = {
+            let mut live = self
+                .live
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            live.record_jobs(looked_up);
+            live.owner_labels(host, &query, &candidate_labels)
+        };
         proven
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

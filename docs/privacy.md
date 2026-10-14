@@ -283,9 +283,10 @@ definition, a bounded `launchctl print` lookup runs at most once per candidate
 job per scan. Only while such a job is running, the daemon reads process
 parents and start times from the kernel, Claude Code's own running-session
 registration files (`sessions/<pid>.json`: pid, session id, process start), and,
-for Codex, the open file paths of that job's process tree, once per scan. A
-registration counts only while its pid still runs with the recorded start. A
-proven job is remembered in memory for that session, bounded, so attribution
+for Codex, the open file paths of the user's own processes in that job's tree,
+once per scan. A registration counts only while its pid still runs with the
+recorded start, and a job only while its pid still runs with the job's start. A
+single proven job is remembered in memory for that session, bounded, so attribution
 survives the job's exit; there is no process watcher. Static
 correlation requires matching schedule time, prompt signature, provider, and
 repository. Interval jobs require a live job-PID relationship. Missing access,

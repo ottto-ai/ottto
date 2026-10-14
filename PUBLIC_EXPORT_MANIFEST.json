@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 636,
-  "content_sha256": "54920c133ee1289721c0f6a1db55a8bb6594e38529a1a76055d630ec0cfb8456",
+  "content_sha256": "ff4d9166efc1794a61220d570bfa5dbf6ec254946343cc352ce0f6c9eba233eb",
   "files": [
     {
       "executable": false,
@@ -902,15 +902,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/external_scheduler_attribution.rs",
-      "sha256": "40a0ab9f5e7dcf95dc3d87833e995a681f92c6c561271daf72f1380013960c54",
-      "size_bytes": 42583
+      "sha256": "b96e0271599eb7385b67e5edb7fabd868bf3fddb087fe0dc604bcbbc00a2ca6c",
+      "size_bytes": 43193
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/external_scheduler_attribution/live_owner.rs",
-      "sha256": "8821605f4b218bbb966bc5a643a54498fbd8c5e07ae8eb30e9bc91eff1b2307c",
-      "size_bytes": 41694
+      "sha256": "96948a8f0812f31025d8cc7f7043a6714ca0298b15af906390559585eedbed23",
+      "size_bytes": 54400
     },
     {
       "executable": false,
@@ -1462,8 +1462,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "e34a73fdf766c3727cd869865be9c7d93f1a27ace9c5f15c75bc6561ad2777f5",
-      "size_bytes": 23390
+      "sha256": "5fa76f0112636f70fc68ef08588090837aa16785e0edcc098189528f1454a069",
+      "size_bytes": 23479
     },
     {
       "executable": false,
@@ -4455,7 +4455,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-14T15:27:02+00:00",
+  "generated_at": "2026-10-14T16:02:12+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 637,
   "public_roots": [

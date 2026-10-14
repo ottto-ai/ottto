@@ -7,12 +7,14 @@
 //! still runs. Codex keeps its rollout open for the life of a session, so the
 //! owner shows up in the open files of a running candidate job's process tree.
 //!
-//! A scan asks `launchctl` about each candidate label at most once, reads each
-//! process at most once, and lists each running job tree's open files at most
-//! once. While no candidate job runs, nothing beyond `launchctl` happens.
-//! A proven owner is remembered for the session, so attribution survives the
-//! job's exit. Any doubt (a pid reused, two live claims, a truncated listing)
-//! yields no proof.
+//! A scan asks `launchctl` about each candidate label at most once and lists
+//! each running job tree's open files at most once. While no candidate job
+//! runs, nothing beyond `launchctl` happens. Process records are read fresh for
+//! every decision, and a job counts only while its pid still runs with the
+//! start read right after `launchctl`, so a pid reused during the scan cannot
+//! stand in for the job or one of its processes. A proven owner is remembered
+//! for the session, so attribution survives the job's exit. Any doubt (a pid
+//! reused, two live claims, two jobs, an incomplete listing) yields no proof.
 
 use crate::snapshots::SnapshotSource;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -24,16 +26,20 @@ const MAX_ANCESTOR_DEPTH: usize = 8;
 const MAX_TREE_DEPTH: usize = 8;
 const MAX_TREE_PROCESSES: usize = 256;
 const MAX_TREE_OPEN_PATHS: usize = 4096;
-const MAX_REMEMBERED_PROCESSES: usize = 4096;
-const MAX_CLAUDE_REGISTRIES: usize = 8;
+/// Claude config dirs whose registry a scan keeps. A registry beyond this is
+/// read again for each session instead of skipped, so whether a session is
+/// checked never depends on the order sessions are scanned in.
+const MAX_CACHED_CLAUDE_REGISTRIES: usize = 64;
 const MAX_PROVEN_SESSIONS: usize = 4096;
-const MAX_PROVEN_LABELS: usize = 8;
+/// launchd starts every job's main process as its own direct child.
+const LAUNCHD_PID: u32 = 1;
 
-/// The parent and start time of a running process.
+/// The parent, start time, and effective user of a running process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ProcessRecord {
     pub(super) parent: u32,
     pub(super) started_unix_seconds: u64,
+    pub(super) uid: u32,
 }
 
 /// A running Claude session's own registration claim. Untrusted until the pid
@@ -52,8 +58,8 @@ pub(super) struct ChildList {
     pub(super) complete: bool,
 }
 
-/// The open file paths of a process. `complete` is false when the listing may
-/// have been cut short.
+/// The open file paths of a process. `complete` is false when the listing
+/// failed or may have been cut short.
 pub(super) struct OpenFileList {
     pub(super) paths: Vec<PathBuf>,
     pub(super) complete: bool,
@@ -66,6 +72,8 @@ pub(super) trait ProcessHost {
     fn children(&self, pid: u32) -> ChildList;
     fn open_files(&self, pid: u32) -> OpenFileList;
     fn claude_sessions(&self, registry: &Path) -> Vec<ClaudeSessionClaim>;
+    /// The effective user the daemon runs as.
+    fn user_id(&self) -> u32;
 }
 
 /// The session a live owner is sought for.
@@ -76,9 +84,33 @@ pub(super) struct OwnerQuery<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct RunningJob {
+pub(super) struct RunningJob {
     pid: u32,
     started_unix_seconds: u64,
+}
+
+impl RunningJob {
+    /// Whether `record` is still the job's own process, not a later process
+    /// that reused its pid.
+    fn is_own_process(&self, record: &ProcessRecord) -> bool {
+        record.started_unix_seconds == self.started_unix_seconds && record.parent == LAUNCHD_PID
+    }
+
+    fn still_runs(&self, host: &impl ProcessHost) -> bool {
+        host.process(self.pid)
+            .is_some_and(|record| self.is_own_process(&record))
+    }
+}
+
+/// The job `launchctl` reports for `label`, anchored to its start time read
+/// right after. Runs a subprocess, so callers keep it outside any lock.
+pub(super) fn running_job(host: &impl ProcessHost, label: &str) -> Option<RunningJob> {
+    let pid = host.launchd_job_pid(label)?;
+    let record = host.process(pid)?;
+    (record.parent == LAUNCHD_PID).then_some(RunningJob {
+        pid,
+        started_unix_seconds: record.started_unix_seconds,
+    })
 }
 
 struct TreeOpenFiles {
@@ -90,12 +122,28 @@ struct TreeOpenFiles {
 #[derive(Default)]
 pub(super) struct LiveScan {
     jobs: BTreeMap<String, Option<RunningJob>>,
-    processes: BTreeMap<u32, Option<ProcessRecord>>,
     claude_registries: BTreeMap<PathBuf, Vec<ClaudeSessionClaim>>,
     job_open_files: BTreeMap<String, TreeOpenFiles>,
 }
 
 impl LiveScan {
+    /// Candidate labels this scan has not yet asked `launchctl` about.
+    pub(super) fn unknown_labels(&self, labels: &[&str]) -> Vec<String> {
+        labels
+            .iter()
+            .filter(|label| !self.jobs.contains_key(**label))
+            .map(|label| (*label).to_string())
+            .collect()
+    }
+
+    /// Jobs looked up outside the scan lock. A label already answered keeps
+    /// its first answer.
+    pub(super) fn record_jobs(&mut self, jobs: Vec<(String, Option<RunningJob>)>) {
+        for (label, job) in jobs {
+            self.jobs.entry(label).or_insert(job);
+        }
+    }
+
     /// Candidate labels whose running job has the session in its process tree.
     pub(super) fn owner_labels(
         &mut self,
@@ -103,7 +151,13 @@ impl LiveScan {
         query: &OwnerQuery<'_>,
         candidate_labels: &[&str],
     ) -> BTreeSet<String> {
-        let jobs = self.running_jobs(host, candidate_labels);
+        // A job that exited since `launchctl` answered, even if its pid now
+        // runs something else, is no longer a candidate.
+        let jobs = self
+            .running_jobs(host, candidate_labels)
+            .into_iter()
+            .filter(|(_, job)| job.still_runs(host))
+            .collect::<Vec<_>>();
         if jobs.is_empty() {
             return BTreeSet::new();
         }
@@ -120,38 +174,16 @@ impl LiveScan {
         host: &impl ProcessHost,
         labels: &[&str],
     ) -> Vec<(String, RunningJob)> {
-        let mut running = Vec::new();
-        for label in labels {
-            let job = match self.jobs.get(*label) {
-                Some(job) => *job,
-                None => {
-                    // The job's own start time anchors every later reuse check.
-                    let job = host.launchd_job_pid(label).and_then(|pid| {
-                        self.process(host, pid).map(|record| RunningJob {
-                            pid,
-                            started_unix_seconds: record.started_unix_seconds,
-                        })
-                    });
-                    self.jobs.insert((*label).to_string(), job);
-                    job
-                }
-            };
-            if let Some(job) = job {
-                running.push(((*label).to_string(), job));
-            }
-        }
-        running
-    }
-
-    fn process(&mut self, host: &impl ProcessHost, pid: u32) -> Option<ProcessRecord> {
-        if let Some(record) = self.processes.get(&pid) {
-            return *record;
-        }
-        let record = host.process(pid);
-        if self.processes.len() < MAX_REMEMBERED_PROCESSES {
-            self.processes.insert(pid, record);
-        }
-        record
+        labels
+            .iter()
+            .filter_map(|label| {
+                let job = *self
+                    .jobs
+                    .entry((*label).to_string())
+                    .or_insert_with(|| running_job(host, label));
+                job.map(|job| ((*label).to_string(), job))
+            })
+            .collect()
     }
 
     fn claude_owner_labels(
@@ -167,22 +199,22 @@ impl LiveScan {
             .transcript_path
             .file_stem()
             .and_then(|value| value.to_str());
-        let claims = self
+        let user = host.user_id();
+        // A claim counts only while its pid still runs, as this user, with
+        // the claimed start; a stale file whose pid was reused names a
+        // different process.
+        let owners = self
             .claude_claims(host, &registry)
             .into_iter()
             .filter(|claim| {
                 claim.session_id == query.source_session_id
                     || Some(claim.session_id.as_str()) == transcript_stem
             })
-            .collect::<Vec<_>>();
-        // A claim counts only while its pid still runs with the claimed start;
-        // a stale file whose pid was reused names a different process.
-        let owners = claims
-            .into_iter()
             .filter_map(|claim| {
-                let record = self.process(host, claim.pid)?;
-                (process_start_witness(record.started_unix_seconds).as_deref()
-                    == Some(claim.proc_start.trim()))
+                let record = host.process(claim.pid)?;
+                (record.uid == user
+                    && process_start_witness(record.started_unix_seconds).as_deref()
+                        == Some(claim.proc_start.trim()))
                 .then_some((claim.pid, record))
             })
             .collect::<BTreeMap<_, _>>();
@@ -193,11 +225,18 @@ impl LiveScan {
         let Some((owner, record)) = owners.into_iter().next() else {
             return BTreeSet::new();
         };
-        let ancestors = self.ancestors(host, owner, record);
+        let ancestors = ancestors(host, owner, record);
+        // A chain read while the owner was reparented or replaced proves
+        // nothing.
+        if host.process(owner) != Some(record) {
+            return BTreeSet::new();
+        }
         jobs.iter()
             .filter(|(_, job)| {
-                ancestors.contains(&job.pid)
-                    && job.started_unix_seconds <= record.started_unix_seconds
+                job.started_unix_seconds <= record.started_unix_seconds
+                    && ancestors
+                        .get(&job.pid)
+                        .is_some_and(|ancestor| job.is_own_process(ancestor))
             })
             .map(|(label, _)| label.clone())
             .collect()
@@ -211,39 +250,12 @@ impl LiveScan {
         if let Some(claims) = self.claude_registries.get(registry) {
             return claims.clone();
         }
-        if self.claude_registries.len() >= MAX_CLAUDE_REGISTRIES {
-            return Vec::new();
-        }
         let claims = host.claude_sessions(registry);
-        self.claude_registries
-            .insert(registry.to_path_buf(), claims.clone());
-        claims
-    }
-
-    /// The owner and its ancestors. A parent must have started no later than
-    /// its child; otherwise the parent pid was reused and the walk stops.
-    fn ancestors(
-        &mut self,
-        host: &impl ProcessHost,
-        owner: u32,
-        record: ProcessRecord,
-    ) -> BTreeSet<u32> {
-        let mut values = BTreeSet::from([owner]);
-        let (mut pid, mut child) = (record.parent, record);
-        for _ in 0..MAX_ANCESTOR_DEPTH {
-            if pid <= 1 || values.contains(&pid) {
-                break;
-            }
-            let Some(parent) = self.process(host, pid) else {
-                break;
-            };
-            if parent.started_unix_seconds > child.started_unix_seconds {
-                break;
-            }
-            values.insert(pid);
-            (pid, child) = (parent.parent, parent);
+        if self.claude_registries.len() < MAX_CACHED_CLAUDE_REGISTRIES {
+            self.claude_registries
+                .insert(registry.to_path_buf(), claims.clone());
         }
-        values
+        claims
     }
 
     fn open_file_owner_labels(
@@ -259,7 +271,7 @@ impl LiveScan {
                 .job_open_files
                 .entry(label.clone())
                 .or_insert_with(|| tree_open_files(host, *job));
-            // A cut-short listing of any running candidate could hide a
+            // An incomplete listing of any running candidate could hide a
             // second owner, so it cannot back a unique answer.
             if !files.complete {
                 return BTreeSet::new();
@@ -276,18 +288,48 @@ impl LiveScan {
     }
 }
 
-/// Open files across a running job's process tree. A process counts only when
-/// it is still the listed parent's child, started no earlier than that parent,
-/// and kept the same parent and start across its listing, so a reused pid is
-/// skipped.
+/// The owner and its ancestors, each read fresh. A parent must have started
+/// no later than its child; otherwise the parent pid was reused and the walk
+/// stops.
+fn ancestors(
+    host: &impl ProcessHost,
+    owner: u32,
+    record: ProcessRecord,
+) -> BTreeMap<u32, ProcessRecord> {
+    let mut values = BTreeMap::from([(owner, record)]);
+    let (mut pid, mut child) = (record.parent, record);
+    for _ in 0..MAX_ANCESTOR_DEPTH {
+        if pid <= LAUNCHD_PID || values.contains_key(&pid) {
+            break;
+        }
+        let Some(parent) = host.process(pid) else {
+            break;
+        };
+        if parent.started_unix_seconds > child.started_unix_seconds {
+            break;
+        }
+        values.insert(pid, parent);
+        (pid, child) = (parent.parent, parent);
+    }
+    values
+}
+
+/// Open files across a running job's process tree. The root must still be the
+/// job's own process. Any other process counts only when it is still the
+/// listed parent's child and started no earlier than that parent, so a reused
+/// pid is skipped. A process owned by another user cannot hold the user's
+/// transcript, so only its children are walked. A failed or cut-short listing,
+/// or a process that changed while it was listed, leaves the result
+/// incomplete.
 fn tree_open_files(host: &impl ProcessHost, job: RunningJob) -> TreeOpenFiles {
+    let user = host.user_id();
     let mut files = TreeOpenFiles {
         paths: BTreeSet::new(),
         complete: true,
     };
     let mut visited = BTreeSet::new();
-    let mut queue = VecDeque::from([(job.pid, None, job.started_unix_seconds, 0_usize)]);
-    while let Some((pid, parent, parent_started, depth)) = queue.pop_front() {
+    let mut queue = VecDeque::from([(job.pid, None::<(u32, u64)>, 0_usize)]);
+    while let Some((pid, parent, depth)) = queue.pop_front() {
         if !visited.insert(pid) {
             continue;
         }
@@ -295,23 +337,34 @@ fn tree_open_files(host: &impl ProcessHost, job: RunningJob) -> TreeOpenFiles {
             files.complete = false;
             break;
         }
-        let Some(before) = host.process(pid) else {
+        let before = host.process(pid).filter(|record| match parent {
+            None => job.is_own_process(record),
+            Some((parent, parent_started)) => {
+                record.parent == parent && record.started_unix_seconds >= parent_started
+            }
+        });
+        let Some(before) = before else {
+            // Without its own process the job no longer runs at all.
+            if parent.is_none() {
+                files.complete = false;
+            }
             continue;
         };
-        if before.started_unix_seconds < parent_started
-            || parent.is_some_and(|parent| parent != before.parent)
-        {
-            continue;
-        }
         let children = host.children(pid);
-        let open = host.open_files(pid);
-        if host.process(pid) != Some(before) {
-            continue;
+        let open = (before.uid == user).then(|| host.open_files(pid));
+        match host.process(pid) {
+            Some(after) if after == before => {}
+            // Exited meanwhile: it holds nothing now.
+            None if parent.is_some() => continue,
+            _ => {
+                files.complete = false;
+                continue;
+            }
         }
-        if !children.complete || !open.complete {
+        if !children.complete || open.as_ref().is_some_and(|open| !open.complete) {
             files.complete = false;
         }
-        for path in open.paths {
+        for path in open.map(|open| open.paths).unwrap_or_default() {
             if files.paths.len() >= MAX_TREE_OPEN_PATHS {
                 files.complete = false;
                 break;
@@ -322,11 +375,28 @@ fn tree_open_files(host: &impl ProcessHost, job: RunningJob) -> TreeOpenFiles {
             children
                 .pids
                 .into_iter()
-                .filter(|child| *child > 1)
-                .map(|child| (child, Some(pid), before.started_unix_seconds, depth + 1)),
+                .filter(|child| *child > LAUNCHD_PID)
+                .map(|child| (child, Some((pid, before.started_unix_seconds)), depth + 1)),
         );
     }
     files
+}
+
+/// Whole entries in a `PROC_PIDLISTFDS` result of `written` bytes, or `None`
+/// when the listing proves nothing. libproc reports a failure (no permission,
+/// process gone) as 0 rather than -1, and a process without any descriptor
+/// cannot be told apart from that. A partial entry is a short write, and a
+/// full buffer may have been cut short.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn listed_descriptor_count(written: i32, entry_size: usize, capacity: usize) -> Option<usize> {
+    let written = usize::try_from(written)
+        .ok()
+        .filter(|written| *written > 0)?;
+    if entry_size == 0 || written % entry_size != 0 {
+        return None;
+    }
+    let count = written / entry_size;
+    (count < capacity).then_some(count)
 }
 
 /// `<config>/sessions` for a transcript at `<config>/projects/<slug>/<id>.jsonl`.
@@ -361,52 +431,49 @@ pub(super) fn process_start_witness(started_unix_seconds: u64) -> Option<String>
     ))
 }
 
-/// Sessions already proven to run under a job, so a later scan keeps the
-/// attribution after the job and its registration are gone. Bounded; the
+/// Sessions already proven to run under a single job, so a later scan keeps
+/// the attribution after the job and its registration are gone. Bounded; the
 /// oldest proof is forgotten first.
 #[derive(Default)]
 pub(super) struct ProvenOwners {
     order: VecDeque<(&'static str, String)>,
-    labels: BTreeMap<(&'static str, String), BTreeSet<String>>,
+    owners: BTreeMap<(&'static str, String), String>,
 }
 
 impl ProvenOwners {
     pub(super) fn labels(&self, source: SnapshotSource, session_id: &str) -> BTreeSet<String> {
-        self.labels
+        self.owners
             .get(&(source.api_slug(), session_id.to_string()))
             .cloned()
-            .unwrap_or_default()
+            .into_iter()
+            .collect()
     }
 
+    /// Keeps only a unique owner. Two or more labels are an ambiguous answer
+    /// that a later scan must stay free to settle.
     pub(super) fn remember(
         &mut self,
         source: SnapshotSource,
         session_id: &str,
         labels: &BTreeSet<String>,
     ) {
-        if session_id.is_empty() || labels.is_empty() {
+        if session_id.is_empty() || labels.len() != 1 {
             return;
         }
+        let Some(label) = labels.first() else {
+            return;
+        };
         let key = (source.api_slug(), session_id.to_string());
-        if let Some(current) = self.labels.get_mut(&key) {
-            for label in labels {
-                if current.len() >= MAX_PROVEN_LABELS {
-                    break;
-                }
-                current.insert(label.clone());
-            }
+        if self.owners.contains_key(&key) {
             return;
         }
         while self.order.len() >= MAX_PROVEN_SESSIONS {
             if let Some(oldest) = self.order.pop_front() {
-                self.labels.remove(&oldest);
+                self.owners.remove(&oldest);
             }
         }
         self.order.push_back(key.clone());
-        self.labels.insert(
-            key,
-            labels.iter().take(MAX_PROVEN_LABELS).cloned().collect(),
-        );
+        self.owners.insert(key, label.clone());
     }
 }
 
@@ -479,6 +546,7 @@ mod native {
             (info.pbi_pid == pid && info.pbi_start_tvsec > 0).then_some(ProcessRecord {
                 parent: info.pbi_ppid,
                 started_unix_seconds: info.pbi_start_tvsec,
+                uid: info.pbi_uid,
             })
         }
 
@@ -523,10 +591,9 @@ mod native {
             let Ok(kernel_pid) = libc::pid_t::try_from(pid) else {
                 return incomplete;
             };
+            let entry = std::mem::size_of::<libc::proc_fdinfo>();
             let mut descriptors = Vec::<libc::proc_fdinfo>::with_capacity(MAX_FILE_DESCRIPTORS);
-            let Ok(bytes) = libc::c_int::try_from(
-                MAX_FILE_DESCRIPTORS * std::mem::size_of::<libc::proc_fdinfo>(),
-            ) else {
+            let Ok(bytes) = libc::c_int::try_from(MAX_FILE_DESCRIPTORS * entry) else {
                 return incomplete;
             };
             // SAFETY: the vector's spare capacity is writable for `bytes`
@@ -540,27 +607,27 @@ mod native {
                     bytes,
                 )
             };
-            let Ok(written) = usize::try_from(written) else {
+            let Some(count) = super::listed_descriptor_count(written, entry, MAX_FILE_DESCRIPTORS)
+            else {
                 return incomplete;
             };
-            let count = written / std::mem::size_of::<libc::proc_fdinfo>();
-            if count > MAX_FILE_DESCRIPTORS {
-                return incomplete;
-            }
-            // SAFETY: the kernel initialized `count` whole entries.
+            // SAFETY: the kernel initialized `count` whole entries, and
+            // `count` is below the capacity.
             unsafe { descriptors.set_len(count) };
             let mut paths = Vec::new();
             for descriptor in descriptors {
                 if descriptor.proc_fdtype != libc::PROX_FDTYPE_VNODE as u32 {
                     continue;
                 }
-                if let Some(path) = vnode_path(kernel_pid, descriptor.proc_fd) {
-                    paths.push(path);
-                }
+                // An unreadable vnode could be the transcript.
+                let Some(path) = vnode_path(kernel_pid, descriptor.proc_fd) else {
+                    return incomplete;
+                };
+                paths.extend(path);
             }
             OpenFileList {
                 paths,
-                complete: count < MAX_FILE_DESCRIPTORS,
+                complete: true,
             }
         }
 
@@ -574,9 +641,16 @@ mod native {
                 })
                 .collect()
         }
+
+        fn user_id(&self) -> u32 {
+            // SAFETY: `geteuid` has no preconditions and does not access memory.
+            unsafe { libc::geteuid() }
+        }
     }
 
-    fn vnode_path(pid: libc::pid_t, fd: i32) -> Option<PathBuf> {
+    /// The path of a vnode descriptor: `None` when the kernel would not
+    /// describe it, `Some(None)` when it has no path (for example unlinked).
+    fn vnode_path(pid: libc::pid_t, fd: i32) -> Option<Option<PathBuf>> {
         use std::os::unix::ffi::OsStrExt;
         let mut info = std::mem::MaybeUninit::<VnodeFdInfoWithPath>::zeroed();
         let size = libc::c_int::try_from(std::mem::size_of::<VnodeFdInfoWithPath>()).ok()?;
@@ -603,16 +677,17 @@ mod native {
             .flatten()
             .map(|value| *value as u8)
             .collect::<Vec<_>>();
+        // A path the kernel did not terminate was cut short.
         let end = raw.iter().position(|value| *value == 0)?;
-        (end > 0).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&raw[..end])))
+        Some((end > 0).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&raw[..end]))))
     }
 }
 
-crate::heap_layout_bound::fields!(LiveScan; jobs, processes, claude_registries, job_open_files);
+crate::heap_layout_bound::fields!(LiveScan; jobs, claude_registries, job_open_files);
 
 crate::heap_layout_bound::fields!(RunningJob; pid, started_unix_seconds);
 
-crate::heap_layout_bound::fields!(ProcessRecord; parent, started_unix_seconds);
+crate::heap_layout_bound::fields!(ProcessRecord; parent, started_unix_seconds, uid);
 
 crate::heap_layout_bound::fields!(ClaudeSessionClaim; pid, session_id, proc_start);
 
@@ -632,9 +707,16 @@ mod tests {
     #[derive(Default)]
     struct FakeHost {
         jobs: BTreeMap<String, u32>,
-        processes: BTreeMap<u32, ProcessRecord>,
+        processes: RefCell<BTreeMap<u32, ProcessRecord>>,
+        /// Once a pid has been read this many times, it reads as the given
+        /// record from then on (`None`: exited), mid-call if need be.
+        replaced: BTreeMap<u32, (usize, Option<ProcessRecord>)>,
+        reads: RefCell<BTreeMap<u32, usize>>,
         children: BTreeMap<u32, Vec<u32>>,
+        cut_short_children: BTreeSet<u32>,
         open_files: BTreeMap<u32, Vec<PathBuf>>,
+        failed_listings: BTreeSet<u32>,
+        listed: RefCell<Vec<u32>>,
         calls: RefCell<Vec<&'static str>>,
     }
 
@@ -645,17 +727,30 @@ mod tests {
         }
         fn process(&self, pid: u32) -> Option<ProcessRecord> {
             self.calls.borrow_mut().push("process");
-            self.processes.get(&pid).copied()
+            let mut reads = self.reads.borrow_mut();
+            let read = reads.entry(pid).or_default();
+            *read += 1;
+            match self.replaced.get(&pid) {
+                Some((after, record)) if *read > *after => *record,
+                _ => self.processes.borrow().get(&pid).copied(),
+            }
         }
         fn children(&self, pid: u32) -> ChildList {
             self.calls.borrow_mut().push("children");
             ChildList {
                 pids: self.children.get(&pid).cloned().unwrap_or_default(),
-                complete: true,
+                complete: !self.cut_short_children.contains(&pid),
             }
         }
         fn open_files(&self, pid: u32) -> OpenFileList {
             self.calls.borrow_mut().push("open_files");
+            self.listed.borrow_mut().push(pid);
+            if self.failed_listings.contains(&pid) {
+                return OpenFileList {
+                    paths: Vec::new(),
+                    complete: false,
+                };
+            }
             OpenFileList {
                 paths: self.open_files.get(&pid).cloned().unwrap_or_default(),
                 complete: true,
@@ -673,11 +768,18 @@ mod tests {
                 })
                 .collect()
         }
+        fn user_id(&self) -> u32 {
+            USER
+        }
     }
 
     impl FakeHost {
         fn calls(&self) -> Vec<&'static str> {
             self.calls.borrow().clone()
+        }
+
+        fn set(&self, pid: u32, record: ProcessRecord) {
+            self.processes.borrow_mut().insert(pid, record);
         }
     }
 
@@ -685,6 +787,7 @@ mod tests {
     const OTHER_JOB: &str = "com.example.other";
     const JOB_STARTED: u64 = 1_791_989_000;
     const OWNER_STARTED: u64 = 1_791_989_736;
+    const USER: u32 = 501;
 
     fn scan_inventory(source: SnapshotSource, labels: &[&str]) -> ExternalSchedulerInventory {
         ExternalSchedulerInventory::from_definitions(
@@ -715,6 +818,14 @@ mod tests {
             repository_hash: Some("repository"),
             source_started_at: Some("2026-10-14T14:55:37Z"),
             source_session_id: session_id,
+            transcript_path,
+        }
+    }
+
+    fn query<'a>(source: SnapshotSource, transcript_path: &'a Path) -> OwnerQuery<'a> {
+        OwnerQuery {
+            source,
+            source_session_id: "session",
             transcript_path,
         }
     }
@@ -761,18 +872,33 @@ mod tests {
     fn job_tree() -> FakeHost {
         FakeHost {
             jobs: BTreeMap::from([(JOB.to_string(), 500)]),
-            processes: BTreeMap::from([
+            processes: RefCell::new(BTreeMap::from([
                 (500, record(1, JOB_STARTED)),
                 (600, record(500, JOB_STARTED)),
                 (700, record(600, OWNER_STARTED)),
-            ]),
+            ])),
             children: BTreeMap::from([(500, vec![600]), (600, vec![700])]),
             ..FakeHost::default()
         }
     }
 
+    /// `job_tree` with provider 700 holding `rollout` open.
+    fn codex_job_tree(rollout: &Path) -> FakeHost {
+        let mut host = job_tree();
+        host.open_files.insert(700, vec![rollout.to_path_buf()]);
+        host
+    }
+
     fn witness() -> String {
         process_start_witness(OWNER_STARTED).expect("witness")
+    }
+
+    fn record(parent: u32, started_unix_seconds: u64) -> ProcessRecord {
+        ProcessRecord {
+            parent,
+            started_unix_seconds,
+            uid: USER,
+        }
     }
 
     #[test]
@@ -806,17 +932,15 @@ mod tests {
             &fixture.transcript,
         );
         // Pid 700 now belongs to a process that started later.
-        let mut reused = job_tree();
-        reused
-            .processes
-            .insert(700, record(600, OWNER_STARTED + 60));
+        let reused = job_tree();
+        reused.set(700, record(600, OWNER_STARTED + 60));
         let proven = Mutex::new(ProvenOwners::default());
         assert!(inventory
             .live_owner_labels(&session, &reused, &proven, SystemTime::now())
             .is_empty());
         // Pid 700 is gone; the registration file is stale.
-        let mut exited = job_tree();
-        exited.processes.remove(&700);
+        let exited = job_tree();
+        exited.processes.borrow_mut().remove(&700);
         let inventory = scan_inventory(SnapshotSource::ClaudeCode, &[JOB]);
         assert!(inventory
             .live_owner_labels(&session, &exited, &proven, SystemTime::now())
@@ -824,11 +948,82 @@ mod tests {
     }
 
     #[test]
-    fn two_live_claims_on_one_claude_session_prove_nothing() {
-        let fixture = ClaudeFixture::new("claude-session", &[(700, &witness()), (701, &witness())]);
+    fn claude_chain_through_a_reused_or_changed_process_proves_nothing() {
+        let fixture = ClaudeFixture::new("claude-session", &[(700, &witness())]);
+        let query = query(SnapshotSource::ClaudeCode, &fixture.transcript);
+        // The shell's pid now runs a process that started after the owner.
+        let reused_ancestor = job_tree();
+        reused_ancestor.set(600, record(500, OWNER_STARTED + 5));
+        // The owner was reparented while its chain was read.
+        let mut reparented = job_tree();
+        reparented
+            .replaced
+            .insert(700, (1, Some(record(1, OWNER_STARTED))));
+        // The owner is younger than the job, but its chain no longer reaches it.
+        let changed_parent = job_tree();
+        changed_parent.set(700, record(650, OWNER_STARTED));
+        changed_parent.set(650, record(1, JOB_STARTED));
+        for host in [reused_ancestor, reparented, changed_parent] {
+            assert!(LiveScan::default()
+                .owner_labels(&host, &query, &[JOB])
+                .is_empty());
+        }
+        // Control: the unchanged tree proves the job.
+        assert_eq!(
+            LiveScan::default().owner_labels(&job_tree(), &query, &[JOB]),
+            BTreeSet::from([JOB.to_string()])
+        );
+    }
+
+    #[test]
+    fn job_pid_reused_within_a_scan_proves_nothing_for_claude() {
+        let first = ClaudeFixture::new("first-session", &[(700, &witness())]);
+        let reused_started = OWNER_STARTED + 100;
+        let second = ClaudeFixture::new(
+            "second-session",
+            &[(
+                710,
+                &process_start_witness(reused_started + 1).expect("witness"),
+            )],
+        );
+        let host = job_tree();
+        let mut scan = LiveScan::default();
+        assert_eq!(
+            scan.owner_labels(
+                &host,
+                &query(SnapshotSource::ClaudeCode, &first.transcript),
+                &[JOB]
+            ),
+            BTreeSet::from([JOB.to_string()])
+        );
+        // The job exits; its pid now runs an unrelated launchd child that
+        // starts a Claude session of its own.
+        host.set(500, record(1, reused_started));
+        host.set(710, record(500, reused_started + 1));
+        assert!(scan
+            .owner_labels(
+                &host,
+                &query(SnapshotSource::ClaudeCode, &second.transcript),
+                &[JOB]
+            )
+            .is_empty());
+        assert_eq!(
+            host.calls()
+                .iter()
+                .filter(|call| **call == "launchctl")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn users_own_claude_session_outside_the_job_proves_nothing() {
+        let fixture = ClaudeFixture::new("claude-session", &[(900, &witness())]);
         let inventory = scan_inventory(SnapshotSource::ClaudeCode, &[JOB]);
-        let mut host = job_tree();
-        host.processes.insert(701, record(600, OWNER_STARTED));
+        // The job runs, but the session belongs to a terminal shell.
+        let host = job_tree();
+        host.set(800, record(1, JOB_STARTED - 3_600));
+        host.set(900, record(800, OWNER_STARTED));
         let proven = Mutex::new(ProvenOwners::default());
         let session = session(
             SnapshotSource::ClaudeCode,
@@ -838,6 +1033,48 @@ mod tests {
         assert!(inventory
             .live_owner_labels(&session, &host, &proven, SystemTime::now())
             .is_empty());
+        assert!(!host.calls().contains(&"open_files"));
+        assert!(proven
+            .lock()
+            .expect("proven")
+            .labels(SnapshotSource::ClaudeCode, "claude-session")
+            .is_empty());
+    }
+
+    #[test]
+    fn two_live_claims_on_one_claude_session_prove_nothing() {
+        let fixture = ClaudeFixture::new("claude-session", &[(700, &witness()), (701, &witness())]);
+        let inventory = scan_inventory(SnapshotSource::ClaudeCode, &[JOB]);
+        let host = job_tree();
+        host.set(701, record(600, OWNER_STARTED));
+        let proven = Mutex::new(ProvenOwners::default());
+        let session = session(
+            SnapshotSource::ClaudeCode,
+            "claude-session",
+            &fixture.transcript,
+        );
+        assert!(inventory
+            .live_owner_labels(&session, &host, &proven, SystemTime::now())
+            .is_empty());
+    }
+
+    #[test]
+    fn claude_registries_beyond_the_scan_cache_are_still_checked() {
+        let fixture = ClaudeFixture::new("claude-session", &[(700, &witness())]);
+        let host = job_tree();
+        let mut scan = LiveScan::default();
+        for index in 0..MAX_CACHED_CLAUDE_REGISTRIES {
+            scan.claude_claims(&host, Path::new(&format!("/missing/{index}/sessions")));
+        }
+        assert_eq!(
+            scan.owner_labels(
+                &host,
+                &query(SnapshotSource::ClaudeCode, &fixture.transcript),
+                &[JOB]
+            ),
+            BTreeSet::from([JOB.to_string()])
+        );
+        assert_eq!(scan.claude_registries.len(), MAX_CACHED_CLAUDE_REGISTRIES);
     }
 
     #[test]
@@ -874,20 +1111,111 @@ mod tests {
 
     #[test]
     fn codex_process_older_than_its_job_is_a_reused_pid() {
-        let scratch = crate::test_scratch::private_dir("ottto-live-owner-codex");
-        let rollout = scratch.join("rollout.jsonl");
-        fs::write(&rollout, "{}\n").expect("rollout");
-        let mut host = job_tree();
-        host.processes.insert(700, record(600, JOB_STARTED - 1));
-        host.open_files
-            .insert(700, vec![fs::canonicalize(&rollout).expect("path")]);
-        let inventory = scan_inventory(SnapshotSource::Codex, &[JOB]);
-        let proven = Mutex::new(ProvenOwners::default());
-        let session = session(SnapshotSource::Codex, "rollout", &rollout);
-        assert!(inventory
-            .live_owner_labels(&session, &host, &proven, SystemTime::now())
+        let rollout = PathBuf::from("/h/.codex/sessions/rollout-a.jsonl");
+        let host = codex_job_tree(&rollout);
+        host.set(700, record(600, JOB_STARTED - 1));
+        assert!(LiveScan::default()
+            .owner_labels(&host, &query(SnapshotSource::Codex, &rollout), &[JOB])
             .is_empty());
-        let _ = fs::remove_dir_all(scratch);
+    }
+
+    #[test]
+    fn an_incomplete_tree_listing_proves_nothing() {
+        let rollout = PathBuf::from("/h/.codex/sessions/rollout-a.jsonl");
+        let query = query(SnapshotSource::Codex, &rollout);
+        // The shell's listing failed, so it may hold the rollout too.
+        let mut failed = codex_job_tree(&rollout);
+        failed.failed_listings.insert(600);
+        // The job's children did not all fit.
+        let mut cut_short = codex_job_tree(&rollout);
+        cut_short.cut_short_children.insert(500);
+        for host in [failed, cut_short] {
+            assert!(LiveScan::default()
+                .owner_labels(&host, &query, &[JOB])
+                .is_empty());
+        }
+        assert_eq!(
+            LiveScan::default().owner_labels(&codex_job_tree(&rollout), &query, &[JOB]),
+            BTreeSet::from([JOB.to_string()])
+        );
+    }
+
+    #[test]
+    fn another_users_process_in_the_tree_is_skipped_up_front() {
+        let rollout = PathBuf::from("/h/.codex/sessions/rollout-a.jsonl");
+        let mut host = codex_job_tree(&rollout);
+        // A root helper under the job; listing it would fail.
+        host.set(
+            650,
+            ProcessRecord {
+                uid: 0,
+                ..record(500, JOB_STARTED)
+            },
+        );
+        host.children.insert(500, vec![600, 650]);
+        host.failed_listings.insert(650);
+        assert_eq!(
+            LiveScan::default().owner_labels(
+                &host,
+                &query(SnapshotSource::Codex, &rollout),
+                &[JOB]
+            ),
+            BTreeSet::from([JOB.to_string()])
+        );
+        assert!(!host.listed.borrow().contains(&650));
+    }
+
+    #[test]
+    fn codex_child_with_a_changed_parent_or_changing_mid_listing_proves_nothing() {
+        let rollout = PathBuf::from("/h/.codex/sessions/rollout-a.jsonl");
+        let query = query(SnapshotSource::Codex, &rollout);
+        // Listed under the shell, but its parent is now another process.
+        let changed_parent = codex_job_tree(&rollout);
+        changed_parent.set(700, record(650, OWNER_STARTED));
+        // Pid 700 was reused between its two reads around the listing.
+        let mut replaced = codex_job_tree(&rollout);
+        replaced
+            .replaced
+            .insert(700, (1, Some(record(600, OWNER_STARTED + 1))));
+        for host in [changed_parent, replaced] {
+            assert!(LiveScan::default()
+                .owner_labels(&host, &query, &[JOB])
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn job_pid_reused_within_a_scan_proves_nothing_for_codex() {
+        let first = PathBuf::from("/h/.codex/sessions/rollout-first.jsonl");
+        let second = PathBuf::from("/h/.codex/sessions/rollout-second.jsonl");
+        let reused = record(1, JOB_STARTED + 100);
+        // After the listing: the job exits and its pid is reused, so the
+        // listing taken earlier no longer stands for a running job.
+        let mut host = job_tree();
+        host.open_files
+            .insert(700, vec![first.clone(), second.clone()]);
+        let mut scan = LiveScan::default();
+        assert_eq!(
+            scan.owner_labels(&host, &query(SnapshotSource::Codex, &first), &[JOB]),
+            BTreeSet::from([JOB.to_string()])
+        );
+        host.set(500, reused);
+        assert!(scan
+            .owner_labels(&host, &query(SnapshotSource::Codex, &second), &[JOB])
+            .is_empty());
+        // Before the listing: the pid is reused after the job is confirmed
+        // but before its tree is read, and the reused process holds the
+        // rollout.
+        let mut host = FakeHost {
+            jobs: BTreeMap::from([(JOB.to_string(), 500)]),
+            processes: RefCell::new(BTreeMap::from([(500, record(1, JOB_STARTED))])),
+            open_files: BTreeMap::from([(500, vec![first.clone()])]),
+            ..FakeHost::default()
+        };
+        host.replaced.insert(500, (2, Some(reused)));
+        assert!(LiveScan::default()
+            .owner_labels(&host, &query(SnapshotSource::Codex, &first), &[JOB])
+            .is_empty());
     }
 
     #[test]
@@ -946,17 +1274,17 @@ mod tests {
     }
 
     #[test]
-    fn rollout_open_under_two_equal_jobs_is_ambiguous() {
+    fn rollout_open_under_two_equal_jobs_is_ambiguous_and_not_remembered() {
         let scratch = crate::test_scratch::private_dir("ottto-live-owner-codex");
         let rollout = scratch.join("rollout.jsonl");
         fs::write(&rollout, "{}\n").expect("rollout");
         let path = fs::canonicalize(&rollout).expect("path");
         let host = FakeHost {
             jobs: BTreeMap::from([(JOB.to_string(), 500), (OTHER_JOB.to_string(), 800)]),
-            processes: BTreeMap::from([
+            processes: RefCell::new(BTreeMap::from([
                 (500, record(1, JOB_STARTED)),
                 (800, record(1, JOB_STARTED)),
-            ]),
+            ])),
             open_files: BTreeMap::from([(500, vec![path.clone()]), (800, vec![path])]),
             ..FakeHost::default()
         };
@@ -968,14 +1296,12 @@ mod tests {
         assert!(inventory
             .correlate_with_live_labels(session, &labels)
             .is_none());
+        assert!(proven
+            .lock()
+            .expect("proven")
+            .labels(SnapshotSource::Codex, "rollout")
+            .is_empty());
         let _ = fs::remove_dir_all(scratch);
-    }
-
-    fn record(parent: u32, started_unix_seconds: u64) -> ProcessRecord {
-        ProcessRecord {
-            parent,
-            started_unix_seconds,
-        }
     }
 
     #[test]
@@ -1006,43 +1332,13 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_short_tree_listing_proves_nothing() {
-        struct Truncating(FakeHost);
-        impl ProcessHost for Truncating {
-            fn launchd_job_pid(&self, label: &str) -> Option<u32> {
-                self.0.launchd_job_pid(label)
-            }
-            fn process(&self, pid: u32) -> Option<ProcessRecord> {
-                self.0.process(pid)
-            }
-            fn children(&self, pid: u32) -> ChildList {
-                self.0.children(pid)
-            }
-            fn open_files(&self, pid: u32) -> OpenFileList {
-                OpenFileList {
-                    complete: false,
-                    ..self.0.open_files(pid)
-                }
-            }
-            fn claude_sessions(&self, registry: &Path) -> Vec<ClaudeSessionClaim> {
-                self.0.claude_sessions(registry)
-            }
-        }
-        let rollout = PathBuf::from("/h/.codex/sessions/rollout-a.jsonl");
-        let host = Truncating(FakeHost {
-            jobs: BTreeMap::from([("job".to_string(), 50)]),
-            processes: BTreeMap::from([(50, record(1, 100))]),
-            open_files: BTreeMap::from([(50, vec![rollout.clone()])]),
-            ..FakeHost::default()
-        });
-        let query = OwnerQuery {
-            source: SnapshotSource::Codex,
-            source_session_id: "a",
-            transcript_path: &rollout,
-        };
-        assert!(LiveScan::default()
-            .owner_labels(&host, &query, &["job"])
-            .is_empty());
+    fn a_failed_or_partial_descriptor_listing_proves_nothing() {
+        // libproc reports failure as 0, sometimes -1.
+        assert_eq!(listed_descriptor_count(0, 8, 2048), None);
+        assert_eq!(listed_descriptor_count(-1, 8, 2048), None);
+        assert_eq!(listed_descriptor_count(8 * 3 + 4, 8, 2048), None);
+        assert_eq!(listed_descriptor_count(8 * 2048, 8, 2048), None);
+        assert_eq!(listed_descriptor_count(8 * 3, 8, 2048), Some(3));
     }
 
     #[test]
@@ -1064,6 +1360,7 @@ mod tests {
         let host = NativeHost;
         let pid = std::process::id();
         let own = host.process(pid).expect("own process record");
+        assert_eq!(own.uid, host.user_id());
         // The native start must render exactly as `ps` renders it, since
         // Claude writes `procStart` from `ps`.
         let ps = crate::external_scheduler_attribution::bounded_command_stdout_with_env(
@@ -1087,6 +1384,12 @@ mod tests {
         assert!(open.complete);
         assert!(open.paths.contains(&resolved));
         drop(file);
+
+        // launchd's descriptors are off limits to a normal user, and the
+        // denied listing must not pass for an empty one.
+        if host.user_id() != 0 {
+            assert!(!host.open_files(1).complete);
+        }
 
         let mut child = std::process::Command::new("/bin/sleep")
             .arg("5")
