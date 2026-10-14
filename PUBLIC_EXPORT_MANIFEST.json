@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 636,
-  "content_sha256": "6543544a8f6d10a25a20ab0f9f195c235e1ea84d28b957a694b6a1a5e3706ee3",
+  "candidate_file_count": 638,
+  "content_sha256": "7c5e3cd34b5518961ff7e4643372611a5e67294e43e9a217fe4d302349cd4282",
   "files": [
     {
       "executable": false,
@@ -1175,8 +1175,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "5d5312e5c246fb47b1a52ca18a5b5992b04ca0b79f3d55bcfb513f824183f2c9",
-      "size_bytes": 2425977
+      "sha256": "2d801ff8666f7ac60073b48b971492156cde6c11ed518b10caee76aac78fe36f",
+      "size_bytes": 2426285
     },
     {
       "executable": false,
@@ -1261,6 +1261,13 @@
       "path": "crates/ottto-service/src/snapshots/giant_row_measurement_tests.rs",
       "sha256": "4901febe540660dd3dd34a81f1ff599615f59dc4733afc2294b8cbfd5dced220",
       "size_bytes": 17307
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/launch_demand_tests.rs",
+      "sha256": "f4703e0899e366559081e521e43ef4c861bfd377d6a8e30bb771f8ecae0346e4",
+      "size_bytes": 14708
     },
     {
       "executable": false,
@@ -2696,6 +2703,13 @@
       "path": "docs/session-2026-10-14-cache-head-source-progress.md",
       "sha256": "e4468661022fcb2250736ff9aefe80d15384ce2d05b01b16359cf11c26951fbc",
       "size_bytes": 2249
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-14-claude-launch-demand.md",
+      "sha256": "0655bb1c64b9bc520de5dcee08a28e7c2dc6fd8e654cab259d8ccf5d108011d5",
+      "size_bytes": 3120
     },
     {
       "executable": false,
@@ -4455,9 +4469,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-14T16:02:12+00:00",
+  "generated_at": "2026-10-14T16:51:49+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 637,
+  "output_file_count": 639,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4494,5 +4508,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "90af5d2f54afcaeb7444da193cd17d69e3334f75"
+  "source_commit": "6e43ab8746104d27b793cbf1bb1b3ec6ccd9fa38"
 }
