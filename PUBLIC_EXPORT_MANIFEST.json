@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 640,
-  "content_sha256": "a76d7e20e9989660251677b23dd7c0b7734b2004f13b82993dd78fddf975b346",
+  "content_sha256": "5107b4702d76f360bda161052468fa6594e426efa3c424ae97fa011c44cd7d41",
   "files": [
     {
       "executable": false,
@@ -685,15 +685,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "faf95543b0d9c367314e6786a8c28d12805d89d2c7378dfefefe2b2edf17fbec",
-      "size_bytes": 1553102
+      "sha256": "16b34be387a1dbbacbcbcdd05246e7e9f3234a8ca08f12c2ca7a9e4f6662feea",
+      "size_bytes": 1555280
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/claude_credit_pools.rs",
-      "sha256": "b5bf475cbf75c839ea95c90887ba0a81ca65347678f8b229126b62362144683f",
-      "size_bytes": 164504
+      "sha256": "10f9277f841763d1c467e3c727fff6398826a3534c536fff66112b19c4a7e827",
+      "size_bytes": 167123
     },
     {
       "executable": false,
@@ -713,8 +713,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/codex_saved_quota.rs",
-      "sha256": "8f324234c375882c26de3d68fcaa142c12f079c1ee796929cd0b36715e0e6c8a",
-      "size_bytes": 70457
+      "sha256": "18002e8a33f82a004a69873493669ffcd79b20710831f6cc6b1352e362f46efb",
+      "size_bytes": 71503
     },
     {
       "executable": false,
@@ -888,8 +888,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "8539bd472a47a3c543ae169f4185fb928ea97f05b382206792080552bcf75f0a",
-      "size_bytes": 1209689
+      "sha256": "a5fff74f471251b81c9cad60bace779fa38c1273c60c8ed45dcbe8ad19d77888",
+      "size_bytes": 1212165
     },
     {
       "executable": false,
@@ -4483,7 +4483,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-14T19:41:28+00:00",
+  "generated_at": "2026-10-14T20:05:28+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 641,
   "public_roots": [
@@ -4522,5 +4522,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "6b0889fdcc2621948f513fafb1e525940077fab3"
+  "source_commit": "96d7e27bcbdd1f0d742811a73cd88017ba1ebaca"
 }
