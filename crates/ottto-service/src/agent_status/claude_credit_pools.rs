@@ -741,11 +741,13 @@ pub(super) fn claude_reset_read_delay_seconds(
 }
 
 /// When the reset read for a reading taken at `observed_at` is due: the first
-/// window reset after the reading, plus `delay_seconds`. `None` when no window
-/// of the reading resets after it.
+/// window reset after the reading plus `delay_seconds`, but never before the
+/// stored Retry-After/success spacing (`next_refresh_after`). `None` when no
+/// window of the reading resets after it.
 pub(super) fn claude_reset_read_at(
     windows: &[AgentQuotaWindow],
     observed_at: u64,
+    next_refresh_after: u64,
     delay_seconds: u64,
 ) -> Option<u64> {
     windows
@@ -754,11 +756,11 @@ pub(super) fn claude_reset_read_at(
         .filter_map(|reset| u64::try_from(reset.unix_timestamp()).ok())
         .filter(|reset| *reset > observed_at)
         .min()
-        .map(|reset| reset.saturating_add(delay_seconds))
+        .map(|reset| reset.saturating_add(delay_seconds).max(next_refresh_after))
 }
 
 /// Whether a reset the stored reading predates is due its one extra read,
-/// outside the slot. Retry-After/success spacing still applies.
+/// outside the slot.
 pub(super) fn claude_reset_read_due(
     windows: &[AgentQuotaWindow],
     observed_at: u64,
@@ -766,8 +768,8 @@ pub(super) fn claude_reset_read_due(
     delay_seconds: u64,
     now: u64,
 ) -> bool {
-    now >= next_refresh_after
-        && claude_reset_read_at(windows, observed_at, delay_seconds).is_some_and(|at| now >= at)
+    claude_reset_read_at(windows, observed_at, next_refresh_after, delay_seconds)
+        .is_some_and(|at| now >= at)
 }
 
 /// Whether the binding is due a new reading: never read, or its slot has
@@ -2461,9 +2463,14 @@ mod tests {
         let delay = claude_reset_read_delay_seconds("account-a", "org-a");
         assert!((60..=120).contains(&delay), "delay {delay}");
         assert_eq!(
-            claude_reset_read_at(&windows, observed, delay),
+            claude_reset_read_at(&windows, observed, 0, delay),
             Some(observed + 2 * HOUR + delay),
             "the first reset after the reading, plus the delay"
+        );
+        assert_eq!(
+            claude_reset_read_at(&windows, observed, observed + 2 * HOUR + 290, delay),
+            Some(observed + 2 * HOUR + 290),
+            "never before the stored spacing"
         );
         let reset = observed + 2 * HOUR;
         // Before the delay: not due. After it: due, inside any slot.
@@ -2497,7 +2504,10 @@ mod tests {
             delay,
             reset + delay + 600
         ));
-        assert_eq!(claude_reset_read_at(&windows[2..], observed, delay), None);
+        assert_eq!(
+            claude_reset_read_at(&windows[2..], observed, 0, delay),
+            None
+        );
     }
 
     #[test]

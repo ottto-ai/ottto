@@ -311,7 +311,8 @@ pub(crate) struct AgentStatusCollection {
 
 /// The next time, strictly after `now` (unix seconds), that a Claude binding
 /// in `collection` is due its reset read, so the status lane can run its pass
-/// then rather than up to one interval later.
+/// then rather than up to one interval later. Read from each binding's stored
+/// reading, the same inputs the collector's due check uses.
 pub(crate) fn claude_next_reset_read_at(
     collection: &AgentStatusCollection,
     now: u64,
@@ -321,16 +322,20 @@ pub(crate) fn claude_next_reset_read_at(
         .iter()
         .flat_map(|snapshot| &snapshot.quota_windows)
         .filter_map(|window| {
-            let account = window.account_identifier_hash.as_deref()?;
-            let organization = window.organization_identifier_hash.as_deref()?;
-            let observed_at = window
-                .observed_at
-                .as_deref()
-                .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
-                .and_then(|at| u64::try_from(at.unix_timestamp()).ok())?;
+            Some((
+                window.account_identifier_hash.as_deref()?,
+                window.organization_identifier_hash.as_deref()?,
+            ))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|(account, organization)| {
+            let cache =
+                read_claude_oauth_usage_cache_with_legacy_migration(account, organization, false)?;
             claude_credit_pools::claude_reset_read_at(
-                std::slice::from_ref(window),
-                observed_at,
+                &cache.windows,
+                cache.observed_at_epoch_seconds,
+                cache.next_refresh_after_epoch_seconds,
                 claude_credit_pools::claude_reset_read_delay_seconds(account, organization),
             )
         })
@@ -32613,6 +32618,79 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             ClaudeConfigSlotQuotaSnapshotStateV1::Partial
         );
         assert!(!claude_snapshot_has_account_windows(&snapshot));
+    }
+
+    #[test]
+    #[serial]
+    fn claude_status_lane_wakes_for_a_reset_read_behind_the_spacing_gate() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-reset-read-wake-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&support_dir);
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let (account, organization) = ("account-reset", "org-reset");
+        let observed = 1_800_000_000_u64;
+        let reset = observed + 3_600;
+        let window = AgentQuotaWindow {
+            name: "session".to_string(),
+            scope: AgentQuotaWindowScope::Account,
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            resets_at: rfc3339_from_unix_seconds(reset),
+            account_identifier_hash: Some(account.to_string()),
+            organization_identifier_hash: Some(organization.to_string()),
+            ..Default::default()
+        };
+        let store = |next_refresh_after: u64| {
+            write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
+                schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+                account_identifier_hash: account.to_string(),
+                organization_identifier_hash: organization.to_string(),
+                observed_at_epoch_seconds: observed,
+                next_refresh_after_epoch_seconds: next_refresh_after,
+                windows: vec![window.clone()],
+                credit_balances: Vec::new(),
+                account_weekly_not_offered: false,
+            })
+            .expect("write cache");
+        };
+        let mut snapshot = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-09-01T10:00:00Z".to_string(),
+            "2026-09-01T10:15:00Z".to_string(),
+        );
+        snapshot.quota_windows = vec![window.clone()];
+        let collection = AgentStatusCollection {
+            snapshots: vec![snapshot.clone()],
+            source_health_snapshot: snapshot,
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+        };
+        let delay = claude_credit_pools::claude_reset_read_delay_seconds(account, organization);
+
+        store(observed + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS);
+        assert_eq!(
+            claude_next_reset_read_at(&collection, observed),
+            Some(reset + delay)
+        );
+        // Behind the binding's spacing gate, the wake waits for the gate.
+        store(reset + delay + 200);
+        assert_eq!(
+            claude_next_reset_read_at(&collection, reset + delay),
+            Some(reset + delay + 200)
+        );
+        // Once that time has passed, the lane keeps its regular interval.
+        assert_eq!(
+            claude_next_reset_read_at(&collection, reset + delay + 200),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&support_dir);
     }
 
     #[test]
