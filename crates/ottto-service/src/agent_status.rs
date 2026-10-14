@@ -253,6 +253,10 @@ struct ClaudeOAuthUsageCache {
     /// schema and identity are rejected.
     #[serde(default)]
     credit_balances: Vec<AgentCreditBalance>,
+    /// The response said this account has no account-wide weekly limit
+    /// ([`claude_oauth_account_weekly_not_offered`]). Absent in older caches.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    account_weekly_not_offered: bool,
 }
 
 /// v4 adds organization identity and requires exact identity on every embedded
@@ -278,6 +282,9 @@ static CLAUDE_OAUTH_BEFORE_SEND_HOOK: Mutex<Option<fn()>> = Mutex::new(None);
 struct ClaudeOAuthUsage {
     windows: Vec<AgentQuotaWindow>,
     credit_balances: Vec<AgentCreditBalance>,
+    /// No account-wide weekly limit applies to this account (provider-stated),
+    /// so a session window alone completes its account windows.
+    account_weekly_not_offered: bool,
 }
 
 /// A collection attempt plus anything the snapshot should say about *why* the
@@ -300,6 +307,35 @@ pub(crate) struct AgentStatusCollection {
     pub source_health_snapshot: AgentStatusSnapshot,
     pub codex_scan_homes: Vec<PathBuf>,
     pub codex_home_bindings: Vec<CodexHomeBinding>,
+}
+
+/// The next time, strictly after `now` (unix seconds), that a Claude binding
+/// in `collection` is due its reset read, so the status lane can run its pass
+/// then rather than up to one interval later.
+pub(crate) fn claude_next_reset_read_at(
+    collection: &AgentStatusCollection,
+    now: u64,
+) -> Option<u64> {
+    collection
+        .snapshots
+        .iter()
+        .flat_map(|snapshot| &snapshot.quota_windows)
+        .filter_map(|window| {
+            let account = window.account_identifier_hash.as_deref()?;
+            let organization = window.organization_identifier_hash.as_deref()?;
+            let observed_at = window
+                .observed_at
+                .as_deref()
+                .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+                .and_then(|at| u64::try_from(at.unix_timestamp()).ok())?;
+            claude_credit_pools::claude_reset_read_at(
+                std::slice::from_ref(window),
+                observed_at,
+                claude_credit_pools::claude_reset_read_delay_seconds(account, organization),
+            )
+        })
+        .filter(|at| *at > now)
+        .min()
 }
 
 /// Hash-only identity observed for an exact Codex transcript home.
@@ -3981,9 +4017,11 @@ fn collect_claude_status(
     // breaker: they travel to the backend with the agent-status upload.
     snapshot.diagnostics.extend(oauth_outcome.diagnostics);
     let mut full_oauth_quota_collected = false;
+    let mut account_weekly_not_offered = false;
     match oauth_outcome.result {
         Ok(usage) if !usage.windows.is_empty() => {
             full_oauth_quota_collected = true;
+            account_weekly_not_offered = usage.account_weekly_not_offered;
             snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
             snapshot.quota_windows = usage.windows;
             snapshot.credit_balances = usage.credit_balances;
@@ -4096,6 +4134,11 @@ fn collect_claude_status(
         context_capability,
         runtime_defaults.capability,
     ];
+    if account_weekly_not_offered {
+        snapshot
+            .capabilities
+            .push(claude_account_weekly_not_offered_capability());
+    }
     if let Some(diagnostic) = runtime_defaults.diagnostic {
         snapshot.diagnostics.push(diagnostic);
     }
@@ -5207,15 +5250,12 @@ fn claude_snapshot_candidate_rank(snapshot: &AgentStatusSnapshot) -> Option<Clau
                     .credit_balances
                     .iter()
                     .all(|balance| balance.freshness == AgentQuotaWindowFreshness::Fresh);
-            let complete = snapshot.quota_windows.iter().any(|window| {
-                window.scope == AgentQuotaWindowScope::Account && window.name == "session"
-            }) && snapshot.quota_windows.iter().any(|window| {
-                window.scope == AgentQuotaWindowScope::Account && window.name == "weekly"
-            }) && snapshot.quota_windows.iter().any(|window| {
-                window.scope == AgentQuotaWindowScope::Model
-                    || window.model.is_some()
-                    || window.group.is_some()
-            });
+            let complete = claude_snapshot_has_account_windows(snapshot)
+                && snapshot.quota_windows.iter().any(|window| {
+                    window.scope == AgentQuotaWindowScope::Model
+                        || window.model.is_some()
+                        || window.group.is_some()
+                });
             return Some(ClaudeSnapshotQuality {
                 tier: match (fresh, complete) {
                     (true, true) => 4,
@@ -6194,12 +6234,9 @@ fn custom_claude_snapshot_from_usage(
             .credit_balances
             .iter()
             .any(|balance| balance.freshness != AgentQuotaWindowFreshness::Fresh);
+    let account_weekly_not_offered = usage.account_weekly_not_offered;
     let has_account_windows =
-        usage.windows.iter().any(|window| {
-            window.scope == AgentQuotaWindowScope::Account && window.name == "session"
-        }) && usage.windows.iter().any(|window| {
-            window.scope == AgentQuotaWindowScope::Account && window.name == "weekly"
-        });
+        claude_has_account_windows(&usage.windows, account_weekly_not_offered);
     let has_scoped_limits = usage.windows.iter().any(|window| {
         window.scope == AgentQuotaWindowScope::Model
             || window.model.is_some()
@@ -6234,6 +6271,11 @@ fn custom_claude_snapshot_from_usage(
             "Collected from Claude Code's local OAuth usage endpoint.",
         ),
     ];
+    if account_weekly_not_offered {
+        snapshot
+            .capabilities
+            .push(claude_account_weekly_not_offered_capability());
+    }
     snapshot.diagnostics = diagnostics;
     append_current_plan_observation(&mut snapshot);
     let mut state = if stale {
@@ -7653,11 +7695,7 @@ fn claude_default_slot_collection_status(
                 &snapshot.captured_at,
                 account_hash,
                 organization_hash,
-                snapshot.quota_windows.iter().any(|window| {
-                    window.scope == AgentQuotaWindowScope::Account && window.name == "session"
-                }) && snapshot.quota_windows.iter().any(|window| {
-                    window.scope == AgentQuotaWindowScope::Account && window.name == "weekly"
-                }),
+                claude_snapshot_has_account_windows(snapshot),
                 snapshot.quota_windows.iter().any(|window| {
                     window.scope == AgentQuotaWindowScope::Model
                         || window.model.is_some()
@@ -7688,11 +7726,7 @@ fn claude_default_slot_collection_status(
                             == Some(organization_hash)
                 });
             if exact_values {
-                status.has_account_windows = snapshot.quota_windows.iter().any(|window| {
-                    window.scope == AgentQuotaWindowScope::Account && window.name == "session"
-                }) && snapshot.quota_windows.iter().any(|window| {
-                    window.scope == AgentQuotaWindowScope::Account && window.name == "weekly"
-                });
+                status.has_account_windows = claude_snapshot_has_account_windows(snapshot);
                 status.has_scoped_limits = snapshot.quota_windows.iter().any(|window| {
                     window.scope == AgentQuotaWindowScope::Model
                         || window.model.is_some()
@@ -8983,15 +9017,10 @@ fn derive_unresolved_claude_accounts(
     let mut resolved = full_snapshots
         .iter()
         .filter(|snapshot| {
-            snapshot.quota_windows.iter().any(|window| {
-                window.name == "session"
-                    && window.scope == AgentQuotaWindowScope::Account
-                    && window.freshness == AgentQuotaWindowFreshness::Fresh
-            }) && snapshot.quota_windows.iter().any(|window| {
-                window.name == "weekly"
-                    && window.scope == AgentQuotaWindowScope::Account
-                    && window.freshness == AgentQuotaWindowFreshness::Fresh
-            }) && snapshot.quota_windows.iter().any(|window| {
+            claude_has_account_windows(
+                &fresh_quota_windows(&snapshot.quota_windows),
+                claude_snapshot_account_weekly_not_offered(snapshot),
+            ) && snapshot.quota_windows.iter().any(|window| {
                 (window.scope == AgentQuotaWindowScope::Model
                     || window.model.is_some()
                     || window.group.is_some())
@@ -10113,8 +10142,21 @@ fn collect_claude_oauth_usage_unstamped(
             last_reading_at = Some(cache.observed_at_epoch_seconds);
         }
         let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
+        // A window that reset after this reading gets one read shortly after
+        // the reset instead of waiting out the slot.
+        let reset_read_due = claude_credit_pools::claude_reset_read_due(
+            &cache.windows,
+            cache.observed_at_epoch_seconds,
+            cache.next_refresh_after_epoch_seconds,
+            claude_credit_pools::claude_reset_read_delay_seconds(
+                account_identifier_hash,
+                organization_identifier_hash,
+            ),
+            now,
+        );
         if !cache.windows.is_empty()
             && cache_age <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
+            && !reset_read_due
             && !claude_credit_pools::claude_reading_due(
                 Some(cache.observed_at_epoch_seconds),
                 cache.next_refresh_after_epoch_seconds,
@@ -10434,6 +10476,7 @@ fn collect_claude_oauth_usage_unstamped(
                 next_refresh_after_epoch_seconds: retry_after,
                 windows: Vec::new(),
                 credit_balances: Vec::new(),
+                account_weekly_not_offered: false,
             });
             cache.next_refresh_after_epoch_seconds = retry_after;
             let _ = write_claude_oauth_usage_cache(&cache);
@@ -10774,6 +10817,7 @@ fn claude_oauth_saved_resets_without_windows(
                 }),
             &credit_read,
         ),
+        account_weekly_not_offered: false,
     };
     claude_oauth_stamp_account_identity(
         &mut usage,
@@ -10802,6 +10846,7 @@ fn claude_oauth_saved_resets_without_windows(
         next_refresh_after_epoch_seconds: next_read,
         windows: Vec::new(),
         credit_balances: Vec::new(),
+        account_weekly_not_offered: false,
     });
     cache.credit_balances = usage.credit_balances;
     cache.next_refresh_after_epoch_seconds = next_read;
@@ -10999,6 +11044,7 @@ fn claude_oauth_usage_record_reading(
     let mut usage = ClaudeOAuthUsage {
         windows: claude_oauth_quota_windows(reading.body),
         credit_balances: Vec::new(),
+        account_weekly_not_offered: claude_oauth_account_weekly_not_offered(reading.body),
     };
     let Some(observed_at) = observed_at.filter(|_| !usage.windows.is_empty()) else {
         usage.credit_balances = claude_oauth_credit_balances(reading.body);
@@ -11052,6 +11098,7 @@ fn claude_oauth_usage_record_reading(
         next_refresh_after_epoch_seconds: reading.now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
         windows: usage.windows.clone(),
         credit_balances: usage.credit_balances.clone(),
+        account_weekly_not_offered: usage.account_weekly_not_offered,
     };
     let _ = write_claude_oauth_usage_cache(&cache);
     if reading.mirror_legacy_default {
@@ -12643,6 +12690,74 @@ fn claude_oauth_quota_windows(value: &Value) -> Vec<AgentQuotaWindow> {
     windows
 }
 
+/// Whether the body says the account has no account-wide weekly limit (some
+/// Team plans): `seven_day` is present and null, and `limits[]` lists no
+/// account-wide weekly entry. A missing key or a missing `limits[]` proves
+/// nothing, so the weekly window stays expected.
+fn claude_oauth_account_weekly_not_offered(value: &Value) -> bool {
+    let Some(limits) = value.get("limits").and_then(Value::as_array) else {
+        return false;
+    };
+    value.get("seven_day").is_some_and(Value::is_null)
+        && !limits.is_empty()
+        && !limits.iter().any(|entry| {
+            let account_scoped = entry
+                .get("scope")
+                .and_then(|scope| scope.get("model"))
+                .map_or(true, Value::is_null);
+            entry.get("kind").and_then(Value::as_str) == Some("weekly_all")
+                || account_scoped && entry.get("group").and_then(Value::as_str) == Some("weekly")
+        })
+}
+
+/// Capability a Claude snapshot carries when Claude said the account has no
+/// account-wide weekly limit, so completeness checks over the snapshot expect
+/// only its session window.
+const CLAUDE_ACCOUNT_WEEKLY_NOT_OFFERED_CAPABILITY: &str = "account_weekly_window";
+
+fn claude_account_weekly_not_offered_capability() -> AgentCapabilityGap {
+    unsupported_capability(
+        CLAUDE_ACCOUNT_WEEKLY_NOT_OFFERED_CAPABILITY,
+        "Claude reports no account-wide weekly limit for this account.",
+    )
+}
+
+fn claude_snapshot_account_weekly_not_offered(snapshot: &AgentStatusSnapshot) -> bool {
+    snapshot.capabilities.iter().any(|capability| {
+        capability.capability == CLAUDE_ACCOUNT_WEEKLY_NOT_OFFERED_CAPABILITY
+            && capability.status == AgentCapabilityStatus::Unsupported
+    })
+}
+
+fn claude_snapshot_has_account_windows(snapshot: &AgentStatusSnapshot) -> bool {
+    claude_has_account_windows(
+        &snapshot.quota_windows,
+        claude_snapshot_account_weekly_not_offered(snapshot),
+    )
+}
+
+fn fresh_quota_windows(windows: &[AgentQuotaWindow]) -> Vec<AgentQuotaWindow> {
+    windows
+        .iter()
+        .filter(|window| window.freshness == AgentQuotaWindowFreshness::Fresh)
+        .cloned()
+        .collect()
+}
+
+/// Every account-wide window the account has: the session window, plus the
+/// weekly window unless Claude said the account has none.
+fn claude_has_account_windows(
+    windows: &[AgentQuotaWindow],
+    account_weekly_not_offered: bool,
+) -> bool {
+    let has = |name: &str| {
+        windows
+            .iter()
+            .any(|window| window.scope == AgentQuotaWindowScope::Account && window.name == name)
+    };
+    has("session") && (account_weekly_not_offered || has("weekly"))
+}
+
 /// Per-model scoped limits from the `limits[]` array (e.g. `weekly_scoped`
 /// for one model at 98% while the account-level `seven_day` shows 82%).
 /// Entries without a model scope duplicate `five_hour`/`seven_day` account
@@ -12973,6 +13088,7 @@ fn claude_oauth_usage_from_cache(cache: ClaudeOAuthUsageCache, now: u64) -> Clau
             );
             credits
         },
+        account_weekly_not_offered: cache.account_weekly_not_offered,
     }
 }
 
@@ -20350,6 +20466,7 @@ exit 1
                     remaining: Some(credits),
                     ..Default::default()
                 }],
+                account_weekly_not_offered: false,
             };
             claude_oauth_stamp_account_identity(&mut usage, account_hash, Some(organization_hash));
             ClaudeOAuthUsageCache {
@@ -20360,6 +20477,7 @@ exit 1
                 next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
                 windows: usage.windows,
                 credit_balances: usage.credit_balances,
+                account_weekly_not_offered: false,
             }
         };
         write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
@@ -20370,6 +20488,7 @@ exit 1
             next_refresh_after_epoch_seconds: u64::MAX,
             windows: Vec::new(),
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         })
         .expect("write unavailable primary cache");
         write_claude_oauth_usage_cache(&usage_cache(&secondary_hash, &secondary_org, 77, 777))
@@ -27191,6 +27310,7 @@ for line in sys.stdin:
                 enabled: Some(true),
                 ..Default::default()
             }],
+            account_weekly_not_offered: false,
         };
 
         let usage = claude_oauth_usage_from_cache(cache, 200);
@@ -27240,6 +27360,7 @@ for line in sys.stdin:
                 enabled: Some(true),
                 ..Default::default()
             }],
+            account_weekly_not_offered: false,
         };
 
         // Past the account's own jittered gate, not the bare base constant.
@@ -27395,6 +27516,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         })
         .expect("write cache");
 
@@ -27430,6 +27552,7 @@ for line in sys.stdin:
                 next_refresh_after_epoch_seconds: retry_after,
                 windows: Vec::new(),
                 credit_balances: Vec::new(),
+                account_weekly_not_offered: false,
             },
         );
         assert!(
@@ -27466,6 +27589,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
         assert!(claude_oauth_usage_cache_belongs_to_identity(
             &cache,
@@ -27557,6 +27681,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         })
         .expect("write exact stale cache");
         let fingerprint = claude_oauth_usage_config_fingerprint();
@@ -27607,6 +27732,7 @@ for line in sys.stdin:
             next_refresh_after_epoch_seconds: 0,
             windows: Vec::new(),
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
 
         assert!(claude_oauth_usage_cache_belongs_to_identity(
@@ -27662,6 +27788,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
         fs::write(
             claude_oauth_usage_legacy_cache_path(),
@@ -27709,6 +27836,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
         let custom_cache = ClaudeOAuthUsageCache {
             account_identifier_hash: "account-custom".to_string(),
@@ -27849,6 +27977,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
         fs::write(
             claude_oauth_usage_legacy_cache_path(),
@@ -27908,6 +28037,7 @@ for line in sys.stdin:
             next_refresh_after_epoch_seconds: 200,
             windows: Vec::new(),
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
 
         #[cfg(unix)]
@@ -28003,6 +28133,7 @@ for line in sys.stdin:
                         next_refresh_after_epoch_seconds: observed_at_epoch_seconds + 100,
                         windows: Vec::new(),
                         credit_balances: Vec::new(),
+                        account_weekly_not_offered: false,
                     })
                 })
             })
@@ -28473,6 +28604,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         })
         .expect("write cache fixture");
 
@@ -28608,6 +28740,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         })
         .expect("write cache fixture");
     }
@@ -30441,6 +30574,7 @@ for line in sys.stdin:
             let mut usage = ClaudeOAuthUsage {
                 windows: claude_oauth_quota_windows(&response),
                 credit_balances: claude_oauth_credit_balances(&response),
+                account_weekly_not_offered: false,
             };
             claude_oauth_stamp_account_identity(&mut usage, "account-a", Some("org-a"));
             for window in &mut usage.windows {
@@ -30528,6 +30662,7 @@ for line in sys.stdin:
             let mut usage = ClaudeOAuthUsage {
                 windows: claude_oauth_quota_windows(&response),
                 credit_balances: claude_oauth_credit_balances(&response),
+                account_weekly_not_offered: false,
             };
             claude_oauth_stamp_account_identity(&mut usage, "account-a", Some("org-a"));
             for window in &mut usage.windows {
@@ -30690,6 +30825,7 @@ for line in sys.stdin:
                 name: "Usage credits".to_string(),
                 ..Default::default()
             }],
+            account_weekly_not_offered: false,
         };
 
         claude_oauth_stamp_account_identity(&mut usage, "account-hash", Some("org-hash"));
@@ -30723,6 +30859,7 @@ for line in sys.stdin:
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
+            account_weekly_not_offered: false,
         };
         claude_oauth_stamp_account_identity(&mut unresolved, "", Some(""));
         assert_eq!(unresolved.windows[0].account_identifier_hash, None);
@@ -32387,6 +32524,98 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
     }
 
     #[test]
+    fn claude_account_without_weekly_limit_reads_complete() {
+        // Some Team plans have no account-wide weekly limit: Claude sends
+        // `seven_day: null` and lists only the session and model limits.
+        let body = serde_json::json!({
+            "five_hour": {"utilization": 45, "resets_at": "2026-09-01T13:00:00+00:00"},
+            "seven_day": null,
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 45,
+                 "resets_at": "2026-09-01T13:00:00+00:00", "scope": null},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 0,
+                 "resets_at": "2026-09-03T01:00:00+00:00",
+                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}
+            ]
+        });
+        assert!(claude_oauth_account_weekly_not_offered(&body));
+        let mut listed = body.clone();
+        listed["limits"]
+            .as_array_mut()
+            .expect("limits")
+            .push(serde_json::json!({"kind": "weekly_all", "group": "weekly", "percent": 1, "scope": null}));
+        assert!(
+            !claude_oauth_account_weekly_not_offered(&listed),
+            "a listed account weekly limit stays expected"
+        );
+        for key in ["limits", "seven_day"] {
+            let mut missing = body.clone();
+            missing.as_object_mut().expect("body").remove(key);
+            assert!(
+                !claude_oauth_account_weekly_not_offered(&missing),
+                "a missing {key} proves nothing"
+            );
+        }
+
+        let resolved = || ResolvedClaudeSlot {
+            descriptor: ClaudeConfigDirSlot::Default
+                .descriptor("default", ClaudeConfigSlotOwnership::External),
+            account: AgentAccountStatus {
+                login_state: AgentLoginState::SignedIn,
+                plan_type: Some("team".to_string()),
+                account_identifier_hash: Some("account-a".to_string()),
+                organization_identifier_hash: Some("org-a".to_string()),
+                ..unsupported_account("anthropic")
+            },
+            account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "org-a".to_string(),
+            credential: ClaudeOAuthCredential {
+                access_token: None,
+                has_refresh_token: true,
+                access_expires_at: None,
+                relogin_required_at: None,
+                has_inference_scope: None,
+                has_profile_scope: false,
+                subscription_type: None,
+            },
+        };
+        let read = |account_weekly_not_offered: bool| {
+            let mut usage = ClaudeOAuthUsage {
+                windows: claude_oauth_quota_windows(&body),
+                credit_balances: Vec::new(),
+                account_weekly_not_offered,
+            };
+            claude_oauth_stamp_account_identity(&mut usage, "account-a", Some("org-a"));
+            custom_claude_snapshot_from_usage(
+                resolved(),
+                ClaudeOAuthUsageOutcome::from(Ok(usage)),
+                true,
+                "2026-09-01T10:00:00Z".to_string(),
+                "2026-09-01T10:05:00Z".to_string(),
+            )
+            .unwrap_or_else(|_| panic!("fresh reading"))
+        };
+        let (snapshot, status) = read(true);
+        assert!(status.has_account_windows);
+        assert!(status.last_full_quota_read_at.is_some());
+        assert_eq!(
+            status.quota_snapshot.expect("snapshot").state,
+            ClaudeConfigSlotQuotaSnapshotStateV1::Fresh
+        );
+        assert!(claude_snapshot_has_account_windows(&snapshot));
+        assert!(claude_default_slot_collection_status(&snapshot).has_account_windows);
+
+        // Without Claude's word, the same windows are still a partial reading.
+        let (snapshot, status) = read(false);
+        assert!(!status.has_account_windows);
+        assert_eq!(
+            status.quota_snapshot.expect("snapshot").state,
+            ClaudeConfigSlotQuotaSnapshotStateV1::Partial
+        );
+        assert!(!claude_snapshot_has_account_windows(&snapshot));
+    }
+
+    #[test]
     fn unavailable_claude_read_keeps_verified_slot_labels_without_quota() {
         let resolved = ResolvedClaudeSlot {
             descriptor: ClaudeConfigDirSlot::Default
@@ -33645,6 +33874,7 @@ exit 0
                         }))
                         .collect(),
                     credit_balances: Vec::new(),
+                    account_weekly_not_offered: false,
                 };
                 claude_oauth_stamp_account_identity(
                     &mut usage,
@@ -33659,6 +33889,7 @@ exit 0
                     next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
                     windows: usage.windows,
                     credit_balances: usage.credit_balances,
+                    account_weekly_not_offered: false,
                 })
                 .expect("write usage cache");
             }
@@ -34203,6 +34434,7 @@ exit 0
                 next_refresh_after_epoch_seconds: observed,
                 windows: vec![window],
                 credit_balances,
+                account_weekly_not_offered: false,
             })
             .expect("write due cache");
         }
@@ -35674,6 +35906,7 @@ exit 44
                     }))
                     .collect(),
                 credit_balances: Vec::new(),
+                account_weekly_not_offered: false,
             };
             claude_oauth_stamp_account_identity(
                 &mut usage,
@@ -35692,6 +35925,7 @@ exit 44
                 },
                 windows: usage.windows,
                 credit_balances: usage.credit_balances,
+                account_weekly_not_offered: false,
             })
             .expect("write cache");
         }
