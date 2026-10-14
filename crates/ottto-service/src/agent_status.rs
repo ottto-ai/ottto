@@ -22193,8 +22193,10 @@ for line in sys.stdin:
         let before_read = witness();
         let before = codex_app_server_runs();
 
-        // One scheduled read: the token is rewritten, the reading is kept.
-        let now = current_unix_seconds();
+        // One scheduled read: the token is rewritten, the reading is kept. A
+        // little ahead of the clock, so every attempt is stamped `now` however
+        // long the fake read takes.
+        let now = current_unix_seconds() + 30;
         assert_eq!(codex_saved_quota::scheduled_round(&support, now), 1);
         assert_eq!(codex_app_server_runs(), before + 1);
         assert_ne!(witness(), before_read, "the read rewrote auth.json");
