@@ -3115,6 +3115,63 @@ mod tests {
         assert_eq!(harness.requests(), 3);
     }
 
+    /// An older app's status refresh (no `quota_refresh`) is an explicit
+    /// refresh of every account with a 5-minute gap: it reads an account whose
+    /// reading is 5 minutes old, then serves the stored reading, and never
+    /// reads inside a Retry-After hold.
+    #[test]
+    #[serial_test::serial]
+    fn an_older_apps_status_refresh_reads_at_most_every_five_minutes() {
+        let harness = VariantHarness::new("legacy-status-refresh");
+        harness.due(ClaudeReadSchedule::default());
+        let now = super::super::current_unix_seconds();
+        let older_app_refresh = |harness: &VariantHarness, respond| {
+            super::super::request_claude_explicit_refresh_spaced(None, None, 5 * 60);
+            super::super::with_claude_pass(true, now, || harness.collect(respond))
+        };
+        // Nothing stored yet: the refresh reads.
+        assert!(older_app_refresh(&harness, respond_recognized)
+            .result
+            .is_ok());
+        assert_eq!(harness.requests(), 1);
+        // Within 5 minutes: the stored reading.
+        assert!(older_app_refresh(&harness, respond_recognized)
+            .result
+            .is_ok());
+        harness.age_reading(4 * 60 + 59);
+        assert!(older_app_refresh(&harness, respond_recognized)
+            .result
+            .is_ok());
+        assert_eq!(harness.requests(), 1);
+        // 5 minutes after the read: one read, then the stored reading again.
+        harness.age_reading(1);
+        assert!(older_app_refresh(&harness, respond_recognized)
+            .result
+            .is_ok());
+        assert_eq!(harness.requests(), 2);
+        assert!(older_app_refresh(&harness, respond_recognized)
+            .result
+            .is_ok());
+        assert_eq!(harness.requests(), 2);
+        // Retry-After on record: no read inside it, however old the reading.
+        harness.age_reading(10 * 60);
+        let now = super::super::current_unix_seconds();
+        let mut cache =
+            super::super::read_claude_oauth_usage_cache(harness.account, harness.organization)
+                .expect("stored reading");
+        cache.next_refresh_after_epoch_seconds = now + 600;
+        super::super::write_claude_oauth_usage_cache(&cache).unwrap();
+        super::super::record_claude_oauth_usage_failure(
+            super::super::ClaudeOAuthUsageFailure::RateLimited,
+            harness.account,
+            harness.organization,
+            &super::super::claude_oauth_usage_config_fingerprint(),
+            now,
+        );
+        older_app_refresh(&harness, respond_recognized);
+        assert_eq!(harness.requests(), 2);
+    }
+
     /// A 429 with a short Retry-After inside the success spacing: an explicit
     /// refresh still waits it out when the persisted breaker cannot say so
     /// (for example after a configuration change).

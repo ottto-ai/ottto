@@ -354,7 +354,15 @@ pub fn handle_request_with_peer(
     let client_install_owner = request
         .client_install_owner
         .unwrap_or(InstallOwner::Unknown);
-    match handle_command(daemon, authorization, request.command, client_install_owner) {
+    let status_refresh_is_quota_refresh =
+        status_refresh_is_quota_refresh(request.client_kind, request.protocol_version);
+    match handle_command(
+        daemon,
+        authorization,
+        request.command,
+        client_install_owner,
+        status_refresh_is_quota_refresh,
+    ) {
         Ok(payload) => LocalControlResponse {
             request_id,
             ok: true,
@@ -807,17 +815,42 @@ fn daemon_is_release_signed() -> bool {
     })
 }
 
+/// Companion apps up to this protocol version have no `quota_refresh`: their
+/// Refresh button sends `status` with `refresh_agent_status`, the same request
+/// as their 5-minute scan. Those requests stand in for an explicit refresh of
+/// every account, at most once per [`LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS`]
+/// per account.
+const LEGACY_APP_QUOTA_REFRESH_MAX_PROTOCOL_VERSION: u16 = 15;
+const LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS: u64 = 5 * 60;
+
+fn status_refresh_is_quota_refresh(
+    client_kind: Option<LocalClientKind>,
+    protocol_version: u16,
+) -> bool {
+    client_kind == Some(LocalClientKind::CompanionApp)
+        && protocol_version <= LEGACY_APP_QUOTA_REFRESH_MAX_PROTOCOL_VERSION
+}
+
 fn handle_command(
     daemon: &LocalDaemon,
     authorization: RequestAuthorization,
     command: LocalControlCommand,
     client_install_owner: InstallOwner,
+    status_refresh_is_quota_refresh: bool,
 ) -> Result<serde_json::Value, LocalApiError> {
     match command {
         LocalControlCommand::Status {
             refresh_agent_status,
         } => {
             if refresh_agent_status {
+                if status_refresh_is_quota_refresh {
+                    require_authorized_local_client(daemon, &authorization)?;
+                    request_explicit_quota_refresh(
+                        None,
+                        &ottto_protocol::AgentQuotaRefreshTarget::default(),
+                        LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS,
+                    );
+                }
                 refresh_agent_status_for(daemon, &authorization, None)?;
             }
             let mut status = status_for(daemon, &authorization)?;
@@ -871,7 +904,7 @@ fn handle_command(
         } => {
             if let Some(target) = quota_refresh.as_ref() {
                 require_authorized_local_client(daemon, &authorization)?;
-                request_explicit_quota_refresh(source.as_ref(), target);
+                request_explicit_quota_refresh(source.as_ref(), target, 0);
             }
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
         }
@@ -4743,23 +4776,33 @@ fn refresh_agent_status_for(
 }
 
 /// Explicit quota refresh (a user's Refresh action). Codex homes are read
-/// here, each at most once a minute (one `codex app-server` run per matching
-/// home, up to its timeout, before the reply). Claude accounts are marked for
-/// the collection that follows, whose usage gate reads them at most once a
-/// minute and keeps every hold, breaker and Retry-After; the lane's next own
-/// pass answers a mark that collection missed (one already in flight).
+/// here, each at most once a minute or `min_gap_seconds` if longer (one
+/// `codex app-server` run per matching home, up to its timeout, before the
+/// reply). Claude accounts are marked for the collection that follows, whose
+/// usage gate reads them with the same spacing and keeps every hold, breaker
+/// and Retry-After; the lane's next own pass answers a mark that collection
+/// missed (one already in flight).
 fn request_explicit_quota_refresh(
     source: Option<&SourceKind>,
     target: &ottto_protocol::AgentQuotaRefreshTarget,
+    min_gap_seconds: u64,
 ) {
     let account = target.account_identifier_hash.as_deref();
     let organization = target.organization_identifier_hash.as_deref();
     if source.map_or(true, |source| source == &SourceKind::ClaudeCode) {
-        crate::agent_status::request_claude_explicit_refresh(account, organization);
+        crate::agent_status::request_claude_explicit_refresh_spaced(
+            account,
+            organization,
+            min_gap_seconds,
+        );
         crate::agent_status_refresh::request(&SourceKind::ClaudeCode);
     }
     if source.map_or(true, |source| source == &SourceKind::Codex) {
-        let outcome = crate::agent_status::refresh_codex_quota_now(account, organization);
+        let outcome = crate::agent_status::refresh_codex_quota_now_spaced(
+            account,
+            organization,
+            min_gap_seconds,
+        );
         eprintln!(
             "explicit Codex quota refresh: read={} rate_limited={}",
             outcome.read, outcome.rate_limited
@@ -17904,6 +17947,33 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    /// Only an app without `quota_refresh` (protocol 15 or older) has its
+    /// status refresh stand in for Refresh; the CLI and newer apps do not.
+    #[test]
+    fn only_older_companion_apps_status_refresh_reads_quota() {
+        assert!(status_refresh_is_quota_refresh(
+            Some(LocalClientKind::CompanionApp),
+            15
+        ));
+        assert!(status_refresh_is_quota_refresh(
+            Some(LocalClientKind::CompanionApp),
+            14
+        ));
+        assert!(!status_refresh_is_quota_refresh(
+            Some(LocalClientKind::CompanionApp),
+            16
+        ));
+        assert!(!status_refresh_is_quota_refresh(
+            Some(LocalClientKind::Cli),
+            15
+        ));
+        assert!(!status_refresh_is_quota_refresh(
+            Some(LocalClientKind::WebUi),
+            15
+        ));
+        assert!(!status_refresh_is_quota_refresh(None, 15));
     }
 
     #[test]

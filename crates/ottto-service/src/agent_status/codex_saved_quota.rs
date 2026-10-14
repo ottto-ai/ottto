@@ -710,13 +710,17 @@ pub(super) fn scheduled_read_due(
     elapsed >= refresh_interval_seconds(in_use)
 }
 
-/// Whether an explicit refresh may read the home now: at most once a minute,
-/// counting any read.
-pub(super) fn explicit_refresh_allowed(saved: Option<&SavedCodexQuota>, now: u64) -> bool {
+/// Whether an explicit refresh may read the home now: at most once a minute
+/// (or `min_gap_seconds`, if longer), counting any read.
+pub(super) fn explicit_refresh_allowed(
+    saved: Option<&SavedCodexQuota>,
+    min_gap_seconds: u64,
+    now: u64,
+) -> bool {
     saved.map_or(true, |saved| {
         let last = saved.last_attempt_at_epoch_seconds;
         last > now.saturating_add(CLOCK_SKEW_SECONDS)
-            || now.saturating_sub(last) >= EXPLICIT_REFRESH_MIN_GAP_SECONDS
+            || now.saturating_sub(last) >= min_gap_seconds.max(EXPLICIT_REFRESH_MIN_GAP_SECONDS)
     })
 }
 
@@ -1013,12 +1017,27 @@ pub(crate) struct CodexExplicitRefresh {
     pub(crate) rate_limited: usize,
 }
 
-/// Explicit refresh: read the matching Codex homes now, each at most once a
-/// minute. `account`/`workspace` narrow it to one account (hashes as in
-/// status snapshots); `None` refreshes every home.
+/// Explicit refresh with the one-minute gap.
+#[cfg(test)]
 pub(crate) fn refresh_codex_quota_now(
     account_identifier_hash: Option<&str>,
     workspace_identifier_hash: Option<&str>,
+) -> CodexExplicitRefresh {
+    refresh_codex_quota_now_spaced(
+        account_identifier_hash,
+        workspace_identifier_hash,
+        EXPLICIT_REFRESH_MIN_GAP_SECONDS,
+    )
+}
+
+/// Explicit refresh: read the matching Codex homes now, each at most once a
+/// minute, or once per `min_gap_seconds` if longer, counting any read.
+/// `account`/`workspace` narrow it to one account (hashes as in status
+/// snapshots); `None` refreshes every home.
+pub(crate) fn refresh_codex_quota_now_spaced(
+    account_identifier_hash: Option<&str>,
+    workspace_identifier_hash: Option<&str>,
+    min_gap_seconds: u64,
 ) -> CodexExplicitRefresh {
     let support_dir = saved_quota_support_dir();
     let now = current_unix_seconds();
@@ -1041,7 +1060,7 @@ pub(crate) fn refresh_codex_quota_now(
         &support_dir,
         homes,
         now,
-        |saved, _, now| explicit_refresh_allowed(saved, now),
+        |saved, _, now| explicit_refresh_allowed(saved, min_gap_seconds, now),
         |home| read_codex_usage_from_provider(&home.home, home.trust),
     );
     if read > 0 {
@@ -1367,11 +1386,17 @@ mod tests {
 
     #[test]
     fn explicit_refresh_reads_at_most_once_a_minute() {
-        assert!(explicit_refresh_allowed(None, 10_000));
+        let gap = EXPLICIT_REFRESH_MIN_GAP_SECONDS;
+        assert!(explicit_refresh_allowed(None, gap, 10_000));
         let saved = saved_with(10_000, LoginMark::default());
-        assert!(!explicit_refresh_allowed(Some(&saved), 10_000));
-        assert!(!explicit_refresh_allowed(Some(&saved), 10_059));
-        assert!(explicit_refresh_allowed(Some(&saved), 10_060));
+        assert!(!explicit_refresh_allowed(Some(&saved), gap, 10_000));
+        assert!(!explicit_refresh_allowed(Some(&saved), gap, 10_059));
+        assert!(explicit_refresh_allowed(Some(&saved), gap, 10_060));
+        // A longer gap (an older app's status refresh): five minutes.
+        assert!(!explicit_refresh_allowed(Some(&saved), 300, 10_299));
+        assert!(explicit_refresh_allowed(Some(&saved), 300, 10_300));
+        // Never shorter than the minute.
+        assert!(!explicit_refresh_allowed(Some(&saved), 0, 10_059));
         // Through the saved file: two refreshes within a minute read once.
         let root = scratch("explicit");
         let home = opaque_home(&root);
@@ -1382,7 +1407,7 @@ mod tests {
                 &home,
                 CodexHomeTrust::Managed,
                 current_unix_seconds() + at,
-                explicit_refresh_allowed,
+                |saved, now| explicit_refresh_allowed(saved, gap, now),
                 || {
                     reads += 1;
                     Ok(probe("a", "w", &rfc3339(current_unix_seconds())))
@@ -1686,8 +1711,9 @@ mod tests {
         )
         .is_some());
         assert_eq!(reads.get(), 2);
-        let explicit =
-            |saved: Option<&SavedCodexQuota>, now: u64| explicit_refresh_allowed(saved, now);
+        let explicit = |saved: Option<&SavedCodexQuota>, now: u64| {
+            explicit_refresh_allowed(saved, EXPLICIT_REFRESH_MIN_GAP_SECONDS, now)
+        };
         assert!(read_and_save_at(
             &root,
             &home,

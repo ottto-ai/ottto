@@ -54,9 +54,11 @@ mod codex_credit_grants;
 mod codex_last_known;
 mod codex_saved_quota;
 
+#[cfg(test)]
+pub(crate) use codex_saved_quota::refresh_codex_quota_now;
 pub use codex_saved_quota::start_codex_quota_scheduler;
 pub(crate) use codex_saved_quota::{
-    refresh_codex_quota_now, saved_codex_quota_generation, stop_codex_quota_scheduler,
+    refresh_codex_quota_now_spaced, saved_codex_quota_generation, stop_codex_quota_scheduler,
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -11554,10 +11556,11 @@ fn claude_statusline_fresh_for_binding(
 }
 
 /// Explicit refresh requests from the companion's Refresh button, for the
-/// Claude usage gate: refresh now, at most once a minute per account. A
-/// request names one account (and optionally one organization) or all; it
-/// lapses after [`CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS`] so a request whose
-/// read keeps failing never turns into a retry loop.
+/// Claude usage gate: refresh now, at most once a minute per account (or the
+/// request's own longer gap). A request names one account (and optionally
+/// one organization) or all; it lapses after
+/// [`CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS`] so a request whose read keeps
+/// failing never turns into a retry loop.
 const CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS: u64 = 2 * 60;
 const CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS: u64 = 60;
 const CLAUDE_EXPLICIT_REFRESH_REQUESTS_MAX: usize = 16;
@@ -11567,6 +11570,7 @@ struct ClaudeExplicitRefreshRequest {
     account_identifier_hash: Option<String>,
     organization_identifier_hash: Option<String>,
     requested_at: u64,
+    min_gap_seconds: u64,
 }
 
 fn claude_explicit_refresh_requests(
@@ -11577,11 +11581,27 @@ fn claude_explicit_refresh_requests(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Ask the next Claude collection to read the matching accounts now. `None`
-/// matches every account.
+/// Explicit refresh with the one-minute gap.
+#[cfg(test)]
 pub(crate) fn request_claude_explicit_refresh(
     account_identifier_hash: Option<&str>,
     organization_identifier_hash: Option<&str>,
+) {
+    request_claude_explicit_refresh_spaced(
+        account_identifier_hash,
+        organization_identifier_hash,
+        CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS,
+    );
+}
+
+/// Ask the next Claude collection to read the matching accounts now, each
+/// only when its stored reading and its last explicit refresh are both at
+/// least a minute old, or `min_gap_seconds` if longer. `None` matches every
+/// account.
+pub(crate) fn request_claude_explicit_refresh_spaced(
+    account_identifier_hash: Option<&str>,
+    organization_identifier_hash: Option<&str>,
+    min_gap_seconds: u64,
 ) {
     let now = current_unix_seconds();
     let mut requests = claude_explicit_refresh_requests();
@@ -11592,6 +11612,7 @@ pub(crate) fn request_claude_explicit_refresh(
         account_identifier_hash: account_identifier_hash.map(str::to_string),
         organization_identifier_hash: organization_identifier_hash.map(str::to_string),
         requested_at: now,
+        min_gap_seconds,
     });
     let excess = requests
         .len()
@@ -11601,8 +11622,8 @@ pub(crate) fn request_claude_explicit_refresh(
 
 /// Whether an explicit refresh asks to read this binding now: a live request
 /// made after the stored reading and after the last refresh this binding
-/// answered, both at least a minute ago. The read still passes every hold,
-/// breaker and Retry-After check after this.
+/// answered, both at least the request's gap (a minute or more) ago. The
+/// read still passes every hold, breaker and Retry-After check after this.
 fn claude_explicit_refresh_requested(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
@@ -11615,13 +11636,14 @@ fn claude_explicit_refresh_requested(
         organization_identifier_hash,
     )
     .map_or(reading_observed_at, |at| at.max(reading_observed_at));
-    if now.saturating_sub(last) < CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS
-        && last <= now.saturating_add(60)
-    {
-        return false;
-    }
+    let skewed = last > now.saturating_add(60);
     claude_explicit_refresh_requests().iter().any(|request| {
         now.saturating_sub(request.requested_at) <= CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS
+            && (skewed
+                || now.saturating_sub(last)
+                    >= request
+                        .min_gap_seconds
+                        .max(CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS))
             && request.requested_at > last
             && request
                 .account_identifier_hash
@@ -22008,6 +22030,35 @@ for line in sys.stdin:
             1
         );
         assert_eq!(codex_app_server_runs(), before + 2);
+
+        let binding = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
+            .ok()
+            .flatten()
+            .and_then(|credentials| codex_credential_claimed_binding(&credentials));
+        if let Some(binding) = binding {
+            codex_credit_grants::forget_binding_cadence(&binding);
+        }
+        drop(_guards);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An older app's status refresh stands in for Refresh with a 5-minute
+    /// gap: one read per home, then the saved copy, even for the one-minute
+    /// Refresh, until the home's last read is 5 minutes old.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_older_app_status_refresh_reads_each_home_once_per_five_minutes() {
+        let (root, home, _guards) = synthetic_default_codex_install("legacy-status-refresh");
+        codex_saved_quota::forget_running_homes();
+        let before = codex_app_server_runs();
+
+        let first = refresh_codex_quota_now_spaced(None, None, 5 * 60);
+        assert_eq!((first.read, first.rate_limited), (1, 0));
+        assert_eq!(codex_app_server_runs(), before + 1);
+        let second = refresh_codex_quota_now_spaced(None, None, 5 * 60);
+        assert_eq!((second.read, second.rate_limited), (0, 1));
+        assert_eq!(codex_app_server_runs(), before + 1);
 
         let binding = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
             .ok()
