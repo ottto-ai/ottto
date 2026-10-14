@@ -277,10 +277,16 @@ or always-on watcher.
 
 On macOS, external-scheduler attribution may also inventory bounded user
 launchd definitions and the user's crontab at startup and once per day. Raw
-plist, crontab, wrapper-script, command, and path content stays local. A
-specific-file `lsof`, content-free process parent table, and bounded
-`launchctl print` lookup run only for a changed session that already matches a
-plausible scheduler definition; there is no process watcher. Static
+plist, crontab, wrapper-script, command, and path content stays local. Only
+for a recently written session that already matches a plausible scheduler
+definition, a bounded `launchctl print` lookup runs at most once per candidate
+job per scan. Only while such a job is running, the daemon reads process
+parents and start times from the kernel, Claude Code's own running-session
+registration files (`sessions/<pid>.json`: pid, session id, process start), and,
+for Codex, the open file paths of that job's process tree, once per scan. A
+registration counts only while its pid still runs with the recorded start. A
+proven job is remembered in memory for that session, bounded, so attribution
+survives the job's exit; there is no process watcher. Static
 correlation requires matching schedule time, prompt signature, provider, and
 repository. Interval jobs require a live job-PID relationship. Missing access,
 timeouts, and ambiguity produce no external-scheduler fact.
