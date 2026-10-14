@@ -41,3 +41,7 @@ A terminal-held key keeps its committed revision while the upload context advanc
 ## Security audit refresh during validation
 
 Validation discovered four RustSec advisories published on October 14, 2026 for rustls 0.23.45 (RUSTSEC-2026-0346 through RUSTSEC-2026-0349). The runtime lockfile now selects the patched 0.23.46 release through Cargo's resolver; its dependency list and all other locked package versions are unchanged. This dependency repair clears a separate security-audit gate and is not evidence that the recorded memory peaks came from TLS or that collection memory is reduced.
+
+## HTTP observer fixture repair during validation
+
+The macOS CI run passed the new replay regressions but exposed a broken-pipe failure in the existing install-registration observer test. Its nonblocking listener passed an inherited nonblocking accepted socket to a request reader that stops on `WouldBlock`, allowing the fixture to reply and close before receiving the body. Accepted observer connections now use blocking reads with the existing bounded timeout, and the fixture asserts that the complete request arrived before responding. Listener polling and operation-finished detection remain unchanged; this repairs only the synthetic test server.
