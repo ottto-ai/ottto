@@ -7505,6 +7505,97 @@ mod tests {
     }
 
     #[test]
+    fn held_cache_probe_lets_revision_adoption_commit_so_next_scan_parses_nothing() {
+        // An index saved before projection revision 1 must re-read and re-offer
+        // each file once. When that file's cache-head probe body was already
+        // quarantined, bootstrap used to fail the whole source before the index
+        // save, so every later pass re-read every file again.
+        let root = cache_effective_wire_fixture_root();
+        let index_path = root.join("index.json");
+        let scan = |index: &mut ScanIndex| {
+            crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                index,
+                "2026-09-30T10:05:00Z",
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap()
+        };
+        let load = || {
+            let mut index = ScanIndex::load(&index_path).unwrap();
+            index.activate_upload_context("cache-on".into());
+            index.activate_effective_upload_body_witness_revision(
+                EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            );
+            index
+        };
+        let mut legacy = ScanIndex::default();
+        legacy.activate_upload_context("cache-on".into());
+        let mut first = scan(&mut legacy);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut legacy);
+        legacy.save(&index_path).unwrap();
+
+        let mut index = load();
+        let mut adoption = scan(&mut index);
+        assert_eq!(adoption.scanned_file_count, 1, "adoption re-reads once");
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut adoption, &mut index);
+        assert_eq!(adoption.snapshots.len(), 1, "adoption re-offers the body");
+        assert!(adoption.snapshots[0].cache_observations.is_some());
+        let probe = cache_head_probe(&adoption.snapshots[0]);
+        let mut progress = test_upload_progress();
+        progress.quarantine_retryable_body(
+            &probe.snapshot_fingerprint,
+            &snapshot_upload_body_witness(&probe),
+        );
+        let record = progress
+            .quarantined_fingerprints
+            .get_mut(&probe.snapshot_fingerprint)
+            .unwrap();
+        record.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+        record.retry_after_unix_seconds = 0;
+
+        bootstrap_cache_heads(
+            &[probe],
+            &unique_poison_scope(),
+            &mut progress,
+            true,
+            |_, _| panic!("a held probe body is not resent"),
+            |_| Ok(()),
+        )
+        .expect("a held probe no longer fails the source before index save");
+        assert_eq!(
+            apply_bootstrapped_cache_heads(&mut adoption.snapshots, &progress).unwrap(),
+            1
+        );
+        let mut accepted = 0;
+        upload_resumable_batches_with_body_witness(
+            &adoption.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |_| panic!("a held body is not resent"),
+            |_| Ok(()),
+        )
+        .unwrap();
+        index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        index.save(&index_path).unwrap();
+
+        let next = scan(&mut load());
+        assert_eq!(
+            next.scanned_file_count, 0,
+            "unchanged file is not read again"
+        );
+        assert!(next.snapshots.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn cache_pending_head_stamp_preserves_actual_quarantine_candidate_retry() {
         let root = cache_effective_wire_fixture_root();
         let scan = |index: &mut ScanIndex| {
