@@ -14,9 +14,9 @@ use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
     LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
-    RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusReportKind,
-    SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed, CENSUS_RESIDUE_ERROR_CODE,
-    CENSUS_RESIDUE_STATUS_CONTRACT,
+    RelayTokenAuthorizationRejected, SnapshotAckRejected, SnapshotApiClient,
+    SnapshotStatusReportKind, SnapshotStatusRequest, UploadFailureDiagnostics, UploadShed,
+    CENSUS_RESIDUE_ERROR_CODE, CENSUS_RESIDUE_STATUS_CONTRACT,
 };
 use crate::snapshots::{
     apply_upload_policy, collector_version, context_curve_derivation_revision,
@@ -107,7 +107,8 @@ fn bootstrap_cache_heads(
         bool,
     ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     mut persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
-) -> Result<()> {
+) -> Result<usize> {
+    let mut deferred = 0usize;
     let stages: &[bool] = if ordinary_bootstrap {
         &[false, true]
     } else {
@@ -138,13 +139,101 @@ fn bootstrap_cache_heads(
             |items| upload(items, enforce_head_cas),
             |progress| persist(progress),
         )?;
-        if !matches!(outcome, ResumableUploadResult::Completed) {
-            return Err(anyhow!(
-                "cache head probe did not settle exact predecessor evidence"
-            ));
+        match outcome {
+            ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {}
+            // The partitioned uploader persisted each conflicting probe's exact
+            // body quarantine. Carry that hold into the normal upload rather
+            // than discarding every unrelated file's progress.
+            ResumableUploadResult::Deferred { count } => {
+                deferred = deferred.saturating_add(count);
+            }
+            _ => {
+                return Err(anyhow::Error::new(SnapshotAckRejected {
+                    reason: "cache head probe did not settle exact predecessor evidence",
+                }));
+            }
         }
     }
-    Ok(())
+    Ok(deferred)
+}
+
+fn cache_head_probe(item: &SnapshotItem) -> SnapshotItem {
+    let mut probe = item.clone();
+    probe.cache_observations = None;
+    probe.cache_observations_state = None;
+    probe
+}
+
+/// Exact non-acceptance of these bytes, using the uploader's existing hold
+/// predicate. An accepted body without a head is not a quarantine certificate.
+fn cache_head_probe_held(progress: &SnapshotUploadProgress, probe: &SnapshotItem) -> bool {
+    let fingerprint = &probe.snapshot_fingerprint;
+    let witness = snapshot_upload_body_witness(probe);
+    progress
+        .permanent_rejections
+        .get(fingerprint)
+        .is_some_and(|record| record.body_witness == witness)
+        || (!progress.active_quarantine_retries.contains(fingerprint)
+            && progress
+                .quarantined_fingerprints
+                .get(fingerprint)
+                .is_some_and(|record| {
+                    record.upload_body_witness.as_deref() == Some(witness.as_str())
+                }))
+}
+
+fn apply_bootstrapped_cache_heads(
+    snapshots: &mut [SnapshotItem],
+    progress: &SnapshotUploadProgress,
+) -> Result<usize> {
+    let mut held = 0usize;
+    for snapshot in snapshots {
+        if snapshot.cache_observations.is_none() {
+            continue;
+        }
+        if snapshot.cache_base_head_etag.is_none() {
+            let probe = cache_head_probe(snapshot);
+            // Check the hold before looking up the head: another entity for
+            // the same session may have acquired one, but that cannot release
+            // this exact body's quarantine or bypass its bounded retry.
+            if cache_head_probe_held(progress, &probe) {
+                // No cache patch or accepted head is invented. The normal
+                // uploader sees the exact held probe and keeps its quarantine;
+                // healthy siblings retain their own independent settlement.
+                *snapshot = probe;
+                held = held.saturating_add(1);
+                continue;
+            }
+        }
+        snapshot.cache_base_head_etag = progress
+            .accepted_cache_heads
+            .get(&cache_session_key(&snapshot.source_session_id))
+            .cloned();
+        if snapshot.cache_base_head_etag.is_none() {
+            return Err(anyhow::Error::new(SnapshotAckRejected {
+                reason: "cache head probe lacks accepted predecessor token",
+            }));
+        }
+    }
+    Ok(held)
+}
+
+fn with_bootstrap_deferred(
+    result: ResumableUploadResult,
+    deferred: usize,
+) -> ResumableUploadResult {
+    if deferred == 0 {
+        return result;
+    }
+    match result {
+        ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {
+            ResumableUploadResult::Deferred { count: deferred }
+        }
+        ResumableUploadResult::Deferred { count } => ResumableUploadResult::Deferred {
+            count: count.saturating_add(deferred),
+        },
+        other => other,
+    }
 }
 
 // Local index projection producer revision; independent of semantic/wire identity.
@@ -162,6 +251,198 @@ fn exclude_held_effective_body_witness_revision(
         .filter_map(|item| item.source_file_fingerprint.clone())
         .collect();
     index.exclude_effective_upload_body_witness_revision_for_source_files(&source_files);
+}
+
+/// Commit a `Completed` upload that left local holds. Every uploaded entity was
+/// accepted or unchanged; only the held revisions are unsettled.
+///
+/// A hold that the same traversal could still change (`progress_blocking`,
+/// which includes any RetryPending authority family) keeps the conservative
+/// partial commit and marks the sweep unsettled, so the generation needs one
+/// clean follow-up. Otherwise every hold is non-progressing: held keys keep
+/// their committed revision, every other key commits as the no-hold save
+/// would, and the traversal may settle. The caller keeps backfill and replay
+/// completion pending, and the durable hold disclosure keeps health red.
+///
+/// A non-progressing hold in a Claude family that retains authority evidence
+/// but has no committed entry to restore, as after a historical replay reset,
+/// still blocks: settling it would let a later page of the same traversal
+/// treat the still-present family as vanished.
+fn commit_completed_with_local_holds(
+    index: ScanIndex,
+    committed_index: &ScanIndex,
+    upload_progress: &SnapshotUploadProgress,
+    locally_held_fingerprints: &BTreeSet<String>,
+    account_deferred_held_fingerprints: &BTreeSet<String>,
+    progress_blocking: bool,
+) -> ScanIndex {
+    if !progress_blocking
+        && index.locally_held_keys_restorable(committed_index, locally_held_fingerprints)
+    {
+        return index.with_locally_held_keys_reverted(
+            committed_index,
+            locally_held_fingerprints,
+            account_deferred_held_fingerprints,
+        );
+    }
+    let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
+    accepted_fingerprints.retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
+    let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
+    server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
+    let mut index =
+        index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine);
+    index.mark_bounded_sweep_unsettled();
+    index
+}
+
+/// Local holds classified once per page, after finalization and before upload.
+/// Every upload outcome settles against this one classification.
+struct LocalHoldSettlement {
+    /// Sessions held locally on this page.
+    held_entity_count: usize,
+    /// RetryPending Claude authority families anywhere in the index.
+    retry_pending_family_count: usize,
+    held_fingerprints: BTreeSet<String>,
+    account_deferred_fingerprints: BTreeSet<String>,
+    progress_blocking: bool,
+}
+
+impl LocalHoldSettlement {
+    /// Record the durable account-hold disclosure, classify which holds a
+    /// later page could still change, and remove every held entity from the
+    /// upload. The disclosure is durable before upload, so every checkpoint
+    /// below carries it. Only Claude account deferrals are settled this way;
+    /// other sources keep every account deferral progress-blocking.
+    fn classify(
+        source: SnapshotSource,
+        index: &mut ScanIndex,
+        scan_result: &mut crate::snapshots::SourceScanResult,
+        disposition: &crate::snapshots::ClaudeUsageAuthorityDisposition,
+    ) -> Self {
+        let held_entity_count = disposition.quarantined_entity_count();
+        let held_fingerprints = disposition.quarantined_fingerprints(&scan_result.snapshots);
+        let account_deferred_fingerprints =
+            disposition.account_deferred_fingerprints(&scan_result.snapshots);
+        let account_holds_recorded = source == SnapshotSource::ClaudeCode
+            && index.record_claude_account_deferred_holds(
+                scan_result.completed_parses(),
+                &account_deferred_fingerprints,
+            );
+        let progress_blocking_held_fingerprints = disposition.progress_blocking_held_fingerprints(
+            &scan_result.snapshots,
+            index,
+            account_holds_recorded,
+        );
+        disposition.retain_uploadable(&mut scan_result.snapshots);
+        let retry_pending_family_count = index.claude_usage_authority_pending_count();
+        Self {
+            held_entity_count,
+            retry_pending_family_count,
+            held_fingerprints,
+            account_deferred_fingerprints,
+            progress_blocking: retry_pending_family_count > 0
+                || !progress_blocking_held_fingerprints.is_empty(),
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.retry_pending_family_count > 0 || self.held_entity_count > 0
+    }
+}
+
+/// The index an upload outcome commits, and whether that outcome leaves the
+/// upload fully settled. An unsettled outcome keeps backfill and context-curve
+/// replay completion pending.
+struct UploadIndexSettlement {
+    index: ScanIndex,
+    fully_settled: bool,
+}
+
+/// A persisted account hold was never uploaded, so the backfill and replay it
+/// belongs to stay pending even on a page that did not revisit it.
+fn upload_settled_without_account_holds(index: &ScanIndex, settled: bool) -> bool {
+    settled && index.claude_account_deferred_hold_count() == 0
+}
+
+/// Settle a `Completed` upload: every uploaded entity was accepted or
+/// unchanged, and only local holds can remain unsettled.
+fn settle_completed_upload(
+    index: ScanIndex,
+    committed_index: &ScanIndex,
+    upload_progress: &SnapshotUploadProgress,
+    holds: &LocalHoldSettlement,
+) -> UploadIndexSettlement {
+    if !holds.any() {
+        let fully_settled = upload_settled_without_account_holds(&index, true);
+        return UploadIndexSettlement {
+            index,
+            fully_settled,
+        };
+    }
+    let index = commit_completed_with_local_holds(
+        index,
+        committed_index,
+        upload_progress,
+        &holds.held_fingerprints,
+        &holds.account_deferred_fingerprints,
+        holds.progress_blocking,
+    );
+    eprintln!(
+        "local snapshot sync retained {} Claude usage family/families and {} revised \
+         entity/entities with unproven authority or session ownership; healthy siblings settled \
+         and the retained revisions remain pending for bounded retry",
+        holds.retry_pending_family_count, holds.held_entity_count
+    );
+    UploadIndexSettlement {
+        index,
+        fully_settled: false,
+    }
+}
+
+/// Settle a `Deferred` or `Rejected` upload. Retryable or locally unproven
+/// entities keep replay pending and owe a clean follow-up. A validated
+/// permanent refusal settles transport and traversal; its separate health
+/// still discloses the rejected usage.
+fn settle_checkpointed_upload(
+    index: ScanIndex,
+    committed_index: &ScanIndex,
+    upload_progress: &SnapshotUploadProgress,
+    holds: &LocalHoldSettlement,
+    resolved_permanent_rejections: bool,
+) -> UploadIndexSettlement {
+    let mut index = if holds.any() {
+        let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
+        accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
+        let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
+        server_quarantine.retain(|fingerprint, _| !holds.held_fingerprints.contains(fingerprint));
+        index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine)
+    } else {
+        index
+    };
+    let settled = resolved_permanent_rejections && !holds.any();
+    if !settled {
+        index.mark_bounded_sweep_unsettled();
+    }
+    let fully_settled = upload_settled_without_account_holds(&index, settled);
+    UploadIndexSettlement {
+        index,
+        fully_settled,
+    }
+}
+
+/// Fold the upload ledger into the index after any outcome that reaches the
+/// durable save.
+fn settle_index_after_upload(
+    index: &mut ScanIndex,
+    committed_index: &ScanIndex,
+    upload_progress: &SnapshotUploadProgress,
+) {
+    index.reconcile_codex_recovery_settlement(
+        committed_index,
+        &upload_progress.accepted_fingerprints,
+    );
+    index.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
+    index.record_accepted_snapshot_fingerprints(&upload_progress.accepted_fingerprints);
 }
 
 #[derive(Debug)]
@@ -351,6 +632,12 @@ struct PendingCacheHeadFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PermanentSnapshotRejection {
+    body_witness: String,
+    reason: crate::upload_receipts::RejectedUsageReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotUploadProgress {
     schema_version: u16,
     #[serde(default)]
@@ -377,6 +664,10 @@ struct SnapshotUploadProgress {
     pending_cache_heads: BTreeMap<String, PendingCacheHeadFile>,
     #[serde(default)]
     quarantined_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
+    /// Exact server-permanent refusals. Same destination, entity and body only;
+    /// parser/replay epochs and premature retry timers cannot erase this fact.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    permanent_rejections: BTreeMap<String, PermanentSnapshotRejection>,
     #[serde(skip)]
     active_quarantine_witness: Option<SnapshotQuarantineWitness>,
     /// Runtime leases for quarantine entries selected this cycle. The durable
@@ -402,6 +693,7 @@ impl SnapshotUploadProgress {
             accepted_cache_heads: BTreeMap::new(),
             pending_cache_heads: BTreeMap::new(),
             quarantined_fingerprints: BTreeMap::new(),
+            permanent_rejections: BTreeMap::new(),
             active_quarantine_witness: Some(active_quarantine_witness),
             active_quarantine_retries: BTreeSet::new(),
         }
@@ -478,6 +770,13 @@ impl SnapshotUploadProgress {
                         .quarantined_fingerprints
                         .keys()
                         .all(|value| is_snapshot_fingerprint(value))
+                    && progress
+                        .permanent_rejections
+                        .iter()
+                        .all(|(fingerprint, record)| {
+                            is_snapshot_fingerprint(fingerprint)
+                                && is_snapshot_fingerprint(&record.body_witness)
+                        })
                     && progress.quarantined_fingerprints.values().all(|record| {
                         snapshot_quarantine_deadline_is_bounded(record)
                             && record
@@ -532,6 +831,21 @@ impl SnapshotUploadProgress {
                     .or_insert_with(|| record.clone());
             }
         }
+        // The server-permanent exact-body fact dominates an older index timer.
+        // Keep the index-facing disposition truthful as well as suppressing I/O.
+        for (fingerprint, record) in &mut self.quarantined_fingerprints {
+            if self
+                .permanent_rejections
+                .get(fingerprint)
+                .is_some_and(|permanent| {
+                    record.upload_body_witness.as_deref() == Some(permanent.body_witness.as_str())
+                })
+            {
+                record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+                record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+                record.retry_after_unix_seconds = 0;
+            }
+        }
         let now = current_unix_seconds();
         let active = self
             .active_quarantine_witness
@@ -540,8 +854,15 @@ impl SnapshotUploadProgress {
         let retry = self
             .quarantined_fingerprints
             .iter()
-            .filter(|(_, record)| {
-                record.disposition == SnapshotQuarantineDisposition::RetryPending
+            .filter(|(fingerprint, record)| {
+                !self
+                    .permanent_rejections
+                    .get(*fingerprint)
+                    .is_some_and(|permanent| {
+                        record.upload_body_witness.as_deref()
+                            == Some(permanent.body_witness.as_str())
+                    })
+                    && record.disposition == SnapshotQuarantineDisposition::RetryPending
                     && (&record.witness != active || record.retry_after_unix_seconds <= now)
             })
             .map(|(fingerprint, record)| {
@@ -606,6 +927,13 @@ impl SnapshotUploadProgress {
     }
 
     fn contains_body(&self, fingerprint: &str, body_witness: &str) -> bool {
+        if self
+            .permanent_rejections
+            .get(fingerprint)
+            .is_some_and(|record| record.body_witness == body_witness)
+        {
+            return true;
+        }
         if self.active_quarantine_retries.contains(fingerprint) {
             return false;
         }
@@ -626,6 +954,7 @@ impl SnapshotUploadProgress {
     }
 
     fn record_body(&mut self, fingerprint: &str, body_witness: &str) {
+        self.permanent_rejections.remove(fingerprint);
         self.accepted_fingerprints.insert(fingerprint.to_string());
         self.accepted_body_witnesses
             .insert(fingerprint.to_string(), body_witness.to_string());
@@ -708,6 +1037,32 @@ impl SnapshotUploadProgress {
         self.accepted_fingerprints.remove(fingerprint);
         self.accepted_body_witnesses.remove(fingerprint);
         self.active_quarantine_retries.remove(fingerprint);
+    }
+
+    fn quarantine_permanent_body(&mut self, fingerprint: &str, body_witness: &str, reason: &str) {
+        self.quarantine_body(fingerprint, body_witness);
+        let record = self.quarantined_fingerprints.get_mut(fingerprint).unwrap();
+        record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        record.retry_after_unix_seconds = 0;
+        self.permanent_rejections.insert(
+            fingerprint.to_string(),
+            PermanentSnapshotRejection {
+                body_witness: body_witness.to_string(),
+                reason: crate::upload_receipts::RejectedUsageReason::from_wire(reason),
+            },
+        );
+    }
+
+    fn quarantine_retryable_body(&mut self, fingerprint: &str, body_witness: &str) {
+        self.quarantine_body(fingerprint, body_witness);
+        let record = self
+            .quarantined_fingerprints
+            .get_mut(fingerprint)
+            .expect("quarantine just recorded");
+        record.failed_reconstruction_count = 1;
+        record.disposition = SnapshotQuarantineDisposition::RetryPending;
+        record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
     }
 
     fn retain_current_quarantines_with_diagnostics(
@@ -1035,7 +1390,8 @@ impl SnapshotUploadProgress {
     }
 
     fn finish_cycle(&mut self, path: &Path) -> Result<()> {
-        if self.accepted_cache_states.is_empty()
+        if self.permanent_rejections.is_empty()
+            && self.accepted_cache_states.is_empty()
             && self.accepted_cache_heads.is_empty()
             && self.pending_cache_heads.is_empty()
         {
@@ -1400,6 +1756,20 @@ fn with_source_cadence<T>(
         .entry(source.api_slug())
         .or_insert_with(|| SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL)));
     Some(apply(cadence))
+}
+
+fn record_finished_snapshot_cadence(
+    cadence: &mut SourceCadence,
+    now: Instant,
+    accepted: u64,
+    retryable_deferral: bool,
+) {
+    if retryable_deferral {
+        cadence.record_scan_failure(now);
+    } else {
+        cadence.record_scan_success(now, accepted);
+        cadence.record_full_sweep(now);
+    }
 }
 
 /// The negotiated wait for one source: `clamp(directive, floor, ceiling)`.
@@ -1848,6 +2218,13 @@ impl SyncCounts {
         self.terminal_ownership_incomplete_file_count = self
             .terminal_ownership_incomplete_file_count
             .saturating_add(self.snapshot_unproven_terminal_count);
+        // Account-deferred holds are retried every generation, so they are
+        // disclosed as incomplete ownership but never as settled residue: the
+        // public count exceeds the terminal share and the receipt stays
+        // unsettled for as long as any hold persists.
+        self.ownership_incomplete_file_count = self
+            .ownership_incomplete_file_count
+            .saturating_add(index.claude_account_deferred_hold_count() as u64);
         self
     }
 }
@@ -1915,6 +2292,21 @@ fn snapshot_manifest_window_days(manifest: &SnapshotSourceManifest) -> Result<u6
     let window_days = u64::try_from(window_seconds / day_seconds)
         .context("convert cached snapshot manifest window days")?;
     validated_receipt_window_days(window_days)
+}
+
+fn deferred_entity_state(permanent: bool) -> CollectorState<'static> {
+    CollectorState::Error {
+        code: if permanent {
+            "backend_validation_error"
+        } else {
+            "server_error"
+        },
+        message: if permanent {
+            "backend permanently rejected exact snapshot bodies; accepted siblings checkpointed"
+        } else {
+            "backend has unsettled snapshot entities; accepted siblings checkpointed"
+        },
+    }
 }
 
 #[derive(Debug)]
@@ -3043,13 +3435,8 @@ fn prepare_sync_source(
     if receipt_window_days == 0 {
         let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
         withdraw_source_manifest(&destination_namespace, source);
-        let _ = crate::active_sessions::reconcile_active_sessions(
-            support_dir,
-            source,
-            &[],
-            None,
-            &scan_started_at,
-        );
+        let _ =
+            crate::active_sessions::clear_active_sessions(support_dir, source, &scan_started_at);
         report_status_with_fresh_relay_token(
             client,
             device,
@@ -3076,7 +3463,6 @@ fn prepare_sync_source(
         agent_status_expires_at,
         false,
     )?;
-    let scan_agent_status = reconciliation_agent_status(&scan_agent_status_collection);
     // Standalone/manual one-shot sync has no periodic daemon owner. Preserve
     // its original status upload without restoring the automatic duplicate.
     if !crate::agent_status_refresh::active() {
@@ -3102,13 +3488,8 @@ fn prepare_sync_source(
             &snapshot_upload_destination_namespace(device, device_secret),
             source,
         );
-        let _ = crate::active_sessions::reconcile_active_sessions(
-            support_dir,
-            source,
-            &[],
-            Some(scan_agent_status),
-            &scan_started_at,
-        );
+        let _ =
+            crate::active_sessions::clear_active_sessions(support_dir, source, &scan_started_at);
         report_status_with_fresh_relay_token(
             client,
             device,
@@ -3672,12 +4053,16 @@ fn finish_sync_source(
         &current_codex_bindings,
         cached_codex_login_changed,
     );
+    // Judge recency on the clock at reconciliation, not the scan start: a long
+    // scan reads transcripts that were still being written after it began, and
+    // anchoring to the start rejected that live activity as "future".
     if crate::active_sessions::reconcile_active_sessions(
         support_dir,
         source,
         &scan_result.snapshots,
         Some(&reconciliation_status),
-        &scan_started_at,
+        upload_policy,
+        &current_rfc3339(),
     )
     .is_err()
     {
@@ -3727,12 +4112,13 @@ fn finish_sync_source(
     // consumers above, then remove only authority-demoting revisions at the
     // network boundary. They are not backend poison and are not counted as
     // accepted/quarantined upload settlement.
-    let deferred_local_authority_entity_count =
-        claude_authority_disposition.quarantined_entity_count();
-    let locally_held_fingerprints =
-        claude_authority_disposition.quarantined_fingerprints(&scan_result.snapshots);
-    claude_authority_disposition.retain_uploadable(&mut scan_result.snapshots);
-    let deferred_local_authority_count = index.claude_usage_authority_pending_count();
+    let local_holds = LocalHoldSettlement::classify(
+        source,
+        &mut index,
+        &mut scan_result,
+        &claude_authority_disposition,
+    );
+    let locally_held_fingerprints = &local_holds.held_fingerprints;
 
     let cache_head_groups = if cache_observations_enabled
         && (activity_hint.snapshot_head_cas_required
@@ -3788,19 +4174,28 @@ fn finish_sync_source(
         .snapshots
         .iter()
         .filter(|item| item.cache_observations.is_some() && item.cache_base_head_etag.is_none())
-        .map(|item| {
-            let mut probe = item.clone();
-            probe.cache_observations = None;
-            probe.cache_observations_state = None;
-            probe
-        })
+        .map(cache_head_probe)
         .collect::<Vec<_>>();
+    let mut bootstrap_deferred = 0usize;
     if !probes.is_empty() {
+        // These failures precede the main upload's diagnostic. Preserve only
+        // the existing typed, content-free cause and the fixed failing role.
+        let log_bootstrap_failure = |role: &'static str| {
+            move |error: &anyhow::Error| {
+                if snapshot_upload_error_class(error).is_some() {
+                    eprintln!(
+                        "ottto-service: local snapshot cache-head bootstrap did not settle for {} — role={role}, {}",
+                        source.api_slug(),
+                        upload_failure_diagnostic(error)
+                    );
+                }
+            }
+        };
         let ordinary_bootstrap = !activity_hint.snapshot_head_cas_required
             && probes
                 .iter()
                 .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
-        bootstrap_cache_heads(
+        bootstrap_deferred = bootstrap_cache_heads(
             &probes,
             source.api_slug(),
             &mut upload_progress,
@@ -3829,17 +4224,15 @@ fn finish_sync_source(
                 Ok(response)
             },
             |progress| progress.save(&upload_progress_path),
-        )?;
-        for snapshot in &mut scan_result.snapshots {
-            if snapshot.cache_observations.is_some() {
-                snapshot.cache_base_head_etag = upload_progress
-                    .accepted_cache_heads
-                    .get(&cache_session_key(&snapshot.source_session_id))
-                    .cloned();
-                if snapshot.cache_base_head_etag.is_none() {
-                    return Err(anyhow!("cache head probe lacks accepted predecessor token"));
-                }
-            }
+        )
+        .inspect_err(log_bootstrap_failure("probe"))?;
+        let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
+            .inspect_err(log_bootstrap_failure("apply"))?;
+        if held > 0 {
+            eprintln!(
+                "local snapshot cache-head bootstrap carried {held} held probe(s) for {} as exact quarantined bodies; siblings continue",
+                source.api_slug()
+            );
         }
     }
     let projected_pending_head_file_witnesses =
@@ -3913,7 +4306,9 @@ fn finish_sync_source(
     .and_then(|result| {
         if matches!(
             result,
-            ResumableUploadResult::Completed | ResumableUploadResult::Conflicted { .. }
+            ResumableUploadResult::Completed
+                | ResumableUploadResult::Deferred { .. }
+                | ResumableUploadResult::Rejected { .. }
         ) {
             // A setup/account switch can replace the relay binding while a
             // long historical scan is uploading. Never commit destination A's
@@ -3921,7 +4316,8 @@ fn finish_sync_source(
             ensure_authority()?;
         }
         Ok(result)
-    });
+    })
+    .map(|result| with_bootstrap_deferred(result, bootstrap_deferred));
 
     // The server may have accepted new entities even when the final result is a
     // timeout, a disabled response, or a later local-state failure. Withdraw
@@ -3930,59 +4326,48 @@ fn finish_sync_source(
     withdraw_source_manifest(&upload_destination_namespace, source);
 
     let mut upload_fully_settled = true;
-    let mut deferred_entity_conflict_count = None;
+    let mut deferred_entity_count = None;
+    let mut resolved_permanent_rejections = false;
     match upload_result {
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
-            if deferred_local_authority_count > 0 || deferred_local_authority_entity_count > 0 {
-                let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
-                accepted_fingerprints
-                    .retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
-                let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
-                server_quarantine
-                    .retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
-                index = index.committable_subset(
-                    &committed_index,
-                    &accepted_fingerprints,
-                    &server_quarantine,
-                );
-                index.mark_bounded_sweep_unsettled();
+            let settlement =
+                settle_completed_upload(index, &committed_index, &upload_progress, &local_holds);
+            index = settlement.index;
+            if !settlement.fully_settled {
                 backfill_succeeded = false;
                 upload_fully_settled = false;
-                eprintln!(
-                    "local snapshot sync retained {deferred_local_authority_count} Claude usage \
-                     family/families and {deferred_local_authority_entity_count} revised \
-                     entity/entities with unproven authority or session ownership; healthy siblings settled \
-                     and the retained revisions remain pending for bounded retry"
-                );
             }
         }
-        Ok(ResumableUploadResult::Conflicted { count }) => {
+        Ok(
+            outcome @ (ResumableUploadResult::Deferred { .. }
+            | ResumableUploadResult::Rejected { .. }),
+        ) => {
+            let count = match outcome {
+                ResumableUploadResult::Rejected { count } => {
+                    resolved_permanent_rejections = true;
+                    count
+                }
+                ResumableUploadResult::Deferred { count } => count,
+                _ => unreachable!(),
+            };
             clear_shed_streak(source);
-            if deferred_local_authority_count > 0 || deferred_local_authority_entity_count > 0 {
-                let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
-                accepted_fingerprints
-                    .retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
-                let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
-                server_quarantine
-                    .retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
-                index = index.committable_subset(
-                    &committed_index,
-                    &accepted_fingerprints,
-                    &server_quarantine,
-                );
+            let settlement = settle_checkpointed_upload(
+                index,
+                &committed_index,
+                &upload_progress,
+                &local_holds,
+                resolved_permanent_rejections,
+            );
+            index = settlement.index;
+            if !settlement.fully_settled {
+                backfill_succeeded = false;
+                upload_fully_settled = false;
             }
-            // Accepted siblings are safe to commit, but a retryable conflict
-            // is not proof that a broad historical replay is complete. Force
-            // one clean follow-up sweep and leave the destination's backfill
-            // marker pending until every replacement entity settles.
-            index.mark_bounded_sweep_unsettled();
-            backfill_succeeded = false;
-            upload_fully_settled = false;
-            deferred_entity_conflict_count = Some(count);
+            deferred_entity_count = Some(count);
             eprintln!(
                 "local snapshot upload checkpointed accepted siblings but left {count} \
-                 conflicting entity(ies) pending for {}; a clean follow-up scan is required",
+                 unsettled entity(ies) pending for {}; a clean follow-up scan is required",
                 source.api_slug()
             );
         }
@@ -3996,7 +4381,7 @@ fn finish_sync_source(
                 &committed_index,
                 &upload_progress,
                 &scan_result.snapshots,
-                &locally_held_fingerprints,
+                locally_held_fingerprints,
                 &index_path,
                 &upload_progress_path,
                 || {
@@ -4104,7 +4489,7 @@ fn finish_sync_source(
                     &committed_index,
                     &upload_progress,
                     &scan_result.snapshots,
-                    &locally_held_fingerprints,
+                    locally_held_fingerprints,
                     &index_path,
                     &upload_progress_path,
                     || {
@@ -4120,6 +4505,13 @@ fn finish_sync_source(
                     ),
                 }
             }
+            if snapshot_upload_error_class(&error).is_some() {
+                eprintln!(
+                    "ottto-service: local snapshot upload did not settle for {} — {}",
+                    source.api_slug(),
+                    upload_failure_diagnostic(&error)
+                );
+            }
             // Distinguish local serializer drift, authorization failures, and
             // backend payload rejection. The resumable driver has already
             // checkpointed every accepted sibling before this terminal error.
@@ -4128,7 +4520,7 @@ fn finish_sync_source(
             {
                 (
                     CollectorState::Error {
-                        code: "local_state_error",
+                        code: "scan_error",
                         message: "local snapshot checkpoint or destination state failed",
                     },
                     "local snapshot state failed",
@@ -4138,7 +4530,7 @@ fn finish_sync_source(
             {
                 (
                     CollectorState::Error {
-                        code: "backend_response_error",
+                        code: "server_error",
                         message: "backend snapshot response did not match the request",
                     },
                     "backend snapshot response was invalid",
@@ -4259,12 +4651,19 @@ fn finish_sync_source(
         }
     }
 
-    index.reconcile_codex_recovery_settlement(
-        &committed_index,
-        &upload_progress.accepted_fingerprints,
-    );
-    index.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
-    index.record_accepted_snapshot_fingerprints(&upload_progress.accepted_fingerprints);
+    settle_index_after_upload(&mut index, &committed_index, &upload_progress);
+    // A quiet/delta-only scan still discloses current permanent refusals even
+    // though no body needed another upload. The committed census owns scope.
+    let current_entities = index.current_snapshot_fingerprints();
+    let retained_permanent = upload_progress
+        .permanent_rejections
+        .keys()
+        .filter(|fingerprint| current_entities.contains(*fingerprint))
+        .count();
+    if deferred_entity_count.is_none() && retained_permanent > 0 {
+        deferred_entity_count = Some(retained_permanent);
+        resolved_permanent_rejections = true;
+    }
     index.finish_legacy_settlement_reconciliation();
     settle_context_curve_replay_state(
         &mut index,
@@ -4290,12 +4689,12 @@ fn finish_sync_source(
     // scan. The sweep marker is stamped only for fully settled scans.
     with_source_cadence(source, |cadence| {
         let now = Instant::now();
-        if deferred_entity_conflict_count.is_some() {
-            cadence.record_scan_failure(now);
-        } else {
-            cadence.record_scan_success(now, accepted);
-            cadence.record_full_sweep(now);
-        }
+        record_finished_snapshot_cadence(
+            cadence,
+            now,
+            accepted,
+            deferred_entity_count.is_some() && !resolved_permanent_rejections,
+        );
     });
 
     // Refresh the per-source detected-uses cache the daemon health assembly
@@ -4337,16 +4736,19 @@ fn finish_sync_source(
     upload_progress.retire_pending_cache_heads(
         &index,
         &scan_result.snapshots,
-        &locally_held_fingerprints,
+        locally_held_fingerprints,
         scan_result.census_complete,
         &projected_pending_head_file_witnesses,
     );
+    upload_progress
+        .permanent_rejections
+        .retain(|fingerprint, _| current_entities.contains(fingerprint));
     upload_progress.finish_cycle(&upload_progress_path)?;
 
-    if let Some(count) = deferred_entity_conflict_count {
+    if let Some(count) = deferred_entity_count {
         // The uploader drained its frozen, scan-capped queue before returning
-        // `Conflicted`, and the index above now owns both accepted siblings and
-        // retryable conflict quarantine. Surface the conflict only after those
+        // `Deferred`, and the index above now owns both accepted siblings and
+        // entity quarantine. Surface the conflict only after those
         // facts are durable: returning earlier would recreate the per-source
         // starvation wedge, while reporting success would hide the backend's
         // capacity condition from source-level isolation and cadence handling.
@@ -4367,13 +4769,16 @@ fn finish_sync_source(
                 scan_started_at: terminal_scan_started_at,
                 counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
                     .with_snapshot_terminal_counts(&index),
-                state: CollectorState::Error {
-                    code: "server_error",
-                    message: "backend deferred conflicting snapshot entities",
-                },
+                state: deferred_entity_state(resolved_permanent_rejections),
             },
         );
-        return Err(snapshot_entity_conflict_deferred(count));
+        // Fully accounted permanent refusals finish transport successfully.
+        // Their terminal health remains incomplete and none are marked accepted.
+        return if resolved_permanent_rejections {
+            Ok(())
+        } else {
+            Err(snapshot_entity_deferred(count))
+        };
     }
 
     report_status_with_fresh_relay_token(
@@ -4519,6 +4924,7 @@ pub struct ClaudeLocalEvidenceStats {
     pub effort_evidence_load_failed: bool,
     pub own_request_complete_root_count: usize,
     pub own_request_unknown_root_count: usize,
+    pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
 }
 
 pub(crate) fn apply_claude_local_evidence_to_scan(
@@ -4746,6 +5152,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
             item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
         })
         .count();
+    stats.duplicate_census = disposition.duplicate_census;
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
     if census_withheld {
         // These revisions were fully readable, but uploading them would demote
@@ -4761,9 +5168,14 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
 #[derive(Debug, PartialEq, Eq)]
 enum ResumableUploadResult {
     Completed,
-    /// Every accepted sibling is durably checkpointed, while one or more
-    /// retryable entity conflicts remain quarantined for a later clean sweep.
-    Conflicted {
+    /// Valid complete ACK: transport finished, but exact permanent refusals
+    /// remain terminal/incomplete usage, never accepted or automatically retried.
+    Rejected {
+        count: usize,
+    },
+    /// Accepted siblings are durably checkpointed; actual backend conflicts
+    /// remain held for bounded retry.
+    Deferred {
         count: usize,
     },
     Disabled(Option<String>),
@@ -4861,24 +5273,24 @@ fn require_normal_write_ack_for_legacy_reconciliation(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SnapshotEntityConflictDeferred {
+struct SnapshotEntityDeferred {
     count: usize,
 }
 
-impl std::fmt::Display for SnapshotEntityConflictDeferred {
+impl std::fmt::Display for SnapshotEntityDeferred {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "snapshot upload deferred {} conflicting entity(ies)",
+            "snapshot upload deferred {} unsettled entity(ies)",
             self.count
         )
     }
 }
 
-impl std::error::Error for SnapshotEntityConflictDeferred {}
+impl std::error::Error for SnapshotEntityDeferred {}
 
-fn snapshot_entity_conflict_deferred(count: usize) -> anyhow::Error {
-    anyhow::Error::new(SnapshotEntityConflictDeferred { count })
+fn snapshot_entity_deferred(count: usize) -> anyhow::Error {
+    anyhow::Error::new(SnapshotEntityDeferred { count })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4890,9 +5302,10 @@ enum SnapshotUploadErrorClass {
 fn snapshot_upload_error_class(error: &anyhow::Error) -> Option<SnapshotUploadErrorClass> {
     if error.downcast_ref::<SnapshotLocalStateRejected>().is_some() {
         Some(SnapshotUploadErrorClass::LocalState)
-    } else if error
-        .downcast_ref::<SnapshotBatchResponseRejected>()
-        .is_some()
+    } else if error.downcast_ref::<SnapshotAckRejected>().is_some()
+        || error
+            .downcast_ref::<SnapshotBatchResponseRejected>()
+            .is_some()
     {
         Some(SnapshotUploadErrorClass::BackendResponse)
     } else {
@@ -5095,8 +5508,8 @@ where
         let rejected = response
             .rejected_entities
             .iter()
-            .map(|entity| entity.snapshot_fingerprint.as_str())
-            .collect::<BTreeSet<_>>();
+            .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
+            .collect::<BTreeMap<_, _>>();
         let conflicted = response
             .conflict_entities
             .iter()
@@ -5105,15 +5518,21 @@ where
         for index in indices {
             let item = &items[*index];
             let item_fingerprint = fingerprint(item);
-            if rejected.contains(item_fingerprint) || conflicted.contains(item_fingerprint) {
-                progress.quarantine_body(item_fingerprint, &body_witness(item));
+            if let Some(rejection) = rejected.get(item_fingerprint) {
+                progress.quarantine_permanent_body(
+                    item_fingerprint,
+                    &body_witness(item),
+                    rejection.safe_reason(),
+                );
+            } else if conflicted.contains(item_fingerprint) {
+                progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
             }
         }
         // A conflict is not a settlement, but it IS retryable: the
         // backend is asking for this entity again later, not never.
-        // It therefore shares the quarantine ledger's bounded
-        // backoff with permanent rejections, so one conflicting
-        // entity defers only itself.
+        // It therefore uses the quarantine ledger's bounded backoff, but
+        // never consumes the permanent reconstruction-failure budget.
+        // A transient conflict remains retryable.
         //
         // Returning the whole page as an error here (the previous
         // behaviour) discarded the entities the backend had ALREADY
@@ -5141,6 +5560,12 @@ where
     if entity_ack {
         for entity in &response.rejected_entities {
             record_poison_loss_once(poison_scope, &entity.snapshot_fingerprint);
+            eprintln!(
+                "local snapshot entity rejected for {poison_scope}: reason={} permanent={}; \
+                 accepted siblings checkpointed, rejected body retained in bounded quarantine",
+                entity.safe_reason(),
+                entity.permanent,
+            );
         }
     }
     *accepted = accepted.saturating_add(response.accepted);
@@ -5206,7 +5631,39 @@ where
         .accepted_fingerprints
         .retain(|value| progress.accepted_body_witnesses.contains_key(value));
     retain_counted_poison_fingerprints(poison_scope, &current_fingerprints);
-    if progress.accepted_fingerprints.len() != progress_len_before_prune {
+    // Replay and cycle retirement clear disposable quarantine records. Restore
+    // the index-facing refusal only when this frozen input proves the same body.
+    // Otherwise suppression could leave a rejected entity in the accepted census.
+    let permanent_to_restore = current_body_witnesses
+        .iter()
+        .filter(|(fingerprint, body)| {
+            progress
+                .permanent_rejections
+                .get(*fingerprint)
+                .is_some_and(|record| record.body_witness == **body)
+                && !progress
+                    .quarantined_fingerprints
+                    .get(*fingerprint)
+                    .is_some_and(|record| {
+                        record.upload_body_witness.as_deref() == Some(body.as_str())
+                            && record.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
+                    })
+        })
+        .map(|(fingerprint, body)| (fingerprint.clone(), body.clone()))
+        .collect::<Vec<_>>();
+    for (fingerprint, body) in &permanent_to_restore {
+        progress.quarantine_body(fingerprint, body);
+        let record = progress
+            .quarantined_fingerprints
+            .get_mut(fingerprint)
+            .unwrap();
+        record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        record.retry_after_unix_seconds = 0;
+    }
+    if progress.accepted_fingerprints.len() != progress_len_before_prune
+        || !permanent_to_restore.is_empty()
+    {
         persist(progress).map_err(|_| {
             anyhow::Error::new(SnapshotLocalStateRejected {
                 operation: "prune upload checkpoint",
@@ -5418,11 +5875,27 @@ where
              retry while every other entity in the page settled."
         );
     }
+    // Only actual backend conflicts defer this upload. Local preflight holds
+    // disclose local loss through index counters, not a backend capacity error.
+    // Exact permanent refusals remain visible without another HTTP request.
+    let permanent_rejected = current_body_witnesses
+        .iter()
+        .filter(|(fingerprint, body)| {
+            progress
+                .permanent_rejections
+                .get(*fingerprint)
+                .is_some_and(|record| record.body_witness == **body)
+        })
+        .count();
     if let Some(error) = deferred_validation_error {
         Err(error)
     } else if conflicted_entities > 0 {
-        Ok(ResumableUploadResult::Conflicted {
+        Ok(ResumableUploadResult::Deferred {
             count: conflicted_entities,
+        })
+    } else if permanent_rejected > 0 {
+        Ok(ResumableUploadResult::Rejected {
+            count: permanent_rejected,
         })
     } else {
         Ok(ResumableUploadResult::Completed)
@@ -6459,6 +6932,9 @@ fn upload_failure_diagnostic(error: &anyhow::Error) -> String {
     if let Some(rejected) = error.downcast_ref::<SnapshotLocalStateRejected>() {
         return format!("kind=local_state, operation={}", rejected.operation);
     }
+    if let Some(rejected) = error.downcast_ref::<SnapshotAckRejected>() {
+        return format!("kind=backend_response, detail={}", rejected.reason);
+    }
     // This module's own upload-loop reasons. Matching on the literals keeps the
     // emitted text a fixed vocabulary rather than arbitrary chain content.
     let text = error
@@ -6483,11 +6959,8 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
     if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
         return diagnostics.safe_message();
     }
-    if error
-        .downcast_ref::<SnapshotEntityConflictDeferred>()
-        .is_some()
-    {
-        return "local snapshot upload deferred by entity conflict".to_string();
+    if error.downcast_ref::<SnapshotEntityDeferred>().is_some() {
+        return "local snapshot upload deferred by unsettled entities".to_string();
     }
     match snapshot_upload_error_class(error) {
         Some(SnapshotUploadErrorClass::LocalState) => {
@@ -7086,7 +7559,7 @@ mod tests {
             |progress| progress.save(&progress_path),
         )
         .unwrap();
-        assert_eq!(outcome, ResumableUploadResult::Conflicted { count: 1 });
+        assert_eq!(outcome, ResumableUploadResult::Deferred { count: 1 });
         index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
         index.save(&index_path).unwrap();
         progress.retire_pending_cache_heads(
@@ -7246,6 +7719,97 @@ mod tests {
         )
         .unwrap();
         root
+    }
+
+    #[test]
+    fn held_cache_probe_lets_revision_adoption_commit_so_next_scan_parses_nothing() {
+        // An index saved before projection revision 1 must re-read and re-offer
+        // each file once. When that file's cache-head probe body was already
+        // quarantined, bootstrap used to fail the whole source before the index
+        // save, so every later pass re-read every file again.
+        let root = cache_effective_wire_fixture_root();
+        let index_path = root.join("index.json");
+        let scan = |index: &mut ScanIndex| {
+            crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                index,
+                "2026-09-30T10:05:00Z",
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap()
+        };
+        let load = || {
+            let mut index = ScanIndex::load(&index_path).unwrap();
+            index.activate_upload_context("cache-on".into());
+            index.activate_effective_upload_body_witness_revision(
+                EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            );
+            index
+        };
+        let mut legacy = ScanIndex::default();
+        legacy.activate_upload_context("cache-on".into());
+        let mut first = scan(&mut legacy);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut legacy);
+        legacy.save(&index_path).unwrap();
+
+        let mut index = load();
+        let mut adoption = scan(&mut index);
+        assert_eq!(adoption.scanned_file_count, 1, "adoption re-reads once");
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut adoption, &mut index);
+        assert_eq!(adoption.snapshots.len(), 1, "adoption re-offers the body");
+        assert!(adoption.snapshots[0].cache_observations.is_some());
+        let probe = cache_head_probe(&adoption.snapshots[0]);
+        let mut progress = test_upload_progress();
+        progress.quarantine_retryable_body(
+            &probe.snapshot_fingerprint,
+            &snapshot_upload_body_witness(&probe),
+        );
+        let record = progress
+            .quarantined_fingerprints
+            .get_mut(&probe.snapshot_fingerprint)
+            .unwrap();
+        record.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+        record.retry_after_unix_seconds = 0;
+
+        bootstrap_cache_heads(
+            &[probe],
+            &unique_poison_scope(),
+            &mut progress,
+            true,
+            |_, _| panic!("a held probe body is not resent"),
+            |_| Ok(()),
+        )
+        .expect("a held probe no longer fails the source before index save");
+        assert_eq!(
+            apply_bootstrapped_cache_heads(&mut adoption.snapshots, &progress).unwrap(),
+            1
+        );
+        let mut accepted = 0;
+        upload_resumable_batches_with_body_witness(
+            &adoption.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |_| panic!("a held body is not resent"),
+            |_| Ok(()),
+        )
+        .unwrap();
+        index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        index.save(&index_path).unwrap();
+
+        let next = scan(&mut load());
+        assert_eq!(
+            next.scanned_file_count, 0,
+            "unchanged file is not read again"
+        );
+        assert!(next.snapshots.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -9515,7 +10079,7 @@ mod tests {
             |state| state.save(&progress_path),
         )
         .expect("conflict remains retryable");
-        assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
+        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
         assert_eq!(accepted, 0);
 
         index.mark_bounded_sweep_unsettled();
@@ -9896,7 +10460,7 @@ mod tests {
         )
         .expect("permanent entity rejection is durably settled");
 
-        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!(result, ResumableUploadResult::Rejected { count: 1 });
         assert_eq!(accepted, 1);
         assert!(progress
             .accepted_fingerprints
@@ -9963,7 +10527,7 @@ mod tests {
         )
         .expect("a per-entity conflict is retryable, not a whole-page failure");
 
-        assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
+        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
         assert_eq!(uploaded_batches, vec![first_batch.clone(), later_batch]);
         assert_eq!(accepted, SNAPSHOT_BATCH_LIMIT as u64);
         assert_eq!(persisted.len(), 2);
@@ -9984,16 +10548,16 @@ mod tests {
             .accepted_fingerprints
             .contains(&items[SNAPSHOT_BATCH_LIMIT]));
 
-        let deferred = snapshot_entity_conflict_deferred(1);
+        let deferred = snapshot_entity_deferred(1);
         assert_eq!(
             deferred
-                .downcast_ref::<SnapshotEntityConflictDeferred>()
+                .downcast_ref::<SnapshotEntityDeferred>()
                 .map(|error| error.count),
             Some(1)
         );
         assert_eq!(
             safe_error(&deferred),
-            "local snapshot upload deferred by entity conflict"
+            "local snapshot upload deferred by unsettled entities"
         );
 
         // Model the next authoritative scan replacing the oversized canonical
@@ -10061,7 +10625,7 @@ mod tests {
         )
         .expect("an all-conflict page remains retryable");
 
-        assert_eq!(result, ResumableUploadResult::Conflicted { count: 3 });
+        assert_eq!(result, ResumableUploadResult::Deferred { count: 3 });
         assert_eq!(accepted, 0);
         assert!(progress.accepted_fingerprints.is_empty());
         assert_eq!(
@@ -10074,122 +10638,39 @@ mod tests {
         );
         assert_eq!(persisted.last(), Some(&progress));
 
-        let deferred = snapshot_entity_conflict_deferred(3);
+        let deferred = snapshot_entity_deferred(3);
         assert_eq!(
             deferred
-                .downcast_ref::<SnapshotEntityConflictDeferred>()
+                .downcast_ref::<SnapshotEntityDeferred>()
                 .map(|error| error.count),
             Some(3)
         );
     }
 
     #[test]
-    fn unchanged_conflict_is_unproven_terminal_on_fourth_failure_and_body_change_recovers() {
+    fn retryable_conflict_never_consumes_permanent_reconstruction_attempts() {
         let fingerprint = "f".repeat(64);
-        let item = BodyWitnessTestItem {
-            snapshot_fingerprint: fingerprint.clone(),
-            body_revision: "a".to_string(),
-        };
         let mut progress = test_upload_progress();
-        let mut accepted = 0;
-        let mut upload_count = 0;
-
-        for expected_failure_count in 1..=MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
-            if expected_failure_count > 1 {
-                progress
-                    .quarantined_fingerprints
-                    .get_mut(&fingerprint)
-                    .expect("retry remains accounted")
-                    .retry_after_unix_seconds = 0;
-                assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
-            }
-            let result = upload_resumable_batches_with_body_witness(
-                std::slice::from_ref(&item),
-                &unique_poison_scope(),
-                &mut progress,
-                &mut accepted,
-                |item| item.snapshot_fingerprint.as_str(),
-                |_| "a".repeat(64),
-                |batch| {
-                    upload_count += 1;
-                    Ok(entity_ack_batch(
-                        &[],
-                        &[],
-                        &[batch[0].snapshot_fingerprint.clone()],
-                    ))
-                },
-                |_| Ok(()),
-            )
-            .expect("conflict remains an explicit outcome");
-            assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
+        for _ in 0..9 {
+            progress.quarantine_retryable_body(&fingerprint, &"a".repeat(64));
             let record = &progress.quarantined_fingerprints[&fingerprint];
-            assert_eq!(record.failed_reconstruction_count, expected_failure_count);
+            assert_eq!(record.failed_reconstruction_count, 1);
             assert_eq!(
                 record.disposition,
-                if expected_failure_count == MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
-                    SnapshotQuarantineDisposition::UnprovenTerminal
-                } else {
-                    SnapshotQuarantineDisposition::RetryPending
-                }
+                SnapshotQuarantineDisposition::RetryPending
             );
+            assert!(snapshot_quarantine_deadline_is_bounded(record));
+            assert!(!progress.prepare_quarantine_retries(&BTreeMap::new()));
+            progress
+                .quarantined_fingerprints
+                .get_mut(&fingerprint)
+                .unwrap()
+                .retry_after_unix_seconds = 0;
+            assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
         }
-        assert_eq!(upload_count, 4);
-        assert!(!progress.prepare_quarantine_retries(&BTreeMap::new()));
-        let mut terminal_index = ScanIndex::default();
-        terminal_index.file_snapshot_fingerprints.insert(
-            "terminal.jsonl".to_string(),
-            BTreeSet::from([fingerprint.clone()]),
-        );
-        terminal_index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
-        assert_eq!(terminal_index.snapshot_unproven_terminal_count(), 1);
-        let disclosed = SyncCounts::default().with_snapshot_terminal_counts(&terminal_index);
-        assert_eq!(disclosed.snapshot_unproven_terminal_count, 1);
-        assert_eq!(disclosed.ownership_incomplete_file_count, 1);
-        // Terminal by disposition, so the settled share grows by the same
-        // number and the ownership-incomplete class stays matched.
-        assert_eq!(disclosed.terminal_ownership_incomplete_file_count, 1);
-
-        let fifth = upload_resumable_batches_with_body_witness(
-            std::slice::from_ref(&item),
-            &unique_poison_scope(),
-            &mut progress,
-            &mut accepted,
-            |item| item.snapshot_fingerprint.as_str(),
-            |_| "a".repeat(64),
-            |_| panic!("unchanged terminal body must not upload a fifth time"),
-            |_| Ok(()),
-        )
-        .expect("terminal suppression is a completed local pass");
-        assert_eq!(fifth, ResumableUploadResult::Completed);
-        assert_eq!(
-            progress.quarantined_fingerprints[&fingerprint].failed_reconstruction_count,
-            MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
-        );
-
-        let corrected = BodyWitnessTestItem {
-            snapshot_fingerprint: fingerprint.clone(),
-            body_revision: "b".to_string(),
-        };
-        let recovered = upload_resumable_batches_with_body_witness(
-            std::slice::from_ref(&corrected),
-            &unique_poison_scope(),
-            &mut progress,
-            &mut accepted,
-            |item| item.snapshot_fingerprint.as_str(),
-            |_| "b".repeat(64),
-            |batch| {
-                Ok(entity_ack_batch(
-                    &[batch[0].snapshot_fingerprint.clone()],
-                    &[],
-                    &[],
-                ))
-            },
-            |_| Ok(()),
-        )
-        .expect("changed body reopens and settles terminal identity");
-        assert_eq!(recovered, ResumableUploadResult::Completed);
-        assert!(!progress.quarantined_fingerprints.contains_key(&fingerprint));
-        assert!(progress.accepted_fingerprints.contains(&fingerprint));
+        assert!(!progress.contains_body(&fingerprint, &"b".repeat(64)));
+        progress.record_body(&fingerprint, &"b".repeat(64));
+        assert!(progress.quarantined_fingerprints.is_empty());
     }
 
     #[test]
@@ -12025,7 +12506,7 @@ mod tests {
             },
             |_| Ok(()),
         )
-        .expect("an empty bounded scan is a vacuous completed upload");
+        .expect("an empty bounded scan leaves its prior quarantine owed");
         assert_eq!(result, ResumableUploadResult::Completed);
         assert_eq!((upload_calls, accepted), (0, 0));
 
@@ -12135,7 +12616,7 @@ mod tests {
         )
         .expect("a normal entity conflict is a closed-machine result");
 
-        assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
+        assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
         assert_eq!(observed_classes, vec![false, true]);
         assert_eq!(accepted, 1);
         assert!(progress.accepted_fingerprints.contains(&ordinary));
@@ -12147,7 +12628,7 @@ mod tests {
             quarantined.disposition,
             SnapshotQuarantineDisposition::RetryPending
         );
-        assert_eq!(quarantined.failed_reconstruction_count, 2);
+        assert_eq!(quarantined.failed_reconstruction_count, 1);
         assert!(quarantined.retry_after_unix_seconds > current_unix_seconds());
     }
 
@@ -13975,6 +14456,164 @@ mod tests {
         assert_eq!(receipt["last_error_code"], "parse_error");
         assert_eq!(receipt["consecutive_failures"], 1);
         assert!(receipt["last_success_at"].is_null());
+    }
+
+    fn claude_index_with(entries: serde_json::Value) -> ScanIndex {
+        let mut serialized = serde_json::to_value(ScanIndex::default()).expect("serialize index");
+        let object = serialized.as_object_mut().expect("index is an object");
+        for (key, value) in entries.as_object().expect("entries are an object") {
+            object.insert(key.clone(), value.clone());
+        }
+        serde_json::from_value(serialized).expect("deserialize index fixture")
+    }
+
+    /// An account-deferred hold is retried every generation. It joins the
+    /// public ownership-incomplete count but never the settled share, so even
+    /// beside settled terminal authority residue the Claude receipt stays an
+    /// unsettled `parse_error` while the hold persists.
+    #[test]
+    #[serial(source_manifests)]
+    fn account_deferred_holds_keep_the_claude_receipt_unsettled() {
+        let _source_manifests = SourceManifestTestGuard::new();
+        let held = claude_index_with(serde_json::json!({
+            "claude_account_deferred_holds": {"/opaque/deferred.jsonl": "deferred-source"},
+        }));
+        assert_eq!(held.claude_account_deferred_hold_count(), 1);
+        let counts = claude_usage_authority_census_counts(
+            "account-deferred-hold-receipt",
+            &[("unproven_terminal", 1)],
+        )
+        .with_snapshot_terminal_counts(&held);
+        assert!(counts.census_complete);
+        assert_eq!(counts.ownership_incomplete_file_count, 2);
+        assert_eq!(counts.terminal_ownership_incomplete_file_count, 1);
+
+        let receipt = captured_terminal_receipt_for_source_under_hint(
+            SnapshotSource::ClaudeCode,
+            counts,
+            CollectorState::Success,
+            TerminalManifestSource::Withdraw,
+            183,
+            RESIDUE_ADMITTING_HINT,
+        );
+        assert_eq!(receipt["last_error_code"], "parse_error");
+        assert_eq!(receipt["consecutive_failures"], 1);
+        assert!(receipt["last_success_at"].is_null());
+        assert_eq!(receipt["last_ownership_incomplete_file_count"], 2);
+        assert_eq!(receipt["last_terminal_ownership_incomplete_file_count"], 1);
+
+        // Without a hold the same terminal residue settles.
+        let settled = claude_usage_authority_census_counts(
+            "account-deferred-hold-released-receipt",
+            &[("unproven_terminal", 1)],
+        )
+        .with_snapshot_terminal_counts(&ScanIndex::default());
+        assert_eq!(
+            settled.ownership_incomplete_file_count,
+            settled.terminal_ownership_incomplete_file_count
+        );
+    }
+
+    /// A completed upload whose holds can still change in this traversal keeps
+    /// the conservative partial commit and owes a clean follow-up; one whose
+    /// holds cannot progress reverts only the held key and may settle.
+    #[test]
+    fn completed_upload_with_local_holds_settles_only_non_progressing_holds() {
+        let activity = "2026-08-02T07:00:00Z";
+        let entry = |source: &str, fingerprint: &str| {
+            serde_json::json!({
+                "size_bytes": 1,
+                "modified_unix_seconds": 2,
+                "source_file_fingerprint": source,
+                "last_snapshot_fingerprint": fingerprint,
+                "scan_identity_version": "semantic_sync:v2",
+            })
+        };
+        let committed = claude_index_with(serde_json::json!({
+            "files": {
+                "/opaque/held.jsonl": entry("held-old-source", "held-old"),
+                "/opaque/sibling.jsonl": entry("sibling-old-source", "sibling-old"),
+            },
+            "file_snapshot_fingerprints": {
+                "/opaque/held.jsonl": ["held-old"],
+                "/opaque/sibling.jsonl": ["sibling-old"],
+            },
+            "snapshot_activity_at": {"held-old": activity, "sibling-old": activity},
+        }));
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {
+                "/opaque/held.jsonl": entry("held-new-source", "held-new"),
+                "/opaque/sibling.jsonl": entry("sibling-new-source", "sibling-new"),
+            },
+            "file_snapshot_fingerprints": {
+                "/opaque/held.jsonl": ["held-new"],
+                "/opaque/sibling.jsonl": ["sibling-new"],
+            },
+            "snapshot_activity_at": {"held-new": activity, "sibling-new": activity},
+        }));
+        let held = BTreeSet::from(["held-new".to_string()]);
+        let mut upload_progress = test_upload_progress();
+        upload_progress
+            .accepted_fingerprints
+            .insert("sibling-new".to_string());
+
+        let settled = commit_completed_with_local_holds(
+            scanned.clone(),
+            &committed,
+            &upload_progress,
+            &held,
+            &BTreeSet::new(),
+            false,
+        );
+        assert!(!settled.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            settled.files["/opaque/held.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("held-old")
+        );
+        assert_eq!(
+            settled.files["/opaque/held.jsonl"].source_file_fingerprint,
+            "held-old-source"
+        );
+        assert_eq!(
+            settled.files["/opaque/sibling.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("sibling-new")
+        );
+        assert!(settled.snapshot_activity_at.contains_key("held-old"));
+        assert!(!settled.snapshot_activity_at.contains_key("held-new"));
+
+        // An account-deferred hold additionally owes a reparse every generation.
+        let deferred = commit_completed_with_local_holds(
+            scanned.clone(),
+            &committed,
+            &upload_progress,
+            &held,
+            &held,
+            false,
+        );
+        assert!(!deferred.bounded_sweep_had_unsettled_upload());
+        assert!(deferred.files["/opaque/held.jsonl"]
+            .source_file_fingerprint
+            .is_empty());
+
+        let blocked = commit_completed_with_local_holds(
+            scanned,
+            &committed,
+            &upload_progress,
+            &held,
+            &BTreeSet::new(),
+            true,
+        );
+        assert!(blocked.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            blocked.files["/opaque/held.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("held-old")
+        );
     }
 
     /// The backend's error-code set is closed and its forward tolerance covers
@@ -15972,6 +16611,7 @@ mod tests {
     include!("retry_owned_rotation.rs");
     include!("retry_bounded_native_tests.rs");
     include!("retry_live_native_tests.rs");
+    include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     #[test]
     fn codex_union_native_transport_common_ack_crash_checkpoint_and_restart() {
         codex_union_native_transport_restart(false, false);
@@ -16195,7 +16835,7 @@ mod tests {
                 |progress| progress.save(&progress_path),
             )
             .unwrap();
-            assert!(matches!(outcome, ResumableUploadResult::Completed));
+            assert_eq!(outcome, ResumableUploadResult::Rejected { count: 1 });
             server.join().unwrap();
             assert_eq!(accepted_count, 1);
             assert_eq!(progress.accepted_fingerprints.len(), 1);
@@ -17376,6 +18016,12 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, active_quarantine_witness, active_quarantine_retries);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
+
+#[cfg(test)]
+#[path = "snapshot_sync/h357_ack_tests.rs"]
+mod h357_ack_tests;
+
+crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason);

@@ -17,3 +17,6 @@ ottto-core = { path = "../ottto-core" }
 ottto-protocol = { path = "../ottto-protocol" }
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+ottto-core = { path = "../ottto-core", features = ["test-secret-store"] }

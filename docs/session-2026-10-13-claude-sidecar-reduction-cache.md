@@ -1,0 +1,17 @@
+# Claude telemetry changes and retained transcript reductions
+
+Claude request-log and ownership-trace files participate in candidate selection so late evidence selects the root and its children. They are read and joined after native transcript finish. Including their stat digests in the retained pre-finish accumulator's validity scope forced an otherwise eligible transcript to be read fully again when only telemetry changed; a telemetry write during acquisition could also fail its completion scope check.
+
+The reduction dependency calculation now omits only these usage-sidecar inputs for Claude. Root Desktop metadata and child naming material remain dependencies. Candidate selection still uses the original usage-sidecar contribution, and both acquisition start and completion use the shared reduction dependency function. Codex, parser versions, persistent formats, upload context, ownership, forced families, quarantine, copy budgets and hourly audit rules are unchanged.
+
+A separate synthetic regression module drives the production scanner without early acceptance. It joins fresh telemetry and applies upload policy before comparing serialized snapshot bodies, semantic fingerprints, body witnesses, family proof and quarantine to an independent native Full scan from the same predecessor index. Tests cover late and mid-acquisition evidence, transcript appends, root/children selection, naming metadata, duplicate/conflicting/missing evidence, cache loss and budget refusal, quarantine recovery, true completion scope changes and audit debt. Sparse capped files are rejected by metadata rather than read as a large synthetic corpus.
+
+The optimization changes acquisition work only in eligible warm-cache cases. No installed CPU or memory saving, storage expiry, identity activation or accounting-policy change is claimed. The existing acquisition mode/reason and native/guard-byte diagnostics remain the acceptance controls. Unmerged identity extensions need integration coverage before activation. Installed CPU benefit and fleet performance remain unmeasured.
+
+## Native and fallback validation
+
+The earlier hosted macOS CI used rustc 1.98.1, outside the validated allocation-layout versions. Its original warm-cache guard failures did not establish cache equivalence. A later operator policy allowed bounded local Cargo tests while the remote native lane is absent. No compiler was installed or added to the production allowlist.
+
+The test initializer now checks actual compiler eligibility. Supported runs require bounded retained state and real Tail/Unchanged modes. Unsupported runs require no retained state and actual Full acquisition; every body, family and ACK assertion still executes. Neither branch skips a fixture or fabricates an eligible layout. A separate cold Full test covers telemetry writes during acquisition and confirms that real context changes and object replacement still refuse publication.
+
+Targeted offline, locked runs on macOS arm64: exact rustc 1.95.0 passed all 13 cases with real reuse; installed unsupported rustc 1.97.1 passed the same 13 cases with Full fallback. Both had zero failed/ignored cases. The existing transcript acquisition regression group also passed on 1.95.0: 23 passed, zero failed, two pre-existing opt-in benchmarks ignored. Each Cargo invocation used at most two compilation jobs and began below the one-minute load threshold, with builds serialized. Whole CI, head-bound review and integration status are separate closeout evidence.

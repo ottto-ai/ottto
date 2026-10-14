@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use ottto_protocol::{
-    ActiveSessionReconciliation, AgentCreditBalance, AgentCreditBalanceUnit,
-    AgentQuotaWindowFreshness, CreditBalanceKind,
+    ActiveSessionReconciliation, AgentCreditBalance, AgentCreditBalanceUnit, AgentQuotaWindow,
+    AgentQuotaWindowFreshness, CreditBalanceKind, CreditGrantsUnavailableCause,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -72,6 +72,12 @@ const PASSIVE_CLOCK_SKEW_SECONDS: u64 = 60;
 /// Longest pause between two collection passes of one caller that still
 /// counts as continuous observation of its sign-in (passes run every ~5 min).
 const CALLER_BINDING_MAX_GAP_SECONDS: u64 = 15 * 60;
+/// A window reset the stored reading predates earns one extra read this long
+/// after the reset, spread per account over the next minute (design R7
+/// amendment: reset read). The reading after it postdates the reset, so each
+/// reset is read at most once.
+const RESET_READ_DELAY_SECONDS: u64 = 60;
+const RESET_READ_SPREAD_SECONDS: u64 = 60;
 /// Persisted cadence state, next to the account's usage cache.
 pub(super) const CLAUDE_READ_SCHEDULE_FILE: &str = "read-schedule.json";
 
@@ -89,6 +95,14 @@ impl ClaudeUsageRead {
         match self {
             Self::Plain => "",
             Self::SavedResets => CLAUDE_SAVED_RESETS_QUERY,
+        }
+    }
+
+    /// The read named in diagnostics.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Plain => "usage",
+            Self::SavedResets => "saved-resets",
         }
     }
 }
@@ -209,10 +223,16 @@ pub(super) fn claude_merge_credit_sections(
     let binding = &binding;
     let mut sections = SectionCache::new();
     for section in SECTIONS {
+        // A reader-blind section stored by an older daemon (complete, 0) is
+        // re-sent in its §11.10 shape.
         let prior = previous
             .iter()
             .filter(|balance| balance_section(balance) == Some(section))
             .cloned()
+            .map(|mut balance| {
+                claude_mark_reader_unavailable(&mut balance);
+                balance
+            })
             .collect::<Vec<_>>();
         if !prior.is_empty() {
             sections.observe_balances(binding, section, &prior);
@@ -242,6 +262,8 @@ pub(super) fn claude_merge_credit_sections(
 /// array lacks the grant list: re-send the last observed list (with its
 /// original `grants_observed_at`, count and `remaining`, so `status` holds)
 /// instead of replacing it with an unavailable one. Readiness stays fresh.
+/// A reader-blind reading keeps its own unavailable list: the stored one was
+/// seen by a reader that no longer sees it.
 fn keep_stored_grant_list(
     mut fresh: Vec<AgentCreditBalance>,
     previous: &[AgentCreditBalance],
@@ -249,9 +271,13 @@ fn keep_stored_grant_list(
     let stored = previous
         .iter()
         .filter(|balance| balance_section(balance) == Some(CreditSection::SavedResets))
+        .filter(|balance| !claude_reader_cannot_see_grants(balance))
         .find_map(|balance| Some((GrantListSection::from_balance(balance)?, balance.remaining)));
     if let Some((list, remaining)) = stored {
-        for balance in fresh.iter_mut().filter(|balance| balance.grants.is_none()) {
+        for balance in fresh
+            .iter_mut()
+            .filter(|balance| balance.grants.is_none() && !claude_reader_cannot_see_grants(balance))
+        {
             balance.remaining = remaining;
             list.apply_to(balance);
         }
@@ -351,9 +377,42 @@ fn claude_one_time_credits(
         .collect()
 }
 
+/// `ineligible_reason` values saying the reader that took the reading cannot
+/// see the grants (contract v2.2 §11.10): the answer is about Ottto's request,
+/// not the account, so its empty list is not "no resets".
+const CLAUDE_READER_INELIGIBLE_REASONS: [&str; 2] = ["surface", "cli_version"];
+
+fn claude_reader_cannot_see_grants(balance: &AgentCreditBalance) -> bool {
+    balance.kind == Some(CreditBalanceKind::SavedResets)
+        && balance
+            .ineligible_reason
+            .as_deref()
+            .is_some_and(|reason| CLAUDE_READER_INELIGIBLE_REASONS.contains(&reason))
+}
+
+/// Contract v2.2 §11.10: a saved-reset reading whose reader cannot see the
+/// grants has an unavailable list (no grants, no `remaining`, no
+/// `grant_count`, `status` unknown) with `grants_unavailable_cause: reader`.
+/// Readiness stays as read. Idempotent; any other balance is left as is.
+pub(super) fn claude_mark_reader_unavailable(balance: &mut AgentCreditBalance) {
+    if !claude_reader_cannot_see_grants(balance) {
+        return;
+    }
+    // Unavailable carries no diagnostics.
+    let _ = build_grants(ListObservation::Unavailable {
+        provider: Provider::Anthropic,
+        provider_count: None,
+    })
+    .apply_to(balance);
+    balance.grants_unavailable_cause = Some(CreditGrantsUnavailableCause::Reader);
+}
+
 /// `cedar_ember` → one saved-reset balance. Grants, `remaining`, `status` and
 /// the readiness passthrough (`eligible`, `ineligible_reason`, `at_limit`,
 /// `cooldown_until`) are all the model's rules; this only names the fields.
+/// A reader-blind answer (`ineligible_reason` `surface`/`cli_version`) has an
+/// unavailable list whatever `grants` holds
+/// ([`claude_mark_reader_unavailable`]).
 fn claude_saved_resets(
     body: &Value,
     observed_at: &str,
@@ -363,20 +422,6 @@ fn claude_saved_resets(
         return None;
     }
     let cedar = body.get("cedar_ember")?.as_object()?;
-    let observation = match cedar.get("grants").and_then(Value::as_array) {
-        // The raw array is the provider's complete enumeration (contract v2.1
-        // §3 B): its length is the count, invalid members included.
-        Some(grants) => ListObservation::Read {
-            provider: Provider::Anthropic,
-            provider_count: Some(grants.len() as u64),
-            records: grants.iter().map(claude_grant_input).collect(),
-            observed_at: observed_at.to_string(),
-        },
-        None => ListObservation::Unavailable {
-            provider: Provider::Anthropic,
-            provider_count: None,
-        },
-    };
     let mut balance = AgentCreditBalance {
         name: CLAUDE_SAVED_RESETS_NAME.to_string(),
         freshness: AgentQuotaWindowFreshness::Fresh,
@@ -394,6 +439,24 @@ fn claude_saved_resets(
             cooldown_until: time_field(cedar, "cooldown_until"),
         },
     ));
+    if claude_reader_cannot_see_grants(&balance) {
+        claude_mark_reader_unavailable(&mut balance);
+        return Some(balance);
+    }
+    let observation = match cedar.get("grants").and_then(Value::as_array) {
+        // The raw array is the provider's complete enumeration (contract v2.1
+        // §3 B): its length is the count, invalid members included.
+        Some(grants) => ListObservation::Read {
+            provider: Provider::Anthropic,
+            provider_count: Some(grants.len() as u64),
+            records: grants.iter().map(claude_grant_input).collect(),
+            observed_at: observed_at.to_string(),
+        },
+        None => ListObservation::Unavailable {
+            provider: Provider::Anthropic,
+            provider_count: None,
+        },
+    };
     diagnostics.extend(build_grants(observation).apply_to(&mut balance));
     Some(balance)
 }
@@ -660,6 +723,55 @@ pub(super) fn claude_slot_elapsed(age_seconds: u64, slot_seconds: u64) -> bool {
     age_seconds.saturating_add(SLOT_ADMISSION_SLACK_SECONDS) >= slot_seconds
 }
 
+/// How long after a window reset this binding's reset read waits: 60-120 s,
+/// spread deterministically per account (load spreading, like the slots).
+pub(super) fn claude_reset_read_delay_seconds(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ottto:claude-oauth-usage-reset-read:");
+    hasher.update(account_identifier_hash.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(organization_identifier_hash.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    RESET_READ_DELAY_SECONDS + u64::from_be_bytes(bytes) % (RESET_READ_SPREAD_SECONDS + 1)
+}
+
+/// When the reset read for a reading taken at `observed_at` is due: the first
+/// window reset after the reading plus `delay_seconds`, but never before the
+/// stored Retry-After/success spacing (`next_refresh_after`). `None` when no
+/// window of the reading resets after it.
+pub(super) fn claude_reset_read_at(
+    windows: &[AgentQuotaWindow],
+    observed_at: u64,
+    next_refresh_after: u64,
+    delay_seconds: u64,
+) -> Option<u64> {
+    windows
+        .iter()
+        .filter_map(|window| window.resets_at.as_deref().and_then(parse_instant))
+        .filter_map(|reset| u64::try_from(reset.unix_timestamp()).ok())
+        .filter(|reset| *reset > observed_at)
+        .min()
+        .map(|reset| reset.saturating_add(delay_seconds).max(next_refresh_after))
+}
+
+/// Whether a reset the stored reading predates is due its one extra read,
+/// outside the slot.
+pub(super) fn claude_reset_read_due(
+    windows: &[AgentQuotaWindow],
+    observed_at: u64,
+    next_refresh_after: u64,
+    delay_seconds: u64,
+    now: u64,
+) -> bool {
+    claude_reset_read_at(windows, observed_at, next_refresh_after, delay_seconds)
+        .is_some_and(|at| now >= at)
+}
+
 /// Whether the binding is due a new reading: never read, or its slot has
 /// elapsed and any Retry-After/success spacing has passed.
 pub(super) fn claude_reading_due(
@@ -769,6 +881,9 @@ pub(super) fn label_credit_freshness(
     now: u64,
 ) {
     for balance in balances {
+        // Every serve path labels here, so a reader-blind saved-reset section
+        // stored by an older daemon is served in its §11.10 shape too.
+        claude_mark_reader_unavailable(balance);
         let (read_at, max_age) = match balance_read_at(balance) {
             None => (stored_read_at, gate_seconds),
             Some(read_at)
@@ -1261,6 +1376,175 @@ mod tests {
         assert_eq!(balance.grants_state, Some(CreditGrantsState::Complete));
         assert_eq!(balance.grant_count, Some(0));
         assert_eq!(balance.remaining, Some(0));
+        assert_eq!(balance.grants_unavailable_cause, None);
+    }
+
+    fn cedar_reader_blind(reason: &str, grants: Option<Value>) -> Value {
+        let mut cedar = cedar_ineligible();
+        cedar["ineligible_reason"] = json!(reason);
+        match grants {
+            Some(grants) => cedar["grants"] = grants,
+            None => {
+                cedar.as_object_mut().unwrap().remove("grants");
+            }
+        }
+        cedar
+    }
+
+    fn assert_reader_unavailable(balance: &AgentCreditBalance, reason: &str) {
+        assert_eq!(
+            balance.grants_unavailable_cause,
+            Some(CreditGrantsUnavailableCause::Reader),
+            "{reason}"
+        );
+        assert!(ottto_protocol::credit_grants_unavailable_cause_allowed(
+            balance
+        ));
+        assert_eq!(balance.grants_state, Some(CreditGrantsState::Unavailable));
+        assert_eq!(balance.grants, None);
+        assert_eq!(balance.remaining, None);
+        assert_eq!(balance.grant_count, None);
+        assert_eq!(balance.grants_observed_at, None);
+        assert_eq!(balance.next_expires_at, None);
+        assert_eq!(balance.latest_granted_at, None);
+        assert_eq!(balance.status, AgentCreditBalanceStatus::Unknown);
+        // Readiness stays exactly as read.
+        assert_eq!(balance.eligible, Some(false));
+        assert_eq!(balance.at_limit, Some(false));
+        assert_eq!(balance.ineligible_reason.as_deref(), Some(reason));
+    }
+
+    /// Contract v2.2 §11.10: `surface` and `cli_version` say the reader cannot
+    /// see the grants, so the list is unavailable whatever `grants` holds;
+    /// any other reason keeps today's list.
+    #[test]
+    fn reader_blind_reasons_make_the_grant_list_unavailable() {
+        for reason in ["surface", "cli_version"] {
+            for grants in [
+                Some(json!([])),
+                Some(json!([cedar_grant("grant_max_01", "One reset", 1, true)])),
+                None,
+            ] {
+                let balance = saved_resets(cedar_reader_blind(reason, grants));
+                assert_reader_unavailable(&balance, reason);
+            }
+        }
+        for (cedar, cause) in [
+            (cedar_ineligible(), None),
+            (cedar_max(), None),
+            (cedar_team(), None),
+            (cedar_reader_blind("seat", Some(json!([]))), None),
+        ] {
+            let balance = saved_resets(cedar);
+            assert_eq!(balance.grants_unavailable_cause, cause);
+            assert_eq!(balance.grants_state, Some(CreditGrantsState::Complete));
+        }
+    }
+
+    /// The cause never appears on any other shape: across every Claude
+    /// fixture, both reads, re-sends, a stored list followed by a reader-blind
+    /// answer and back, and an older daemon's stored reader-blind reading.
+    #[test]
+    fn grants_unavailable_cause_appears_on_no_other_shape() {
+        fn check(balances: &[AgentCreditBalance]) {
+            for balance in balances {
+                let blind = claude_reader_cannot_see_grants(balance);
+                assert_eq!(
+                    balance.grants_unavailable_cause.is_some(),
+                    blind,
+                    "{balance:?}"
+                );
+                if blind {
+                    assert_reader_unavailable(
+                        balance,
+                        balance.ineligible_reason.as_deref().unwrap(),
+                    );
+                }
+            }
+        }
+        for name in [
+            "claude-oauth-usage-plain",
+            "claude-oauth-usage-credits-off",
+            "claude-usage-cedar",
+            "claude-usage-cedar-ineligible",
+            "claude-usage-cedar-reader-surface",
+            "claude-usage-cedar-reader-cli-version",
+            "claude-usage-cedar-refused-expiry",
+        ] {
+            for read in [ClaudeUsageRead::Plain, ClaudeUsageRead::SavedResets] {
+                let body = fixture(&format!("provider/{name}.json"));
+                let read = claude_credit_read(&body, read, READ_AT);
+                check(&claude_merge_credit_sections("fixture", &[], &read));
+            }
+        }
+        let read = |cedar: Value| {
+            claude_credit_read(&variant_body(cedar), ClaudeUsageRead::SavedResets, READ_AT)
+        };
+        let plain = claude_credit_read(&plain_max_body(), ClaudeUsageRead::Plain, READ_AT);
+        let listed = claude_merge_credit_sections("b", &[], &read(cedar_max()));
+        let blind = claude_merge_credit_sections(
+            "b",
+            &listed,
+            &read(cedar_reader_blind("surface", Some(json!([])))),
+        );
+        // A readiness-only blind answer never takes the stored list.
+        let blind_no_list =
+            claude_merge_credit_sections("b", &listed, &read(cedar_reader_blind("surface", None)));
+        let resent = claude_merge_credit_sections("b", &blind, &plain);
+        // Back to a readable answer: an ordinary list again, without the cause.
+        let back = claude_merge_credit_sections("b", &resent, &read(cedar_max()));
+        let readiness_only = claude_merge_credit_sections(
+            "b",
+            &blind,
+            &read(json!({"eligible": true, "ineligible_reason": null})),
+        );
+        for balances in [
+            &listed,
+            &blind,
+            &blind_no_list,
+            &resent,
+            &back,
+            &readiness_only,
+        ] {
+            check(balances);
+        }
+        let saved = |balances: &[AgentCreditBalance]| {
+            balances
+                .iter()
+                .find(|balance| balance.kind == Some(CreditBalanceKind::SavedResets))
+                .cloned()
+                .expect("saved resets")
+        };
+        assert_reader_unavailable(&saved(&blind_no_list), "surface");
+        assert_reader_unavailable(&saved(&resent), "surface");
+        assert_eq!(saved(&back).grants_unavailable_cause, None);
+        assert_eq!(saved(&back).remaining, Some(1));
+        assert_eq!(saved(&readiness_only).grants_unavailable_cause, None);
+        // An older daemon stored the blind answer as a complete, empty list:
+        // re-sent and served in the §11.10 shape.
+        let mut older = saved(&read_older_blind());
+        older.grants_unavailable_cause = None;
+        older.grants = Some(Vec::new());
+        older.grants_state = Some(CreditGrantsState::Complete);
+        older.grant_count = Some(0);
+        older.remaining = Some(0);
+        older.grants_observed_at = Some(READ_AT.to_string());
+        older.status = AgentCreditBalanceStatus::Exhausted;
+        let resent = claude_merge_credit_sections("b", &[older.clone()], &plain);
+        assert_reader_unavailable(&saved(&resent), "surface");
+        let mut served = vec![older];
+        label_credit_freshness(&mut served, 3_600, 0, 0);
+        assert_reader_unavailable(&served[0], "surface");
+    }
+
+    fn read_older_blind() -> Vec<AgentCreditBalance> {
+        claude_credit_read(
+            &variant_body(cedar_reader_blind("surface", Some(json!([])))),
+            ClaudeUsageRead::SavedResets,
+            READ_AT,
+        )
+        .saved_resets
+        .unwrap()
     }
 
     #[test]
@@ -2164,6 +2448,69 @@ mod tests {
     }
 
     #[test]
+    fn a_window_reset_after_the_reading_gets_one_read_soon_after_it() {
+        let observed = 1_000_000;
+        let window = |reset: Option<u64>| AgentQuotaWindow {
+            resets_at: reset.map(rfc3339),
+            ..Default::default()
+        };
+        let windows = [
+            window(Some(observed + 5 * HOUR)),
+            window(Some(observed + 2 * HOUR)),
+            window(Some(observed - 10)),
+            window(None),
+        ];
+        let delay = claude_reset_read_delay_seconds("account-a", "org-a");
+        assert!((60..=120).contains(&delay), "delay {delay}");
+        assert_eq!(
+            claude_reset_read_at(&windows, observed, 0, delay),
+            Some(observed + 2 * HOUR + delay),
+            "the first reset after the reading, plus the delay"
+        );
+        assert_eq!(
+            claude_reset_read_at(&windows, observed, observed + 2 * HOUR + 290, delay),
+            Some(observed + 2 * HOUR + 290),
+            "never before the stored spacing"
+        );
+        let reset = observed + 2 * HOUR;
+        // Before the delay: not due. After it: due, inside any slot.
+        assert!(!claude_reset_read_due(
+            &windows,
+            observed,
+            0,
+            delay,
+            reset + delay - 1
+        ));
+        assert!(claude_reset_read_due(
+            &windows,
+            observed,
+            0,
+            delay,
+            reset + delay
+        ));
+        // Retry-After/success spacing still holds it back.
+        assert!(!claude_reset_read_due(
+            &windows,
+            observed,
+            reset + delay + 300,
+            delay,
+            reset + delay
+        ));
+        // The reading after the reset postdates it: no second read.
+        assert!(!claude_reset_read_due(
+            &windows,
+            reset + delay,
+            0,
+            delay,
+            reset + delay + 600
+        ));
+        assert_eq!(
+            claude_reset_read_at(&windows[2..], observed, 0, delay),
+            None
+        );
+    }
+
+    #[test]
     fn slot_is_admitted_at_its_elapsed_boundary() {
         // A reading a few seconds into one pass, checked a few seconds into
         // the pass one slot later.
@@ -2352,6 +2699,8 @@ mod tests {
             "claude-oauth-usage-credits-off",
             "claude-usage-cedar",
             "claude-usage-cedar-ineligible",
+            "claude-usage-cedar-reader-surface",
+            "claude-usage-cedar-reader-cli-version",
             "claude-usage-cedar-refused-expiry",
         ] {
             let body = fixture(&format!("provider/{name}.json"));
@@ -2646,6 +2995,7 @@ mod tests {
             next_refresh_after_epoch_seconds: now + 240,
             windows: Vec::new(),
             credit_balances: vec![usage, saved.clone()],
+            account_weekly_not_offered: false,
         };
         let served = super::super::claude_oauth_usage_from_cache(cache, now);
         let saved_served = &served.credit_balances[1];
@@ -3146,6 +3496,80 @@ mod tests {
         let usage = held.result.as_ref().expect("stale stored reading served");
         assert!(!usage.windows.is_empty());
         assert!(!usage.credit_balances.is_empty());
+    }
+
+    fn respond_429(endpoint: &str) -> Result<Value, u16> {
+        REQUESTED.lock().unwrap().push(endpoint.to_string());
+        Err(429)
+    }
+
+    /// A 429 adds the rate-limited diagnostic naming the read and the wait,
+    /// with no extra call and the existing backoff unchanged (one rate-limit
+    /// strike, the stored reading held until the Retry-After time).
+    #[test]
+    #[serial_test::serial]
+    fn rate_limited_read_names_the_read_and_wait_without_changing_backoff() {
+        for (schedule, label) in [
+            (ClaudeReadSchedule::default(), "saved-resets"),
+            (
+                ClaudeReadSchedule {
+                    saved_resets_variant_paused_until: Some(
+                        super::super::current_unix_seconds() + 3_600,
+                    ),
+                    ..Default::default()
+                },
+                "usage",
+            ),
+        ] {
+            let harness = VariantHarness::new("rate-limited");
+            harness.due(schedule);
+            REQUESTED.lock().unwrap().clear();
+            let before = super::super::current_unix_seconds();
+            let outcome = harness.collect(respond_429);
+            let after = super::super::current_unix_seconds();
+            assert_eq!(REQUESTED.lock().unwrap().len(), 1, "{label}: one call");
+            let limited = outcome
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == "claude_oauth_usage_rate_limited")
+                .collect::<Vec<_>>();
+            assert_eq!(limited.len(), 1, "{label}");
+            assert!(
+                limited[0]
+                    .message
+                    .starts_with("Claude asked Ottto to wait until "),
+                "{label}"
+            );
+            assert!(
+                limited[0]
+                    .message
+                    .ends_with(&format!(" UTC before the next {label} read.")),
+                "{label}"
+            );
+            let retry_after = limited[0]
+                .retry_after
+                .as_deref()
+                .and_then(parse_instant)
+                .map(|at| at.unix_timestamp() as u64)
+                .expect("retry_after");
+            // No Retry-After header: the existing 5-minute fallback.
+            assert!(
+                (before + 300..=after + 300).contains(&retry_after),
+                "{label}"
+            );
+            let cache =
+                super::super::read_claude_oauth_usage_cache(harness.account, harness.organization)
+                    .expect("cache written");
+            assert_eq!(cache.next_refresh_after_epoch_seconds, retry_after);
+            let breaker = super::super::read_claude_oauth_usage_breaker(
+                harness.account,
+                harness.organization,
+                &super::super::claude_oauth_usage_config_fingerprint(),
+            )
+            .expect("breaker");
+            assert_eq!(breaker.rate_limit_failures, 1, "{label}");
+            assert_eq!(harness.shape_failures(), 0);
+        }
     }
 
     #[test]

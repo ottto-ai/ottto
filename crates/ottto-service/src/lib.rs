@@ -3988,6 +3988,8 @@ fn usage_checks_paused_problem(snapshot: &AgentStatusSnapshot) -> Option<HealthP
     })
 }
 
+const CODEX_USAGE_READ_RETRYING_TITLE: &str = "Codex usage check failed; retrying";
+
 fn is_usage_checks_paused_problem(problem: &HealthProblem) -> bool {
     problem.code == StableProblemCode::Unknown && problem.title == USAGE_CHECKS_PAUSED_TITLE
 }
@@ -4050,6 +4052,25 @@ fn source_health_from_agent_status(
                         source_display_name(&snapshot.source)
                     ),
                     detail: "The current login remains available. One or more saved account connections need attention; their last verified identities remain separate.".to_string(),
+                    retryable: true,
+                }],
+            )
+        }
+        // A failed Codex usage check (for example a timeout) is retried at
+        // the next poll; the login is not in question.
+        AgentStatusState::Degraded
+            if snapshot
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "codex_usage_read_retrying") =>
+        {
+            (
+                SourceState::Healthy,
+                HealthGrade::Warning,
+                vec![HealthProblem {
+                    code: StableProblemCode::Unknown,
+                    title: CODEX_USAGE_READ_RETRYING_TITLE.to_string(),
+                    detail: "The last Codex usage check failed, for example it timed out. It is retried at the next check; until then the last readings are shown as stale.".to_string(),
                     retryable: true,
                 }],
             )
@@ -8069,6 +8090,28 @@ mod tests {
         assert!(health.problems[0]
             .detail
             .contains("current login remains available"));
+    }
+
+    #[test]
+    fn codex_usage_read_failure_is_a_retrying_warning_never_an_expired_secret() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut snapshot = available_agent_status(SourceKind::Codex, "2026-09-03T10:20:00Z");
+        snapshot.status = AgentStatusState::Degraded;
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            "codex_usage_read_retrying",
+            AgentDiagnosticSeverity::Warning,
+            "A Codex usage check failed.",
+        ));
+
+        let state = daemon.inner.lock().expect("state");
+        let health = source_health_from_agent_status(&state, snapshot);
+
+        assert_eq!(health.state, SourceState::Healthy);
+        assert_eq!(health.grade, HealthGrade::Warning);
+        assert_eq!(health.problems.len(), 1);
+        assert_eq!(health.problems[0].code, StableProblemCode::Unknown);
+        assert_eq!(health.problems[0].title, CODEX_USAGE_READ_RETRYING_TITLE);
+        assert!(health.problems[0].retryable);
     }
 
     #[test]

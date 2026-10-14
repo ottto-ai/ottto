@@ -34,6 +34,20 @@ adapter module, `agent_status/claude_credit_pools.rs`.
   by field and never change the list state. A `cedar_ember` with readiness but
   no `grants` array keeps the last observed complete list (through the model's
   `GrantListSection`, with its original read time, count and status).
+- **Saved resets the reader cannot see** (contract v2.2 §11.10). When the
+  provider answers `ineligible_reason` `surface` or `cli_version`, the answer
+  is about the reader that asked, not the account, so its empty list is not
+  "no resets". The balance is sent with `grants_state: unavailable`, no
+  `grants`, `remaining` or `grant_count`, `status: unknown`, readiness as read,
+  and `grants_unavailable_cause: reader`. Any other reason (e.g. `tenure`) is
+  an ordinary list, as before. A stored section from an older daemon (the same
+  answer kept as a complete, empty list) is re-sent and served in the new
+  shape, and a reader-blind reading never takes a stored list. The field is
+  optional (omitted when absent, an unknown value decodes as absent), reaches
+  the local status snapshots under the same name (a retained older slot
+  snapshot is shown in the new shape too), and the upload copy drops it from
+  any balance that is not saved resets with an unavailable list and no
+  `grants`, `remaining` or `grant_count`.
 
 `cedar_ember` is only populated by the saved-reset read variant
 (`?cedar_ember=1&skip_spend=1`), which is enabled and self-checks every
@@ -117,7 +131,13 @@ extra calls:
   the switch, cannot be told apart from local evidence;
 - the existing 5-minute post-success spacing, Retry-After handling, breaker and
   per-caller auth backoff are unchanged; one active binding never shortens
-  another binding's slot;
+  another binding's slot. A 429 also adds the diagnostic
+  `claude_oauth_usage_rate_limited`, naming the read and the wait ("Claude
+  asked Ottto to wait until HH:MM UTC before the next saved-resets read"),
+  with the deadline in `retry_after`; slot status keeps a fixed per-read text
+  and the deadline. It is local status only (Companion and CLI): the upload
+  drops it, so a per-429 time never becomes a backend row. It reports only:
+  no extra call and no backoff change;
 - `CLAUDE_ACTIVITY_CADENCE_ENABLED` is a kill switch (default on): off, every
   binding uses today's 55-65 min gate with no active boost or idle slowdown.
 

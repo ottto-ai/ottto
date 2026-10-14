@@ -29755,7 +29755,17 @@ X-API-Key = "otel_redacted"
             loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Only accept polling is nonblocking. On macOS an accepted
+                        // socket inherits that mode; drain the body before replying
+                        // so a split header/body write cannot race a closed socket.
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking install observer connection");
                         let request = read_complete_http_request(&mut stream);
+                        assert!(
+                            http_request_complete(request.as_bytes()),
+                            "complete install observer request"
+                        );
                         if request.contains("/local-client/install-sessions") {
                             write_json_response(
                                 &mut stream,

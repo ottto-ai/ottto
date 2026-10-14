@@ -100,8 +100,11 @@ impl TelemetryKeyStore {
             return Self::file_only(PathBuf::from(root));
         }
         Self {
-            file_root: ottto_core::default_support_dir().join("telemetry-keys"),
-            keychain_enabled: cfg!(target_os = "macos"),
+            file_root: ottto_core::token_store::isolated_test_secret_dir()
+                .unwrap_or_else(ottto_core::default_support_dir)
+                .join("telemetry-keys"),
+            keychain_enabled: cfg!(target_os = "macos")
+                && !ottto_core::token_store::test_secret_store_enabled(),
         }
     }
 

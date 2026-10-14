@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
@@ -1839,6 +1839,21 @@ pub struct ScanIndex {
     /// permanent.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     claude_owned_start_census: BTreeMap<String, ClaudeOwnedStartCensusWitness>,
+    /// Index keys whose parsed revision is held locally because its session
+    /// ownership could not be bound, mapped to that held source fingerprint.
+    /// The held body is never uploaded and the key keeps its previously
+    /// committed revision. This content-free map keeps the unresolved
+    /// ownership disclosed after the page that parsed it. A key leaves only
+    /// when a later parse resolves it or a complete census proves it absent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    claude_account_deferred_holds: BTreeMap<String, String>,
+    /// Scheduling-only backoff for full duplicate-fence re-arms while the
+    /// fence stays closed. Losing either field schedules one immediate full
+    /// re-arm; neither field can open the fence.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    claude_duplicate_fence_rearm_attempt: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_duplicate_fence_next_full_rearm_unix_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_desktop_store_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1977,6 +1992,9 @@ impl Default for ScanIndex {
             claude_duplicate_request_owners: BTreeMap::new(),
             claude_duplicate_request_witness_overflowed: false,
             claude_owned_start_census: BTreeMap::new(),
+            claude_account_deferred_holds: BTreeMap::new(),
+            claude_duplicate_fence_rearm_attempt: 0,
+            claude_duplicate_fence_next_full_rearm_unix_seconds: None,
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
@@ -2317,7 +2335,11 @@ struct ClaudeUsageAuthorityQuarantineRecord {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeUsageAuthorityDisposition {
+    pub(crate) duplicate_census: ClaudeDuplicateCensusCounts,
     quarantined_source_session_ids: BTreeSet<String>,
+    /// The account-deferred subset of `quarantined_source_session_ids`. Upload
+    /// retention still uses the union; this only classifies settlement.
+    account_deferred_source_session_ids: BTreeSet<String>,
     pub(crate) mixed_uploads: claude_request_accounts::MixedUploads,
     /// Contract-5 only: each rebuilt item's requests, classified and folded
     /// into bounded row x authority-key groups during the rebuild.
@@ -2326,7 +2348,61 @@ pub struct ClaudeUsageAuthorityDisposition {
 
 impl ClaudeUsageAuthorityDisposition {
     pub(crate) fn defer_sessions(&mut self, session_ids: BTreeSet<String>) {
+        self.account_deferred_source_session_ids
+            .extend(session_ids.iter().cloned());
         self.quarantined_source_session_ids.extend(session_ids);
+    }
+
+    pub(crate) fn account_deferred_fingerprints(
+        &self,
+        snapshots: &[SnapshotItem],
+    ) -> BTreeSet<String> {
+        snapshots
+            .iter()
+            .filter(|snapshot| {
+                self.account_deferred_source_session_ids
+                    .contains(&snapshot.source_session_id)
+            })
+            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+            .collect()
+    }
+
+    /// Held revisions that a later page of the same traversal could still
+    /// change. Two hold classes cannot progress within a traversal:
+    ///
+    /// - an authority demotion whose root carries a bounded `UnprovenTerminal`
+    ///   record bound to the retained witness and to this exact revision; the
+    ///   candidate gate skips that revision until the family changes;
+    /// - an account deferral, whose verdict depends on the body and the local
+    ///   request evidence rather than on traversal completeness. Its key keeps
+    ///   the committed revision and is reparsed by every later generation.
+    ///
+    /// Everything else stays progress-blocking. Without a durable disclosure
+    /// for every account deferral (`account_holds_recorded == false`), account
+    /// deferrals stay progress-blocking too.
+    pub(crate) fn progress_blocking_held_fingerprints(
+        &self,
+        snapshots: &[SnapshotItem],
+        index: &ScanIndex,
+        account_holds_recorded: bool,
+    ) -> BTreeSet<String> {
+        snapshots
+            .iter()
+            .filter(|snapshot| {
+                self.quarantined_source_session_ids
+                    .contains(&snapshot.source_session_id)
+            })
+            .filter(|snapshot| {
+                if self
+                    .account_deferred_source_session_ids
+                    .contains(&snapshot.source_session_id)
+                {
+                    return !account_holds_recorded;
+                }
+                !claude_terminal_authority_hold_is_bound(snapshot, index)
+            })
+            .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+            .collect()
     }
 
     pub(crate) fn quarantined_fingerprints(&self, snapshots: &[SnapshotItem]) -> BTreeSet<String> {
@@ -2427,6 +2503,29 @@ fn claude_usage_authority_preserves_pending(
         && quarantine.proven_witness_fingerprint == claude_usage_family_witness_fingerprint(witness)
 }
 
+/// A demoted revision cannot progress within a traversal only while its family
+/// quarantine is terminal, bounded, bound to the retained witness, and records
+/// exactly this revision: the candidate gate then skips it until the family
+/// changes. Every other shape can still change on a later page.
+fn claude_terminal_authority_hold_is_bound(snapshot: &SnapshotItem, index: &ScanIndex) -> bool {
+    let Some(revision) = snapshot.source_file_fingerprint.as_ref() else {
+        return false;
+    };
+    let root_session_id = claude_snapshot_family_root(snapshot);
+    index
+        .claude_usage_authority_quarantine
+        .get(&root_session_id)
+        .zip(index.claude_usage_family_witnesses.get(&root_session_id))
+        .is_some_and(|(record, witness)| {
+            record.disposition == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+                && claude_usage_authority_preserves_pending(record, witness)
+                && record
+                    .member_source_file_fingerprints
+                    .get(&snapshot.source_session_id)
+                    == Some(revision)
+        })
+}
+
 fn claude_usage_authority_deadline_is_bounded(
     record: &ClaudeUsageAuthorityQuarantineRecord,
 ) -> bool {
@@ -2469,6 +2568,15 @@ struct ClaudeDuplicateRequestOwner {
 // the affected pending proof fail closed and never authorizes partial usage.
 const MAX_CLAUDE_PENDING_USAGE_OCCURRENCES: usize = 250_000;
 const MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS: usize = 250_000;
+// Account-deferred holds are disclosed from a durable map. A cycle that cannot
+// record one keeps every account deferral progress-blocking: overflow costs a
+// clean follow-up generation and never settles a traversal undisclosed.
+const MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS: usize = 4_096;
+// Full duplicate-fence re-arms back off while the fence stays closed. This
+// bounds replay cost only; reopening still requires current-window coverage.
+const CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS: u64 = 3_600;
+const CLAUDE_DUPLICATE_FENCE_REARM_MAX_SECONDS: u64 = 86_400;
+const CLAUDE_DUPLICATE_FENCE_REARM_MAX_ATTEMPT: u8 = 8;
 
 fn claude_duplicate_request_owner(
     root_session_id: &str,
@@ -2496,6 +2604,37 @@ fn claude_duplicate_request_witness_within_bound(
         .map(BTreeSet::len)
         .try_fold(0_usize, |total, count| total.checked_add(count))
         .is_some_and(|total| total <= max_owners)
+}
+
+/// Content-free cause counters for one duplicate-census fold call, reported
+/// only in the local Claude evidence log line. They are observed alongside the
+/// fence and never read back: no gate, hash, index, or upload depends on them.
+/// `fence_after && census_invalid` is an invalid census; `fence_after` without
+/// it is the owner bound. On a terminal pass, an invalid census with no invalid
+/// current-window family came from stale unquarantined pending. Page counters
+/// name which pending check invalidated a family during this call. On a
+/// terminal pass, `coverage_complete` says whether every indexed Claude family
+/// member was observed in this census window (or is confirmed empty or held
+/// under a bound quarantine); a closed fence stays closed without it.
+/// `full_rearm` names a full corrective re-arm on this pass, and
+/// `full_rearm_deferred_until` the persisted backoff deadline after it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ClaudeDuplicateCensusCounts {
+    pub census_complete: bool,
+    pub fence_before: bool,
+    pub fence_after: bool,
+    pub census_invalid: bool,
+    pub invalid_current_window_family_count: usize,
+    pub pending_occurrence_count: usize,
+    pub page_invalidated_identity_count: usize,
+    pub page_invalidated_occurrence_mismatch_count: usize,
+    pub page_invalidated_cap_count: usize,
+    pub page_invalidated_member_changed_count: usize,
+    pub coverage_complete: bool,
+    pub coverage_missing_member_count: usize,
+    pub full_rearm: bool,
+    pub rearm_attempt: u8,
+    pub full_rearm_deferred_until: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2824,6 +2963,19 @@ impl SourceScanResult {
             index.resume_upper_bound_path = None;
             index.resume_census_window_end = None;
         }
+    }
+    /// Index keys this scan read to completion, with their parsed source
+    /// fingerprints.
+    pub(crate) fn completed_parses(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.pending_finalization
+            .iter()
+            .filter(|pending| pending.parse_complete)
+            .map(|pending| {
+                (
+                    pending.index_key.as_str(),
+                    pending.source_file_fingerprint.as_str(),
+                )
+            })
     }
     pub(crate) fn codex_joining_validator(&self) -> Option<CodexJoinValidator> {
         self.codex_join_validation.clone().map(CodexJoinValidator)
@@ -3586,12 +3738,14 @@ fn apply_claude_reported_usage_with_index_and_limits(
     max_duplicate_owners: usize,
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
 ) -> ClaudeUsageAuthorityDisposition {
-    accumulate_claude_usage_family_pending_with_limit(
+    let mut duplicate_census = accumulate_claude_usage_family_pending_with_limit(
         snapshots,
         &mut index.claude_usage_family_pending,
         census_window_end,
         max_pending_occurrences,
     );
+    duplicate_census.census_complete = census_complete;
+    duplicate_census.fence_before = index.claude_duplicate_request_witness_overflowed;
 
     let complete_families = if census_complete {
         complete_claude_usage_family_members(index)
@@ -3790,6 +3944,16 @@ fn apply_claude_reported_usage_with_index_and_limits(
     // predecessor may be missing or deleted. Exact inherited-prefix or
     // session-exclusive provider/local proof below must establish the start;
     // all duplicate, missing-id, or unproven-start shapes fail closed.
+    let indexed_claude_family_ids = if census_complete {
+        index
+            .files
+            .keys()
+            .filter_map(|index_key| claude_index_path_family_member(Path::new(index_key)))
+            .flat_map(|(root_session_id, member)| [root_session_id, member])
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
     let duplicate_census_invalid =
         index
             .claude_usage_family_pending
@@ -3797,6 +3961,20 @@ fn apply_claude_reported_usage_with_index_and_limits(
             .any(|(root_session_id, pending)| {
                 if pending.census_window_end == census_window_end {
                     return pending.invalid;
+                }
+                // Only a complete census proves that a family vanished. Old
+                // pending whose root and members have no indexed file left
+                // cannot hide a current request; any remaining file keeps it
+                // fail closed below.
+                if census_complete
+                    && !indexed_claude_family_ids.contains(root_session_id)
+                    && pending
+                        .member_request_id_hashes
+                        .keys()
+                        .chain(pending.member_occurrences.keys())
+                        .all(|member| !indexed_claude_family_ids.contains(member))
+                {
+                    return false;
                 }
                 // A demoted family retains its prior pending proof while bounded
                 // quarantine retries reconstruct the durable witness. That old
@@ -3812,6 +3990,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
                         claude_usage_authority_preserves_pending(quarantine, witness)
                     })
             });
+    duplicate_census.census_invalid = duplicate_census_invalid;
     let detected_duplicate_request_owners = if census_complete && !duplicate_census_invalid {
         let mut owners = BTreeMap::<String, BTreeSet<(String, String)>>::new();
         for (root_session_id, pending) in &index.claude_usage_family_pending {
@@ -4253,6 +4432,11 @@ fn apply_claude_reported_usage_with_index_and_limits(
         }
         for (root_session_id, pending) in &index.claude_usage_family_pending {
             if pending.invalid || pending.census_window_end != census_window_end {
+                if pending.invalid && pending.census_window_end == census_window_end {
+                    duplicate_census.invalid_current_window_family_count = duplicate_census
+                        .invalid_current_window_family_count
+                        .saturating_add(1);
+                }
                 continue;
             }
             for (source_session_id, current_request_hashes) in &pending.member_request_id_hashes {
@@ -4290,11 +4474,20 @@ fn apply_claude_reported_usage_with_index_and_limits(
             })
             .flat_map(|(_, owners)| owners.iter().cloned())
             .collect::<BTreeSet<_>>();
+        let coverage_missing_member_count =
+            claude_duplicate_fence_coverage_missing_member_count(index, census_window_end);
+        duplicate_census.coverage_complete = coverage_missing_member_count == 0;
+        duplicate_census.coverage_missing_member_count = coverage_missing_member_count;
         if duplicate_census_invalid
             || !claude_duplicate_request_witness_within_bound(
                 &duplicate_witnesses_after,
                 max_duplicate_owners,
             )
+            // A closed fence reopens only after a census that observed every
+            // indexed family member in this window. Unchanged files skipped by
+            // an incremental, reset, or partially undone pass carry no current
+            // request evidence, so their absence from pending proves nothing.
+            || (overflowed_before && coverage_missing_member_count > 0)
         {
             index.claude_duplicate_request_owners.clear();
             index.claude_duplicate_request_witness_overflowed = true;
@@ -4302,6 +4495,32 @@ fn apply_claude_reported_usage_with_index_and_limits(
             index.claude_duplicate_request_owners = duplicate_witnesses_after;
             index.claude_duplicate_request_witness_overflowed = false;
         }
+        let census_unix_seconds = rfc3339_unix_seconds(census_window_end);
+        let full_rearm = claude_duplicate_fence_full_rearm_due(
+            index,
+            overflowed_before,
+            index.claude_duplicate_request_witness_overflowed,
+            census_unix_seconds,
+        );
+        if !index.claude_duplicate_request_witness_overflowed {
+            index.claude_duplicate_fence_rearm_attempt = 0;
+            index.claude_duplicate_fence_next_full_rearm_unix_seconds = None;
+        } else if full_rearm {
+            let attempt = index
+                .claude_duplicate_fence_rearm_attempt
+                .min(CLAUDE_DUPLICATE_FENCE_REARM_MAX_ATTEMPT);
+            // An unparsable census clock leaves no deadline, which makes the
+            // next closed census re-arm again: cost only, never an opening.
+            index.claude_duplicate_fence_next_full_rearm_unix_seconds = census_unix_seconds
+                .map(|now| now.saturating_add(claude_duplicate_fence_rearm_delay_seconds(attempt)));
+            index.claude_duplicate_fence_rearm_attempt = attempt
+                .saturating_add(1)
+                .min(CLAUDE_DUPLICATE_FENCE_REARM_MAX_ATTEMPT);
+        }
+        duplicate_census.full_rearm = full_rearm;
+        duplicate_census.rearm_attempt = index.claude_duplicate_fence_rearm_attempt;
+        duplicate_census.full_rearm_deferred_until =
+            index.claude_duplicate_fence_next_full_rearm_unix_seconds;
         let invalidated_witness_roots = witness_roots_before
             .difference(
                 &index
@@ -4331,8 +4550,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
                 .is_some_and(|request_hashes| {
                     !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
                 });
-            if overflowed_before
-                || index.claude_duplicate_request_witness_overflowed
+            if full_rearm
                 || (proven.contains_key(&root_session_id)
                     && !current_ids.contains(source_session_id.as_str()))
                 || invalidated_witness_roots.contains(&root_session_id)
@@ -4412,6 +4630,8 @@ fn apply_claude_reported_usage_with_index_and_limits(
             .remove(&root_session_id);
         index.claude_usage_family_pending.remove(&root_session_id);
     }
+    duplicate_census.fence_after = index.claude_duplicate_request_witness_overflowed;
+    disposition.duplicate_census = duplicate_census;
     disposition
 }
 
@@ -4420,7 +4640,8 @@ fn accumulate_claude_usage_family_pending_with_limit(
     pending_by_root: &mut BTreeMap<String, ClaudeUsageFamilyPending>,
     census_window_end: &str,
     max_occurrences: usize,
-) {
+) -> ClaudeDuplicateCensusCounts {
+    let mut counts = ClaudeDuplicateCensusCounts::default();
     let mut retained_occurrence_count = pending_by_root
         .values()
         .flat_map(|pending| pending.member_occurrences.values())
@@ -4463,6 +4684,8 @@ fn accumulate_claude_usage_family_pending_with_limit(
         let Some(hashes) = claude_snapshot_request_id_hashes(item)
             .filter(|_| item.claude_usage_occurrences.len() == item.claude_usage_request_ids.len())
         else {
+            counts.page_invalidated_identity_count =
+                counts.page_invalidated_identity_count.saturating_add(1);
             invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
         };
@@ -4477,6 +4700,9 @@ fn accumulate_claude_usage_family_pending_with_limit(
             })
             .collect::<BTreeMap<_, _>>();
         if occurrences.keys().cloned().collect::<BTreeSet<_>>() != hashes {
+            counts.page_invalidated_occurrence_mismatch_count = counts
+                .page_invalidated_occurrence_mismatch_count
+                .saturating_add(1);
             invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
         }
@@ -4491,6 +4717,7 @@ fn accumulate_claude_usage_family_pending_with_limit(
             occurrences.len(),
             max_occurrences,
         ) else {
+            counts.page_invalidated_cap_count = counts.page_invalidated_cap_count.saturating_add(1);
             invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
         };
@@ -4499,6 +4726,9 @@ fn accumulate_claude_usage_family_pending_with_limit(
             .insert(item.source_session_id.clone(), hashes.clone())
             .is_some_and(|previous| previous != hashes)
         {
+            counts.page_invalidated_member_changed_count = counts
+                .page_invalidated_member_changed_count
+                .saturating_add(1);
             invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
         }
@@ -4507,11 +4737,16 @@ fn accumulate_claude_usage_family_pending_with_limit(
             .insert(item.source_session_id.clone(), occurrences.clone())
             .is_some_and(|previous| previous != occurrences)
         {
+            counts.page_invalidated_member_changed_count = counts
+                .page_invalidated_member_changed_count
+                .saturating_add(1);
             invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
         }
         retained_occurrence_count = next_retained_occurrence_count;
     }
+    counts.pending_occurrence_count = retained_occurrence_count;
+    counts
 }
 
 fn invalidate_claude_usage_family_pending(
@@ -4538,6 +4773,83 @@ fn claude_pending_occurrence_count_after_replace(
 ) -> Option<usize> {
     let next = retained.saturating_sub(replaced).saturating_add(incoming);
     (next <= max_occurrences).then_some(next)
+}
+
+/// Indexed Claude family members a terminal pass did not observe in this exact
+/// census window. Pending is reset whenever its window changes, so a
+/// current-window, non-invalid member entry exists only if that member was
+/// parsed in this window. Confirmed-empty files carry no request, and members
+/// of a root held by a bound quarantine are excluded exactly as
+/// `duplicate_census_invalid` excludes that root's retained pending.
+fn claude_duplicate_fence_coverage_missing_member_count(
+    index: &ScanIndex,
+    census_window_end: &str,
+) -> usize {
+    let covered = index
+        .claude_usage_family_pending
+        .values()
+        .filter(|pending| !pending.invalid && pending.census_window_end == census_window_end)
+        .flat_map(|pending| {
+            pending
+                .member_request_id_hashes
+                .keys()
+                .filter(move |member| pending.member_occurrences.contains_key(*member))
+        })
+        .collect::<BTreeSet<_>>();
+    index
+        .files
+        .keys()
+        .filter(|index_key| {
+            let Some((root_session_id, member)) =
+                claude_index_path_family_member(Path::new(index_key.as_str()))
+            else {
+                return false;
+            };
+            !(covered.contains(&member)
+                || index.confirmed_empty_files.contains(*index_key)
+                || index
+                    .claude_usage_authority_quarantine
+                    .get(&root_session_id)
+                    .zip(index.claude_usage_family_witnesses.get(&root_session_id))
+                    .is_some_and(|(quarantine, witness)| {
+                        claude_usage_authority_preserves_pending(quarantine, witness)
+                    }))
+        })
+        .count()
+}
+
+/// Whether a terminal pass clears every Claude source fingerprint. Opening the
+/// fence re-emits posture once. A newly closed fence replays at once; a fence
+/// that stays closed replays again only once its backoff deadline passes. A
+/// missing, unreadable, or implausibly distant deadline is due, so losing the
+/// scheduling fields costs one replay and never opens the fence.
+fn claude_duplicate_fence_full_rearm_due(
+    index: &ScanIndex,
+    overflowed_before: bool,
+    overflowed_after: bool,
+    census_unix_seconds: Option<u64>,
+) -> bool {
+    if !overflowed_after {
+        return overflowed_before;
+    }
+    if !overflowed_before {
+        return true;
+    }
+    match (
+        census_unix_seconds,
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds,
+    ) {
+        (Some(now), Some(next)) => {
+            now >= next || next > now.saturating_add(CLAUDE_DUPLICATE_FENCE_REARM_MAX_SECONDS)
+        }
+        _ => true,
+    }
+}
+
+fn claude_duplicate_fence_rearm_delay_seconds(attempt: u8) -> u64 {
+    CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS
+        .saturating_mul(1_u64 << u32::from(attempt.min(16)))
+        .min(CLAUDE_DUPLICATE_FENCE_REARM_MAX_SECONDS)
 }
 
 fn complete_claude_usage_family_members(index: &ScanIndex) -> BTreeMap<String, BTreeSet<String>> {
@@ -8389,8 +8701,14 @@ struct SnapshotAccumulator {
     activity_call_tools: BTreeMap<String, String>,
     activity_mcp_tool_counts: BTreeMap<String, u64>,
     // Codex MCP calls keyed by the backend's qualified `mcp__<server>__<tool>`
-    // spelling. Fed by the same `mcp_tool_call_end` events as the activity map.
+    // spelling. Fed by the same `mcp_tool_call_end` events as the activity map,
+    // and by `function_call`s that name their server in `payload.namespace`.
     activity_mcp_tool_usage_counts: BTreeMap<String, u64>,
+    // Open call ids already counted as MCP, so a call is counted once whichever
+    // of its namespaced `function_call` and `mcp_tool_call_end` comes first.
+    // The value records whether the completion event (and its capability) was
+    // seen. Like `activity_call_tools`, entries end at `function_call_output`.
+    activity_mcp_call_ids: BTreeMap<String, bool>,
     activity_capability_buckets: BTreeMap<(String, String, String), u64>,
     seen_claude_capability_tool_uses: BTreeSet<String>,
     activity_skills: BTreeSet<String>,
@@ -8560,6 +8878,7 @@ impl SnapshotAccumulator {
             activity_call_tools: BTreeMap::new(),
             activity_mcp_tool_counts: BTreeMap::new(),
             activity_mcp_tool_usage_counts: BTreeMap::new(),
+            activity_mcp_call_ids: BTreeMap::new(),
             activity_capability_buckets: BTreeMap::new(),
             seen_claude_capability_tool_uses: BTreeSet::new(),
             activity_skills: BTreeSet::new(),
@@ -9222,6 +9541,15 @@ impl SnapshotAccumulator {
         *count = count.saturating_sub(1);
         if *count == 0 {
             self.activity_tool_counts.remove(&name);
+        }
+    }
+
+    fn note_activity_mcp_tool(&mut self, server: &str, tool: &str) {
+        if let Some(name) = bounded_activity_label(&format!("{server}.{tool}")) {
+            *self.activity_mcp_tool_counts.entry(name).or_default() += 1;
+        }
+        if let Some(name) = bounded_tool_usage_name(&format!("mcp__{server}__{tool}")) {
+            *self.activity_mcp_tool_usage_counts.entry(name).or_default() += 1;
         }
     }
 
@@ -12706,6 +13034,22 @@ impl OwnedSourceScan {
                         .terminal_dropped_usage_record_count
                         .saturating_add(census.terminal_dropped_usage_record_count);
                 }
+                if source == SnapshotSource::ClaudeCode
+                    && census.claude_parse_reasons.iter().any(|count| *count > 0)
+                {
+                    // Count-only attribution of why Claude files were selected
+                    // on this page. No path, session, or identifier is named.
+                    eprintln!(
+                        "local snapshot census claude parse reasons: upload_context_matches={} {}",
+                        index.upload_context_fingerprint == index.active_upload_context_fingerprint,
+                        CANDIDATE_PARSE_REASON_NAMES
+                            .iter()
+                            .zip(census.claude_parse_reasons)
+                            .map(|(name, count)| format!("{name}={count}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
                 // A remove/rename hint can arrive after bounded reconciliation has already
                 // passed this key. Removing it only from `observed_index_keys` is then too
                 // late: the reconciliation cursor will never revisit the stale entry and a
@@ -12890,6 +13234,9 @@ impl OwnedSourceScan {
                     .saturating_add(usize::from(parent_resolution_restart));
                 if raw_census_complete {
                     index.record_scan_residue_witness(source, &traversal_snapshot);
+                    index.retain_observed_claude_account_deferred_holds(
+                        &traversal_snapshot.observed_index_keys,
+                    );
                 }
                 if (raw_census_complete
                     && codex_legacy_join_baselines.is_empty()
@@ -13141,12 +13488,23 @@ impl OwnedSourceScan {
                     }
                 }
             }
-            let mut decision = claude_index_path_family_member(&candidate.path)
+            let (mut decision, parse_reason) = claude_index_path_family_member(&candidate.path)
                 .filter(|(root_session_id, _)| {
                     forced_claude_family_reparses.contains(root_session_id)
                 })
-                .map(|_| CandidateDecision::Parse)
-                .unwrap_or_else(|| index.candidate_decision(&candidate));
+                .map(|_| {
+                    (
+                        CandidateDecision::Parse,
+                        Some(CandidateParseReason::ForcedFamily),
+                    )
+                })
+                .unwrap_or_else(|| index.candidate_decision_with_reason(&candidate));
+            if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
+                if let Some(reason) = parse_reason {
+                    let count = &mut census.claude_parse_reasons[reason as usize];
+                    *count = count.saturating_add(1);
+                }
+            }
             if source == SnapshotSource::Codex
             && decision == CandidateDecision::Skip
             // A terminal disposition at this exact file fingerprint and parser
@@ -16242,9 +16600,27 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             Some("function_call" | "custom_tool_call")
         ) {
             if let Some(name) = string_at(value, &["payload", "name"]) {
-                accumulator.note_activity_tool(&name);
-                if payload_type.as_deref() == Some("function_call") {
-                    if let Some(call_id) = string_at(value, &["payload", "call_id"]) {
+                let is_function_call = payload_type.as_deref() == Some("function_call");
+                let call_id = is_function_call
+                    .then(|| string_at(value, &["payload", "call_id"]))
+                    .flatten();
+                let mcp_tool = is_function_call
+                    .then(|| codex_namespaced_mcp_tool(value, &name))
+                    .flatten();
+                if call_id
+                    .as_ref()
+                    .is_some_and(|call_id| accumulator.activity_mcp_call_ids.contains_key(call_id))
+                {
+                    // Already counted as MCP by its completion event.
+                } else if let Some((server, tool)) = mcp_tool {
+                    accumulator.activity_mcp_calls += 1;
+                    accumulator.note_activity_mcp_tool(&server, &tool);
+                    if let Some(call_id) = call_id {
+                        accumulator.activity_mcp_call_ids.insert(call_id, false);
+                    }
+                } else {
+                    accumulator.note_activity_tool(&name);
+                    if let Some(call_id) = call_id {
                         accumulator.activity_call_tools.insert(call_id, name);
                     }
                 }
@@ -16258,6 +16634,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         if payload_type.as_deref() == Some("function_call_output") {
             if let Some(call_id) = string_at(value, &["payload", "call_id"]) {
                 accumulator.activity_call_tools.remove(&call_id);
+                accumulator.activity_mcp_call_ids.remove(&call_id);
             }
         }
     }
@@ -16289,33 +16666,38 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             }
             Some("web_search_end") => accumulator.activity_web_searches += 1,
             Some("mcp_tool_call_end") => {
-                accumulator.activity_mcp_calls += 1;
-                if let Some((capability_id, raw_origin)) = codex_tool_surface_capability(value) {
-                    accumulator.note_capability_call(
-                        timestamp.as_deref(),
-                        capability_id,
-                        raw_origin,
-                    );
-                }
-                if let Some(call_id) = string_at(value, &["payload", "call_id"]) {
-                    accumulator.reclassify_activity_call_as_mcp(&call_id);
-                }
-                let server = string_at(value, &["payload", "app_name"])
-                    .or_else(|| string_at(value, &["payload", "invocation", "server"]));
-                let tool = string_at(value, &["payload", "action_name"])
-                    .or_else(|| string_at(value, &["payload", "invocation", "tool"]));
-                if let (Some(server), Some(tool)) = (server, tool) {
-                    if let Some(name) = bounded_activity_label(&format!("{server}.{tool}")) {
-                        *accumulator
-                            .activity_mcp_tool_counts
-                            .entry(name)
-                            .or_default() += 1;
+                let call_id = string_at(value, &["payload", "call_id"]);
+                let prior = call_id
+                    .as_ref()
+                    .and_then(|call_id| accumulator.activity_mcp_call_ids.get(call_id).copied());
+                // `Some(true)`: a repeated completion event for a counted call.
+                if prior != Some(true) {
+                    if let Some((capability_id, raw_origin)) = codex_tool_surface_capability(value)
+                    {
+                        accumulator.note_capability_call(
+                            timestamp.as_deref(),
+                            capability_id,
+                            raw_origin,
+                        );
                     }
-                    if let Some(name) = bounded_tool_usage_name(&format!("mcp__{server}__{tool}")) {
-                        *accumulator
-                            .activity_mcp_tool_usage_counts
-                            .entry(name)
-                            .or_default() += 1;
+                    if let Some(call_id) = &call_id {
+                        accumulator
+                            .activity_mcp_call_ids
+                            .insert(call_id.clone(), true);
+                    }
+                }
+                // `Some(false)`: the namespaced function_call already counted it.
+                if prior.is_none() {
+                    if let Some(call_id) = &call_id {
+                        accumulator.reclassify_activity_call_as_mcp(call_id);
+                    }
+                    accumulator.activity_mcp_calls += 1;
+                    let server = string_at(value, &["payload", "app_name"])
+                        .or_else(|| string_at(value, &["payload", "invocation", "server"]));
+                    let tool = string_at(value, &["payload", "action_name"])
+                        .or_else(|| string_at(value, &["payload", "invocation", "tool"]));
+                    if let (Some(server), Some(tool)) = (server, tool) {
+                        accumulator.note_activity_mcp_tool(&server, &tool);
                     }
                 }
             }
@@ -16344,6 +16726,31 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             accumulator.latency_ttft_ms_max = accumulator.latency_ttft_ms_max.max(ttft_ms);
         }
     }
+}
+
+/// The explicit MCP server and tool of a Codex `function_call` that names its
+/// server in `payload.namespace` (`mcp__<server>`), as current Codex writes for
+/// MCP tools (for example `js` under `mcp__cua_repl`). The server comes only
+/// from that field: a bare name, a non-MCP namespace or a malformed one yields
+/// `None`, and so does a name already qualified for a different server.
+fn codex_namespaced_mcp_tool(value: &Value, name: &str) -> Option<(String, String)> {
+    let namespace = string_at(value, &["payload", "namespace"])?;
+    let server = namespace.strip_prefix("mcp__")?;
+    if server.is_empty() || server.contains("__") {
+        return None;
+    }
+    let tool = match name.strip_prefix("mcp__") {
+        Some(qualified) => qualified.strip_prefix(server)?.strip_prefix("__")?,
+        None => name
+            .strip_prefix(server)
+            .and_then(|rest| rest.strip_prefix("__"))
+            .unwrap_or(name),
+    };
+    let qualified = format!("mcp__{server}__{tool}");
+    (!tool.is_empty()
+        && qualified.len() <= MAX_TOOL_USAGE_NAME_LENGTH
+        && bounded_tool_usage_name(&qualified).is_some())
+    .then(|| (server.to_string(), tool.to_string()))
 }
 
 fn codex_tool_surface_capability(value: &Value) -> Option<(&'static str, &'static str)> {
@@ -17972,6 +18379,8 @@ struct ScanCensus {
     terminal_dropped_usage_record_count: u64,
     observed_index_keys: BTreeSet<String>,
     removed_index_keys: BTreeSet<String>,
+    /// Count-only parse-selection reasons for Claude candidates on this page.
+    claude_parse_reasons: [usize; CANDIDATE_PARSE_REASON_COUNT],
 }
 
 /// Preserve the old scope/open/object short-circuit and its one existing open.
@@ -20127,6 +20536,7 @@ fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usiz
             index.files.remove(key);
             index.confirmed_empty_files.remove(key);
             index.file_snapshot_fingerprints.remove(key);
+            index.claude_account_deferred_holds.remove(key);
         }
     }
     let done = page.last() == Some(&upper_bound) || page.len() < limit;
@@ -20564,6 +20974,45 @@ enum CandidateDecision {
     Parse,
 }
 
+/// Count-only diagnostic: the first gate that selected a candidate for parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateParseReason {
+    TerminalDisposition,
+    NewFile,
+    AuthorityQuarantine,
+    Audit,
+    BodyWitnessAdoption,
+    UploadContext,
+    ActivityOrQuarantineRetry,
+    TranscriptChanged,
+    CodexCapture,
+    UnknownOutcome,
+    LegacyActivity,
+    LegacyIdentity,
+    Rearmed,
+    SourceChanged,
+    ForcedFamily,
+}
+
+const CANDIDATE_PARSE_REASON_COUNT: usize = 15;
+const CANDIDATE_PARSE_REASON_NAMES: [&str; CANDIDATE_PARSE_REASON_COUNT] = [
+    "terminal_disposition",
+    "new_file",
+    "authority_quarantine",
+    "audit",
+    "body_witness_adoption",
+    "upload_context",
+    "activity_or_quarantine_retry",
+    "transcript_changed",
+    "codex_capture",
+    "unknown_outcome",
+    "legacy_activity",
+    "legacy_identity",
+    "rearmed",
+    "source_changed",
+    "forced_family",
+];
+
 struct CheckpointLock {
     file: File,
 }
@@ -20913,6 +21362,112 @@ impl ScanIndex {
 
     pub fn mark_bounded_sweep_unsettled(&mut self) {
         self.bounded_sweep_had_unsettled_upload = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bounded_sweep_had_unsettled_upload(&self) -> bool {
+        self.bounded_sweep_had_unsettled_upload
+    }
+
+    #[cfg(test)]
+    pub(crate) fn accepted_snapshot_fingerprint_recorded(&self, fingerprint: &str) -> bool {
+        self.accepted_snapshot_fingerprints.contains(fingerprint)
+    }
+
+    /// A well-formed RetryPending family quarantine bound to a retained
+    /// synthetic witness whose only member is the root itself.
+    #[cfg(test)]
+    pub(crate) fn insert_retry_pending_claude_authority_for_test(&mut self, root_session_id: &str) {
+        self.insert_claude_authority_for_test(
+            root_session_id,
+            &"1".repeat(64),
+            ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+        );
+    }
+
+    /// A well-formed UnprovenTerminal family quarantine bound to a retained
+    /// synthetic witness whose only member is the root itself, recording
+    /// `revision` as that member's held source revision.
+    #[cfg(test)]
+    pub(crate) fn insert_unproven_terminal_claude_authority_for_test(
+        &mut self,
+        root_session_id: &str,
+        revision: &str,
+    ) {
+        self.insert_claude_authority_for_test(
+            root_session_id,
+            revision,
+            ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+        );
+    }
+
+    /// The root member revision recorded by a terminal quarantine that is
+    /// still bound to the family's retained witness.
+    #[cfg(test)]
+    pub(crate) fn bound_terminal_claude_authority_revision_for_test(
+        &self,
+        root_session_id: &str,
+    ) -> Option<String> {
+        let record = self
+            .claude_usage_authority_quarantine
+            .get(root_session_id)?;
+        let witness = self.claude_usage_family_witnesses.get(root_session_id)?;
+        if record.disposition != ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+            || !claude_usage_authority_preserves_pending(record, witness)
+        {
+            return None;
+        }
+        record
+            .member_source_file_fingerprints
+            .get(root_session_id)
+            .cloned()
+    }
+
+    #[cfg(test)]
+    fn insert_claude_authority_for_test(
+        &mut self,
+        root_session_id: &str,
+        revision: &str,
+        disposition: ClaudeUsageAuthorityQuarantineDisposition,
+    ) {
+        let witness = ClaudeUsageFamilyWitness {
+            evidence_fingerprint: "e".repeat(64),
+            member_request_id_fingerprints: BTreeMap::from([(
+                root_session_id.to_string(),
+                "f".repeat(64),
+            )]),
+            member_occurrence_fingerprints: BTreeMap::new(),
+            assigned_request_id_fingerprints: BTreeMap::new(),
+            legacy_excluded_request_id_hashes: BTreeMap::new(),
+            legacy_exclusion_evidence_fingerprint: None,
+            legacy_owner_roots: BTreeSet::new(),
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let failed_reconstruction_count = match disposition {
+            ClaudeUsageAuthorityQuarantineDisposition::RetryPending => 1,
+            ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal => {
+                MAX_CLAUDE_USAGE_AUTHORITY_FAILURES
+            }
+        };
+        let record = ClaudeUsageAuthorityQuarantineRecord {
+            contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
+            proven_witness_fingerprint: claude_usage_family_witness_fingerprint(&witness),
+            member_source_file_fingerprints: BTreeMap::from([(
+                root_session_id.to_string(),
+                revision.to_string(),
+            )]),
+            failed_reconstruction_count,
+            disposition,
+            retry_after_unix_seconds: now.saturating_add(CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS),
+        };
+        assert!(claude_usage_authority_preserves_pending(&record, &witness));
+        self.claude_usage_family_witnesses
+            .insert(root_session_id.to_string(), witness);
+        self.claude_usage_authority_quarantine
+            .insert(root_session_id.to_string(), record);
     }
 
     /// Record (or clear) the residue the completing generation disclosed, and
@@ -21457,7 +22012,7 @@ impl ScanIndex {
         let _lock = CheckpointLock::acquire(path)?;
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
-        match serde_json::from_reader::<_, Self>(file) {
+        match serde_json::from_reader::<_, Self>(BufReader::new(file)) {
             Ok(mut index)
                 if index.schema_version == SCAN_INDEX_SCHEMA_VERSION
                     && index
@@ -21541,9 +22096,9 @@ impl ScanIndex {
                     &crate::snapshot_retry::read_state(path, cap)
                         .context("read bounded current local snapshot scan index")?,
                 ),
-                None => serde_json::from_reader(
+                None => serde_json::from_reader(BufReader::new(
                     File::open(path).context("open current local snapshot scan index")?,
-                )
+                ))
                 .map_err(anyhow::Error::from),
             }
             .context("parse current local snapshot scan index for compare-and-swap")?;
@@ -21571,8 +22126,14 @@ impl ScanIndex {
         let mut file = File::create(&temp_path)
             .with_context(|| format!("create scan index temp {}", temp_path.display()))?;
         let result = (|| -> Result<()> {
-            serde_json::to_writer_pretty(&mut file, &self)
-                .with_context(|| format!("write scan index temp {}", temp_path.display()))?;
+            {
+                let mut writer = BufWriter::new(&mut file);
+                serde_json::to_writer_pretty(&mut writer, &self)
+                    .with_context(|| format!("write scan index temp {}", temp_path.display()))?;
+                writer
+                    .flush()
+                    .with_context(|| format!("flush scan index temp {}", temp_path.display()))?;
+            }
             file.sync_all()
                 .with_context(|| format!("sync scan index temp {}", temp_path.display()))?;
             fs::rename(&temp_path, path)
@@ -21968,6 +22529,218 @@ impl ScanIndex {
         }
     }
 
+    /// Re-decide the durable account-hold disclosure for every key this cycle
+    /// parsed to completion: the key is held while one of its current entities
+    /// is account-deferred, and leaves as soon as a parse resolves it. Keys
+    /// not parsed this cycle keep their entry; only a parse or a proven
+    /// absence changes it. Returns false when the bound prevented recording a
+    /// hold, in which case account deferrals must stay progress-blocking.
+    pub(crate) fn record_claude_account_deferred_holds<'a>(
+        &mut self,
+        completed_parses: impl IntoIterator<Item = (&'a str, &'a str)>,
+        account_deferred_fingerprints: &BTreeSet<String>,
+    ) -> bool {
+        let mut recorded = true;
+        for (index_key, source_file_fingerprint) in completed_parses {
+            let held = self
+                .file_snapshot_fingerprints
+                .get(index_key)
+                .is_some_and(|fingerprints| {
+                    !fingerprints.is_disjoint(account_deferred_fingerprints)
+                });
+            if !held {
+                self.claude_account_deferred_holds.remove(index_key);
+            } else if self.claude_account_deferred_holds.len() < MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS
+                || self.claude_account_deferred_holds.contains_key(index_key)
+            {
+                self.claude_account_deferred_holds
+                    .insert(index_key.to_string(), source_file_fingerprint.to_string());
+            } else {
+                recorded = false;
+            }
+        }
+        recorded
+    }
+
+    pub(crate) fn claude_account_deferred_hold_count(&self) -> usize {
+        self.claude_account_deferred_holds.len()
+    }
+
+    /// A completed traversal observed every present path, so a held key that
+    /// is neither indexed nor observed is proved absent.
+    fn retain_observed_claude_account_deferred_holds(&mut self, observed: &BTreeSet<String>) {
+        let files = &self.files;
+        self.claude_account_deferred_holds
+            .retain(|index_key, _| files.contains_key(index_key) || observed.contains(index_key));
+    }
+
+    /// Keys whose scanned entity set or head names a held revision.
+    fn locally_held_keys(&self, held: &BTreeSet<String>) -> BTreeSet<String> {
+        self.files
+            .iter()
+            .filter(|(key, entry)| {
+                self.file_snapshot_fingerprints
+                    .get(*key)
+                    .is_some_and(|fingerprints| !fingerprints.is_disjoint(held))
+                    || entry
+                        .last_snapshot_fingerprint
+                        .as_ref()
+                        .is_some_and(|fingerprint| held.contains(fingerprint))
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Whether `with_locally_held_keys_reverted` keeps every held Claude
+    /// family that still carries authority evidence in the census. The revert
+    /// drops a held key that has no committed entry, and a later complete page
+    /// of the same traversal would then read its still-present family as
+    /// vanished: it drops the retained witness, resolves the quarantine, and
+    /// omits the family from the manifest. A historical replay reset clears
+    /// ordinary committed entries but keeps that evidence, so such a hold must
+    /// stay progress-blocking instead.
+    pub(crate) fn locally_held_keys_restorable(
+        &self,
+        previous: &ScanIndex,
+        held: &BTreeSet<String>,
+    ) -> bool {
+        self.locally_held_keys(held).iter().all(|key| {
+            if previous.files.contains_key(key) {
+                return true;
+            }
+            let Some((root_session_id, _)) = claude_index_path_family_member(Path::new(key)) else {
+                return true;
+            };
+            [self, previous].iter().all(|index| {
+                !index
+                    .claude_usage_family_witnesses
+                    .contains_key(&root_session_id)
+                    && !index
+                        .claude_usage_authority_quarantine
+                        .contains_key(&root_session_id)
+            })
+        })
+    }
+
+    /// The commit for a `Completed` upload whose only unsettled entities are
+    /// locally held, non-progressing revisions. Every uploaded entity was
+    /// accepted or unchanged, so each key without a held entity commits
+    /// exactly as the no-hold save would, including complete-census pruning
+    /// and the adopted upload context. A held key keeps its committed revision
+    /// instead: entry, exact entity set, empty marker, terminal disposition,
+    /// owned-start witness, and the activity and accepted ledger for those
+    /// restored entities. A held body therefore never enters the committed
+    /// entity set, the manifest, or the accepted ledger, and a held key that
+    /// was never committed stays absent; `locally_held_keys_restorable` says
+    /// whether that absence is safe to settle.
+    ///
+    /// `reparse_held` names held entities whose key every later generation
+    /// must reparse (account deferrals). Their restored entry carries an empty
+    /// source fingerprint, so neither an unchanged file nor a newly adopted
+    /// upload context can skip the retry. A held key whose scanned source
+    /// fingerprint was explicitly cleared keeps that reparse debt as well.
+    pub(crate) fn with_locally_held_keys_reverted(
+        &self,
+        previous: &ScanIndex,
+        held: &BTreeSet<String>,
+        reparse_held: &BTreeSet<String>,
+    ) -> ScanIndex {
+        let held_keys = self.locally_held_keys(held);
+        let mut result = self.clone();
+        for key in &held_keys {
+            let reparse = self
+                .files
+                .get(key)
+                .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+                || self
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held));
+            match previous.files.get(key) {
+                Some(committed) => {
+                    let mut committed = committed.clone();
+                    if reparse {
+                        committed.source_file_fingerprint.clear();
+                    }
+                    result.files.insert(key.clone(), committed);
+                }
+                None => {
+                    result.files.remove(key);
+                }
+            }
+            match previous.file_snapshot_fingerprints.get(key) {
+                Some(fingerprints) => {
+                    result
+                        .file_snapshot_fingerprints
+                        .insert(key.clone(), fingerprints.clone());
+                }
+                None => {
+                    result.file_snapshot_fingerprints.remove(key);
+                }
+            }
+            if previous.confirmed_empty_files.contains(key) {
+                result.confirmed_empty_files.insert(key.clone());
+            } else {
+                result.confirmed_empty_files.remove(key);
+            }
+            match previous.terminal_jsonl_dispositions.get(key) {
+                Some(disposition) => {
+                    result
+                        .terminal_jsonl_dispositions
+                        .insert(key.clone(), disposition.clone());
+                }
+                None => {
+                    result.terminal_jsonl_dispositions.remove(key);
+                }
+            }
+            if let Some((_, member)) = claude_index_path_family_member(Path::new(key)) {
+                match previous.claude_owned_start_census.get(&member) {
+                    Some(witness) => {
+                        result
+                            .claude_owned_start_census
+                            .insert(member, witness.clone());
+                    }
+                    None => {
+                        result.claude_owned_start_census.remove(&member);
+                    }
+                }
+            }
+        }
+        let mut restored = BTreeSet::new();
+        for key in &held_keys {
+            match result.file_snapshot_fingerprints.get(key) {
+                Some(fingerprints) => restored.extend(fingerprints.iter().cloned()),
+                None => restored.extend(
+                    result
+                        .files
+                        .get(key)
+                        .and_then(|entry| entry.last_snapshot_fingerprint.clone()),
+                ),
+            }
+        }
+        for fingerprint in &restored {
+            if let Some(activity_at) = previous.snapshot_activity_at.get(fingerprint) {
+                result
+                    .snapshot_activity_at
+                    .entry(fingerprint.clone())
+                    .or_insert_with(|| activity_at.clone());
+            }
+            if previous
+                .accepted_snapshot_fingerprints
+                .contains(fingerprint)
+            {
+                result
+                    .accepted_snapshot_fingerprints
+                    .insert(fingerprint.clone());
+            }
+        }
+        let current = result.current_snapshot_fingerprints();
+        result
+            .snapshot_activity_at
+            .retain(|fingerprint, _| current.contains(fingerprint));
+        result
+    }
+
     pub fn committable_subset(
         &self,
         previous: &ScanIndex,
@@ -22137,6 +22910,10 @@ impl ScanIndex {
             // until the curve-bearing entity itself is accepted. Otherwise a
             // shed upload could make the corrective reparse disappear.
             claude_owned_start_census,
+            claude_account_deferred_holds: self.claude_account_deferred_holds.clone(),
+            claude_duplicate_fence_rearm_attempt: self.claude_duplicate_fence_rearm_attempt,
+            claude_duplicate_fence_next_full_rearm_unix_seconds: self
+                .claude_duplicate_fence_next_full_rearm_unix_seconds,
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
             claude_desktop_store_sweep_had_errors: self.claude_desktop_store_sweep_had_errors,
@@ -22194,6 +22971,14 @@ impl ScanIndex {
             }
         }
         for (key, working) in &self.files {
+            // A cleared source witness is outstanding reparse work, not a new
+            // accepted body. Reverting an unsettled entry must keep that debt;
+            // otherwise a partial save can undo a census/fence correction.
+            if working.source_file_fingerprint.is_empty() {
+                if let Some(retained) = result.files.get_mut(key) {
+                    retained.source_file_fingerprint.clear();
+                }
+            }
             if let Some(due) = working.unverified_deadline() {
                 if let Some(retained) = result.files.get_mut(key) {
                     retained.set_unverified_deadline(
@@ -22268,6 +23053,7 @@ impl ScanIndex {
         self.terminal_jsonl_dispositions.remove(key);
         self.confirmed_empty_files.remove(key);
         self.file_snapshot_fingerprints.remove(key);
+        self.claude_account_deferred_holds.remove(key);
     }
 
     /// Retire terminal JSONL dispositions whose file is no longer indexed.
@@ -22313,13 +23099,33 @@ impl ScanIndex {
     }
 
     fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
+        self.candidate_decision_with_reason(candidate).0
+    }
+
+    fn candidate_decision_with_reason(
+        &self,
+        candidate: &CandidateFile,
+    ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or_default();
-        self.candidate_decision_at(candidate, now)
+        self.candidate_decision_with_reason_at(candidate, now)
     }
+
+    #[cfg(test)]
     fn candidate_decision_at(&self, candidate: &CandidateFile, now: u64) -> CandidateDecision {
+        self.candidate_decision_with_reason_at(candidate, now).0
+    }
+
+    /// The candidate decision plus, for `Parse`, the first gate that selected
+    /// the file. The reason is a count-only diagnostic and never changes the
+    /// decision.
+    fn candidate_decision_with_reason_at(
+        &self,
+        candidate: &CandidateFile,
+        now: u64,
+    ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let key = local_index_key(&candidate.path);
         if self
             .terminal_jsonl_dispositions
@@ -22329,10 +23135,16 @@ impl ScanIndex {
                     || disposition.parser_generation != JSONL_TERMINAL_DISPOSITION_GENERATION
             })
         {
-            return CandidateDecision::Parse;
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::TerminalDisposition),
+            );
         }
         let Some(entry) = self.files.get(&key) else {
-            return CandidateDecision::Parse;
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::NewFile),
+            );
         };
         if let Some((root_session_id, _)) = claude_index_path_family_member(&candidate.path) {
             if self
@@ -22343,22 +23155,31 @@ impl ScanIndex {
                     .claude_usage_authority_candidate_requires_family_reparse(candidate)
                     .is_some()
                 {
-                    return CandidateDecision::Parse;
+                    return (
+                        CandidateDecision::Parse,
+                        Some(CandidateParseReason::AuthorityQuarantine),
+                    );
                 }
-                return CandidateDecision::Skip;
+                return (CandidateDecision::Skip, None);
             }
         }
         if entry.audit_requires_full(now) {
-            return CandidateDecision::Parse;
+            return (CandidateDecision::Parse, Some(CandidateParseReason::Audit));
         }
         // A locally held Claude family above keeps its existing bounded retry
         // gate. Otherwise a projection change selects even an unchanged v2
         // file under an already admitted context, independently of parser age.
         if self.effective_upload_body_witness_revision_requires_adoption(&key) {
-            return CandidateDecision::Parse;
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::BodyWitnessAdoption),
+            );
         }
         if self.upload_context_fingerprint != self.active_upload_context_fingerprint {
-            return CandidateDecision::Parse;
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::UploadContext),
+            );
         }
         if self
             .file_snapshot_fingerprints
@@ -22373,7 +23194,10 @@ impl ScanIndex {
                 })
             })
         {
-            return CandidateDecision::Parse;
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::ActivityOrQuarantineRetry),
+            );
         }
         let transcript_changed = entry.size_bytes != candidate.size_bytes
             || entry.modified_unix_seconds != candidate.modified_unix_seconds
@@ -22381,7 +23205,10 @@ impl ScanIndex {
                 .modified_unix_nanos
                 .is_some_and(|value| value != candidate.modified_unix_nanos);
         if transcript_changed {
-            return CandidateDecision::Parse;
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::TranscriptChanged),
+            );
         }
         if entry.codex_captured_uncommitted
             || entry.codex_captured_tier_receipt_required
@@ -22407,13 +23234,19 @@ impl ScanIndex {
                             })
                     });
             return if quarantine_holds {
-                CandidateDecision::Skip
+                (CandidateDecision::Skip, None)
             } else {
-                CandidateDecision::Parse
+                (
+                    CandidateDecision::Parse,
+                    Some(CandidateParseReason::CodexCapture),
+                )
             };
         }
         if entry.last_snapshot_fingerprint.is_none() && !self.confirmed_empty_files.contains(&key) {
-            return CandidateDecision::Parse;
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::UnknownOutcome),
+            );
         }
         if !self.file_snapshot_fingerprints.contains_key(&key)
             && entry
@@ -22426,29 +23259,40 @@ impl ScanIndex {
                         .is_some_and(valid_snapshot_activity)
                 })
         {
-            return CandidateDecision::Parse;
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::LegacyActivity),
+            );
         }
         if entry.scan_identity_version.as_deref() != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
             && !entry.has_unverified_source()
         {
             return if entry.source_file_fingerprint == candidate.legacy_source_file_fingerprint {
                 if candidate.legacy_config_reconciliation_required {
-                    CandidateDecision::ReconcileLegacy
+                    (CandidateDecision::ReconcileLegacy, None)
                 } else {
-                    CandidateDecision::Migrate
+                    (CandidateDecision::Migrate, None)
                 }
             } else {
                 // The legacy source-wide sidecar identity changed while this
                 // entry was not observed. We cannot prove which session was
                 // affected from the irreversible old digest, so correctness
                 // requires a one-time parse instead of silently absorbing it.
-                CandidateDecision::Parse
+                (
+                    CandidateDecision::Parse,
+                    Some(CandidateParseReason::LegacyIdentity),
+                )
             };
         }
         if entry.source_file_fingerprint != candidate.source_file_fingerprint {
-            CandidateDecision::Parse
+            let reason = if entry.source_file_fingerprint.is_empty() {
+                CandidateParseReason::Rearmed
+            } else {
+                CandidateParseReason::SourceChanged
+            };
+            (CandidateDecision::Parse, Some(reason))
         } else {
-            CandidateDecision::Skip
+            (CandidateDecision::Skip, None)
         }
     }
 
@@ -23599,6 +24443,9 @@ mod tests {
     mod claude_request_identity_tests {
         include!("snapshots/claude_request_identity_tests.rs");
     }
+    mod census_convergence_tests {
+        include!("snapshots/census_convergence_tests.rs");
+    }
     mod giant_row_measurement_tests {
         include!("snapshots/giant_row_measurement_tests.rs");
     }
@@ -24529,6 +25376,170 @@ mod tests {
         assert_ne!(labels_disabled.snapshot_fingerprint, original_fingerprint);
 
         let _ = fs::remove_file(path);
+    }
+
+    fn parse_codex_activity_fixture(name: &str, lines: &[Value]) -> SnapshotItem {
+        let path = temp_file(name);
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("write transcript");
+        let item = parse_codex_jsonl_file(&path, "2026-10-12T06:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        let _ = fs::remove_file(path);
+        item
+    }
+
+    #[test]
+    fn codex_namespaced_mcp_calls_keep_their_explicit_server_once() {
+        let call = |call_id: &str, name: &str, namespace: Option<&str>| {
+            let mut payload =
+                json!({"type":"function_call","name":name,"call_id":call_id,"arguments":"{}"});
+            if let Some(namespace) = namespace {
+                payload["namespace"] = json!(namespace);
+            }
+            json!({"timestamp":"2026-10-12T06:00:01Z","type":"response_item","payload":payload})
+        };
+        let output = |call_id: &str| json!({"timestamp":"2026-10-12T06:00:01Z","type":"response_item","payload":{"type":"function_call_output","call_id":call_id,"output":"private output"}});
+        let end = |call_id: &str, server: &str, meta: Value| json!({"timestamp":"2026-10-12T06:00:01Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":call_id,"invocation":{"server":server,"tool":"js"},"result":{"Ok":{"_meta":meta}}}});
+        let computer_use = json!({"codex/toolSurface":{"kind":"computerUse","backend":null}});
+        let ns = Some("mcp__cua_repl");
+        let lines = vec![
+            json!({"timestamp":"2026-10-12T06:00:00Z","type":"session_meta","payload":{"id":"namespace-session"}}),
+            // Bare tool name; the server is named only by the namespace.
+            call("n1", "js", ns),
+            output("n1"),
+            // Already qualified, or prefixed with the same server: not re-prefixed.
+            call("n2", "mcp__cua_repl__js", ns),
+            output("n2"),
+            call("n3", "cua_repl__js_reset", ns),
+            // Absent namespace: the bare name stays an ordinary tool; no server
+            // is inferred from the name or from the namespaced calls around it.
+            call("b1", "js", None),
+            output("b1"),
+            // Conflicting, non-MCP and malformed namespaces are not applied.
+            call("x1", "mcp__other__js", ns),
+            call("x2", "spawn_agent", Some("multi_agent_v1")),
+            call("x3", "js", Some("mcp__")),
+            call("x4", "js", Some("mcp__a__b")),
+            // Completion after the call, then a repeated completion.
+            call("o1", "js", ns),
+            end("o1", "cua_repl", computer_use.clone()),
+            end("o1", "cua_repl", computer_use),
+            output("o1"),
+            // Completion before the call, with and without a namespace.
+            end("o2", "cua_repl", json!({})),
+            call("o2", "js", ns),
+            end("o3", "node_repl", json!({})),
+            call("o3", "js", None),
+            output("o2"),
+            output("o3"),
+            call("e1", "exec_command", None),
+            output("e1"),
+            json!({"timestamp":"2026-10-12T06:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"request_count":1},"model":"gpt-5.6"}}}),
+        ];
+        let item = parse_codex_activity_fixture("codex-mcp-namespace", &lines);
+
+        let tool_usage = |name: &str, count: u64| SnapshotToolUsage {
+            name: name.to_string(),
+            count,
+        };
+        assert_eq!(
+            item.tool_usage.as_deref(),
+            Some(
+                &[
+                    tool_usage("mcp__cua_repl__js", 4),
+                    tool_usage("js", 3),
+                    tool_usage("exec_command", 1),
+                    tool_usage("mcp__cua_repl__js_reset", 1),
+                    tool_usage("mcp__node_repl__js", 1),
+                    tool_usage("mcp__other__js", 1),
+                    tool_usage("spawn_agent", 1),
+                ][..]
+            )
+        );
+        let summary = item.activity_summary.as_ref().expect("activity summary");
+        // Twelve function calls, each counted exactly once.
+        assert_eq!(summary.tool_calls, 12);
+        assert_eq!(summary.mcp_calls, 6);
+        assert_eq!(summary.shell_commands, 1);
+        fn count_of(rows: &[SnapshotActivityCount], name: &str) -> Option<u64> {
+            rows.iter()
+                .find(|row| row.name == name)
+                .map(|row| row.count)
+        }
+        assert_eq!(count_of(&summary.mcp_tool_counts, "cua_repl.js"), Some(4));
+        assert_eq!(
+            count_of(&summary.mcp_tool_counts, "cua_repl.js_reset"),
+            Some(1)
+        );
+        assert_eq!(count_of(&summary.mcp_tool_counts, "node_repl.js"), Some(1));
+        assert_eq!(summary.mcp_tool_counts.len(), 3);
+        assert_eq!(count_of(&summary.tool_counts, "js"), Some(3));
+        assert_eq!(count_of(&summary.tool_counts, "mcp__other__js"), Some(1));
+        // Capability comes only from the completion event's explicit tool
+        // surface, once per call; the namespace alone adds none.
+        assert_eq!(summary.capability_counts.len(), 1);
+        assert_eq!(summary.capability_counts[0].capability_id, "computer.use");
+        assert_eq!(summary.capability_counts[0].count, 1);
+        assert!(!serde_json::to_string(&item)
+            .expect("serialize")
+            .contains("private output"));
+
+        // Usage and accounting are independent of the namespace field.
+        let stripped = lines
+            .iter()
+            .cloned()
+            .map(|mut line| {
+                if let Some(payload) = line.get_mut("payload").and_then(Value::as_object_mut) {
+                    payload.remove("namespace");
+                }
+                line
+            })
+            .collect::<Vec<_>>();
+        let legacy = parse_codex_activity_fixture("codex-mcp-namespace-absent", &stripped);
+        assert_eq!(
+            (
+                legacy.input_tokens,
+                legacy.output_tokens,
+                legacy.cache_read_tokens,
+                legacy.reasoning_output_tokens,
+                legacy.request_count,
+            ),
+            (
+                item.input_tokens,
+                item.output_tokens,
+                item.cache_read_tokens,
+                item.reasoning_output_tokens,
+                item.request_count,
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(&legacy.model_usage).expect("model usage"),
+            serde_json::to_value(&item.model_usage).expect("model usage")
+        );
+        assert_eq!(
+            serde_json::to_value(&legacy.usage_buckets).expect("usage buckets"),
+            serde_json::to_value(&item.usage_buckets).expect("usage buckets")
+        );
+        assert_eq!(
+            serde_json::to_value(&legacy.cost).expect("cost"),
+            serde_json::to_value(&item.cost).expect("cost")
+        );
+        assert_eq!(legacy.attribution_facts, item.attribution_facts);
+        let legacy_usage = legacy.tool_usage.as_deref().expect("legacy tool usage");
+        assert!(legacy_usage
+            .iter()
+            .all(|row| row.name != "mcp__cua_repl__js_reset"));
+        assert!(legacy_usage.iter().any(|row| row.name == "js"));
     }
 
     #[test]
@@ -25563,6 +26574,38 @@ mod tests {
         let observed = ScanIndex::load(&path).expect("load winner");
         assert_eq!(observed.generation, 2);
         assert_eq!(observed.resume_after_path.as_deref(), Some("winner"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn large_scan_index_save_preserves_bytes_and_generation_fence() {
+        let root = temp_dir("large-scan-index-durability");
+        let path = root.join("scan-index.json");
+        let mut index = ScanIndex {
+            resume_after_path: Some("synthetic-checkpoint".repeat(4096)),
+            ..ScanIndex::default()
+        };
+        index.save(&path).expect("save large generation");
+        assert_eq!(
+            fs::read(&path).expect("read durable index"),
+            serde_json::to_vec_pretty(&index).expect("encode exact index bytes")
+        );
+        let mut stale = ScanIndex::load(&path).expect("load stale generation");
+        let mut winner = ScanIndex::load(&path).expect("load winning generation");
+        winner.resume_after_path = Some("replacement-checkpoint".repeat(8192));
+        winner.save(&path).expect("save larger replacement");
+        stale
+            .save(&path)
+            .expect_err("stale generation stays fenced");
+        assert_eq!(
+            fs::read(&path).expect("read winning bytes"),
+            serde_json::to_vec_pretty(&winner).expect("encode winning bytes")
+        );
+        let observed = ScanIndex::load(&path).expect("reload winning generation");
+        assert_eq!(observed.generation, 2);
+        assert_eq!(observed.resume_after_path, winner.resume_after_path);
+        let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        assert!(!temp_path.exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -36181,6 +37224,475 @@ mod tests {
         assert!(index.claude_duplicate_request_owners.is_empty());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn claude_census_counts_run(
+        items: &[SnapshotItem],
+        index: &ScanIndex,
+        census_complete: bool,
+        max_pending_occurrences: usize,
+        max_duplicate_owners: usize,
+    ) -> (Vec<SnapshotItem>, ScanIndex, ClaudeDuplicateCensusCounts) {
+        let mut items = items.to_vec();
+        let mut index = index.clone();
+        let mut disposition = apply_claude_reported_usage_with_index_and_limits(
+            &mut items,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut index,
+            census_complete,
+            "2026-08-02T07:10:00Z",
+            max_pending_occurrences,
+            max_duplicate_owners,
+        );
+        let counts = disposition.duplicate_census;
+        // The counters are the only disposition output of these report-free
+        // folds, and they never reach persisted index or emitted item bytes.
+        disposition.duplicate_census = ClaudeDuplicateCensusCounts::default();
+        assert_eq!(disposition, ClaudeUsageAuthorityDisposition::default());
+        let index_json = serde_json::to_string(&index).expect("serialize index");
+        let items_json = serde_json::to_string(&items).expect("serialize items");
+        for key in ["fence_after", "census_invalid", "page_invalidated"] {
+            assert!(!index_json.contains(key), "index must not carry {key}");
+            assert!(!items_json.contains(key), "items must not carry {key}");
+        }
+        (items, index, counts)
+    }
+
+    fn claude_census_counts_run_twice(
+        items: &[SnapshotItem],
+        index: &ScanIndex,
+        census_complete: bool,
+        max_pending_occurrences: usize,
+        max_duplicate_owners: usize,
+    ) -> (Vec<SnapshotItem>, ScanIndex, ClaudeDuplicateCensusCounts) {
+        let first = claude_census_counts_run(
+            items,
+            index,
+            census_complete,
+            max_pending_occurrences,
+            max_duplicate_owners,
+        );
+        let second = claude_census_counts_run(
+            items,
+            index,
+            census_complete,
+            max_pending_occurrences,
+            max_duplicate_owners,
+        );
+        assert_eq!(
+            serde_json::to_string(&first.0).expect("serialize items"),
+            serde_json::to_string(&second.0).expect("serialize items")
+        );
+        assert_eq!(
+            serde_json::to_string(&first.1).expect("serialize index"),
+            serde_json::to_string(&second.1).expect("serialize index")
+        );
+        for (left, right) in first.0.iter().zip(&second.0) {
+            assert_eq!(left.snapshot_fingerprint, right.snapshot_fingerprint);
+            assert_eq!(
+                snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, left),
+                snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, right)
+            );
+        }
+        assert_eq!(first.2, second.2);
+        first
+    }
+
+    #[test]
+    fn claude_duplicate_census_counts_separate_complete_invalid_and_owner_bound() {
+        let (root, parent, items) = claude_account_family_fixture();
+
+        // The fixture census clock; a fresh closure schedules its next full
+        // re-arm one base backoff later.
+        let next_full_rearm = Some(1_785_654_600 + CLAUDE_DUPLICATE_FENCE_REARM_BASE_SECONDS);
+
+        // Complete valid census: fence stays clear and no cause fires.
+        let (_, _, counts) = claude_census_counts_run_twice(
+            &items,
+            &ScanIndex::default(),
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                pending_occurrence_count: 5,
+                coverage_complete: true,
+                ..Default::default()
+            }
+        );
+
+        // Invalid census from a family whose occurrence proof is incomplete.
+        let mut invalid_items = items.clone();
+        invalid_items[1].claude_usage_occurrences.clear();
+        let (_, invalid_index, counts) = claude_census_counts_run_twice(
+            &invalid_items,
+            &ScanIndex::default(),
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(invalid_index.claude_duplicate_request_witness_overflowed);
+        assert!(invalid_index.claude_duplicate_request_owners.is_empty());
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                census_invalid: true,
+                invalid_current_window_family_count: 1,
+                page_invalidated_identity_count: 1,
+                coverage_complete: true,
+                full_rearm: true,
+                rearm_attempt: 1,
+                full_rearm_deferred_until: next_full_rearm,
+                ..Default::default()
+            }
+        );
+
+        // The same page before the terminal pass: invalid, but the fence and
+        // the terminal-only family count are untouched.
+        let (_, open_index, counts) = claude_census_counts_run_twice(
+            &invalid_items,
+            &ScanIndex::default(),
+            false,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(!open_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_invalid: true,
+                page_invalidated_identity_count: 1,
+                ..Default::default()
+            }
+        );
+
+        // Invalid census from the pending-occurrence cap.
+        let (_, cap_index, counts) = claude_census_counts_run_twice(
+            &items,
+            &ScanIndex::default(),
+            true,
+            1,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(cap_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                census_invalid: true,
+                invalid_current_window_family_count: 1,
+                page_invalidated_cap_count: 1,
+                coverage_complete: true,
+                full_rearm: true,
+                rearm_attempt: 1,
+                full_rearm_deferred_until: next_full_rearm,
+                ..Default::default()
+            }
+        );
+
+        // Stale, unquarantined pending from an older window whose family has
+        // no indexed file left: a complete census proves it vanished, so it
+        // cannot hide a current request and does not poison the census.
+        let mut stale_index = ScanIndex::default();
+        stale_index.claude_usage_family_pending.insert(
+            "stale-root".to_string(),
+            ClaudeUsageFamilyPending {
+                census_window_end: "2026-08-01T00:00:00Z".to_string(),
+                member_request_id_hashes: BTreeMap::new(),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+            },
+        );
+        let (_, stale_after, counts) = claude_census_counts_run_twice(
+            &items,
+            &stale_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(!stale_after.claude_duplicate_request_witness_overflowed);
+        assert!(!stale_after
+            .claude_usage_family_pending
+            .contains_key("stale-root"));
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                pending_occurrence_count: 5,
+                coverage_complete: true,
+                ..Default::default()
+            }
+        );
+
+        // The same stale pending while one of its files is still indexed is
+        // an invalid census: no current-window family is invalid, and the
+        // unobserved member also leaves coverage incomplete.
+        stale_index.files.insert(
+            "/opaque/stale-root.jsonl".to_string(),
+            manifest_index_entry(Some("stale-settled")),
+        );
+        let (_, stale_after, counts) = claude_census_counts_run_twice(
+            &items,
+            &stale_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(stale_after.claude_duplicate_request_witness_overflowed);
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                census_invalid: true,
+                pending_occurrence_count: 5,
+                coverage_missing_member_count: 1,
+                full_rearm: true,
+                rearm_attempt: 1,
+                full_rearm_deferred_until: next_full_rearm,
+                ..Default::default()
+            }
+        );
+
+        // The same stale member pending, also only in the old window, keeps
+        // it fail closed even without a root file.
+        let mut stale_member_index = ScanIndex::default();
+        stale_member_index.claude_usage_family_pending.insert(
+            "stale-root".to_string(),
+            ClaudeUsageFamilyPending {
+                census_window_end: "2026-08-01T00:00:00Z".to_string(),
+                member_request_id_hashes: BTreeMap::from([(
+                    "stale-member".to_string(),
+                    BTreeSet::new(),
+                )]),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+            },
+        );
+        stale_member_index.files.insert(
+            "/opaque/stale-member.jsonl".to_string(),
+            manifest_index_entry(Some("stale-member-settled")),
+        );
+        let (_, stale_member_after, counts) = claude_census_counts_run_twice(
+            &items,
+            &stale_member_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        );
+        assert!(stale_member_after.claude_duplicate_request_witness_overflowed);
+        assert!(counts.census_invalid);
+
+        // Owner bound: a valid census whose cross-family duplicates exceed
+        // the owner limit sets the fence without any invalid cause.
+        let copy_id = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let mut copy = items[0].clone();
+        copy.source_session_id = copy_id.to_string();
+        for fact in &mut copy.attribution_facts {
+            if fact.value == parent {
+                fact.value = copy_id.to_string();
+            }
+        }
+        assert_eq!(claude_snapshot_family_root(&copy), copy_id);
+        let mut bound_items = items.clone();
+        bound_items.push(copy);
+        let (_, bound_index, counts) = claude_census_counts_run_twice(
+            &bound_items,
+            &ScanIndex::default(),
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            1,
+        );
+        assert!(bound_index.claude_duplicate_request_witness_overflowed);
+        assert!(bound_index.claude_duplicate_request_owners.is_empty());
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_after: true,
+                pending_occurrence_count: 9,
+                coverage_complete: true,
+                full_rearm: true,
+                rearm_attempt: 1,
+                full_rearm_deferred_until: next_full_rearm,
+                ..Default::default()
+            }
+        );
+
+        // Once the copy is gone, the next valid, fully covered terminal pass
+        // clears the fence, re-emits posture once, and resets the backoff.
+        let (_, cleared_index, counts) = claude_census_counts_run_twice(
+            &items,
+            &bound_index,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            1,
+        );
+        assert!(!cleared_index.claude_duplicate_request_witness_overflowed);
+        assert_eq!(cleared_index.claude_duplicate_fence_rearm_attempt, 0);
+        assert_eq!(
+            cleared_index.claude_duplicate_fence_next_full_rearm_unix_seconds,
+            None
+        );
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                fence_before: true,
+                pending_occurrence_count: 5,
+                coverage_complete: true,
+                full_rearm: true,
+                ..Default::default()
+            }
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_duplicate_census_counts_name_each_pending_invalidation_once() {
+        let (root, _, items) = claude_account_family_fixture();
+        let window = "2026-08-02T07:10:00Z";
+        let accumulate = |page: &[SnapshotItem], max_occurrences: usize| {
+            let mut pending = BTreeMap::new();
+            let counts = accumulate_claude_usage_family_pending_with_limit(
+                page,
+                &mut pending,
+                window,
+                max_occurrences,
+            );
+            (pending, counts)
+        };
+
+        let (pending, counts) = accumulate(&items, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+        assert!(pending.values().all(|family| !family.invalid));
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                pending_occurrence_count: 5,
+                ..Default::default()
+            }
+        );
+
+        // Request ids disagree with request_count. A second bad member of the
+        // already-invalid family is skipped, so each family counts once.
+        let mut identity = items.clone();
+        identity[0].request_count = 0;
+        identity[1].claude_usage_occurrences.clear();
+        let (pending, counts) = accumulate(&identity, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+        assert!(pending.values().all(|family| family.invalid));
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                page_invalidated_identity_count: 1,
+                ..Default::default()
+            }
+        );
+
+        // Occurrence keys differ from the request-id set at equal length.
+        let mut mismatch = items.clone();
+        let (_, occurrence) = mismatch[0]
+            .claude_usage_occurrences
+            .pop_first()
+            .expect("parent occurrence");
+        mismatch[0]
+            .claude_usage_occurrences
+            .insert("req_not_in_ids".to_string(), occurrence);
+        let (pending, counts) = accumulate(&mismatch, MAX_CLAUDE_PENDING_USAGE_OCCURRENCES);
+        assert!(pending.values().all(|family| family.invalid));
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                page_invalidated_occurrence_mismatch_count: 1,
+                ..Default::default()
+            }
+        );
+
+        // The bounded pending-occurrence cap.
+        let (pending, counts) = accumulate(&items, 4);
+        assert!(pending.values().all(|family| family.invalid));
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                page_invalidated_cap_count: 1,
+                ..Default::default()
+            }
+        );
+
+        // The same member seen again in one window with other request ids.
+        let mut changed = items[0].clone();
+        let request_id = changed
+            .claude_usage_request_ids
+            .pop_first()
+            .expect("parent request id");
+        changed.claude_usage_occurrences.remove(&request_id);
+        changed.request_count -= 1;
+        let (pending, counts) = accumulate(
+            &[items[0].clone(), changed],
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        );
+        assert!(pending.values().all(|family| family.invalid));
+        assert_eq!(
+            counts,
+            ClaudeDuplicateCensusCounts {
+                page_invalidated_member_changed_count: 1,
+                ..Default::default()
+            }
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_duplicate_census_counts_encoding_is_bounded() {
+        let max = ClaudeDuplicateCensusCounts {
+            census_complete: true,
+            fence_before: true,
+            fence_after: true,
+            census_invalid: true,
+            invalid_current_window_family_count: usize::MAX,
+            pending_occurrence_count: usize::MAX,
+            page_invalidated_identity_count: usize::MAX,
+            page_invalidated_occurrence_mismatch_count: usize::MAX,
+            page_invalidated_cap_count: usize::MAX,
+            page_invalidated_member_changed_count: usize::MAX,
+            coverage_complete: true,
+            coverage_missing_member_count: usize::MAX,
+            full_rearm: true,
+            rearm_attempt: u8::MAX,
+            full_rearm_deferred_until: Some(u64::MAX),
+        };
+        let encoded = serde_json::to_string(&max).expect("encode counters");
+        assert!(encoded.len() <= 589, "{} bytes", encoded.len());
+
+        let stats = crate::snapshot_sync::ClaudeLocalEvidenceStats {
+            duplicate_census: max,
+            ..Default::default()
+        };
+        let line = serde_json::to_string(&stats).expect("encode stats");
+        let mut without = serde_json::to_value(&stats).expect("stats value");
+        let nested = without
+            .as_object_mut()
+            .expect("stats object")
+            .remove("duplicate_census")
+            .expect("nested counters");
+        assert_eq!(nested, serde_json::to_value(max).expect("counters value"));
+        let baseline = serde_json::to_string(&without).expect("encode baseline");
+        assert!(
+            line.len() - baseline.len() <= 589 + r#","duplicate_census":"#.len(),
+            "line grew by {} bytes",
+            line.len() - baseline.len()
+        );
     }
 
     #[test]
@@ -52274,6 +53786,127 @@ mod tests {
     }
 
     #[test]
+    fn partial_commit_preserves_rearm_debt_without_accepting_held_revision() {
+        let key = "/opaque/rearmed.jsonl".to_string();
+        let mut previous = ScanIndex::default();
+        let mut entry = manifest_index_entry(Some("old-entity"));
+        entry.last_upload_body_witness = Some("old-body".to_string());
+        previous.files.insert(key.clone(), entry);
+        previous
+            .file_snapshot_fingerprints
+            .insert(key.clone(), BTreeSet::from(["old-entity".to_string()]));
+        previous
+            .accepted_snapshot_fingerprints
+            .insert("old-entity".to_string());
+
+        let mut scanned = previous.clone();
+        let working = scanned.files.get_mut(&key).unwrap();
+        working.source_file_fingerprint.clear();
+        working.last_snapshot_fingerprint = Some("held-entity".to_string());
+        working.last_upload_body_witness = Some("held-body".to_string());
+        working.size_bytes = 42;
+        scanned
+            .file_snapshot_fingerprints
+            .insert(key.clone(), BTreeSet::from(["held-entity".to_string()]));
+        scanned.claude_duplicate_request_witness_overflowed = true;
+
+        let checkpoint = scanned.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+        let saved: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        let retained = &saved.files[&key];
+        assert!(retained.source_file_fingerprint.is_empty());
+        assert_eq!(retained.size_bytes, previous.files[&key].size_bytes);
+        assert_eq!(
+            retained.last_snapshot_fingerprint.as_deref(),
+            Some("old-entity")
+        );
+        assert_eq!(
+            retained.last_upload_body_witness.as_deref(),
+            Some("old-body")
+        );
+        assert_eq!(
+            saved.file_snapshot_fingerprints[&key],
+            previous.file_snapshot_fingerprints[&key]
+        );
+        assert_eq!(
+            saved.accepted_snapshot_fingerprints,
+            previous.accepted_snapshot_fingerprints
+        );
+        assert!(saved.claude_duplicate_request_witness_overflowed);
+
+        // Without an explicit re-arm, the unaccepted entry still retains its
+        // complete old source/body checkpoint; this change grants no receipt.
+        scanned.files.get_mut(&key).unwrap().source_file_fingerprint = "changed-source".into();
+        let ordinary = scanned.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+        assert_eq!(
+            ordinary.files[&key].source_file_fingerprint,
+            previous.files[&key].source_file_fingerprint
+        );
+    }
+
+    #[test]
+    fn partial_commit_reparses_unchanged_rearmed_file_after_held_sibling() {
+        let key = "/opaque/rearmed.jsonl".to_string();
+        let mut previous = ScanIndex::default();
+        let mut entry = manifest_index_entry(Some("old-entity"));
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        previous.files.insert(key.clone(), entry.clone());
+        previous
+            .file_snapshot_fingerprints
+            .insert(key.clone(), BTreeSet::from(["old-entity".to_string()]));
+        previous
+            .snapshot_activity_at
+            .insert("old-entity".into(), Some("2026-10-14T10:00:00Z".into()));
+        let mut candidate = test_candidate(PathBuf::from(&key));
+        candidate.size_bytes = entry.size_bytes;
+        candidate.modified_unix_seconds = entry.modified_unix_seconds;
+        candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap();
+        candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
+        assert_eq!(
+            previous.candidate_decision_at(&candidate, 0),
+            CandidateDecision::Skip
+        );
+
+        let sibling = "/opaque/held.jsonl".to_string();
+        previous
+            .files
+            .insert(sibling.clone(), manifest_index_entry(Some("old-sibling")));
+        previous
+            .file_snapshot_fingerprints
+            .insert(sibling.clone(), BTreeSet::from(["old-sibling".into()]));
+        let mut scanned = previous.clone();
+        scanned
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        scanned
+            .files
+            .get_mut(&sibling)
+            .unwrap()
+            .last_snapshot_fingerprint = Some("held-sibling".into());
+        scanned
+            .file_snapshot_fingerprints
+            .insert(sibling.clone(), BTreeSet::from(["held-sibling".into()]));
+        let checkpoint = scanned.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+        let saved: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        assert_eq!(
+            saved.candidate_decision_at(&candidate, 0),
+            CandidateDecision::Parse
+        );
+        assert_eq!(
+            saved.files[&sibling].last_snapshot_fingerprint.as_deref(),
+            Some("old-sibling")
+        );
+        assert_eq!(
+            saved.file_snapshot_fingerprints[&key],
+            previous.file_snapshot_fingerprints[&key]
+        );
+    }
+
+    #[test]
     fn partial_commit_preserves_old_upload_context_and_forces_full_policy_reparse() {
         let mut previous = ScanIndex {
             upload_context_fingerprint: Some("context-a".to_string()),
@@ -53555,8 +55188,8 @@ crate::heap_layout_bound::fields!(OwnedSourceScan; resource_probe, sampling, sou
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
-crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys);
-crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
+crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_parse_reasons);
+crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
@@ -53567,7 +55200,7 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);

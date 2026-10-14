@@ -38,6 +38,14 @@ and, after accepted fixes, one focused verification within 24 hours. Existing
 Cargo, native and public-surface checks remain required; review does not replace
 them. Small prose, cosmetic or purely mechanical changes may skip with a reason.
 
+## Credential Store Tests
+
+Service and CLI dev-dependencies enable core's `test-secret-store` feature.
+It keeps test harnesses away from the host Keychain, even when fixture environment
+overrides are absent. Core unit tests use the same isolation. Prefer scoped file
+fixtures and clean them up; the fallback is a fresh private process-local temporary
+directory. Never enable this feature for installed runtime binaries.
+
 ## CLI And Protocol Contracts
 
 The visible CLI help, JSON output, NDJSON watch output, stable exit codes, and

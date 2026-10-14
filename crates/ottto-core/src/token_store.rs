@@ -674,11 +674,47 @@ fn file_secret_path(account: &str) -> PathBuf {
 fn file_secret_dir() -> PathBuf {
     std::env::var_os(OTTTO_SECRET_FALLBACK_DIR_ENV)
         .map(PathBuf::from)
+        .or_else(isolated_test_secret_dir)
         .unwrap_or_else(|| default_support_dir().join("secrets"))
 }
 
+/// Whether this build must use synthetic file stores, including when compiled
+/// as a dependency of another crate's tests (which does not set `cfg(test)`).
+#[doc(hidden)]
+pub const fn test_secret_store_enabled() -> bool {
+    cfg!(any(test, feature = "test-secret-store"))
+}
+
+/// A fresh process-local root for tests that have not selected their own fixture
+/// directory. Never derive this from HOME or adopt a previous process's files.
+/// Test callers may still select an explicit fixture directory via the existing
+/// environment variables; removing those variables cannot enable Keychain.
+#[doc(hidden)]
+pub fn isolated_test_secret_dir() -> Option<PathBuf> {
+    #[cfg(any(test, feature = "test-secret-store"))]
+    {
+        use std::sync::OnceLock;
+        static ROOT: OnceLock<PathBuf> = OnceLock::new();
+        Some(
+            ROOT.get_or_init(|| {
+                let suffix = generate_control_token().expect("random test secret directory");
+                let root = std::env::temp_dir().join(format!(
+                    "ottto-test-secrets-{}-{suffix}",
+                    std::process::id()
+                ));
+                fs::create_dir(&root).expect("create fresh test secret directory");
+                set_user_only_directory_permissions(&root).expect("private test secret directory");
+                root
+            })
+            .clone(),
+        )
+    }
+    #[cfg(not(any(test, feature = "test-secret-store")))]
+    None
+}
+
 fn explicit_file_secret_store() -> bool {
-    std::env::var_os(OTTTO_SECRET_FALLBACK_DIR_ENV).is_some()
+    test_secret_store_enabled() || std::env::var_os(OTTTO_SECRET_FALLBACK_DIR_ENV).is_some()
 }
 
 fn secret_file_name(account: &str) -> String {

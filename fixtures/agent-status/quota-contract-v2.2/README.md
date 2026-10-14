@@ -12,6 +12,8 @@ account in these files comes from a real account; only the provider response
     (`availableCount` plus `credits[]` rows with Unix-second times).
   - `claude-usage-cedar*.json`: Claude usage body with the saved-reset section
     (`cedar_ember`) and a one-time credit pool (`iguana_necktie`).
+    `claude-usage-cedar-reader-*.json` answer `ineligible_reason` `surface`
+    and `cli_version`: the reader cannot see the grants (§11.10).
   - `codex-rate-limits-plan-and-workspace.json`: Codex app-server `rateLimits`
     with plan credits (`credits`) and a workspace monthly allowance
     (`individualLimit`).
@@ -62,6 +64,11 @@ All single readings use read time `2026-10-01T12:00:00Z`.
   one) and is absent otherwise. Codex `remaining` is the provider count.
   Saved-reset `status` follows `remaining`: 0 is `exhausted`, more is `ok`,
   unknown is `unknown`.
+- Claude saved resets whose `ineligible_reason` is `surface` or `cli_version`
+  (contract v2.2 §11.10) have `grants_state: unavailable`, no `grants`,
+  `remaining` or `grant_count`, `status: unknown`, readiness as read, and
+  `grants_unavailable_cause: reader`. That field appears on no other shape;
+  every other reason (e.g. `tenure`) is an ordinary list.
 - Readiness (`eligible`, `at_limit`, `ineligible_reason`, `cooldown_until`)
   appears only on saved resets. A switched-off balance has `enabled: false`,
   no amounts, `status: unknown`, and an optional `disabled_reason` code.
