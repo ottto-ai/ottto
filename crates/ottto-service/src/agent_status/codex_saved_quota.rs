@@ -319,12 +319,60 @@ fn write_saved_at(support_dir: &Path, home: &Path, saved: &SavedCodexQuota) {
     let Ok(body) = serde_json::to_vec(&saved) else {
         return;
     };
-    if let Err(error) =
-        ottto_core::write_owner_only_file_atomic(&saved_path(support_dir, home), &body)
-    {
-        eprintln!("saved Codex quota not written: {}", error.kind());
+    match ottto_core::write_owner_only_file_atomic(&saved_path(support_dir, home), &body) {
+        Ok(()) => {
+            GENERATION.fetch_add(1, Ordering::SeqCst);
+        }
+        Err(error) => eprintln!("saved Codex quota not written: {}", error.kind()),
     }
-    GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// The last attempt per saved file, kept in memory too: a file that cannot be
+/// written must not make every scheduler tick read the provider again.
+#[derive(Debug, Clone, Copy)]
+struct Attempt {
+    at: u64,
+    auth: Option<AuthWitness>,
+}
+
+const ATTEMPTS_MAX: usize = 64;
+
+fn attempts() -> MutexGuard<'static, BTreeMap<PathBuf, Attempt>> {
+    static ATTEMPTS: OnceLock<Mutex<BTreeMap<PathBuf, Attempt>>> = OnceLock::new();
+    ATTEMPTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn note_attempt(support_dir: &Path, home: &Path, attempt: Attempt) {
+    let mut attempts = attempts();
+    attempts.insert(saved_path(support_dir, home), attempt);
+    while attempts.len() > ATTEMPTS_MAX {
+        let Some(oldest) = attempts
+            .iter()
+            .min_by_key(|(_, attempt)| attempt.at)
+            .map(|(path, _)| path.clone())
+        else {
+            break;
+        };
+        attempts.remove(&oldest);
+    }
+}
+
+/// The saved state with the in-memory attempt applied when it is newer than
+/// the one on disk.
+fn saved_with_attempt(support_dir: &Path, home: &Path) -> Option<SavedCodexQuota> {
+    let saved = read_saved_at(support_dir, home);
+    let Some(attempt) = attempts().get(&saved_path(support_dir, home)).copied() else {
+        return saved;
+    };
+    let mut saved = saved.unwrap_or_else(|| SavedCodexQuota::new(home));
+    if attempt.at > saved.last_attempt_at_epoch_seconds {
+        saved.last_attempt_at_epoch_seconds = attempt.at;
+        saved.last_attempt_auth = attempt.auth;
+    }
+    Some(saved)
 }
 
 /// One lock per home: provider reads of one home never overlap, and a saved
@@ -441,17 +489,30 @@ fn read_and_save_at(
 ) -> Option<Result<CodexUsageProbe, String>> {
     let lock_for_home = home_lock(home);
     let _guard = lock(&lock_for_home);
-    let saved = read_saved_at(support_dir, home);
+    let saved = saved_with_attempt(support_dir, home);
     if !admit(saved.as_ref(), now) {
         return None;
     }
+    // The login the read starts under. A login that changes while the read
+    // runs leaves the reading unsaved: it cannot be told which login it
+    // belongs to, and the changed login is read again after a minute.
+    let auth = auth_witness(home);
     let result = read();
     let finished_at = current_unix_seconds();
-    let auth = auth_witness(home);
+    let login_unchanged = auth_witness(home) == auth;
+    note_attempt(
+        support_dir,
+        home,
+        Attempt {
+            at: finished_at,
+            auth,
+        },
+    );
     let mut next = saved.unwrap_or_else(|| SavedCodexQuota::new(home));
     next.last_attempt_at_epoch_seconds = finished_at;
     next.last_attempt_auth = auth;
     match &result {
+        Ok(_) if !login_unchanged => {}
         Ok(probe) => {
             let observed_at = probe
                 .response_completed_at
@@ -756,16 +817,15 @@ pub(crate) fn refresh_codex_quota_now(
     let homes = scheduled_homes(&support_dir, true, now)
         .into_iter()
         .filter(|home| {
-            account_identifier_hash.is_none()
-                || read_saved_at(&support_dir, &home.home)
-                    .and_then(|saved| saved.reading)
-                    .and_then(|reading| reading.identity)
-                    .is_some_and(|identity| {
-                        Some(identity.account_identifier_hash.as_str()) == account_identifier_hash
-                            && workspace_identifier_hash.map_or(true, |workspace| {
-                                identity.workspace_identifier_hash == workspace
-                            })
-                    })
+            (account_identifier_hash.is_none() && workspace_identifier_hash.is_none())
+                || refresh_target_matches(
+                    read_saved_at(&support_dir, &home.home)
+                        .and_then(|saved| saved.reading)
+                        .and_then(|reading| reading.identity)
+                        .as_ref(),
+                    account_identifier_hash,
+                    workspace_identifier_hash,
+                )
         })
         .collect::<Vec<_>>();
     let matching = homes.len();
@@ -779,6 +839,22 @@ pub(crate) fn refresh_codex_quota_now(
         read,
         rate_limited: matching - read,
     }
+}
+
+/// Whether a home's saved identity is one an explicit refresh names. Each
+/// given hash must match; a home without a saved identity matches only a
+/// refresh of every home (decided by the caller).
+fn refresh_target_matches(
+    identity: Option<&CodexIdentityHashes>,
+    account_identifier_hash: Option<&str>,
+    workspace_identifier_hash: Option<&str>,
+) -> bool {
+    identity.is_some_and(|identity| {
+        account_identifier_hash.map_or(true, |account| identity.account_identifier_hash == account)
+            && workspace_identifier_hash.map_or(true, |workspace| {
+                identity.workspace_identifier_hash == workspace
+            })
+    })
 }
 
 struct Scheduler {
@@ -1157,6 +1233,89 @@ mod tests {
         assert!(saved.reading.is_some(), "the last good reading is kept");
         assert_eq!(saved.consecutive_failures, 1);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_login_that_changes_during_the_read_leaves_the_reading_unsaved() {
+        let root = scratch("login-race");
+        let home = opaque_home(&root);
+        let now = current_unix_seconds();
+        let before = auth_witness(&home);
+        let result = read_and_save_at(
+            &root,
+            &home,
+            now,
+            |_, _| true,
+            || {
+                write_opaque_auth(&home, "another-login-written-during-the-read");
+                Ok(probe("account-a", "workspace-a", &rfc3339(now)))
+            },
+        );
+        assert!(
+            matches!(result, Some(Ok(_))),
+            "the caller still gets its read"
+        );
+        let saved = read_saved_at(&root, &home).unwrap();
+        assert!(saved.reading.is_none(), "no login can be named for it");
+        assert_eq!(saved.last_attempt_auth, before);
+        assert_eq!(
+            serve_saved_at(&root, &home, CodexHomeTrust::Managed, now).err(),
+            Some(CODEX_QUOTA_NOT_READ_YET.to_string())
+        );
+        // The changed login is read again after a minute.
+        let current = auth_witness(&home);
+        assert!(!scheduled_read_due(Some(&saved), current, false, now + 59));
+        assert!(scheduled_read_due(Some(&saved), current, false, now + 61));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_unwritable_saved_file_still_spaces_the_reads() {
+        let root = scratch("unwritable");
+        let home = opaque_home(&root);
+        // The state directory is a file: every saved write fails.
+        std::fs::write(root.join("codex-quota"), b"").unwrap();
+        let now = current_unix_seconds();
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok(probe("account-a", "workspace-a", &rfc3339(now)))
+        };
+        let due = |saved: Option<&SavedCodexQuota>, now: u64| {
+            scheduled_read_due(saved, auth_witness(&home), false, now)
+        };
+        assert!(read_and_save_at(&root, &home, now, due, read).is_some());
+        assert!(read_saved_at(&root, &home).is_none(), "nothing was written");
+        // Later ticks inside the interval do not read again.
+        for tick in [15, 60, 14 * 60] {
+            assert!(read_and_save_at(&root, &home, now + tick, due, read).is_none());
+        }
+        assert!(read_and_save_at(&root, &home, now + 15 * 60 + 1, due, read).is_some());
+        assert_eq!(reads.get(), 2);
+        let explicit =
+            |saved: Option<&SavedCodexQuota>, now: u64| explicit_refresh_allowed(saved, now);
+        assert!(read_and_save_at(&root, &home, current_unix_seconds(), explicit, read).is_none());
+        assert_eq!(reads.get(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_refresh_targets_match_every_given_hash() {
+        let identity = CodexIdentityHashes {
+            account_identifier_hash: "account-a".to_string(),
+            workspace_identifier_hash: "workspace-a".to_string(),
+            superseded_account_identifier_hash: None,
+            superseded_organization_identifier_hash: None,
+        };
+        let matches =
+            |account, workspace| refresh_target_matches(Some(&identity), account, workspace);
+        assert!(matches(Some("account-a"), None));
+        assert!(matches(Some("account-a"), Some("workspace-a")));
+        assert!(matches(None, Some("workspace-a")));
+        assert!(!matches(None, Some("workspace-b")));
+        assert!(!matches(Some("account-b"), None));
+        assert!(!matches(Some("account-a"), Some("workspace-b")));
+        assert!(!refresh_target_matches(None, Some("account-a"), None));
     }
 
     #[test]

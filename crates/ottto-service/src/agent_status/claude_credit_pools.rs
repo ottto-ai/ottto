@@ -2813,6 +2813,11 @@ mod tests {
         ))
     }
 
+    fn respond_server_error(endpoint: &str) -> Result<Value, u16> {
+        REQUESTED.lock().unwrap().push(endpoint.to_string());
+        Err(500)
+    }
+
     fn respond_cedar_null(endpoint: &str) -> Result<Value, u16> {
         Ok(respond_with(endpoint, Value::Null))
     }
@@ -2876,6 +2881,7 @@ mod tests {
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             REQUESTED.lock().unwrap().clear();
             super::super::claude_explicit_refresh_requests().clear();
+            super::super::claude_explicit_refresh_attempts().clear();
             Self {
                 dir,
                 _support: support,
@@ -2974,6 +2980,9 @@ mod tests {
             for request in super::super::claude_explicit_refresh_requests().iter_mut() {
                 request.requested_at -= seconds;
             }
+            for attempt in super::super::claude_explicit_refresh_attempts().iter_mut() {
+                attempt.at -= seconds;
+            }
             let mut cache =
                 super::super::read_claude_oauth_usage_cache(self.account, self.organization)
                     .expect("stored reading");
@@ -3035,10 +3044,21 @@ mod tests {
         harness.age_reading(90);
         harness.collect(respond_recognized);
         assert_eq!(harness.requests(), 2);
+        // A refresh whose read fails still counts: the request is used up and
+        // the next one waits out the minute.
+        harness.age_reading(90);
+        super::super::request_claude_explicit_refresh(Some(harness.account), None);
+        harness.collect(respond_server_error);
+        assert_eq!(harness.requests(), 3);
+        harness.collect(respond_server_error);
+        assert_eq!(harness.requests(), 3);
+        super::super::request_claude_explicit_refresh(Some(harness.account), None);
+        harness.collect(respond_server_error);
+        assert_eq!(harness.requests(), 3);
         // A request for another account reads nothing here.
         super::super::request_claude_explicit_refresh(Some("account-other"), None);
         harness.collect(respond_recognized);
-        assert_eq!(harness.requests(), 2);
+        assert_eq!(harness.requests(), 3);
         // Retry-After on record: a request never reads inside it.
         let now = super::super::current_unix_seconds();
         let mut cache =
@@ -3056,7 +3076,7 @@ mod tests {
         );
         super::super::request_claude_explicit_refresh(None, None);
         harness.collect(respond_recognized);
-        assert_eq!(harness.requests(), 2);
+        assert_eq!(harness.requests(), 3);
     }
 
     /// An in-use account (default login) prefers Claude Code's free

@@ -10371,6 +10371,13 @@ fn collect_claude_oauth_usage_unstamped(
                     <= cache
                         .observed_at_epoch_seconds
                         .saturating_add(CLAUDE_OAUTH_USAGE_REFRESH_SECONDS)));
+        if explicit_refresh_due {
+            note_claude_explicit_refresh_attempt(
+                account_identifier_hash,
+                organization_identifier_hash,
+                now,
+            );
+        }
         // A window that reset after this reading gets one read shortly after
         // the reset instead of waiting out the slot.
         let reset_read_due = claude_credit_pools::claude_reset_read_due(
@@ -11471,6 +11478,7 @@ fn claude_statusline_fresh_for_binding(
 const CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS: u64 = 2 * 60;
 const CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS: u64 = 60;
 const CLAUDE_EXPLICIT_REFRESH_REQUESTS_MAX: usize = 16;
+const CLAUDE_EXPLICIT_REFRESH_ATTEMPTS_MAX: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClaudeExplicitRefreshRequest {
@@ -11510,22 +11518,31 @@ pub(crate) fn request_claude_explicit_refresh(
 }
 
 /// Whether an explicit refresh asks to read this binding now: a live request
-/// made after the stored reading, which is at least a minute old. The read
-/// still passes every hold, breaker and Retry-After check after this.
+/// made after the stored reading and after the last refresh this binding
+/// answered, both at least a minute ago. The read still passes every hold,
+/// breaker and Retry-After check after this.
 fn claude_explicit_refresh_requested(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
     reading_observed_at: u64,
     now: u64,
 ) -> bool {
-    if now.saturating_sub(reading_observed_at) < CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS
-        && reading_observed_at <= now.saturating_add(60)
+    let last = claude_explicit_refresh_attempts()
+        .iter()
+        .filter(|attempt| {
+            attempt.account_identifier_hash == account_identifier_hash
+                && attempt.organization_identifier_hash == organization_identifier_hash
+        })
+        .map(|attempt| attempt.at)
+        .fold(reading_observed_at, u64::max);
+    if now.saturating_sub(last) < CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS
+        && last <= now.saturating_add(60)
     {
         return false;
     }
     claude_explicit_refresh_requests().iter().any(|request| {
         now.saturating_sub(request.requested_at) <= CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS
-            && request.requested_at > reading_observed_at
+            && request.requested_at > last
             && request
                 .account_identifier_hash
                 .as_deref()
@@ -11537,6 +11554,45 @@ fn claude_explicit_refresh_requested(
                     organization == organization_identifier_hash
                 })
     })
+}
+
+/// The last time each binding answered an explicit refresh, whatever the
+/// read's outcome: a failed read consumes the request and still counts for
+/// the once-a-minute limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaudeExplicitRefreshAttempt {
+    account_identifier_hash: String,
+    organization_identifier_hash: String,
+    at: u64,
+}
+
+fn claude_explicit_refresh_attempts(
+) -> std::sync::MutexGuard<'static, Vec<ClaudeExplicitRefreshAttempt>> {
+    static ATTEMPTS: Mutex<Vec<ClaudeExplicitRefreshAttempt>> = Mutex::new(Vec::new());
+    ATTEMPTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn note_claude_explicit_refresh_attempt(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: u64,
+) {
+    let mut attempts = claude_explicit_refresh_attempts();
+    attempts.retain(|attempt| {
+        attempt.account_identifier_hash != account_identifier_hash
+            || attempt.organization_identifier_hash != organization_identifier_hash
+    });
+    attempts.push(ClaudeExplicitRefreshAttempt {
+        account_identifier_hash: account_identifier_hash.to_string(),
+        organization_identifier_hash: organization_identifier_hash.to_string(),
+        at: now,
+    });
+    let excess = attempts
+        .len()
+        .saturating_sub(CLAUDE_EXPLICIT_REFRESH_ATTEMPTS_MAX);
+    attempts.drain(..excess);
 }
 
 impl From<Result<ClaudeOAuthUsage, String>> for ClaudeOAuthUsageOutcome {
