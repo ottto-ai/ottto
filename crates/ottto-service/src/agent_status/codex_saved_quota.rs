@@ -91,6 +91,9 @@ const PROCESS_SCAN_MIN_GAP_SECONDS: u64 = 5 * 60;
 pub(super) const CODEX_QUOTA_NOT_READ_YET: &str =
     "Codex quota for this account has not been read since its login was last seen; the daemon reads it shortly.";
 
+/// The failure saved for a read that panicked.
+const CODEX_QUOTA_READ_PANICKED: &str = "Codex quota read failed unexpectedly.";
+
 /// A status read that has no reading to serve: the message, and when it was
 /// true (a saved failure keeps the time of the read that failed).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,8 +196,6 @@ pub(super) struct SavedCodexQuota {
     /// The last attempt's failure, while it is newer than `reading`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_failure: Option<SavedCodexFailure>,
-    #[serde(default)]
-    consecutive_failures: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -245,7 +246,6 @@ impl SavedCodexQuota {
             last_attempt_at_epoch_seconds: 0,
             last_attempt_login: LoginMark::default(),
             last_failure: None,
-            consecutive_failures: 0,
         }
     }
 
@@ -629,7 +629,10 @@ fn read_and_save_at(
         return None;
     }
     let before = login_mark(home, home_trust);
-    let result = read();
+    // A read that panics is a failed attempt too, so the schedule does not
+    // retry it on every tick.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read))
+        .unwrap_or_else(|_| Err(CODEX_QUOTA_READ_PANICKED.to_string()));
     let finished_at = current_unix_seconds().max(now);
     let after = login_mark(home, home_trust);
     // A login that changed while the read ran leaves the reading unsaved: it
@@ -662,7 +665,6 @@ fn read_and_save_at(
                 .unwrap_or(finished_at);
             next.reading = Some(SavedCodexReading::from_probe(probe, observed_at, login));
             next.last_failure = None;
-            next.consecutive_failures = 0;
         }
         Err(message) => {
             next.last_failure = Some(SavedCodexFailure {
@@ -670,7 +672,6 @@ fn read_and_save_at(
                 message: message.clone(),
                 login,
             });
-            next.consecutive_failures = next.consecutive_failures.saturating_add(1);
         }
     }
     write_saved_at(support_dir, home, &next);
@@ -1013,48 +1014,16 @@ pub(super) fn scheduled_round(support_dir: &Path, now: u64) -> usize {
 pub(crate) struct CodexExplicitRefresh {
     /// Homes read from the provider now.
     pub(crate) read: usize,
-    /// Matching homes not read: one was read in the last minute.
+    /// Homes not read: each was read within the gap.
     pub(crate) rate_limited: usize,
 }
 
-/// Explicit refresh with the one-minute gap.
-#[cfg(test)]
-pub(crate) fn refresh_codex_quota_now(
-    account_identifier_hash: Option<&str>,
-    workspace_identifier_hash: Option<&str>,
-) -> CodexExplicitRefresh {
-    refresh_codex_quota_now_spaced(
-        account_identifier_hash,
-        workspace_identifier_hash,
-        EXPLICIT_REFRESH_MIN_GAP_SECONDS,
-    )
-}
-
-/// Explicit refresh: read the matching Codex homes now, each at most once a
-/// minute, or once per `min_gap_seconds` if longer, counting any read.
-/// `account`/`workspace` narrow it to one account (hashes as in status
-/// snapshots); `None` refreshes every home.
-pub(crate) fn refresh_codex_quota_now_spaced(
-    account_identifier_hash: Option<&str>,
-    workspace_identifier_hash: Option<&str>,
-    min_gap_seconds: u64,
-) -> CodexExplicitRefresh {
+/// Explicit refresh: read every Codex home now, each at most once a minute,
+/// or once per `min_gap_seconds` if longer, counting any read.
+pub(crate) fn refresh_codex_quota_now(min_gap_seconds: u64) -> CodexExplicitRefresh {
     let support_dir = saved_quota_support_dir();
     let now = current_unix_seconds();
-    let homes = scheduled_homes(&support_dir, now)
-        .into_iter()
-        .filter(|home| {
-            (account_identifier_hash.is_none() && workspace_identifier_hash.is_none())
-                || refresh_target_matches(
-                    read_saved_at(&support_dir, &home.home)
-                        .and_then(|saved| saved.reading)
-                        .and_then(|reading| reading.identity)
-                        .as_ref(),
-                    account_identifier_hash,
-                    workspace_identifier_hash,
-                )
-        })
-        .collect::<Vec<_>>();
+    let homes = scheduled_homes(&support_dir, now);
     let matching = homes.len();
     let read = read_homes(
         &support_dir,
@@ -1070,22 +1039,6 @@ pub(crate) fn refresh_codex_quota_now_spaced(
         read,
         rate_limited: matching - read,
     }
-}
-
-/// Whether a home's saved identity is one an explicit refresh names. Each
-/// given hash must match; a home without a saved identity matches only a
-/// refresh of every home (decided by the caller).
-fn refresh_target_matches(
-    identity: Option<&CodexIdentityHashes>,
-    account_identifier_hash: Option<&str>,
-    workspace_identifier_hash: Option<&str>,
-) -> bool {
-    identity.is_some_and(|identity| {
-        account_identifier_hash.map_or(true, |account| identity.account_identifier_hash == account)
-            && workspace_identifier_hash.map_or(true, |workspace| {
-                identity.workspace_identifier_hash == workspace
-            })
-    })
 }
 
 struct Scheduler {
@@ -1368,7 +1321,6 @@ mod tests {
             message: "Codex app-server quota read timed out.".to_string(),
             login: LoginMark::default(),
         });
-        saved.consecutive_failures = 3;
         // Never sooner than the interval: the failure adds no retry.
         assert!(!scheduled_read_due(
             Some(&saved),
@@ -1517,7 +1469,6 @@ mod tests {
         );
         let saved = read_saved_at(&root, &home).unwrap();
         assert!(saved.reading.is_some(), "the last good reading is kept");
-        assert_eq!(saved.consecutive_failures, 1);
         let failed_at = saved.last_failure.as_ref().unwrap().at_epoch_seconds;
         // Served later with the failed read's own time, not as a new failure.
         assert_eq!(
@@ -1728,22 +1679,30 @@ mod tests {
     }
 
     #[test]
-    fn explicit_refresh_targets_match_every_given_hash() {
-        let identity = CodexIdentityHashes {
-            account_identifier_hash: "account-a".to_string(),
-            workspace_identifier_hash: "workspace-a".to_string(),
-            superseded_account_identifier_hash: None,
-            superseded_organization_identifier_hash: None,
-        };
-        let matches =
-            |account, workspace| refresh_target_matches(Some(&identity), account, workspace);
-        assert!(matches(Some("account-a"), None));
-        assert!(matches(Some("account-a"), Some("workspace-a")));
-        assert!(matches(None, Some("workspace-a")));
-        assert!(!matches(None, Some("workspace-b")));
-        assert!(!matches(Some("account-b"), None));
-        assert!(!matches(Some("account-a"), Some("workspace-b")));
-        assert!(!refresh_target_matches(None, Some("account-a"), None));
+    fn a_read_that_panics_still_counts_as_an_attempt() {
+        let root = scratch("panic");
+        let home = opaque_home(&root);
+        let now = current_unix_seconds();
+        let result = read_and_save_at(
+            &root,
+            &home,
+            CodexHomeTrust::Managed,
+            now,
+            |_, _| true,
+            || panic!("a parser bug"),
+        );
+        assert!(matches!(result, Some(Err(message)) if message == CODEX_QUOTA_READ_PANICKED));
+        let saved = saved_with_attempt(&root, &home).expect("attempt recorded");
+        assert!(saved.last_attempt_at_epoch_seconds >= now);
+        let login = login_mark(&home, CodexHomeTrust::Managed);
+        assert!(!scheduled_read_due(Some(&saved), &login, true, now + 15));
+        assert!(scheduled_read_due(
+            Some(&saved),
+            &login,
+            true,
+            saved.last_attempt_at_epoch_seconds + IN_USE_REFRESH_SECONDS
+        ));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

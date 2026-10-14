@@ -54,11 +54,9 @@ mod codex_credit_grants;
 mod codex_last_known;
 mod codex_saved_quota;
 
-#[cfg(test)]
-pub(crate) use codex_saved_quota::refresh_codex_quota_now;
 pub use codex_saved_quota::start_codex_quota_scheduler;
 pub(crate) use codex_saved_quota::{
-    refresh_codex_quota_now_spaced, saved_codex_quota_generation, stop_codex_quota_scheduler,
+    refresh_codex_quota_now, saved_codex_quota_generation, stop_codex_quota_scheduler,
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -11556,80 +11554,38 @@ fn claude_statusline_fresh_for_binding(
 }
 
 /// Explicit refresh requests from the companion's Refresh button, for the
-/// Claude usage gate: refresh now, at most once a minute per account (or the
-/// request's own longer gap). A request names one account (and optionally
-/// one organization) or all; it lapses after
-/// [`CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS`] so a request whose read keeps
-/// failing never turns into a retry loop.
+/// Claude usage gate: refresh every account now, at most once a minute per
+/// account. A request lapses after [`CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS`] so
+/// a request whose read keeps failing never turns into a retry loop.
 const CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS: u64 = 2 * 60;
 const CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS: u64 = 60;
-const CLAUDE_EXPLICIT_REFRESH_REQUESTS_MAX: usize = 16;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ClaudeExplicitRefreshRequest {
-    account_identifier_hash: Option<String>,
-    organization_identifier_hash: Option<String>,
-    requested_at: u64,
-    min_gap_seconds: u64,
-}
-
-fn claude_explicit_refresh_requests(
-) -> std::sync::MutexGuard<'static, Vec<ClaudeExplicitRefreshRequest>> {
-    static REQUESTS: Mutex<Vec<ClaudeExplicitRefreshRequest>> = Mutex::new(Vec::new());
-    REQUESTS
+/// When the last explicit refresh was requested (0: never).
+fn claude_explicit_refresh_requested_at() -> std::sync::MutexGuard<'static, u64> {
+    static REQUESTED_AT: Mutex<u64> = Mutex::new(0);
+    REQUESTED_AT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Explicit refresh with the one-minute gap.
-#[cfg(test)]
-pub(crate) fn request_claude_explicit_refresh(
-    account_identifier_hash: Option<&str>,
-    organization_identifier_hash: Option<&str>,
-) {
-    request_claude_explicit_refresh_spaced(
-        account_identifier_hash,
-        organization_identifier_hash,
-        CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS,
-    );
-}
-
-/// Ask the next Claude collection to read the matching accounts now, each
-/// only when its stored reading and its last explicit refresh are both at
-/// least a minute old, or `min_gap_seconds` if longer. `None` matches every
-/// account.
-pub(crate) fn request_claude_explicit_refresh_spaced(
-    account_identifier_hash: Option<&str>,
-    organization_identifier_hash: Option<&str>,
-    min_gap_seconds: u64,
-) {
-    let now = current_unix_seconds();
-    let mut requests = claude_explicit_refresh_requests();
-    requests.retain(|request| {
-        now.saturating_sub(request.requested_at) <= CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS
-    });
-    requests.push(ClaudeExplicitRefreshRequest {
-        account_identifier_hash: account_identifier_hash.map(str::to_string),
-        organization_identifier_hash: organization_identifier_hash.map(str::to_string),
-        requested_at: now,
-        min_gap_seconds,
-    });
-    let excess = requests
-        .len()
-        .saturating_sub(CLAUDE_EXPLICIT_REFRESH_REQUESTS_MAX);
-    requests.drain(..excess);
+/// Ask the next Claude collection to read every account now, each only when
+/// its stored reading and its last explicit refresh are both at least a
+/// minute old.
+pub(crate) fn request_claude_explicit_refresh() {
+    *claude_explicit_refresh_requested_at() = current_unix_seconds();
 }
 
 /// Whether an explicit refresh asks to read this binding now: a live request
 /// made after the stored reading and after the last refresh this binding
-/// answered, both at least the request's gap (a minute or more) ago. The
-/// read still passes every hold, breaker and Retry-After check after this.
+/// answered, both at least a minute ago. The read still passes every hold,
+/// breaker and Retry-After check after this.
 fn claude_explicit_refresh_requested(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
     reading_observed_at: u64,
     now: u64,
 ) -> bool {
+    let requested_at = *claude_explicit_refresh_requested_at();
     let last = claude_binding_time(
         &claude_explicit_refresh_attempts(),
         account_identifier_hash,
@@ -11637,25 +11593,10 @@ fn claude_explicit_refresh_requested(
     )
     .map_or(reading_observed_at, |at| at.max(reading_observed_at));
     let skewed = last > now.saturating_add(60);
-    claude_explicit_refresh_requests().iter().any(|request| {
-        now.saturating_sub(request.requested_at) <= CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS
-            && (skewed
-                || now.saturating_sub(last)
-                    >= request
-                        .min_gap_seconds
-                        .max(CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS))
-            && request.requested_at > last
-            && request
-                .account_identifier_hash
-                .as_deref()
-                .map_or(true, |account| account == account_identifier_hash)
-            && request
-                .organization_identifier_hash
-                .as_deref()
-                .map_or(true, |organization| {
-                    organization == organization_identifier_hash
-                })
-    })
+    requested_at != 0
+        && now.saturating_sub(requested_at) <= CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS
+        && (skewed || now.saturating_sub(last) >= CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS)
+        && requested_at > last
 }
 
 /// A per-binding time kept in memory (bounded): the last explicit refresh a
@@ -22002,20 +21943,16 @@ for line in sys.stdin:
         codex_saved_quota::forget_running_homes();
         let before = codex_app_server_runs();
 
-        let first = refresh_codex_quota_now(None, None);
+        let first = refresh_codex_quota_now(0);
         assert_eq!(first.read, 1);
         assert_eq!(first.rate_limited, 0);
         assert_eq!(codex_app_server_runs(), before + 1);
 
         // A second press within the minute reads nothing.
-        let second = refresh_codex_quota_now(None, None);
+        let second = refresh_codex_quota_now(0);
         assert_eq!(second.read, 0);
         assert_eq!(second.rate_limited, 1);
         assert_eq!(codex_app_server_runs(), before + 1);
-
-        // A press for another account matches no home.
-        let other = refresh_codex_quota_now(Some("another-account"), None);
-        assert_eq!(other, codex_saved_quota::CodexExplicitRefresh::default());
 
         // The schedule: the home is not in use, so it is not due before 15
         // minutes, and due at 15.
@@ -22053,10 +21990,10 @@ for line in sys.stdin:
         codex_saved_quota::forget_running_homes();
         let before = codex_app_server_runs();
 
-        let first = refresh_codex_quota_now_spaced(None, None, 5 * 60);
+        let first = refresh_codex_quota_now(5 * 60);
         assert_eq!((first.read, first.rate_limited), (1, 0));
         assert_eq!(codex_app_server_runs(), before + 1);
-        let second = refresh_codex_quota_now_spaced(None, None, 5 * 60);
+        let second = refresh_codex_quota_now(5 * 60);
         assert_eq!((second.read, second.rate_limited), (0, 1));
         assert_eq!(codex_app_server_runs(), before + 1);
 
