@@ -280,6 +280,7 @@ pub(super) fn new_source_parser(
     parents: Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
     artifacts: bool,
     curve: bool,
+    identity_capture: bool,
     index: &ScanIndex,
 ) -> Result<OwnedJsonlParser> {
     let mut parser = OwnedJsonlParser::new(
@@ -297,6 +298,7 @@ pub(super) fn new_source_parser(
         artifacts,
         curve,
     )?;
+    parser.accumulator.claude_request_identity_capture = identity_capture;
     if source == SnapshotSource::Codex {
         configure_tier_replay(&mut parser, candidate, index);
     }

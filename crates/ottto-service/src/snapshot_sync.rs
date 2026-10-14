@@ -3413,6 +3413,14 @@ fn prepare_sync_source(
     let cache_observations_enabled = source != SnapshotSource::Pi
         && activity_hint.session_cache_observations_contract.as_deref()
             == Some("session_cache_observations:v1");
+    // Contract-5 marker capture and the Desktop census witness are local work
+    // only an emitting cycle uses, so they follow this cycle's permit, not the
+    // compiled switch alone. Finish recomputes the permit from the same hint.
+    let request_identity_capture = crate::snapshots::claude_request_identity::emission_permit(
+        source,
+        activity_hint.session_request_identity_contract.as_deref(),
+    )
+    .is_ok();
     // The server's scan directive was parsed and discarded before this. It is a
     // cost lever, so it may only lengthen the local cadence (see
     // `negotiated_wait`), never shorten it.
@@ -3736,7 +3744,17 @@ fn prepare_sync_source(
     } else {
         None
     };
-    let scan = crate::snapshots::OwnedSourceScan::new(
+    let mut sampled_scope = format!(
+        "sampled_scan:v1:{account_witness:?}:{upload_destination_namespace}:{}:{}",
+        index_path.display(),
+        context_curve_enabled
+    );
+    if request_identity_capture {
+        // A retained parser never crosses capture modes; the dark scope bytes
+        // are unchanged.
+        sampled_scope.push_str(":request_identity");
+    }
+    let scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
         source,
         &roots,
         index,
@@ -3752,19 +3770,13 @@ fn prepare_sync_source(
         &watcher_hints.paths,
         watcher_hints.overflowed,
         context_curve_enabled,
+        request_identity_capture,
     )
     .with_sampled_acquisition(
         daemon.transcript_cache.clone(),
         crate::transcript_acquisition::Scope(format!(
             "{:x}",
-            Sha256::digest(
-                format!(
-                    "sampled_scan:v1:{account_witness:?}:{upload_destination_namespace}:{}:{}",
-                    index_path.display(),
-                    context_curve_enabled
-                )
-                .as_bytes()
-            )
+            Sha256::digest(sampled_scope.as_bytes())
         )),
     );
     Ok(Some(SourcePreparation {
@@ -3932,9 +3944,13 @@ fn finish_sync_source(
             support_dir,
             &mut scan_result,
             &mut index,
-            // No trusted seam delivers a cohort grant yet: every install is
-            // denied, even with emission compiled in (see `CohortGrant`).
-            crate::snapshots::claude_request_identity::emission_permit(None, &account_witness).ok(),
+            // This cycle's authenticated hint only; never cached across
+            // cycles, so a revoked token takes effect on the next fetch.
+            crate::snapshots::claude_request_identity::emission_permit(
+                source,
+                activity_hint.session_request_identity_contract.as_deref(),
+            )
+            .ok(),
         );
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(

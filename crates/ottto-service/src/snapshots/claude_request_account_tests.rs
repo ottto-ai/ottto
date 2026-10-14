@@ -740,7 +740,7 @@ fn claude_h296_root_production_enrichment_keeps_child_separate() {
 /// permitted cycle reaches contract 5.
 #[test]
 fn claude_contract5_bodies_need_this_cycles_cohort_permit() {
-    use crate::snapshots::claude_request_identity::{self as identity, CohortGrant};
+    use crate::snapshots::claude_request_identity as identity;
     let (dir, root, api, trace) = h296_root_evidence();
     let support = dir.join("support");
     let digest = format!("{:x}", Sha256::digest(root.source_session_id.as_bytes()));
@@ -759,22 +759,23 @@ fn claude_contract5_bodies_need_this_cycles_cohort_permit() {
         scan.snapshots
     };
     let collector = |items: &[SnapshotItem]| items.iter().find(|item| item.source_session_id == root.source_session_id).unwrap().provenance.collector.clone();
-    let account = [7u8; 32];
-    let other = [8u8; 32];
-    let grant = CohortGrant { contract: identity::COLLECTOR, account_witness: &account };
+    let claude = SnapshotSource::ClaudeCode;
+    let token = Some(identity::COHORT_HINT_TOKEN);
     let dark = serde_json::to_vec(&run(None)).unwrap();
     for denied in [
-        identity::emission_permit(Some(grant), &account).ok(),
-        identity::permit_when(true, None, &account).ok(),
-        identity::permit_when(true, Some(grant), &other).ok(),
-        identity::permit_when(true, Some(CohortGrant { contract: "malformed", account_witness: &account }), &account).ok(),
+        // This build: emission compiled out, even with the exact token.
+        identity::emission_permit(claude, token).ok(),
+        identity::permit_when(true, claude, None).ok(),
+        identity::permit_when(true, claude, Some("own_request_identity_rows:v2")).ok(),
+        identity::permit_when(true, claude, Some(identity::COLLECTOR)).ok(),
+        identity::permit_when(true, SnapshotSource::Codex, token).ok(),
     ] {
         assert!(denied.is_none());
         let items = run(denied);
         assert_eq!(collector(&items), claude_request_accounts::COMPLETE);
         assert_eq!(serde_json::to_vec(&items).unwrap(), dark, "denied cycles keep today's bytes");
     }
-    let permitted = run(identity::permit_when(true, Some(grant), &account).ok());
+    let permitted = run(identity::permit_when(true, claude, token).ok());
     assert_eq!(collector(&permitted), identity::COLLECTOR);
     fs::remove_dir_all(dir).unwrap();
 }

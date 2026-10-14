@@ -37,10 +37,11 @@ pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:
 /// emits it. Flipping this is a separate, parent-owned change.
 pub(crate) const EMISSION_ENABLED: bool = false;
 
-/// Marker capture and placement recording run only where contract 5 can be
-/// produced: never in a released build while emission is off.
-pub(crate) const fn capture_enabled() -> bool {
-    EMISSION_ENABLED || cfg!(test)
+/// Marker capture and the census witness run only in a scan whose sync cycle
+/// holds an emission permit. Outside a cycle nothing captures in a released
+/// build; tests capture by default so parser fixtures see markers.
+pub(crate) const fn capture_by_default() -> bool {
+    cfg!(test)
 }
 
 /// `transcript_email` (and its status-coverage feed) needs its own review and
@@ -59,57 +60,52 @@ pub(crate) const fn transcript_email_enabled() -> bool {
 /// parent-owned change.
 pub(crate) const TRANSCRIPT_SOLE_LOGIN_ENABLED: bool = false;
 
-/// Contract 5 is emitted only for an install in the approved cohort, on top of
-/// `EMISSION_ENABLED`. Cohort membership is an account-bound grant from a
-/// trusted, authenticated seam, decided once per sync cycle; nothing is
-/// persisted, so a restart starts denied. No seam delivers a grant yet, so
-/// every install is denied (`CohortDenial::NoGrant`) even with emission on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CohortGrant<'a> {
-    /// The contract the seam names; only `COLLECTOR` qualifies.
-    pub(crate) contract: &'a str,
-    /// Account witness of the cycle the grant was issued in.
-    pub(crate) account_witness: &'a [u8; 32],
-}
+/// The activity-hint token (`session_request_identity_contract`) the server
+/// sends only to the approved cohort on the accepted-log route. It is not the
+/// collector name.
+pub(crate) const COHORT_HINT_TOKEN: &str = "own_request_identity_rows:v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CohortDenial {
     EmissionDisabled,
-    NoGrant,
-    UnknownContract,
-    OtherAccount,
+    OtherSource,
+    NoToken,
+    UnknownToken,
 }
 
-/// Proof that this cycle may build contract-5 bodies. Only `emission_permit`
-/// makes one (`permit_when` takes the emission constant as an argument, for
-/// tests).
+/// Proof that this sync cycle may capture identity evidence and build
+/// contract-5 bodies. Only `emission_permit` makes one (`permit_when` takes
+/// the emission constant as an argument, for tests).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EmissionPermit(());
 
+/// The current cycle's permit, from the activity hint fetched for it with
+/// this device's credential. A missing, null or unknown token denies; nothing
+/// is persisted, so a revoked token denies from the next fetched cycle and a
+/// restart or account switch starts from that cycle's hint.
 pub(crate) fn emission_permit(
-    grant: Option<CohortGrant<'_>>,
-    account_witness: &[u8; 32],
+    source: SnapshotSource,
+    hint_token: Option<&str>,
 ) -> Result<EmissionPermit, CohortDenial> {
-    permit_when(EMISSION_ENABLED, grant, account_witness)
+    permit_when(EMISSION_ENABLED, source, hint_token)
 }
 
 pub(super) fn permit_when(
     emission_enabled: bool,
-    grant: Option<CohortGrant<'_>>,
-    account_witness: &[u8; 32],
+    source: SnapshotSource,
+    hint_token: Option<&str>,
 ) -> Result<EmissionPermit, CohortDenial> {
     if !emission_enabled {
         return Err(CohortDenial::EmissionDisabled);
     }
-    let grant = grant.ok_or(CohortDenial::NoGrant)?;
-    if grant.contract != COLLECTOR {
-        return Err(CohortDenial::UnknownContract);
+    if source != SnapshotSource::ClaudeCode {
+        return Err(CohortDenial::OtherSource);
     }
-    // An account switch between the grant and this cycle never carries over.
-    if grant.account_witness != account_witness {
-        return Err(CohortDenial::OtherAccount);
+    match hint_token {
+        None => Err(CohortDenial::NoToken),
+        Some(COHORT_HINT_TOKEN) => Ok(EmissionPermit(())),
+        Some(_) => Err(CohortDenial::UnknownToken),
     }
-    Ok(EmissionPermit(()))
 }
 
 pub(crate) const MAX_EVIDENCE_ENTRIES: usize = 16;
@@ -408,6 +404,12 @@ impl Grouping {
             return;
         }
         let key = match identity {
+            // Only a strictly lowercase-hex login reaches the wire; anything
+            // else is refused here, never transformed into another identity.
+            IdentityRef::Tagged(key) if !key.login.map_or(true, wire_login_is_valid) => {
+                group.refused = true;
+                None
+            }
             IdentityRef::Tagged(key) if !self.keys_over_cap => {
                 // At most `MAX_AUTHORITY_KEYS` keys: scan before copying one.
                 if !self.keys.iter().any(|known| key.matches(known)) {
@@ -1253,6 +1255,14 @@ fn account_origin_matches(account: &ClaudeIdentityAttributeEvidence, login: &str
         }
         ClaudeIdentityAttributeOrigin::Missing => false,
     }
+}
+
+/// The receiver's stored `account_identifier_hash` spelling.
+fn wire_login_is_valid(login: &str) -> bool {
+    (8..=128).contains(&login.len())
+        && login
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn hash_is_valid(hash: &str) -> bool {

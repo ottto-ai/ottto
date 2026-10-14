@@ -24,11 +24,10 @@ captures no markers, classifies and groups no requests, and emits no
 contract-5 body. The
 scan hook and every new field stay inert until a compatible receiver is
 confirmed, and flipping the constant is a separate change. Tests exercise the
-same code through `capture_enabled()` (`cfg(test)`).
+same code through `capture_by_default()` (`cfg(test)`).
 
 Flipping the constant alone still emits nothing: each sync cycle also needs
-an account-bound cohort grant (`emission_permit`), and no seam supplies one
-yet. See
+the exact cohort token in that cycle's activity hint (`emission_permit`). See
 [the activation-readiness note](session-2026-10-14-claude-request-identity-activation-readiness.md).
 
 ## How tagging works

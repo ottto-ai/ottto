@@ -7904,13 +7904,21 @@ impl ClaudeTitleMetadata {
     #[cfg(test)]
     fn load_from_roots(roots: &[PathBuf]) -> Self {
         let mut index = ScanIndex::default();
-        Self::load_from_roots_with_index(roots, &mut index, "2026-07-31T00:00:00Z")
+        Self::load_from_roots_with_index(
+            roots,
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            claude_request_identity::capture_by_default(),
+        )
     }
 
+    /// `identity_capture`: this scan's cycle holds a contract-5 permit, so
+    /// the census witness may be kept and set.
     fn load_from_roots_with_index(
         roots: &[PathBuf],
         index: &mut ScanIndex,
         collected_at: &str,
+        identity_capture: bool,
     ) -> Self {
         let mut store_dirs = BTreeSet::new();
         for root in roots {
@@ -7926,13 +7934,14 @@ impl ClaudeTitleMetadata {
                     .join("claude-code-sessions"),
             );
         }
-        Self::load_from_store_dirs_with_index(&store_dirs, index, collected_at)
+        Self::load_from_store_dirs_with_index(&store_dirs, index, collected_at, identity_capture)
     }
 
     fn load_from_store_dirs_with_index(
         store_dirs: &BTreeSet<PathBuf>,
         index: &mut ScanIndex,
         collected_at: &str,
+        identity_capture: bool,
     ) -> Self {
         let now = rfc3339_unix_seconds(collected_at);
         let retry_due = match (
@@ -7945,10 +7954,10 @@ impl ClaudeTitleMetadata {
             }
             (None, Some(_)) => true,
         };
-        // The witness serves only contract 5; dark builds neither keep nor
-        // persist one. Reconciled before the backoff return: a store inventory
-        // that changed during backoff never keeps the old census's witness.
-        if claude_request_identity::capture_enabled() {
+        // The witness serves only contract 5; scans without a permit neither
+        // keep nor persist one. Reconciled before the backoff return: a store
+        // inventory that changed during backoff never keeps the old witness.
+        if identity_capture {
             claude_request_identity::DesktopCensusWitness::retain_for_inventory(
                 &mut index.claude_desktop_census_witness,
                 store_dirs,
@@ -8041,7 +8050,7 @@ impl ClaudeTitleMetadata {
         } else if sweep_complete {
             index.claude_desktop_identity_census_complete = true;
             index.claude_desktop_census_witness = now
-                .filter(|_| claude_request_identity::capture_enabled())
+                .filter(|_| identity_capture)
                 .map(|now| claude_request_identity::DesktopCensusWitness::new(now, store_dirs));
         }
         metadata.original_identity_census_incomplete =
@@ -8752,6 +8761,8 @@ struct SnapshotAccumulator {
     // coverage and never serialized.
     claude_usage_request_ids: BTreeSet<String>,
     claude_usage_occurrences: BTreeMap<String, ClaudeTranscriptUsageOccurrence>,
+    /// Capture transcript markers: the scan's cycle holds a contract-5 permit.
+    claude_request_identity_capture: bool,
     claude_org_markers: Option<Box<claude_request_identity::OrgMarkers>>,
     cache_observations: Option<CacheObservations>,
     pub(crate) cache_requests: crate::owned_heap::OwnedVec<OwnedRequest>,
@@ -8905,6 +8916,7 @@ impl SnapshotAccumulator {
             claude_response_record_count: 0,
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
+            claude_request_identity_capture: claude_request_identity::capture_by_default(),
             claude_org_markers: None,
             cache_observations: None,
             cache_requests: crate::owned_heap::OwnedVec::new(),
@@ -11439,6 +11451,8 @@ pub(crate) struct OwnedSourceScan {
     file_limit: usize,
     artifacts_enabled: bool,
     context_curve_enabled: bool,
+    /// This scan's sync cycle holds a contract-5 permit.
+    claude_request_identity_capture: bool,
     claude_effort_support_dir: Option<PathBuf>,
     codex_title_metadata: CodexTitleMetadata,
     claude_title_metadata: ClaudeTitleMetadata,
@@ -11507,6 +11521,39 @@ impl OwnedSourceScan {
     pub(crate) fn new(
         source: SnapshotSource,
         roots: &[PathBuf],
+        owned_index: ScanIndex,
+        collected_at: &str,
+        requested_backfill_window_days: u64,
+        file_limit: usize,
+        artifacts_enabled: bool,
+        claude_effort_support_dir: Option<&Path>,
+        hinted_paths: &[PathBuf],
+        watcher_overflowed: bool,
+        context_curve_enabled: bool,
+    ) -> Self {
+        Self::new_with_identity_capture(
+            source,
+            roots,
+            owned_index,
+            collected_at,
+            requested_backfill_window_days,
+            file_limit,
+            artifacts_enabled,
+            claude_effort_support_dir,
+            hinted_paths,
+            watcher_overflowed,
+            context_curve_enabled,
+            claude_request_identity::capture_by_default(),
+        )
+    }
+
+    /// `claude_request_identity_capture`: the sync cycle holds a contract-5
+    /// permit, so this scan captures transcript markers and keeps the Desktop
+    /// census witness. Without one it does neither.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_identity_capture(
+        source: SnapshotSource,
+        roots: &[PathBuf],
         mut owned_index: ScanIndex,
         collected_at: &str,
         requested_backfill_window_days: u64,
@@ -11516,6 +11563,7 @@ impl OwnedSourceScan {
         hinted_paths: &[PathBuf],
         watcher_overflowed: bool,
         context_curve_enabled: bool,
+        claude_request_identity_capture: bool,
     ) -> Self {
         let resource_probe = crate::local_resource_diagnostics::Probe::start();
         let index = &mut owned_index;
@@ -11534,7 +11582,12 @@ impl OwnedSourceScan {
                 || index.claude_desktop_store_cursor.is_some()
                 || index.claude_desktop_store_sweep_had_errors);
         let claude_title_metadata = if source == SnapshotSource::ClaudeCode {
-            ClaudeTitleMetadata::load_from_roots_with_index(roots, index, collected_at)
+            ClaudeTitleMetadata::load_from_roots_with_index(
+                roots,
+                index,
+                collected_at,
+                claude_request_identity_capture,
+            )
         } else {
             ClaudeTitleMetadata::default()
         };
@@ -11885,6 +11938,7 @@ impl OwnedSourceScan {
             file_limit,
             artifacts_enabled,
             context_curve_enabled,
+            claude_request_identity_capture,
             claude_effort_support_dir: claude_effort_support_dir.map(Path::to_path_buf),
             codex_title_metadata,
             claude_title_metadata,
@@ -11993,6 +12047,7 @@ impl OwnedSourceScan {
             file_limit,
             artifacts_enabled,
             context_curve_enabled,
+            claude_request_identity_capture,
             claude_effort_support_dir,
             codex_title_metadata,
             claude_title_metadata,
@@ -12423,6 +12478,7 @@ impl OwnedSourceScan {
                         codex_parent_ownership_ledgers.clone(),
                         source != SnapshotSource::ClaudeCode || artifacts_enabled,
                         context_curve_enabled,
+                        claude_request_identity_capture,
                         index,
                     ) else {
                         census.record_unreadable(UnreadableCause::Reduction, 1);
@@ -13564,6 +13620,7 @@ impl OwnedSourceScan {
                 codex_parent_ownership_ledgers.clone(),
                 source != SnapshotSource::ClaudeCode || artifacts_enabled,
                 context_curve_enabled,
+                claude_request_identity_capture,
                 index,
             ) {
                 Ok(parser) => parser,
@@ -13682,6 +13739,7 @@ impl OwnedSourceScan {
             file_limit,
             artifacts_enabled,
             context_curve_enabled,
+            claude_request_identity_capture,
             claude_effort_support_dir,
             codex_title_metadata,
             claude_title_metadata,
@@ -17026,7 +17084,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         }
         ClaudeForkLineProvenance::None => {}
     }
-    if claude_request_identity::capture_enabled() {
+    if accumulator.claude_request_identity_capture {
         claude_request_identity::note_marker_line(
             &mut accumulator.claude_org_markers,
             value,
@@ -45208,12 +45266,14 @@ mod tests {
             &dirs,
             &mut index,
             "2026-09-30T10:00:00Z",
+            true,
         );
         assert!(first.original_identity_census_incomplete);
         let complete = ClaudeTitleMetadata::load_from_store_dirs_with_index(
             &dirs,
             &mut index,
             "2026-09-30T10:05:00Z",
+            true,
         );
         assert_eq!(
             complete
@@ -45229,6 +45289,7 @@ mod tests {
                 &dirs,
                 &mut restored,
                 &format!("2026-09-30T10:{minute:02}:00Z"),
+                true,
             );
             assert_eq!(
                 refreshed
@@ -45250,6 +45311,7 @@ mod tests {
             &dirs,
             &mut restored,
             "2026-09-30T10:27:00Z",
+            true,
         );
         assert!(
             changed.original_identity_census_incomplete,
@@ -45265,6 +45327,7 @@ mod tests {
             &dirs,
             &mut restored,
             "2026-09-30T10:29:00Z",
+            true,
         );
         assert_eq!(
             settled
@@ -45279,6 +45342,7 @@ mod tests {
             &dirs,
             &mut restored,
             "2026-09-30T10:30:00Z",
+            true,
         );
         assert_eq!(
             lost.session_account_evidence("changed-session")
@@ -45289,6 +45353,7 @@ mod tests {
             &dirs,
             &mut restored,
             "2026-09-30T10:30:01Z",
+            true,
         );
         assert_eq!(
             backed_off
@@ -46692,6 +46757,7 @@ mod tests {
             &BTreeSet::from([not_a_directory]),
             &mut index,
             "2026-07-31T00:00:00Z",
+            true,
         );
         assert!(metadata.sidecar_census_incomplete);
         assert!(metadata.titles.is_empty());
@@ -55186,7 +55252,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger);
 crate::heap_layout_bound::fields!(OwnedActiveFile; sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence);
-crate::heap_layout_bound::fields!(OwnedSourceScan; resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines);
+crate::heap_layout_bound::fields!(OwnedSourceScan; resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_validation_roots, codex_parent_frozen_census_paths, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
@@ -55202,7 +55268,7 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_tier_replay, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);

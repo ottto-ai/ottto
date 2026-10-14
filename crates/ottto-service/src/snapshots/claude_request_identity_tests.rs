@@ -678,6 +678,80 @@ fn telemetry(login: char, org: char) -> RequestIdentity {
     })
 }
 
+fn login_key(login: &str) -> RequestIdentity {
+    RequestIdentity::Tagged(AuthorityKey {
+        login: Some(login.to_string()),
+        org: Some("d".repeat(64)),
+        basis: identity::TELEMETRY,
+    })
+}
+
+/// A login reaches the wire only as strictly lowercase hex of 8 to 128
+/// characters, exactly as read.
+#[test]
+fn builder_tags_lowercase_hex_logins_at_the_length_bounds_verbatim() {
+    let eight = "0123abcd".to_string();
+    let max = "a".repeat(128);
+    let digest = format!("{:x}", Sha256::digest(b"synthetic login"));
+    let mut item = one_row_item(&[(10, Some("1")), (20, Some("2")), (30, Some("3"))]);
+    let contributions = vec![
+        contribution(&item, 10, Some("1"), login_key(&eight)),
+        contribution(&item, 20, Some("2"), login_key(&max)),
+        contribution(&item, 30, Some("3"), login_key(&digest)),
+    ];
+    assert_eq!(
+        identity::apply(&mut item, &contributions),
+        Ok(Tagged::Sent { refusals: 0 })
+    );
+    let wire = serde_json::to_string(&item).unwrap();
+    for login in [&eight, &max, &digest] {
+        assert!(wire.contains(&format!("\"{login}\"")), "{login}");
+    }
+}
+
+/// Any other spelling refuses its own usage, which stays on the row untagged:
+/// never rewritten into another login, never poisoning a valid key beside it.
+#[test]
+fn builder_refuses_logins_that_are_not_lowercase_hex() {
+    let valid = "b".repeat(64);
+    for invalid in [
+        "C".repeat(64),
+        "Abcdef01".to_string(),
+        "g".repeat(64),
+        format!("{}-", "e".repeat(63)),
+        "abcdef0".to_string(),
+        "a".repeat(129),
+        String::new(),
+    ] {
+        let mut item = one_row_item(&[(10, Some("1")), (20, Some("2"))]);
+        let before = item.model_usage.clone();
+        let contributions = vec![
+            contribution(&item, 10, Some("1"), login_key(&valid)),
+            contribution(&item, 20, Some("2"), login_key(&invalid)),
+        ];
+        assert_eq!(
+            identity::apply(&mut item, &contributions),
+            Ok(Tagged::Sent { refusals: 1 }),
+            "{invalid}"
+        );
+        let wire = serde_json::to_string(&item).unwrap();
+        assert!(wire.contains(&format!("\"{valid}\"")), "{invalid}");
+        if !invalid.is_empty() {
+            for spelling in [invalid.clone(), invalid.to_ascii_lowercase()] {
+                assert!(!wire.contains(&format!("\"{spelling}\"")), "{invalid}");
+            }
+        }
+        // Usage and money are conserved on today's row.
+        let strip = |rows: &[SnapshotModelUsage]| {
+            rows.iter()
+                .map(|row| (row.input_tokens, row.request_count, row.cost_usd.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(&item.model_usage), strip(&before), "{invalid}");
+        assert_eq!(item.provenance.collector, identity::COLLECTOR);
+    }
+}
+
 #[test]
 fn builder_refuses_rows_it_cannot_reproduce_and_leaves_them_untouched() {
     let item = one_row_item(&[(10, None), (20, None)]);
@@ -1180,45 +1254,73 @@ fn trace_owned_requests_refuse_before_any_transcript_basis() {
 }
 
 #[test]
-fn contract5_permit_needs_emission_and_a_grant_for_this_account() {
-    use identity::{CohortDenial, CohortGrant};
-    let account = [1u8; 32];
-    let other = [2u8; 32];
-    let grant = |contract, account_witness| {
-        Some(CohortGrant {
-            contract,
-            account_witness,
-        })
-    };
-    assert!(identity::permit_when(true, grant(identity::COLLECTOR, &account), &account).is_ok());
+fn contract5_permit_needs_emission_claude_code_and_the_exact_hint_token() {
+    use identity::CohortDenial;
+    let token = Some(identity::COHORT_HINT_TOKEN);
+    assert_eq!(identity::COHORT_HINT_TOKEN, "own_request_identity_rows:v1");
+    assert!(identity::permit_when(true, SnapshotSource::ClaudeCode, token).is_ok());
     for (offered, denial) in [
-        (None, CohortDenial::NoGrant),
-        (grant("", &account), CohortDenial::UnknownContract),
-        (
-            grant("claude_code_jsonl:own_request_identity_rows:v2", &account),
-            CohortDenial::UnknownContract,
-        ),
-        (
-            grant(" claude_code_jsonl:own_request_identity_rows:v1", &account),
-            CohortDenial::UnknownContract,
-        ),
-        // An account switch after the grant never carries it over.
-        (grant(identity::COLLECTOR, &other), CohortDenial::OtherAccount),
+        (None, CohortDenial::NoToken),
+        (Some(""), CohortDenial::UnknownToken),
+        // The collector name is not the hint token.
+        (Some(identity::COLLECTOR), CohortDenial::UnknownToken),
+        (Some("own_request_identity_rows:v2"), CohortDenial::UnknownToken),
+        (Some(" own_request_identity_rows:v1"), CohortDenial::UnknownToken),
+        (Some("own_request_identity_rows:v1 "), CohortDenial::UnknownToken),
+        (Some("OWN_REQUEST_IDENTITY_ROWS:V1"), CohortDenial::UnknownToken),
     ] {
         assert_eq!(
-            identity::permit_when(true, offered, &account),
+            identity::permit_when(true, SnapshotSource::ClaudeCode, offered),
             Err(denial),
             "{offered:?}"
         );
     }
+    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        assert_eq!(
+            identity::permit_when(true, source, token),
+            Err(CohortDenial::OtherSource)
+        );
+    }
     assert_eq!(
-        identity::permit_when(false, grant(identity::COLLECTOR, &account), &account),
+        identity::permit_when(false, SnapshotSource::ClaudeCode, token),
         Err(CohortDenial::EmissionDisabled)
     );
-    // This build: even a valid grant is denied while emission is off.
+    // This build: even the exact token is denied while emission is off.
     assert_eq!(
-        identity::emission_permit(grant(identity::COLLECTOR, &account), &account),
+        identity::emission_permit(SnapshotSource::ClaudeCode, token),
         Err(CohortDenial::EmissionDisabled)
+    );
+}
+
+/// Each cycle's permit comes from that cycle's hint alone: a token dropped by
+/// the server denies on the next fetched cycle, with nothing carried over.
+#[test]
+fn contract5_permit_is_revoked_by_the_next_cycles_hint() {
+    let hint = |extra: &str| -> crate::snapshot_client::ActivityHintResponse {
+        serde_json::from_str(&format!(
+            r#"{{"source":"claude_code","server_time":"2026-10-14T10:00:00Z","last_data_at":null,
+                "record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,
+                "backfill_window_days":183,"recommended_scan_after":"2026-10-14T10:05:00Z"{extra}}}"#
+        ))
+        .unwrap()
+    };
+    let cycle = |hint: &crate::snapshot_client::ActivityHintResponse| {
+        identity::permit_when(
+            true,
+            SnapshotSource::ClaudeCode,
+            hint.session_request_identity_contract.as_deref(),
+        )
+        .is_ok()
+    };
+    let cycles = [
+        hint(r#","session_request_identity_contract":"own_request_identity_rows:v1""#),
+        hint(r#","session_request_identity_contract":null"#),
+        hint(r#","session_request_identity_contract":"own_request_identity_rows:v1""#),
+        hint(""),
+    ];
+    assert_eq!(
+        cycles.iter().map(cycle).collect::<Vec<_>>(),
+        [true, false, true, false]
     );
 }
 
@@ -1319,7 +1421,7 @@ fn desktop_census_witness_follows_the_store_inventory_through_retry_backoff() {
         let metadata = ClaudeTitleMetadata::load_from_store_dirs_with_index(
             store_dirs,
             &mut index,
-            "2027-01-15T08:00:00Z",
+            "2027-01-15T08:00:00Z", true,
         );
         assert!(metadata.sidecar_census_incomplete);
         assert_eq!(

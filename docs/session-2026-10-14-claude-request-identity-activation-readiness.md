@@ -1,4 +1,4 @@
-# Contract 5 activation readiness: owner refusals, census backoff, cohort gate
+# Contract 5 activation readiness: owner refusals, census backoff, cohort token, hex logins
 
 Contract 5 (`claude_code_jsonl:own_request_identity_rows:v1`) merged dark. This
 change closes the defects found in the dark-merge review and adds the gates an
@@ -44,40 +44,59 @@ deployed. While it is off, a qualifying Desktop census yields `transcript_org`
 (org only), the same as when no census qualifies. Tests opt in per evidence
 set.
 
-## Cohort gate: default deny, no seam yet
+## Cohort gate: the activity-hint token
 
 A global `EMISSION_ENABLED = true` would emit from every install. Emission now
-also needs an `EmissionPermit` for the current sync cycle, which
-`emission_permit` grants only when all hold:
+also needs an `EmissionPermit` for the current sync cycle. `emission_permit`
+grants one only when all of these hold:
 
 - emission is compiled in;
-- a `CohortGrant` is present;
-- the grant names exactly `COLLECTOR`; any other spelling is refused;
-- the grant's account witness equals the cycle's (`snapshot_scan_account_witness`),
-  so a grant never survives an account switch.
+- the source is Claude Code;
+- the cycle's activity hint carries `session_request_identity_contract` equal
+  to exactly `own_request_identity_rows:v1`. That is the cohort token, not the
+  collector name; prefixed, padded or other spellings are refused.
 
-The permit is computed per cycle and never persisted, so a restart starts
-denied. `apply_claude_local_evidence_to_scan_with_permit` builds contract-5
-evidence only under a permit; the old entry point is the dark path.
+The hint is the existing per-source response the daemon already fetches each
+cycle with its device credential. The new field is optional and defaults to
+none, so an older server, a missing field or `null` all deny, and the body
+stays exactly today's. A failed hint fetch still aborts the cycle before any
+scan. The server sends the token only to its approved cohort. That makes this
+compliant producer control, not security enforcement: the server's admission
+is unchanged and stays permissive. The daemon holds no allowlist and makes no
+extra fetch or provider read.
 
-**No trusted seam supplies a grant today**, so production passes none and
-every install is denied. This is not operational targeting. The existing
-per-account, authenticated capability channel is the activity-hint response
-(`ActivityHintResponse`, re-read every cycle with the device credential;
-absent or unknown values fail closed). It carries no contract-5 field, and
-adding one is a server-contract change that needs its owner's decision. A
-scoped build that is never published to the stable channel is the other
-option. Neither is chosen here.
+The permit is computed from the hint each cycle and never persisted. A token
+the server drops denies from the next fetched cycle, and a restart or account
+switch starts from that cycle's hint. Prepare and finish read the same
+cycle's hint. Bodies are rebuilt each cycle (upload progress keeps ACK
+ledgers, not bodies), so a revoked install sends today's shape again. How the
+receiver treats a contract-5 entity later re-sent in today's shape is its
+rollback contract, not decided here.
 
-What to settle before wiring a seam:
+## Local identity work follows the permit
 
-- revocation applies from the next cycle: bodies are rebuilt each cycle
-  (upload progress keeps ACK ledgers, not bodies), so a revoked install sends
-  today's shape again. How the receiver treats a contract-5 entity later
-  re-sent in today's shape is its rollback contract, not decided here;
-- marker capture and the census witness follow `EMISSION_ENABLED`, not the
-  permit. They stay local and are never uploaded, but every install pays
-  their parse-time cost once emission is compiled in.
+Marker capture and the Desktop census witness now follow the cycle's permit,
+not the compiled switch. A scan without a permit captures no transcript
+markers and clears any stored witness, so installs outside the cohort pay no
+extra parse-time cost even once emission is compiled in.
+
+- The permitted cycle's sampled-scan cache scope gains a `:request_identity`
+  suffix, so a parser retained in one capture mode never resumes in the
+  other. The scope string without a permit is unchanged.
+- A file parsed in an earlier cycle without capture carries no markers.
+  Transcript bases then do not qualify, and those requests stay untagged.
+  This is the conservative direction.
+- After a clear, the witness returns only with the next complete store
+  sweep.
+
+## Logins must be lowercase hex
+
+A login reaches the wire only as strictly lowercase hex of 8 to 128
+characters, the receiver's stored `account_identifier_hash` spelling. Every
+authority key passes through one grouping step, which refuses any other
+spelling there: uppercase, other characters, too short or too long. The
+refused request's usage and money stay on the row untagged, and a valid key
+beside it is still tagged. A login is never lowercased, trimmed or re-hashed.
 
 ## Status-coverage registration past capacity
 
@@ -106,10 +125,17 @@ What to settle before wiring a seam:
     valid-owner and no-owner controls;
   - inventory changed during backoff drops the witness; unchanged keeps it;
   - sole login suppressed by default, available only with the opt-in;
-  - the permit matrix: missing, malformed or other-account grants deny, and
-    so does a valid grant while emission is off;
+  - the permit matrix: the exact token permits; a missing, empty, prefixed,
+    padded, upper-case or other-version token denies; Codex and Pi deny; the
+    exact token denies while emission is off;
+  - the hint field: missing and `null` read as none, and any string is kept
+    as sent;
+  - revocation: a token dropped from the next cycle's hint denies that cycle;
   - one production fixture through the evidence entry point: denied cycles
     keep today's bytes exactly; a permitted cycle reaches contract 5;
+  - lowercase-hex logins at 8, 64 and 128 characters are tagged as read;
+    upper-case, mixed-case, non-hex, empty, 7- and 129-character logins are
+    refused without poisoning a valid key, and usage is conserved;
   - registration past the slot and ledger caps never proves absence; within
     the caps, absence is still proven (control);
   - folder-key spellings.
