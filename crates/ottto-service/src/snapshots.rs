@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
@@ -21370,7 +21370,7 @@ impl ScanIndex {
         let _lock = CheckpointLock::acquire(path)?;
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
-        match serde_json::from_reader::<_, Self>(file) {
+        match serde_json::from_reader::<_, Self>(BufReader::new(file)) {
             Ok(mut index)
                 if index.schema_version == SCAN_INDEX_SCHEMA_VERSION
                     && index
@@ -21454,9 +21454,9 @@ impl ScanIndex {
                     &crate::snapshot_retry::read_state(path, cap)
                         .context("read bounded current local snapshot scan index")?,
                 ),
-                None => serde_json::from_reader(
+                None => serde_json::from_reader(BufReader::new(
                     File::open(path).context("open current local snapshot scan index")?,
-                )
+                ))
                 .map_err(anyhow::Error::from),
             }
             .context("parse current local snapshot scan index for compare-and-swap")?;
@@ -21484,8 +21484,14 @@ impl ScanIndex {
         let mut file = File::create(&temp_path)
             .with_context(|| format!("create scan index temp {}", temp_path.display()))?;
         let result = (|| -> Result<()> {
-            serde_json::to_writer_pretty(&mut file, &self)
-                .with_context(|| format!("write scan index temp {}", temp_path.display()))?;
+            {
+                let mut writer = BufWriter::new(&mut file);
+                serde_json::to_writer_pretty(&mut writer, &self)
+                    .with_context(|| format!("write scan index temp {}", temp_path.display()))?;
+                writer
+                    .flush()
+                    .with_context(|| format!("flush scan index temp {}", temp_path.display()))?;
+            }
             file.sync_all()
                 .with_context(|| format!("sync scan index temp {}", temp_path.display()))?;
             fs::rename(&temp_path, path)
@@ -25636,6 +25642,38 @@ mod tests {
         let observed = ScanIndex::load(&path).expect("load winner");
         assert_eq!(observed.generation, 2);
         assert_eq!(observed.resume_after_path.as_deref(), Some("winner"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn large_scan_index_save_preserves_bytes_and_generation_fence() {
+        let root = temp_dir("large-scan-index-durability");
+        let path = root.join("scan-index.json");
+        let mut index = ScanIndex {
+            resume_after_path: Some("synthetic-checkpoint".repeat(4096)),
+            ..ScanIndex::default()
+        };
+        index.save(&path).expect("save large generation");
+        assert_eq!(
+            fs::read(&path).expect("read durable index"),
+            serde_json::to_vec_pretty(&index).expect("encode exact index bytes")
+        );
+        let mut stale = ScanIndex::load(&path).expect("load stale generation");
+        let mut winner = ScanIndex::load(&path).expect("load winning generation");
+        winner.resume_after_path = Some("replacement-checkpoint".repeat(8192));
+        winner.save(&path).expect("save larger replacement");
+        stale
+            .save(&path)
+            .expect_err("stale generation stays fenced");
+        assert_eq!(
+            fs::read(&path).expect("read winning bytes"),
+            serde_json::to_vec_pretty(&winner).expect("encode winning bytes")
+        );
+        let observed = ScanIndex::load(&path).expect("reload winning generation");
+        assert_eq!(observed.generation, 2);
+        assert_eq!(observed.resume_after_path, winner.resume_after_path);
+        let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        assert!(!temp_path.exists());
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 557,
-  "content_sha256": "c82f2ebdd90bba335c29e3d296259a14b184aa48f1f0fd8c1a754009f9c1e293",
+  "candidate_file_count": 562,
+  "content_sha256": "6df82983d8c29d16742555e866603196aeaffcd58751f0721f808a3549a6db59",
   "files": [
     {
       "executable": false,
@@ -1119,15 +1119,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "7cca7197d79979beb34a2eec5df649c620760e56dad60692938a1b3f783b6ca8",
-      "size_bytes": 736669
+      "sha256": "80cb30ff029700cdc49ea2210ceb3e8451345022aa9e13f406212c2bb293fddf",
+      "size_bytes": 743459
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/h357_ack_tests.rs",
-      "sha256": "f1167367f88a1756f11a996e592b93575ee30d1ab2674d3f4c2118e4d1ae21a6",
-      "size_bytes": 24877
+      "sha256": "4b2ae43ba1ef69a2dbcc3560515c855c648a21d4f8e6100c368dc116f1830fcf",
+      "size_bytes": 63022
     },
     {
       "executable": false,
@@ -1140,8 +1140,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "91da44575bb233623a45f72da396d067b4f49f075ba1707f3871ee095c5e4d26",
-      "size_bytes": 2372636
+      "sha256": "84db59cd3177ecfbd46a73236a268556d95f0fa974d1a23479868e1fb7429f2f",
+      "size_bytes": 2374455
     },
     {
       "executable": false,
@@ -1170,6 +1170,13 @@
       "path": "crates/ottto-service/src/snapshots/claude_request_accounts.rs",
       "sha256": "0df50e635c34a02fc89e7f9a3f49430971025bae7f40f52b88f2d2565812a927",
       "size_bytes": 19327
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_sidecar_reduction_tests.rs",
+      "sha256": "ac76f95d9608e4907c728436cd07505e356e818ecec5a5012a6688abc8970fe0",
+      "size_bytes": 25645
     },
     {
       "executable": false,
@@ -1224,8 +1231,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan.rs",
-      "sha256": "7c17d1ed956704960a978c22ca6cbf69a4c75c9b30ed640a5399724f69ab6745",
-      "size_bytes": 12304
+      "sha256": "ed56fba3563ee25f31cb600135d606c663b77e7280b50d49f84b452be2577d9c",
+      "size_bytes": 13014
     },
     {
       "executable": false,
@@ -2602,9 +2609,37 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-13-claude-sidecar-reduction-cache.md",
+      "sha256": "7ac8e991eaa51f12435db626be0bba6d16f7a4abd1ffb911435db0e11bab1dc0",
+      "size_bytes": 3506
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-13-codex-balance-name-constants.md",
       "sha256": "a2591b05d9355ee0bf3cdbe25c6b6e49726bcd2c18482452a80e1fe041b0c78a",
       "size_bytes": 1259
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-14-buffer-scan-index-io.md",
+      "sha256": "f795940b5a0fcb113fe105f2d858d3848e2d86dbbcc80799b9f9e9ef25e78c2e",
+      "size_bytes": 1238
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-14-cache-head-source-progress.md",
+      "sha256": "e4468661022fcb2250736ff9aefe80d15384ce2d05b01b16359cf11c26951fbc",
+      "size_bytes": 2249
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-14-codex-full-rescan-loop.md",
+      "sha256": "45329287913935abf907dbfb45c8b80cc36a81d52d061af4cc9e340cb3107101",
+      "size_bytes": 3166
     },
     {
       "executable": false,
@@ -3902,9 +3937,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-13T15:11:49+00:00",
+  "generated_at": "2026-10-14T07:02:21+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 558,
+  "output_file_count": 563,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -3941,5 +3976,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "add666fffbdaf21e3eaac803eefcfca9512d90b4"
+  "source_commit": "dadf525b2325fdeeb0a83212bc9eecd5d7c62b8f"
 }

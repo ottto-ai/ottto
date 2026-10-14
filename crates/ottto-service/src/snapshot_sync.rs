@@ -107,7 +107,8 @@ fn bootstrap_cache_heads(
         bool,
     ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     mut persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
-) -> Result<()> {
+) -> Result<usize> {
+    let mut deferred = 0usize;
     let stages: &[bool] = if ordinary_bootstrap {
         &[false, true]
     } else {
@@ -138,16 +139,22 @@ fn bootstrap_cache_heads(
             |items| upload(items, enforce_head_cas),
             |progress| persist(progress),
         )?;
-        if !matches!(
-            outcome,
-            ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. }
-        ) {
-            return Err(anyhow::Error::new(SnapshotAckRejected {
-                reason: "cache head probe did not settle exact predecessor evidence",
-            }));
+        match outcome {
+            ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {}
+            // The partitioned uploader persisted each conflicting probe's exact
+            // body quarantine. Carry that hold into the normal upload rather
+            // than discarding every unrelated file's progress.
+            ResumableUploadResult::Deferred { count } => {
+                deferred = deferred.saturating_add(count);
+            }
+            _ => {
+                return Err(anyhow::Error::new(SnapshotAckRejected {
+                    reason: "cache head probe did not settle exact predecessor evidence",
+                }));
+            }
         }
     }
-    Ok(())
+    Ok(deferred)
 }
 
 fn cache_head_probe(item: &SnapshotItem) -> SnapshotItem {
@@ -157,25 +164,44 @@ fn cache_head_probe(item: &SnapshotItem) -> SnapshotItem {
     probe
 }
 
+/// Exact non-acceptance of these bytes, using the uploader's existing hold
+/// predicate. An accepted body without a head is not a quarantine certificate.
+fn cache_head_probe_held(progress: &SnapshotUploadProgress, probe: &SnapshotItem) -> bool {
+    let fingerprint = &probe.snapshot_fingerprint;
+    let witness = snapshot_upload_body_witness(probe);
+    progress
+        .permanent_rejections
+        .get(fingerprint)
+        .is_some_and(|record| record.body_witness == witness)
+        || (!progress.active_quarantine_retries.contains(fingerprint)
+            && progress
+                .quarantined_fingerprints
+                .get(fingerprint)
+                .is_some_and(|record| {
+                    record.upload_body_witness.as_deref() == Some(witness.as_str())
+                }))
+}
+
 fn apply_bootstrapped_cache_heads(
     snapshots: &mut [SnapshotItem],
     progress: &SnapshotUploadProgress,
-) -> Result<()> {
+) -> Result<usize> {
+    let mut held = 0usize;
     for snapshot in snapshots {
         if snapshot.cache_observations.is_none() {
             continue;
         }
         if snapshot.cache_base_head_etag.is_none() {
             let probe = cache_head_probe(snapshot);
-            if progress
-                .permanent_rejections
-                .get(&probe.snapshot_fingerprint)
-                .is_some_and(|record| record.body_witness == snapshot_upload_body_witness(&probe))
-            {
-                // A refused predecessor cannot authorize a cache patch. Carry
-                // its exact rejected body into the ordinary settlement path;
-                // other sessions still use their own proven head tokens.
+            // Check the hold before looking up the head: another entity for
+            // the same session may have acquired one, but that cannot release
+            // this exact body's quarantine or bypass its bounded retry.
+            if cache_head_probe_held(progress, &probe) {
+                // No cache patch or accepted head is invented. The normal
+                // uploader sees the exact held probe and keeps its quarantine;
+                // healthy siblings retain their own independent settlement.
                 *snapshot = probe;
+                held = held.saturating_add(1);
                 continue;
             }
         }
@@ -189,7 +215,25 @@ fn apply_bootstrapped_cache_heads(
             }));
         }
     }
-    Ok(())
+    Ok(held)
+}
+
+fn with_bootstrap_deferred(
+    result: ResumableUploadResult,
+    deferred: usize,
+) -> ResumableUploadResult {
+    if deferred == 0 {
+        return result;
+    }
+    match result {
+        ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {
+            ResumableUploadResult::Deferred { count: deferred }
+        }
+        ResumableUploadResult::Deferred { count } => ResumableUploadResult::Deferred {
+            count: count.saturating_add(deferred),
+        },
+        other => other,
+    }
 }
 
 // Local index projection producer revision; independent of semantic/wire identity.
@@ -3929,12 +3973,26 @@ fn finish_sync_source(
         .filter(|item| item.cache_observations.is_some() && item.cache_base_head_etag.is_none())
         .map(cache_head_probe)
         .collect::<Vec<_>>();
+    let mut bootstrap_deferred = 0usize;
     if !probes.is_empty() {
+        // These failures precede the main upload's diagnostic. Preserve only
+        // the existing typed, content-free cause and the fixed failing role.
+        let log_bootstrap_failure = |role: &'static str| {
+            move |error: &anyhow::Error| {
+                if snapshot_upload_error_class(error).is_some() {
+                    eprintln!(
+                        "ottto-service: local snapshot cache-head bootstrap did not settle for {} — role={role}, {}",
+                        source.api_slug(),
+                        upload_failure_diagnostic(error)
+                    );
+                }
+            }
+        };
         let ordinary_bootstrap = !activity_hint.snapshot_head_cas_required
             && probes
                 .iter()
                 .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
-        bootstrap_cache_heads(
+        bootstrap_deferred = bootstrap_cache_heads(
             &probes,
             source.api_slug(),
             &mut upload_progress,
@@ -3963,8 +4021,16 @@ fn finish_sync_source(
                 Ok(response)
             },
             |progress| progress.save(&upload_progress_path),
-        )?;
-        apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)?;
+        )
+        .inspect_err(log_bootstrap_failure("probe"))?;
+        let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
+            .inspect_err(log_bootstrap_failure("apply"))?;
+        if held > 0 {
+            eprintln!(
+                "local snapshot cache-head bootstrap carried {held} held probe(s) for {} as exact quarantined bodies; siblings continue",
+                source.api_slug()
+            );
+        }
     }
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
@@ -4047,7 +4113,8 @@ fn finish_sync_source(
             ensure_authority()?;
         }
         Ok(result)
-    });
+    })
+    .map(|result| with_bootstrap_deferred(result, bootstrap_deferred));
 
     // The server may have accepted new entities even when the final result is a
     // timeout, a disabled response, or a later local-state failure. Withdraw
@@ -7428,6 +7495,97 @@ mod tests {
         )
         .unwrap();
         root
+    }
+
+    #[test]
+    fn held_cache_probe_lets_revision_adoption_commit_so_next_scan_parses_nothing() {
+        // An index saved before projection revision 1 must re-read and re-offer
+        // each file once. When that file's cache-head probe body was already
+        // quarantined, bootstrap used to fail the whole source before the index
+        // save, so every later pass re-read every file again.
+        let root = cache_effective_wire_fixture_root();
+        let index_path = root.join("index.json");
+        let scan = |index: &mut ScanIndex| {
+            crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                index,
+                "2026-09-30T10:05:00Z",
+                crate::snapshots::BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .unwrap()
+        };
+        let load = || {
+            let mut index = ScanIndex::load(&index_path).unwrap();
+            index.activate_upload_context("cache-on".into());
+            index.activate_effective_upload_body_witness_revision(
+                EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            );
+            index
+        };
+        let mut legacy = ScanIndex::default();
+        legacy.activate_upload_context("cache-on".into());
+        let mut first = scan(&mut legacy);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut legacy);
+        legacy.save(&index_path).unwrap();
+
+        let mut index = load();
+        let mut adoption = scan(&mut index);
+        assert_eq!(adoption.scanned_file_count, 1, "adoption re-reads once");
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut adoption, &mut index);
+        assert_eq!(adoption.snapshots.len(), 1, "adoption re-offers the body");
+        assert!(adoption.snapshots[0].cache_observations.is_some());
+        let probe = cache_head_probe(&adoption.snapshots[0]);
+        let mut progress = test_upload_progress();
+        progress.quarantine_retryable_body(
+            &probe.snapshot_fingerprint,
+            &snapshot_upload_body_witness(&probe),
+        );
+        let record = progress
+            .quarantined_fingerprints
+            .get_mut(&probe.snapshot_fingerprint)
+            .unwrap();
+        record.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+        record.retry_after_unix_seconds = 0;
+
+        bootstrap_cache_heads(
+            &[probe],
+            &unique_poison_scope(),
+            &mut progress,
+            true,
+            |_, _| panic!("a held probe body is not resent"),
+            |_| Ok(()),
+        )
+        .expect("a held probe no longer fails the source before index save");
+        assert_eq!(
+            apply_bootstrapped_cache_heads(&mut adoption.snapshots, &progress).unwrap(),
+            1
+        );
+        let mut accepted = 0;
+        upload_resumable_batches_with_body_witness(
+            &adoption.snapshots,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |_| panic!("a held body is not resent"),
+            |_| Ok(()),
+        )
+        .unwrap();
+        index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        index.save(&index_path).unwrap();
+
+        let next = scan(&mut load());
+        assert_eq!(
+            next.scanned_file_count, 0,
+            "unchanged file is not read again"
+        );
+        assert!(next.snapshots.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
