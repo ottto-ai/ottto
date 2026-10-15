@@ -267,7 +267,9 @@ fn exclude_held_effective_body_witness_revision(
 /// A non-progressing hold in a Claude family that retains authority evidence
 /// but has no committed entry to restore, as after a historical replay reset,
 /// still blocks: settling it would let a later page of the same traversal
-/// treat the still-present family as vanished.
+/// treat the still-present family as vanished. A never-committed member bound
+/// by its committed family's terminal quarantine settles with a delivery-free
+/// membership entry instead, so the family census stays complete.
 fn commit_completed_with_local_holds(
     index: ScanIndex,
     committed_index: &ScanIndex,
@@ -277,7 +279,11 @@ fn commit_completed_with_local_holds(
     progress_blocking: bool,
 ) -> ScanIndex {
     if !progress_blocking
-        && index.locally_held_keys_restorable(committed_index, locally_held_fingerprints)
+        && index.locally_held_keys_restorable(
+            committed_index,
+            locally_held_fingerprints,
+            account_deferred_held_fingerprints,
+        )
     {
         return index.with_locally_held_keys_reverted(
             committed_index,
