@@ -3972,6 +3972,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
         // are bounded by the rows it builds, never by the request count.
         let mut sink = identity.and_then(|evidence| {
             claude_request_identity::RequestSink::for_item(evidence, item, usize::MAX)
+                .map(|sink| sink.excluding(item, &excluded_request_hashes))
         });
         if rebuild_claude_reported_usage(item, rows, &excluded_request_hashes, sink.as_mut()) {
             if let Some(sink) = sink {
