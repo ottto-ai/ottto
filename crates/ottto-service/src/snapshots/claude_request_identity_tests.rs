@@ -2984,9 +2984,14 @@ fn transcript_markers_tag_only_requests_a_settled_census_shows_unduplicated() {
     );
     let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
     let before = parse_session(&dir, &lines).remove(0);
-    let run = |index: &ScanIndex, census: &ClaudeDuplicateCensusCounts| {
+    let run = |index: &ScanIndex, census: &ClaudeDuplicateCensusCounts, compared: bool| {
         let mut items = parse_session(&dir, &lines);
-        let ownership = identity::TranscriptOwnership::after_census(index, census);
+        let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition {
+            duplicate_census: *census,
+            transcript_ownership_complete: compared,
+            ..Default::default()
+        };
+        let ownership = identity::TranscriptOwnership::after_census(index, &disposition);
         identity::apply_scan_with_ownership(&mut items, &evidence, BTreeMap::new(), &ownership);
         items.remove(0)
     };
@@ -3020,7 +3025,7 @@ fn transcript_markers_tag_only_requests_a_settled_census_shows_unduplicated() {
     let clean = ScanIndex::default();
 
     // Settled and unduplicated: today's contract-5 tags, as `apply_scan`.
-    let tagged = run(&clean, &settled);
+    let tagged = run(&clean, &settled, true);
     assert_eq!(
         bases(&tagged),
         BTreeSet::from([
@@ -3043,29 +3048,32 @@ fn transcript_markers_tag_only_requests_a_settled_census_shows_unduplicated() {
             claude_duplicate_request_owner(OTHER_ROOT, OTHER_ROOT),
         ]),
     );
-    let refused = run(&duplicated, &settled);
+    let refused = run(&duplicated, &settled, true);
     assert!(refused.request_identity_refusals >= 1);
     assert!(!bases(&refused).iter().any(|(basis, _)| basis == identity::TRANSCRIPT_ORG));
     conserved(&refused);
 
     // Unsettled passes: no marker reaches the wire, nothing is refused that
-    // was not, and the refusal above survives.
-    for census in [
-        ClaudeDuplicateCensusCounts::default(),
-        ClaudeDuplicateCensusCounts { coverage_complete: false, ..settled },
-        ClaudeDuplicateCensusCounts { census_invalid: true, ..settled },
-        ClaudeDuplicateCensusCounts { fence_after: true, ..settled },
+    // was not, and the refusal above survives. The last case passes every
+    // census flag but left an indexed member uncompared (a quarantined
+    // original): ownership alone withdraws.
+    for (census, compared) in [
+        (ClaudeDuplicateCensusCounts::default(), false),
+        (ClaudeDuplicateCensusCounts { coverage_complete: false, ..settled }, true),
+        (ClaudeDuplicateCensusCounts { census_invalid: true, ..settled }, true),
+        (ClaudeDuplicateCensusCounts { fence_after: true, ..settled }, true),
+        (settled, false),
     ] {
-        let withdrawn = run(&clean, &census);
+        let withdrawn = run(&clean, &census, compared);
         assert_eq!(
             bases(&withdrawn),
             BTreeSet::from([(identity::TELEMETRY_LOGIN.to_string(), None)]),
-            "{census:?}"
+            "{census:?} compared={compared}"
         );
-        assert_eq!(withdrawn.request_identity_refusals, 0, "{census:?}");
+        assert_eq!(withdrawn.request_identity_refusals, 0, "{census:?} compared={compared}");
         conserved(&withdrawn);
-        let still_refused = run(&duplicated, &census);
-        assert!(still_refused.request_identity_refusals >= 1, "{census:?}");
+        let still_refused = run(&duplicated, &census, compared);
+        assert!(still_refused.request_identity_refusals >= 1, "{census:?} compared={compared}");
         conserved(&still_refused);
     }
     let _ = fs::remove_dir_all(dir);

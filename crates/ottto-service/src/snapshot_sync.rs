@@ -5137,7 +5137,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
         let ownership =
             crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(
                 index,
-                &disposition.duplicate_census,
+                &disposition,
             );
         let _request_identity =
             crate::snapshots::claude_request_identity::apply_scan_with_ownership(

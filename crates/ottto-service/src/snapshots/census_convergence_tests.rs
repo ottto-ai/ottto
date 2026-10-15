@@ -1148,10 +1148,7 @@ fn transcript_ownership<'i>(
     index: &'i ScanIndex,
     disposition: &ClaudeUsageAuthorityDisposition,
 ) -> crate::snapshots::claude_request_identity::TranscriptOwnership<'i> {
-    crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(
-        index,
-        &disposition.duplicate_census,
-    )
+    crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(index, disposition)
 }
 
 #[test]

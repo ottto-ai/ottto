@@ -1923,22 +1923,26 @@ type Duplicates = BTreeMap<String, BTreeSet<super::ClaudeDuplicateRequestOwner>>
 pub(crate) struct TranscriptOwnership<'i> {
     /// Request-id hashes that more than one transcript carries.
     duplicates: &'i Duplicates,
-    /// The pass compared every indexed Claude transcript (complete census,
-    /// full coverage, valid, fence open). Only then can a request without
-    /// its own telemetry be shown to be this transcript's alone, so only then
-    /// may transcript markers tag it.
+    /// The pass compared every indexed Claude transcript's current requests
+    /// (complete, valid census with the fence open, and every indexed member
+    /// observed this window). Fence coverage alone is not enough: it excuses
+    /// a family under a bound authority quarantine, whose requests were not
+    /// compared. Only then can a request without its own telemetry be shown
+    /// to be this transcript's alone, so only then may markers tag it.
     settled: bool,
 }
 
 impl<'i> TranscriptOwnership<'i> {
     pub(crate) fn after_census(
         index: &'i ScanIndex,
-        census: &super::ClaudeDuplicateCensusCounts,
+        disposition: &super::ClaudeUsageAuthorityDisposition,
     ) -> Self {
+        let census = &disposition.duplicate_census;
         Self {
             duplicates: &index.claude_duplicate_request_owners,
             settled: census.census_complete
                 && census.coverage_complete
+                && disposition.transcript_ownership_complete
                 && !census.census_invalid
                 && !census.fence_after,
         }

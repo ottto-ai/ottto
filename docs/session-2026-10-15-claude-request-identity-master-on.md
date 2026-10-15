@@ -68,9 +68,23 @@ are:
 3. **Unsettled passes withdraw marker tags.** Only a census that compared
    every indexed Claude transcript can show that a request is this
    transcript's alone. That needs a complete census, complete coverage, a
-   valid census, and an open fence after the pass
-   (`TranscriptOwnership::after_census`). In any other pass, every tag that
-   rests on markers is withdrawn:
+   valid census, an open fence after the pass, and the census's own
+   ownership qualification (`TranscriptOwnership::after_census`).
+
+   Fence coverage alone is not enough. It excuses a family held by a bound
+   authority quarantine, whose retained pending is from an older window, so
+   its requests were never compared. An unmarked copy of such an original
+   under a new root carries the original's request and org marker, and would
+   pass all four census flags. The census therefore also records
+   `transcript_ownership_complete`: every indexed member's current requests
+   were observed this window, and a quarantine excuses nothing. It is taken
+   before the census prunes this window's pending, so it can never claim
+   completeness from pending that was already cleared. A pass with no
+   terminal census leaves it false. It is not a census, fence or upload
+   input, and no counter, cap or fence rule changes.
+
+   In any pass that is not settled, every tag that rests on markers is
+   withdrawn:
    - a `transcript_org` tag becomes untagged (missing);
    - a marker org joined to login-only telemetry becomes login-only
      (`telemetry_login` with no org).
@@ -80,6 +94,13 @@ are:
 
 As a result, `transcript_org` and marker orgs reach the wire only from passes
 whose census settled. A fresh install's first complete scan is one example.
+While any indexed Claude family is under a bound authority quarantine and not
+re-observed in the window, no pass settles. A terminal (`UnprovenTerminal`)
+quarantine can persist, so on such a machine marker-derived tags stay
+withdrawn, for every session, until the quarantine resolves. Telemetry
+attribution is unaffected. An original whose transcript is gone from the index
+and whose telemetry is unavailable leaves no local evidence at all; a copy of
+it cannot be told from an original.
 Per-request telemetry attribution (`telemetry`, `telemetry_login`) is
 unaffected. This is the bounded handling that stays within the current source
 and store contract. To recover org-only coverage from unsettled passes, one of
@@ -116,6 +137,12 @@ hash, or index depends on them.
     orgs and refuses nothing new;
   - the refusal survives an unsettled pass;
   - usage is conserved in every case.
+- Quarantined original (`census_convergence_tests::transcript_ownership_needs_quarantined_originals_observed`):
+  a real terminal census over an index holding a quarantined, unobserved
+  original whose retained pending names the copied request. All four census
+  flags pass, and the copy's request is withdrawn to missing with no refusal
+  and usage conserved. In the control, with no original indexed, the copy
+  keeps `transcript_org`. Hosted CI ran this test red before the fix.
 - Capture-mode cache guard: a dark seed, an append, then a capturing cycle
   under the same scope does a full read (`StateMissing`) and captures the
   prefix's marker. In the control case, the same mode on both cycles tails.
