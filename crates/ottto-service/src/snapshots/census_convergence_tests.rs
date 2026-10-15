@@ -266,8 +266,8 @@ fn claude_duplicate_fence_coverage_counts_unobserved_indexed_members() {
         0
     );
 
-    // A root held by a bound quarantine is excluded, as the census excludes
-    // its retained pending.
+    // A bound quarantine preserves a hold, but its retained evidence cannot
+    // prove current request-owner coverage.
     let mut quarantined = index.clone();
     bind_authority_quarantine(
         &mut quarantined,
@@ -278,7 +278,7 @@ fn claude_duplicate_fence_coverage_counts_unobserved_indexed_members() {
     );
     assert_eq!(
         claude_duplicate_fence_coverage_missing_member_count(&quarantined, WINDOW),
-        0
+        1
     );
 }
 
@@ -1254,12 +1254,13 @@ fn transcript_ownership_needs_quarantined_originals_observed() {
     held.claude_usage_family_pending
         .insert(ORIGINAL.to_string(), retained);
     let (counts, after, copy) = run(held);
-    // Every fence flag passes: the quarantine excuses the original.
+    // Retained quarantine evidence does not compare the original's requests.
+    // The fence closes until an actual current owner census can do so.
     assert!(
         counts.census_complete
-            && counts.coverage_complete
+            && !counts.coverage_complete
             && !counts.census_invalid
-            && !counts.fence_after,
+            && counts.fence_after,
         "{counts:?}"
     );
     assert!(after.claude_duplicate_request_owners.is_empty());

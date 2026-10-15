@@ -16668,6 +16668,7 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
+    include!("snapshot_sync/stable_proof_rearm_pipeline_tests.rs");
     #[test]
     fn codex_union_native_transport_common_ack_crash_checkpoint_and_restart() {
         codex_union_native_transport_restart(false, false);
