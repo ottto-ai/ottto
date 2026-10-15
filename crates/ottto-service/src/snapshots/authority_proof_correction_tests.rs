@@ -418,7 +418,8 @@ fn invalid_correction_states_fail_the_whole_index_closed() {
     assert_eq!(serde_json::to_value(&loaded).unwrap(), valid);
 
     let old_digest = claude_usage_family_witness_fingerprint(&apc_witness('e'));
-    let cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+    type RecordMutation = Box<dyn Fn(&mut Value)>;
+    let cases: Vec<(&str, RecordMutation)> = vec![
         (
             "proof-not-record",
             Box::new(|record: &mut Value| {
