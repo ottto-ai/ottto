@@ -210,6 +210,13 @@ fn read_header_settled(candidate: &CandidateFile) -> (Result<(String, String, us
         }
     }
 }
+/// Metadata witness of one path without following a final symlink, or `None`
+/// when it cannot be read (including when it is gone).
+pub(super) fn path_witness(path: &Path) -> Option<String> {
+    fs::symlink_metadata(path)
+        .ok()
+        .map(|metadata| metadata_witness(&metadata))
+}
 /// Raw header digest for a file whose owning header the native inventory has
 /// already established. No extra decoded Value is retained or allocated.
 pub(super) fn header_reduction_witness(candidate: &CandidateFile) -> Result<String> {
@@ -226,6 +233,13 @@ pub(super) struct HeaderInventory {
     pub(super) directories: DirectoryCensus,
     pub(super) complete: bool,
     pub(super) read_bytes: usize,
+    /// Roster files whose first record was refused, each with the metadata
+    /// witness seen at the refusal (`None` when it could not be read). This is
+    /// the evidence a held page waits on; see `CodexInventoryHold`.
+    pub(super) refused: BTreeMap<String, Option<String>>,
+    /// The inventory hit a population or read bound, or had no stable
+    /// directory census. Only a fresh walk can change that.
+    pub(super) bounded_out: bool,
 }
 impl HeaderInventory {
     pub(super) fn new(
@@ -245,6 +259,9 @@ impl HeaderInventory {
             complete: paths.len() <= MAX_HEADER_FILES
                 && directories.is_some_and(|value| value.stable),
             read_bytes: 0,
+            refused: BTreeMap::new(),
+            bounded_out: paths.len() > MAX_HEADER_FILES
+                || !directories.is_some_and(|value| value.stable),
         }
     }
     pub(super) fn owner_for_path(&self, path: &Path) -> Option<&str> {
@@ -262,6 +279,7 @@ impl HeaderInventory {
         };
         if self.read_bytes >= MAX_HEADER_READ_BYTES || self.headers.len() >= MAX_HEADER_FILES {
             self.complete = false;
+            self.bounded_out = true;
             self.pending.clear();
             return true;
         }
@@ -273,8 +291,10 @@ impl HeaderInventory {
             .cloned()
         else {
             self.complete = false;
+            self.bounded_out = true;
             return false;
         };
+        let key = local_index_key(&path);
         let result = (|| -> Result<HeaderWitness> {
             let stat = fs::symlink_metadata(&path)?;
             anyhow::ensure!(
@@ -324,10 +344,13 @@ impl HeaderInventory {
                 self.complete = false;
                 // A failed read may have consumed its whole bounded prefix.
                 self.read_bytes = self.read_bytes.saturating_add(MAX_HEADER_BYTES + 1);
+                let witness = path_witness(Path::new(&key));
+                self.refused.insert(key, witness);
             }
         }
         if self.read_bytes > MAX_HEADER_READ_BYTES {
             self.complete = false;
+            self.bounded_out = true;
         }
         false
     }
@@ -389,7 +412,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, metadata);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes);
+crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, refused, bounded_out);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
@@ -2490,28 +2513,118 @@ pub(super) mod tests {
             .any(|item| item.source_session_id == UNRELATED && item.input_tokens == 70));
         fs::remove_dir_all(root).unwrap();
     }
-    #[test]
-    fn unreadable_new_header_holds_the_page_only_while_it_is_unreadable() {
-        // An unreadable header has no provable owner, so it may belong to any
-        // selected session: the page stays held. Once it is gone, the next
-        // page proceeds before the retry deadline instead of waiting for it.
+    fn inventory_hold(index: &ScanIndex) -> Option<&super::super::CodexInventoryHold> {
+        index
+            .traversal
+            .as_ref()
+            .and_then(|traversal| traversal.residue.codex_inventory_hold.as_ref())
+    }
+    /// A retained red generation where a new unreadable first record and a
+    /// valid unrelated rollout arrive together, so the page holds both.
+    fn held_behind_unreadable_header() -> (PathBuf, ScanIndex, PathBuf, PathBuf, String) {
         let (root, settled) = retained_red_generation(member(KNOWN, "k-1", 100, 100));
-        let deadline = retry_deadline(&settled);
         let unreadable = root.join("sessions/unreadable.jsonl");
         fs::write(&unreadable, "not a header\n").unwrap();
         let new = root.join("sessions/new.jsonl");
         write_rows(&new, &member(UNRELATED, "n-1", 70, 70));
-        let (held_index, held) = retained_page(&root, settled, &[unreadable.clone(), new]);
+        let (held_index, held) = retained_page(&root, settled, &[unreadable.clone(), new.clone()]);
         assert!(held.snapshots.is_empty(), "{:?}", held.snapshots);
         assert!(held.ownership_incomplete_file_count > 0);
+        let hold = inventory_hold(&held_index).expect("the held page is owed a retry");
+        assert!(hold.owed.contains(&local_index_key(&new)));
+        assert!(hold
+            .refused_headers
+            .contains_key(&local_index_key(&unreadable)));
+        let witness = path_witness(&new).unwrap();
+        (root, held_index, unreadable, new, witness)
+    }
+    #[test]
+    fn unreadable_new_header_holds_the_page_only_while_it_is_unreadable() {
+        // An unreadable header has no provable owner, so it may belong to any
+        // selected session: the page stays held, and an idle tick re-reads
+        // nothing. Once it is gone, the valid session held with it is admitted
+        // on the next ordinary tick: no write to it, no hint for it, no walk.
+        let (root, held_index, unreadable, new, witness) = held_behind_unreadable_header();
+        let deadline = retry_deadline(&held_index);
+        let (idle_index, idle) = retained_page(&root, held_index, &[]);
+        assert_eq!(
+            idle.scanned_file_count, 0,
+            "unmoved evidence re-reads nothing"
+        );
+        assert!(idle.snapshots.is_empty());
+        assert!(inventory_hold(&idle_index).is_some());
+        // The hold is durable state: it survives a service restart.
+        let restarted: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&idle_index).unwrap()).unwrap();
+        assert_eq!(inventory_hold(&restarted), inventory_hold(&idle_index));
         fs::remove_file(&unreadable).unwrap();
-        let later = root.join("sessions/later.jsonl");
-        let later_owner = "44444444-4444-4444-8444-444444444444";
-        write_rows(&later, &member(later_owner, "l-1", 30, 30));
-        let (index, page) = retained_page(&root, held_index, &[unreadable, later]);
-        assert_eq!(page.snapshots.len(), 1, "{:?}", page.snapshots);
-        assert_eq!(page.snapshots[0].source_session_id, later_owner);
-        assert_eq!(retry_deadline(&index), deadline);
+        let (index, page) = retained_page(&root, restarted, &[]);
+        assert_eq!(
+            page.snapshots
+                .iter()
+                .map(|item| (item.source_session_id.as_str(), item.input_tokens))
+                .collect::<Vec<_>>(),
+            vec![(UNRELATED, 70)],
+            "the originally held valid session recovers"
+        );
+        assert_eq!(page.scanned_file_count, 1);
+        assert_eq!(
+            path_witness(&new).unwrap(),
+            witness,
+            "the held file was not rewritten"
+        );
+        assert_eq!(retry_deadline(&index), deadline, "no re-walk was forced");
+        assert!(inventory_hold(&index).is_none());
+        let (_, again) = retained_page(&root, index, &[]);
+        assert_eq!(
+            again.scanned_file_count, 0,
+            "a recovered file is not re-read"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn repaired_header_releases_the_held_page_and_a_still_unreadable_one_does_not() {
+        let (root, held_index, unreadable, new, witness) = held_behind_unreadable_header();
+        let deadline = retry_deadline(&held_index);
+        // The blocker changes but still proves no owner: the owed candidates
+        // are tried again once, held again, and nothing is emitted.
+        fs::write(&unreadable, "still not a header\n").unwrap();
+        let (still_index, still) = retained_page(&root, held_index, &[unreadable.clone()]);
+        assert!(still.snapshots.is_empty(), "{:?}", still.snapshots);
+        assert!(still.ownership_incomplete_file_count > 0);
+        assert!(inventory_hold(&still_index)
+            .is_some_and(|hold| hold.owed.contains(&local_index_key(&new))));
+        let (idle_index, idle) = retained_page(&root, still_index, &[]);
+        assert_eq!(
+            idle.scanned_file_count, 0,
+            "unmoved evidence re-reads nothing"
+        );
+        // Repaired in place: same directory, same inode, a provable owner.
+        let repaired_owner = "44444444-4444-4444-8444-444444444444";
+        write_rows(&unreadable, &member(repaired_owner, "l-1", 30, 30));
+        let (index, page) = retained_page(&root, idle_index, &[unreadable]);
+        let mut totals = page
+            .snapshots
+            .iter()
+            .map(|item| (item.source_session_id.clone(), item.input_tokens))
+            .collect::<Vec<_>>();
+        totals.sort();
+        assert_eq!(
+            totals,
+            vec![
+                (UNRELATED.to_string(), 70),
+                (repaired_owner.to_string(), 30)
+            ],
+            "the held valid session and the repaired one are both admitted"
+        );
+        assert_eq!(page.scanned_file_count, 2);
+        assert_eq!(
+            path_witness(&new).unwrap(),
+            witness,
+            "the held file was not rewritten"
+        );
+        assert_eq!(retry_deadline(&index), deadline, "no re-walk was forced");
+        assert!(inventory_hold(&index).is_none());
         fs::remove_dir_all(root).unwrap();
     }
     #[test]

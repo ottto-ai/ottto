@@ -50,6 +50,27 @@ that one failure kept the census red for an hour.
 
   Unchanged directories cost one `lstat` each. Files already in the roster are
   not selected again. The retry deadline and its backoff are unchanged.
+- **Held candidates come back when their blocker moves.** A page whose header
+  inventory is incomplete holds every candidate, including sessions whose own
+  ownership is fine. Those candidates used to leave the queue and wait for
+  their next write or the next walk, so a valid session that went quiet while
+  held stayed stale. The page now records, in the generation's durable
+  residue:
+  - the held candidates;
+  - each refused first record with its metadata witness;
+  - each held candidate outside the roster with its witness;
+  - whether the walk still had directories open.
+
+  Before each page, one `lstat` per recorded path checks that evidence. When
+  it has moved (a refused record changed, was replaced or is gone, an unlisted
+  candidate joined the roster, or the walk finished), the held candidates
+  still in the roster are queued once more. They meet the same inventory and
+  ownership gates. If the evidence still proves nothing, the page is held and
+  recorded again. Unmoved evidence queues nothing, so an unresolved hold
+  re-reads no transcript. An inventory that hit its population or read bound,
+  or had no stable census, records nothing and waits for the walk, as before.
+  The record is part of the persisted traversal, so it survives a restart, and
+  a new walk replaces it.
 - **Header read retry.** A first-record read that races an append is repeated
   up to three times. Each attempt still has to observe an unchanged object, and
   each abandoned attempt is charged to the inventory read budget.
@@ -78,16 +99,26 @@ The new tests use a red generation kept behind its retry deadline:
   nothing. An admitted file is not read again.
 - A new segment of a settled session is joined or held, never sent alone,
   while an unrelated new rollout on the page is admitted.
-- A new unreadable first record holds the page. After it is removed, the next
-  page proceeds before the retry deadline.
+- A new unreadable first record holds the page together with a valid unrelated
+  rollout. An idle tick parses nothing, and the hold survives a serialize
+  round trip. After the unreadable file is removed, the next tick admits the
+  originally held session without any write or hint to it, before the retry
+  deadline, and a later idle tick does not re-read it.
+- The unreadable record is rewritten but still unreadable: the page is held
+  again and nothing is emitted. An idle tick parses nothing. It is then
+  repaired in place: the next tick admits both the held session and the
+  repaired one, with no write to the held file and no walk.
 
 ## Not changed / residual
 
-- Candidates held by an incomplete inventory go to the generation residue.
-  They are selected again on their next change, or at the next walk. A held
-  session that goes quiet can wait for the walk. Re-queuing them needs a bound
-  so a persistent hold cannot prevent the re-walk, and is left to that code's
-  owner.
+- A hold whose evidence never moves stays held until the held file changes or
+  the next walk: an unreadable first record may belong to any session.
+- A refused first record that keeps changing (a file still being written)
+  releases the hold on each tick. That costs one header inventory per tick, as
+  any hinted page already does, but no transcript read while it stays
+  unreadable.
+- An inventory past its population or read bound is still released only by
+  the walk.
 - An append during a transcript read still counts as a retryable problem. The
   census stays red until a walk sees no such race, but freshness no longer
   depends on that walk.
@@ -103,3 +134,6 @@ On a Mac with a red Codex census, between walks:
 - Receipts arrive within one page of a session's activity, not hourly.
 - The fenced census `losses.discovered` grows as rollouts appear.
 - The `transcript read failed` log text names the recurring `OpenRead` cause.
+  Its source is still an inference from the code (an append during the
+  sampled read), not observed. Every reader error behind that line is a fixed
+  string or an operating-system I/O error; none carries a path or content.
