@@ -2647,6 +2647,61 @@ fn claude_duplicate_request_witness_within_bound(
         .is_some_and(|total| total <= max_owners)
 }
 
+/// Indexed Claude files one terminal census newly re-armed, by the first cause
+/// that selected each, and the earlier-page members an unchanged exact family
+/// proof kept. Content-free and log-only: no gate, hash, or index reads them.
+#[derive(Debug, Default)]
+struct ClaudeUsageFamilyRearmCounts {
+    full_rearm_file_count: usize,
+    changed_proof_file_count: usize,
+    invalidated_witness_file_count: usize,
+    changed_duplicate_file_count: usize,
+    unchanged_proof_kept_file_count: usize,
+}
+
+impl ClaudeUsageFamilyRearmCounts {
+    fn record(&mut self, full_rearm: bool, proof_changed: bool, witness_invalidated: bool) {
+        let count = if full_rearm {
+            &mut self.full_rearm_file_count
+        } else if proof_changed {
+            &mut self.changed_proof_file_count
+        } else if witness_invalidated {
+            &mut self.invalidated_witness_file_count
+        } else {
+            &mut self.changed_duplicate_file_count
+        };
+        *count = count.saturating_add(1);
+    }
+
+    fn report(&self, unchanged_proof_family_count: usize, owned_start_member_count: usize) {
+        let rearmed_file_count = self
+            .full_rearm_file_count
+            .saturating_add(self.changed_proof_file_count)
+            .saturating_add(self.invalidated_witness_file_count)
+            .saturating_add(self.changed_duplicate_file_count);
+        if rearmed_file_count == 0
+            && self.unchanged_proof_kept_file_count == 0
+            && owned_start_member_count == 0
+        {
+            return;
+        }
+        eprintln!(
+            "local snapshot census re-armed {} Claude family file(s): full re-arm {}, new or \
+             changed family proof {}, invalidated family witness {}, changed request duplicate \
+             {}; {} unchanged family proof(s) kept {} earlier-page file(s); {} owned-start \
+             member(s) re-armed this pass; bounded scan counters include this work",
+            rearmed_file_count,
+            self.full_rearm_file_count,
+            self.changed_proof_file_count,
+            self.invalidated_witness_file_count,
+            self.changed_duplicate_file_count,
+            unchanged_proof_family_count,
+            self.unchanged_proof_kept_file_count,
+            owned_start_member_count,
+        );
+    }
+}
+
 /// Content-free cause counters for one duplicate-census fold call, reported
 /// only in the local Claude evidence log line. They are observed alongside the
 /// fence and never read back by the census: no gate, hash, or index depends on
@@ -4581,6 +4636,21 @@ fn apply_claude_reported_usage_with_index_and_limits(
             .iter()
             .map(|item| item.source_session_id.as_str())
             .collect::<BTreeSet<_>>();
+        // Only a new or changed exact family witness re-arms earlier-page
+        // members. Under an unchanged witness each of those pages already
+        // rebuilt its member from the retained witness, or demoted it into the
+        // bounded authority quarantine, which owns that retry. Re-arming them
+        // again would reparse the family on every traversal, and that reparse
+        // is what lets the next census prove the same family once more.
+        let changed_proof_roots = proven
+            .iter()
+            .filter(|(root_session_id, family)| {
+                witness_fingerprints_before.get(*root_session_id)
+                    != Some(&claude_usage_family_witness_fingerprint(&family.witness))
+            })
+            .map(|(root_session_id, _)| root_session_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut rearm = ClaudeUsageFamilyRearmCounts::default();
         for (index_key, entry) in &mut index.files {
             let Some((root_session_id, source_session_id)) =
                 claude_index_path_family_member(Path::new(index_key))
@@ -4596,21 +4666,33 @@ fn apply_claude_reported_usage_with_index_and_limits(
                 .is_some_and(|request_hashes| {
                     !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
                 });
-            if full_rearm
-                || (proven.contains_key(&root_session_id)
-                    && !current_ids.contains(source_session_id.as_str()))
-                || invalidated_witness_roots.contains(&root_session_id)
-                || changed_duplicate_owners.contains(&duplicate_owner)
-                || current_member_owns_changed_request
-            {
+            let earlier_page_member = proven.contains_key(&root_session_id)
+                && !current_ids.contains(source_session_id.as_str());
+            let proof_changed =
+                earlier_page_member && changed_proof_roots.contains(&root_session_id);
+            let witness_invalidated = invalidated_witness_roots.contains(&root_session_id);
+            let duplicate_changed = changed_duplicate_owners.contains(&duplicate_owner)
+                || current_member_owns_changed_request;
+            let armed = !entry.source_file_fingerprint.is_empty();
+            if full_rearm || proof_changed || witness_invalidated || duplicate_changed {
                 // Reparse earlier-page members when terminal family proof
                 // changes or when a later page reveals a cross-family request
                 // duplicate. Changed hash-only witnesses re-arm every affected
                 // owner once; stable duplicates remain fail-closed without an
                 // unbounded corrective replay loop.
                 entry.source_file_fingerprint.clear();
+                if armed {
+                    rearm.record(full_rearm, proof_changed, witness_invalidated);
+                }
+            } else if earlier_page_member && armed {
+                rearm.unchanged_proof_kept_file_count =
+                    rearm.unchanged_proof_kept_file_count.saturating_add(1);
             }
         }
+        rearm.report(
+            proven.len().saturating_sub(changed_proof_roots.len()),
+            owned_start_reparse_ids.len(),
+        );
 
         index
             .claude_usage_family_pending
@@ -24970,6 +25052,9 @@ mod tests {
     }
     mod census_convergence_tests {
         include!("snapshots/census_convergence_tests.rs");
+    }
+    mod claude_usage_proof_rearm_tests {
+        include!("snapshots/claude_usage_proof_rearm_tests.rs");
     }
     mod giant_row_measurement_tests {
         include!("snapshots/giant_row_measurement_tests.rs");

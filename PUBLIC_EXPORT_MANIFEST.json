@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 650,
-  "content_sha256": "6062a727590507b52b0552d6574900edbbbb98f441c9549125086cd76a80d55d",
+  "candidate_file_count": 652,
+  "content_sha256": "2f857e0ea8338cf23b93285c9f68c871dfa5dc95f61a14e0e30c3064f620b94f",
   "files": [
     {
       "executable": false,
@@ -1217,8 +1217,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "50adfafd5f4b638847de9f9f77de3de1a4e3894a75b64c43546386f9f3990182",
-      "size_bytes": 2449764
+      "sha256": "f64ea411d0ccb4c809738005d44c56aaa2b15159f4a535f998da95445cf7832e",
+      "size_bytes": 2453825
     },
     {
       "executable": false,
@@ -1275,6 +1275,13 @@
       "path": "crates/ottto-service/src/snapshots/claude_sidecar_reduction_tests.rs",
       "sha256": "0ccdac5f6155aef448f8529d34128d3c17561ab3e4c666d6aaa7c030cacd4d24",
       "size_bytes": 28951
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_usage_proof_rearm_tests.rs",
+      "sha256": "15c8c6dca29ec0fee3137da0d603faea81f6e19261980787614ada62e9b36958",
+      "size_bytes": 14056
     },
     {
       "executable": false,
@@ -2794,6 +2801,13 @@
       "path": "docs/session-2026-10-15-claude-slot-state-follows-windows.md",
       "sha256": "a517305104edf00a313491ba03527ecc9fef8698ae3ca97161ae5cc95b6d6911",
       "size_bytes": 2404
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-15-claude-stable-family-proof-rearm.md",
+      "sha256": "5166597ea29dea240f3ddd01bb038c924dd15694850488b2fb5bdf2f8a4714d0",
+      "size_bytes": 5623
     },
     {
       "executable": false,
@@ -4553,9 +4567,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-15T17:42:49+00:00",
+  "generated_at": "2026-10-15T18:19:44+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 651,
+  "output_file_count": 653,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4592,5 +4606,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "e7dc160680f626fc6da40fc1a8bfa7499aaf87d3"
+  "source_commit": "b51fc63799bd66b014b07c444b8b0f2cf87775b9"
 }
