@@ -285,7 +285,7 @@ fn commit_completed_with_local_holds(
             account_deferred_held_fingerprints,
         )
     {
-        return index.with_locally_held_keys_reverted(
+        return index.into_locally_held_keys_reverted(
             committed_index,
             locally_held_fingerprints,
             account_deferred_held_fingerprints,

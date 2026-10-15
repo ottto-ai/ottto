@@ -193,6 +193,25 @@ impl PipelineFixture {
         )
         .expect("in-process upload");
         assert_eq!(result, ResumableUploadResult::Completed);
+        // Completed/restorable holds are the sole changed production route.
+        // Keep all existing field/ACK/debt/restart assertions below, and compare
+        // the full state at that boundary with the borrowed reference surface.
+        let borrowed_reference = (matches!(&upload, PipelineUpload::Accept)
+            && holds.any()
+            && !holds.progress_blocking
+            && index.locally_held_keys_restorable(
+                &committed_index,
+                &holds.held_fingerprints,
+                &holds.account_deferred_fingerprints,
+            ))
+        .then(|| {
+            serde_json::to_vec(&index.with_locally_held_keys_reverted(
+                &committed_index,
+                &holds.held_fingerprints,
+                &holds.account_deferred_fingerprints,
+            ))
+            .unwrap()
+        });
         let settlement = match upload {
             PipelineUpload::Accept => {
                 settle_completed_upload(index, &committed_index, &progress, &holds)
@@ -201,6 +220,13 @@ impl PipelineFixture {
                 settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
             }
         };
+        if let Some(reference) = borrowed_reference {
+            assert_eq!(
+                serde_json::to_vec(&settlement.index).unwrap(),
+                reference,
+                "owned Completed settlement preserves the entire borrowed state"
+            );
+        }
         let fully_settled = settlement.fully_settled;
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);

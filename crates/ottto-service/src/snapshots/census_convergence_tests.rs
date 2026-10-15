@@ -1275,3 +1275,7 @@ fn transcript_ownership_needs_quarantined_originals_observed() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+mod owned_held_index_allocation {
+    include!("owned_held_index_allocation_tests.rs");
+}
