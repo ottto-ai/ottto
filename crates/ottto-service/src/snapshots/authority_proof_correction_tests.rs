@@ -1427,7 +1427,16 @@ fn a2_partial_save_without_a_prior_entity_carries_the_pair_and_drains_at_a_compl
         entry.last_snapshot_fingerprint = None;
         entry.last_upload_body_witness = None;
     }
-    committed.file_snapshot_fingerprints.remove(&agent_key);
+    // This member starts delivery-free. Do not seed an orphan accepted
+    // entity: ordinary checkpoint reconciliation correctly prunes one.
+    if let Some(entities) = committed.file_snapshot_fingerprints.remove(&agent_key) {
+        for fingerprint in entities {
+            committed
+                .accepted_snapshot_fingerprints
+                .remove(&fingerprint);
+            committed.snapshot_activity_at.remove(&fingerprint);
+        }
+    }
     let mut index = committed.clone();
     let scan = apc_empty_page(&mut index, 1, &new, false);
     let mut subset = index.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());

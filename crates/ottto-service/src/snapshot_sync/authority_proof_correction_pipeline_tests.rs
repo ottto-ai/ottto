@@ -222,6 +222,7 @@ struct ApcFixture {
     /// Members whose owner proof is withheld on the next pages.
     withheld_owners: std::cell::RefCell<BTreeSet<String>>,
     next_sequence: std::cell::Cell<u64>,
+    page_files: std::cell::Cell<usize>,
 }
 
 impl ApcFixture {
@@ -246,6 +247,7 @@ impl ApcFixture {
             owners,
             withheld_owners: std::cell::RefCell::new(BTreeSet::new()),
             next_sequence: std::cell::Cell::new(1),
+            page_files: std::cell::Cell::new(APC_PAGE_FILES),
         };
         for (session, path) in [
             (
@@ -451,7 +453,7 @@ impl ApcFixture {
             &mut index,
             collected_at,
             183,
-            APC_PAGE_FILES,
+            self.page_files.get(),
             &self.support,
         )
         .expect("scan bounded Claude page");
@@ -1296,9 +1298,9 @@ fn account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
 /// that actually offered an owed corrected body records no ACK for it and
 /// keeps that member owed through the real partial checkpoint and a restart
 /// from disk, with only exact no-op drains (no upload) leaving the debt;
-/// neither changes the proof, counter or deadline; the same generation's
-/// complete census re-proves the same proof and mints nothing. A later
-/// accepting generation re-parses (at least once) and settles exactly.
+/// neither changes the proof, counter or deadline. The shed generation cannot
+/// certify a complete census; later clean accepting generations re-parse
+/// (at least once), settle exactly and re-prove without a fresh grant.
 #[test]
 #[serial(source_manifests)]
 fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
@@ -1377,10 +1379,11 @@ fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
         record.retry_after_unix_seconds,
         grant.record.retry_after_unix_seconds
     );
-    // Same-proof replay: the shed generation's complete census re-proved the
-    // granted proof and minted no grant, counter or deadline change.
+    // A shed marks this sweep unsettled. Traversal completion is not census
+    // acceptance: the existing scanner requires a clean follow-up generation.
     let terminal = pages.last().expect("terminal page");
-    assert!(terminal.scan.census_complete);
+    assert!(!terminal.scan.census_complete);
+    assert!(terminal.index.bounded_sweep_had_unsettled_upload());
     assert_eq!(
         terminal
             .index
@@ -1388,8 +1391,31 @@ fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
             .as_deref(),
         Some(grant.proof.as_str())
     );
-    let (drained, _, _) = fixture.drain_until_clear(&grant, grant.hour + 2);
+    let (drained, settled_hour, _) = fixture.drain_until_clear(&grant, grant.hour + 2);
     assert!(offered_owed.is_subset(&drained));
+    let clean = fixture.generation(settled_hour + 1, |_| ApcUpload::Accept);
+    for (number, page) in clean.iter().enumerate() {
+        let transition = ApcFixture::check(page, &format!("clean follow-up {number}"));
+        assert!(transition.granted.is_none(), "same proof grants nothing");
+        assert!(!transition.failed);
+        assert!(
+            page.record().is_none(),
+            "settled grant stays cleared after restart"
+        );
+    }
+    let complete = clean.last().expect("clean terminal page");
+    assert!(
+        complete.scan.census_complete,
+        "clean follow-up certifies the census"
+    );
+    assert_eq!(
+        complete
+            .index
+            .claude_usage_family_witness_digest_for_test(APC_ROOT)
+            .as_deref(),
+        Some(grant.proof.as_str()),
+        "the complete follow-up re-proves the same proof without a regrant"
+    );
 }
 
 /// R4: a member's revision changes while it is owed under the same proof. A
@@ -1645,6 +1671,10 @@ fn natural_owed_members_drain_on_separate_bounded_pages() {
             .keys()
             .collect::<Vec<_>>()
     );
+    // Preserve the original hour-12 causal fixture, then tighten its drain
+    // page size. One parsed file per page forces the two naturally owed
+    // members to settle on separate real bounded pages without seeding debt.
+    fixture.page_files.set(1);
     ApcFixture::append(&fixture.sibling_path(), &apc_note_line(APC_SIBLING, 2));
     let pages = fixture.generation(grant.hour + 1, |_| ApcUpload::Accept);
     let mut drained_on = BTreeMap::new();
@@ -1666,7 +1696,13 @@ fn natural_owed_members_drain_on_separate_bounded_pages() {
         acked.extend(transition.acked);
         noop.extend(transition.noop);
         if transition.cleared {
+            assert!(cleared_on.is_none(), "the record clears exactly once");
             cleared_on = Some(number);
+        } else if cleared_on.is_some() {
+            assert!(
+                page.record().is_none(),
+                "later pages cannot revive the record"
+            );
         } else if !drained_on.is_empty() {
             let (_, owed) = page
                 .record()
@@ -1714,6 +1750,7 @@ fn natural_owed_members_drain_on_separate_bounded_pages() {
         "acked_member_count": acked.len(),
         "noop_member_count": noop.len(),
         "page_count": pages.len(),
+        "page_file_limit": fixture.page_files.get(),
     });
     std::io::stderr()
         .write_all(format!("{line}\n").as_bytes())
