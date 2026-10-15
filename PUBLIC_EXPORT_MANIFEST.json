@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 651,
-  "content_sha256": "1d587ed1f723d9a528c1103d10c0e03581e172774abf50e771e4bc432cb16e25",
+  "candidate_file_count": 652,
+  "content_sha256": "532e45bf86f54a033d00aeb35d308a7a3075ce4ab7ab2ce7c993faeeece9d80b",
   "files": [
     {
       "executable": false,
@@ -1189,8 +1189,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/census_convergence_pipeline_tests.rs",
-      "sha256": "ac40ef0659b4168b42f08da2750f447703f7d6cc9fcb783c1d84a06236fbf7a3",
-      "size_bytes": 45773
+      "sha256": "6bc3fa8b2b09aea40db2fd252733ad36dafd7e567c9151384eab356a2cc885a5",
+      "size_bytes": 62104
     },
     {
       "executable": false,
@@ -1238,8 +1238,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/census_convergence_tests.rs",
-      "sha256": "592a1322e16d9bac54d3718b237b46d9d5494f2ec98b47c0664f7d631e485bcb",
-      "size_bytes": 46670
+      "sha256": "c718a71aacc19ee6aabf6e0a5f52f518d2999b367bded729fe1d7aeefe361e8b",
+      "size_bytes": 60763
     },
     {
       "executable": false,
@@ -2815,6 +2815,13 @@
       "path": "docs/session-2026-10-15-codex-retained-roster-refresh.md",
       "sha256": "193258515a7c474c2e4a73b4c8c7ccd7cdb642188111ae5ac01cf9e87e4c3a9d",
       "size_bytes": 7417
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-15-scan-allocation-attribution-tests.md",
+      "sha256": "e71e630f3b51467e0ff160a5d6e32269fd42d57ebbb406b50650779896bb6328",
+      "size_bytes": 4158
     },
     {
       "executable": false,
@@ -4562,7 +4569,7 @@
   ],
   "generated_at": "2026-10-15T18:12:42+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 652,
+  "output_file_count": 653,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

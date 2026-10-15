@@ -1079,3 +1079,395 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
         );
     }
 }
+
+// M2 allocation attribution, S7: the Claude local-evidence join over W
+// retained family witnesses with R paired API/trace telemetry rows each. Every
+// family is proven on one parsed control page; after convergence a page that
+// parses nothing still decodes both sidecars of every witness root. The
+// thread-local probe charges only this test thread's requested allocator calls
+// inside `measure`; it is neither RSS nor footprint, and it is not a leak
+// proof. The join mutates its scan and index, so each measured run clones them
+// inside the scope and reports the join phase above those clones. Each run
+// writes one count-only JSON line straight to stderr, outside libtest's
+// captured print path, so hosted CI logs keep the values. Nothing here changes
+// the join; it characterizes today's all-witness-root decode.
+mod m2_claude_evidence_join_allocation {
+    use super::*;
+    use crate::retry_allocation_probe::{self as probe, Stats};
+    use crate::snapshots::claude_request_identity::{self as identity, EmissionPermit};
+
+    const REQUESTS_PER_ROOT: usize = 16;
+    const WINDOW_DAYS: u64 = 183;
+    const MAX_CONVERGENCE_PAGES: usize = 3;
+    const REPORTED: &str = "session_exclusive_reported_usage:v1";
+
+    fn root_id(root: usize) -> String {
+        format!("{:08x}-5a5a-4000-8000-000000000007", 0x7e00_0000 + root)
+    }
+
+    fn request_id(root: usize, request: usize) -> String {
+        format!("req_m2_{root:03}_{request:02}")
+    }
+
+    fn observed_at(request: usize) -> String {
+        format!("2026-08-02T07:00:{request:02}Z")
+    }
+
+    fn api_row(
+        session: &str,
+        request_id: &str,
+        request: usize,
+    ) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+        let mut row = crate::claude_local_otel::ClaudeLocalOtelEvidence {
+            capture_revision: "claude_api_request:v2".to_string(),
+            session_id: session.to_string(),
+            request_id: request_id.to_string(),
+            client_request_id: format!("client-{request_id}"),
+            observed_at: observed_at(request),
+            model: "claude-haiku-4-5".to_string(),
+            effort: "high".to_string(),
+            query_source: "user".to_string(),
+            cost_usd_micros: Some(100),
+            event_sequence: Some(request as u64),
+            app_version: "2.1.226".to_string(),
+            input_tokens: 10,
+            output_tokens: 10,
+            request_count: 1,
+            account_identity_checked: true,
+            account_identifier_hash: Some("a".repeat(64)),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&row).expect("serialize synthetic API row");
+        row.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
+        row
+    }
+
+    fn trace_row(
+        session: &str,
+        request_id: &str,
+        request: usize,
+    ) -> crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
+        let mut row = crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
+            capture_revision: "claude_llm_request_ownership:v1".to_string(),
+            session_id: session.to_string(),
+            request_id: request_id.to_string(),
+            client_request_id: format!("client-{request_id}"),
+            observed_at: observed_at(request),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&row).expect("serialize synthetic trace row");
+        row.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
+        row
+    }
+
+    struct JoinFixture {
+        base: PathBuf,
+        root: PathBuf,
+        support: PathBuf,
+    }
+
+    impl JoinFixture {
+        /// `roots` single-member families, each with one transcript and
+        /// exactly paired API and trace sidecars for its requests.
+        fn new(roots: usize) -> Self {
+            let base = test_dir("m2-claude-evidence-join");
+            let root = base.join("projects");
+            let support = base.join("support");
+            std::fs::create_dir_all(&root).expect("create synthetic Claude root");
+            for root_index in 0..roots {
+                let session = root_id(root_index);
+                let mut transcript = String::new();
+                let mut api = String::new();
+                let mut trace = String::new();
+                for request in 0..REQUESTS_PER_ROOT {
+                    let request_id = request_id(root_index, request);
+                    let line = serde_json::json!({
+                        "timestamp": observed_at(request),
+                        "type": "assistant",
+                        "sessionId": session,
+                        "requestId": request_id,
+                        "message": {
+                            "id": format!("msg_{request_id}"),
+                            "model": "claude-haiku-4-5",
+                            "usage": {"input_tokens": 10, "output_tokens": 10}
+                        }
+                    });
+                    transcript.push_str(&format!("{line}\n"));
+                    let api_line = serde_json::to_string(&api_row(&session, &request_id, request))
+                        .expect("encode synthetic API row");
+                    api.push_str(&format!("{api_line}\n"));
+                    let trace_line =
+                        serde_json::to_string(&trace_row(&session, &request_id, request))
+                            .expect("encode synthetic trace row");
+                    trace.push_str(&format!("{trace_line}\n"));
+                }
+                std::fs::write(root.join(format!("{session}.jsonl")), transcript)
+                    .expect("write synthetic Claude transcript");
+                let digest = format!("{:x}", Sha256::digest(session.as_bytes()));
+                for (kind, body) in [
+                    ("claude-code-effort", api),
+                    ("claude-code-trace-ownership", trace),
+                ] {
+                    let path = support
+                        .join("local-otel")
+                        .join(kind)
+                        .join(format!("{digest}.jsonl"));
+                    std::fs::create_dir_all(path.parent().expect("sidecar directory"))
+                        .expect("create synthetic sidecar directory");
+                    std::fs::write(path, body).expect("write synthetic sidecar");
+                }
+            }
+            Self {
+                base,
+                root,
+                support,
+            }
+        }
+
+        fn scan(
+            &self,
+            index: &mut ScanIndex,
+            collected_at: &str,
+            roots: usize,
+        ) -> SourceScanResult {
+            crate::snapshots::scan_source_roots_with_test_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&self.root),
+                index,
+                collected_at,
+                WINDOW_DAYS,
+                roots + 8,
+                false,
+            )
+            .expect("scan synthetic Claude page")
+        }
+    }
+
+    impl Drop for JoinFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// Policy and finalization record each parsed body, so an unchanged file
+    /// skips on the next page.
+    fn settle(scan: &mut SourceScanResult, index: &mut ScanIndex) {
+        apply_upload_policy(
+            SnapshotSource::ClaudeCode,
+            &mut scan.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        crate::snapshots::finalize_scan_after_policy(SnapshotSource::ClaudeCode, scan, index);
+    }
+
+    struct JoinRun {
+        scan: SourceScanResult,
+        index: ScanIndex,
+        disposition: crate::snapshots::ClaudeUsageAuthorityDisposition,
+        withheld: bool,
+        stats: ClaudeLocalEvidenceStats,
+        /// Requested bytes above the two cloned inputs while the join runs.
+        join_peak: usize,
+        join_allocations: usize,
+        join_deallocations: usize,
+        join_retained: isize,
+        scope: Stats,
+    }
+
+    fn measured_join(
+        support: &std::path::Path,
+        scan: &SourceScanResult,
+        index: &ScanIndex,
+        permit: Option<EmissionPermit>,
+    ) -> JoinRun {
+        let (run, scope) = probe::measure(|| {
+            let mut scan = scan.clone();
+            let mut index = index.clone();
+            let before = probe::stats();
+            probe::phase_begin();
+            let (disposition, withheld, stats) = apply_claude_local_evidence_to_scan_with_permit(
+                support, &mut scan, &mut index, permit,
+            );
+            let join_peak = probe::phase_peak();
+            let after = probe::stats();
+            JoinRun {
+                scan,
+                index,
+                disposition,
+                withheld,
+                stats,
+                join_peak,
+                join_allocations: after.allocations - before.allocations,
+                join_deallocations: after.deallocations - before.deallocations,
+                join_retained: after.requested_live - before.requested_live,
+                scope: Stats::default(),
+            }
+        });
+        JoinRun { scope, ..run }
+    }
+
+    fn emit_receipt(roots: usize, stage: &str, permit: &str, run: &JoinRun) {
+        use std::io::Write as _;
+        let receipt = serde_json::json!({
+            "receipt": "m2_allocation_attribution:v1",
+            "case": "s7_claude_evidence_join",
+            "synthetic_witness_roots": roots,
+            "requests_per_root": REQUESTS_PER_ROOT,
+            "stage": stage,
+            "permit": permit,
+            "parsed_snapshot_count": run.scan.snapshots.len(),
+            "requested_session_count": run.stats.requested_session_count,
+            "candidate_root_count": run.stats.candidate_root_count,
+            "paired_sidecar_root_count": run.stats.paired_sidecar_root_count,
+            "complete_sidecar_root_count": run.stats.complete_sidecar_root_count,
+            "api_evidence_row_count": run.stats.api_evidence_row_count,
+            "trace_evidence_row_count": run.stats.trace_evidence_row_count,
+            "join_requested_peak_bytes": run.join_peak,
+            "join_requested_retained_bytes": run.join_retained,
+            "join_allocations": run.join_allocations,
+            "join_deallocations": run.join_deallocations,
+            "scope_requested_peak_bytes": run.scope.requested_peak,
+            "scope_usable_peak_bytes": run.scope.usable_peak,
+            "scope_allocations": run.scope.allocations,
+            "scope_deallocations": run.scope.deallocations,
+        });
+        let _ = std::io::stderr().write_all(format!("{receipt}\n").as_bytes());
+    }
+
+    /// Session, request count, input and output tokens, accounting contract.
+    type Usage = (String, u64, u64, u64, Option<String>);
+
+    fn usage(scan: &SourceScanResult) -> Vec<Usage> {
+        scan.snapshots
+            .iter()
+            .map(|item| {
+                (
+                    item.source_session_id.clone(),
+                    item.request_count,
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.usage_accounting_contract.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_rows(run: &JoinRun, roots: usize) {
+        let rows = roots * REQUESTS_PER_ROOT;
+        assert_eq!(run.stats.candidate_root_count, roots);
+        assert_eq!(run.stats.paired_sidecar_root_count, roots);
+        assert_eq!(run.stats.complete_sidecar_root_count, roots);
+        assert_eq!(run.stats.exact_request_set_root_count, roots);
+        assert_eq!(run.stats.api_evidence_row_count, rows);
+        assert_eq!(run.stats.trace_evidence_row_count, rows);
+    }
+
+    /// Returns the zero-parse page's join allocation events.
+    fn attribute_join(roots: usize) -> usize {
+        let fixture = JoinFixture::new(roots);
+        let denied = identity::emission_permit(SnapshotSource::ClaudeCode, None).ok();
+        let allowed = identity::emission_permit(
+            SnapshotSource::ClaudeCode,
+            Some(identity::COHORT_HINT_TOKEN),
+        )
+        .ok();
+        assert!(denied.is_none() && allowed.is_some());
+
+        // Parsed control page: every family is proven and REPORTED.
+        let mut index = ScanIndex::default();
+        let control = fixture.scan(&mut index, "2026-08-02T07:10:00Z", roots);
+        assert!(control.census_complete);
+        assert_eq!(control.snapshots.len(), roots);
+        let mut reference_scan = control.clone();
+        let mut reference_index = index.clone();
+        let reference = apply_claude_local_evidence_to_scan_with_permit(
+            &fixture.support,
+            &mut reference_scan,
+            &mut reference_index,
+            denied,
+        );
+        let dark = measured_join(&fixture.support, &control, &index, denied);
+        emit_receipt(roots, "parsed_control_page", "denied", &dark);
+        // Measuring changes nothing the join produces.
+        assert_eq!(dark.disposition, reference.0);
+        assert_eq!(dark.withheld, reference.1);
+        assert_eq!(dark.stats, reference.2);
+        assert_eq!(
+            serde_json::to_value(&dark.scan.snapshots).expect("serialize measured bodies"),
+            serde_json::to_value(&reference_scan.snapshots).expect("serialize reference bodies"),
+        );
+        assert_rows(&dark, roots);
+        assert_eq!(dark.stats.session_exclusive_reported_usage_count, roots);
+        let requests = REQUESTS_PER_ROOT as u64;
+        for (_, request_count, input, output, contract) in usage(&dark.scan) {
+            assert_eq!(
+                (request_count, input, output),
+                (requests, 10 * requests, 10 * requests)
+            );
+            assert_eq!(contract.as_deref(), Some(REPORTED));
+        }
+        // Without the permit no contract-5 evidence is built.
+        assert!(dark.scan.snapshots.iter().all(|item| {
+            item.provenance.collector != identity::COLLECTOR && item.request_evidence.is_empty()
+        }));
+        let permitted = measured_join(&fixture.support, &control, &index, allowed);
+        emit_receipt(roots, "parsed_control_page", "allowed", &permitted);
+        assert_rows(&permitted, roots);
+        assert_eq!(usage(&permitted.scan), usage(&dark.scan));
+
+        // Converge: an unchanged page parses nothing.
+        let JoinRun {
+            scan: mut page,
+            mut index,
+            ..
+        } = dark;
+        settle(&mut page, &mut index);
+        assert_eq!(
+            crate::snapshots::claude_pending_family_session_ids(&index).len(),
+            roots
+        );
+        let mut quiet = None;
+        for number in 0..MAX_CONVERGENCE_PAGES {
+            let mut page =
+                fixture.scan(&mut index, &format!("2026-08-02T08:{number:02}:00Z"), roots);
+            if page.snapshots.is_empty() {
+                quiet = Some(page);
+                break;
+            }
+            apply_claude_local_evidence_to_scan_with_permit(
+                &fixture.support,
+                &mut page,
+                &mut index,
+                denied,
+            );
+            settle(&mut page, &mut index);
+        }
+        let quiet = quiet.expect("an unchanged synthetic page parses nothing");
+        assert!(quiet.census_complete);
+        assert_eq!(
+            crate::snapshots::claude_pending_family_session_ids(&index).len(),
+            roots
+        );
+
+        // Zero-parse page: every witness root's sidecars are decoded again.
+        let idle = measured_join(&fixture.support, &quiet, &index, denied);
+        emit_receipt(roots, "zero_parse_page", "denied", &idle);
+        assert!(idle.scan.snapshots.is_empty());
+        assert_eq!(idle.stats.requested_session_count, roots);
+        assert_rows(&idle, roots);
+        assert!(idle.join_peak > 0 && idle.join_allocations > 0);
+        idle.join_allocations
+    }
+
+    #[test]
+    fn m2_s7_claude_evidence_join_decodes_every_witness_root_on_a_zero_parse_page() {
+        let small = attribute_join(16);
+        let large = attribute_join(32);
+        // Doubling the witness roots doubles the decoded rows. Fixed join
+        // overhead keeps the ratio from being exact, so the bound is loose.
+        assert!(
+            large * 2 >= small * 3,
+            "zero-parse join allocations {small} -> {large}"
+        );
+    }
+}
