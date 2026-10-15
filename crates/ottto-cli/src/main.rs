@@ -2407,6 +2407,7 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::CodexAccountReconnect { .. } => "codex_account_reconnect",
         LocalControlCommand::CodexAccountCheck { .. } => "codex_account_check",
         LocalControlCommand::CodexAccountStopWaiting { .. } => "codex_account_stop_waiting",
+        LocalControlCommand::CodexAccountStartSignIn { .. } => "codex_account_start_sign_in",
         LocalControlCommand::CodexAccountRemove { .. } => "codex_account_remove",
         LocalControlCommand::Detect { .. } => "detect",
         LocalControlCommand::Setup { .. } => "setup",
