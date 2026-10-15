@@ -23156,6 +23156,7 @@ impl ScanIndex {
     /// source fingerprint, so neither an unchanged file nor a newly adopted
     /// upload context can skip the retry. A held key whose scanned source
     /// fingerprint was explicitly cleared keeps that reparse debt as well.
+    #[cfg(test)]
     pub(crate) fn with_locally_held_keys_reverted(
         &self,
         previous: &ScanIndex,
@@ -23265,6 +23266,111 @@ impl ScanIndex {
             .snapshot_activity_at
             .retain(|fingerprint, _| current.contains(fingerprint));
         result
+    }
+
+    /// The caller already owns the scanned graph. Restore only held keys in
+    /// that allocation; the unchanged borrowed implementation remains a test-only oracle.
+    pub(crate) fn into_locally_held_keys_reverted(
+        mut self,
+        previous: &ScanIndex,
+        held: &BTreeSet<String>,
+        reparse_held: &BTreeSet<String>,
+    ) -> ScanIndex {
+        let held_keys = self.locally_held_keys(held);
+        let placeholders =
+            self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
+        for key in &held_keys {
+            let reparse = self
+                .files
+                .get(key)
+                .is_some_and(|entry| entry.source_file_fingerprint.is_empty())
+                || self
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held));
+            match previous.files.get(key) {
+                Some(committed) => {
+                    let mut committed = committed.clone();
+                    if reparse {
+                        committed.source_file_fingerprint.clear();
+                    }
+                    self.files.insert(key.clone(), committed);
+                }
+                None if placeholders.contains(key) => {
+                    if let Some(entry) = self.files.get_mut(key) {
+                        entry.last_snapshot_fingerprint = None;
+                        entry.last_upload_body_witness = None;
+                        entry.effective_upload_body_witness_revision = 0;
+                    }
+                }
+                None => {
+                    self.files.remove(key);
+                }
+            }
+            match previous.file_snapshot_fingerprints.get(key) {
+                Some(fingerprints) => {
+                    self.file_snapshot_fingerprints
+                        .insert(key.clone(), fingerprints.clone());
+                }
+                None => {
+                    self.file_snapshot_fingerprints.remove(key);
+                }
+            }
+            if previous.confirmed_empty_files.contains(key) {
+                self.confirmed_empty_files.insert(key.clone());
+            } else {
+                self.confirmed_empty_files.remove(key);
+            }
+            match previous.terminal_jsonl_dispositions.get(key) {
+                Some(disposition) => {
+                    self.terminal_jsonl_dispositions
+                        .insert(key.clone(), disposition.clone());
+                }
+                None => {
+                    self.terminal_jsonl_dispositions.remove(key);
+                }
+            }
+            if let Some((_, member)) = claude_index_path_family_member(Path::new(key)) {
+                match previous.claude_owned_start_census.get(&member) {
+                    Some(witness) => {
+                        self.claude_owned_start_census
+                            .insert(member, witness.clone());
+                    }
+                    None => {
+                        self.claude_owned_start_census.remove(&member);
+                    }
+                }
+            }
+        }
+        let mut restored = BTreeSet::new();
+        for key in &held_keys {
+            match self.file_snapshot_fingerprints.get(key) {
+                Some(fingerprints) => restored.extend(fingerprints.iter().cloned()),
+                None => restored.extend(
+                    self.files
+                        .get(key)
+                        .and_then(|entry| entry.last_snapshot_fingerprint.clone()),
+                ),
+            }
+        }
+        for fingerprint in &restored {
+            if let Some(activity_at) = previous.snapshot_activity_at.get(fingerprint) {
+                self.snapshot_activity_at
+                    .entry(fingerprint.clone())
+                    .or_insert_with(|| activity_at.clone());
+            }
+            if previous
+                .accepted_snapshot_fingerprints
+                .contains(fingerprint)
+            {
+                self.accepted_snapshot_fingerprints
+                    .insert(fingerprint.clone());
+            }
+        }
+        let current = self.current_snapshot_fingerprints();
+        self.snapshot_activity_at
+            .retain(|fingerprint, _| current.contains(fingerprint));
+        self
     }
 
     pub fn committable_subset(
