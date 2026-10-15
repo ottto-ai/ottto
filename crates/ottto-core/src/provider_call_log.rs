@@ -473,6 +473,23 @@ mod writer {
 
     static WRITER: Mutex<Option<Count>> = Mutex::new(None);
 
+    #[cfg(test)]
+    thread_local! {
+        /// Bytes the next write on this thread gets out before it fails, as
+        /// on a full disk.
+        pub(super) static SHORT_WRITE: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    fn write_line(file: &mut File, line: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(partial) = SHORT_WRITE.with(std::cell::Cell::take) {
+            file.write_all(&line[..partial.min(line.len())])?;
+            return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        }
+        file.write_all(line)
+    }
+
     pub(super) fn append(dir: &Path, call: &ProviderCall, at: u64) -> std::io::Result<()> {
         let mut line = serde_json::to_vec(&ProviderCallLine::new(call, at))
             .map_err(|_| std::io::Error::other("unserializable line"))?;
@@ -530,7 +547,7 @@ mod writer {
         } else {
             (line, entries + 1)
         };
-        if let Err(error) = file.write_all(&written) {
+        if let Err(error) = write_line(&mut file, &written) {
             // Never leave part of a line (a full disk): the next line would
             // join it. The lock keeps other writers out until then.
             let _ = file.set_len(metadata.len());
@@ -1088,6 +1105,31 @@ mod tests {
             at(NOON + SECONDS_PER_DAY),
         );
         assert_eq!(lines(&support, "2026-10-16").len(), 1);
+        let _ = std::fs::remove_dir_all(support);
+    }
+
+    /// A write that fails part-way (a full disk) leaves no partial line,
+    /// and the next write appends a whole line after the earlier ones.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_leaves_no_partial_line() {
+        let support = scratch("short-write");
+        let call = codex_read(Trigger::Schedule, CallResult::Ok);
+        record_provider_call(&support, &call, at(NOON));
+        let before = lines(&support, "2026-10-15");
+        assert_eq!(before.len(), 1);
+        writer::SHORT_WRITE.with(|short| short.set(Some(20)));
+        record_provider_call(&support, &call, at(NOON + 1));
+        assert_eq!(writer::SHORT_WRITE.with(std::cell::Cell::get), None);
+        let raw = std::fs::read_to_string(provider_call_log_dir(&support).join("2026-10-15.jsonl"))
+            .unwrap();
+        assert_eq!(raw, format!("{}\n", before[0]));
+        record_provider_call(&support, &call, at(NOON + 2));
+        let after = lines(&support, "2026-10-15");
+        assert_eq!(after.len(), 2);
+        assert!(after[1].contains(r#""at":"2026-10-15T12:00:02Z""#));
+        let summary = summarize_provider_calls(&support, None, at(NOON + 60));
+        assert_eq!((summary.calls, summary.skipped_lines), (2, 0));
         let _ = std::fs::remove_dir_all(support);
     }
 
