@@ -14,19 +14,32 @@
 //! - stops the CLI (SIGTERM, then SIGKILL) on cancel or after
 //!   [`SIGN_IN_TIMEOUT`], and waits for the port to be free again;
 //! - decides by the home's `auth.json`, not the exit status: `codex login`
-//!   exits 0 both when it saved a credential and when it was stopped. A
-//!   credential that appeared or changed during the run is the result; then
-//!   the account is read through the setup's validation, and that read is
-//!   retried once after [`CHECK_RETRY_DELAY`] when it fails;
-//! - never restarts a sign-in after a daemon restart: a run whose credential
-//!   changed is checked once, any other ends `interrupted`.
+//!   exits 0 both when it saved a credential and when it was stopped. The
+//!   baseline is taken just before the CLI starts, under the home's
+//!   quota-read lock, and scheduled and explicit quota reads leave the home
+//!   alone while the sign-in runs (each read rewrites `auth.json`). In a home
+//!   without a credential, one that appeared is the result. In a home that
+//!   had one (a reconnect, or a sign-in again after a mismatch) the person's
+//!   own Codex sessions may rewrite it too, so there the CLI must also exit 0
+//!   and print its success line;
+//! - then reads the account through the setup's validation, retrying that
+//!   identity read once after [`CHECK_RETRY_DELAY`] when it fails (at most
+//!   two), plus the validation's own fresh read of a pinned workspace. A
+//!   success after a retry so starts three `codex app-server` runs;
+//! - never restarts a sign-in after a daemon restart: a run whose home had
+//!   no credential and now has one is checked once, any other ends
+//!   `interrupted`.
 //!
 //! The browser sign-in is the person's, not a provider call of ours; the call
 //! log records the account reads only (trigger `setup`). Never used for the
 //! person's own `~/.codex`: setup operations only name managed homes.
 //!
 //! The CLI stays in the daemon's process group, so the service manager ends
-//! it with the daemon.
+//! it with the daemon. A stop ends the CLI's own child processes too: the
+//! `codex` wrapper's child holds the callback port.
+//!
+//! `daemon_sign_in_supported` says this daemon runs sign-ins, not that the
+//! Codex CLI is installed: a missing CLI ends the run `codex_unavailable`.
 
 use std::io::{BufRead, BufReader, Read};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
@@ -56,6 +69,12 @@ const CODEX_LOGIN_PORT: u16 = 1455;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Time the CLI gets to exit after SIGTERM before SIGKILL.
 const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+/// Time to wait for the CLI's output reader to read the last lines after it
+/// exited.
+const OUTPUT_READ_WAIT: Duration = Duration::from_secs(2);
+/// Bound on the CLI's child processes a stop looks for.
+#[cfg(target_os = "macos")]
+const MAX_LOGIN_PROCESSES: usize = 64;
 /// Time to wait for the callback port to be free after the CLI exited.
 const PORT_RELEASE_WAIT: Duration = Duration::from_secs(3);
 /// How long a stop request waits for a running sign-in to end.
@@ -180,6 +199,7 @@ pub(crate) fn start(
     schema_version: u16,
     operation_id: &str,
 ) -> Result<(), CodexAccountSlotSettingsError> {
+    end_stale_run();
     let mut active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(run) = active.as_ref() {
         if run.operation_id == operation_id {
@@ -278,13 +298,21 @@ pub(crate) fn present(mut status: CodexAccountsStatusV1) -> CodexAccountsStatusV
 }
 
 /// After a daemon restart: a sign-in that was running is never started
-/// again. If its home's credential appeared or changed, the sign-in finished
-/// just before the restart, so the account is checked once; otherwise the
-/// run ends `interrupted`.
+/// again. If its home had no credential and now has one, the sign-in
+/// finished just before the restart, so the account is checked once. In a
+/// home that had one, a changed credential is no proof (the person's own
+/// Codex sessions rewrite it too), so that run, like any other, ends
+/// `interrupted`.
 pub fn recover_at_startup() {
     let store = store();
-    let Ok(Some(active)) = store.active_sign_in() else {
-        return;
+    let active = match store.active_sign_in() {
+        Ok(Some(active)) => active,
+        Ok(None) => return,
+        // Its home is gone or unreadable: no worker can end it later.
+        Err(_) => {
+            end_unworked_run(false);
+            return;
+        }
     };
     let operation_id = active.operation_id.clone();
     let settled = store
@@ -314,7 +342,7 @@ pub fn recover_at_startup() {
         guard.finish(outcome, message);
         return;
     }
-    if !active.credential_changed() {
+    if active.baseline.is_some() || !active.credential_changed() {
         guard.finish(
             CodexAccountSignInOutcomeV1::Interrupted,
             INTERRUPTED_MESSAGE,
@@ -329,6 +357,48 @@ pub fn recover_at_startup() {
         });
     // On a failed spawn the moved guard is dropped and ends the run.
     let _ = spawned;
+}
+
+/// End a persisted sign-in that no worker in this daemon runs once its
+/// deadline has passed (its recovery failed, or its worker could not record
+/// an outcome), so it cannot keep the setup waiting.
+pub(crate) fn end_stale_run() {
+    end_unworked_run(true);
+}
+
+fn end_unworked_run(only_past_deadline: bool) {
+    // Held throughout, so no run starts meanwhile; a worker clears it only
+    // after it recorded its outcome.
+    let active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
+    if active.is_some() {
+        return;
+    }
+    let store = store();
+    let Ok(status) = store.load() else {
+        return;
+    };
+    let operation = &status.setup_operation;
+    let (Some(operation_id), Some(sign_in)) = (
+        operation.operation_id.as_deref(),
+        operation.sign_in.as_ref(),
+    ) else {
+        return;
+    };
+    if sign_in.phase == CodexAccountSignInPhaseV1::Done {
+        return;
+    }
+    if only_past_deadline
+        && OffsetDateTime::parse(&sign_in.deadline_at, &Rfc3339)
+            .is_ok_and(|deadline| OffsetDateTime::now_utc() < deadline)
+    {
+        return;
+    }
+    let _ = store.finish_sign_in(
+        operation_id,
+        CodexAccountSignInOutcomeV1::Interrupted,
+        STOPPED_UNEXPECTEDLY_MESSAGE,
+    );
+    drop(active);
 }
 
 /// The sign-in outcome of a setup whose validation already settled it.
@@ -405,6 +475,17 @@ fn supervise_login(run: &Arc<Run>, home: &Path, deadline: Deadline) -> LoginEnd 
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    // Quota reads leave this home alone since the run began; the lock waits
+    // out one that was already reading (and rewriting `auth.json`).
+    let Ok(baseline) = crate::agent_status::with_codex_home_read_lock(home, || {
+        store().renew_sign_in_baseline(&run.operation_id)
+    }) else {
+        return LoginEnd::OperationGone;
+    };
+    // A stop while the run started opens no browser.
+    if run.cancelled() {
+        return LoginEnd::Ended(CodexAccountSignInOutcomeV1::Cancelled, CANCELLED_MESSAGE);
+    }
     let Ok(mut child) = command.spawn() else {
         return LoginEnd::Ended(
             CodexAccountSignInOutcomeV1::CodexUnavailable,
@@ -412,13 +493,14 @@ fn supervise_login(run: &Arc<Run>, home: &Path, deadline: Deadline) -> LoginEnd 
         );
     };
     let reported_success = Arc::new(AtomicBool::new(false));
-    if let Some(stderr) = child.stderr.take() {
+    let output_reader = child.stderr.take().and_then(|stderr| {
         let scan_run = Arc::clone(run);
         let reported = reported_success.clone();
-        let _ = thread::Builder::new()
+        thread::Builder::new()
             .name("ottto-codex-sign-in-output".to_string())
-            .spawn(move || scan_login_output(stderr, &scan_run, &reported));
-    }
+            .spawn(move || scan_login_output(stderr, &scan_run, &reported))
+            .ok()
+    });
     if store()
         .set_sign_in_phase(
             &run.operation_id,
@@ -431,9 +513,16 @@ fn supervise_login(run: &Arc<Run>, home: &Path, deadline: Deadline) -> LoginEnd 
     }
     let exit = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => break status,
             Ok(None) => {}
-            Err(_) => break None,
+            Err(_) => {
+                stop_login(&mut child, port);
+                run.set_url(None);
+                return LoginEnd::Ended(
+                    CodexAccountSignInOutcomeV1::LoginFailed,
+                    STOPPED_UNEXPECTEDLY_MESSAGE,
+                );
+            }
         }
         if run.cancelled() {
             stop_login(&mut child, port);
@@ -451,28 +540,51 @@ fn supervise_login(run: &Arc<Run>, home: &Path, deadline: Deadline) -> LoginEnd 
     if run.cancelled() {
         return LoginEnd::Ended(CodexAccountSignInOutcomeV1::Cancelled, CANCELLED_MESSAGE);
     }
+    // The success line may still be in the pipe.
+    if let Some(reader) = output_reader {
+        let waited = Instant::now() + OUTPUT_READ_WAIT;
+        while !reader.is_finished() && Instant::now() < waited {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let reported_success = reported_success.load(Ordering::SeqCst);
     let credential_changed = store()
         .active_sign_in()
         .ok()
         .flatten()
         .filter(|active| active.operation_id == run.operation_id)
         .is_some_and(|active| active.credential_changed());
-    if credential_changed {
+    if signed_in(
+        baseline.is_some(),
+        credential_changed,
+        exit,
+        reported_success,
+    ) {
         return LoginEnd::SignedIn;
     }
     LoginEnd::Ended(
         CodexAccountSignInOutcomeV1::LoginFailed,
-        ended_without_credential_message(exit, reported_success.load(Ordering::SeqCst)),
+        login_failed_message(exit, reported_success),
     )
 }
 
-fn ended_without_credential_message(
-    exit: Option<ExitStatus>,
+/// Whether `codex login` signed in. Only the CLI writes a credential into a
+/// home that had none: nothing reads or uses an unadopted home. A home that
+/// had one may also be rewritten by the person's own Codex sessions, so
+/// there the CLI must also have exited 0 and printed its success line.
+fn signed_in(
+    had_credential: bool,
+    credential_changed: bool,
+    exit: ExitStatus,
     reported_success: bool,
-) -> &'static str {
+) -> bool {
+    credential_changed && (!had_credential || (exit.success() && reported_success))
+}
+
+fn login_failed_message(exit: ExitStatus, reported_success: bool) -> &'static str {
     if reported_success {
         NOT_SAVED_MESSAGE
-    } else if exit.is_some_and(|status| status.success()) {
+    } else if exit.success() {
         ENDED_EARLY_MESSAGE
     } else {
         FAILED_MESSAGE
@@ -563,11 +675,14 @@ fn validation_outcome(end: CodexSetupValidationEnd) -> CodexAccountSignInOutcome
     }
 }
 
-/// End `codex login`: SIGTERM (the CLI then stops its callback server), then
-/// SIGKILL after [`TERMINATE_GRACE`]; then wait a short time for the port to
-/// be free.
+/// End `codex login` and its child processes (the `codex` wrapper's child
+/// listens on the port): SIGTERM, then SIGKILL after the grace time; then
+/// wait a short time for the port to be free.
 fn stop_login(child: &mut Child, port: u16) {
     if matches!(child.try_wait(), Ok(None)) {
+        // Found while they are still the wrapper's children: once it exits,
+        // they are nobody's.
+        let processes = LoginProcesses::below(child.id());
         #[cfg(unix)]
         if let Ok(pid) = libc::pid_t::try_from(child.id()) {
             // SAFETY: `pid` is our own child, not yet reaped.
@@ -575,19 +690,118 @@ fn stop_login(child: &mut Child, port: u16) {
                 libc::kill(pid, libc::SIGTERM);
             }
         }
-        let deadline = Instant::now() + TERMINATE_GRACE;
-        while Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+        processes.signal(libc::SIGTERM);
+        let deadline = Instant::now() + timings().terminate_grace;
+        while Instant::now() < deadline
+            && (matches!(child.try_wait(), Ok(None)) || processes.any_alive())
+        {
             thread::sleep(POLL_INTERVAL);
         }
         if matches!(child.try_wait(), Ok(None)) {
             let _ = child.kill();
         }
+        processes.signal(libc::SIGKILL);
     }
     let _ = child.wait();
     let deadline = Instant::now() + PORT_RELEASE_WAIT;
     while Instant::now() < deadline && port_in_use(port) {
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// The processes below a `codex login` wrapper, each with its start time, so
+/// a signal never reaches a process that reused a pid.
+struct LoginProcesses {
+    #[cfg(target_os = "macos")]
+    processes: Vec<(libc::pid_t, (u64, u64))>,
+}
+
+#[cfg(target_os = "macos")]
+impl LoginProcesses {
+    fn below(pid: u32) -> Self {
+        let mut processes = Vec::new();
+        let mut parents = libc::pid_t::try_from(pid).into_iter().collect::<Vec<_>>();
+        while let Some(parent) = parents.pop() {
+            for child in child_pids(parent) {
+                if processes.len() >= MAX_LOGIN_PROCESSES {
+                    return Self { processes };
+                }
+                if let Some(started) = process_started(child) {
+                    processes.push((child, started));
+                    parents.push(child);
+                }
+            }
+        }
+        Self { processes }
+    }
+
+    fn signal(&self, signal: libc::c_int) {
+        for (pid, started) in &self.processes {
+            if process_started(*pid) == Some(*started) {
+                // SAFETY: the same process found below our child: its pid
+                // and start time match.
+                unsafe {
+                    libc::kill(*pid, signal);
+                }
+            }
+        }
+    }
+
+    fn any_alive(&self) -> bool {
+        self.processes
+            .iter()
+            .any(|(pid, started)| process_started(*pid) == Some(*started))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl LoginProcesses {
+    fn below(_pid: u32) -> Self {
+        Self {}
+    }
+
+    fn signal(&self, _signal: libc::c_int) {}
+
+    fn any_alive(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn child_pids(parent: libc::pid_t) -> Vec<libc::pid_t> {
+    let mut buffer = vec![0 as libc::pid_t; MAX_LOGIN_PROCESSES];
+    let bytes =
+        libc::c_int::try_from(std::mem::size_of_val(buffer.as_slice())).unwrap_or(libc::c_int::MAX);
+    // SAFETY: the buffer is writable for `bytes` bytes and the call returns
+    // how many pids it wrote into it.
+    let count = unsafe { libc::proc_listchildpids(parent, buffer.as_mut_ptr().cast(), bytes) };
+    buffer.truncate(usize::try_from(count).unwrap_or(0).min(MAX_LOGIN_PROCESSES));
+    buffer.retain(|pid| *pid > 1);
+    buffer
+}
+
+/// A live process's start time; `None` once it is gone (or a zombie).
+#[cfg(target_os = "macos")]
+fn process_started(pid: libc::pid_t) -> Option<(u64, u64)> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: the buffer is writable for `size` bytes.
+    let returned = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if returned != size {
+        return None;
+    }
+    // SAFETY: the kernel filled the whole buffer.
+    let info = unsafe { info.assume_init() };
+    (u32::try_from(pid).ok() == Some(info.pbi_pid) && info.pbi_status != libc::SZOMB)
+        .then_some((info.pbi_start_tvsec, info.pbi_start_tvusec))
 }
 
 /// Whether something holds the local sign-in port: a server answers on it,
@@ -669,12 +883,14 @@ struct Timings {
     sign_in_timeout: Duration,
     check_retry_delay: Duration,
     login_port: u16,
+    terminate_grace: Duration,
 }
 
 const TIMINGS: Timings = Timings {
     sign_in_timeout: SIGN_IN_TIMEOUT,
     check_retry_delay: CHECK_RETRY_DELAY,
     login_port: CODEX_LOGIN_PORT,
+    terminate_grace: TERMINATE_GRACE,
 };
 
 #[cfg(not(test))]
@@ -708,6 +924,7 @@ impl TestTimingsGuard {
             sign_in_timeout,
             check_retry_delay,
             login_port,
+            terminate_grace: Duration::from_secs(1),
         });
         Self
     }
@@ -800,17 +1017,34 @@ mod tests {
     fn a_login_without_a_new_credential_says_why_plainly() {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(
-            ended_without_credential_message(Some(ExitStatus::from_raw(0)), false),
+            login_failed_message(ExitStatus::from_raw(0), false),
             ENDED_EARLY_MESSAGE
         );
         assert_eq!(
-            ended_without_credential_message(Some(ExitStatus::from_raw(1 << 8)), false),
+            login_failed_message(ExitStatus::from_raw(1 << 8), false),
             FAILED_MESSAGE
         );
         assert_eq!(
-            ended_without_credential_message(Some(ExitStatus::from_raw(0)), true),
+            login_failed_message(ExitStatus::from_raw(0), true),
             NOT_SAVED_MESSAGE
         );
+    }
+
+    /// A home without a credential gets one only from the CLI. In a home
+    /// that had one, a rewrite counts only with the CLI's own success.
+    #[cfg(unix)]
+    #[test]
+    fn a_home_that_had_a_credential_needs_the_cli_to_report_success() {
+        use std::os::unix::process::ExitStatusExt;
+        let ok = ExitStatus::from_raw(0);
+        let failed = ExitStatus::from_raw(1 << 8);
+        assert!(signed_in(false, true, ok, false));
+        assert!(signed_in(false, true, failed, false));
+        assert!(!signed_in(false, false, ok, true));
+        assert!(signed_in(true, true, ok, true));
+        assert!(!signed_in(true, true, ok, false));
+        assert!(!signed_in(true, true, failed, true));
+        assert!(!signed_in(true, false, ok, true));
     }
 
     #[test]

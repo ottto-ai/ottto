@@ -55,9 +55,12 @@ mod codex_last_known;
 mod codex_saved_quota;
 mod codex_setup_gate;
 
+#[cfg(test)]
+pub(crate) use codex_saved_quota::scheduled_round_now as codex_scheduled_round_now;
 pub use codex_saved_quota::start_codex_quota_scheduler;
 pub(crate) use codex_saved_quota::{
     refresh_codex_quota_now, saved_codex_quota_generation, stop_codex_quota_scheduler,
+    with_codex_home_read_lock,
 };
 #[cfg(test)]
 pub(crate) use codex_setup_gate::SetupGateTestClock;

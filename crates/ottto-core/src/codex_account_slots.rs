@@ -820,6 +820,35 @@ impl FileCodexAccountSlotSettingsStore {
         Ok(Some(home))
     }
 
+    /// Take the baseline of the active daemon-run sign-in of `operation_id`
+    /// again, just before `codex login` starts, and return it. The caller
+    /// holds the home's quota-read lock, so no read that rewrites the
+    /// credential is in flight.
+    pub fn renew_sign_in_baseline(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<CodexAuthFileMark>, CodexAccountSlotSettingsError> {
+        validate_setup_operation_id(operation_id)?;
+        let _transaction = self.transaction_lock()?;
+        let mut persisted = self.read_persisted()?;
+        self.validate_persisted(&persisted)?;
+        require_setup_operation(&persisted, operation_id)?;
+        if !sign_in_active(&persisted.setup_operation) {
+            return Err(CodexAccountSlotSettingsError::Invalid(
+                "the Codex sign-in has already ended".to_string(),
+            ));
+        }
+        let slot_id = persisted.setup_operation.slot_id.clone().ok_or_else(|| {
+            CodexAccountSlotSettingsError::Invalid(
+                "Codex setup operation has no durable connection slot".to_string(),
+            )
+        })?;
+        let auth = codex_auth_file_mark(&self.slot_home(&slot_id)?);
+        persisted.sign_in_baseline = Some(PersistedCodexSignInBaselineV1 { auth });
+        self.write_persisted(&persisted)?;
+        Ok(auth)
+    }
+
     /// Move an active daemon-run sign-in of `operation_id` to `phase`.
     pub fn set_sign_in_phase(
         &self,
@@ -2849,6 +2878,16 @@ mod tests {
         assert!(!active.credential_changed());
         fs::write(home.join("auth.json"), "{}").expect("credential");
         assert!(active.credential_changed());
+        // Taken again just before `codex login` starts, the baseline holds
+        // that credential.
+        let renewed = store
+            .renew_sign_in_baseline(&operation)
+            .expect("renew")
+            .expect("credential mark");
+        let active = store.active_sign_in().expect("read").expect("active");
+        assert_eq!(active.baseline, Some(renewed));
+        assert!(!active.credential_changed());
+        fs::remove_file(home.join("auth.json")).expect("remove credential");
 
         store
             .set_sign_in_phase(&operation, CodexAccountSignInPhaseV1::WaitingForBrowser)
@@ -2874,6 +2913,7 @@ mod tests {
         assert!(store
             .finish_sign_in(&operation, CodexAccountSignInOutcomeV1::Cancelled, "x")
             .is_err());
+        assert!(store.renew_sign_in_baseline(&operation).is_err());
         // A replay reports the outcome; nothing starts.
         assert!(begin_test_sign_in(&store, &operation)
             .expect("replay")
