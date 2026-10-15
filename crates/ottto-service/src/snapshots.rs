@@ -2610,7 +2610,10 @@ fn claude_duplicate_request_witness_within_bound(
 
 /// Content-free cause counters for one duplicate-census fold call, reported
 /// only in the local Claude evidence log line. They are observed alongside the
-/// fence and never read back: no gate, hash, index, or upload depends on them.
+/// fence and never read back by the census: no gate, hash, or index depends on
+/// them. Contract 5 alone reads one pass's counts, to withhold transcript-marker
+/// tags from a pass whose census did not settle
+/// (`claude_request_identity::TranscriptOwnership`).
 /// `fence_after && census_invalid` is an invalid census; `fence_after` without
 /// it is the owner bound. On a terminal pass, an invalid census with no invalid
 /// current-window family came from stale unquarantined pending. Page counters

@@ -763,8 +763,10 @@ fn claude_contract5_bodies_need_this_cycles_cohort_permit() {
     let token = Some(identity::COHORT_HINT_TOKEN);
     let dark = serde_json::to_vec(&run(None)).unwrap();
     for denied in [
-        // This build: emission compiled out, even with the exact token.
-        identity::emission_permit(claude, token).ok(),
+        // This build: emission compiled on, but a cycle without the exact
+        // token still gets no permit.
+        identity::emission_permit(claude, None).ok(),
+        identity::emission_permit(claude, Some(" own_request_identity_rows:v1")).ok(),
         identity::permit_when(true, claude, None).ok(),
         identity::permit_when(true, claude, Some("own_request_identity_rows:v2")).ok(),
         identity::permit_when(true, claude, Some(identity::COLLECTOR)).ok(),
@@ -777,6 +779,8 @@ fn claude_contract5_bodies_need_this_cycles_cohort_permit() {
     }
     let permitted = run(identity::permit_when(true, claude, token).ok());
     assert_eq!(collector(&permitted), identity::COLLECTOR);
+    let released = run(identity::emission_permit(claude, token).ok());
+    assert_eq!(serde_json::to_vec(&released).unwrap(), serde_json::to_vec(&permitted).unwrap());
     fs::remove_dir_all(dir).unwrap();
 }
 

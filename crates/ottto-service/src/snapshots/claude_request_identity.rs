@@ -33,9 +33,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
 
-/// The receiver must accept contract 5 on WEB and WORKER before any daemon
-/// emits it. Flipping this is a separate, parent-owned change.
-pub(crate) const EMISSION_ENABLED: bool = false;
+/// Compiled on. Each cycle still emits only under that cycle's exact cohort
+/// hint token (`emission_permit`); without it the body is today's.
+pub(crate) const EMISSION_ENABLED: bool = true;
 
 /// Marker capture and the census witness run only in a scan whose sync cycle
 /// holds an emission permit. Outside a cycle nothing captures in a released
@@ -446,6 +446,26 @@ impl Grouping {
 
     fn get(&self, bucket_start: &str, row_key: &RowKey) -> Option<&RowGroup> {
         self.groups.get(bucket_start)?.get(row_key)
+    }
+
+    /// Drops every tag that rests on transcript markers: the org-only and
+    /// sole-login bases, and a marker org joined to login-only telemetry. Their
+    /// usage stays on its row, untagged or login-only; refusals stay.
+    fn withdraw_transcript_tags(&mut self) {
+        for group in self.groups.values_mut().flat_map(BTreeMap::values_mut) {
+            let mut kept: BTreeMap<Option<AuthorityKey>, Amounts> = BTreeMap::new();
+            for (key, amounts) in std::mem::take(&mut group.by_key) {
+                let key = key.and_then(|key| match key.basis {
+                    TELEMETRY => Some(key),
+                    TELEMETRY_LOGIN => Some(AuthorityKey { org: None, ..key }),
+                    _ => None,
+                });
+                if kept.entry(key).or_default().merge(&amounts).is_none() {
+                    self.failed = Some(Ineligible::RowsNotReproduced);
+                }
+            }
+            group.by_key = kept;
+        }
     }
 
     fn rows(&self) -> impl Iterator<Item = (&RowKey, &RowGroup)> {
@@ -1078,6 +1098,13 @@ pub(crate) const TELEMETRY_FLUSH_WINDOW_SECONDS: u64 = 300;
 pub(crate) struct ScanEvidence<'a> {
     pub(crate) requests: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeLocalOtelEvidence>>,
     pub(crate) owners: BTreeMap<(&'a str, &'a str), Option<&'a ClaudeTraceOwnershipEvidence>>,
+    /// Each request id named by loaded API or trace rows, sorted, with the
+    /// one root holding them, or `None` when rows under several roots name
+    /// it. Rows are keyed by trace root, so this is how a fork or resume copy
+    /// under another root sees that the request already has an owner. Built
+    /// on the first request without rows of its own: a pass whose requests
+    /// all have their own rows never pays for it.
+    request_roots: std::cell::OnceCell<Vec<(&'a str, Option<&'a str>)>>,
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
     /// Roots with a qualified witness that their telemetry writer is healthy
@@ -1162,6 +1189,43 @@ impl<'a> ScanEvidence<'a> {
             }
         }
         evidence
+    }
+
+    /// The root whose rows name `request_id` (`Some(None)`: several roots).
+    fn request_root(&self, request_id: &str) -> Option<Option<&'a str>> {
+        let roots = self.request_roots.get_or_init(|| {
+            // Both maps are ordered by (root, request id); merging them
+            // yields each pair once.
+            let pairs = || {
+                let mut api = self.requests.keys().copied().peekable();
+                let mut trace = self.owners.keys().copied().peekable();
+                std::iter::from_fn(move || match (api.peek(), trace.peek()) {
+                    (Some(a), Some(t)) if a < t => api.next(),
+                    (Some(a), Some(t)) if a > t => trace.next(),
+                    (Some(_), Some(_)) => {
+                        trace.next();
+                        api.next()
+                    }
+                    (Some(_), None) => api.next(),
+                    (None, _) => trace.next(),
+                })
+            };
+            let mut roots = Vec::with_capacity(pairs().count());
+            roots.extend(pairs().map(|(root, request_id)| (request_id, Some(root))));
+            roots.sort_unstable();
+            roots.dedup_by(|later, kept| {
+                if later.0 != kept.0 {
+                    return false;
+                }
+                kept.1 = None;
+                true
+            });
+            roots
+        });
+        roots
+            .binary_search_by(|(known, _)| (*known).cmp(request_id))
+            .ok()
+            .map(|at| roots[at].1)
     }
 
     /// Adds this scan's status-coverage copy: the `transcript_email` window
@@ -1286,6 +1350,9 @@ pub(crate) struct RequestFacts<'a> {
     /// Registered-folder key when an unchanged email precedes this request.
     pub(crate) email_home: Option<&'a crate::claude_status_coverage::HomeKey>,
     pub(crate) session_start_unix_seconds: Option<u64>,
+    /// Another transcript also carries this request (the pass's duplicate
+    /// witness): it is not this transcript's alone.
+    pub(crate) duplicated_elsewhere: bool,
 }
 
 impl RequestFacts<'_> {
@@ -1400,6 +1467,17 @@ pub(crate) fn classify_ref<'k>(
                     Some(owner) if owner_is_foreign(owner, facts) => Refusal::ForeignOwner,
                     Some(_) => Refusal::IncompleteEvidence,
                 });
+            }
+            // Rows are keyed by trace root: a fork or resume copy holds its
+            // original's request with the original's rows under another root.
+            // Those rows own it; the copy's markers never claim it.
+            match evidence.request_root(facts.request_id) {
+                Some(Some(_)) => return Refused(Refusal::ForeignOwner),
+                Some(None) => return Refused(Refusal::ConflictingDuplicate),
+                None => {}
+            }
+            if facts.duplicated_elsewhere {
+                return Refused(Refusal::ConflictingDuplicate);
             }
             return match transcript_identity(evidence, facts) {
                 // A carried or missing clock cannot establish attribution.
@@ -1667,6 +1745,9 @@ pub(super) struct Request<'r> {
 /// each straight into a bounded `Grouping`; no request is retained.
 pub(crate) struct RequestSink<'s, 'a> {
     evidence: &'s ScanEvidence<'a>,
+    /// The duplicate witness, on the transcript path only; reported rows
+    /// carry their own telemetry owner.
+    duplicates: Option<&'s Duplicates>,
     root: String,
     desktop: bool,
     scan_unix_seconds: Option<u64>,
@@ -1683,6 +1764,7 @@ impl<'s, 'a> RequestSink<'s, 'a> {
     ) -> Option<Self> {
         Some(Self {
             evidence,
+            duplicates: None,
             root: owner_root(item)?.to_string(),
             desktop: item
                 .origin
@@ -1698,11 +1780,23 @@ impl<'s, 'a> RequestSink<'s, 'a> {
         })
     }
 
+    fn with_duplicates(mut self, duplicates: &'s Duplicates) -> Self {
+        self.duplicates = Some(duplicates);
+        self
+    }
+
     pub(super) fn add(&mut self, item: &SnapshotItem, request: Request<'_>) {
         if self.grouping.failed.is_some() {
             return;
         }
         let (sequence, event_clock_complete) = request.occurrence.unzip();
+        let duplicated_elsewhere = self.duplicates.is_some_and(|duplicates| {
+            !duplicates.is_empty()
+                && duplicates.contains_key(&format!(
+                    "{:x}",
+                    sha2::Sha256::digest(request.request_id.as_bytes())
+                ))
+        });
         let facts = RequestFacts {
             root: &self.root,
             source_session_id: &item.source_session_id,
@@ -1727,6 +1821,7 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                 _ => None,
             },
             session_start_unix_seconds: self.session_start_unix_seconds,
+            duplicated_elsewhere,
         };
         let identity = classify_ref(self.evidence, &facts);
         self.grouping.add(
@@ -1821,20 +1916,69 @@ fn owner_root(item: &SnapshotItem) -> Option<&str> {
     }
 }
 
-/// Tag every eligible Claude item of this pass. Runs before D1, which leaves
-/// new-collector items alone; ineligible items stay on today's path untouched.
-/// `reported` holds the groupings the reported rebuild produced this pass.
+type Duplicates = BTreeMap<String, BTreeSet<super::ClaudeDuplicateRequestOwner>>;
+
+/// What this pass's duplicate census settled about who holds a transcript
+/// request. Known only after the reported rebuild has updated the witness.
+pub(crate) struct TranscriptOwnership<'i> {
+    /// Request-id hashes that more than one transcript carries.
+    duplicates: &'i Duplicates,
+    /// The pass compared every indexed Claude transcript (complete census,
+    /// full coverage, valid, fence open). Only then can a request without
+    /// its own telemetry be shown to be this transcript's alone, so only then
+    /// may transcript markers tag it.
+    settled: bool,
+}
+
+impl<'i> TranscriptOwnership<'i> {
+    pub(crate) fn after_census(
+        index: &'i ScanIndex,
+        census: &super::ClaudeDuplicateCensusCounts,
+    ) -> Self {
+        Self {
+            duplicates: &index.claude_duplicate_request_owners,
+            settled: census.census_complete
+                && census.coverage_complete
+                && !census.census_invalid
+                && !census.fence_after,
+        }
+    }
+}
+
+/// A settled pass with no duplicates: what the classification tests assume.
+#[cfg(test)]
 pub(crate) fn apply_scan(
     snapshots: &mut [SnapshotItem],
     evidence: &ScanEvidence<'_>,
+    reported: BTreeMap<String, Grouping>,
+) -> ScanOutcome {
+    static NONE: Duplicates = BTreeMap::new();
+    apply_scan_with_ownership(
+        snapshots,
+        evidence,
+        reported,
+        &TranscriptOwnership {
+            duplicates: &NONE,
+            settled: true,
+        },
+    )
+}
+
+/// Tag every eligible Claude item of this pass. Runs before D1, which leaves
+/// new-collector items alone; ineligible items stay on today's path untouched.
+/// `reported` holds the groupings the reported rebuild produced this pass.
+pub(crate) fn apply_scan_with_ownership(
+    snapshots: &mut [SnapshotItem],
+    evidence: &ScanEvidence<'_>,
     mut reported: BTreeMap<String, Grouping>,
+    ownership: &TranscriptOwnership<'_>,
 ) -> ScanOutcome {
     let mut outcome = ScanOutcome::default();
     for item in snapshots {
         if item.provenance.collector != "claude_code_jsonl" {
             continue;
         }
-        match tag_item(item, evidence, &mut reported) {
+        match tag_item(item, evidence, &mut reported, ownership) {
             Some(Ok(Tagged::Sent { .. })) => outcome.sent += 1,
             Some(Ok(Tagged::Fallback { .. })) => outcome.fallback += 1,
             Some(Err(_)) | None => outcome.ineligible += 1,
@@ -1847,6 +1991,7 @@ fn tag_item(
     item: &mut SnapshotItem,
     evidence: &ScanEvidence<'_>,
     reported: &mut BTreeMap<String, Grouping>,
+    ownership: &TranscriptOwnership<'_>,
 ) -> Option<Result<Tagged, Ineligible>> {
     let root = owner_root(item)?;
     if !item.claude_context_curve_request_index_complete
@@ -1867,13 +2012,20 @@ fn tag_item(
     {
         return None;
     }
-    let grouping = if item.usage_accounting_contract.as_deref() == Some(REPORTED) {
+    let mut grouping = if item.usage_accounting_contract.as_deref() == Some(REPORTED) {
         reported.remove(&item.source_session_id)?
     } else {
-        let mut sink = RequestSink::for_item(evidence, item, bucket_row_count(item))?;
+        let mut sink = RequestSink::for_item(evidence, item, bucket_row_count(item))?
+            .with_duplicates(ownership.duplicates);
         transcript_requests(item, |request| sink.add(item, request))?;
         sink.finish()
     };
+    if !ownership.settled {
+        // An unmarked fork or resume copies its predecessor's lines, markers
+        // included, and nothing short of a fully compared pass shows which
+        // lines are copies: markers tag nothing this pass.
+        grouping.withdraw_transcript_tags();
+    }
     // D1 leaves new-collector items alone, so the backend UTC lifecycle
     // spelling it applies to every item it qualifies happens here, inside the
     // byte cap; an ineligible item returns to D1 exactly as it arrived.
