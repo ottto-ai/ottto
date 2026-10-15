@@ -20108,18 +20108,16 @@ fn apply_claude_settings_scope(
     user_file: bool,
     document: &Value,
 ) {
-    if let Some(model) = document
-        .get("model")
-        .and_then(Value::as_str)
-        .and_then(display_safe_config_scalar)
-    {
-        raw.model = Some((model, format!("{label}.model")));
-    }
+    // The winning `model` both names the model and selects its effort, so a
+    // model too unusual to display clears a lower file's model rather than
+    // pairing it with this model's effort.
     if let Some(model) = document
         .get("model")
         .and_then(Value::as_str)
         .filter(|model| !model.trim().is_empty())
     {
+        raw.model =
+            display_safe_config_scalar(model).map(|model| (model, format!("{label}.model")));
         raw.model_key = Some(claude_model_settings_key(model));
     }
     let mut top_level = document
@@ -36978,7 +36976,7 @@ mod tests {
         // A managed per-model entry overrides both.
         fs::write(
             &managed,
-            "{\"model\": \"claude-opus-5-5\", \"modelSettings\": {\"claude-opus-5-5\": {\"effortLevel\": \"low\"}}}\n",
+            "{\"model\": \"claude-opus-5-5[1m]\", \"modelSettings\": {\"claude-opus-5-5\": {\"effortLevel\": \"low\"}}}\n",
         )
         .expect("rewrite managed");
         assert_eq!(
@@ -36994,6 +36992,9 @@ mod tests {
         let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
             panic!("expected configured Claude defaults");
         };
+        // The managed model is too unusual to display, so the user's model is
+        // not shown beside the managed model's effort.
+        assert_eq!(defaults.model, None);
         assert_eq!(
             defaults.reasoning_effort_by_model,
             BTreeMap::from([
