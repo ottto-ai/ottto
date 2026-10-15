@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 654,
-  "content_sha256": "e5ef9353dd3e15b0adff1aa302782b1c2b8f8603ecdc3f422bd39690df037e3c",
+  "content_sha256": "c20721885103e0dc9a181039311ffe644d143e941f5643d38f326bcfd5037368",
   "files": [
     {
       "executable": false,
@@ -2820,8 +2820,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-15-claude-stable-family-proof-rearm.md",
-      "sha256": "2ad5b57eccd6b714a0ab5c6f894fd2cd98ff5fba85533c5ae49864cdc8ff6161",
-      "size_bytes": 10336
+      "sha256": "77ba0a992ab79bd47189f1e659e619712965a0faa2c6d8b5e98185ff670b59e5",
+      "size_bytes": 10414
     },
     {
       "executable": false,
@@ -4581,7 +4581,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-15T20:08:39+00:00",
+  "generated_at": "2026-10-15T20:09:46+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 655,
   "public_roots": [
@@ -4620,5 +4620,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "77badb5833a41762f4dd31ea48fc3aea09bfbb84"
+  "source_commit": "5f074d9f9c449e2234e652b2bc6e40744790c158"
 }
