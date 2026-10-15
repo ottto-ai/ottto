@@ -37,6 +37,12 @@ pub const CLAUDE_AUTH_CODE_CONTROL_PROTOCOL_VERSION: u16 = 25;
 /// The base protocol remains unchanged so older clients continue to use every
 /// unrelated command during a rolling local-runtime upgrade.
 pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 24;
+/// Command-scoped version for a Codex sign-in the daemon runs itself: it
+/// starts `codex login` for the managed home of the current setup operation,
+/// supervises it and checks the account once when it ends. The v24 commands
+/// keep their meaning; clients send v26 only when the status carries
+/// `daemon_sign_in_supported`.
+pub const CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION: u16 = 26;
 /// Destructive installation reset is command-scoped so an older daemon cannot
 /// accept the request while silently ignoring `forget_installation`.
 pub const INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION: u16 = 25;
@@ -2819,6 +2825,9 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         | LocalControlCommand::CodexAccountCheck { .. }
         | LocalControlCommand::CodexAccountStopWaiting { .. }
         | LocalControlCommand::CodexAccountRemove { .. } => CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+        LocalControlCommand::CodexAccountStartSignIn { .. } => {
+            CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION
+        }
         LocalControlCommand::AuthReset {
             forget_installation: true,
             ..
@@ -3392,6 +3401,73 @@ pub struct CodexAccountSetupOperationV1 {
     pub launch_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The daemon-run sign-in of this operation (v26), if one was started.
+    /// Older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<CodexAccountSignInV1>,
+}
+
+/// Where a daemon-run Codex sign-in is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSignInPhaseV1 {
+    /// `codex login` is being started.
+    Starting,
+    /// `codex login` runs and waits for the person to finish in the browser.
+    WaitingForBrowser,
+    /// The sign-in saved a credential; the daemon reads the account once.
+    CheckingAccount,
+    /// The run ended; `outcome` says how.
+    Done,
+}
+
+/// How a daemon-run Codex sign-in ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSignInOutcomeV1 {
+    /// The account and workspace were accepted.
+    Complete,
+    /// Another account or workspace signed in; the same operation may start a
+    /// sign-in again.
+    IdentityMismatch,
+    /// That account and workspace is already connected.
+    DuplicateAccount,
+    /// The workspace restriction did not hold in a fresh provider session.
+    WorkspaceNotKept,
+    /// The sign-in saved a credential, but the account could not be read
+    /// (twice, about 15 s apart).
+    CheckFailed,
+    /// `codex login` ended without saving a new credential.
+    LoginFailed,
+    /// Another Codex sign-in holds the local sign-in port, so none started.
+    PortBusy,
+    /// The sign-in did not finish within the time limit and was stopped.
+    TimedOut,
+    /// Stopped on request.
+    Cancelled,
+    /// The daemon restarted during the sign-in, and no new credential was
+    /// saved.
+    Interrupted,
+    /// The Codex CLI could not be found or started.
+    CodexUnavailable,
+}
+
+/// A daemon-run `codex login` for the operation's managed home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountSignInV1 {
+    pub phase: CodexAccountSignInPhaseV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<CodexAccountSignInOutcomeV1>,
+    pub started_at: Rfc3339Timestamp,
+    /// When the daemon stops a sign-in that has not finished.
+    pub deadline_at: Rfc3339Timestamp,
+    /// The provider's sign-in page for this run, as `codex login` printed it,
+    /// so a client can open it again or copy it (the CLI opens it in the
+    /// default browser once). Only while the run waits for the browser, only
+    /// through authenticated local control, never stored on disk. Clients
+    /// must not log, upload or show it as text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_url: Option<SecretString>,
 }
 
 impl Default for CodexAccountSetupOperationV1 {
@@ -3406,6 +3482,7 @@ impl Default for CodexAccountSetupOperationV1 {
             workspace_identifier_hash: None,
             launch_command: None,
             message: None,
+            sign_in: None,
         }
     }
 }
@@ -3590,6 +3667,11 @@ pub struct CodexAccountsStatusV1 {
     #[serde(default)]
     pub target_coverage: CodexAccountTargetCoverageV1,
     pub capacity: CodexAccountCapacityV1,
+    /// Presence is the capability bit for the v26 daemon-run sign-in
+    /// (`codex_account_start_sign_in`). Older daemons omit it; older clients
+    /// ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_sign_in_supported: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3938,6 +4020,16 @@ pub enum LocalControlCommand {
         /// Clients set it only for a person's action, never on a timer.
         #[serde(default, skip_serializing_if = "is_false")]
         explicit: bool,
+    },
+    /// v26: run `codex login` for the managed home of the current setup
+    /// operation (after prepare, prepare-open, prepare-target or reconnect, or
+    /// after an identity mismatch). The daemon supervises it, stops it after
+    /// ten minutes, and checks the account once when it ends; progress is in
+    /// `setup_operation.sign_in`. `codex_account_stop_waiting` cancels it.
+    /// Replaying the command while the run is active only returns status.
+    CodexAccountStartSignIn {
+        schema_version: u16,
+        operation_id: String,
     },
     /// Stop setup observation without signing out or deleting provider state.
     CodexAccountStopWaiting {
@@ -5010,6 +5102,7 @@ mod tests {
                 used_slots: 1,
                 remaining_slots: 9,
             },
+            daemon_sign_in_supported: None,
         };
 
         let wire = serde_json::to_value(&status).expect("serialize");
@@ -5019,6 +5112,96 @@ mod tests {
             "an empty blocker list must still be sent: {target}"
         );
         assert_eq!(target["setup_blockers"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn codex_start_sign_in_is_v26_only() {
+        let wire = serde_json::json!({
+            "request_id": "req_codex_sign_in",
+            "protocol_version": CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "codex_account_start_sign_in",
+            "schema_version": 1,
+            "operation_id": "codex_setup_0123456789abcdef0123456789abcdef"
+        });
+        let request =
+            serde_json::from_value::<LocalControlRequest>(wire.clone()).expect("v26 sign-in");
+        assert!(matches!(
+            request.command,
+            LocalControlCommand::CodexAccountStartSignIn { ref operation_id, schema_version: 1 }
+                if operation_id == "codex_setup_0123456789abcdef0123456789abcdef"
+        ));
+        assert_eq!(
+            serde_json::to_value(&request).expect("serialize")["command"],
+            "codex_account_start_sign_in"
+        );
+        for wrong in [
+            LOCAL_CONTROL_PROTOCOL_VERSION,
+            CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            CLAUDE_AUTH_CODE_CONTROL_PROTOCOL_VERSION,
+        ] {
+            let mut stale = wire.clone();
+            stale["protocol_version"] = serde_json::json!(wrong);
+            let error = serde_json::from_value::<LocalControlRequest>(stale)
+                .expect_err("the daemon-run sign-in rejects every other protocol");
+            assert!(error.to_string().contains("expected 26"));
+        }
+        assert_eq!(CODEX_SIGN_IN_CONTROL_PROTOCOL_VERSION, 26);
+    }
+
+    #[test]
+    fn codex_sign_in_status_is_additive_and_keeps_the_url_out_of_debug() {
+        // A v24 status (older daemon) has neither field.
+        let legacy: CodexAccountsStatusV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "setup_operation": {"state": "waiting_for_user_login"},
+            "default_slot": {"slot_id": "default", "ownership": "default", "collection": {"state": "unverified"}},
+            "capacity": {"max_slots": 10, "used_slots": 1, "remaining_slots": 9}
+        }))
+        .expect("v24 status decodes");
+        assert_eq!(legacy.daemon_sign_in_supported, None);
+        assert_eq!(legacy.setup_operation.sign_in, None);
+
+        let operation: CodexAccountSetupOperationV1 = serde_json::from_value(serde_json::json!({
+            "state": "waiting_for_user_login",
+            "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
+            "sign_in": {
+                "phase": "waiting_for_browser",
+                "started_at": "2026-10-15T12:00:00Z",
+                "deadline_at": "2026-10-15T12:10:00Z",
+                "sign_in_url": "https://auth.example.test/oauth/authorize?state=synthetic-state"
+            }
+        }))
+        .expect("v26 sign-in decodes");
+        let sign_in = operation.sign_in.clone().expect("sign-in");
+        assert_eq!(sign_in.phase, CodexAccountSignInPhaseV1::WaitingForBrowser);
+        assert_eq!(sign_in.outcome, None);
+        assert_eq!(
+            sign_in
+                .sign_in_url
+                .as_ref()
+                .map(SecretString::expose_secret),
+            Some("https://auth.example.test/oauth/authorize?state=synthetic-state")
+        );
+        assert!(!format!("{operation:?}").contains("synthetic-state"));
+
+        let done = serde_json::to_value(CodexAccountSignInV1 {
+            phase: CodexAccountSignInPhaseV1::Done,
+            outcome: Some(CodexAccountSignInOutcomeV1::PortBusy),
+            started_at: "2026-10-15T12:00:00Z".to_string(),
+            deadline_at: "2026-10-15T12:10:00Z".to_string(),
+            sign_in_url: None,
+        })
+        .expect("serialize");
+        assert_eq!(
+            done,
+            serde_json::json!({
+                "phase": "done",
+                "outcome": "port_busy",
+                "started_at": "2026-10-15T12:00:00Z",
+                "deadline_at": "2026-10-15T12:10:00Z"
+            })
+        );
     }
 
     #[test]

@@ -506,6 +506,13 @@ fn home_lock(home: &Path) -> Arc<Mutex<()>> {
     locks.entry(home_key(home)).or_default().clone()
 }
 
+/// Run `f` while no provider read of `home` runs: under the home's lock.
+pub(crate) fn with_codex_home_read_lock<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+    let lock_for_home = home_lock(home);
+    let _guard = lock(&lock_for_home);
+    f()
+}
+
 fn lock(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -868,12 +875,26 @@ pub(super) fn homes_in_use(
 /// slot, and recently seen process homes. Read from the stored settings on
 /// every tick, so a removed slot leaves the schedule at once. The device's
 /// upload grant does not matter: the companion shows these readings locally.
+///
+/// The home of a running daemon sign-in is left out, for the schedule and
+/// the explicit refresh alike: every read rewrites `auth.json`, and the
+/// sign-in decides by that file.
 fn scheduled_homes(support_dir: &Path, now: u64) -> Vec<ScheduledHome> {
-    let status = FileCodexAccountSlotSettingsStore::default()
+    let store = FileCodexAccountSlotSettingsStore::default();
+    let status = store
         .load()
         .unwrap_or_else(|_| empty_codex_accounts_status());
+    let signing_in = store
+        .active_sign_in()
+        .ok()
+        .flatten()
+        .map(|active| home_key(&active.home));
     let running = running_homes().clone();
-    scheduled_homes_from(support_dir, codex_home_slots(&status), &running, now)
+    let mut homes = scheduled_homes_from(support_dir, codex_home_slots(&status), &running, now);
+    if let Some(signing_in) = signing_in {
+        homes.retain(|home| home_key(&home.home) != signing_in);
+    }
+    homes
 }
 
 fn scheduled_homes_from(
@@ -1024,6 +1045,7 @@ fn scan_running_homes_if_due(now: u64) {
 
 /// One scheduler pass: read every due home. Returns how many were read.
 pub(super) fn scheduled_round(support_dir: &Path, now: u64) -> usize {
+    crate::codex_sign_in::end_stale_run();
     scan_running_homes_if_due(now);
     let homes = scheduled_homes(support_dir, now);
     if homes.is_empty() {
@@ -1038,6 +1060,12 @@ pub(super) fn scheduled_round(support_dir: &Path, now: u64) -> usize {
     scheduled_round_for(support_dir, homes, &sessions, now, |home| {
         read_codex_usage_from_provider(&home.home, home.trust)
     })
+}
+
+/// One scheduler pass in the support dir the daemon uses.
+#[cfg(test)]
+pub(crate) fn scheduled_round_now(now: u64) -> usize {
+    scheduled_round(&saved_quota_support_dir(), now)
 }
 
 /// What an explicit refresh did.

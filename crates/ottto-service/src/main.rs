@@ -275,6 +275,7 @@ fn main() -> Result<()> {
                     eprintln!("pending relay credential recovery deferred");
                 }
                 ottto_service::claude_browser_auth::recover_at_startup();
+                ottto_service::codex_sign_in::recover_at_startup();
                 let token = load_or_create_control_token()?;
                 let daemon = LocalDaemon::new(
                     local_machine(),
@@ -317,6 +318,7 @@ fn main() -> Result<()> {
                 eprintln!("pending relay credential recovery deferred");
             }
             ottto_service::claude_browser_auth::recover_at_startup();
+            ottto_service::codex_sign_in::recover_at_startup();
             let token = load_or_create_control_token()?;
             let daemon = LocalDaemon::new(
                 local_machine(),

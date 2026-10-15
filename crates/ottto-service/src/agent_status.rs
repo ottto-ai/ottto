@@ -55,9 +55,12 @@ mod codex_last_known;
 mod codex_saved_quota;
 mod codex_setup_gate;
 
+#[cfg(test)]
+pub(crate) use codex_saved_quota::scheduled_round_now as codex_scheduled_round_now;
 pub use codex_saved_quota::start_codex_quota_scheduler;
 pub(crate) use codex_saved_quota::{
     refresh_codex_quota_now, saved_codex_quota_generation, stop_codex_quota_scheduler,
+    with_codex_home_read_lock,
 };
 #[cfg(test)]
 pub(crate) use codex_setup_gate::SetupGateTestClock;
@@ -2998,6 +3001,7 @@ fn empty_codex_accounts_status() -> CodexAccountsStatusV1 {
             used_slots: 1,
             remaining_slots: ottto_core::MAX_CODEX_ACCOUNT_SLOTS.saturating_sub(1),
         },
+        daemon_sign_in_supported: None,
     }
 }
 
@@ -18343,6 +18347,12 @@ fn run_codex_home_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     run_prepared_command_capture(command, timeout)
+}
+
+/// `codex login` for one managed home, with the same binary, PATH and clean
+/// environment as the home's quota reads. `None` when Codex is not found.
+pub(crate) fn codex_login_command(codex_home: &Path) -> Option<Command> {
+    resolved_codex_home_command(codex_home, &["login"], false)
 }
 
 /// Resolve Codex once and run it with one exact credential home. Ambient

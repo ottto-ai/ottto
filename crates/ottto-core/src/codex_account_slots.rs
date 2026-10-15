@@ -1,5 +1,6 @@
 use ottto_protocol::{
     CodexAccountCapacityV1, CodexAccountSetupOperationStateV1, CodexAccountSetupOperationV1,
+    CodexAccountSignInOutcomeV1, CodexAccountSignInPhaseV1, CodexAccountSignInV1,
     CodexAccountSlotCollectionStatusV1, CodexAccountSlotDescriptorV1, CodexAccountSlotOwnershipV1,
     CodexAccountTargetCoverageV1, CodexAccountsStatusV1,
     CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
@@ -61,6 +62,73 @@ struct PersistedCodexAccountSlotsV1 {
     /// on adoption and its tree is removed if the setup is abandoned.
     #[serde(default)]
     pending_open_slot_id: Option<String>,
+    /// The home's `auth.json` when the daemon-run sign-in of the setup
+    /// operation started, while that run has not ended. A credential that
+    /// appeared or changed since is the sign-in's result: `codex login`
+    /// exits 0 both when it saved one and when it was stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sign_in_baseline: Option<PersistedCodexSignInBaselineV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedCodexSignInBaselineV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth: Option<CodexAuthFileMark>,
+}
+
+/// Metadata of a Codex home's `auth.json`, enough to tell that the file was
+/// written: Codex replaces the whole file when it saves a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAuthFileMark {
+    modified_secs: u64,
+    modified_nanos: u32,
+    len: u64,
+    inode: u64,
+}
+
+/// The current mark of `<home>/auth.json`, or `None` when there is no such
+/// regular file. A symlink is never followed.
+pub fn codex_auth_file_mark(home: &Path) -> Option<CodexAuthFileMark> {
+    let metadata = fs::symlink_metadata(home.join("auth.json")).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.ino()
+    };
+    #[cfg(not(unix))]
+    let inode = 0;
+    Some(CodexAuthFileMark {
+        modified_secs: modified.as_secs(),
+        modified_nanos: modified.subsec_nanos(),
+        len: metadata.len(),
+        inode,
+    })
+}
+
+/// A daemon-run sign-in that has not ended, as persisted.
+#[derive(Debug, Clone)]
+pub struct CodexActiveSignIn {
+    pub operation_id: String,
+    pub home: PathBuf,
+    pub phase: CodexAccountSignInPhaseV1,
+    /// `auth.json` when the run started.
+    pub baseline: Option<CodexAuthFileMark>,
+}
+
+impl CodexActiveSignIn {
+    /// Whether the home's credential appeared or changed since the run
+    /// started.
+    pub fn credential_changed(&self) -> bool {
+        codex_auth_file_mark(&self.home).is_some_and(|current| Some(current) != self.baseline)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +150,7 @@ impl Default for PersistedCodexAccountSlotsV1 {
             setup_preserves_accepted_binding: false,
             verifying_pinned_workspace: false,
             pending_open_slot_id: None,
+            sign_in_baseline: None,
         }
     }
 }
@@ -213,7 +282,9 @@ impl FileCodexAccountSlotSettingsStore {
                 "Complete the official Codex sign-in and pick any workspace you want to keep."
                     .to_string(),
             ),
+            sign_in: None,
         };
+        persisted.sign_in_baseline = None;
         self.write_persisted(&persisted)?;
         Ok(status_contract(&persisted))
     }
@@ -353,7 +424,9 @@ impl FileCodexAccountSlotSettingsStore {
                 "Complete the official Codex sign-in and select the intended workspace."
                     .to_string(),
             ),
+            sign_in: None,
         };
+        persisted.sign_in_baseline = None;
         persisted.setup_preserves_accepted_binding = false;
         persisted.verifying_pinned_workspace = false;
         self.write_persisted(&persisted)?;
@@ -430,7 +503,9 @@ impl FileCodexAccountSlotSettingsStore {
             message: Some(
                 "Sign in again through Codex for this exact account and workspace.".to_string(),
             ),
+            sign_in: None,
         };
+        persisted.sign_in_baseline = None;
         persisted.setup_preserves_accepted_binding = true;
         persisted.verifying_pinned_workspace = false;
         self.write_persisted(&persisted)?;
@@ -645,17 +720,7 @@ impl FileCodexAccountSlotSettingsStore {
         validate_setup_operation_id(operation_id)?;
         self.mutate(|persisted| {
             require_setup_operation(persisted, operation_id)?;
-            if !persisted.setup_preserves_accepted_binding {
-                if let Some(slot_id) = persisted.setup_operation.slot_id.as_deref() {
-                    if let Some(binding) = persisted.managed_bindings.get_mut(slot_id) {
-                        binding.accepted = false;
-                    }
-                }
-            }
-            persisted.setup_operation.state = CodexAccountSetupOperationStateV1::SetupFailed;
-            persisted.verifying_pinned_workspace = false;
-            persisted.setup_operation.launch_command = None;
-            persisted.setup_operation.message = Some(message.to_string());
+            fail_setup(persisted, message);
             Ok(())
         })
     }
@@ -670,19 +735,219 @@ impl FileCodexAccountSlotSettingsStore {
         let mut pending_open_to_discard: Option<String> = None;
         let status = self.mutate(|persisted| {
             require_setup_operation(persisted, operation_id)?;
-            persisted.setup_operation.state = CodexAccountSetupOperationStateV1::SetupStopped;
-            persisted.verifying_pinned_workspace = false;
-            pending_open_to_discard = persisted.pending_open_slot_id.take();
-            if pending_open_to_discard.is_some()
-                && persisted.setup_operation.slot_id == pending_open_to_discard
-            {
-                persisted.setup_operation.slot_id = None;
-            }
-            persisted.setup_operation.launch_command = None;
-            persisted.setup_operation.message = Some(
-                "Stopped waiting; the Codex home and provider credential were left untouched."
-                    .to_string(),
+            pending_open_to_discard = stop_setup(
+                persisted,
+                "Stopped waiting; the Codex home and provider credential were left untouched.",
             );
+            // A daemon-run sign-in ends with it. While `codex login` runs,
+            // the daemon ends it first and records this itself.
+            if sign_in_active(&persisted.setup_operation) {
+                persisted.sign_in_baseline = None;
+                if let Some(sign_in) = persisted.setup_operation.sign_in.as_mut() {
+                    sign_in.phase = CodexAccountSignInPhaseV1::Done;
+                    sign_in.outcome = Some(CodexAccountSignInOutcomeV1::Cancelled);
+                    sign_in.sign_in_url = None;
+                }
+            }
+            Ok(())
+        })?;
+        if let Some(slot_id) = pending_open_to_discard {
+            self.delete_managed_slot_tree(&slot_id)?;
+        }
+        Ok(status)
+    }
+
+    /// Record the start of a daemon-run sign-in for the operation's managed
+    /// home and return the home. Allowed while the operation waits for
+    /// sign-in or after an identity mismatch, never for the default home.
+    /// `Ok(None)` when a run of this operation is active or has ended for
+    /// good: the caller only reports status.
+    pub fn begin_sign_in(
+        &self,
+        schema_version: u16,
+        operation_id: &str,
+        started_at: String,
+        deadline_at: String,
+    ) -> Result<Option<PathBuf>, CodexAccountSlotSettingsError> {
+        validate_schema_version(schema_version)?;
+        validate_setup_operation_id(operation_id)?;
+        let _transaction = self.transaction_lock()?;
+        let mut persisted = self.read_persisted()?;
+        self.validate_persisted(&persisted)?;
+        require_setup_operation(&persisted, operation_id)?;
+        if sign_in_active(&persisted.setup_operation) {
+            return Ok(None);
+        }
+        let can_sign_in = matches!(
+            persisted.setup_operation.state,
+            CodexAccountSetupOperationStateV1::WaitingForUserLogin
+                | CodexAccountSetupOperationStateV1::IdentityMismatch
+        ) && !persisted.verifying_pinned_workspace;
+        // A replay after this operation's sign-in ended reports its outcome.
+        if !can_sign_in && persisted.setup_operation.sign_in.is_some() {
+            return Ok(None);
+        }
+        if !can_sign_in {
+            return Err(CodexAccountSlotSettingsError::Invalid(
+                "This Codex setup is not waiting for a sign-in.".to_string(),
+            ));
+        }
+        let slot_id = persisted.setup_operation.slot_id.clone().ok_or_else(|| {
+            CodexAccountSlotSettingsError::Invalid(
+                "Codex setup operation has no durable connection slot".to_string(),
+            )
+        })?;
+        let home = self.slot_home(&slot_id)?;
+        persisted.setup_operation.state = CodexAccountSetupOperationStateV1::WaitingForUserLogin;
+        persisted.setup_operation.account_identifier_hash = None;
+        persisted.setup_operation.workspace_identifier_hash = None;
+        // Another client must not start a second `codex login` for this
+        // home: they would take over each other's sign-in port.
+        persisted.setup_operation.launch_command = None;
+        persisted.setup_operation.message =
+            Some("Finish signing in to Codex in your browser.".to_string());
+        persisted.setup_operation.sign_in = Some(CodexAccountSignInV1 {
+            phase: CodexAccountSignInPhaseV1::Starting,
+            outcome: None,
+            started_at,
+            deadline_at,
+            sign_in_url: None,
+        });
+        persisted.sign_in_baseline = Some(PersistedCodexSignInBaselineV1 {
+            auth: codex_auth_file_mark(&home),
+        });
+        self.write_persisted(&persisted)?;
+        Ok(Some(home))
+    }
+
+    /// Take the baseline of the active daemon-run sign-in of `operation_id`
+    /// again, just before `codex login` starts, and return it. The caller
+    /// holds the home's quota-read lock, so no read that rewrites the
+    /// credential is in flight.
+    pub fn renew_sign_in_baseline(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<CodexAuthFileMark>, CodexAccountSlotSettingsError> {
+        validate_setup_operation_id(operation_id)?;
+        let _transaction = self.transaction_lock()?;
+        let mut persisted = self.read_persisted()?;
+        self.validate_persisted(&persisted)?;
+        require_setup_operation(&persisted, operation_id)?;
+        if !sign_in_active(&persisted.setup_operation) {
+            return Err(CodexAccountSlotSettingsError::Invalid(
+                "the Codex sign-in has already ended".to_string(),
+            ));
+        }
+        let slot_id = persisted.setup_operation.slot_id.clone().ok_or_else(|| {
+            CodexAccountSlotSettingsError::Invalid(
+                "Codex setup operation has no durable connection slot".to_string(),
+            )
+        })?;
+        let auth = codex_auth_file_mark(&self.slot_home(&slot_id)?);
+        persisted.sign_in_baseline = Some(PersistedCodexSignInBaselineV1 { auth });
+        self.write_persisted(&persisted)?;
+        Ok(auth)
+    }
+
+    /// Move an active daemon-run sign-in of `operation_id` to `phase`.
+    pub fn set_sign_in_phase(
+        &self,
+        operation_id: &str,
+        phase: CodexAccountSignInPhaseV1,
+    ) -> Result<(), CodexAccountSlotSettingsError> {
+        validate_setup_operation_id(operation_id)?;
+        self.mutate(|persisted| {
+            require_setup_operation(persisted, operation_id)?;
+            if !sign_in_active(&persisted.setup_operation) {
+                return Err(CodexAccountSlotSettingsError::Invalid(
+                    "the Codex sign-in has already ended".to_string(),
+                ));
+            }
+            if let Some(sign_in) = persisted.setup_operation.sign_in.as_mut() {
+                sign_in.phase = phase;
+            }
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// The daemon-run sign-in that has not ended, if any.
+    pub fn active_sign_in(
+        &self,
+    ) -> Result<Option<CodexActiveSignIn>, CodexAccountSlotSettingsError> {
+        let persisted = self.read_persisted()?;
+        self.validate_persisted(&persisted)?;
+        if !sign_in_active(&persisted.setup_operation) {
+            return Ok(None);
+        }
+        let (Some(operation_id), Some(slot_id), Some(sign_in)) = (
+            persisted.setup_operation.operation_id.clone(),
+            persisted.setup_operation.slot_id.clone(),
+            persisted.setup_operation.sign_in.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(CodexActiveSignIn {
+            operation_id,
+            home: self.slot_home(&slot_id)?,
+            phase: sign_in.phase,
+            baseline: persisted
+                .sign_in_baseline
+                .as_ref()
+                .and_then(|baseline| baseline.auth),
+        }))
+    }
+
+    /// End the daemon-run sign-in of `operation_id` with `outcome`.
+    ///
+    /// The account outcomes (`complete`, `identity_mismatch`,
+    /// `duplicate_account`, `workspace_not_kept`, `check_failed`) follow a
+    /// validation that already set the setup state; they only record the
+    /// outcome. `cancelled`, `timed_out` and `interrupted` stop the setup as
+    /// `codex_account_stop_waiting` does, removing an unadopted open home;
+    /// the caller must have ended `codex login` first. `login_failed`,
+    /// `port_busy` and `codex_unavailable` fail it. `message` replaces the
+    /// setup message for those.
+    pub fn finish_sign_in(
+        &self,
+        operation_id: &str,
+        outcome: CodexAccountSignInOutcomeV1,
+        message: &str,
+    ) -> Result<CodexAccountsStatusV1, CodexAccountSlotSettingsError> {
+        validate_setup_operation_id(operation_id)?;
+        let mut pending_open_to_discard: Option<String> = None;
+        let status = self.mutate(|persisted| {
+            require_setup_operation(persisted, operation_id)?;
+            if !sign_in_active(&persisted.setup_operation) {
+                return Err(CodexAccountSlotSettingsError::Invalid(
+                    "the Codex sign-in has already ended".to_string(),
+                ));
+            }
+            match outcome {
+                CodexAccountSignInOutcomeV1::Complete
+                | CodexAccountSignInOutcomeV1::IdentityMismatch
+                | CodexAccountSignInOutcomeV1::DuplicateAccount
+                | CodexAccountSignInOutcomeV1::WorkspaceNotKept
+                | CodexAccountSignInOutcomeV1::CheckFailed => {}
+                CodexAccountSignInOutcomeV1::Cancelled
+                | CodexAccountSignInOutcomeV1::TimedOut
+                | CodexAccountSignInOutcomeV1::Interrupted => {
+                    pending_open_to_discard = stop_setup(persisted, message);
+                }
+                CodexAccountSignInOutcomeV1::LoginFailed
+                | CodexAccountSignInOutcomeV1::PortBusy
+                | CodexAccountSignInOutcomeV1::CodexUnavailable => {
+                    fail_setup(persisted, message);
+                }
+            }
+            // A sign-in again after a mismatch is the daemon's to run.
+            persisted.setup_operation.launch_command = None;
+            persisted.sign_in_baseline = None;
+            if let Some(sign_in) = persisted.setup_operation.sign_in.as_mut() {
+                sign_in.phase = CodexAccountSignInPhaseV1::Done;
+                sign_in.outcome = Some(outcome);
+                sign_in.sign_in_url = None;
+            }
             Ok(())
         })?;
         if let Some(slot_id) = pending_open_to_discard {
@@ -1105,6 +1370,7 @@ fn status_contract(persisted: &PersistedCodexAccountSlotsV1) -> CodexAccountsSta
             used_slots,
             remaining_slots: MAX_CODEX_ACCOUNT_SLOTS.saturating_sub(used_slots),
         },
+        daemon_sign_in_supported: None,
     }
 }
 
@@ -1259,6 +1525,46 @@ fn remove_directory_contents_fd(directory: &fs::File) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn remove_managed_slot_tree_fd(managed_root: &Path, slot_id: &str) -> std::io::Result<()> {
     fs::remove_dir_all(managed_root.join(slot_id))
+}
+
+/// Whether the operation has a daemon-run sign-in that has not ended.
+fn sign_in_active(operation: &CodexAccountSetupOperationV1) -> bool {
+    operation
+        .sign_in
+        .as_ref()
+        .is_some_and(|sign_in| sign_in.phase != CodexAccountSignInPhaseV1::Done)
+}
+
+/// Stop the setup without touching provider state. Returns an unadopted open
+/// slot whose tree the caller removes after writing.
+fn stop_setup(persisted: &mut PersistedCodexAccountSlotsV1, message: &str) -> Option<String> {
+    persisted.setup_operation.state = CodexAccountSetupOperationStateV1::SetupStopped;
+    persisted.verifying_pinned_workspace = false;
+    let pending_open_to_discard = persisted.pending_open_slot_id.take();
+    if pending_open_to_discard.is_some()
+        && persisted.setup_operation.slot_id == pending_open_to_discard
+    {
+        persisted.setup_operation.slot_id = None;
+    }
+    persisted.setup_operation.launch_command = None;
+    persisted.setup_operation.message = Some(message.to_string());
+    pending_open_to_discard
+}
+
+/// Fail the setup. A new binding stays unaccepted; a reconnect keeps its
+/// accepted one.
+fn fail_setup(persisted: &mut PersistedCodexAccountSlotsV1, message: &str) {
+    if !persisted.setup_preserves_accepted_binding {
+        if let Some(slot_id) = persisted.setup_operation.slot_id.as_deref() {
+            if let Some(binding) = persisted.managed_bindings.get_mut(slot_id) {
+                binding.accepted = false;
+            }
+        }
+    }
+    persisted.setup_operation.state = CodexAccountSetupOperationStateV1::SetupFailed;
+    persisted.verifying_pinned_workspace = false;
+    persisted.setup_operation.launch_command = None;
+    persisted.setup_operation.message = Some(message.to_string());
 }
 
 fn require_setup_operation(
@@ -2521,5 +2827,205 @@ mod tests {
             assert_eq!(status.setup_operation.state, expected);
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    fn begin_test_sign_in(
+        store: &FileCodexAccountSlotSettingsStore,
+        operation: &str,
+    ) -> Result<Option<PathBuf>, CodexAccountSlotSettingsError> {
+        store.begin_sign_in(
+            CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+            operation,
+            "2026-10-15T12:00:00Z".to_string(),
+            "2026-10-15T12:10:00Z".to_string(),
+        )
+    }
+
+    #[test]
+    fn daemon_sign_in_records_its_run_and_ends_once() {
+        let (root, store) = test_store("sign-in");
+        let operation = format!("codex_setup_{}", "a".repeat(32));
+        let prepared = store
+            .prepare_open_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                operation.clone(),
+            )
+            .expect("open prepare");
+        let slot_id = prepared.setup_operation.slot_id.expect("reserved slot");
+
+        let home = begin_test_sign_in(&store, &operation)
+            .expect("start")
+            .expect("a new run");
+        assert_eq!(home, store.slot_home(&slot_id).expect("home"));
+        let status = store.load().expect("status");
+        let sign_in = status.setup_operation.sign_in.expect("run recorded");
+        assert_eq!(sign_in.phase, CodexAccountSignInPhaseV1::Starting);
+        assert_eq!(sign_in.outcome, None);
+        assert_eq!(sign_in.deadline_at, "2026-10-15T12:10:00Z");
+        assert_eq!(status.setup_operation.launch_command, None);
+        assert_eq!(
+            status.setup_operation.state,
+            CodexAccountSetupOperationStateV1::WaitingForUserLogin
+        );
+        // A replay while the run is active starts nothing.
+        assert!(begin_test_sign_in(&store, &operation)
+            .expect("replay")
+            .is_none());
+
+        let active = store.active_sign_in().expect("read").expect("active");
+        assert_eq!(active.operation_id, operation);
+        assert_eq!(active.baseline, None);
+        assert!(!active.credential_changed());
+        fs::write(home.join("auth.json"), "{}").expect("credential");
+        assert!(active.credential_changed());
+        // Taken again just before `codex login` starts, the baseline holds
+        // that credential.
+        let renewed = store
+            .renew_sign_in_baseline(&operation)
+            .expect("renew")
+            .expect("credential mark");
+        let active = store.active_sign_in().expect("read").expect("active");
+        assert_eq!(active.baseline, Some(renewed));
+        assert!(!active.credential_changed());
+        fs::remove_file(home.join("auth.json")).expect("remove credential");
+
+        store
+            .set_sign_in_phase(&operation, CodexAccountSignInPhaseV1::WaitingForBrowser)
+            .expect("phase");
+        let ended = store
+            .finish_sign_in(
+                &operation,
+                CodexAccountSignInOutcomeV1::TimedOut,
+                "The Codex sign-in took too long and was stopped.",
+            )
+            .expect("finish");
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupStopped
+        );
+        let sign_in = ended.setup_operation.sign_in.expect("run kept");
+        assert_eq!(sign_in.phase, CodexAccountSignInPhaseV1::Done);
+        assert_eq!(sign_in.outcome, Some(CodexAccountSignInOutcomeV1::TimedOut));
+        // An abandoned open setup frees its home, as stop-waiting does.
+        assert!(!home.exists());
+        assert!(store.active_sign_in().expect("read").is_none());
+        // It ends once.
+        assert!(store
+            .finish_sign_in(&operation, CodexAccountSignInOutcomeV1::Cancelled, "x")
+            .is_err());
+        assert!(store.renew_sign_in_baseline(&operation).is_err());
+        // A replay reports the outcome; nothing starts.
+        assert!(begin_test_sign_in(&store, &operation)
+            .expect("replay")
+            .is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_sign_in_after_a_mismatch_reuses_the_operation_and_failure_keeps_the_home() {
+        let (root, store) = test_store("sign-in-again");
+        let operation = format!("codex_setup_{}", "b".repeat(32));
+        store
+            .prepare_managed_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                operation.clone(),
+                "c".repeat(64),
+                "d".repeat(64),
+            )
+            .expect("prepare");
+        let home = begin_test_sign_in(&store, &operation)
+            .expect("start")
+            .expect("run");
+        fs::write(home.join("auth.json"), "{}").expect("credential");
+        store
+            .begin_validation(CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION, &operation)
+            .expect("validating");
+        let mismatch = store
+            .finish_validation(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                &operation,
+                "e".repeat(64),
+                "f".repeat(64),
+                "synthetic-workspace",
+                false,
+            )
+            .expect("mismatch");
+        assert_eq!(
+            mismatch.setup_operation.state,
+            CodexAccountSetupOperationStateV1::IdentityMismatch
+        );
+        let ended = store
+            .finish_sign_in(
+                &operation,
+                CodexAccountSignInOutcomeV1::IdentityMismatch,
+                "",
+            )
+            .expect("finish");
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::IdentityMismatch
+        );
+        assert_eq!(ended.setup_operation.launch_command, None);
+        assert!(ended.setup_operation.message.is_some_and(|m| !m.is_empty()));
+
+        // Sign in again on the same operation: the baseline is the wrong
+        // account's credential.
+        let again = begin_test_sign_in(&store, &operation)
+            .expect("again")
+            .expect("run");
+        assert_eq!(again, home);
+        let active = store.active_sign_in().expect("read").expect("active");
+        assert!(active.baseline.is_some());
+        assert!(!active.credential_changed());
+        let status = store.load().expect("status");
+        assert_eq!(
+            status.setup_operation.state,
+            CodexAccountSetupOperationStateV1::WaitingForUserLogin
+        );
+        assert_eq!(status.setup_operation.account_identifier_hash, None);
+
+        let failed = store
+            .finish_sign_in(
+                &operation,
+                CodexAccountSignInOutcomeV1::LoginFailed,
+                "The Codex sign-in ended before it finished.",
+            )
+            .expect("fail");
+        assert_eq!(
+            failed.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupFailed
+        );
+        assert_eq!(
+            failed.setup_operation.message.as_deref(),
+            Some("The Codex sign-in ended before it finished.")
+        );
+        assert!(home.exists(), "a failed target setup keeps its home");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_waiting_ends_a_recorded_sign_in_as_cancelled() {
+        let (root, store) = test_store("sign-in-stop");
+        let operation = format!("codex_setup_{}", "c".repeat(32));
+        store
+            .prepare_open_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                operation.clone(),
+            )
+            .expect("open prepare");
+        begin_test_sign_in(&store, &operation)
+            .expect("start")
+            .expect("run");
+        let stopped = store
+            .stop_waiting(CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION, &operation)
+            .expect("stop");
+        let sign_in = stopped.setup_operation.sign_in.expect("run");
+        assert_eq!(sign_in.phase, CodexAccountSignInPhaseV1::Done);
+        assert_eq!(
+            sign_in.outcome,
+            Some(CodexAccountSignInOutcomeV1::Cancelled)
+        );
+        assert!(store.active_sign_in().expect("read").is_none());
+        let _ = fs::remove_dir_all(root);
     }
 }

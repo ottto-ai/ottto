@@ -1141,7 +1141,10 @@ fn handle_command(
         }
         LocalControlCommand::CodexAccountsStatus => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(load_codex_account_settings_for_status_read()?)
+            crate::codex_sign_in::end_stale_run();
+            to_value(crate::codex_sign_in::present(
+                load_codex_account_settings_for_status_read()?,
+            ))
         }
         LocalControlCommand::CodexAccountPrepare {
             schema_version,
@@ -1150,19 +1153,22 @@ fn handle_command(
             expected_workspace_identifier_hash,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(prepare_codex_account(
+            to_value(crate::codex_sign_in::present(prepare_codex_account(
                 schema_version,
                 operation_id,
                 expected_account_identifier_hash,
                 expected_workspace_identifier_hash,
-            )?)
+            )?))
         }
         LocalControlCommand::CodexAccountPrepareOpen {
             schema_version,
             operation_id,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(prepare_open_codex_account(schema_version, operation_id)?)
+            to_value(crate::codex_sign_in::present(prepare_open_codex_account(
+                schema_version,
+                operation_id,
+            )?))
         }
         LocalControlCommand::CodexAccountPrepareTarget {
             schema_version,
@@ -1170,11 +1176,11 @@ fn handle_command(
             target_id,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(prepare_codex_account_target(
+            to_value(crate::codex_sign_in::present(prepare_codex_account_target(
                 schema_version,
                 operation_id,
                 target_id,
-            )?)
+            )?))
         }
         LocalControlCommand::CodexAccountReconnect {
             schema_version,
@@ -1184,13 +1190,13 @@ fn handle_command(
             expected_workspace_identifier_hash,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(reconnect_codex_account(
+            to_value(crate::codex_sign_in::present(reconnect_codex_account(
                 schema_version,
                 operation_id,
                 &slot_id,
                 expected_account_identifier_hash,
                 expected_workspace_identifier_hash,
-            )?)
+            )?))
         }
         LocalControlCommand::CodexAccountCheck {
             schema_version,
@@ -1198,28 +1204,40 @@ fn handle_command(
             explicit,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(check_codex_account(
+            to_value(crate::codex_sign_in::present(check_codex_account(
                 schema_version,
                 &operation_id,
                 explicit,
-            )?)
+            )?))
+        }
+        LocalControlCommand::CodexAccountStartSignIn {
+            schema_version,
+            operation_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(crate::codex_sign_in::present(start_codex_sign_in(
+                schema_version,
+                &operation_id,
+            )?))
         }
         LocalControlCommand::CodexAccountStopWaiting {
             schema_version,
             operation_id,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(stop_waiting_for_codex_account(
-                schema_version,
-                &operation_id,
-            )?)
+            to_value(crate::codex_sign_in::present(
+                stop_waiting_for_codex_account(schema_version, &operation_id)?,
+            ))
         }
         LocalControlCommand::CodexAccountRemove {
             schema_version,
             slot_id,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(remove_codex_account(schema_version, &slot_id)?)
+            to_value(crate::codex_sign_in::present(remove_codex_account(
+                schema_version,
+                &slot_id,
+            )?))
         }
         LocalControlCommand::Detect { source } => {
             require_authorized_local_client(daemon, &authorization)?;
@@ -2774,7 +2792,12 @@ fn check_codex_account(
     let current_operation = store
         .setup_operation(operation_id)
         .map_err(codex_account_slot_settings_error)?;
-    if current_operation.state == CodexAccountSetupOperationStateV1::Complete {
+    // A daemon-run sign-in reads the account itself when `codex login` ends,
+    // so a check while it runs (an older client polling, or a second app)
+    // only reports where it is.
+    if current_operation.state == CodexAccountSetupOperationStateV1::Complete
+        || crate::codex_sign_in::is_running(&current_operation)
+    {
         return store
             .load()
             .map_err(codex_account_slot_settings_error)
@@ -2816,61 +2839,13 @@ fn check_codex_account(
     store
         .begin_validation(schema_version, operation_id)
         .map_err(codex_account_slot_settings_error)?;
-    let operation = store
-        .setup_operation(operation_id)
-        .map_err(codex_account_slot_settings_error)?;
-    let slot_id = operation.slot_id.ok_or_else(|| {
-        LocalApiError::InvalidRequest(
-            "Codex setup operation has no durable connection slot".to_string(),
-        )
-    })?;
+    let slot_id = codex_setup_slot_id(&store, operation_id)?;
     if store
         .is_verifying_pinned_workspace(operation_id)
         .map_err(codex_account_slot_settings_error)?
     {
-        let account_hash = operation
-            .account_identifier_hash
-            .as_deref()
-            .ok_or_else(|| {
-                LocalApiError::InvalidRequest(
-                    "Pinned Codex verification has no account identity.".to_string(),
-                )
-            })?;
-        let workspace_hash = operation
-            .workspace_identifier_hash
-            .as_deref()
-            .ok_or_else(|| {
-                LocalApiError::InvalidRequest(
-                    "Pinned Codex verification has no workspace identity.".to_string(),
-                )
-            })?;
-        return match crate::agent_status::collect_registered_codex_slot_for_setup(
-            &slot_id,
-            crate::agent_status::CodexSetupRead::Validation,
-        ) {
-            Ok((pinned, _))
-                if pinned.account_identifier_hash == account_hash
-                    && pinned.workspace_identifier_hash == workspace_hash =>
-            {
-                store
-                    .complete_pinned_verification(
-                        schema_version,
-                        operation_id,
-                        account_hash,
-                        workspace_hash,
-                    )
-                    .map_err(codex_account_slot_settings_error)
-                    .map(crate::agent_status::annotate_codex_accounts_status)
-            }
-            _ => store
-                .fail_validation(
-                    schema_version,
-                    operation_id,
-                    "Codex workspace restriction did not survive a fresh provider restart.",
-                )
-                .map_err(codex_account_slot_settings_error)
-                .map(crate::agent_status::annotate_codex_accounts_status),
-        };
+        return verify_pinned_codex_setup(&store, schema_version, operation_id, &slot_id)
+            .map(|(status, _)| crate::agent_status::annotate_codex_accounts_status(status));
     }
     let collection = match pending_collection {
         Some(result) => result,
@@ -2879,20 +2854,137 @@ fn check_codex_account(
             crate::agent_status::CodexSetupRead::Validation,
         ),
     };
+    finish_codex_setup_validation(&store, schema_version, operation_id, &slot_id, collection)
+        .map(|(status, _)| crate::agent_status::annotate_codex_accounts_status(status))
+}
+
+/// How the validation of a Codex setup ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexSetupValidationEnd {
+    /// The exact account and workspace is connected.
+    Accepted,
+    IdentityMismatch,
+    DuplicateAccount,
+    /// The workspace restriction did not hold in a fresh provider session.
+    WorkspaceNotKept,
+    /// The account read failed; the setup failed with its message.
+    ReadFailed,
+}
+
+/// The managed slot of the setup operation.
+pub(crate) fn codex_setup_slot_id(
+    store: &FileCodexAccountSlotSettingsStore,
+    operation_id: &str,
+) -> Result<String, LocalApiError> {
+    store
+        .setup_operation(operation_id)
+        .map_err(codex_account_slot_settings_error)?
+        .slot_id
+        .ok_or_else(|| {
+            LocalApiError::InvalidRequest(
+                "Codex setup operation has no durable connection slot".to_string(),
+            )
+        })
+}
+
+/// The fresh restricted read that accepts a pinned workspace, for a setup
+/// whose restriction is already durable.
+pub(crate) fn verify_pinned_codex_setup(
+    store: &FileCodexAccountSlotSettingsStore,
+    schema_version: u16,
+    operation_id: &str,
+    slot_id: &str,
+) -> Result<
+    (
+        ottto_protocol::CodexAccountsStatusV1,
+        CodexSetupValidationEnd,
+    ),
+    LocalApiError,
+> {
+    let operation = store
+        .setup_operation(operation_id)
+        .map_err(codex_account_slot_settings_error)?;
+    let account_hash = operation
+        .account_identifier_hash
+        .as_deref()
+        .ok_or_else(|| {
+            LocalApiError::InvalidRequest(
+                "Pinned Codex verification has no account identity.".to_string(),
+            )
+        })?;
+    let workspace_hash = operation
+        .workspace_identifier_hash
+        .as_deref()
+        .ok_or_else(|| {
+            LocalApiError::InvalidRequest(
+                "Pinned Codex verification has no workspace identity.".to_string(),
+            )
+        })?;
+    match crate::agent_status::collect_registered_codex_slot_for_setup(
+        slot_id,
+        crate::agent_status::CodexSetupRead::Validation,
+    ) {
+        Ok((pinned, _))
+            if pinned.account_identifier_hash == account_hash
+                && pinned.workspace_identifier_hash == workspace_hash =>
+        {
+            store
+                .complete_pinned_verification(
+                    schema_version,
+                    operation_id,
+                    account_hash,
+                    workspace_hash,
+                )
+                .map_err(codex_account_slot_settings_error)
+                .map(|status| (status, CodexSetupValidationEnd::Accepted))
+        }
+        _ => store
+            .fail_validation(
+                schema_version,
+                operation_id,
+                "Codex workspace restriction did not survive a fresh provider restart.",
+            )
+            .map_err(codex_account_slot_settings_error)
+            .map(|status| (status, CodexSetupValidationEnd::WorkspaceNotKept)),
+    }
+}
+
+/// Validate a setup from one account read of its home: accept the exact
+/// identity (pinning its workspace and verifying the pin in a fresh read),
+/// or record a mismatch, a duplicate, or the read's failure.
+pub(crate) fn finish_codex_setup_validation(
+    store: &FileCodexAccountSlotSettingsStore,
+    schema_version: u16,
+    operation_id: &str,
+    slot_id: &str,
+    collection: Result<
+        (
+            crate::agent_status::CodexStrongIdentity,
+            ottto_protocol::CodexAccountSlotCollectionStatusV1,
+        ),
+        crate::agent_status::CodexSlotSetupCollectionError,
+    >,
+) -> Result<
+    (
+        ottto_protocol::CodexAccountsStatusV1,
+        CodexSetupValidationEnd,
+    ),
+    LocalApiError,
+> {
     let (identity, _) = match collection {
         Ok(result) => result,
         Err(error) => {
             return store
                 .fail_validation(schema_version, operation_id, error.message())
                 .map_err(codex_account_slot_settings_error)
-                .map(crate::agent_status::annotate_codex_accounts_status);
+                .map(|status| (status, CodexSetupValidationEnd::ReadFailed));
         }
     };
     let duplicate = store
         .has_registered_binding(
             &identity.account_identifier_hash,
             &identity.workspace_identifier_hash,
-            Some(&slot_id),
+            Some(slot_id),
         )
         .map_err(codex_account_slot_settings_error)?;
     let status = store
@@ -2909,43 +3001,37 @@ fn check_codex_account(
         .is_verifying_pinned_workspace(operation_id)
         .map_err(codex_account_slot_settings_error)?
     {
-        match crate::agent_status::collect_registered_codex_slot_for_setup(
-            &slot_id,
-            crate::agent_status::CodexSetupRead::Validation,
-        ) {
-            Ok((pinned, _))
-                if pinned.account_identifier_hash == identity.account_identifier_hash
-                    && pinned.workspace_identifier_hash == identity.workspace_identifier_hash =>
-            {
-                return store
-                    .complete_pinned_verification(
-                        schema_version,
-                        operation_id,
-                        &identity.account_identifier_hash,
-                        &identity.workspace_identifier_hash,
-                    )
-                    .map_err(codex_account_slot_settings_error)
-                    .map(crate::agent_status::annotate_codex_accounts_status);
-            }
-            _ => {
-                return store
-                    .fail_validation(
-                        schema_version,
-                        operation_id,
-                        "Codex workspace restriction did not survive a fresh provider restart.",
-                    )
-                    .map_err(codex_account_slot_settings_error)
-                    .map(crate::agent_status::annotate_codex_accounts_status);
-            }
-        }
+        return verify_pinned_codex_setup(store, schema_version, operation_id, slot_id);
     }
-    Ok(crate::agent_status::annotate_codex_accounts_status(status))
+    let end = match status.setup_operation.state {
+        CodexAccountSetupOperationStateV1::DuplicateAccount => {
+            CodexSetupValidationEnd::DuplicateAccount
+        }
+        CodexAccountSetupOperationStateV1::Complete => CodexSetupValidationEnd::Accepted,
+        _ => CodexSetupValidationEnd::IdentityMismatch,
+    };
+    Ok((status, end))
+}
+
+/// v26: start the daemon-run sign-in of a setup operation.
+fn start_codex_sign_in(
+    schema_version: u16,
+    operation_id: &str,
+) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    crate::codex_sign_in::start(schema_version, operation_id)
+        .map_err(codex_account_slot_settings_error)?;
+    load_codex_account_settings()
 }
 
 fn stop_waiting_for_codex_account(
     schema_version: u16,
     operation_id: &str,
 ) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    // A running `codex login` ends first, so it cannot write into a home that
+    // stopping is about to remove; the sign-in then stops the setup itself.
+    if crate::codex_sign_in::cancel(operation_id) {
+        return load_codex_account_settings();
+    }
     FileCodexAccountSlotSettingsStore::default()
         .stop_waiting(schema_version, operation_id)
         .map_err(codex_account_slot_settings_error)
@@ -2956,7 +3042,24 @@ fn remove_codex_account(
     schema_version: u16,
     slot_id: &str,
 ) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
-    FileCodexAccountSlotSettingsStore::default()
+    let store = FileCodexAccountSlotSettingsStore::default();
+    // A sign-in into the home being removed ends first, so `codex login`
+    // never writes into a removed home.
+    if let Ok(status) = store.load() {
+        let operation = &status.setup_operation;
+        if operation.slot_id.as_deref() == Some(slot_id)
+            && crate::codex_sign_in::is_running(operation)
+            && status
+                .managed_slots
+                .iter()
+                .any(|slot| slot.slot_id == slot_id)
+        {
+            if let Some(operation_id) = operation.operation_id.as_deref() {
+                stop_waiting_for_codex_account(schema_version, operation_id)?;
+            }
+        }
+    }
+    store
         .remove(schema_version, slot_id)
         .map_err(codex_account_slot_settings_error)
         .map(crate::agent_status::annotate_codex_accounts_status)
@@ -15864,6 +15967,7 @@ mod tests {
                 used_slots: 1,
                 remaining_slots: 9,
             },
+            daemon_sign_in_supported: None,
         };
 
         assert_eq!(
@@ -16515,6 +16619,935 @@ for line in sys.stdin:
 
         drop(clock);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A fake `codex` for the daemon-run sign-in. `login` follows the mode in
+    /// `<bin>/login-mode`:
+    /// - `success`: prints the sign-in address, writes `<bin>/auth-body` to
+    ///   `$CODEX_HOME/auth.json`, prints the success line and exits 0;
+    /// - `wait`: prints the address and waits; SIGTERM makes it exit 0, as
+    ///   the real CLI does;
+    /// - `early`: exits 0 without saving anything;
+    /// - `fail`: exits 1;
+    /// - `hold`: prints the address and waits for `<bin>/release-login`,
+    ///   then exits with the status written there, saving nothing;
+    /// - `fork`: as the real wrapper, starts a child that listens on the
+    ///   port in `<bin>/listen-port` (its pid in `<bin>/listener-pid`); both
+    ///   ignore SIGTERM.
+    ///
+    /// `app-server` answers with a signed-in account and a fresh quota
+    /// window; the runs listed in `<bin>/failing-reads` (1-based) fail the
+    /// quota read instead. Every login appends its pid to `<bin>/login-runs`,
+    /// every app-server start one line to `<bin>/app-server-runs` and its
+    /// `CODEX_HOME` to `<bin>/app-server-homes`.
+    #[cfg(unix)]
+    fn write_sign_in_fake_codex(bin: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(bin).expect("fake Codex bin dir");
+        let script = format!(
+            r#"#!/usr/bin/python3
+import json, os, signal, sys, time
+BIN = {bin:?}
+
+def read(name, default=""):
+    try:
+        with open(os.path.join(BIN, name)) as f:
+            return f.read()
+    except OSError:
+        return default
+
+args = sys.argv[1:]
+if args == ["login"]:
+    with open(os.path.join(BIN, "login-runs"), "a") as f:
+        f.write("%d\n" % os.getpid())
+    mode = read("login-mode").strip()
+    if mode == "fail":
+        sys.exit(1)
+    if mode == "early":
+        sys.exit(0)
+    if mode == "fork":
+        import socket
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        listener = socket.socket()
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if os.fork() == 0:
+            listener.bind(("127.0.0.1", int(read("listen-port"))))
+            listener.listen(1)
+            with open(os.path.join(BIN, "listener-pid"), "w") as f:
+                f.write("%d" % os.getpid())
+            while True:
+                time.sleep(1)
+        sys.stderr.write("If your browser did not open, navigate to this URL to authenticate:\n\n")
+        sys.stderr.write("https://auth.example.test/oauth/authorize?state=SYNTHETIC-SIGN-IN-URL-MARKER\n\n")
+        sys.stderr.flush()
+        while True:
+            time.sleep(1)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    sys.stderr.write("Starting local login server on http://localhost:1455.\n")
+    sys.stderr.write("If your browser did not open, navigate to this URL to authenticate:\n\n")
+    sys.stderr.write("https://auth.example.test/oauth/authorize?state=SYNTHETIC-SIGN-IN-URL-MARKER\n\n")
+    sys.stderr.flush()
+    if mode == "wait":
+        while True:
+            time.sleep(1)
+    if mode == "hold":
+        while not os.path.exists(os.path.join(BIN, "release-login")):
+            time.sleep(0.05)
+        sys.exit(int(read("release-login").strip() or "0"))
+    time.sleep(0.3)
+    path = os.path.join(os.environ["CODEX_HOME"], "auth.json")
+    with open(path + ".tmp", "w") as f:
+        f.write(read("auth-body"))
+    os.chmod(path + ".tmp", 0o600)
+    os.rename(path + ".tmp", path)
+    sys.stderr.write("Successfully logged in\n")
+    sys.exit(0)
+if args != ["app-server", "--stdio"]:
+    sys.exit(1)
+with open(os.path.join(BIN, "app-server-runs"), "a") as f:
+    f.write("run\n")
+with open(os.path.join(BIN, "app-server-homes"), "a") as f:
+    f.write(os.environ.get("CODEX_HOME", "") + "\n")
+run = len(read("app-server-runs").splitlines())
+failing = [int(n) for n in read("failing-reads").split()]
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "initialize":
+        print(json.dumps({{"id": request_id, "result": {{"userAgent": "synthetic"}}}}), flush=True)
+    elif method == "account/read":
+        print(json.dumps({{"id": request_id, "result": {{"account": {{"type": "chatgpt", "email": "synthetic-account", "planType": "pro"}}, "requiresOpenaiAuth": True}}}}), flush=True)
+    elif method == "account/rateLimits/read":
+        if run in failing:
+            print(json.dumps({{"id": request_id, "error": {{"code": -32603, "message": "synthetic failure"}}}}), flush=True)
+        else:
+            print(json.dumps({{"id": request_id, "result": {{"rateLimits": {{"primary": {{"usedPercent": 25, "windowDurationMins": 300}}}}}}}}), flush=True)
+"#,
+            bin = bin.display().to_string()
+        );
+        let executable = bin.join("codex");
+        fs::write(&executable, script).expect("fake Codex executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("fake Codex mode");
+    }
+
+    /// One test's daemon-run sign-in setup: a support dir, the fake `codex`,
+    /// short timings and a free stand-in for the sign-in port.
+    #[cfg(unix)]
+    struct SignInFixture {
+        root: PathBuf,
+        bin: PathBuf,
+        port: u16,
+        _timings: crate::codex_sign_in::TestTimingsGuard,
+        _commands: EnvVarGuard,
+        _support: EnvVarGuard,
+        _home: EnvVarGuard,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl SignInFixture {
+        fn new(name: &str, sign_in_timeout: Duration) -> Self {
+            let guard = lock_backend_test_env();
+            let root = control_test_root(name)
+                .canonicalize()
+                .expect("canonical Codex sign-in test root");
+            let support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+            let bin = root.join("bin");
+            write_sign_in_fake_codex(&bin);
+            let commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &bin);
+            // The schedule's default home is `$HOME/.codex`: none here.
+            let home = EnvVarGuard::set_path("HOME", &root);
+            let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .expect("free port")
+                .local_addr()
+                .expect("port")
+                .port();
+            let timings = crate::codex_sign_in::TestTimingsGuard::set(
+                sign_in_timeout,
+                Duration::from_millis(300),
+                port,
+            );
+            let expires_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_secs() as i64
+                + 24 * 60 * 60;
+            fs::write(
+                bin.join("auth-body"),
+                synthetic_codex_auth_with_claims(
+                    "synthetic-user",
+                    "synthetic-workspace",
+                    expires_at,
+                ),
+            )
+            .expect("auth body");
+            Self {
+                root,
+                bin,
+                port,
+                _timings: timings,
+                _commands: commands,
+                _support: support,
+                _home: home,
+                _guard: guard,
+            }
+        }
+
+        fn set(&self, name: &str, body: &str) {
+            fs::write(self.bin.join(name), body).expect("fake Codex setting");
+        }
+
+        fn app_server_runs(&self) -> usize {
+            counted_lines(&self.bin.join("app-server-runs"))
+        }
+
+        /// App-server runs that read `home`.
+        fn app_server_runs_for(&self, home: &Path) -> usize {
+            fs::read_to_string(self.bin.join("app-server-homes"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| Path::new(line) == home)
+                .count()
+        }
+
+        /// The status once the sign-in waits for the browser with an address.
+        fn waiting_for_browser(&self) -> ottto_protocol::CodexAccountsStatusV1 {
+            let status = self.status_until(|status| {
+                status
+                    .setup_operation
+                    .sign_in
+                    .as_ref()
+                    .is_some_and(|sign_in| sign_in.sign_in_url.is_some())
+            });
+            assert!(status
+                .setup_operation
+                .sign_in
+                .as_ref()
+                .is_some_and(|sign_in| sign_in.sign_in_url.is_some()));
+            status
+        }
+
+        /// A connected account from a daemon sign-in: its slot, home and
+        /// binding hashes.
+        fn connected_account(&self, operation_id: &str) -> (String, PathBuf, String, String) {
+            self.set("login-mode", "success");
+            let home = open_waiting_codex_setup(operation_id);
+            start_codex_sign_in(1, operation_id).expect("start sign-in");
+            let ended = self.ended();
+            assert_eq!(
+                sign_in_outcome(&ended),
+                Some(ottto_protocol::CodexAccountSignInOutcomeV1::Complete)
+            );
+            let operation = ended.setup_operation;
+            (
+                operation.slot_id.expect("slot"),
+                home,
+                operation.account_identifier_hash.expect("account hash"),
+                operation.workspace_identifier_hash.expect("workspace hash"),
+            )
+        }
+
+        fn login_pids(&self) -> Vec<i32> {
+            fs::read_to_string(self.bin.join("login-runs"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.parse().ok())
+                .collect()
+        }
+
+        /// The status a client reads, until `done` holds or 20 s pass.
+        fn status_until(
+            &self,
+            done: impl Fn(&ottto_protocol::CodexAccountsStatusV1) -> bool,
+        ) -> ottto_protocol::CodexAccountsStatusV1 {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let status = crate::codex_sign_in::present(
+                    FileCodexAccountSlotSettingsStore::default()
+                        .load()
+                        .expect("status"),
+                );
+                if done(&status) || Instant::now() >= deadline {
+                    return status;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn ended(&self) -> ottto_protocol::CodexAccountsStatusV1 {
+            let status = self.status_until(|status| {
+                status
+                    .setup_operation
+                    .sign_in
+                    .as_ref()
+                    .is_some_and(|sign_in| {
+                        sign_in.phase == ottto_protocol::CodexAccountSignInPhaseV1::Done
+                    })
+            });
+            assert!(crate::codex_sign_in::wait_until_idle(Duration::from_secs(
+                20
+            )));
+            status
+        }
+
+        /// No file under the support dir holds the sign-in address.
+        fn assert_url_never_written(&self) {
+            fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+                for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, found);
+                    } else if fs::read(&path).is_ok_and(|body| {
+                        String::from_utf8_lossy(&body).contains("SYNTHETIC-SIGN-IN-URL-MARKER")
+                    }) {
+                        found.push(path);
+                    }
+                }
+            }
+            let mut found = Vec::new();
+            walk(&self.root, &mut found);
+            // The fake CLI itself holds it.
+            found.retain(|path| !path.starts_with(&self.bin));
+            assert!(found.is_empty(), "sign-in address written to {found:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SignInFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    fn sign_in_outcome(
+        status: &ottto_protocol::CodexAccountsStatusV1,
+    ) -> Option<ottto_protocol::CodexAccountSignInOutcomeV1> {
+        status
+            .setup_operation
+            .sign_in
+            .as_ref()
+            .and_then(|sign_in| sign_in.outcome)
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    const SIGN_IN_OPERATION: &str = "codex_setup_5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+
+    /// The daemon runs `codex login`: the address it prints is offered to the
+    /// client while the browser is open and never written anywhere; the
+    /// saved credential is checked once (the identity read plus the fresh
+    /// pinned-workspace read) and the account is connected.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_connects_the_account_and_never_writes_the_url() {
+        let fixture = SignInFixture::new("codex-sign-in-success", Duration::from_secs(60));
+        fixture.set("login-mode", "wait");
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+
+        let started = crate::codex_sign_in::present(
+            start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in"),
+        );
+        assert_eq!(started.daemon_sign_in_supported, Some(true));
+        assert_eq!(started.setup_operation.launch_command, None);
+        let waiting = fixture.status_until(|status| {
+            status
+                .setup_operation
+                .sign_in
+                .as_ref()
+                .is_some_and(|sign_in| sign_in.sign_in_url.is_some())
+        });
+        let sign_in = waiting.setup_operation.sign_in.clone().expect("sign-in");
+        assert_eq!(
+            sign_in.phase,
+            ottto_protocol::CodexAccountSignInPhaseV1::WaitingForBrowser
+        );
+        assert_eq!(
+            sign_in.sign_in_url.as_ref().map(|url| url.expose_secret()),
+            Some("https://auth.example.test/oauth/authorize?state=SYNTHETIC-SIGN-IN-URL-MARKER")
+        );
+        assert!(!format!("{waiting:?}").contains("SYNTHETIC-SIGN-IN-URL-MARKER"));
+        // A replay only reports status; a check while it runs reads nothing.
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("replay");
+        for _ in 0..50 {
+            check_codex_account(1, SIGN_IN_OPERATION, false).expect("check while running");
+        }
+        assert_eq!(fixture.login_pids().len(), 1);
+        assert_eq!(fixture.app_server_runs(), 0);
+        fixture.assert_url_never_written();
+
+        // Cancel that one, then sign in for real on a new operation.
+        stop_waiting_for_codex_account(1, SIGN_IN_OPERATION).expect("stop");
+        let operation = "codex_setup_6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b";
+        fixture.set("login-mode", "success");
+        open_waiting_codex_setup(operation);
+        start_codex_sign_in(1, operation).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Complete)
+        );
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::Complete
+        );
+        assert_eq!(ended.managed_slots.len(), 1);
+        assert_eq!(fixture.app_server_runs(), 2);
+        let sign_in = ended.setup_operation.sign_in.expect("sign-in");
+        assert_eq!(sign_in.sign_in_url, None);
+        // The account reads are logged as setup reads; the browser sign-in is not.
+        let lines = setup_call_lines(&fixture.root);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines
+            .iter()
+            .all(|line| line.kind == "codex_app_server_quota" && line.result == "ok"));
+        fixture.assert_url_never_written();
+    }
+
+    /// Call-log lines with trigger `setup`.
+    #[cfg(unix)]
+    fn setup_call_lines(support: &Path) -> Vec<ottto_core::provider_call_log::ProviderCallLine> {
+        let dir = ottto_core::provider_call_log::provider_call_log_dir(support);
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
+            .flat_map(|body| {
+                body.lines()
+                    .filter_map(|line| {
+                        serde_json::from_str::<ottto_core::provider_call_log::ProviderCallLine>(
+                            line,
+                        )
+                        .ok()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|line| line.trigger == "setup")
+            .collect()
+    }
+
+    /// Stop ends `codex login` before the unadopted home is removed, and
+    /// the sign-in ends `cancelled`.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_cancel_ends_the_cli_before_removing_the_home() {
+        let fixture = SignInFixture::new("codex-sign-in-cancel", Duration::from_secs(60));
+        fixture.set("login-mode", "wait");
+        let home = open_waiting_codex_setup(SIGN_IN_OPERATION);
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+        fixture.status_until(|status| {
+            status
+                .setup_operation
+                .sign_in
+                .as_ref()
+                .is_some_and(|sign_in| sign_in.sign_in_url.is_some())
+        });
+        let pid = fixture.login_pids()[0];
+        assert!(process_alive(pid));
+
+        let stopped = crate::codex_sign_in::present(
+            stop_waiting_for_codex_account(1, SIGN_IN_OPERATION).expect("stop"),
+        );
+        assert_eq!(
+            sign_in_outcome(&stopped),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Cancelled)
+        );
+        assert_eq!(
+            stopped.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupStopped
+        );
+        assert!(!process_alive(pid), "codex login still runs");
+        assert!(!home.exists(), "the unadopted home is removed");
+        assert_eq!(
+            stopped
+                .setup_operation
+                .sign_in
+                .expect("sign-in")
+                .sign_in_url,
+            None
+        );
+        assert_eq!(fixture.app_server_runs(), 0);
+        assert!(crate::codex_sign_in::wait_until_idle(Duration::from_secs(
+            5
+        )));
+    }
+
+    /// A sign-in nobody finishes is stopped at the deadline.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_times_out_and_ends_the_cli() {
+        let fixture = SignInFixture::new("codex-sign-in-timeout", Duration::from_secs(1));
+        fixture.set("login-mode", "wait");
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::TimedOut)
+        );
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupStopped
+        );
+        assert!(!process_alive(fixture.login_pids()[0]));
+        assert_eq!(fixture.app_server_runs(), 0);
+    }
+
+    /// `codex login` exits 0 when stopped too: without a new credential the
+    /// sign-in failed, whatever the exit status. A busy sign-in port starts
+    /// nothing.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_without_a_credential_or_with_a_busy_port_fails_plainly() {
+        let fixture = SignInFixture::new("codex-sign-in-early", Duration::from_secs(60));
+        for (index, mode) in ["early", "fail"].into_iter().enumerate() {
+            fixture.set("login-mode", mode);
+            let operation = format!("codex_setup_{index:032}");
+            open_waiting_codex_setup(&operation);
+            start_codex_sign_in(1, &operation).expect("start sign-in");
+            let ended = fixture.ended();
+            assert_eq!(
+                sign_in_outcome(&ended),
+                Some(ottto_protocol::CodexAccountSignInOutcomeV1::LoginFailed),
+                "{mode}"
+            );
+            assert_eq!(
+                ended.setup_operation.state,
+                CodexAccountSetupOperationStateV1::SetupFailed
+            );
+        }
+        assert_eq!(fixture.login_pids().len(), 2);
+
+        let _held = std::net::TcpListener::bind(("127.0.0.1", fixture.port)).expect("hold port");
+        let operation = "codex_setup_7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c";
+        open_waiting_codex_setup(operation);
+        start_codex_sign_in(1, operation).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::PortBusy)
+        );
+        assert_eq!(fixture.login_pids().len(), 2, "no login started");
+        assert_eq!(fixture.app_server_runs(), 0);
+    }
+
+    /// A failed account read after the sign-in is retried once; a second
+    /// failure ends `check_failed` after exactly two reads.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_retries_a_failed_account_read_once() {
+        let fixture = SignInFixture::new("codex-sign-in-retry", Duration::from_secs(60));
+        fixture.set("login-mode", "success");
+        fixture.set("failing-reads", "1 2");
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::CheckFailed)
+        );
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupFailed
+        );
+        assert_eq!(fixture.app_server_runs(), 2);
+
+        // The retry succeeds: one failed read, then the identity read and
+        // the pinned-workspace read.
+        fixture.set("failing-reads", "3");
+        let operation = "codex_setup_8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d";
+        open_waiting_codex_setup(operation);
+        start_codex_sign_in(1, operation).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Complete)
+        );
+        assert_eq!(fixture.app_server_runs(), 5);
+    }
+
+    /// The pinned-workspace read fails: `workspace_not_kept`.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_reports_a_workspace_restriction_that_did_not_hold() {
+        let fixture = SignInFixture::new("codex-sign-in-pinned", Duration::from_secs(60));
+        fixture.set("login-mode", "success");
+        fixture.set("failing-reads", "2");
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::WorkspaceNotKept)
+        );
+        assert_eq!(fixture.app_server_runs(), 2);
+    }
+
+    /// A target setup signed into another account: `identity_mismatch`, and
+    /// the same operation may sign in again.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_after_a_mismatch_runs_again_on_the_same_operation() {
+        let fixture = SignInFixture::new("codex-sign-in-mismatch", Duration::from_secs(60));
+        fixture.set("login-mode", "success");
+        prepare_codex_account(
+            1,
+            SIGN_IN_OPERATION.to_string(),
+            "a".repeat(64),
+            "b".repeat(64),
+        )
+        .expect("prepare target");
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::IdentityMismatch)
+        );
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::IdentityMismatch
+        );
+        assert_eq!(ended.setup_operation.launch_command, None);
+        assert_eq!(fixture.app_server_runs(), 1);
+
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("sign in again");
+        let ended = fixture.ended();
+        assert_eq!(fixture.login_pids().len(), 2);
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::IdentityMismatch)
+        );
+    }
+
+    /// After a daemon restart a sign-in is never started again: a credential
+    /// saved meanwhile is checked once, otherwise it ends `interrupted`.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_recovery_checks_a_saved_credential_once_or_interrupts() {
+        let fixture = SignInFixture::new("codex-sign-in-recovery", Duration::from_secs(60));
+        let store = FileCodexAccountSlotSettingsStore::default();
+        // The run as a daemon that stopped mid-sign-in left it.
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+        store
+            .begin_sign_in(
+                1,
+                SIGN_IN_OPERATION,
+                "2026-10-15T12:00:00Z".to_string(),
+                "2026-10-15T12:10:00Z".to_string(),
+            )
+            .expect("record run")
+            .expect("new run");
+        crate::codex_sign_in::recover_at_startup();
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Interrupted)
+        );
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupStopped
+        );
+
+        let operation = "codex_setup_9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e";
+        let home = open_waiting_codex_setup(operation);
+        store
+            .begin_sign_in(
+                1,
+                operation,
+                "2026-10-15T12:00:00Z".to_string(),
+                "2026-10-15T12:10:00Z".to_string(),
+            )
+            .expect("record run")
+            .expect("new run");
+        write_synthetic_codex_auth(
+            &home,
+            &fs::read_to_string(fixture.bin.join("auth-body")).expect("auth body"),
+        );
+        crate::codex_sign_in::recover_at_startup();
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Complete)
+        );
+        assert_eq!(fixture.app_server_runs(), 2);
+        assert!(fixture.login_pids().is_empty(), "no sign-in restarted");
+    }
+
+    /// A reconnect signs into a home that already has a credential, which
+    /// the person's own Codex sessions may rewrite meanwhile. Scheduled and
+    /// explicit quota reads leave the home alone while the sign-in runs, and
+    /// a rewritten credential counts only with the CLI's own success: a CLI
+    /// that ends early (exit 0 or 1) is `login_failed`, with no account read.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_reconnect_counts_only_the_clis_own_sign_in() {
+        let fixture = SignInFixture::new("codex-sign-in-reconnect", Duration::from_secs(60));
+        let (slot_id, home, account, workspace) = fixture.connected_account(SIGN_IN_OPERATION);
+        assert_eq!(fixture.app_server_runs_for(&home), 2);
+        let auth_body = fs::read_to_string(home.join("auth.json")).expect("credential");
+        let later = || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_secs()
+                + 24 * 60 * 60
+        };
+
+        fixture.set("login-mode", "hold");
+        for (index, exit) in ["0", "1"].into_iter().enumerate() {
+            let _ = fs::remove_file(fixture.bin.join("release-login"));
+            let operation = format!("codex_setup_{:032}", index + 1);
+            reconnect_codex_account(
+                1,
+                operation.clone(),
+                &slot_id,
+                account.clone(),
+                workspace.clone(),
+            )
+            .expect("reconnect");
+            start_codex_sign_in(1, &operation).expect("start sign-in");
+            fixture.waiting_for_browser();
+
+            // A scheduled round and an explicit refresh during the run.
+            crate::agent_status::codex_scheduled_round_now(later());
+            crate::agent_status::refresh_codex_quota_now(0);
+            assert_eq!(fixture.app_server_runs_for(&home), 2, "exit {exit}");
+            // The person's own Codex session refreshes the credential.
+            write_synthetic_codex_auth(&home, &format!("{auth_body}\n"));
+
+            fixture.set("release-login", exit);
+            let ended = fixture.ended();
+            assert_eq!(
+                sign_in_outcome(&ended),
+                Some(ottto_protocol::CodexAccountSignInOutcomeV1::LoginFailed),
+                "exit {exit}"
+            );
+            assert_eq!(
+                ended.setup_operation.state,
+                CodexAccountSetupOperationStateV1::SetupFailed
+            );
+            assert_eq!(fixture.app_server_runs_for(&home), 2, "no account read");
+        }
+
+        // Once the sign-in has ended, the schedule reads the home again.
+        crate::agent_status::codex_scheduled_round_now(later() + 24 * 60 * 60);
+        assert_eq!(fixture.app_server_runs_for(&home), 3);
+
+        // A reconnect the CLI completes still connects.
+        let operation = "codex_setup_afafafafafafafafafafafafafafafaf";
+        reconnect_codex_account(1, operation.to_string(), &slot_id, account, workspace)
+            .expect("reconnect");
+        fixture.set("login-mode", "success");
+        start_codex_sign_in(1, operation).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Complete)
+        );
+    }
+
+    /// A daemon restart during a reconnect never verifies the home's
+    /// credential, changed or not: the run ends `interrupted`, and the
+    /// connected home stays.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_restart_during_a_reconnect_interrupts() {
+        let fixture =
+            SignInFixture::new("codex-sign-in-reconnect-restart", Duration::from_secs(60));
+        let (slot_id, home, account, workspace) = fixture.connected_account(SIGN_IN_OPERATION);
+        let runs = fixture.app_server_runs();
+        let operation = "codex_setup_bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc";
+        reconnect_codex_account(1, operation.to_string(), &slot_id, account, workspace)
+            .expect("reconnect");
+        FileCodexAccountSlotSettingsStore::default()
+            .begin_sign_in(
+                1,
+                operation,
+                "2026-10-15T12:00:00Z".to_string(),
+                "2026-10-15T12:10:00Z".to_string(),
+            )
+            .expect("record run")
+            .expect("new run");
+        let auth_body = fs::read_to_string(home.join("auth.json")).expect("credential");
+        write_synthetic_codex_auth(&home, &format!("{auth_body}\n"));
+
+        crate::codex_sign_in::recover_at_startup();
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Interrupted)
+        );
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupStopped
+        );
+        assert_eq!(fixture.app_server_runs(), runs);
+        assert!(home.join("auth.json").exists(), "the connected home stays");
+        assert_eq!(ended.managed_slots.len(), 1);
+    }
+
+    /// A stop that comes while the run starts (here: while a quota read of
+    /// the home holds its lock) starts no `codex login`.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_stopped_while_starting_launches_nothing() {
+        let fixture = SignInFixture::new("codex-sign-in-stop-starting", Duration::from_secs(60));
+        fixture.set("login-mode", "wait");
+        let home = open_waiting_codex_setup(SIGN_IN_OPERATION);
+        let stopper = crate::agent_status::with_codex_home_read_lock(&home, || {
+            start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+            let stopper = std::thread::spawn(|| {
+                stop_waiting_for_codex_account(1, SIGN_IN_OPERATION).expect("stop")
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            stopper
+        });
+        let stopped = crate::codex_sign_in::present(stopper.join().expect("stopper"));
+        assert_eq!(
+            sign_in_outcome(&stopped),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Cancelled)
+        );
+        assert!(fixture.login_pids().is_empty(), "no codex login started");
+        assert!(crate::codex_sign_in::wait_until_idle(Duration::from_secs(
+            5
+        )));
+    }
+
+    /// A recorded run no worker runs (its recovery failed) ends on its own
+    /// once its deadline passed; one within its deadline is left alone.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_without_a_worker_ends_after_its_deadline() {
+        let fixture = SignInFixture::new("codex-sign-in-stale", Duration::from_secs(60));
+        let store = FileCodexAccountSlotSettingsStore::default();
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+        store
+            .begin_sign_in(
+                1,
+                SIGN_IN_OPERATION,
+                "2999-01-01T00:00:00Z".to_string(),
+                "2999-01-01T00:10:00Z".to_string(),
+            )
+            .expect("record run")
+            .expect("new run");
+        crate::codex_sign_in::end_stale_run();
+        assert!(store.active_sign_in().expect("read").is_some());
+        stop_waiting_for_codex_account(1, SIGN_IN_OPERATION).expect("stop");
+
+        let operation = "codex_setup_cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        open_waiting_codex_setup(operation);
+        store
+            .begin_sign_in(
+                1,
+                operation,
+                "2020-01-01T00:00:00Z".to_string(),
+                "2020-01-01T00:10:00Z".to_string(),
+            )
+            .expect("record run")
+            .expect("new run");
+        // The daemon's own scheduler pass ends it.
+        crate::agent_status::codex_scheduled_round_now(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_secs(),
+        );
+        let status = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&status),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Interrupted)
+        );
+        assert_eq!(
+            status.setup_operation.state,
+            CodexAccountSetupOperationStateV1::SetupStopped
+        );
+    }
+
+    /// Removing a connected account during its reconnect sign-in ends
+    /// `codex login` first.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_ends_when_its_account_is_removed() {
+        let fixture = SignInFixture::new("codex-sign-in-remove", Duration::from_secs(60));
+        let (slot_id, home, account, workspace) = fixture.connected_account(SIGN_IN_OPERATION);
+        let operation = "codex_setup_dededededededededededededededede";
+        reconnect_codex_account(1, operation.to_string(), &slot_id, account, workspace)
+            .expect("reconnect");
+        fixture.set("login-mode", "wait");
+        start_codex_sign_in(1, operation).expect("start sign-in");
+        fixture.waiting_for_browser();
+        let pid = *fixture.login_pids().last().expect("login pid");
+        assert!(process_alive(pid));
+
+        let removed = remove_codex_account(1, &slot_id).expect("remove");
+        assert!(!process_alive(pid), "codex login still runs");
+        assert!(removed.managed_slots.is_empty());
+        assert!(!home.exists());
+        assert!(!crate::codex_sign_in::is_running(&removed.setup_operation));
+        assert!(crate::codex_sign_in::wait_until_idle(Duration::from_secs(
+            5
+        )));
+    }
+
+    /// The real `codex` is a wrapper whose child listens on the port. A
+    /// stop ends both, even when they ignore SIGTERM, so the port is free.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial]
+    fn codex_daemon_sign_in_stop_ends_the_clis_listener_and_frees_the_port() {
+        let fixture = SignInFixture::new("codex-sign-in-listener", Duration::from_secs(60));
+        fixture.set("login-mode", "fork");
+        fixture.set("listen-port", &fixture.port.to_string());
+        open_waiting_codex_setup(SIGN_IN_OPERATION);
+        start_codex_sign_in(1, SIGN_IN_OPERATION).expect("start sign-in");
+        fixture.waiting_for_browser();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let listener = loop {
+            if let Some(pid) = fs::read_to_string(fixture.bin.join("listener-pid"))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "listener never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let wrapper = fixture.login_pids()[0];
+        assert!(std::net::TcpStream::connect(("127.0.0.1", fixture.port)).is_ok());
+
+        let stopped = crate::codex_sign_in::present(
+            stop_waiting_for_codex_account(1, SIGN_IN_OPERATION).expect("stop"),
+        );
+        assert_eq!(
+            sign_in_outcome(&stopped),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Cancelled)
+        );
+        assert!(!process_alive(wrapper), "the wrapper still runs");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(listener) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!process_alive(listener), "the listener still runs");
+        assert!(std::net::TcpListener::bind(("127.0.0.1", fixture.port)).is_ok());
     }
 
     #[test]
