@@ -32,19 +32,30 @@ The terminal census now writes one aggregate log line when it re-arms anything, 
 - Settlement, the stale-pending traversal-start re-arm, owned-start re-arm, duplicate witnesses, fence coverage and backoff, upload authority and body witnesses are unchanged.
 - Fingerprints already cleared by an older daemon stay cleared, so debt that exists when this change is installed is still reparsed once.
 
-## Consequences to know before release
+## Freshness after a member change
 
-- **Latency for a first change.** Take a family whose proof has been stable. If only one member changes, only that member is parsed, so the census cannot prove the family. The changed member is demoted and held under a `RetryPending` authority quarantine, and the family is reparsed when the quarantine requests it. That happens when the retry deadline (6 to 12 hours) passes, or earlier if a member changes again. The old loop reparsed the whole family on every traversal, so it re-proved the family one traversal later. The body is held, never downgraded.
-- **Body changes without a witness change.** A release that changes the uploaded body of a reported-usage member, but not its family witness, used to reach every proven multi-page family through this loop on the next traversal. After this change it does not. Such a change needs its own re-offer path, or it must ship and be verified before this change.
+This change adds no delay to a changed family. The existing authority contract bounds that delay, before and after this change:
+
+- A new request in any member also appends the root's API and trace sidecars. The sidecar stat is part of every member's source fingerprint, so the next traversal selects the whole family once.
+- The root, parsed on an earlier page, no longer reconstructs from the retained witness, because the evidence digest changed. It is demoted into a `RetryPending` authority quarantine, and its new body is held while the accepted body stays current.
+- Any `RetryPending` family makes the page's local holds progress-blocking (`LocalHoldSettlement::progress_blocking`). The traversal then owes a clean follow-up, so no census completes and no family can be re-proven while the quarantine is pending.
+- Each failed reconstruction sets a wall-clock retry deadline 6 to 12 hours ahead. The quarantine becomes terminal, and stops blocking, on the fourth failure. A member change can count as a failure too, so a family that spans two pages usually reaches the fourth failure after two retry windows, 12 to 24 hours. Only then can a complete census prove the changed witness.
+
+The old loop did not shorten this. Its reparse happened on earlier pages, and the census that would have proven the change was blocked the same way. Only a family that sits entirely on the terminal page is re-proven in the same traversal. Prompt reproof for families that span pages needs a separate decision about the progress-blocking rule for a bound `RetryPending` hold. It is not a re-arm question.
+
+A changed body without a family witness change is the other consequence. A release that changes the uploaded body of a reported-usage member, but not its witness, used to reach every proven multi-page family through this loop. After this change it does not. Such a change needs its own re-offer path, or it must ship and be verified before this change.
 
 ## Tests
 
-The tests are in `snapshots/claude_usage_proof_rearm_tests.rs`. They use the production `apply_claude_reported_usage_with_index` fold with a synthetic two-member family. The root is on an earlier page and the subagent is on the terminal page. The index goes through the production save and load between traversals.
+`snapshots/claude_usage_proof_rearm_tests.rs` drives the production `apply_claude_reported_usage_with_index` fold with a synthetic two-member family and a save and load between traversals. It covers the first proof, an unchanged re-proof, changed evidence, and a child that changes alone.
 
-- The first proof re-arms the root. The correction pass rebuilds it with reported usage. The next terminal census proves the same witness and keeps the root's fingerprint. A following census with nothing parsed keeps the witness and re-arms nothing.
-- Changed reported evidence demotes and holds the root on its page. The terminal census then proves a changed witness and re-arms the root.
-- A child that grows alone is held, the family is not re-proven, and the quarantine stays bound to the retained witness. The family reparse proves the changed witness and re-arms both members. The next page rebuilds both with the grown usage and resolves the quarantine.
+`snapshot_sync/stable_proof_rearm_pipeline_tests.rs` runs bounded traversals through the production page order: scan with the local OTEL support directory, local evidence, account binding, upload policy, finalization, hold classification, an in-process upload, settlement, and the durable save and reload. The family root and both subagents are on earlier pages; an unrelated session is alone on the terminal page.
+
+- `stable_claude_family_proof_stops_rereading_after_cross_page_correction`: the first proof re-arms the family, the next generation delivers reported bodies after their ACK, and the two generations after that read no file and upload nothing.
+- `changed_family_member_after_stable_proof_is_held_by_the_authority_retry`: an appended subagent request selects only that family. Its bodies are held under a bound `RetryPending` quarantine, the accepted heads stay current, and later generations read nothing. This pins the existing contract described above.
+- `unhealthy_family_evidence_stays_held_without_renewed_family_reads`: malformed evidence holds the family the same way, without renewed reads.
+- `rearm_debt_survives_a_shed_correction_and_reload_until_accepted`: a shed correction keeps the re-arm debt across the save and reload, and a later generation delivers the corrected body after its exact ACK.
 
 ## Limits
 
-This changes when the terminal census re-arms earlier-page members, and nothing else. It makes no claim about how much I/O is saved on any machine. It does not change the stale-pending or owned-start re-arms, or the duplicate-fence full re-arm.
+This changes when the terminal census re-arms earlier-page members, and nothing else. It makes no claim about how much I/O is saved on any machine. It does not change the stale-pending or owned-start re-arms, the duplicate-fence full re-arm, the authority quarantine, or settlement.

@@ -11429,6 +11429,33 @@ pub(crate) fn scan_source_roots_with_test_limit(
     )
 }
 
+/// The production Claude scan with its local OTEL support directory, so
+/// sidecar changes enter each family member's source fingerprint, and an
+/// injectable page size.
+#[cfg(test)]
+pub(crate) fn scan_source_roots_with_test_limit_and_claude_support(
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    requested_backfill_window_days: u64,
+    file_limit: usize,
+    claude_effort_support_dir: &Path,
+) -> Result<SourceScanResult> {
+    scan_source_roots_with_limit_and_attribution(
+        SnapshotSource::ClaudeCode,
+        roots,
+        index,
+        collected_at,
+        requested_backfill_window_days,
+        file_limit,
+        true,
+        None,
+        Some(claude_effort_support_dir),
+        &[],
+        false,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_source_roots_with_limit_and_attribution(
     source: SnapshotSource,
@@ -21937,6 +21964,39 @@ impl ScanIndex {
         (record.disposition == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
             && claude_usage_authority_preserves_pending(record, witness))
         .then(|| record.member_source_file_fingerprints.clone())
+    }
+
+    /// The content-free digest of the family's retained usage witness.
+    #[cfg(test)]
+    pub(crate) fn claude_usage_family_witness_digest_for_test(
+        &self,
+        root_session_id: &str,
+    ) -> Option<String> {
+        self.claude_usage_family_witnesses
+            .get(root_session_id)
+            .map(claude_usage_family_witness_fingerprint)
+    }
+
+    /// Whether the family holds a RetryPending authority quarantine bound to
+    /// its retained witness.
+    #[cfg(test)]
+    pub(crate) fn bound_retry_pending_claude_authority_for_test(
+        &self,
+        root_session_id: &str,
+    ) -> bool {
+        self.claude_usage_authority_quarantine
+            .get(root_session_id)
+            .zip(self.claude_usage_family_witnesses.get(root_session_id))
+            .is_some_and(|(record, witness)| {
+                record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+                    && claude_usage_authority_preserves_pending(record, witness)
+            })
+    }
+
+    /// Whether a bounded traversal is still in progress.
+    #[cfg(test)]
+    pub(crate) fn scan_traversal_in_progress_for_test(&self) -> bool {
+        self.traversal.is_some()
     }
 
     #[cfg(test)]
