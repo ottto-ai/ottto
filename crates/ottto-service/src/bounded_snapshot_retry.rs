@@ -383,6 +383,9 @@ impl PreparedRetry {
             &self.baseline,
             &self.progress,
             &self.items,
+            // Retained-body retries carry correction debt unchanged; no new
+            // scan facts can qualify an empty-member completion here.
+            None,
             &BTreeSet::new(),
             &self.index_path,
             &self.progress_path,
