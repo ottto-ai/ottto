@@ -982,20 +982,36 @@ fn assert_late_import_checks_settled_request_owners(copied: bool) {
     let last = corrected.last().unwrap();
     assert!(last.duplicate_census.coverage_complete);
     assert!(!last.duplicate_census.fence_after);
-    let item = corrected
-        .iter()
-        .flat_map(|page| &page.scan.snapshots)
-        .find(|item| item.source_session_id == IMPORT)
-        .expect("corrective import body");
-    assert_eq!(
-        item.first_turn_context_tokens,
-        if copied { None } else { Some(10) }
-    );
-    assert!(
-        last.index
-            .accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint),
-        "only the exact offered corrective body becomes accepted"
-    );
+    if copied {
+        // The import was already offered without unique posture. Re-parsing
+        // an identical safe body may be suppressed by normal finalization;
+        // its exact ACKed head must remain, without requiring another POST.
+        let key = local_index_key(&path);
+        assert_eq!(
+            last.index.file_snapshot_fingerprints[&key],
+            BTreeSet::from([item.snapshot_fingerprint.clone()]),
+        );
+        assert!(last
+            .index
+            .accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint));
+        assert!(corrected
+            .iter()
+            .flat_map(|page| &page.scan.snapshots)
+            .filter(|body| body.source_session_id == IMPORT)
+            .all(|body| body.first_turn_context_tokens.is_none()));
+    } else {
+        let item = corrected
+            .iter()
+            .flat_map(|page| &page.scan.snapshots)
+            .find(|item| item.source_session_id == IMPORT)
+            .expect("corrective import body");
+        assert_eq!(item.first_turn_context_tokens, Some(10));
+        assert!(
+            last.index
+                .accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint),
+            "only the exact offered corrective body becomes accepted"
+        );
+    }
     for hour in [14, 15] {
         let quiet = fixture.generation(hour);
         assert_eq!(
