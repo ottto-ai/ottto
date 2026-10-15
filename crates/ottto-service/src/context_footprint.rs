@@ -183,6 +183,21 @@ impl std::fmt::Display for ClaudeContextRefused {
 
 impl std::error::Error for ClaudeContextRefused {}
 
+/// A `/context` run whose process never started: not a provider call.
+#[cfg(unix)]
+#[derive(Debug)]
+struct ClaudeContextNotStarted(&'static str);
+
+#[cfg(unix)]
+impl std::fmt::Display for ClaudeContextNotStarted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for ClaudeContextNotStarted {}
+
 /// After a refusal the next cycle starts sooner, once the login is refreshed.
 const CONTEXT_REFUSED_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
@@ -505,8 +520,12 @@ fn record_claude_context_run(
     use crate::provider_calls::{CallKind, CallResult, Provider, ProviderCall, Trigger};
     let result = match result {
         Ok(_) => CallResult::Ok,
-        Err(error) if error.downcast_ref::<ClaudeContextRefused>().is_some() => return,
-        Err(error) if error.to_string().ends_with("could not be started") => return,
+        Err(error)
+            if error.downcast_ref::<ClaudeContextRefused>().is_some()
+                || error.downcast_ref::<ClaudeContextNotStarted>().is_some() =>
+        {
+            return
+        }
         Err(error) if error.to_string().ends_with("timed out") => CallResult::Timeout,
         Err(error) if error.to_string().ends_with("exited unsuccessfully") => {
             CallResult::Error("exited")
@@ -538,9 +557,11 @@ fn capture_claude_context(
             match error {
                 StartError::Refused(refusal) => anyhow::Error::new(ClaudeContextRefused(refusal)),
                 StartError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                    anyhow!("Claude Code /context timed out")
+                    anyhow::Error::new(ClaudeContextNotStarted("Claude Code /context timed out"))
                 }
-                StartError::Io(_) => anyhow!("Claude Code /context could not be started"),
+                StartError::Io(_) => anyhow::Error::new(ClaudeContextNotStarted(
+                    "Claude Code /context could not be started",
+                )),
             }
         })?;
     // Accepted output remains complete and uncapped. Drain concurrently with

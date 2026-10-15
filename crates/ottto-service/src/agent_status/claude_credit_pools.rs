@@ -2889,7 +2889,7 @@ mod tests {
             super::super::CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             REQUESTED.lock().unwrap().clear();
-            *super::super::claude_explicit_refresh_requested_at() = 0;
+            super::super::claude_explicit_refresh_request().at = 0;
             super::super::claude_explicit_refresh_attempts().clear();
             super::super::claude_transient_failures().clear();
             super::super::claude_rate_limit_holds().clear();
@@ -2989,8 +2989,8 @@ mod tests {
         /// keeping only the plain spacing after a successful read.
         fn age_reading(&self, seconds: u64) {
             {
-                let mut requested_at = super::super::claude_explicit_refresh_requested_at();
-                *requested_at = requested_at.saturating_sub(seconds);
+                let mut request = super::super::claude_explicit_refresh_request();
+                request.at = request.at.saturating_sub(seconds);
             }
             for attempt in super::super::claude_explicit_refresh_attempts().iter_mut() {
                 attempt.at -= seconds;
@@ -3068,10 +3068,18 @@ mod tests {
         with_trigger(Trigger::Setup, || harness.collect(respond_recognized));
         // A fresh reading inside its slot: served, no request, no line.
         harness.collect(respond_recognized);
+        // An older app's status refresh marks the read; the lane thread that
+        // makes it keeps that label.
+        harness.age_reading(90);
+        with_trigger(
+            Trigger::OlderAppCompat,
+            super::super::request_claude_explicit_refresh,
+        );
+        harness.collect(respond_recognized);
         harness.age_reading(90);
         super::super::request_claude_explicit_refresh();
         harness.collect(respond_server_error);
-        assert_eq!(harness.requests(), 2);
+        assert_eq!(harness.requests(), 3);
         let lines = crate::provider_calls::test_lines(CallKind::ClaudeOauthUsage, harness.account);
         let summary = lines
             .iter()
@@ -3089,6 +3097,7 @@ mod tests {
             summary,
             [
                 ("anthropic", "setup", "ok", "observed", 1),
+                ("anthropic", "older_app_compat", "ok", "observed", 1),
                 ("anthropic", "explicit_refresh", "http_500", "observed", 1),
             ]
         );

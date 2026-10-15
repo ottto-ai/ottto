@@ -2943,6 +2943,20 @@ mod tests {
             ),
             noon + Duration::from_secs(120),
         );
+        // Pi's default route: a model request with an unknown provider.
+        record_provider_call(
+            &support,
+            &ProviderCall::subprocess(
+                Provider::Unknown,
+                CallKind::PiDefaultSmokePrompt,
+                Trigger::Setup,
+                None,
+                CallResult::Ok,
+                Duration::from_millis(3_000),
+                1,
+            ),
+            noon + Duration::from_secs(180),
+        );
         // Two days earlier: outside a 24 h window.
         record_provider_call(
             &support,
@@ -2964,27 +2978,41 @@ mod tests {
                 "generated_at": "2026-10-15T12:10:00Z",
                 "since": "2026-10-14T12:10:00Z",
                 "retention_days": 7,
-                "calls": 3,
-                "requests_at_least": 5,
-                "by_provider": {"anthropic": count(1, 1), "openai": count(2, 4)},
+                "calls": 4,
+                "requests_at_least": 6,
+                "by_provider": {
+                    "anthropic": count(1, 1),
+                    "openai": count(2, 4),
+                    "unknown": count(1, 1)
+                },
                 "days": [{
                     "day": "2026-10-15",
-                    "calls": 3,
-                    "requests_at_least": 5,
+                    "calls": 4,
+                    "requests_at_least": 6,
                     "observed_requests": 1,
-                    "subprocess_runs": 2,
+                    "subprocess_runs": 3,
                     "log_full": false,
-                    "by_provider": {"anthropic": count(1, 1), "openai": count(2, 4)},
+                    "by_provider": {
+                        "anthropic": count(1, 1),
+                        "openai": count(2, 4),
+                        "unknown": count(1, 1)
+                    },
                     "by_kind": {
                         "claude_oauth_usage": count(1, 1),
-                        "codex_app_server_quota": count(2, 4)
+                        "codex_app_server_quota": count(2, 4),
+                        "pi_default_smoke_prompt": count(1, 1)
                     },
-                    "by_trigger": {"explicit_refresh": count(1, 2), "schedule": count(2, 3)},
-                    "by_result": {"http_429": count(1, 1), "ok": count(1, 2), "timeout": count(1, 2)},
+                    "by_trigger": {
+                        "explicit_refresh": count(1, 2),
+                        "schedule": count(2, 3),
+                        "setup": count(1, 1)
+                    },
+                    "by_result": {"http_429": count(1, 1), "ok": count(2, 3), "timeout": count(1, 2)},
                     "by_provider_kind_trigger": {
                         "anthropic/claude_oauth_usage/schedule": count(1, 1),
                         "openai/codex_app_server_quota/explicit_refresh": count(1, 2),
-                        "openai/codex_app_server_quota/schedule": count(1, 2)
+                        "openai/codex_app_server_quota/schedule": count(1, 2),
+                        "unknown/pi_default_smoke_prompt/setup": count(1, 1)
                     }
                 }],
                 "skipped_lines": 0
@@ -2992,7 +3020,7 @@ mod tests {
         );
         let text = ottto_core::provider_call_log::render_provider_call_summary(&summary);
         assert!(
-            text.contains("2026-10-15: 3 calls, >= 5 requests (anthropic 1 calls, >= 1 requests; openai 2 calls, >= 4 requests)"),
+            text.contains("2026-10-15: 4 calls, >= 6 requests (anthropic 1 calls, >= 1 requests; openai 2 calls, >= 4 requests; unknown 1 calls, >= 1 requests)"),
             "{text}"
         );
         let _ = std::fs::remove_dir_all(support);

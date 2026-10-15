@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 643,
-  "content_sha256": "80a50f2f99c5499f02676f2fdec854c2477266d30e2de394f0ca4bbe460535c9",
+  "content_sha256": "088467414761b2abc94799dba7331da2c6916ff37b49023cd11f63a187bc76a3",
   "files": [
     {
       "executable": false,
@@ -468,8 +468,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "4029839c16593ba95391ec832bebc44246279fe3ab24d2ff0c45a87c228b23ac",
-      "size_bytes": 183766
+      "sha256": "7595a8ee7f6a98a4dac2b8120fc8d2a74b228770f66a0185f203bdedc75b2349",
+      "size_bytes": 184745
     },
     {
       "executable": false,
@@ -580,8 +580,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/provider_call_log.rs",
-      "sha256": "fbabbbfa0acbc84115725c88fccd31bb5936426e5b541a2dc99ffc324a47c4f6",
-      "size_bytes": 45230
+      "sha256": "093b8124b85b8fd267783412329b8114196e8acdcaa1895737a61c4c4d586fb6",
+      "size_bytes": 45811
     },
     {
       "executable": false,
@@ -692,15 +692,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "002d42cd5e590ef13229fc86b12f0a9df9a5faeea19bec6964b88c7d8b4951ab",
-      "size_bytes": 1565160
+      "sha256": "cf1ca9a84df6991830b3bff7e8b3819b60680cb2a13933ab0239abbf0b136a2a",
+      "size_bytes": 1565550
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/claude_credit_pools.rs",
-      "sha256": "2707ddee2cc262a3b6d6fce2245c37e3242da448b57fae2a7bdf0b88c022a659",
-      "size_bytes": 166043
+      "sha256": "9711bb7e4a57d77958994874f98b1ec780c7784bace6f7ba0d05e0a8606c635f",
+      "size_bytes": 166420
     },
     {
       "executable": false,
@@ -734,8 +734,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status_refresh.rs",
-      "sha256": "039d805034f8f4cebfff782cb491715d2d742944b47fcefe1d13e9f4d526b322",
-      "size_bytes": 49104
+      "sha256": "541a101200b8c3d6e99fd7d9576cfbdd6228fc34c78356bc2597035ffef1894a",
+      "size_bytes": 50772
     },
     {
       "executable": false,
@@ -769,8 +769,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_browser_auth.rs",
-      "sha256": "b8908f1442de544246431a4997829b6e142aaeccea5a2941d8825b56a1136a9d",
-      "size_bytes": 353855
+      "sha256": "843343dc9a246367668ef3fd6e89f8b38aeb2611aad2279ec1667e6906906296",
+      "size_bytes": 354279
     },
     {
       "executable": false,
@@ -839,8 +839,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/cloud_sessions.rs",
-      "sha256": "a6e5b1368499fb919ea34369e4643f27b3f55db09368d2eaff7ed283a3726334",
-      "size_bytes": 369250
+      "sha256": "c4cac88d0496d11f3936d4e9787242ee6bc5cb580e3388770ac8ec68da59b31a",
+      "size_bytes": 369411
     },
     {
       "executable": false,
@@ -881,8 +881,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_footprint.rs",
-      "sha256": "d79d15c6e2ebcb628f7524c934ffd4f8ef94a652cb8e047f706f6a03076f5f66",
-      "size_bytes": 87058
+      "sha256": "8d1fcddb045866497625fa7a8e0fe9282d64f4350f003dc395103407063cac79",
+      "size_bytes": 87612
     },
     {
       "executable": false,
@@ -895,8 +895,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "4e079fca3a54240b38a9394da103a1dfe23902e725a4450a4f03b538c86b67ef",
-      "size_bytes": 1216256
+      "sha256": "3a0aa87337ffbf8f6b3e6516c823642df5fe6777c9e8712fe844abd3a9784685",
+      "size_bytes": 1218102
     },
     {
       "executable": false,
@@ -1455,8 +1455,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/diagnostics.md",
-      "sha256": "c24ea058632d3bbf65ae86144aab4b105513277ff402e37b6786e9e621f549e9",
-      "size_bytes": 15499
+      "sha256": "1a7913b619575dc1edfa9869e0f45b0057403f2318364c588de55e0095a6ddba",
+      "size_bytes": 15933
     },
     {
       "executable": false,

@@ -1478,6 +1478,7 @@ fn run_worker(operation_id: &str) {
                         fail_operation(operation_id, ClaudeBrowserAuthOutcomeV1::LoginFailed);
                         return;
                     }
+                    sign_in_call.code_submitted = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => break,
@@ -1553,12 +1554,14 @@ fn run_worker(operation_id: &str) {
 }
 
 /// The provider-call log line of one `claude auth login` run: written when
-/// the run ends, or when the worker gives up on it. A completed sign-in made
-/// at least the token exchange; an unfinished one may have made none.
+/// the run ends, or when the worker gives up on it. A run that completed or
+/// was given a code sent at least the token exchange, whatever its result; one
+/// that never got a code may have sent none.
 struct SignInCall<'a> {
     config_dir: &'a str,
     started: Instant,
     pending: bool,
+    code_submitted: bool,
 }
 
 impl<'a> SignInCall<'a> {
@@ -1567,6 +1570,7 @@ impl<'a> SignInCall<'a> {
             config_dir,
             started: Instant::now(),
             pending: true,
+            code_submitted: false,
         }
     }
 
@@ -1585,7 +1589,7 @@ impl<'a> SignInCall<'a> {
             (!account.is_empty()).then_some(account.as_str()),
             result,
             self.started.elapsed(),
-            u32::from(result == CallResult::Ok),
+            u32::from(self.code_submitted || result == CallResult::Ok),
         ));
     }
 }
@@ -4935,8 +4939,9 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// A sign-in run is one provider-call line for setup: a completed one
-    /// made at least the token exchange; one given up on is still logged.
+    /// A sign-in run is one provider-call line for setup: one that completed
+    /// or was given a code sent at least the token exchange; one given up on
+    /// is still logged.
     #[test]
     #[serial]
     fn each_sign_in_run_is_one_provider_call_line() {
@@ -4959,6 +4964,9 @@ mod tests {
         cancelled.finish(CallResult::Error("cancelled"));
         cancelled.finish(CallResult::Ok);
         drop(SignInCall::started(config));
+        let mut submitted = SignInCall::started(config);
+        submitted.code_submitted = true;
+        submitted.finish(CallResult::Timeout);
         let lines = crate::provider_calls::test_lines(CallKind::ClaudeSignIn, &account);
         assert_eq!(
             lines
@@ -4974,6 +4982,7 @@ mod tests {
                 ("anthropic", "setup", "ok", 1),
                 ("anthropic", "setup", "cancelled", 0),
                 ("anthropic", "setup", "abandoned", 0),
+                ("anthropic", "setup", "timeout", 1),
             ]
         );
         let _ = fs::remove_dir_all(root);

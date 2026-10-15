@@ -46,6 +46,9 @@ const LOCK_WAIT: Duration = Duration::from_millis(50);
 pub enum Provider {
     Openai,
     Anthropic,
+    /// A model request whose provider the daemon cannot tell, such as Pi's
+    /// default route.
+    Unknown,
 }
 
 impl Provider {
@@ -53,6 +56,7 @@ impl Provider {
         match self {
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -68,7 +72,7 @@ pub enum CallKind {
     CodexDailyWorkspaceUsage,
     /// One `codex app-server` quota read: a token refresh and a rate-limits
     /// read, plus a detailed rate-limits read when due. Counts the requests
-    /// the CLI answered (2 or 3 for a successful read).
+    /// sent, answered or not: 2, or 3 with the detailed read.
     CodexAppServerQuota,
     /// One `codex cloud list` page.
     CodexCloudList,
@@ -76,6 +80,8 @@ pub enum CallKind {
     CodexSmokePrompt,
     ClaudeSmokePrompt,
     PiSmokePrompt,
+    /// `pi --print` on Pi's default route, whose provider is unknown.
+    PiDefaultSmokePrompt,
     /// `claude -p /usage` run to keep an expiring login signed in.
     ClaudeLoginRefresh,
     /// `claude auth login` for a sign-in.
@@ -97,6 +103,7 @@ impl CallKind {
             Self::CodexSmokePrompt => "codex_smoke_prompt",
             Self::ClaudeSmokePrompt => "claude_smoke_prompt",
             Self::PiSmokePrompt => "pi_smoke_prompt",
+            Self::PiDefaultSmokePrompt => "pi_default_smoke_prompt",
             Self::ClaudeLoginRefresh => "claude_login_refresh",
             Self::ClaudeSignIn => "claude_sign_in",
             Self::ClaudeContextProbe => "claude_context_probe",
@@ -523,7 +530,12 @@ mod writer {
         } else {
             (line, entries + 1)
         };
-        file.write_all(&written)?;
+        if let Err(error) = file.write_all(&written) {
+            // Never leave part of a line (a full disk): the next line would
+            // join it. The lock keeps other writers out until then.
+            let _ = file.set_len(metadata.len());
+            return Err(error);
+        }
         *count = Some(Count {
             dev: metadata.dev(),
             ino: metadata.ino(),

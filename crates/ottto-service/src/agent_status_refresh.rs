@@ -250,7 +250,7 @@ impl StatusLane {
         publish: impl FnOnce(&AgentStatusCollection) -> bool,
         finished_at: impl FnOnce() -> Duration,
     ) -> bool {
-        let (reused, app_only) = {
+        let (reused, app_only, first_pass) = {
             let mut state = self
                 .state
                 .lock()
@@ -281,6 +281,7 @@ impl StatusLane {
             state.manual = false;
             state.running = true;
             state.collecting = reused.is_none();
+            let first_pass = !app_only && state.schedule.last_started.is_none();
             if app_only {
                 state.last_app_pass = Some(now);
             } else if reused.is_none() {
@@ -289,13 +290,26 @@ impl StatusLane {
                 state.schedule.next_due = state.schedule.last_started.unwrap() + INTERVAL;
                 state.schedule.retry_not_before = Duration::ZERO;
             }
-            (reused, app_only)
+            (reused, app_only, first_pass)
         };
         let collection = if let Some(collection) = reused {
             collection
         } else {
             let started_at = u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
-            let collect = || crate::agent_status::with_claude_pass(app_only, started_at, collect);
+            let collect = || {
+                let collect =
+                    || crate::agent_status::with_claude_pass(app_only, started_at, collect);
+                // The provider calls of the first pass after daemon start
+                // are its startup burst, not its steady cadence.
+                if first_pass {
+                    crate::provider_calls::with_trigger(
+                        crate::provider_calls::Trigger::Startup,
+                        collect,
+                    )
+                } else {
+                    collect()
+                }
+            };
             let collection = match catch_unwind(AssertUnwindSafe(collect)) {
                 Ok(collection) => Arc::new(collection),
                 Err(_) => {
@@ -708,6 +722,33 @@ mod tests {
         codex.state.lock().unwrap().manual = true;
         assert!(pass(&codex, 120, 122, true));
         assert_eq!(codex.state.lock().unwrap().schedule.next_due, seconds(420));
+    }
+    /// The provider calls of a lane's first pass after daemon start are
+    /// labelled `startup`; an app-only pass before it does not count, and
+    /// later passes keep their callers' labels.
+    #[test]
+    fn first_lane_pass_is_the_startup_trigger() {
+        use crate::provider_calls::{current_trigger, Trigger};
+        let lane = StatusLane::for_source(&SourceKind::ClaudeCode);
+        let seen = std::cell::RefCell::new(Vec::new());
+        let run = |at: u64| {
+            lane.pass(
+                seconds(at),
+                true,
+                || {
+                    seen.borrow_mut().push(current_trigger());
+                    specimen(SourceKind::ClaudeCode)
+                },
+                |_| true,
+                || seconds(at + 2),
+            )
+        };
+        lane.state.lock().unwrap().schedule.next_due = seconds(60);
+        lane.state.lock().unwrap().manual = true;
+        assert!(run(10));
+        assert!(run(60));
+        assert!(run(360));
+        assert_eq!(*seen.borrow(), [None, Some(Trigger::Startup), None]);
     }
     #[test]
     fn claude_reset_read_brings_the_next_pass_forward_only() {

@@ -10718,7 +10718,7 @@ fn collect_claude_oauth_usage_unstamped(
     let record_call = |result: crate::provider_calls::CallResult| {
         use crate::provider_calls::{CallKind, Provider, ProviderCall, Trigger};
         let trigger = if explicit_refresh_due {
-            Trigger::ExplicitRefresh
+            claude_explicit_refresh_request().trigger
         } else {
             crate::provider_calls::trigger_or(Trigger::Schedule)
         };
@@ -11582,19 +11582,34 @@ fn claude_statusline_fresh_for_binding(
 const CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS: u64 = 2 * 60;
 const CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS: u64 = 60;
 
-/// When the last explicit refresh was requested (0: never).
-fn claude_explicit_refresh_requested_at() -> std::sync::MutexGuard<'static, u64> {
-    static REQUESTED_AT: Mutex<u64> = Mutex::new(0);
-    REQUESTED_AT
+/// The last explicit refresh request: when it was made (0: never) and why,
+/// for the provider-call log of the reads it causes on the lane thread.
+struct ClaudeExplicitRefreshRequest {
+    at: u64,
+    trigger: crate::provider_calls::Trigger,
+}
+
+fn claude_explicit_refresh_request() -> std::sync::MutexGuard<'static, ClaudeExplicitRefreshRequest>
+{
+    static REQUEST: Mutex<ClaudeExplicitRefreshRequest> =
+        Mutex::new(ClaudeExplicitRefreshRequest {
+            at: 0,
+            trigger: crate::provider_calls::Trigger::ExplicitRefresh,
+        });
+    REQUEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Ask the next Claude collection to read every account now, each only when
 /// its stored reading and its last explicit refresh are both at least a
-/// minute old.
+/// minute old. The caller's trigger (an older app's status refresh) labels
+/// those reads; a person's Refresh is the default.
 pub(crate) fn request_claude_explicit_refresh() {
-    *claude_explicit_refresh_requested_at() = current_unix_seconds();
+    *claude_explicit_refresh_request() = ClaudeExplicitRefreshRequest {
+        at: current_unix_seconds(),
+        trigger: crate::provider_calls::trigger_or(crate::provider_calls::Trigger::ExplicitRefresh),
+    };
 }
 
 /// Whether an explicit refresh asks to read this binding now: a live request
@@ -11607,7 +11622,7 @@ fn claude_explicit_refresh_requested(
     reading_observed_at: u64,
     now: u64,
 ) -> bool {
-    let requested_at = *claude_explicit_refresh_requested_at();
+    let requested_at = claude_explicit_refresh_request().at;
     let last = claude_binding_time(
         &claude_explicit_refresh_attempts(),
         account_identifier_hash,
@@ -14702,9 +14717,6 @@ fn codex_credential_claimed_ids(credentials: &CodexAuthCredentials) -> Option<(S
     Some((account_id, raw_workspace_id))
 }
 
-/// The binding key ([`codex_credit_grants::binding_key`]) a local Codex
-/// credential claims. Only a key to compare with an earlier provider-validated
-/// binding; it is never an identity and grants no authority.
 /// The account identifier hash the credential claims (not validated), for
 /// the provider-call log.
 fn codex_credential_claimed_account_hash(credentials: &CodexAuthCredentials) -> Option<String> {
@@ -14756,6 +14768,9 @@ pub(crate) fn codex_access_token_claimed_account_hash(access_token: &str) -> Opt
     billing_identity_hash("openai", "account", &account_id)
 }
 
+/// The binding key ([`codex_credit_grants::binding_key`]) a local Codex
+/// credential claims. Only a key to compare with an earlier provider-validated
+/// binding; it is never an identity and grants no authority.
 fn codex_credential_claimed_binding(credentials: &CodexAuthCredentials) -> Option<String> {
     let (account_id, raw_workspace_id) = codex_credential_claimed_ids(credentials)?;
     Some(codex_credit_grants::binding_key(
@@ -15219,12 +15234,15 @@ fn codex_app_server_end_failure(
 #[derive(Debug, Default)]
 struct CodexAppServerRun {
     spawned: bool,
-    /// Provider requests the CLI answered: the account read (it refreshes
-    /// the token), the rate-limits read, and a detailed rate-limits read. A
-    /// request it rejected or never answered may not have left the Mac.
-    requests_answered: u32,
+    /// Whether the session asked for the detailed rate-limits read.
+    detail_read_sent: bool,
     timed_out: bool,
 }
+
+/// Provider requests a started `codex app-server` quota session counts at
+/// least, sent whether or not they were answered: the token refresh and the
+/// rate-limits read.
+const CODEX_APP_SERVER_MIN_REQUESTS: u32 = 2;
 
 /// One `codex app-server` quota session for `codex_home`, logged as one
 /// provider-call line when the CLI started.
@@ -15257,7 +15275,7 @@ fn call_codex_app_server_rate_limits_for_home(
             account.as_deref(),
             result_class,
             started.elapsed(),
-            run.requests_answered,
+            CODEX_APP_SERVER_MIN_REQUESTS + u32::from(run.detail_read_sent),
         ));
     }
     result
@@ -15415,11 +15433,7 @@ fn run_codex_app_server_rate_limits_for_home(
             (Some("ottto_account"), Some(error)) => {
                 break Err(rpc_failure("account", error));
             }
-            (Some("ottto_account"), None) => {
-                let answered = account_result.is_some();
-                account_result = message.get("result").cloned();
-                run.requests_answered += u32::from(!answered && account_result.is_some());
-            }
+            (Some("ottto_account"), None) => account_result = message.get("result").cloned(),
             (Some("ottto_rate_limits"), Some(error))
                 if !detail_requested && codex_credit_grants::routine_param_rejected(error) =>
             {
@@ -15435,7 +15449,6 @@ fn run_codex_app_server_rate_limits_for_home(
                     .get("result")
                     .cloned()
                     .map(|result| (result, arrived_at()));
-                run.requests_answered += u32::from(rate_limits_result.is_some());
             }
             (Some(codex_credit_grants::DETAIL_READ_ID), Some(error)) => {
                 if rate_limits_result.is_none() {
@@ -15444,12 +15457,10 @@ fn run_codex_app_server_rate_limits_for_home(
                 detail_failed = true;
             }
             (Some(codex_credit_grants::DETAIL_READ_ID), None) => {
-                let answered = detail_result.is_some();
                 detail_result = message
                     .get("result")
                     .cloned()
                     .map(|result| (result, arrived_at()));
-                run.requests_answered += u32::from(!answered && detail_result.is_some());
             }
             _ => {}
         }
@@ -15482,6 +15493,7 @@ fn run_codex_app_server_rate_limits_for_home(
                 }
                 break Err("Codex app-server quota request failed.".to_string());
             }
+            run.detail_read_sent = true;
             continue;
         }
         if detail_requested
@@ -23393,13 +23405,13 @@ for line in sys.stdin:
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Each app-server run that started is one provider-call line, counting
-    /// only the provider requests the CLI answered: a run that failed before
-    /// the account read answered counts none.
+    /// Each app-server run that started is one provider-call line counting
+    /// the requests it sent, answered or not: a failed or timed-out read still
+    /// counts its token refresh and rate-limits read.
     #[cfg(unix)]
     #[test]
     #[serial]
-    fn codex_probe_runs_count_only_answered_provider_requests() {
+    fn codex_probe_runs_count_sent_provider_requests_even_when_they_fail() {
         use crate::provider_calls::CallKind;
         let support = crate::test_scratch::ScratchDir::new("codex-probe-call-log");
         let _support = EnvVarGuard::set_os(
@@ -23423,10 +23435,10 @@ for line in sys.stdin:
                 .map(|line| (line.result.as_str(), line.requests_at_least))
                 .collect::<Vec<_>>(),
             [
-                ("rpc_error", 0),
-                ("rpc_error", 0),
-                ("rpc_error", 1),
-                ("exited", 1),
+                ("rpc_error", 2),
+                ("rpc_error", 2),
+                ("rpc_error", 2),
+                ("exited", 2),
                 ("ok", 2),
             ]
         );

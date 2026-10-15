@@ -1273,7 +1273,11 @@ fn handle_command(
             }
         }
         LocalControlCommand::Verify { source, repair } => {
-            let result = verify_source(daemon, &authorization, source, repair)?;
+            // A person's Verify (the app or `ottto verify`) is a setup check.
+            let result =
+                crate::provider_calls::with_trigger(crate::provider_calls::Trigger::Setup, || {
+                    verify_source(daemon, &authorization, source, repair)
+                })?;
             if verification_result_should_refresh_agent_status(&result) {
                 if let Err(error) =
                     refresh_agent_status_for(daemon, &authorization, Some(result.source.clone()))
@@ -11506,9 +11510,14 @@ fn run_smoke_prompt(source: &SourceKind) -> SmokeResult {
             ),
             &result,
         ),
-        // Pi's default route names no provider; only a routed smoke is
-        // known to reach OpenAI or Anthropic.
-        SourceKind::Pi => {}
+        // Pi's default route names no provider, but it is a real model
+        // request.
+        SourceKind::Pi => record_smoke_prompt(
+            crate::provider_calls::Provider::Unknown,
+            crate::provider_calls::CallKind::PiDefaultSmokePrompt,
+            None,
+            &result,
+        ),
     }
     classify_source_smoke_failure(source, &mut result);
     result
@@ -26119,6 +26128,42 @@ mod tests {
             ("anthropic", "other", "ok", "subprocess_lower_bound", 1)
         );
         assert!(!crate::provider_calls::test_raw_log().contains("fixture-access"));
+    }
+
+    /// Pi's default route names no provider, but its smoke prompt is a real
+    /// model request: one line with provider `unknown` and its own kind.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pi_default_route_smoke_is_one_unknown_provider_line() {
+        use crate::provider_calls::CallKind;
+        use std::os::unix::fs::PermissionsExt;
+        let root = control_test_root("pi-default-smoke");
+        let bin = root.join("bin");
+        create_control_test_dir(&bin);
+        let pi = bin.join("pi");
+        fs::write(&pi, "#!/bin/sh\necho ok\n").expect("fake pi");
+        fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).expect("executable");
+        let _home = EnvVarGuard::set_path("HOME", &root);
+        let _search = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &bin);
+        let _support =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+
+        let _ = run_smoke_prompt(&SourceKind::Pi);
+
+        let lines = crate::provider_calls::test_lines(CallKind::PiDefaultSmokePrompt, "unknown");
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (
+                    line.provider.as_str(),
+                    line.basis.as_str(),
+                    line.requests_at_least
+                ))
+                .collect::<Vec<_>>(),
+            [("unknown", "subprocess_lower_bound", 1)]
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

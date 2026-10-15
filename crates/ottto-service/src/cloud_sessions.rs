@@ -4737,11 +4737,24 @@ mod tests {
     #[serial_test::serial]
     fn each_cloud_list_run_is_one_provider_call_line() {
         use crate::provider_calls::CallKind;
+        /// Restores an env var even when an assertion below panics.
+        struct Restore(&'static str, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.1.take() {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let set = |key: &'static str, value: std::path::PathBuf| {
+            let restore = Restore(key, std::env::var_os(key));
+            std::env::set_var(key, value);
+            restore
+        };
         let scratch = temp_dir("cloud-call-log");
-        let previous_home = std::env::var_os("HOME");
-        let previous_support = std::env::var_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
-        std::env::set_var("HOME", scratch.join("home"));
-        std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", scratch.join("support"));
+        let _home = set("HOME", scratch.join("home"));
+        let _support = set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", scratch.join("support"));
         {
             let _fixture = CloudCliFixture::new("output", br#"{"tasks":[]}"#, 0);
             CodexCloudCliRunner
@@ -4767,15 +4780,6 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        for (key, value) in [
-            ("HOME", previous_home),
-            ("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", previous_support),
-        ] {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
         let _ = fs::remove_dir_all(scratch);
         assert_eq!(
             summary,
