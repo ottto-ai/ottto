@@ -146,7 +146,7 @@ impl LoginMark {
     /// The same login: the same claimed account and workspace. The file
     /// metadata decides only when neither side claims one (a token rewrite
     /// for the same account is not a new login).
-    fn same_login(&self, other: &Self) -> bool {
+    pub(super) fn same_login(&self, other: &Self) -> bool {
         match (&self.binding, &other.binding) {
             (Some(own), Some(other)) => own == other,
             (None, None) => self.auth == other.auth,

@@ -59,6 +59,8 @@ pub use codex_saved_quota::start_codex_quota_scheduler;
 pub(crate) use codex_saved_quota::{
     refresh_codex_quota_now, saved_codex_quota_generation, stop_codex_quota_scheduler,
 };
+#[cfg(test)]
+pub(crate) use codex_setup_gate::SetupGateTestClock;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);

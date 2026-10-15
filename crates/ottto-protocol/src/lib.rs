@@ -3935,6 +3935,7 @@ pub enum LocalControlCommand {
         /// A person's check (a button), not a client's poll. While the setup
         /// waits for sign-in, the daemon spaces provider reads after a failed
         /// one; an explicit check reads at most once per few seconds instead.
+        /// Clients set it only for a person's action, never on a timer.
         #[serde(default, skip_serializing_if = "is_false")]
         explicit: bool,
     },
