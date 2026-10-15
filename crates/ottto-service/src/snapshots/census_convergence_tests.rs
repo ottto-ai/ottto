@@ -1279,3 +1279,7 @@ fn transcript_ownership_needs_quarantined_originals_observed() {
 mod owned_held_index_allocation {
     include!("owned_held_index_allocation_tests.rs");
 }
+
+mod authority_binding_prototype {
+    include!("authority_binding_prototype_tests.rs");
+}
