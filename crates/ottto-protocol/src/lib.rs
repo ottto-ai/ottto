@@ -3932,6 +3932,11 @@ pub enum LocalControlCommand {
     CodexAccountCheck {
         schema_version: u16,
         operation_id: String,
+        /// A person's check (a button), not a client's poll. While the setup
+        /// waits for sign-in, the daemon spaces provider reads after a failed
+        /// one; an explicit check reads at most once per few seconds instead.
+        #[serde(default, skip_serializing_if = "is_false")]
+        explicit: bool,
     },
     /// Stop setup observation without signing out or deleting provider state.
     CodexAccountStopWaiting {
@@ -4936,6 +4941,12 @@ mod tests {
                 "command": "codex_account_check",
                 "schema_version": 1,
                 "operation_id": "codex_setup_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "codex_account_check",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
+                "explicit": true
             }),
             serde_json::json!({
                 "command": "codex_account_stop_waiting",

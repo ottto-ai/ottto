@@ -6,7 +6,8 @@
 //! Every status read (the companion's accounts poll, agent-status refreshes,
 //! startup re-verify, the collection lane) serves that saved copy and never
 //! starts `codex app-server` itself. Setup checks and an explicit refresh read
-//! the provider directly and update the same copy.
+//! the provider directly and update the same copy; the checks of a setup that
+//! waits for sign-in are spaced per home by `codex_setup_gate`.
 //!
 //! Schedule per home:
 //! - in use on this Mac (a Codex process held a rollout in the home, or a
@@ -161,6 +162,23 @@ impl LoginMark {
         match (&self.binding, &current.binding) {
             (Some(own), Some(current)) => own != current,
             _ => self.auth.is_some() != current.auth.is_some(),
+        }
+    }
+
+    /// Whether the home has an `auth.json` at all.
+    pub(super) fn has_credential_file(&self) -> bool {
+        self.auth.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(binding: Option<&str>, auth_modified_secs: Option<u64>) -> Self {
+        Self {
+            binding: binding.map(str::to_string),
+            auth: auth_modified_secs.map(|modified_secs| AuthWitness {
+                modified_secs,
+                modified_nanos: 0,
+                len: 1,
+            }),
         }
     }
 }

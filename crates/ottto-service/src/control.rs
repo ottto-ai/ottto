@@ -1195,9 +1195,14 @@ fn handle_command(
         LocalControlCommand::CodexAccountCheck {
             schema_version,
             operation_id,
+            explicit,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(check_codex_account(schema_version, &operation_id)?)
+            to_value(check_codex_account(
+                schema_version,
+                &operation_id,
+                explicit,
+            )?)
         }
         LocalControlCommand::CodexAccountStopWaiting {
             schema_version,
@@ -2763,6 +2768,7 @@ fn reconnect_codex_account(
 fn check_codex_account(
     schema_version: u16,
     operation_id: &str,
+    explicit: bool,
 ) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
     let store = FileCodexAccountSlotSettingsStore::default();
     let current_operation = store
@@ -2778,7 +2784,8 @@ fn check_codex_account(
     // to poll while the provider-owned browser flow is open, but an incomplete
     // login is progress, not a failed durable connection. Probe before moving
     // the persisted operation to `validating`; only a complete exact identity
-    // and fresh quota snapshot crosses that state boundary.
+    // and fresh quota snapshot crosses that state boundary. Clients poll this
+    // every few seconds, so the probe's provider reads are spaced per home.
     let pending_collection = if current_operation.state
         == CodexAccountSetupOperationStateV1::WaitingForUserLogin
     {
@@ -2787,7 +2794,13 @@ fn check_codex_account(
                 "Codex setup operation has no durable connection slot".to_string(),
             )
         })?;
-        match crate::agent_status::collect_registered_codex_slot_for_setup(slot_id) {
+        match crate::agent_status::collect_registered_codex_slot_for_setup(
+            slot_id,
+            crate::agent_status::CodexSetupRead::WaitingForLogin {
+                operation_id,
+                explicit,
+            },
+        ) {
             Ok(result) => Some(Ok(result)),
             Err(crate::agent_status::CodexSlotSetupCollectionError::ProviderLoginPending(_)) => {
                 return store
@@ -2831,7 +2844,10 @@ fn check_codex_account(
                     "Pinned Codex verification has no workspace identity.".to_string(),
                 )
             })?;
-        return match crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id) {
+        return match crate::agent_status::collect_registered_codex_slot_for_setup(
+            &slot_id,
+            crate::agent_status::CodexSetupRead::Validation,
+        ) {
             Ok((pinned, _))
                 if pinned.account_identifier_hash == account_hash
                     && pinned.workspace_identifier_hash == workspace_hash =>
@@ -2858,7 +2874,10 @@ fn check_codex_account(
     }
     let collection = match pending_collection {
         Some(result) => result,
-        None => crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id),
+        None => crate::agent_status::collect_registered_codex_slot_for_setup(
+            &slot_id,
+            crate::agent_status::CodexSetupRead::Validation,
+        ),
     };
     let (identity, _) = match collection {
         Ok(result) => result,
@@ -2890,7 +2909,10 @@ fn check_codex_account(
         .is_verifying_pinned_workspace(operation_id)
         .map_err(codex_account_slot_settings_error)?
     {
-        match crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id) {
+        match crate::agent_status::collect_registered_codex_slot_for_setup(
+            &slot_id,
+            crate::agent_status::CodexSetupRead::Validation,
+        ) {
             Ok((pinned, _))
                 if pinned.account_identifier_hash == identity.account_identifier_hash
                     && pinned.workspace_identifier_hash == identity.workspace_identifier_hash =>
@@ -16118,13 +16140,148 @@ mod tests {
             CodexAccountSetupOperationStateV1::WaitingForUserLogin
         );
 
-        let checked = check_codex_account(1, operation_id)
+        let checked = check_codex_account(1, operation_id, false)
             .expect("pending provider login remains a successful status read");
         assert_eq!(
             checked.setup_operation.state,
             CodexAccountSetupOperationStateV1::WaitingForUserLogin
         );
         assert!(checked.setup_operation.launch_command.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A fake `codex` whose app-server answers like a home nobody signed in to:
+    /// `account/read` succeeds without an account, and the quota read fails.
+    /// Each app-server start appends one line to `runs`.
+    #[cfg(unix)]
+    fn write_signed_out_fake_codex(bin: &Path, runs: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(bin).expect("fake Codex bin dir");
+        let executable = bin.join("codex");
+        fs::write(
+            &executable,
+            format!(
+                r#"#!/usr/bin/python3
+import sys
+
+if sys.argv[1:] != ["app-server", "--stdio"]:
+    sys.exit(1)
+with open({runs:?}, "a") as runs:
+    runs.write("run\n")
+for line in sys.stdin:
+    if '"id":1' in line:
+        print('{{"id":1,"result":{{"userAgent":"synthetic"}}}}', flush=True)
+    elif '"id":"ottto_account"' in line:
+        print('{{"id":"ottto_account","result":{{"account":null,"requiresOpenaiAuth":true}}}}', flush=True)
+    elif "account/rateLimits/read" in line:
+        print('{{"id":"ottto_rate_limits","error":{{"code":-32600,"message":"codex account authentication required to read rate limits"}}}}', flush=True)
+"#,
+                runs = runs.display().to_string()
+            ),
+        )
+        .expect("fake Codex executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("fake Codex mode");
+    }
+
+    #[cfg(unix)]
+    fn counted_lines(path: &Path) -> usize {
+        fs::read_to_string(path)
+            .map(|body| body.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// `codex_app_server_quota` lines with trigger `setup` and result `rpc_error`.
+    #[cfg(unix)]
+    fn setup_rpc_error_call_lines(support: &Path) -> usize {
+        let dir = ottto_core::provider_call_log::provider_call_log_dir(support);
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
+            .flat_map(|body| {
+                body.lines()
+                    .filter_map(|line| {
+                        serde_json::from_str::<ottto_core::provider_call_log::ProviderCallLine>(
+                            line,
+                        )
+                        .ok()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|line| {
+                line.kind == "codex_app_server_quota"
+                    && line.trigger == "setup"
+                    && line.result == "rpc_error"
+            })
+            .count()
+    }
+
+    /// The companion checks a setup that waits for sign-in every few seconds.
+    /// Before the fix each check started one `codex app-server` (20 checks, 20
+    /// runs). Now a home without a credential is never read, a failing read
+    /// backs off, and a new sign-in is read at once.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_waiting_check_storm_stays_under_the_setup_backoff() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("codex-check-storm")
+            .canonicalize()
+            .expect("canonical Codex account test root");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let runs = root.join("app-server-runs");
+        write_signed_out_fake_codex(&root.join("bin"), &runs);
+        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("bin"));
+        let operation_id = "codex_setup_0123456789abcdef0123456789abcdef";
+        let prepared =
+            prepare_open_codex_account(1, operation_id.to_string()).expect("prepare open");
+        let slot_id = prepared
+            .setup_operation
+            .slot_id
+            .expect("the open setup reserves a home");
+        let home = FileCodexAccountSlotSettingsStore::default()
+            .slot_home(&slot_id)
+            .expect("reserved Codex home");
+        let write_auth = |body: &str| {
+            let auth = home.join("auth.json");
+            fs::write(&auth, body).expect("synthetic credential");
+            fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("credential mode");
+        };
+        let check = |times: usize, explicit: bool| {
+            for _ in 0..times {
+                let checked =
+                    check_codex_account(1, operation_id, explicit).expect("waiting check");
+                assert_eq!(
+                    checked.setup_operation.state,
+                    CodexAccountSetupOperationStateV1::WaitingForUserLogin
+                );
+            }
+        };
+
+        // Before the sign-in writes a credential, no check starts the CLI.
+        check(20, false);
+        assert_eq!(counted_lines(&runs), 0);
+
+        // A credential whose quota read fails: the first check reads at once,
+        // the following polls wait out the backoff, and so does a person's
+        // check right after the failure.
+        write_auth("{}");
+        check(20, false);
+        assert_eq!(counted_lines(&runs), 1);
+        check(1, true);
+        assert_eq!(counted_lines(&runs), 1);
+
+        // A new sign-in is read at once, then backs off again.
+        write_auth("{\"tokens\":null}");
+        check(20, false);
+        assert_eq!(counted_lines(&runs), 2);
+
+        // Each failed read still counts as a sent call.
+        assert_eq!(setup_rpc_error_call_lines(&root), 2);
 
         let _ = fs::remove_dir_all(root);
     }
