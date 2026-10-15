@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 649,
-  "content_sha256": "bc3322fe471407dc3ccceeb5bf3e708007f7237ed452a516f272fb898f8b3a32",
+  "candidate_file_count": 650,
+  "content_sha256": "d73b0511c8cffea78878393f8e1cb064859fcab54ea651a2a429862f359a6d0b",
   "files": [
     {
       "executable": false,
@@ -1217,8 +1217,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "8a85bbbccd733f7aba1b7fe85ad78061bac0922fdf7e270b01698c76c345c11f",
-      "size_bytes": 2435521
+      "sha256": "5ec4f3aab1a66b8197dea6731e89ce966bdff428dc96276ab6c76aad200a3ec0",
+      "size_bytes": 2442446
     },
     {
       "executable": false,
@@ -1280,8 +1280,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join.rs",
-      "sha256": "5afdd1814eb78f37153dd40a63f279ac294fcceea5535cafef2e0d835aaff312",
-      "size_bytes": 129983
+      "sha256": "a604eced122365b51f9c4f8c46a654a94a562d3d2053b51a0b7a5a1be9575363",
+      "size_bytes": 141848
     },
     {
       "executable": false,
@@ -2801,6 +2801,13 @@
       "path": "docs/session-2026-10-15-claude-terminal-family-members.md",
       "sha256": "30ed17a7e55269840a1dd1f7f83dfbda8fd6efed3ddb8fcc7c45674268ebdb66",
       "size_bytes": 4573
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-15-codex-retained-roster-refresh.md",
+      "sha256": "91ffc9653709f494be2c3922d4ab4bb0b9aaac3bafbfe0d0b48bed4df2dc083c",
+      "size_bytes": 5195
     },
     {
       "executable": false,
@@ -4546,9 +4553,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-15T09:37:57+00:00",
+  "generated_at": "2026-10-15T17:42:05+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 650,
+  "output_file_count": 651,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4585,5 +4592,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "5047a96fa30f76128dcd838fe0961a56a4faa147"
+  "source_commit": "fb6986e331280c1da148e33a0e2cd49166a7bb97"
 }

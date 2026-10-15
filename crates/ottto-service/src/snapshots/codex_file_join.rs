@@ -76,6 +76,46 @@ impl DirectoryCensus {
             self.stable = false;
         }
     }
+    pub(super) fn contains(&self, path: &Path) -> bool {
+        self.directories.contains_key(&local_index_key(path))
+    }
+    /// Census directories whose current metadata no longer matches their
+    /// recorded witness: an entry was added, removed or renamed, or the
+    /// directory itself was replaced or removed. Unchanged directories cost one
+    /// `lstat` each and are never re-listed.
+    pub(super) fn moved_directories(&self) -> Vec<PathBuf> {
+        self.directories
+            .iter()
+            .filter(|(path, witness)| {
+                fs::symlink_metadata(path).map_or(true, |current| {
+                    !current.is_dir()
+                        || current.file_type().is_symlink()
+                        || metadata_witness(&current) != **witness
+                })
+            })
+            .map(|(path, _)| PathBuf::from(path))
+            .collect()
+    }
+    /// Re-certify one directory after a complete re-listing. The listing
+    /// counts only if `before` (taken ahead of it) still matches the
+    /// directory afterwards; otherwise the old witness stays, so `validate`
+    /// keeps refusing joins in that home until a later refresh or walk.
+    pub(super) fn refresh(&mut self, path: &Path, before: &fs::Metadata) -> bool {
+        let witness = metadata_witness(before);
+        let unchanged = fs::symlink_metadata(path).is_ok_and(|after| {
+            after.is_dir() && !after.file_type().is_symlink() && metadata_witness(&after) == witness
+        });
+        if unchanged {
+            self.directories.insert(local_index_key(path), witness);
+        }
+        unchanged
+    }
+    /// Drop a directory that no longer exists, with every census directory
+    /// beneath it. A fresh walk would not list them either.
+    pub(super) fn retire(&mut self, path: &Path) {
+        self.directories
+            .retain(|directory, _| !Path::new(directory).starts_with(path));
+    }
     pub(super) fn validate(&self, home: &Path) -> Result<()> {
         anyhow::ensure!(self.stable, "Codex joining directory census is unproved");
         let mut count = 0;
@@ -133,7 +173,7 @@ fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usiz
     let witness = metadata_witness(&before);
     anyhow::ensure!(
         metadata_witness(&after) == witness,
-        "Codex header changed while read"
+        HEADER_CHANGED_WHILE_READ
     );
     let read_bytes = (MAX_HEADER_BYTES + 1) - reader.get_ref().limit() as usize;
     Ok((bytes, witness, read_bytes))
@@ -146,6 +186,29 @@ fn read_header(candidate: &CandidateFile) -> Result<(String, String, usize)> {
     let owner = resolve_codex_identity_option(codex_identity_at(meta, &["id"]))
         .context("Codex header lacks ownership")?;
     Ok((owner, witness, read_bytes))
+}
+/// Live rollouts are appended to while the inventory reads them. An append
+/// that lands during the bounded first-record read moves the bracketing
+/// witness without touching the header, and one such collision used to hold
+/// every candidate on the page. Repeat the same bracketed read a few times;
+/// each attempt still has to observe an unchanged object, so a replaced or
+/// rewritten file, or an unreadable header, still fails. Only that race is
+/// repeated; every other refusal is final on its first read.
+const HEADER_READ_ATTEMPTS: usize = 3;
+const HEADER_CHANGED_WHILE_READ: &str = "Codex header changed while read";
+fn read_header_settled(candidate: &CandidateFile) -> (Result<(String, String, usize)>, usize) {
+    let mut retried = 0;
+    loop {
+        match read_header(candidate) {
+            Err(error)
+                if retried + 1 < HEADER_READ_ATTEMPTS
+                    && error.to_string() == HEADER_CHANGED_WHILE_READ =>
+            {
+                retried += 1
+            }
+            result => return (result, retried),
+        }
+    }
 }
 /// Raw header digest for a file whose owning header the native inventory has
 /// already established. No extra decoded Value is retained or allocated.
@@ -241,7 +304,12 @@ impl HeaderInventory {
                 &ClaudeTitleMetadata::default(),
                 None,
             );
-            let (owner, witness, bytes) = read_header(&candidate)?;
+            let (header, retried) = read_header_settled(&candidate);
+            // Each abandoned attempt may have consumed its whole bounded prefix.
+            self.read_bytes = self
+                .read_bytes
+                .saturating_add(retried.saturating_mul(MAX_HEADER_BYTES + 1));
+            let (owner, witness, bytes) = header?;
             self.read_bytes = self.read_bytes.saturating_add(bytes);
             Ok(HeaderWitness {
                 home: member_home(&candidate.scan_root),
@@ -2250,6 +2318,200 @@ pub(super) mod tests {
         assert!(!next.census_complete);
         assert_eq!(next.snapshots.len(), 1);
         assert_eq!(next.snapshots[0].source_session_id, healthy);
+        fs::remove_dir_all(root).unwrap();
+    }
+    const RETAINED_AT: &str = "2026-10-06T23:00:00Z";
+    const KNOWN: &str = "11111111-1111-4111-8111-111111111111";
+    const UNRELATED: &str = "22222222-2222-4222-8222-222222222222";
+    fn write_rows(path: &Path, rows: &[Value]) {
+        fs::write(
+            path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+    fn retained_page(
+        root: &Path,
+        index: ScanIndex,
+        hints: &[PathBuf],
+    ) -> (ScanIndex, SourceScanResult) {
+        let mut owned = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[root.join("sessions")],
+            index,
+            RETAINED_AT,
+            7,
+            10,
+            false,
+            None,
+            hints,
+            false,
+            false,
+        );
+        for _ in 0..1000 {
+            match owned.step(None) {
+                OwnedSourceScanStep::Pending(next) => owned = next,
+                OwnedSourceScanStep::Complete { index, scan } => return (index, scan),
+            }
+        }
+        panic!("bounded native scan did not finish");
+    }
+    /// A settled `known` rollout beside one whose malformed line keeps the
+    /// generation red, so it is retained behind its bounded retry deadline.
+    fn retained_red_generation(known: Vec<Value>) -> (PathBuf, ScanIndex) {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-codex-retained-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        write_rows(&sessions.join("a.jsonl"), &known);
+        let red = "33333333-3333-4333-8333-333333333333";
+        fs::write(
+            sessions.join("red.jsonl"),
+            serde_json::to_string(&member(red, "r-red", 10, 10)[0]).unwrap() + "\n{not json\n",
+        )
+        .unwrap();
+        let (mut index, mut result) = retained_page(&root, ScanIndex::default(), &[]);
+        assert!(!result.census_complete);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        result.finish_codex_capture_boundary(&mut index);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let settled = index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+        let deadline = settled
+            .traversal
+            .as_ref()
+            .and_then(|traversal| traversal.unhealthy_retry_not_before_unix_seconds)
+            .expect("red generation keeps a retry deadline");
+        assert!(deadline > rfc3339_unix_seconds(RETAINED_AT).unwrap());
+        (root, settled)
+    }
+    fn retry_deadline(index: &ScanIndex) -> Option<u64> {
+        index
+            .traversal
+            .as_ref()
+            .and_then(|traversal| traversal.unhealthy_retry_not_before_unix_seconds)
+    }
+    #[test]
+    fn retained_generation_admits_new_rollout_without_holding_known_update() {
+        let (root, settled) = retained_red_generation(member(KNOWN, "k-1", 100, 100));
+        let deadline = retry_deadline(&settled);
+        let known = root.join("sessions/a.jsonl");
+        let mut text = fs::read_to_string(&known).unwrap();
+        for row in &member(KNOWN, "k-2", 150, 250)[1..] {
+            text.push_str(&(serde_json::to_string(row).unwrap() + "\n"));
+        }
+        fs::write(&known, text).unwrap();
+        let new = root.join("sessions/new.jsonl");
+        write_rows(&new, &member(UNRELATED, "n-1", 70, 70));
+        let (index, page) = retained_page(&root, settled, &[known, new.clone()]);
+        let mut totals = page
+            .snapshots
+            .iter()
+            .map(|item| (item.source_session_id.clone(), item.input_tokens))
+            .collect::<Vec<_>>();
+        totals.sort();
+        assert_eq!(
+            totals,
+            vec![(KNOWN.to_string(), 250), (UNRELATED.to_string(), 70)],
+            "a rollout created after the walk must not hold the known update"
+        );
+        assert_eq!(page.scanned_file_count, 2, "only the changed and new files");
+        assert_eq!(retry_deadline(&index), deadline, "no re-walk was forced");
+        assert!(index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .codex_rollout_paths
+            .contains(&local_index_key(&new)));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn retained_generation_discovers_new_rollout_without_a_watcher_hint() {
+        let (root, settled) = retained_red_generation(member(KNOWN, "k-1", 100, 100));
+        let deadline = retry_deadline(&settled);
+        let (idle, quiet) = retained_page(&root, settled, &[]);
+        assert_eq!(
+            quiet.scanned_file_count, 0,
+            "unchanged directories re-list nothing"
+        );
+        assert!(quiet.snapshots.is_empty());
+        write_rows(
+            &root.join("sessions/new.jsonl"),
+            &member(UNRELATED, "n-1", 70, 70),
+        );
+        let (index, page) = retained_page(&root, idle, &[]);
+        assert_eq!(page.scanned_file_count, 1);
+        assert_eq!(page.snapshots.len(), 1);
+        assert_eq!(page.snapshots[0].source_session_id, UNRELATED);
+        assert_eq!(retry_deadline(&index), deadline);
+        let (_, again) = retained_page(&root, index, &[]);
+        assert_eq!(
+            again.scanned_file_count, 0,
+            "an admitted file is not re-read"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn retained_generation_never_sends_a_settled_segment_without_its_new_sibling() {
+        // The known owner's second physical segment appears after the walk.
+        // Emitting the settled first segment alone would replace the session
+        // with part of its usage; it must be joined or held, while an
+        // unrelated new rollout on the same page is still admitted.
+        let (root, settled) = retained_red_generation(member(KNOWN, "r-a", 100, 100));
+        let segment = root.join("sessions/b.jsonl");
+        write_rows(&segment, &member(KNOWN, "r-b", 200, 300));
+        let new = root.join("sessions/new.jsonl");
+        write_rows(&new, &member(UNRELATED, "n-1", 70, 70));
+        let (_, page) = retained_page(&root, settled, &[segment, new]);
+        let known = page
+            .snapshots
+            .iter()
+            .filter(|item| item.source_session_id == KNOWN)
+            .collect::<Vec<_>>();
+        assert!(
+            known.iter().all(|item| item.input_tokens == 300),
+            "a known segment cannot be sent alone once its sibling exists: {known:?}"
+        );
+        assert!(!known.is_empty() || page.ownership_incomplete_file_count >= 2);
+        assert!(page
+            .snapshots
+            .iter()
+            .any(|item| item.source_session_id == UNRELATED && item.input_tokens == 70));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn unreadable_new_header_holds_the_page_only_while_it_is_unreadable() {
+        // An unreadable header has no provable owner, so it may belong to any
+        // selected session: the page stays held. Once it is gone, the next
+        // page proceeds before the retry deadline instead of waiting for it.
+        let (root, settled) = retained_red_generation(member(KNOWN, "k-1", 100, 100));
+        let deadline = retry_deadline(&settled);
+        let unreadable = root.join("sessions/unreadable.jsonl");
+        fs::write(&unreadable, "not a header\n").unwrap();
+        let new = root.join("sessions/new.jsonl");
+        write_rows(&new, &member(UNRELATED, "n-1", 70, 70));
+        let (held_index, held) = retained_page(&root, settled, &[unreadable.clone(), new]);
+        assert!(held.snapshots.is_empty(), "{:?}", held.snapshots);
+        assert!(held.ownership_incomplete_file_count > 0);
+        fs::remove_file(&unreadable).unwrap();
+        let later = root.join("sessions/later.jsonl");
+        let later_owner = "44444444-4444-4444-8444-444444444444";
+        write_rows(&later, &member(later_owner, "l-1", 30, 30));
+        let (index, page) = retained_page(&root, held_index, &[unreadable, later]);
+        assert_eq!(page.snapshots.len(), 1, "{:?}", page.snapshots);
+        assert_eq!(page.snapshots[0].source_session_id, later_owner);
+        assert_eq!(retry_deadline(&index), deadline);
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
