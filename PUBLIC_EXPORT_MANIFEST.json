@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 647,
-  "content_sha256": "100cb471c0ce4abf73243107a88a7308d1596fbd84b724f6c7823d717f19ae77",
+  "candidate_file_count": 648,
+  "content_sha256": "f4484053f4f4afdc03da5036df29c0cabb19dc7cfddcb5002e728697ef5e0fe1",
   "files": [
     {
       "executable": false,
@@ -692,8 +692,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "28a084bc74fcea38069635fc330b2bf18ebcde62b7e813ee687a55fd3c87785a",
-      "size_bytes": 1567622
+      "sha256": "13068a17cfb128914e5747038f2079b7a81e532e6791250c95894f0cd1edb59e",
+      "size_bytes": 1572997
     },
     {
       "executable": false,
@@ -2784,6 +2784,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-15-claude-slot-state-follows-windows.md",
+      "sha256": "a517305104edf00a313491ba03527ecc9fef8698ae3ca97161ae5cc95b6d6911",
+      "size_bytes": 2404
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-15-claude-terminal-family-members.md",
       "sha256": "30ed17a7e55269840a1dd1f7f83dfbda8fd6efed3ddb8fcc7c45674268ebdb66",
       "size_bytes": 4573
@@ -4534,7 +4541,7 @@
   ],
   "generated_at": "2026-10-15T09:37:57+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 648,
+  "output_file_count": 649,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

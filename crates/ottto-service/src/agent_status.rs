@@ -6470,14 +6470,14 @@ fn custom_claude_snapshot_from_usage(
     ) {
         return Err(ClaudeSlotProbeFailure::IdentityMismatch.status(&captured_at));
     }
+    // Credit sections carry their own per-section freshness (each from its own
+    // read time); the slot's state is its meters', as in
+    // `local_claude_quota_snapshot`. A section read on alternate slots goes
+    // Stale while the windows are fresh, which is not a failed read.
     let stale = usage
         .windows
         .iter()
-        .any(|window| window.freshness != AgentQuotaWindowFreshness::Fresh)
-        || usage
-            .credit_balances
-            .iter()
-            .any(|balance| balance.freshness != AgentQuotaWindowFreshness::Fresh);
+        .any(|window| window.freshness != AgentQuotaWindowFreshness::Fresh);
     let account_weekly_not_offered = usage.account_weekly_not_offered;
     let has_account_windows =
         claude_has_account_windows(&usage.windows, account_weekly_not_offered);
@@ -7927,11 +7927,11 @@ fn claude_default_slot_collection_status(
                         && window.organization_identifier_hash.as_deref() == Some(organization_hash)
                         && window.freshness == AgentQuotaWindowFreshness::Fresh
                 })
+                // Credit sections keep their own freshness; the state is the meters'.
                 && snapshot.credit_balances.iter().all(|balance| {
                     balance.account_identifier_hash.as_deref() == Some(account_hash)
                         && balance.organization_identifier_hash.as_deref()
                             == Some(organization_hash)
-                        && balance.freshness == AgentQuotaWindowFreshness::Fresh
                 }) =>
         {
             let mut status = fresh_slot_status(
@@ -33909,6 +33909,120 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             ClaudeConfigSlotQuotaSnapshotStateV1::Partial
         );
         assert!(!claude_snapshot_has_account_windows(&snapshot));
+    }
+
+    #[test]
+    fn claude_slot_with_fresh_meters_stays_fresh_when_a_credit_section_is_stale() {
+        // A plain read refreshes the windows but not the saved-reset section,
+        // which keeps its own older read time and can go Stale before the next
+        // read. That section is labelled Stale on its own; the slot must not
+        // become "temporarily unavailable" while its meters are fresh.
+        let body = serde_json::json!({
+            "five_hour": {"utilization": 0, "resets_at": null},
+            "seven_day": {"utilization": 100, "resets_at": "2026-09-03T05:00:00+00:00"},
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 0,
+                 "resets_at": null, "scope": null},
+                {"kind": "weekly_all", "group": "weekly", "percent": 100,
+                 "resets_at": "2026-09-03T05:00:00+00:00", "scope": null},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 2,
+                 "resets_at": "2026-09-03T05:00:00+00:00",
+                 "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}
+            ]
+        });
+        let resolved = || ResolvedClaudeSlot {
+            descriptor: ClaudeConfigDirSlot::Default
+                .descriptor("default", ClaudeConfigSlotOwnership::External),
+            account: AgentAccountStatus {
+                login_state: AgentLoginState::SignedIn,
+                plan_type: Some("max".to_string()),
+                account_identifier_hash: Some("account-a".to_string()),
+                organization_identifier_hash: Some("org-a".to_string()),
+                ..unsupported_account("anthropic")
+            },
+            account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "org-a".to_string(),
+            credential: ClaudeOAuthCredential {
+                access_token: None,
+                has_refresh_token: true,
+                access_expires_at: None,
+                relogin_required_at: None,
+                has_inference_scope: None,
+                has_profile_scope: false,
+                subscription_type: None,
+            },
+        };
+        let read = |window_freshness: AgentQuotaWindowFreshness| {
+            let mut windows = claude_oauth_quota_windows(&body);
+            assert!(!windows.is_empty());
+            for window in &mut windows {
+                window.freshness = window_freshness.clone();
+            }
+            let mut usage = ClaudeOAuthUsage {
+                windows,
+                credit_balances: vec![AgentCreditBalance {
+                    name: "reset_bank".to_string(),
+                    kind: Some(ottto_protocol::CreditBalanceKind::SavedResets),
+                    freshness: AgentQuotaWindowFreshness::Stale,
+                    observed_at: Some("2026-09-01T08:40:00Z".to_string()),
+                    ..Default::default()
+                }],
+                account_weekly_not_offered: false,
+            };
+            claude_oauth_stamp_account_identity(&mut usage, "account-a", Some("org-a"));
+            custom_claude_snapshot_from_usage(
+                resolved(),
+                ClaudeOAuthUsageOutcome::from(Ok(usage)),
+                true,
+                "2026-09-01T10:00:00Z".to_string(),
+                "2026-09-01T10:05:00Z".to_string(),
+            )
+            .unwrap_or_else(|_| panic!("reading with windows"))
+        };
+
+        let (snapshot, status) = read(AgentQuotaWindowFreshness::Fresh);
+        // The default login's path reads the same snapshot the same way.
+        let default_status = claude_default_slot_collection_status(&snapshot);
+        assert_eq!(
+            default_status.state,
+            ClaudeConfigSlotCollectionStateV1::Fresh
+        );
+        assert_ne!(
+            default_status
+                .quota_snapshot
+                .expect("default snapshot")
+                .state,
+            ClaudeConfigSlotQuotaSnapshotStateV1::Stale
+        );
+        assert_eq!(status.state, ClaudeConfigSlotCollectionStateV1::Fresh);
+        assert!(status.diagnostics.is_empty());
+        assert!(matches!(
+            projected_claude_quota_access_state(&status),
+            Some(ClaudeQuotaAccessState::Full | ClaudeQuotaAccessState::Partial)
+        ));
+        let quota = status.quota_snapshot.expect("snapshot");
+        assert_ne!(quota.state, ClaudeConfigSlotQuotaSnapshotStateV1::Stale);
+        let saved = quota
+            .credit_balances
+            .iter()
+            .find(|balance| balance.kind == Some(ottto_protocol::CreditBalanceKind::SavedResets))
+            .expect("saved-reset section kept");
+        assert_eq!(
+            saved.freshness,
+            AgentQuotaWindowFreshness::Stale,
+            "the section keeps its own Stale label"
+        );
+
+        // Stale meters still mean no current reading.
+        let (snapshot, status) = read(AgentQuotaWindowFreshness::Stale);
+        assert_eq!(
+            status.state,
+            ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
+        );
+        assert_eq!(
+            claude_default_slot_collection_status(&snapshot).state,
+            ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
+        );
     }
 
     #[test]
