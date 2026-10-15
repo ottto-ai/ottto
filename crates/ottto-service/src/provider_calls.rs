@@ -26,32 +26,35 @@ pub(crate) fn trigger_or(default: Trigger) -> Trigger {
 
 /// The account identifier hash a Claude login's `.claude.json` names.
 pub(crate) fn claude_slot_account_hash(slot: &ottto_core::ClaudeConfigDirSlot) -> Option<String> {
-    if !home_readable_for_account() {
-        return None;
-    }
-    let hash = match slot {
-        ottto_core::ClaudeConfigDirSlot::Default => {
-            ottto_core::claude_cli_account_identifier_hash()
-        }
+    let path = match slot {
+        ottto_core::ClaudeConfigDirSlot::Default => ottto_core::default_claude_cli_config_path(),
         ottto_core::ClaudeConfigDirSlot::Registered { .. } => {
-            let home = std::env::var_os("HOME").map(PathBuf::from)?;
-            ottto_core::claude_cli_account_identifier_hash_at(&slot.identity_path(&home))
+            slot.identity_path(&std::env::var_os("HOME").map(PathBuf::from)?)
         }
     };
+    if !readable_for_account(&path) {
+        return None;
+    }
+    let hash = ottto_core::claude_cli_account_identifier_hash_at(&path);
     (!hash.is_empty()).then_some(hash)
 }
 
-/// Whether the user's home may be read to name an account. Unit tests read
-/// only a scratch home, never the operator's own logins.
-pub(crate) fn home_readable_for_account() -> bool {
+/// Whether `path` may be read to name an account. Unit tests read only
+/// scratch files, never the operator's own logins.
+pub(crate) fn readable_for_account(path: &std::path::Path) -> bool {
     #[cfg(test)]
     {
-        let canonical = |path: PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        home.is_some_and(|home| canonical(home).starts_with(canonical(std::env::temp_dir())))
+        let canonical = |path: &std::path::Path| {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        };
+        let scratch = std::env::temp_dir();
+        path.starts_with(&scratch) || canonical(path).starts_with(canonical(&scratch))
     }
     #[cfg(not(test))]
-    true
+    {
+        let _ = path;
+        true
+    }
 }
 
 /// Unit tests that did not choose a support dir log to a per-process

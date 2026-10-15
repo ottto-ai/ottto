@@ -1354,15 +1354,18 @@ impl ProviderDailyUsageReader for ChatGptDailyUsageReader {
         if let Some(account_id) = self.credential.account_id.as_deref() {
             request = request.set("ChatGPT-Account-Id", account_id);
         }
+        // The user the request's own token names, as every other Codex line
+        // does (`account_id` is the workspace).
+        let account = crate::agent_status::codex_access_token_claimed_account_hash(
+            &self.credential.access_token,
+        );
         let started = std::time::Instant::now();
         let response = request.call();
         crate::provider_calls::record(crate::provider_calls::ProviderCall::observed(
             crate::provider_calls::Provider::Openai,
             crate::provider_calls::CallKind::CodexDailyWorkspaceUsage,
             crate::provider_calls::trigger_or(crate::provider_calls::Trigger::Schedule),
-            // The credential comes from `~/.codex/auth.json`: name its user as
-            // every other Codex line does (`account_id` is the workspace).
-            crate::agent_status::default_codex_home_claimed_account_hash().as_deref(),
+            account.as_deref(),
             crate::provider_calls::http_result(&response),
             started.elapsed(),
         ));

@@ -14713,11 +14713,15 @@ fn codex_credential_claimed_account_hash(credentials: &CodexAuthCredentials) -> 
 }
 
 /// The account identifier hash a home's credential claims, for the
-/// provider-call log. `None` when it names none or cannot be read.
+/// provider-call log. `None` when it names none or cannot be read (and, in
+/// unit tests, for any home outside the scratch dir).
 pub(crate) fn codex_home_claimed_account_hash(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
 ) -> Option<String> {
+    if !crate::provider_calls::readable_for_account(codex_home) {
+        return None;
+    }
     let credentials = read_codex_auth_credentials_at(codex_home, home_trust).ok()??;
     codex_credential_claimed_account_hash(&credentials)
 }
@@ -14725,9 +14729,6 @@ pub(crate) fn codex_home_claimed_account_hash(
 /// The account the default Codex home's credential claims, for the
 /// provider-call log of reads that use `~/.codex` itself.
 pub(crate) fn default_codex_home_claimed_account_hash() -> Option<String> {
-    if !crate::provider_calls::home_readable_for_account() {
-        return None;
-    }
     codex_home_claimed_account_hash(&default_codex_home(), CodexHomeTrust::ProviderDefault)
 }
 
@@ -14738,14 +14739,21 @@ pub(crate) fn codex_cli_home_claimed_account_hash() -> Option<String> {
         .filter(|home| !home.is_empty())
         .map(PathBuf::from);
     match home {
-        Some(home) => {
-            if !crate::provider_calls::home_readable_for_account() {
-                return None;
-            }
-            codex_home_claimed_account_hash(&home, CodexHomeTrust::ProviderDefault)
-        }
+        Some(home) => codex_home_claimed_account_hash(&home, CodexHomeTrust::ProviderDefault),
         None => default_codex_home_claimed_account_hash(),
     }
+}
+
+/// The user a Codex access token claims (not validated), hashed like
+/// [`codex_credential_claimed_account_hash`], for the provider-call log of a
+/// request made with exactly that token.
+pub(crate) fn codex_access_token_claimed_account_hash(access_token: &str) -> Option<String> {
+    let claims = structurally_valid_live_codex_jwt_claims(access_token)?;
+    let account_id = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|value| first_json_string(value, &["chatgpt_user_id", "user_id"]))
+        .or_else(|| first_json_string(&claims, &["sub"]))?;
+    billing_identity_hash("openai", "account", &account_id)
 }
 
 fn codex_credential_claimed_binding(credentials: &CodexAuthCredentials) -> Option<String> {
@@ -23362,6 +23370,27 @@ for line in sys.stdin:
             assert_closed_during(&message, phase, observed_end);
             assert_no_provider_text(&message);
         }
+    }
+
+    /// A request made with a Codex token is logged under the same user hash
+    /// as reads of the home that holds it.
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_token_names_the_same_account_as_its_home() {
+        let (root, home) = synthetic_codex_collector_home("token-account", 0o600);
+        let credentials = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
+            .expect("readable")
+            .expect("credential");
+        let from_token = codex_access_token_claimed_account_hash(
+            credentials.access_token.as_deref().expect("token"),
+        );
+        assert!(from_token.is_some());
+        assert_eq!(
+            from_token,
+            codex_home_claimed_account_hash(&home, CodexHomeTrust::ProviderDefault)
+        );
+        assert_eq!(codex_access_token_claimed_account_hash("not-a-jwt"), None);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Each app-server run that started is one provider-call line, counting
