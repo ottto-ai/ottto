@@ -3868,26 +3868,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
                         .member_request_id_hashes
                         .iter()
                         .any(|(member, hashes)| {
-                            if hashes.is_empty() {
-                                return false;
-                            }
-                            let Some(witness) = index.claude_usage_family_witnesses.get(root)
-                            else {
-                                return true;
-                            };
-                            // The retained member digest excludes an exactly
-                            // proven legacy prefix; compare the same request set.
-                            let excluded = witness.legacy_excluded_request_id_hashes.get(member);
-                            let observed = excluded.map(|excluded| {
-                                hashes
-                                    .difference(excluded)
-                                    .cloned()
-                                    .collect::<BTreeSet<_>>()
-                            });
-                            witness.member_request_id_fingerprints.get(member)
-                                != Some(&claude_request_id_set_fingerprint(
-                                    observed.as_ref().unwrap_or(hashes),
-                                ))
+                            !claude_request_owner_set_is_retained(index, root, member, hashes)
                         })
             });
     let reports_healthy = api_report.health.is_complete() && trace_report.is_complete();
@@ -4135,7 +4116,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
         0
     };
     let request_ownership_needs_census =
-        unobserved_request_owners && (!census_complete || coverage_missing_member_count > 0);
+        census_complete && unobserved_request_owners && coverage_missing_member_count > 0;
     if census_complete && request_ownership_needs_census {
         eprintln!(
             "local snapshot census requires current request-owner coverage for a new request set: {coverage_missing_member_count} indexed member(s) unobserved; duplicate fence stays closed"
@@ -4239,7 +4220,30 @@ fn apply_claude_reported_usage_with_index_and_limits(
             })
             .cloned()
             .unwrap_or_default();
+        // On partial pages, suppress a newly observed member itself, not
+        // already proven siblings. Otherwise a stable unproven transcript on
+        // an earlier page would prevent healthy corrective bodies from ever
+        // regaining their posture after the full fence opens.
+        let member_needs_owner_census = !census_complete
+            && !claude_owned_start_was_census_verified(item, index)
+            && index
+                .claude_usage_family_pending
+                .get(&root_session_id)
+                .and_then(|pending| {
+                    pending
+                        .member_request_id_hashes
+                        .get(&item.source_session_id)
+                })
+                .is_some_and(|hashes| {
+                    !claude_request_owner_set_is_retained(
+                        index,
+                        &root_session_id,
+                        &item.source_session_id,
+                        hashes,
+                    )
+                });
         let unresolved_duplicate = duplicate_census_invalid
+            || member_needs_owner_census
             || request_ownership_needs_census
             || index.claude_duplicate_request_witness_overflowed
             || item.claude_usage_request_ids.iter().any(|request_id| {
@@ -5681,6 +5685,36 @@ fn claude_snapshot_request_id_hashes(item: &SnapshotItem) -> Option<BTreeSet<Str
             .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
             .collect(),
     )
+}
+
+/// Whether the exact request set is already bound by the retained member
+/// proof. This classifies new owner observations; it never counts as current
+/// census coverage. Match the witness's proven legacy-exclusion domain.
+fn claude_request_owner_set_is_retained(
+    index: &ScanIndex,
+    root: &str,
+    member: &str,
+    hashes: &BTreeSet<String>,
+) -> bool {
+    if hashes.is_empty() {
+        return true;
+    }
+    let Some(witness) = index.claude_usage_family_witnesses.get(root) else {
+        return false;
+    };
+    let observed = witness
+        .legacy_excluded_request_id_hashes
+        .get(member)
+        .map(|excluded| {
+            hashes
+                .difference(excluded)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        });
+    witness.member_request_id_fingerprints.get(member)
+        == Some(&claude_request_id_set_fingerprint(
+            observed.as_ref().unwrap_or(hashes),
+        ))
 }
 
 fn claude_request_id_set_fingerprint(request_id_hashes: &BTreeSet<String>) -> String {

@@ -1000,6 +1000,11 @@ fn assert_late_import_checks_settled_request_owners(copied: bool) {
             .filter(|body| body.source_session_id == IMPORT)
             .all(|body| body.first_turn_context_tokens.is_none()));
     } else {
+        assert_eq!(
+            RearmFixture::family_heads(&last.index),
+            established.heads,
+            "known healthy siblings regain their exact ACKed posture after the fence opens"
+        );
         let item = corrected
             .iter()
             .flat_map(|page| &page.scan.snapshots)
