@@ -644,3 +644,438 @@ fn restorable_terminal_authority_hold_lets_a_bounded_claude_traversal_converge()
         Some(manifest)
     );
 }
+
+const TERMINAL_FAMILY_ROOT: &str = PIPELINE_HELD_SESSION;
+const TERMINAL_FAMILY_AGENTS: [&str; 2] = ["a5e1b2c3d4e5f6071", "b5e1b2c3d4e5f6072"];
+
+fn terminal_family_member(agent: &str) -> String {
+    format!("{TERMINAL_FAMILY_ROOT}_agent-{agent}")
+}
+
+fn pipeline_subagent_line(agent: &str, request: &str, second: u32) -> String {
+    format!(
+        "{{\"timestamp\":\"2026-08-02T07:01:{second:02}Z\",\"type\":\"assistant\",\"sessionId\":\"{TERMINAL_FAMILY_ROOT}\",\"agentId\":\"{agent}\",\"isSidechain\":true,\"requestId\":\"{request}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
+    )
+}
+
+const TERMINAL_FAMILY_BASELINE_CYCLE: PipelineCycle<'static> = PipelineCycle {
+    upload_context: "upload-context-1",
+    replay_generation: "replay-generation-1",
+    proven_owner_session: None,
+    first_page_upload: PipelineUpload::Accept,
+    historical_replay: false,
+};
+
+/// The 0.1.170 production shape: the committed family root carries a
+/// terminal authority quarantine whose record binds never-committed subagent
+/// members at their current revisions, under an upload context the index has
+/// not adopted.
+const TERMINAL_FAMILY_CYCLE: PipelineCycle<'static> = PipelineCycle {
+    upload_context: "upload-context-3",
+    replay_generation: "replay-generation-1",
+    proven_owner_session: None,
+    first_page_upload: PipelineUpload::Accept,
+    historical_replay: false,
+};
+
+impl PipelineFixture {
+    fn subagent_path(&self, agent: &str) -> PathBuf {
+        self.root
+            .join(TERMINAL_FAMILY_ROOT)
+            .join("subagents")
+            .join(format!("agent-{agent}.jsonl"))
+    }
+
+    /// The indexed key of a subagent transcript, if the index has one.
+    fn subagent_key(index: &ScanIndex, agent: &str) -> Option<String> {
+        let suffix = format!("/subagents/agent-{agent}.jsonl");
+        index
+            .files
+            .keys()
+            .find(|key| key.ends_with(&suffix))
+            .cloned()
+    }
+
+    /// One committed family root, one healthy top-level sibling, and one
+    /// healthy sibling in a nested project directory, so the breadth-first
+    /// walk reaches the root's subagents before the last sibling: the held
+    /// members land on an earlier page and the terminal page is healthy. The
+    /// root then gains a retained witness and terminal quarantine, two new
+    /// subagents appear, one traversal binds them into the record, and their
+    /// index entries (if any) are removed again.
+    fn terminal_family(name: &str) -> (Self, ScanIndex) {
+        let fixture = Self::new(name);
+        let nested = fixture.root.join("nested-project").join("worktree");
+        std::fs::create_dir_all(&nested).expect("create nested project");
+        let deep_sibling = format!("{}.jsonl", PIPELINE_SESSIONS[2]);
+        std::fs::rename(fixture.root.join(&deep_sibling), nested.join(&deep_sibling))
+            .expect("move the last sibling into the nested project");
+        let pages = fixture.traversal(8, &TERMINAL_FAMILY_BASELINE_CYCLE);
+        let baseline = pages.last().expect("baseline page").index.clone();
+        assert!(pages.last().is_some_and(|page| page.scan.census_complete));
+        assert!(pages.iter().all(|page| page.held.is_empty()));
+        fixture.seed_terminal_authority(TERMINAL_FAMILY_ROOT);
+
+        std::fs::create_dir_all(fixture.root.join(TERMINAL_FAMILY_ROOT).join("subagents"))
+            .expect("create subagents directory");
+        for (number, agent) in TERMINAL_FAMILY_AGENTS.iter().enumerate() {
+            std::fs::write(
+                fixture.subagent_path(agent),
+                pipeline_subagent_line(agent, &format!("req_agent_{number}"), 0),
+            )
+            .expect("write synthetic subagent transcript");
+        }
+        let bind = PipelineCycle {
+            upload_context: "upload-context-2",
+            ..TERMINAL_FAMILY_BASELINE_CYCLE
+        };
+        let pages = fixture.traversal(9, &bind);
+        for page in &pages {
+            assert!(page.uploaded.is_disjoint(&page.held));
+        }
+
+        let mut index = ScanIndex::load(&fixture.index_path).expect("load scan index");
+        for agent in TERMINAL_FAMILY_AGENTS {
+            if let Some(key) = Self::subagent_key(&index, agent) {
+                index.files.remove(&key);
+                index.file_snapshot_fingerprints.remove(&key);
+            }
+        }
+        index.save(&fixture.index_path).expect("save scan index");
+        let index = ScanIndex::load(&fixture.index_path).expect("reload scan index");
+        let members = index
+            .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+            .expect("terminal quarantine stays bound to the retained witness");
+        let expected_members = std::iter::once(TERMINAL_FAMILY_ROOT.to_string())
+            .chain(
+                TERMINAL_FAMILY_AGENTS
+                    .iter()
+                    .copied()
+                    .map(terminal_family_member),
+            )
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            members.keys().cloned().collect::<BTreeSet<_>>(),
+            expected_members
+        );
+        assert!(index
+            .files
+            .contains_key(&Self::key(&index, TERMINAL_FAMILY_ROOT)));
+        for agent in TERMINAL_FAMILY_AGENTS {
+            assert_eq!(Self::subagent_key(&index, agent), None);
+        }
+        assert_eq!(index.claude_usage_authority_pending_count(), 0);
+        assert_eq!(index.claude_account_deferred_hold_count(), 0);
+        (fixture, baseline)
+    }
+}
+
+/// No held body is ever uploaded, and none that the baseline had not already
+/// accepted becomes accepted, current, or active. A forced family reparse can
+/// hold an unchanged committed root whose body the baseline accepted.
+fn assert_held_bodies_never_delivered(
+    pages: &[PipelinePage],
+    index: &ScanIndex,
+    baseline: &ScanIndex,
+) {
+    let accepted_before = baseline.current_snapshot_fingerprints();
+    for page in pages {
+        assert!(page.uploaded.is_disjoint(&page.held));
+        for held in page.held.difference(&accepted_before) {
+            assert!(!index.accepted_snapshot_fingerprint_recorded(held));
+            assert!(!index.current_snapshot_fingerprints().contains(held));
+            assert!(!index.snapshot_activity_at.contains_key(held));
+        }
+    }
+}
+
+/// 0.1.170 loop: a committed Claude family root with a terminal authority
+/// quarantine whose record binds never-committed subagents. Each generation
+/// reparsed the subagents as new files and held them; with no committed entry
+/// to restore, the replay-reset guard kept the sweep unsettled, so the
+/// terminal page owed a clean follow-up, the census never completed, the
+/// upload context was never adopted, and every generation reparsed the whole
+/// corpus. The held members now keep a delivery-free membership entry, so the
+/// census completes with the quarantine and witness retained, the held bodies
+/// are never uploaded, accepted, or in the manifest, healthy siblings keep
+/// their accepted bodies, and the next unchanged traversal parses nothing.
+#[test]
+#[serial(source_manifests)]
+fn terminal_family_never_committed_members_let_the_claude_census_complete() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let (fixture, baseline) =
+        PipelineFixture::terminal_family("claude-census-terminal-family-members");
+    let bound_members = ScanIndex::load(&fixture.index_path)
+        .expect("load scan index")
+        .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+        .expect("bound terminal record");
+
+    let pages = fixture.traversal(10, &TERMINAL_FAMILY_CYCLE);
+    let (last, earlier) = pages.split_last().expect("terminal page");
+    let hold_pages = earlier
+        .iter()
+        .filter(|page| !page.held.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        hold_pages.len(),
+        1,
+        "the subagents are held on one earlier page"
+    );
+    let hold = hold_pages[0];
+    assert_eq!(hold.held.len(), TERMINAL_FAMILY_AGENTS.len());
+    assert!(!hold.progress_blocking);
+    assert!(!hold.fully_settled);
+    assert_eq!(hold.index.claude_account_deferred_hold_count(), 0);
+    assert!(
+        !hold.index.bounded_sweep_had_unsettled_upload(),
+        "bound terminal members of a committed family settle the page"
+    );
+    for agent in TERMINAL_FAMILY_AGENTS {
+        let key =
+            PipelineFixture::subagent_key(&hold.index, agent).expect("delivery-free member entry");
+        let entry = &hold.index.files[&key];
+        assert_eq!(entry.last_snapshot_fingerprint, None);
+        assert_eq!(entry.last_upload_body_witness, None);
+        assert_eq!(
+            Some(&entry.source_file_fingerprint),
+            bound_members.get(&terminal_family_member(agent))
+        );
+        assert!(!hold.index.file_snapshot_fingerprints.contains_key(&key));
+    }
+    assert!(last.held.is_empty());
+
+    // The census completes in the same window with the authority evidence.
+    assert!(last.scan.census_complete);
+    assert_eq!(last.scan.census_window_end, hold.scan.census_window_end);
+    let settled = &last.index;
+    assert_eq!(
+        settled.bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT),
+        Some(bound_members.clone())
+    );
+    assert_eq!(settled.claude_usage_authority_pending_count(), 0);
+    assert_held_bodies_never_delivered(&pages, settled, &baseline);
+
+    // Parity: every committed body, entity set, and acceptance is the
+    // baseline's; only the delivery-free member entries are new.
+    for session in PIPELINE_SESSIONS {
+        let key = PipelineFixture::key(&baseline, session);
+        assert_eq!(
+            settled.files[&key].last_snapshot_fingerprint,
+            baseline.files[&key].last_snapshot_fingerprint
+        );
+        assert_eq!(
+            settled.file_snapshot_fingerprints[&key],
+            baseline.file_snapshot_fingerprints[&key]
+        );
+        for fingerprint in &baseline.file_snapshot_fingerprints[&key] {
+            assert!(settled.accepted_snapshot_fingerprint_recorded(fingerprint));
+        }
+    }
+    assert_eq!(
+        settled.current_snapshot_fingerprints(),
+        baseline.current_snapshot_fingerprints()
+    );
+    for page in &pages {
+        assert!(page
+            .uploaded
+            .is_subset(&baseline.current_snapshot_fingerprints()));
+    }
+    let (window_start, window_end) =
+        snapshot_manifest_window(&last.scan.census_window_end, 183).expect("manifest window");
+    let manifest = settled
+        .manifest_for_window(SnapshotSource::ClaudeCode, &window_start, &window_end)
+        .expect("complete activity witness");
+    assert_eq!(
+        manifest,
+        baseline
+            .manifest_for_window(SnapshotSource::ClaudeCode, &window_start, &window_end)
+            .expect("baseline manifest")
+    );
+    assert_eq!(
+        cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode),
+        Some(manifest)
+    );
+
+    // The next unchanged traversal adopts nothing new and parses nothing.
+    let next = fixture.traversal(11, &TERMINAL_FAMILY_CYCLE);
+    let next_last = next.last().expect("next traversal page");
+    assert!(next_last.scan.census_complete);
+    assert_eq!(
+        next.iter()
+            .map(|page| page.scan.scanned_file_count)
+            .sum::<usize>(),
+        0
+    );
+    assert!(next.iter().all(|page| page.uploaded.is_empty()));
+    assert!(next.iter().all(|page| page.held.is_empty()));
+    assert_eq!(
+        next_last
+            .index
+            .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT),
+        Some(bound_members)
+    );
+    for agent in TERMINAL_FAMILY_AGENTS {
+        assert!(PipelineFixture::subagent_key(&next_last.index, agent).is_some());
+    }
+}
+
+/// Controls for the same production shape: a RetryPending family anywhere
+/// and a historical replay reset (no committed root to anchor membership)
+/// keep the conservative block; a missing member is pruned only by the
+/// complete census; a replaced member is reparsed once, held, and rebound.
+#[test]
+#[serial(source_manifests)]
+fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
+    let _source_manifests = SourceManifestTestGuard::new();
+
+    // RetryPending still blocks; no member entry is committed.
+    {
+        let (fixture, baseline) =
+            PipelineFixture::terminal_family("claude-census-terminal-family-retry-pending");
+        fixture.inject_retry_pending_family();
+        let pages = fixture.traversal(10, &TERMINAL_FAMILY_CYCLE);
+        let last = pages.last().expect("terminal page");
+        assert!(!last.scan.census_complete);
+        assert!(!last.backfill_succeeded);
+        let hold = pages
+            .iter()
+            .find(|page| !page.held.is_empty())
+            .expect("held page");
+        assert!(hold.progress_blocking);
+        assert!(hold.index.bounded_sweep_had_unsettled_upload());
+        for agent in TERMINAL_FAMILY_AGENTS {
+            assert_eq!(PipelineFixture::subagent_key(&last.index, agent), None);
+        }
+        assert!(last
+            .index
+            .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+            .is_some());
+        assert_held_bodies_never_delivered(&pages, &last.index, &baseline);
+        // Every save withdraws the cached manifest; only a complete census
+        // publishes one.
+        assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
+    }
+
+    // A historical replay reset clears the committed root, so membership has
+    // no committed anchor and the replay-reset block stays.
+    {
+        let (fixture, baseline) =
+            PipelineFixture::terminal_family("claude-census-terminal-family-replay");
+        let cycle = PipelineCycle {
+            replay_generation: "replay-generation-reset",
+            historical_replay: true,
+            ..TERMINAL_FAMILY_CYCLE
+        };
+        let pages = fixture.traversal(10, &cycle);
+        let last = pages.last().expect("terminal page");
+        assert!(!last.scan.census_complete);
+        assert!(!last.backfill_succeeded);
+        assert!(pages
+            .iter()
+            .any(|page| !page.held.is_empty() && page.index.bounded_sweep_had_unsettled_upload()));
+        for agent in TERMINAL_FAMILY_AGENTS {
+            assert_eq!(PipelineFixture::subagent_key(&last.index, agent), None);
+        }
+        assert!(last
+            .index
+            .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+            .is_some());
+        assert!(last
+            .index
+            .context_curve_replay_needed(cycle.replay_generation));
+        assert_held_bodies_never_delivered(&pages, &last.index, &baseline);
+        // Every save withdraws the cached manifest; only a complete census
+        // publishes one.
+        assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
+    }
+
+    // A missing member is pruned only by the complete census; the quarantine
+    // stays terminal and converges on the present members.
+    {
+        let (fixture, baseline) =
+            PipelineFixture::terminal_family("claude-census-terminal-family-missing");
+        let pages = fixture.traversal(10, &TERMINAL_FAMILY_CYCLE);
+        assert!(pages.last().is_some_and(|page| page.scan.census_complete));
+        std::fs::remove_file(fixture.subagent_path(TERMINAL_FAMILY_AGENTS[0]))
+            .expect("remove one subagent transcript");
+        let mut all_pages = Vec::new();
+        for hour in 11..13 {
+            let pages = fixture.traversal(hour, &TERMINAL_FAMILY_CYCLE);
+            let last = pages.last().expect("terminal page");
+            assert!(last.scan.census_complete);
+            assert_eq!(
+                PipelineFixture::subagent_key(&last.index, TERMINAL_FAMILY_AGENTS[0]),
+                None
+            );
+            assert!(
+                PipelineFixture::subagent_key(&last.index, TERMINAL_FAMILY_AGENTS[1]).is_some()
+            );
+            all_pages.extend(pages);
+        }
+        let settled = &all_pages.last().expect("terminal page").index;
+        let members = settled
+            .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+            .expect("terminal quarantine retained");
+        assert_eq!(
+            members.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                TERMINAL_FAMILY_ROOT.to_string(),
+                terminal_family_member(TERMINAL_FAMILY_AGENTS[1])
+            ])
+        );
+        assert_held_bodies_never_delivered(&all_pages, settled, &baseline);
+        let quiet = fixture.traversal(13, &TERMINAL_FAMILY_CYCLE);
+        assert!(quiet.last().is_some_and(|page| page.scan.census_complete));
+        assert_eq!(
+            quiet
+                .iter()
+                .map(|page| page.scan.scanned_file_count)
+                .sum::<usize>(),
+            0
+        );
+    }
+
+    // A replaced member is reparsed, held, and rebound to its new revision;
+    // its body is never delivered and the census still completes.
+    {
+        let (fixture, baseline) =
+            PipelineFixture::terminal_family("claude-census-terminal-family-replaced");
+        let pages = fixture.traversal(10, &TERMINAL_FAMILY_CYCLE);
+        let before = pages.last().expect("terminal page").index.clone();
+        let replaced_member = terminal_family_member(TERMINAL_FAMILY_AGENTS[1]);
+        let old_revision = before
+            .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+            .expect("bound record")[&replaced_member]
+            .clone();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(fixture.subagent_path(TERMINAL_FAMILY_AGENTS[1]))
+            .expect("open subagent transcript");
+        file.write_all(
+            pipeline_subagent_line(TERMINAL_FAMILY_AGENTS[1], "req_agent_1_2", 30).as_bytes(),
+        )
+        .expect("append subagent response");
+        drop(file);
+        let pages = fixture.traversal(11, &TERMINAL_FAMILY_CYCLE);
+        let last = pages.last().expect("terminal page");
+        assert!(last.scan.census_complete);
+        assert!(pages.iter().any(|page| !page.held.is_empty()));
+        let rebound = last
+            .index
+            .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
+            .expect("terminal quarantine retained")[&replaced_member]
+            .clone();
+        assert_ne!(rebound, old_revision);
+        assert!(PipelineFixture::subagent_key(&last.index, TERMINAL_FAMILY_AGENTS[1]).is_some());
+        assert_held_bodies_never_delivered(&pages, &last.index, &baseline);
+        let quiet = fixture.traversal(12, &TERMINAL_FAMILY_CYCLE);
+        assert!(quiet.last().is_some_and(|page| page.scan.census_complete));
+        assert_eq!(
+            quiet
+                .iter()
+                .map(|page| page.scan.scanned_file_count)
+                .sum::<usize>(),
+            0
+        );
+    }
+}

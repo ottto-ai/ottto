@@ -21491,6 +21491,22 @@ impl ScanIndex {
             .cloned()
     }
 
+    /// Every member revision recorded by a terminal quarantine that is still
+    /// bound to the family's retained witness.
+    #[cfg(test)]
+    pub(crate) fn bound_terminal_claude_authority_members_for_test(
+        &self,
+        root_session_id: &str,
+    ) -> Option<BTreeMap<String, String>> {
+        let record = self
+            .claude_usage_authority_quarantine
+            .get(root_session_id)?;
+        let witness = self.claude_usage_family_witnesses.get(root_session_id)?;
+        (record.disposition == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+            && claude_usage_authority_preserves_pending(record, witness))
+        .then(|| record.member_source_file_fingerprints.clone())
+    }
+
     #[cfg(test)]
     fn insert_claude_authority_for_test(
         &mut self,
@@ -22659,21 +22675,100 @@ impl ScanIndex {
             .collect()
     }
 
+    /// Held keys with no committed entry that still name a present member of
+    /// a committed Claude family whose terminal authority quarantine is bound
+    /// to the retained witness and records exactly this scanned revision. Such
+    /// a member cannot progress within the traversal, and its family's root
+    /// entry is committed, so the revert keeps a delivery-free membership
+    /// entry for it instead of dropping it: the family census then sees every
+    /// present member, and the candidate gate skips the unchanged member at
+    /// the quarantine gate instead of reparsing it as a new file. The root
+    /// itself, a family whose root entry is not committed (as after a
+    /// historical replay reset), and account deferrals are never included.
+    fn claude_terminal_member_placeholder_keys(
+        &self,
+        previous: &ScanIndex,
+        held_keys: &BTreeSet<String>,
+        reparse_held: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let mut committed_roots = None;
+        held_keys
+            .iter()
+            .filter(|key| !previous.files.contains_key(*key))
+            .filter(|key| {
+                let Some((root_session_id, member)) =
+                    claude_index_path_family_member(Path::new(key.as_str()))
+                else {
+                    return false;
+                };
+                let Some(entry) = self.files.get(*key) else {
+                    return false;
+                };
+                let account_held = self
+                    .file_snapshot_fingerprints
+                    .get(*key)
+                    .is_some_and(|fingerprints| !fingerprints.is_disjoint(reparse_held))
+                    || entry
+                        .last_snapshot_fingerprint
+                        .as_ref()
+                        .is_some_and(|fingerprint| reparse_held.contains(fingerprint));
+                if member == root_session_id
+                    || account_held
+                    || entry.source_file_fingerprint.is_empty()
+                {
+                    return false;
+                }
+                let bound = self
+                    .claude_usage_authority_quarantine
+                    .get(&root_session_id)
+                    .zip(self.claude_usage_family_witnesses.get(&root_session_id))
+                    .is_some_and(|(record, witness)| {
+                        record.disposition
+                            == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+                            && claude_usage_authority_preserves_pending(record, witness)
+                            && record.member_source_file_fingerprints.get(&member)
+                                == Some(&entry.source_file_fingerprint)
+                    });
+                bound
+                    && committed_roots
+                        .get_or_insert_with(|| {
+                            previous
+                                .files
+                                .keys()
+                                .filter_map(|index_key| {
+                                    claude_index_path_family_member(Path::new(index_key))
+                                })
+                                .filter(|(root, member)| root == member)
+                                .map(|(root, _)| root)
+                                .collect::<BTreeSet<_>>()
+                        })
+                        .contains(&root_session_id)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Whether `with_locally_held_keys_reverted` keeps every held Claude
     /// family that still carries authority evidence in the census. The revert
     /// drops a held key that has no committed entry, and a later complete page
     /// of the same traversal would then read its still-present family as
-    /// vanished: it drops the retained witness, resolves the quarantine, and
-    /// omits the family from the manifest. A historical replay reset clears
-    /// ordinary committed entries but keeps that evidence, so such a hold must
-    /// stay progress-blocking instead.
+    /// vanished or incomplete: it drops the retained witness, resolves the
+    /// quarantine against partial membership, and omits the family from the
+    /// manifest. A historical replay reset clears ordinary committed entries
+    /// but keeps that evidence, so such a hold must stay progress-blocking
+    /// instead. A bound terminal member of a committed family is the one
+    /// exception: the revert keeps its delivery-free membership entry.
     pub(crate) fn locally_held_keys_restorable(
         &self,
         previous: &ScanIndex,
         held: &BTreeSet<String>,
+        reparse_held: &BTreeSet<String>,
     ) -> bool {
-        self.locally_held_keys(held).iter().all(|key| {
-            if previous.files.contains_key(key) {
+        let held_keys = self.locally_held_keys(held);
+        let placeholders =
+            self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
+        held_keys.iter().all(|key| {
+            if previous.files.contains_key(key) || placeholders.contains(key) {
                 return true;
             }
             let Some((root_session_id, _)) = claude_index_path_family_member(Path::new(key)) else {
@@ -22700,7 +22795,10 @@ impl ScanIndex {
     /// restored entities. A held body therefore never enters the committed
     /// entity set, the manifest, or the accepted ledger, and a held key that
     /// was never committed stays absent; `locally_held_keys_restorable` says
-    /// whether that absence is safe to settle.
+    /// whether that absence is safe to settle. The one exception is a bound
+    /// terminal member of a committed family
+    /// (`claude_terminal_member_placeholder_keys`): it keeps only its scanned
+    /// file identity, with no entity, body witness, activity, or acceptance.
     ///
     /// `reparse_held` names held entities whose key every later generation
     /// must reparse (account deferrals). Their restored entry carries an empty
@@ -22714,6 +22812,8 @@ impl ScanIndex {
         reparse_held: &BTreeSet<String>,
     ) -> ScanIndex {
         let held_keys = self.locally_held_keys(held);
+        let placeholders =
+            self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
         let mut result = self.clone();
         for key in &held_keys {
             let reparse = self
@@ -22731,6 +22831,13 @@ impl ScanIndex {
                         committed.source_file_fingerprint.clear();
                     }
                     result.files.insert(key.clone(), committed);
+                }
+                None if placeholders.contains(key) => {
+                    if let Some(entry) = result.files.get_mut(key) {
+                        entry.last_snapshot_fingerprint = None;
+                        entry.last_upload_body_witness = None;
+                        entry.effective_upload_body_witness_revision = 0;
+                    }
                 }
                 None => {
                     result.files.remove(key);

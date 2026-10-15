@@ -723,7 +723,7 @@ fn locally_held_keys_revert_to_committed_revision_and_keep_manifest() {
 
     // Dropping a never-committed held key is settleable only while its family
     // carries no retained authority evidence; a committed held key restores.
-    assert!(scanned.locally_held_keys_restorable(&previous, &held));
+    assert!(scanned.locally_held_keys_restorable(&previous, &held, &BTreeSet::new()));
     let mut fresh_family_evidence = scanned.clone();
     bind_authority_quarantine(
         &mut fresh_family_evidence,
@@ -732,7 +732,11 @@ fn locally_held_keys_revert_to_committed_revision_and_keep_manifest() {
         &hex64('a'),
         ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
     );
-    assert!(!fresh_family_evidence.locally_held_keys_restorable(&previous, &held));
+    assert!(!fresh_family_evidence.locally_held_keys_restorable(
+        &previous,
+        &held,
+        &BTreeSet::new()
+    ));
     let mut previous_family_evidence = previous.clone();
     bind_authority_quarantine(
         &mut previous_family_evidence,
@@ -741,7 +745,11 @@ fn locally_held_keys_revert_to_committed_revision_and_keep_manifest() {
         &hex64('a'),
         ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
     );
-    assert!(!scanned.locally_held_keys_restorable(&previous_family_evidence, &held));
+    assert!(!scanned.locally_held_keys_restorable(
+        &previous_family_evidence,
+        &held,
+        &BTreeSet::new()
+    ));
     let mut committed_family_evidence = scanned.clone();
     bind_authority_quarantine(
         &mut committed_family_evidence,
@@ -750,7 +758,154 @@ fn locally_held_keys_revert_to_committed_revision_and_keep_manifest() {
         &hex64('a'),
         ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
     );
-    assert!(committed_family_evidence.locally_held_keys_restorable(&previous, &held));
+    assert!(committed_family_evidence.locally_held_keys_restorable(
+        &previous,
+        &held,
+        &BTreeSet::new()
+    ));
+}
+
+// A never-committed subagent of a committed family, held by that family's
+// bound terminal quarantine at exactly its scanned revision, settles with a
+// delivery-free membership entry: no entity, activity, acceptance, or
+// manifest member, and the unchanged file is skipped at the quarantine gate.
+// The family census then sees every present member. Every other shape keeps
+// the conservative block or drop.
+#[test]
+fn bound_terminal_member_of_committed_family_keeps_delivery_free_membership() {
+    let activity = "2026-08-02T07:00:00Z";
+    let root_key = "/opaque/family-root.jsonl";
+    let member_key = "/opaque/family-root/subagents/agent-member.jsonl";
+    let member = "family-root_agent-member";
+    let member_revision = hex64('b');
+    let mut previous = ScanIndex::default();
+    index_file(&mut previous, root_key, &hex64('a'), "root-old", activity);
+    previous
+        .accepted_snapshot_fingerprints
+        .insert("root-old".to_string());
+    let mut scanned = previous.clone();
+    index_file(
+        &mut scanned,
+        member_key,
+        &member_revision,
+        "member-held",
+        activity,
+    );
+    {
+        let entry = scanned.files.get_mut(member_key).expect("member entry");
+        entry.last_upload_body_witness = Some("member-witness".to_string());
+        entry.effective_upload_body_witness_revision = 1;
+    }
+    bind_authority_quarantine(
+        &mut scanned,
+        "family-root",
+        member,
+        &member_revision,
+        ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+    );
+    let held = BTreeSet::from(["member-held".to_string()]);
+    let no_account_holds = BTreeSet::new();
+
+    assert!(scanned.locally_held_keys_restorable(&previous, &held, &no_account_holds));
+    let reverted = scanned.with_locally_held_keys_reverted(&previous, &held, &no_account_holds);
+    let saved: ScanIndex =
+        serde_json::from_slice(&serde_json::to_vec(&reverted).expect("encode index"))
+            .expect("decode index");
+    let placeholder = &saved.files[member_key];
+    assert_eq!(placeholder.source_file_fingerprint, member_revision);
+    assert_eq!(placeholder.last_snapshot_fingerprint, None);
+    assert_eq!(placeholder.last_upload_body_witness, None);
+    assert_eq!(placeholder.effective_upload_body_witness_revision, 0);
+    assert!(!saved.file_snapshot_fingerprints.contains_key(member_key));
+    assert!(!saved.confirmed_empty_files.contains(member_key));
+    assert!(!saved.snapshot_activity_at.contains_key("member-held"));
+    assert!(!saved.accepted_snapshot_fingerprints.contains("member-held"));
+    assert!(!saved
+        .current_snapshot_fingerprints()
+        .contains("member-held"));
+    let window_start = "2026-08-01T00:00:00Z";
+    let window_end = "2026-08-03T00:00:00Z";
+    assert_eq!(
+        saved
+            .manifest_for_window(SnapshotSource::ClaudeCode, window_start, window_end)
+            .expect("placeholder adds no activity witness"),
+        previous
+            .manifest_for_window(SnapshotSource::ClaudeCode, window_start, window_end)
+            .expect("committed manifest")
+    );
+    assert_eq!(
+        complete_claude_usage_family_members(&saved).get("family-root"),
+        Some(&BTreeSet::from([
+            "family-root".to_string(),
+            member.to_string()
+        ]))
+    );
+    let candidate = matching_candidate(&saved, member_key);
+    assert_eq!(
+        decision(&saved, &candidate),
+        (CandidateDecision::Skip, None)
+    );
+    let mut replaced = candidate.clone();
+    replaced.source_file_fingerprint = hex64('d');
+    assert_eq!(
+        decision(&saved, &replaced),
+        (
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::AuthorityQuarantine)
+        )
+    );
+    // Once the quarantine is gone the delivery-free entry is reparsed.
+    let mut resolved = saved.clone();
+    resolved.claude_usage_authority_quarantine.clear();
+    assert_eq!(
+        decision(&resolved, &candidate),
+        (
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::UnknownOutcome)
+        )
+    );
+
+    // An account deferral on the same key keeps the replay-reset block.
+    assert!(!scanned.locally_held_keys_restorable(&previous, &held, &held));
+    assert!(!scanned
+        .with_locally_held_keys_reverted(&previous, &held, &held)
+        .files
+        .contains_key(member_key));
+    // A family whose root entry is not committed (a replay reset) blocks.
+    let mut rootless = previous.clone();
+    rootless.files.remove(root_key);
+    assert!(!scanned.locally_held_keys_restorable(&rootless, &held, &no_account_holds));
+    // A record bound to another revision, or a RetryPending record, blocks.
+    for (revision, disposition) in [
+        (
+            hex64('c'),
+            ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+        ),
+        (
+            member_revision.clone(),
+            ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+        ),
+    ] {
+        let mut unbound = scanned.clone();
+        bind_authority_quarantine(&mut unbound, "family-root", member, &revision, disposition);
+        assert!(!unbound.locally_held_keys_restorable(&previous, &held, &no_account_holds));
+    }
+    // The root member itself never gets a placeholder.
+    let mut root_held = ScanIndex::default();
+    index_file(&mut root_held, root_key, &hex64('a'), "root-held", activity);
+    bind_authority_quarantine(
+        &mut root_held,
+        "family-root",
+        "family-root",
+        &hex64('a'),
+        ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+    );
+    let root_hold = BTreeSet::from(["root-held".to_string()]);
+    assert!(!root_held.locally_held_keys_restorable(
+        &ScanIndex::default(),
+        &root_hold,
+        &no_account_holds
+    ));
 }
 
 // A bound terminal hold keeps its revision and is skipped even under a

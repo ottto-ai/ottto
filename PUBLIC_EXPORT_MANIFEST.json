@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 643,
-  "content_sha256": "4d9a1c31879489f53b4a1eec24e19e0e23dc1dfd80153a9a6c8706c23299029d",
+  "candidate_file_count": 644,
+  "content_sha256": "51f8e9f0e4be984252695a1e5c206ac7251bd6fdea7412271f6dc6fb5dd546af",
   "files": [
     {
       "executable": false,
@@ -1168,15 +1168,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "56cb3b490f3b1361b5627e7cc0f288b9b2f333b36d1aaca742bf5af27a48854b",
-      "size_bytes": 760228
+      "sha256": "5a5474ebd27473eb0771583560afb9164b55f8e235b9f25841d084e6d00cc290",
+      "size_bytes": 760488
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/census_convergence_pipeline_tests.rs",
-      "sha256": "be8480387df01b51aaebe14b8643abecfcb0e66ab62f6ff30aee6c1c8ba1a568",
-      "size_bytes": 26621
+      "sha256": "ac40ef0659b4168b42f08da2750f447703f7d6cc9fcb783c1d84a06236fbf7a3",
+      "size_bytes": 45773
     },
     {
       "executable": false,
@@ -1196,8 +1196,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "5fa0e05ac71db78f1dd59cf23705a4555dc40506a0c9ffd819615ab213f125c9",
-      "size_bytes": 2428739
+      "sha256": "cfc5476bba2783924290ca8523f5e052abc9cea47766e37d2b2c2f53a3d59444",
+      "size_bytes": 2434085
     },
     {
       "executable": false,
@@ -1217,8 +1217,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/census_convergence_tests.rs",
-      "sha256": "33fa726ffdd10139a49868c0612e5e8aca00ccf254351fa342a29285dd5cebdc",
-      "size_bytes": 35125
+      "sha256": "a2fd12c97e44c3ffee6f46ef7876b00085be97836e904cc14bd7ece5b7984c6d",
+      "size_bytes": 41094
     },
     {
       "executable": false,
@@ -2759,6 +2759,13 @@
       "path": "docs/session-2026-10-14-stale-older-rejection-reason.md",
       "sha256": "d0d32bc3dbfa2c5041603debed5db2a136fdb83256c0cbe3ae65b1b4a67592db",
       "size_bytes": 1344
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-15-claude-terminal-family-members.md",
+      "sha256": "30ed17a7e55269840a1dd1f7f83dfbda8fd6efed3ddb8fcc7c45674268ebdb66",
+      "size_bytes": 4573
     },
     {
       "executable": false,
@@ -4506,7 +4513,7 @@
   ],
   "generated_at": "2026-10-15T02:30:39+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 644,
+  "output_file_count": 645,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
