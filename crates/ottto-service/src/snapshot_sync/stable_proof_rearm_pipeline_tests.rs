@@ -986,7 +986,7 @@ fn assert_late_import_checks_settled_request_owners(copied: bool) {
         // The import was already offered without unique posture. Re-parsing
         // an identical safe body may be suppressed by normal finalization;
         // its exact ACKed head must remain, without requiring another POST.
-        let key = local_index_key(&path);
+        let key = path.to_string_lossy().to_string();
         assert_eq!(
             last.index.file_snapshot_fingerprints[&key],
             BTreeSet::from([item.snapshot_fingerprint.clone()]),

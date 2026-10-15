@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 654,
-  "content_sha256": "f0b0b2fa1d0a8cd52d19fa2794afa32116f72f32c0764a9b41427e8cfc06389f",
+  "content_sha256": "42719d7824135627b9beaa48aff9c9237e5521228c40f882263ed7b4f8b4e671",
   "files": [
     {
       "executable": false,
@@ -1210,8 +1210,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/stable_proof_rearm_pipeline_tests.rs",
-      "sha256": "2ffeea4c700ce166d525895d68cfaa3a1dbca4d4f0f1a19b2ae8e2fb71436065",
-      "size_bytes": 40411
+      "sha256": "6113b5602288881d65571555cc3afbbd614e1d29983154625b9bd049dc1c699d",
+      "size_bytes": 40423
     },
     {
       "executable": false,
@@ -4581,7 +4581,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-15T20:12:26+00:00",
+  "generated_at": "2026-10-15T20:27:02+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 655,
   "public_roots": [
@@ -4620,5 +4620,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ff6e44cf184819048ff79844bfa6f6fc18ad1285"
+  "source_commit": "84a23d40085e0c73286addb782a4234c1e0cc500"
 }
