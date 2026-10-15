@@ -933,8 +933,6 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
         let (fixture, baseline) =
             PipelineFixture::terminal_family("claude-census-terminal-family-retry-pending");
         fixture.inject_retry_pending_family();
-        let manifest_before =
-            cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode);
         let pages = fixture.traversal(10, &TERMINAL_FAMILY_CYCLE);
         let last = pages.last().expect("terminal page");
         assert!(!last.scan.census_complete);
@@ -953,10 +951,9 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
             .bound_terminal_claude_authority_members_for_test(TERMINAL_FAMILY_ROOT)
             .is_some());
         assert_held_bodies_never_delivered(&pages, &last.index, &baseline);
-        assert_eq!(
-            cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode),
-            manifest_before
-        );
+        // Every save withdraws the cached manifest; only a complete census
+        // publishes one.
+        assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
     }
 
     // A historical replay reset clears the committed root, so membership has
@@ -969,8 +966,6 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
             historical_replay: true,
             ..TERMINAL_FAMILY_CYCLE
         };
-        let manifest_before =
-            cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode);
         let pages = fixture.traversal(10, &cycle);
         let last = pages.last().expect("terminal page");
         assert!(!last.scan.census_complete);
@@ -989,10 +984,9 @@ fn terminal_family_member_controls_keep_blocking_pruning_and_rebinding() {
             .index
             .context_curve_replay_needed(cycle.replay_generation));
         assert_held_bodies_never_delivered(&pages, &last.index, &baseline);
-        assert_eq!(
-            cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode),
-            manifest_before
-        );
+        // Every save withdraws the cached manifest; only a complete census
+        // publishes one.
+        assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
     }
 
     // A missing member is pruned only by the complete census; the quarantine
