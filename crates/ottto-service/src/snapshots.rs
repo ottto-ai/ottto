@@ -1660,12 +1660,46 @@ struct ScanTraversalResidue {
     /// exclusive usage is exactly what could not be determined.
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     blocked_session_ids: BTreeSet<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_inventory_hold: Option<CodexInventoryHold>,
 }
 
 impl ScanTraversalResidue {
     fn is_empty(&self) -> bool {
-        self.index_keys.is_empty() && self.blocked_session_ids.is_empty()
+        self.index_keys.is_empty()
+            && self.blocked_session_ids.is_empty()
+            && self.codex_inventory_hold.is_none()
     }
+}
+
+/// Upper bound on each key set of a `CodexInventoryHold`.
+const MAX_CODEX_INVENTORY_HOLD_KEYS: usize = MAX_BACKFILL_FILES_PER_SOURCE;
+
+/// Codex candidates a page held only because its header inventory was
+/// incomplete, with the evidence that made it incomplete.
+///
+/// Such a page holds every candidate, including sessions whose own ownership
+/// is fine: an unreadable first record may belong to any of them. Those
+/// candidates leave the traversal queue, so without this record they waited
+/// for their next write or the next walk. They are queued again once the
+/// recorded evidence moves (see `release_codex_inventory_hold`), and pass the
+/// unchanged inventory and ownership gates like any other candidate. While the
+/// evidence stays put nothing is re-read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct CodexInventoryHold {
+    /// Local index keys of the held candidates.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    owed: BTreeSet<String>,
+    /// Roster files whose first record was refused, with their metadata
+    /// witness at the refusal.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    refused_headers: BTreeMap<String, Option<String>>,
+    /// Held candidates outside the roster, with their metadata witness.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    outside_roster: BTreeMap<String, Option<String>>,
+    /// The walk still had directories to visit. Released once it has none.
+    awaiting_directories: bool,
 }
 
 /// Durable record of the residue disclosed by the last census that completed
@@ -11648,6 +11682,7 @@ impl OwnedSourceScan {
         ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
         {
             let traversal = index.traversal.as_mut().expect("traversal initialized");
+            refresh_retained_codex_roster(source, traversal, backfill_window_days, &index.files);
             enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
             advance_bounded_directory_traversal(
                 source,
@@ -11655,6 +11690,7 @@ impl OwnedSourceScan {
                 backfill_window_days,
                 &index.files,
             );
+            release_codex_inventory_hold(source, traversal);
         }
         let codex_parent_validation_roots = if source == SnapshotSource::Codex {
             index
@@ -12439,7 +12475,15 @@ impl OwnedSourceScan {
                         active_file = Some(active);
                         pending!();
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        // Static reader text only, never a path or content. A
+                        // live rollout appended while it is read reports
+                        // "acquisition exceeds stable source"; that file is
+                        // retried when its next write is hinted.
+                        eprintln!(
+                            "local snapshot scan: {} transcript read failed: {error}",
+                            source.api_slug()
+                        );
                         census.record_unreadable(UnreadableCause::OpenRead, 1);
                         pending!();
                     }
@@ -13057,6 +13101,12 @@ impl OwnedSourceScan {
                         }),
                     ) {
                         traversal.residue.index_keys.remove(index_key);
+                    }
+                    if let Some(inventory) = codex_join_inventory
+                        .as_ref()
+                        .filter(|inventory| !inventory.complete)
+                    {
+                        record_codex_inventory_hold(traversal, inventory, &residue_index_keys);
                     }
                     traversal.residue.index_keys.extend(residue_index_keys);
                     traversal
@@ -20306,6 +20356,286 @@ fn enqueue_watcher_hints(
             census_member: true,
             watcher_hint: true,
         });
+    }
+}
+
+/// Keep a retained Codex generation's roster current without a re-walk.
+///
+/// A generation whose discovery finished but whose census is incomplete is
+/// kept: a red one until its bounded retry, a green-but-incomplete one until it
+/// completes. Its roster and directory witness are the ownership evidence for
+/// every later page. Left frozen, one rollout created after the walk made each
+/// page that selected it unprovable, and the whole page was held until the next
+/// walk. Here only directories whose witness moved are re-listed, one level
+/// deep: rollouts that appeared join the roster and the census candidates
+/// exactly as the walk adds them, rollouts that left drop out of the roster,
+/// and new subdirectories go through the ordinary bounded walk. Files already
+/// in the roster are not re-selected. A listing the walk would turn red (a
+/// symlink, an unreadable entry, a change during the listing, a vanished
+/// entry) refreshes nothing: that directory keeps its old witness and the
+/// existing holds apply until a later tick or the next walk.
+fn refresh_retained_codex_roster(
+    source: SnapshotSource,
+    traversal: &mut ScanTraversalCheckpoint,
+    backfill_window_days: u64,
+    files: &BTreeMap<String, ScanIndexEntry>,
+) {
+    if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
+        return;
+    }
+    let moved = match traversal.codex_join_directory_census.as_ref() {
+        // An unproved walk stays unproved until a fresh generation.
+        Some(census) if census.local_diagnostic_counts().0 => census.moved_directories(),
+        _ => return,
+    };
+    let census_unix_seconds = rfc3339_unix_seconds(&traversal.census_window_end);
+    let mut remaining = MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK;
+    for directory in moved {
+        let Some(scan_root) = traversal
+            .scan_roots
+            .iter()
+            .filter(|root| directory.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .cloned()
+        else {
+            continue;
+        };
+        let census = traversal
+            .codex_join_directory_census
+            .as_mut()
+            .expect("census checked above");
+        let before = match fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && directory != scan_root =>
+            {
+                census.retire(&directory);
+                traversal
+                    .codex_rollout_paths
+                    .retain(|key| !Path::new(key).starts_with(&directory));
+                continue;
+            }
+            _ => continue,
+        };
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        let entries = entries.take(remaining + 1).collect::<Vec<_>>();
+        if entries.len() > remaining {
+            break;
+        }
+        remaining -= entries.len();
+        let mut present = BTreeSet::new();
+        let mut appeared = Vec::new();
+        let mut new_directories = Vec::new();
+        let mut clean = true;
+        for entry in entries {
+            let Some((path, file_type)) = entry
+                .ok()
+                .and_then(|entry| entry.file_type().ok().map(|kind| (entry.path(), kind)))
+            else {
+                clean = false;
+                break;
+            };
+            if file_type.is_symlink() {
+                clean = false;
+                break;
+            }
+            if file_type.is_dir() {
+                if !census.contains(&path) {
+                    new_directories.push(path);
+                }
+                continue;
+            }
+            if !file_type.is_file()
+                || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            let key = local_index_key(&path);
+            if !traversal.codex_rollout_paths.contains(&key) {
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.is_file() => appeared.push((path, metadata)),
+                    _ => {
+                        clean = false;
+                        break;
+                    }
+                }
+            }
+            present.insert(key);
+        }
+        if !clean || !census.refresh(&directory, &before) {
+            continue;
+        }
+        traversal.codex_rollout_paths.retain(|key| {
+            Path::new(key).parent() != Some(directory.as_path()) || present.contains(key)
+        });
+        for (path, metadata) in appeared {
+            traversal.codex_rollout_paths.insert(local_index_key(&path));
+            let modified_unix_seconds = metadata
+                .modified()
+                .ok()
+                .and_then(unix_seconds)
+                .unwrap_or_default();
+            if !sampled_audit::path_requires_verification(files, &path)
+                && census_unix_seconds.is_some_and(|now| {
+                    !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
+                })
+            {
+                continue;
+            }
+            traversal.counts.discovered_file_count += 1;
+            traversal.observed_index_keys.insert(local_index_key(&path));
+            if metadata.len() > max_jsonl_file_bytes(source) {
+                traversal.counts.oversized_file_count += 1;
+                continue;
+            }
+            if let Some(existing) = traversal
+                .pending_candidates
+                .iter_mut()
+                .find(|candidate| candidate.path == path)
+            {
+                existing.census_member = true;
+            } else {
+                traversal.pending_candidates.push_back(ScanTraversalPath {
+                    scan_root: scan_root.clone(),
+                    path,
+                    census_member: true,
+                    watcher_hint: false,
+                });
+            }
+        }
+        traversal
+            .pending_directories
+            .extend(new_directories.into_iter().map(|path| ScanTraversalPath {
+                scan_root: scan_root.clone(),
+                path,
+                census_member: true,
+                watcher_hint: false,
+            }));
+    }
+}
+
+/// Remember the candidates an incomplete Codex header inventory held on this
+/// page, with what made it incomplete. With an incomplete inventory every
+/// selected candidate is held, so this page's residue is exactly the held
+/// set. An inventory that hit a population or read bound, or had no stable
+/// census, records nothing: only a fresh walk changes that, and the walk
+/// selects them again.
+fn record_codex_inventory_hold(
+    traversal: &mut ScanTraversalCheckpoint,
+    inventory: &codex_file_join::HeaderInventory,
+    held: &BTreeSet<String>,
+) {
+    if inventory.bounded_out || held.is_empty() {
+        return;
+    }
+    let outside_roster = held
+        .iter()
+        .filter(|key| !traversal.codex_rollout_paths.contains(*key))
+        .map(|key| (key.clone(), codex_file_join::path_witness(Path::new(key))))
+        .collect::<Vec<_>>();
+    let hold = traversal
+        .residue
+        .codex_inventory_hold
+        .get_or_insert_with(CodexInventoryHold::default);
+    // Without a refused record or an unlisted candidate, the walk's open
+    // directories were what kept the roster from proving the page.
+    hold.awaiting_directories |= !traversal.pending_directories.is_empty()
+        || (inventory.refused.is_empty() && outside_roster.is_empty());
+    hold.owed.extend(held.iter().cloned());
+    // The newest witness is the one a later tick has to see move.
+    hold.refused_headers.extend(
+        inventory
+            .refused
+            .iter()
+            .map(|(key, witness)| (key.clone(), witness.clone())),
+    );
+    hold.outside_roster.extend(outside_roster);
+    if hold.owed.len() > MAX_CODEX_INVENTORY_HOLD_KEYS
+        || hold.refused_headers.len() > MAX_CODEX_INVENTORY_HOLD_KEYS
+        || hold.outside_roster.len() > MAX_CODEX_INVENTORY_HOLD_KEYS
+    {
+        // Past the bound only the next walk re-selects them, as before.
+        traversal.residue.codex_inventory_hold = None;
+    }
+}
+
+/// Queue the candidates of a `CodexInventoryHold` again once its evidence
+/// has moved: a refused first record changed, was replaced, is gone or left
+/// the roster; a held
+/// candidate outside the roster joined it or is gone; or the walk finished its
+/// directories. The check costs one `lstat` per recorded path. Unmoved
+/// evidence queues nothing, so a hold that cannot be resolved re-reads no
+/// transcript. Only candidates still in the roster are queued, at the back,
+/// after any watcher hints, and they meet the same inventory, ownership,
+/// capture, send and checkpoint gates as any candidate. If the evidence still
+/// does not prove the page, it is held and recorded again.
+fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTraversalCheckpoint) {
+    if source != SnapshotSource::Codex || !traversal.pending_directories.is_empty() {
+        return;
+    }
+    let Some(hold) = traversal.residue.codex_inventory_hold.as_ref() else {
+        return;
+    };
+    let moved = |key: &String, witness: &Option<String>| {
+        codex_file_join::path_witness(Path::new(key)) != *witness
+    };
+    let released = hold.awaiting_directories
+        || hold.refused_headers.iter().any(|(key, witness)| {
+            // A record that vanished before its read has no witness to move;
+            // leaving the roster is its evidence.
+            !traversal.codex_rollout_paths.contains(key) || moved(key, witness)
+        })
+        || hold.outside_roster.iter().any(|(key, witness)| {
+            traversal.codex_rollout_paths.contains(key) || moved(key, witness)
+        });
+    if !released {
+        return;
+    }
+    let hold = traversal
+        .residue
+        .codex_inventory_hold
+        .take()
+        .expect("hold checked above");
+    let mut pending = traversal
+        .pending_candidates
+        .iter()
+        .map(|candidate| local_index_key(&candidate.path))
+        .collect::<BTreeSet<_>>();
+    let mut unlisted = CodexInventoryHold::default();
+    for key in hold.owed {
+        if !traversal.codex_rollout_paths.contains(&key) {
+            // Selecting a file the roster cannot prove would hold the page
+            // again. One that still exists stays owed until it is listed.
+            if let Some(witness) = codex_file_join::path_witness(Path::new(&key)) {
+                unlisted.outside_roster.insert(key.clone(), Some(witness));
+                unlisted.owed.insert(key);
+            }
+            continue;
+        }
+        if !pending.insert(key.clone()) {
+            continue;
+        }
+        let path = PathBuf::from(key);
+        let Some(scan_root) = traversal
+            .scan_roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .cloned()
+        else {
+            continue;
+        };
+        traversal.pending_candidates.push_back(ScanTraversalPath {
+            scan_root,
+            path,
+            census_member: true,
+            watcher_hint: false,
+        });
+    }
+    if !unlisted.owed.is_empty() {
+        traversal.residue.codex_inventory_hold = Some(unlisted);
     }
 }
 
@@ -55401,7 +55731,8 @@ crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownersh
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
-crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, blocked_session_ids);
+crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, blocked_session_ids, codex_inventory_hold);
+crate::heap_layout_bound::fields!(CodexInventoryHold; owed, refused_headers, outside_roster, awaiting_directories);
 crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
