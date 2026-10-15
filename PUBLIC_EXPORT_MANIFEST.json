@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 646,
-  "content_sha256": "3ebf52006a55acb5c973a9d11d8eeb8bb9cbbc6e2fa0d017a33d641bc9ac12fa",
+  "candidate_file_count": 647,
+  "content_sha256": "3c73ac68537dd95a80277b7d8691b44e498960bbb769560e626288c345ed7d0f",
   "files": [
     {
       "executable": false,
@@ -615,8 +615,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "3e7e659c34954557aaf94f9293450d0d2a46bc6e3ad23c30e35fc1fe3cd28438",
-      "size_bytes": 332122
+      "sha256": "b6ea6f4b05851693e997a79e47ae715f547dfff0d6444c606f288907c39a3436",
+      "size_bytes": 332763
     },
     {
       "executable": false,
@@ -692,8 +692,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "dd9c958af66a805b3f3695b313945a6cfc0e6a24c0589b3353dfe079e655487c",
-      "size_bytes": 1566198
+      "sha256": "28a084bc74fcea38069635fc330b2bf18ebcde62b7e813ee687a55fd3c87785a",
+      "size_bytes": 1567622
     },
     {
       "executable": false,
@@ -720,8 +720,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/codex_saved_quota.rs",
-      "sha256": "bee76032b61fb810492592b68960cdc01cae67da21d1bed86e0b382c83a533ed",
-      "size_bytes": 70523
+      "sha256": "6b722e048cf487a776a596671edc321f82cffb2bec6315f0dbb9bc2f569dd41d",
+      "size_bytes": 71137
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/agent_status/codex_setup_gate.rs",
+      "sha256": "83523b7f17c7564818c5c5a7dfe286da8ccbb8a1c2d5c28ae3f5579bfb887b65",
+      "size_bytes": 18767
     },
     {
       "executable": false,
@@ -895,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "3a0aa87337ffbf8f6b3e6516c823642df5fe6777c9e8712fe844abd3a9784685",
-      "size_bytes": 1218102
+      "sha256": "ac9366640e34dfe4791ed3a3fdd0fd645fc4460bf1bd78d7fa6da2d18e51c633",
+      "size_bytes": 1229253
     },
     {
       "executable": false,
@@ -4527,7 +4534,7 @@
   ],
   "generated_at": "2026-10-15T09:37:57+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 647,
+  "output_file_count": 648,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

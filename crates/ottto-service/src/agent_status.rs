@@ -53,11 +53,14 @@ mod claude_credit_pools;
 mod codex_credit_grants;
 mod codex_last_known;
 mod codex_saved_quota;
+mod codex_setup_gate;
 
 pub use codex_saved_quota::start_codex_quota_scheduler;
 pub(crate) use codex_saved_quota::{
     refresh_codex_quota_now, saved_codex_quota_generation, stop_codex_quota_scheduler,
 };
+#[cfg(test)]
+pub(crate) use codex_setup_gate::SetupGateTestClock;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -2050,8 +2053,23 @@ impl CodexSlotSetupCollectionError {
     }
 }
 
+/// Which setup step reads a registered Codex home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexSetupRead<'a> {
+    /// A check of a setup that waits for the person's sign-in. Clients repeat
+    /// it every few seconds, so its provider reads are spaced per home
+    /// (`codex_setup_gate`); `explicit` is a person's check.
+    WaitingForLogin {
+        operation_id: &'a str,
+        explicit: bool,
+    },
+    /// A validation step. It moves the setup out of waiting, so it reads now.
+    Validation,
+}
+
 pub(crate) fn collect_registered_codex_slot_for_setup(
     slot_id: &str,
+    read: CodexSetupRead<'_>,
 ) -> Result<(CodexStrongIdentity, CodexAccountSlotCollectionStatusV1), CodexSlotSetupCollectionError>
 {
     let store = FileCodexAccountSlotSettingsStore::default();
@@ -2060,6 +2078,28 @@ pub(crate) fn collect_registered_codex_slot_for_setup(
             "Codex durable connection state is unavailable.".to_string(),
         )
     })?;
+    match read {
+        CodexSetupRead::WaitingForLogin {
+            operation_id,
+            explicit,
+        } => codex_setup_gate::read_waiting_setup_home(&home, operation_id, explicit, || {
+            let result = read_registered_codex_home_for_setup(&home);
+            let succeeded = result.is_ok();
+            (result, succeeded)
+        })
+        .unwrap_or_else(|deferred| {
+            Err(CodexSlotSetupCollectionError::ProviderLoginPending(
+                deferred.message(),
+            ))
+        }),
+        CodexSetupRead::Validation => read_registered_codex_home_for_setup(&home),
+    }
+}
+
+fn read_registered_codex_home_for_setup(
+    home: &Path,
+) -> Result<(CodexStrongIdentity, CodexAccountSlotCollectionStatusV1), CodexSlotSetupCollectionError>
+{
     let captured_at = crate::current_rfc3339_timestamp();
     // A setup check needs a fresh provider read; it also refreshes the saved
     // copy every status read then serves.
@@ -2068,7 +2108,7 @@ pub(crate) fn collect_registered_codex_slot_for_setup(
             collect_codex_status_for_home(
                 captured_at.clone(),
                 captured_at,
-                &home,
+                home,
                 CodexHomeTrust::Managed,
                 CodexQuotaRead::Provider,
             )
