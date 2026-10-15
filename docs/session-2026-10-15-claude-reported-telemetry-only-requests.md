@@ -33,11 +33,17 @@ against the requests its own rebuild admitted:
   telemetry-only ones. `Grouping` carries the two counters, so nothing grows
   with the request count.
 - For a reported item, `tag_item` requires
-  `Grouping::admitted_reported_requests`. The rebuild must have admitted every
-  transcript request id of the item, with none excluded, and transcript plus
-  telemetry-only requests must equal `item.request_count`. The ledger holds
-  one row per request id (`reduce_claude_usage_ledger`), so each counted
-  request is distinct.
+  `Grouping::reported_requests_admissible`, which is exact owned-request
+  accounting (`Grouping::owned_reported_requests`) or, failing that, the old
+  request-id count check (see "Legacy exclusions" below). Owned-request
+  accounting holds when:
+  - the rebuild admitted exactly the item's owned transcript requests:
+    `transcript_requests == claude_usage_request_ids.len() - excluded`, and
+    that is more than zero;
+  - transcript plus telemetry-only requests equal `item.request_count`;
+  - every admitted request is the item's own (see below).
+- The ledger holds one row per request id (`reduce_claude_usage_ledger`), and
+  the transcript request ids are a set, so each counted request is distinct.
 - The transcript path keeps `claude_snapshot_request_id_hashes` unchanged.
 - `apply_grouped` still has to reproduce every bucket and top-level row
   exactly, and money must be micro-exact. The byte cap and fallback are
@@ -54,13 +60,46 @@ What stays the same:
   refused. The transcript requests keep their telemetry tags.
 - **Unsettled census.** `withdraw_transcript_tags` still removes only
   marker-derived tags. Telemetry tags stay, so the item stays contract 5.
-- **Exclusions.** A reported item whose rebuild excluded transcript requests
-  (a legacy fork prefix owned by another root) stays on today's path. The old
-  check let such an item through only when the number of excluded requests
-  happened to equal the number of telemetry-only requests. Now it never
-  passes.
 - No collection, reads, retained state, wire fields, hashes or fences change.
   The W0 r5 digest test is unchanged.
+
+## Legacy exclusions
+
+A top-level fork written before `forkedFrom` existed copies its parent's first
+responses. When a complete census proves that prefix belongs to another root,
+the family witness records it in `legacy_excluded_request_id_hashes`, and
+`rebuild_claude_reported_usage` leaves it out. Those requests stay in the
+item's `claude_usage_request_ids`, but never in its rows, count or usage:
+
+- the rebuild returns false if any of the member's ledger rows is excluded,
+  before any row is counted or given to the sink;
+- `item.request_count` is set to the number of ledger rows, one per request;
+- the ledger rows of the child root cannot hold another root's request: a
+  request owner is unique across roots, and the exclusion requires a different
+  owner (`claude_legacy_request_owners`,
+  `claude_legacy_exclusion_evidence_fingerprint`).
+
+The sink proves this rather than subtracting counts:
+
+- `RequestSink::excluding` takes the exclusions the call site passes to the
+  rebuild. It records how many of them are request ids of the item. If any is
+  not, the owned count is unknown and owned-request accounting fails.
+- `RequestSink::add` marks the grouping when it admits an excluded request, a
+  transcript request that is not one of the item's ids, or a telemetry-only
+  request that is. Such a grouping is never tagged, whatever the counts. An
+  excluded request is never classified, so it cannot tag the child or lend it
+  the parent's telemetry login.
+
+So a legacy fork with excluded requests is contract 5 with or without
+telemetry-only requests: its owned transcript requests carry their own
+telemetry tags, and the excluded usage stays with the parent.
+
+Before this change, such a reported item passed only when the number of
+excluded requests happened to equal the number of telemetry-only requests,
+because only then did `request_count == claude_usage_request_ids.len()` hold.
+That check is kept as the fallback, so no item it admitted is now refused.
+When the exclusions cannot be proven to be the item's own requests, the old
+check alone decides, as it did. It only ever admitted the rebuild's own rows.
 
 ## Re-offer of already accepted unknown-account bodies
 
@@ -105,7 +144,8 @@ own one-time re-arm of reported members whose body is not contract 5.
 - A persisted "last accepted body was contract 5, so hold rather than
   downgrade" flag. It brings revocation and delayed-money questions with it.
 - Any change to server fences.
-- Contract 5 for reported items with legacy exclusions.
+- Tags for telemetry-only requests. Their own observer clock does not qualify
+  under the current rules.
 
 ## Tests
 
@@ -137,3 +177,33 @@ In `snapshots/claude_request_identity_tests.rs`:
 Both tests fail on the previous source at the contract-5 outcome assertion:
 one item was sent and one was ineligible, where both should be sent. Every
 other assertion before that point already held on the previous source.
+
+Legacy exclusions, also in `snapshots/claude_request_identity_tests.rs`:
+
+- `legacy_excluded_reported_fork_stays_contract5_by_owned_requests` runs the
+  real census, legacy-exclusion proof and reported rebuild on a legacy fork.
+  The parent's telemetry carries a different login. It runs with one, none
+  and two telemetry-only requests.
+  - The child counts only its own and its telemetry-only requests, and the
+    parent keeps the shared request's usage.
+  - Owned-request accounting admits the child in every case. The old count
+    check admits it only with one telemetry-only request, the case already
+    sent as contract 5 before this change.
+  - Both items are sent as contract 5 with usage conserved. The child's own
+    requests carry its own login, its telemetry-only requests stay untagged
+    and refused, and the parent's login appears nowhere in the child's body.
+- `legacy_exclusion_skew_never_tags_or_borrows_the_parent` drives skewed
+  exclusions through the real rebuild, with two telemetry-only requests so the
+  old count check is negative:
+  - a missing exclusion, an exclusion of a request the child owns, and
+    excluding every request: there is no reported body;
+  - an exclusion that is not one of the child's requests, a count mismatch,
+    and unadmitted transcript ids: never tagged, bytes unchanged. One
+    unadmitted id that makes the old count coincide is still admitted by that
+    check, as before;
+  - a grouping that admitted the excluded request is refused, even though the
+    old count check is positive.
+
+On the previous revision of this change, the first test fails at the
+contract-5 outcome with one telemetry-only request: one item sent, one
+ineligible.
