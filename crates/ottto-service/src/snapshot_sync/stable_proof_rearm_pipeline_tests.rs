@@ -261,7 +261,14 @@ impl RearmFixture {
     fn family_heads(index: &ScanIndex) -> BTreeMap<String, Option<String>> {
         Self::family_keys(index)
             .into_iter()
-            .map(|(session, key)| (session, index.files[&key].last_snapshot_fingerprint.clone()))
+            .map(|(session, key)| {
+                let entities = index
+                    .file_snapshot_fingerprints
+                    .get(&key)
+                    .expect("the fixture file has an exact entity ledger");
+                assert_eq!(entities.len(), 1, "one entity per fixture transcript");
+                (session, entities.first().cloned())
+            })
             .collect()
     }
 
@@ -473,7 +480,7 @@ impl RearmFixture {
                 )
                 .get("usage_accounting")
                 .cloned()
-                .unwrap_or_default()
+                .expect("the semantic component registry includes usage accounting")
             })
             .collect::<Vec<_>>();
         let offered = offered
@@ -825,10 +832,25 @@ fn rearm_debt_survives_a_shed_correction_and_reload_until_accepted() {
         .index
         .accepted_snapshot_fingerprint_recorded(&corrected_root));
     assert_eq!(
-        last.index.files[&root_key]
-            .last_snapshot_fingerprint
-            .as_deref(),
-        Some(corrected_root.as_str())
+        last.index.file_snapshot_fingerprints[&root_key],
+        BTreeSet::from([corrected_root.clone()]),
+        "the exact ACKed entity is current after checkpoint recovery"
+    );
+    // The file entry stores a domain-separated hash of the entity set, even
+    // when that set has one body. It is not the body's own fingerprint.
+    use sha2::Digest;
+    let mut group = sha2::Sha256::new();
+    for value in [
+        b"snapshot_file_entity_set:v1".as_slice(),
+        corrected_root.as_bytes(),
+    ] {
+        group.update((value.len() as u32).to_be_bytes());
+        group.update(value);
+    }
+    assert_eq!(
+        last.index.files[&root_key].last_snapshot_fingerprint,
+        Some(format!("{:x}", group.finalize())),
+        "the file-set witness binds that exact ACKed entity"
     );
 
     // Optimized rule only from here: the unchanged re-proof leaves no debt.
