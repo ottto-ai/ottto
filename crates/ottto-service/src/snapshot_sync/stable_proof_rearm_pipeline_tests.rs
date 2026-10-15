@@ -868,3 +868,46 @@ fn rearm_debt_survives_a_shed_correction_and_reload_until_accepted() {
         );
     }
 }
+
+/// Hazard characterization, pipeline path without a clock edit. Repeated
+/// member changes each rebind the family's RetryPending quarantine and count
+/// as a failed reconstruction, so the quarantine turns terminal and stops
+/// blocking the census. A complete census can then prove the changed witness
+/// while the terminal quarantine is still bound to the previous one. The
+/// saved index must reload with the family intact, not be quarantined and
+/// rebuilt.
+#[test]
+#[serial(source_manifests)]
+fn changed_proof_after_terminal_authority_reloads_the_saved_index() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = RearmFixture::new("claude-stable-proof-rearm-terminal-reload");
+    let established = fixture.establish();
+    for (step, hour) in (10..16).enumerate() {
+        let sequence = 5 + step as u64;
+        fixture.append_family_request(
+            Some(REARM_AGENTS[0]),
+            &format!("req_agent_a_{}", step + 2),
+            4 + step as u32,
+            sequence,
+        );
+        let pages = fixture.generation(hour);
+        let last = pages.last().expect("terminal page");
+        if !last.scan.census_complete {
+            continue;
+        }
+        assert_eq!(
+            RearmFixture::family_keys(&last.index).len(),
+            rearm_family_sessions().len(),
+            "hour {hour}: the saved index reloads intact instead of being quarantined"
+        );
+        assert_ne!(
+            last.index
+                .claude_usage_family_witness_digest_for_test(REARM_ROOT)
+                .as_deref(),
+            Some(established.proven.as_str()),
+            "hour {hour}: the complete census proves the changed witness"
+        );
+        return;
+    }
+    panic!("a complete census follows the terminal authority hold");
+}
