@@ -2619,7 +2619,8 @@ pub(super) mod tests {
         // The blocker changes but still proves no owner: the owed candidates
         // are tried again once, held again, and nothing is emitted.
         fs::write(&unreadable, "still not a header\n").unwrap();
-        let (still_index, still) = retained_page(&root, held_index, &[unreadable.clone()]);
+        let (still_index, still) =
+            retained_page(&root, held_index, std::slice::from_ref(&unreadable));
         assert!(still.snapshots.is_empty(), "{:?}", still.snapshots);
         assert!(still.ownership_incomplete_file_count > 0);
         assert!(inventory_hold(&still_index)
