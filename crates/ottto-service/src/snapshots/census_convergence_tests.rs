@@ -1275,3 +1275,312 @@ fn transcript_ownership_needs_quarantined_originals_observed() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// M2 allocation attribution, S6: requested-byte and allocation-event counts
+// for one synthetic scan index through load, clone, compare-and-swap save,
+// and local settlement. The thread-local probe charges only this test
+// thread's requested/usable allocator calls inside `measure`; it is neither
+// RSS nor footprint, and it is not a leak proof. Fixture generation and its
+// first serialization happen outside every measured scope, and each measured
+// operation only borrows inputs born earlier, so nothing allocated before a
+// scope is freed inside it. Each stage writes one count-only JSON line
+// straight to stderr, outside libtest's captured print path, so hosted CI
+// logs keep the values.
+mod m2_scan_index_allocation {
+    use super::*;
+    use crate::retry_allocation_probe::{self as probe, Stats};
+
+    const REQUESTS_PER_ROOT: usize = 16;
+    const MEMBERS_PER_ROOT: usize = 2;
+    const MAX_DUPLICATE_OWNERS: usize = 1024;
+    const MAX_FIXTURE_BYTES: u64 = 8 * 1024 * 1024;
+
+    fn digest(tag: u64, value: usize) -> String {
+        format!("{tag:016x}{value:048x}")
+    }
+
+    fn root_id(root: usize) -> String {
+        format!("{:08x}-5a5a-4000-8000-000000000006", 0x6e00_0000 + root)
+    }
+
+    fn member_keys(root: usize) -> [(String, String); MEMBERS_PER_ROOT] {
+        let session = root_id(root);
+        [
+            (
+                session.clone(),
+                format!("/synthetic/m2/projects/{session}.jsonl"),
+            ),
+            (
+                format!("{session}_agent-m2{root:04x}"),
+                format!("/synthetic/m2/projects/{session}/subagents/agent-m2{root:04x}.jsonl"),
+            ),
+        ]
+    }
+
+    /// Committed files, pending occurrence maps, retained witnesses, and
+    /// duplicate owners for `roots` families. Every collection grows with
+    /// `roots`; ids are fixed width so string sizes do not.
+    fn synthetic_index(roots: usize) -> ScanIndex {
+        let mut index = ScanIndex {
+            accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_VERSION,
+            ..ScanIndex::default()
+        };
+        for root in 0..roots {
+            let mut pending = ClaudeUsageFamilyPending {
+                census_window_end: WINDOW.to_string(),
+                member_request_id_hashes: BTreeMap::new(),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+            };
+            let mut witness = ClaudeUsageFamilyWitness {
+                evidence_fingerprint: digest(1, root),
+                member_request_id_fingerprints: BTreeMap::new(),
+                member_occurrence_fingerprints: BTreeMap::new(),
+                assigned_request_id_fingerprints: BTreeMap::new(),
+                legacy_excluded_request_id_hashes: BTreeMap::new(),
+                legacy_exclusion_evidence_fingerprint: None,
+                legacy_owner_roots: BTreeSet::new(),
+            };
+            for (slot, (member, key)) in member_keys(root).into_iter().enumerate() {
+                let file = root * MEMBERS_PER_ROOT + slot;
+                index_file(&mut index, &key, &digest(2, file), &digest(3, file), WINDOW);
+                index.accepted_snapshot_fingerprints.insert(digest(3, file));
+                let requests = (0..REQUESTS_PER_ROOT / MEMBERS_PER_ROOT)
+                    .map(|request| file * REQUESTS_PER_ROOT + request)
+                    .collect::<Vec<_>>();
+                pending.member_request_id_hashes.insert(
+                    member.clone(),
+                    requests.iter().map(|request| digest(4, *request)).collect(),
+                );
+                pending.member_occurrences.insert(
+                    member.clone(),
+                    requests
+                        .iter()
+                        .map(|request| {
+                            (
+                                digest(4, *request),
+                                occurrence(*request as u64, 1 + (*request % 7) as u64),
+                            )
+                        })
+                        .collect(),
+                );
+                witness
+                    .member_request_id_fingerprints
+                    .insert(member.clone(), digest(5, file));
+                witness
+                    .member_occurrence_fingerprints
+                    .insert(member.clone(), digest(6, file));
+                witness
+                    .assigned_request_id_fingerprints
+                    .insert(member, digest(7, file));
+            }
+            index
+                .claude_usage_family_pending
+                .insert(root_id(root), pending);
+            index
+                .claude_usage_family_witnesses
+                .insert(root_id(root), witness);
+        }
+        for request in 0..(roots * REQUESTS_PER_ROOT).min(MAX_DUPLICATE_OWNERS) {
+            let first = root_id(request / REQUESTS_PER_ROOT);
+            let second = root_id((request / REQUESTS_PER_ROOT + 1) % roots);
+            index.claude_duplicate_request_owners.insert(
+                digest(8, request),
+                BTreeSet::from([
+                    claude_duplicate_request_owner(&first, &first),
+                    claude_duplicate_request_owner(&second, &second),
+                ]),
+            );
+        }
+        index
+    }
+
+    fn replace_body(index: &mut ScanIndex, key: &str, fingerprint: &str) {
+        index
+            .files
+            .get_mut(key)
+            .expect("indexed synthetic root")
+            .last_snapshot_fingerprint = Some(fingerprint.to_string());
+        index
+            .file_snapshot_fingerprints
+            .insert(key.to_string(), BTreeSet::from([fingerprint.to_string()]));
+        index
+            .snapshot_activity_at
+            .insert(fingerprint.to_string(), Some(WINDOW.to_string()));
+    }
+
+    fn value<T: Serialize>(value: &T) -> Value {
+        serde_json::to_value(value).expect("serialize synthetic index state")
+    }
+
+    fn emit_receipt(roots: usize, stage: &str, stats: &Stats, fixture_bytes: u64) {
+        use std::io::Write as _;
+        let receipt = serde_json::json!({
+            "receipt": "m2_allocation_attribution:v1",
+            "case": "s6_scan_index",
+            "synthetic_family_roots": roots,
+            "requests_per_root": REQUESTS_PER_ROOT,
+            "fixture_bytes": fixture_bytes,
+            "stage": stage,
+            "requested_peak_bytes": stats.requested_peak,
+            "usable_peak_bytes": stats.usable_peak,
+            "requested_live_bytes": stats.requested_live,
+            "usable_live_bytes": stats.usable_live,
+            "allocations": stats.allocations,
+            "deallocations": stats.deallocations,
+        });
+        let _ = std::io::stderr().write_all(format!("{receipt}\n").as_bytes());
+    }
+
+    /// Measures every stage for `roots` families and returns the requested
+    /// bytes one clone of the loaded index retains.
+    fn attribute(roots: usize) -> usize {
+        let scratch = crate::test_scratch::ScratchDir::new("ottto-m2-scan-index");
+        let path = scratch.join("claude-scan-index.json");
+        let mut fixture = synthetic_index(roots);
+        fixture.save(&path).expect("write synthetic scan index");
+        let fixture_bytes = fs::metadata(&path).expect("stat synthetic index").len();
+        assert!(fixture_bytes <= MAX_FIXTURE_BYTES, "{fixture_bytes}");
+        let fixture_value = value(&fixture);
+
+        // Load: the decoded index is born inside the scope and kept alive.
+        let (mut loaded, load) =
+            probe::measure(|| ScanIndex::load(&path).expect("load synthetic index"));
+        assert_eq!(
+            value(&loaded),
+            fixture_value,
+            "load round-trips every field"
+        );
+        assert_eq!(loaded.generation, 1);
+        emit_receipt(roots, "load", &load, fixture_bytes);
+
+        // Clone with both copies alive.
+        let (mut copy, clone) = probe::measure(|| loaded.clone());
+        assert_eq!(value(&copy), fixture_value, "clone equals its input");
+        let clone_bytes = usize::try_from(clone.requested_live).expect("clone retains bytes");
+        assert!(clone_bytes > 0);
+        emit_receipt(roots, "clone", &clone, fixture_bytes);
+
+        // Normal compare-and-swap save. The CAS check decodes the whole
+        // on-disk index again to compare two scalars, so the scope holds a
+        // transient decoded copy and retains none. A header-only CAS decode
+        // (M1) is expected to change this characterization deliberately.
+        let (saved, save) = probe::measure(|| copy.save(&path));
+        saved.expect("save synthetic index");
+        assert_eq!(copy.generation, loaded.generation + 1);
+        assert!(save.requested_peak * 2 >= clone_bytes, "{save:?}");
+        assert!(
+            save.requested_live.unsigned_abs() * 16 < clone_bytes,
+            "{save:?}"
+        );
+        emit_receipt(roots, "save", &save, fixture_bytes);
+        let previous = ScanIndex::load(&path).expect("reload saved index");
+        assert_eq!(value(&previous), value(&copy), "save persists every field");
+        // The stale generation is refused and leaves the file untouched.
+        let on_disk = fs::read(&path).expect("read saved index");
+        assert!(loaded.save(&path).is_err());
+        assert_eq!(loaded.generation, 1);
+        assert_eq!(fs::read(&path).expect("reread saved index"), on_disk);
+
+        // Settlement inputs: every fourth root has a changed held body, a
+        // changed accepted body, or a changed unaccepted body.
+        let mut current = previous.clone();
+        let mut held = BTreeSet::new();
+        let mut accepted = BTreeSet::new();
+        let mut unaccepted = BTreeSet::new();
+        for root in 0..roots {
+            let changed = digest(9, root);
+            let target = match root % 4 {
+                0 => &mut held,
+                1 => &mut accepted,
+                2 => &mut unaccepted,
+                _ => continue,
+            };
+            target.insert(changed.clone());
+            let [(_, key), _] = member_keys(root);
+            replace_body(&mut current, &key, &changed);
+        }
+        let (current_copy, current_clone) = probe::measure(|| current.clone());
+        drop(current_copy);
+        let current_clone_bytes =
+            usize::try_from(current_clone.requested_live).expect("clone retains bytes");
+
+        // Non-progressing held settlement: the revert starts from a full
+        // clone of the scanned index, so its peak covers one whole copy.
+        let (reverted, revert) = probe::measure(|| {
+            current.with_locally_held_keys_reverted(&previous, &held, &BTreeSet::new())
+        });
+        assert!(revert.requested_peak >= current_clone_bytes, "{revert:?}");
+        emit_receipt(roots, "held_settlement", &revert, fixture_bytes);
+        for root in 0..roots {
+            let [(_, key), _] = member_keys(root);
+            let expected = if root % 4 == 0 { &previous } else { &current };
+            assert_eq!(value(&reverted.files[&key]), value(&expected.files[&key]));
+            assert_eq!(
+                reverted.file_snapshot_fingerprints.get(&key),
+                expected.file_snapshot_fingerprints.get(&key)
+            );
+        }
+        let reverted_current = reverted.current_snapshot_fingerprints();
+        for fingerprint in &held {
+            assert!(!reverted_current.contains(fingerprint));
+            assert!(!reverted
+                .accepted_snapshot_fingerprints
+                .contains(fingerprint));
+            assert!(!reverted.snapshot_activity_at.contains_key(fingerprint));
+        }
+        assert!(previous
+            .accepted_snapshot_fingerprints
+            .iter()
+            .filter(|fingerprint| reverted_current.contains(*fingerprint))
+            .all(|fingerprint| reverted
+                .accepted_snapshot_fingerprints
+                .contains(fingerprint)));
+
+        // Partial subset: only the accepted bodies advance.
+        let (subset, partial) =
+            probe::measure(|| current.committable_subset(&previous, &accepted, &BTreeMap::new()));
+        emit_receipt(roots, "partial_subset", &partial, fixture_bytes);
+        assert_eq!(subset.generation, previous.generation);
+        for root in 0..roots {
+            let [(_, key), _] = member_keys(root);
+            let expected = if root % 4 == 1 { &current } else { &previous };
+            assert_eq!(value(&subset.files[&key]), value(&expected.files[&key]));
+            assert_eq!(
+                subset.file_snapshot_fingerprints.get(&key),
+                expected.file_snapshot_fingerprints.get(&key)
+            );
+        }
+        let committed = subset.current_snapshot_fingerprints();
+        assert!(accepted
+            .iter()
+            .all(|fingerprint| subset.accepted_snapshot_fingerprints.contains(fingerprint)));
+        assert!(held
+            .iter()
+            .chain(&unaccepted)
+            .all(|fingerprint| !subset.accepted_snapshot_fingerprints.contains(fingerprint)));
+        assert!(previous
+            .accepted_snapshot_fingerprints
+            .iter()
+            .filter(|fingerprint| committed.contains(*fingerprint))
+            .all(|fingerprint| subset.accepted_snapshot_fingerprints.contains(fingerprint)));
+        clone_bytes
+    }
+
+    // The duplicate-owner census block runs inside the reported-usage rebuild
+    // on a census-complete page, so S7's join covers it; it has no separable
+    // entry point here. The bounded `save_with_read_limit` path refuses an
+    // index of this size at its shape cap and is not measured.
+    #[test]
+    fn m2_s6_scan_index_load_clone_save_and_settlement_allocations() {
+        let small = attribute(32);
+        let large = attribute(64);
+        // Doubling the families roughly doubles one copy. The fixed share
+        // (the struct itself, B-tree node rounding) keeps this from being
+        // exact, so the bound is loose and states no per-family cost.
+        assert!(
+            large * 2 >= small * 3 && large * 2 <= small * 5,
+            "clone bytes {small} -> {large}"
+        );
+    }
+}
