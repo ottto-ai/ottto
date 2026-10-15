@@ -355,6 +355,17 @@ pub(crate) struct Grouping {
     keys: BTreeSet<AuthorityKey>,
     keys_over_cap: bool,
     failed: Option<Ineligible>,
+    /// Requests a `RequestSink` admitted: those the item's transcript holds,
+    /// and telemetry-only (auxiliary) ones the reported rebuild added.
+    transcript_requests: u64,
+    telemetry_only_requests: u64,
+    /// The item's transcript requests the reported rebuild excluded as
+    /// another root's (a legacy fork's inherited prefix); `None` when an
+    /// exclusion is not one of the item's transcript requests.
+    excluded_requests: Option<u64>,
+    /// An admitted request was excluded, or its transcript membership
+    /// disagrees with its occurrence: such a grouping is never tagged.
+    unowned_request: bool,
 }
 
 impl Grouping {
@@ -366,6 +377,10 @@ impl Grouping {
             keys: BTreeSet::new(),
             keys_over_cap: false,
             failed: None,
+            transcript_requests: 0,
+            telemetry_only_requests: 0,
+            excluded_requests: Some(0),
+            unowned_request: false,
         }
     }
 
@@ -470,6 +485,37 @@ impl Grouping {
 
     fn rows(&self) -> impl Iterator<Item = (&RowKey, &RowGroup)> {
         self.groups.values().flatten()
+    }
+
+    /// The reported rebuild counted exactly the item's own requests, each
+    /// once (the ledger holds one row per request id): every transcript
+    /// request except those it excluded as another root's, plus telemetry-only
+    /// requests. Each exclusion is one of the item's transcript requests and
+    /// none was admitted, so excluded requests are outside the item's count
+    /// and usage. Telemetry-only requests are classified on their own rows;
+    /// the transcript request-id set itself is not widened.
+    pub(super) fn owned_reported_requests(&self, item: &SnapshotItem) -> bool {
+        let owned = self.excluded_requests.and_then(|excluded| {
+            u64::try_from(item.claude_usage_request_ids.len())
+                .ok()?
+                .checked_sub(excluded)
+        });
+        !self.unowned_request
+            && owned.is_some_and(|owned| owned > 0 && self.transcript_requests == owned)
+            && self
+                .transcript_requests
+                .checked_add(self.telemetry_only_requests)
+                == Some(item.request_count)
+    }
+
+    /// Whether a reported item may be tagged from this grouping: exact
+    /// owned-request accounting or, failing that, the request-id count guard
+    /// the transcript path keeps, so no item that guard admitted is refused.
+    /// A grouping that admitted an excluded or non-member request never is.
+    pub(super) fn reported_requests_admissible(&self, item: &SnapshotItem) -> bool {
+        !self.unowned_request
+            && (self.owned_reported_requests(item)
+                || claude_snapshot_request_id_hashes(item).is_some())
     }
 }
 
@@ -1748,6 +1794,8 @@ pub(crate) struct RequestSink<'s, 'a> {
     /// The duplicate witness, on the transcript path only; reported rows
     /// carry their own telemetry owner.
     duplicates: Option<&'s Duplicates>,
+    /// Request-id hashes the reported rebuild excludes as another root's.
+    excluded: Option<&'s BTreeSet<String>>,
     root: String,
     desktop: bool,
     scan_unix_seconds: Option<u64>,
@@ -1765,6 +1813,7 @@ impl<'s, 'a> RequestSink<'s, 'a> {
         Some(Self {
             evidence,
             duplicates: None,
+            excluded: None,
             root: owner_root(item)?.to_string(),
             desktop: item
                 .origin
@@ -1785,7 +1834,48 @@ impl<'s, 'a> RequestSink<'s, 'a> {
         self
     }
 
+    /// The item's transcript requests (by request-id hash) the reported
+    /// rebuild excludes as another root's: a legacy fork's inherited prefix.
+    /// Each must be one of the item's distinct transcript requests, and none
+    /// may be admitted; they are never classified, so never tag or lend
+    /// their owner's evidence.
+    pub(crate) fn excluding(mut self, item: &SnapshotItem, excluded: &'s BTreeSet<String>) -> Self {
+        if !excluded.is_empty() {
+            let members = item
+                .claude_usage_request_ids
+                .iter()
+                .filter(|request_id| {
+                    excluded.contains(&format!(
+                        "{:x}",
+                        sha2::Sha256::digest(request_id.as_bytes())
+                    ))
+                })
+                .count();
+            self.grouping.excluded_requests = (members == excluded.len())
+                .then(|| u64::try_from(members).ok())
+                .flatten();
+            self.excluded = Some(excluded);
+        }
+        self
+    }
+
     pub(super) fn add(&mut self, item: &SnapshotItem, request: Request<'_>) {
+        let transcript_member = item.claude_usage_request_ids.contains(request.request_id);
+        if transcript_member != request.occurrence.is_some()
+            || self.excluded.is_some_and(|excluded| {
+                excluded.contains(&format!(
+                    "{:x}",
+                    sha2::Sha256::digest(request.request_id.as_bytes())
+                ))
+            })
+        {
+            self.grouping.unowned_request = true;
+        }
+        let admitted = match request.occurrence {
+            Some(_) => &mut self.grouping.transcript_requests,
+            None => &mut self.grouping.telemetry_only_requests,
+        };
+        *admitted = admitted.saturating_add(1);
         if self.grouping.failed.is_some() {
             return;
         }
@@ -1998,8 +2088,12 @@ fn tag_item(
     ownership: &TranscriptOwnership<'_>,
 ) -> Option<Result<Tagged, Ineligible>> {
     let root = owner_root(item)?;
+    let reported_usage = item.usage_accounting_contract.as_deref() == Some(REPORTED);
     if !item.claude_context_curve_request_index_complete
-        || claude_snapshot_request_id_hashes(item).is_none()
+        // A reported item also counts telemetry-only requests and excludes a
+        // legacy fork's inherited prefix; its rebuild's admitted requests are
+        // checked against its grouping below instead.
+        || (!reported_usage && claude_snapshot_request_id_hashes(item).is_none())
         || item
             .attribution_facts
             .iter()
@@ -2016,8 +2110,12 @@ fn tag_item(
     {
         return None;
     }
-    let mut grouping = if item.usage_accounting_contract.as_deref() == Some(REPORTED) {
-        reported.remove(&item.source_session_id)?
+    let mut grouping = if reported_usage {
+        let grouping = reported.remove(&item.source_session_id)?;
+        if !grouping.reported_requests_admissible(item) {
+            return None;
+        }
+        grouping
     } else {
         let mut sink = RequestSink::for_item(evidence, item, bucket_row_count(item))?
             .with_duplicates(ownership.duplicates);

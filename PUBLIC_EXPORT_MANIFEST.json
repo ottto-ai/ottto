@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 653,
-  "content_sha256": "1f8f30745579c281e9abc41af23a2c7e1a751611de3cb439a13d5cb05baf7950",
+  "candidate_file_count": 654,
+  "content_sha256": "a4874fabb8a08b0b366f636ae4c0f57908f5c6c40ce642b3369e7e7d9d183e55",
   "files": [
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "4aaac42036da1ff293d813318f08ea1c59535afc585587fc59607f8cdb1070f5",
-      "size_bytes": 2455794
+      "sha256": "3faa4f93ead7ae275802ce5ddf7feee1bb420170ed996138253d31d4a245ff6e",
+      "size_bytes": 2455870
     },
     {
       "executable": false,
@@ -1266,15 +1266,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_identity.rs",
-      "sha256": "b5ec2537fb2a97765f7b47384f366c2915d8a4ac6bb570cec2daf560469b0b3e",
-      "size_bytes": 78383
+      "sha256": "d2d85f7d69c52a7a0b8303caa1aeabcabddbe117f17049c086cda9153202420b",
+      "size_bytes": 83091
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_identity_tests.rs",
-      "sha256": "41849b6f009213d564e0917d8a9c28483ec7260fa8126523ac231b1ace1541ff",
-      "size_bytes": 125708
+      "sha256": "3a6205ae43e88c794d18b629cf72fafd8c35bf01d31d822cce0e991ab8670ded",
+      "size_bytes": 149712
     },
     {
       "executable": false,
@@ -2794,6 +2794,13 @@
       "path": "docs/session-2026-10-14-stale-older-rejection-reason.md",
       "sha256": "d0d32bc3dbfa2c5041603debed5db2a136fdb83256c0cbe3ae65b1b4a67592db",
       "size_bytes": 1344
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-15-claude-reported-telemetry-only-requests.md",
+      "sha256": "7eb407b6e3ef73aa9325401faa935923eb5e3fbe8e0a42ab6655272ce0937551",
+      "size_bytes": 11000
     },
     {
       "executable": false,
@@ -4574,9 +4581,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-15T18:48:57+00:00",
+  "generated_at": "2026-10-15T18:59:09+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 654,
+  "output_file_count": 655,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4613,5 +4620,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c2b63ca4d5ae87538fffb3fa0eeb2794cd0b83bb"
+  "source_commit": "2ef244d232cd6615d20dac9315238d6386792d03"
 }
