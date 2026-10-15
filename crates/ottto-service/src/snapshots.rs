@@ -21488,6 +21488,22 @@ impl ScanIndex {
             .cloned()
     }
 
+    /// Every member revision recorded by a terminal quarantine that is still
+    /// bound to the family's retained witness.
+    #[cfg(test)]
+    pub(crate) fn bound_terminal_claude_authority_members_for_test(
+        &self,
+        root_session_id: &str,
+    ) -> Option<BTreeMap<String, String>> {
+        let record = self
+            .claude_usage_authority_quarantine
+            .get(root_session_id)?;
+        let witness = self.claude_usage_family_witnesses.get(root_session_id)?;
+        (record.disposition == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+            && claude_usage_authority_preserves_pending(record, witness))
+        .then(|| record.member_source_file_fingerprints.clone())
+    }
+
     #[cfg(test)]
     fn insert_claude_authority_for_test(
         &mut self,
