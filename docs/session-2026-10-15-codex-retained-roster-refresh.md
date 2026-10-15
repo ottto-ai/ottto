@@ -62,7 +62,8 @@ that one failure kept the census red for an hour.
   - whether the walk still had directories open.
 
   Before each page, one `lstat` per recorded path checks that evidence. When
-  it has moved (a refused record changed, was replaced or is gone, an unlisted
+  it has moved (a refused record changed, was replaced, is gone or left the
+  roster, an unlisted
   candidate joined the roster, or the walk finished), the held candidates
   still in the roster are queued once more. They meet the same inventory and
   ownership gates. If the evidence still proves nothing, the page is held and

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 650,
-  "content_sha256": "5d8a9e90db3a8b6485290528df2f0215807e5780bcbeeb7d625e8613cad24de7",
+  "content_sha256": "b8b383b94f18005963ea5a1d485d9edee4b5277085a6ae33fd98b60fd69b5f96",
   "files": [
     {
       "executable": false,
@@ -1217,8 +1217,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "234edc0e56b124fa0cac866dc4f8f6d9c48e4a498ebcab7456fe8185862b708e",
-      "size_bytes": 2449581
+      "sha256": "50adfafd5f4b638847de9f9f77de3de1a4e3894a75b64c43546386f9f3990182",
+      "size_bytes": 2449764
     },
     {
       "executable": false,
@@ -1280,8 +1280,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join.rs",
-      "sha256": "33a47dc5936538cfec1f81eade871866750ac703d25a80760aa56d6155103d5d",
-      "size_bytes": 147131
+      "sha256": "48dcdc4ee2aa234286ebb0251db6d6a53d991ba863c6995770e42b64a50919bd",
+      "size_bytes": 148382
     },
     {
       "executable": false,
@@ -2806,8 +2806,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-15-codex-retained-roster-refresh.md",
-      "sha256": "f2638fac9cf6d654900c5f8f09e544c0002f2bd9cf7fc9309179d5b758979251",
-      "size_bytes": 7398
+      "sha256": "193258515a7c474c2e4a73b4c8c7ccd7cdb642188111ae5ac01cf9e87e4c3a9d",
+      "size_bytes": 7417
     },
     {
       "executable": false,
@@ -4553,7 +4553,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-15T17:42:20+00:00",
+  "generated_at": "2026-10-15T17:42:34+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 651,
   "public_roots": [
@@ -4592,5 +4592,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "40e5d220390ef414be2741438ad57870c1f79d1b"
+  "source_commit": "c49c901647932545b799080636c22a7394db44dd"
 }

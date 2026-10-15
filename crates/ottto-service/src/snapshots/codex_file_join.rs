@@ -2583,6 +2583,36 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
+    fn header_that_vanished_before_its_read_releases_the_hold_once_unlisted() {
+        // The refused record was already gone when the inventory reached it,
+        // so its recorded witness is absent and can never change. Leaving the
+        // roster is the evidence that releases the held valid session.
+        let (root, mut held_index, unreadable, _, _) = held_behind_unreadable_header();
+        let key = local_index_key(&unreadable);
+        let hold = held_index
+            .traversal
+            .as_mut()
+            .and_then(|traversal| traversal.residue.codex_inventory_hold.as_mut())
+            .unwrap();
+        *hold.refused_headers.get_mut(&key).unwrap() = None;
+        fs::remove_file(&unreadable).unwrap();
+        let (index, page) = retained_page(&root, held_index, &[]);
+        assert!(!index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .codex_rollout_paths
+            .contains(&key));
+        assert_eq!(
+            page.snapshots
+                .iter()
+                .map(|item| (item.source_session_id.as_str(), item.input_tokens))
+                .collect::<Vec<_>>(),
+            vec![(UNRELATED, 70)]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn repaired_header_releases_the_held_page_and_a_still_unreadable_one_does_not() {
         let (root, held_index, unreadable, new, witness) = held_behind_unreadable_header();
         let deadline = retry_deadline(&held_index);

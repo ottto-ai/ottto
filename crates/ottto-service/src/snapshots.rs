@@ -20562,7 +20562,8 @@ fn record_codex_inventory_hold(
 }
 
 /// Queue the candidates of a `CodexInventoryHold` again once its evidence
-/// has moved: a refused first record changed, was replaced or is gone; a held
+/// has moved: a refused first record changed, was replaced, is gone or left
+/// the roster; a held
 /// candidate outside the roster joined it or is gone; or the walk finished its
 /// directories. The check costs one `lstat` per recorded path. Unmoved
 /// evidence queues nothing, so a hold that cannot be resolved re-reads no
@@ -20581,10 +20582,11 @@ fn release_codex_inventory_hold(source: SnapshotSource, traversal: &mut ScanTrav
         codex_file_join::path_witness(Path::new(key)) != *witness
     };
     let released = hold.awaiting_directories
-        || hold
-            .refused_headers
-            .iter()
-            .any(|(key, witness)| moved(key, witness))
+        || hold.refused_headers.iter().any(|(key, witness)| {
+            // A record that vanished before its read has no witness to move;
+            // leaving the roster is its evidence.
+            !traversal.codex_rollout_paths.contains(key) || moved(key, witness)
+        })
         || hold.outside_roster.iter().any(|(key, witness)| {
             traversal.codex_rollout_paths.contains(key) || moved(key, witness)
         });
