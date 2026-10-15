@@ -16399,6 +16399,124 @@ for line in sys.stdin:
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A synthetic `auth.json` whose live tokens claim `user` in `workspace`.
+    /// A new `expires_at` is a new token for the same sign-in.
+    #[cfg(unix)]
+    fn synthetic_codex_auth_with_claims(user: &str, workspace: &str, expires_at: i64) -> String {
+        let jwt = |kind: &str| {
+            let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+            let payload = URL_SAFE_NO_PAD.encode(
+                serde_json::json!({
+                    "iss": "https://auth.openai.com",
+                    "aud": "synthetic-client",
+                    "exp": expires_at,
+                    "email": "synthetic-account",
+                    "https://api.openai.com/auth": {
+                        "chatgpt_user_id": user,
+                        "chatgpt_account_id": workspace,
+                        "chatgpt_plan_type": "pro"
+                    }
+                })
+                .to_string(),
+            );
+            format!("{header}.{payload}.synthetic-{kind}-signature")
+        };
+        serde_json::json!({
+            "tokens": {"access_token": jwt("access"), "id_token": jwt("id")},
+            "account_id": workspace,
+        })
+        .to_string()
+    }
+
+    /// A reconnect keeps the home and its credential, and the person signs in
+    /// again to the same account and workspace while the old token is still
+    /// live. With a credential that names its account, the read's own token
+    /// refresh still continues the run, but a rewrite made between reads (the
+    /// new sign-in) is read at once, once, and the run keeps its spacing.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_waiting_check_reads_a_same_account_sign_in_at_once() {
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("codex-check-same-account")
+            .canonicalize()
+            .expect("canonical Codex account test root");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let runs = root.join("app-server-runs");
+        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("bin"));
+        let clock = crate::agent_status::SetupGateTestClock::frozen_at(std::time::Instant::now());
+        let operation_id = "codex_setup_0123456789abcdef0123456789abcdef";
+        let home = open_waiting_codex_setup(operation_id);
+        let auth = home.join("auth.json");
+        write_signed_out_fake_codex(&root.join("bin"), &runs, Some(&auth));
+        let expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs() as i64
+            + 24 * 60 * 60;
+        write_synthetic_codex_auth(
+            &home,
+            &synthetic_codex_auth_with_claims("synthetic-user", "synthetic-workspace", expires_at),
+        );
+
+        // The read's own rewrite does not restart the run: the spacing grows.
+        for (seconds, expected_runs) in [
+            (0, 1),
+            (4, 1),
+            (5, 2),
+            (10, 3),
+            (15, 4),
+            (24, 4),
+            (25, 5),
+            (44, 5),
+        ] {
+            clock.set(seconds);
+            check_waiting_codex_setup(operation_id, 3, false);
+            assert_eq!(
+                counted_lines(&runs),
+                expected_runs,
+                "runs after the checks at {seconds} s"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&auth)
+                .expect("credential")
+                .matches('\n')
+                .count(),
+            5,
+            "every read rewrote the credential"
+        );
+
+        // The person signs in again to the same account; the next due read
+        // would be at 45 s, then 85 s. The new credential is read at once,
+        // once.
+        clock.set(30);
+        write_synthetic_codex_auth(
+            &home,
+            &synthetic_codex_auth_with_claims(
+                "synthetic-user",
+                "synthetic-workspace",
+                expires_at + 60,
+            ),
+        );
+        check_waiting_codex_setup(operation_id, 3, false);
+        assert_eq!(counted_lines(&runs), 6);
+        // That read continued the run: six failures, so 40 s after it, not
+        // the short retries of a new run.
+        clock.set(35);
+        check_waiting_codex_setup(operation_id, 3, false);
+        assert_eq!(counted_lines(&runs), 6);
+        clock.set(69);
+        check_waiting_codex_setup(operation_id, 3, false);
+        assert_eq!(counted_lines(&runs), 6);
+        clock.set(70);
+        check_waiting_codex_setup(operation_id, 3, false);
+        assert_eq!(counted_lines(&runs), 7);
+
+        drop(clock);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn cloud_operation_rejects_secrets_and_unapproved_mutations() {
         let secret = CloudOperation::Plan {
