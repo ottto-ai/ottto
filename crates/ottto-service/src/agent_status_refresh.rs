@@ -74,6 +74,9 @@ struct LaneState {
     /// Start of the last saved-only pass an app's request ran
     /// ([`StatusLane::app_passes_saved_only`]); the schedule ignores it.
     last_app_pass: Option<Duration>,
+    /// The lane ran its first provider-reading pass since daemon start.
+    /// Unlike `schedule.last_started`, a wake never clears it.
+    startup_pass_ran: bool,
     stopped: bool,
     generation: u64,
     collection: Option<Arc<AgentStatusCollection>>,
@@ -281,7 +284,8 @@ impl StatusLane {
             state.manual = false;
             state.running = true;
             state.collecting = reused.is_none();
-            let first_pass = !app_only && state.schedule.last_started.is_none();
+            let first_pass = !app_only && !state.startup_pass_ran;
+            state.startup_pass_ran |= first_pass;
             if app_only {
                 state.last_app_pass = Some(now);
             } else if reused.is_none() {
@@ -725,7 +729,8 @@ mod tests {
     }
     /// The provider calls of a lane's first pass after daemon start are
     /// labelled `startup`; an app-only pass before it does not count, and
-    /// later passes keep their callers' labels.
+    /// later passes, including the first one after a wake, keep their
+    /// callers' labels.
     #[test]
     fn first_lane_pass_is_the_startup_trigger() {
         use crate::provider_calls::{current_trigger, Trigger};
@@ -748,7 +753,12 @@ mod tests {
         assert!(run(10));
         assert!(run(60));
         assert!(run(360));
-        assert_eq!(*seen.borrow(), [None, Some(Trigger::Startup), None]);
+        // A wake with a stale collection restarts the schedule, not the daemon.
+        let wall = OffsetDateTime::parse("2026-10-05T01:00:00Z", &Rfc3339).unwrap();
+        lane.wake_if_stale(seconds(370), wall);
+        assert!(lane.state.lock().unwrap().schedule.last_started.is_none());
+        assert!(run(370));
+        assert_eq!(*seen.borrow(), [None, Some(Trigger::Startup), None, None]);
     }
     #[test]
     fn claude_reset_read_brings_the_next_pass_forward_only() {

@@ -15236,6 +15236,9 @@ struct CodexAppServerRun {
     spawned: bool,
     /// Whether the session asked for the detailed rate-limits read.
     detail_read_sent: bool,
+    /// Whether the CLI rejected the routine read's parameter itself; that
+    /// read never reached the provider, and the detailed read replaced it.
+    routine_read_rejected: bool,
     timed_out: bool,
 }
 
@@ -15275,7 +15278,8 @@ fn call_codex_app_server_rate_limits_for_home(
             account.as_deref(),
             result_class,
             started.elapsed(),
-            CODEX_APP_SERVER_MIN_REQUESTS + u32::from(run.detail_read_sent),
+            CODEX_APP_SERVER_MIN_REQUESTS
+                + u32::from(run.detail_read_sent && !run.routine_read_rejected),
         ));
     }
     result
@@ -15440,6 +15444,7 @@ fn run_codex_app_server_rate_limits_for_home(
                 // A server that does not accept the routine parameter still
                 // answers the plain read it always accepted.
                 send_details = true;
+                run.routine_read_rejected = true;
             }
             (Some("ottto_rate_limits"), Some(error)) => {
                 break Err(rpc_failure("quota", error));
@@ -23267,6 +23272,11 @@ for line in sys.stdin:
         if mode == "quota_error":
             reply(request_id, code=-32603)
             sys.exit(0)
+        if mode == "routine_rejected" and request_id == "ottto_rate_limits":
+            # An older CLI refuses the routine parameter without asking the
+            # provider.
+            reply(request_id, code=-32602)
+            continue
         reply(request_id, {"rateLimits": {"primary": {"usedPercent": 25, "windowDurationMins": 300}}})
 "#;
 
@@ -23407,7 +23417,8 @@ for line in sys.stdin:
 
     /// Each app-server run that started is one provider-call line counting
     /// the requests it sent, answered or not: a failed or timed-out read still
-    /// counts its token refresh and rate-limits read.
+    /// counts its token refresh and rate-limits read. A routine read an older
+    /// CLI refused locally is not counted.
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -23424,6 +23435,7 @@ for line in sys.stdin:
             "quota_error",
             "quota_eof",
             "success",
+            "routine_rejected",
         ];
         for mode in modes {
             let _ = run_codex_probe_failure_fake(mode);
@@ -23439,6 +23451,7 @@ for line in sys.stdin:
                 ("rpc_error", 2),
                 ("rpc_error", 2),
                 ("exited", 2),
+                ("ok", 2),
                 ("ok", 2),
             ]
         );

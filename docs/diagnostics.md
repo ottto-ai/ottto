@@ -282,7 +282,8 @@ the Ottto support directory, readable only by the user:
   provider the daemon cannot tell (the Pi smoke prompt on Pi's default route).
 - `trigger` is `schedule`, `explicit_refresh`, `older_app_compat`, `setup`,
   `startup` or `other`. A person's Verify is `setup`; the first status pass
-  after the daemon starts is `startup`.
+  after the daemon starts is `startup`, and the first pass after the Mac wakes
+  is `schedule`.
 - `account` is the first 8 hex characters of the account identifier hash, or
   `unknown`.
 - `result` is `ok`, `http_<status>`, `timeout`, `exit_<code>` or a short
