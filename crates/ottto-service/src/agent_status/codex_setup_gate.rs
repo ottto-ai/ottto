@@ -11,6 +11,8 @@
 //!   writes it;
 //! - the first read of a setup operation, and the first read after the home's
 //!   sign-in changed, at once;
+//! - one read at once after `auth.json` was rewritten since the last read
+//!   noted it, without restarting the run of failures (see below);
 //! - after a failed read, the next automatic read only after
 //!   [`SHORT_RETRY_SECONDS`] for the first [`SHORT_RETRIES`] failures under
 //!   one sign-in, then after [`FIRST_RETRY_SECONDS`], doubling per failure up
@@ -25,6 +27,14 @@
 //! by another reader of the home, is not a new sign-in. Only a credential
 //! that names no account falls back to the file's metadata. Whether a read
 //! continues a run of failures is decided from the sign-in seen before it.
+//!
+//! A reconnect keeps the home and its `auth.json`, and the person signs in
+//! again to the same account and workspace. While the old access token has
+//! not expired, that new credential names the same sign-in, so it continues
+//! the run. The gate stores the file's metadata as it was right after each
+//! read, so a read's own rewrite is never seen as a change; a rewrite made
+//! between reads (that sign-in, or another reader refreshing the token) is
+//! read once at once and then spaced like the run it continues.
 //!
 //! One read at a time per home: a check that arrives while a read runs waits
 //! for it. After a failed read it is spaced like any other check; after a
@@ -82,6 +92,12 @@ struct Failures {
 impl Failures {
     /// Whether a read of `operation_id` under `current_login` (the login seen
     /// before it) continues this run.
+    ///
+    /// The claimed sign-in exists only while the access token has not
+    /// expired by the wall clock. When the stored token expires between
+    /// reads, or the clock steps across its expiry, the claim appears or
+    /// disappears and a new run starts, with its short retries. That happens
+    /// once per expiry: the next read refreshes the token.
     fn continued_by(&self, operation_id: &str, current_login: &LoginMark) -> bool {
         self.operation_id == operation_id && self.login.same_login(current_login)
     }
@@ -125,7 +141,8 @@ fn retry_after(failures: u32) -> u64 {
 
 /// Whether a waiting setup's check reads the provider now. `run` is the run
 /// of failures this read would continue ([`Failures::continued_by`]); `None`
-/// for a new setup operation or a new sign-in.
+/// for a new setup operation or a new sign-in. A credential file rewritten
+/// since the run's last read is read at once; the run goes on.
 fn admit(
     run: Option<&Failures>,
     current_login: &LoginMark,
@@ -138,6 +155,11 @@ fn admit(
     let Some(run) = run else {
         return Ok(());
     };
+    // `run.login` is the file as the last read left it, so this is a rewrite
+    // made between reads, such as a sign-in to the same account.
+    if !run.login.same_credential_file(current_login) {
+        return Ok(());
+    }
     let wait = if explicit {
         EXPLICIT_MIN_GAP_SECONDS
     } else if now.saturating_duration_since(run.first_failed_at)
@@ -333,6 +355,51 @@ mod tests {
         let run = failed(4, Instant::now(), Instant::now(), before);
         assert!(run.continued_by(OPERATION, &rewritten));
         assert!(!run.continued_by(OPERATION, &other_account));
+    }
+
+    #[test]
+    fn a_credential_rewritten_between_reads_is_read_once_at_once() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        // The last read left the file like this, its own refresh included.
+        let after_last_read = LoginMark::for_test(Some("account-a"), Some(1));
+        let run = failed(6, start, at(100), after_last_read.clone());
+        assert_eq!(
+            admit(Some(&run), &after_last_read, false, at(101)),
+            Err(SetupReadDeferred::RetryIn(39))
+        );
+        // The person signed in again to the same account: same run, read now.
+        let signed_in_again = LoginMark::for_test(Some("account-a"), Some(2));
+        assert!(run.continued_by(OPERATION, &signed_in_again));
+        assert_eq!(admit(Some(&run), &signed_in_again, false, at(101)), Ok(()));
+        // That read failed too: the run keeps counting and spacing.
+        let next = after_read(
+            Some(run),
+            OPERATION,
+            LoginMark::for_test(Some("account-a"), Some(3)),
+            false,
+            at(101),
+            at(102),
+        )
+        .expect("the failure is noted");
+        assert_eq!(
+            next,
+            failed(
+                7,
+                start,
+                at(102),
+                LoginMark::for_test(Some("account-a"), Some(3))
+            )
+        );
+        assert_eq!(
+            admit(
+                Some(&next),
+                &LoginMark::for_test(Some("account-a"), Some(3)),
+                false,
+                at(103)
+            ),
+            Err(SetupReadDeferred::RetryIn(79))
+        );
     }
 
     #[test]

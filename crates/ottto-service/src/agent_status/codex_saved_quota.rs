@@ -170,6 +170,11 @@ impl LoginMark {
         self.auth.is_some()
     }
 
+    /// The same `auth.json` metadata: the file was not rewritten in between.
+    pub(super) fn same_credential_file(&self, other: &Self) -> bool {
+        self.auth == other.auth
+    }
+
     #[cfg(test)]
     pub(super) fn for_test(binding: Option<&str>, auth_modified_secs: Option<u64>) -> Self {
         Self {
