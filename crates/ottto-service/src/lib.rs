@@ -1450,6 +1450,7 @@ impl LocalDaemon {
         state.running = false;
         drop(state);
         agent_status_refresh::stop();
+        agent_status::stop_codex_quota_scheduler();
         Ok(())
     }
 

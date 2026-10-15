@@ -52,6 +52,12 @@ use time::{
 mod claude_credit_pools;
 mod codex_credit_grants;
 mod codex_last_known;
+mod codex_saved_quota;
+
+pub use codex_saved_quota::start_codex_quota_scheduler;
+pub(crate) use codex_saved_quota::{
+    refresh_codex_quota_now, saved_codex_quota_generation, stop_codex_quota_scheduler,
+};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -72,17 +78,24 @@ const CLAUDE_OAUTH_USAGE_LEGACY_CACHE_FILE: &str = "claude-code-oauth-usage-cach
 /// Display fallback only: how long a cached payload may still be rendered (as
 /// `Stale`) when the endpoint cannot be reached. Not a refresh cadence.
 const CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
-/// Default slot: ~1 read per hour per account binding (~24/day). Sparse
-/// polling is half of the recorded provider-endpoints posture (identify
-/// honestly, poll sparsely, circuit-break instead of adapting). The
-/// activity-based slots in `claude_credit_pools` shorten this to 15 min while
-/// the binding is in active use (up to ~4/hour, ~96/day if active all day) and
-/// lengthen it to 2-3 h once idle; `CLAUDE_ACTIVITY_CADENCE_ENABLED` turns
-/// them off.
-const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS: u64 = 60 * 60;
+/// Unused-account slot: one read per ~40 min per account binding (~36/day).
+/// Sparse polling is half of the recorded provider-endpoints posture
+/// (identify honestly, poll sparsely, circuit-break instead of adapting). The
+/// activity-based slot in `claude_credit_pools` shortens this to 5 min while
+/// the binding is in use on this Mac, and a fresh local statusLine reading
+/// stands in for those reads; `CLAUDE_ACTIVITY_CADENCE_ENABLED` turns the
+/// in-use slot off.
+const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS: u64 = 40 * 60;
 /// Half-width of the deterministic spread applied to the base cadence, giving
-/// an effective gate in the 55-65 minute range.
-const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_JITTER_SECONDS: u64 = 5 * 60;
+/// an effective gate in the 38-42 minute range.
+const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_JITTER_SECONDS: u64 = 2 * 60;
+/// Spacing after a successful read: 5 min to the next read of the account,
+/// pass to pass. Measured from the start of the collection pass that read
+/// ([`claude_spacing_anchor`]), so the daemon's next 5-min pass finds an
+/// in-use account due wherever in the pass its read falls; two reads can
+/// therefore be up to the anchor cap closer than 5 min. Retry-After and
+/// breaker holds are stored and checked separately and are never shortened
+/// by it.
 const CLAUDE_OAUTH_USAGE_REFRESH_SECONDS: u64 = 5 * 60;
 const CLAUDE_OAUTH_USAGE_RETRY_AFTER_FALLBACK_SECONDS: u64 = 5 * 60;
 /// Off-switch sentinel: while this file exists in the daemon support dir the
@@ -166,7 +179,11 @@ struct CodexUsageProbe {
     quota_windows: Vec<AgentQuotaWindow>,
     credit_balances: Vec<AgentCreditBalance>,
     account: Option<AgentAccountStatus>,
+    /// Set by a provider read only; a saved reading carries `saved_identity`.
     identity: Option<CodexStrongIdentity>,
+    /// The identity hashes of a saved reading, whose provider validation
+    /// happened when it was read (see `codex_saved_quota`).
+    saved_identity: Option<CodexIdentityHashes>,
     credential_read_failed: bool,
     /// Completion of the app-server read, distinct from quota value changes.
     response_completed_at: Option<String>,
@@ -195,6 +212,44 @@ pub(crate) struct CodexStrongIdentity {
     /// collector holds the raw values, so only it can say they are one account.
     pub(crate) superseded_account_identifier_hash: Option<String>,
     pub(crate) superseded_organization_identifier_hash: Option<String>,
+}
+
+/// The identity hashes of a provider-validated Codex reading, without the raw
+/// workspace id. This is all a saved reading keeps; it grants no setup
+/// authority (setup always reads the provider).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CodexIdentityHashes {
+    account_identifier_hash: String,
+    workspace_identifier_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_organization_identifier_hash: Option<String>,
+}
+
+impl From<&CodexStrongIdentity> for CodexIdentityHashes {
+    fn from(identity: &CodexStrongIdentity) -> Self {
+        Self {
+            account_identifier_hash: identity.account_identifier_hash.clone(),
+            workspace_identifier_hash: identity.workspace_identifier_hash.clone(),
+            superseded_account_identifier_hash: identity.superseded_account_identifier_hash.clone(),
+            superseded_organization_identifier_hash: identity
+                .superseded_organization_identifier_hash
+                .clone(),
+        }
+    }
+}
+
+/// Where a Codex home's quota comes from in one collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexQuotaRead {
+    /// The home's saved reading (`codex_saved_quota`); never starts a
+    /// provider read. Every status read uses this.
+    Saved,
+    /// Read the provider now (one `codex app-server` run) and save the
+    /// outcome. Only the refresh schedule, an explicit refresh and setup
+    /// checks use this.
+    Provider,
 }
 
 #[derive(Clone)]
@@ -267,6 +322,11 @@ const CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION: u16 = 4;
 const CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION: u16 = 3;
 #[cfg(test)]
 static CLAUDE_OAUTH_PROVIDER_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// `codex app-server` runs started by this test process: the seam that proves a
+/// status read never starts one.
+#[cfg(test)]
+static CODEX_APP_SERVER_RUNS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 /// Tests that must never reach the provider set this: an attempted request is
 /// still counted in `CLAUDE_OAUTH_PROVIDER_CALLS`, then refused locally.
@@ -1540,7 +1600,16 @@ fn collect_codex_status_snapshots(
                 )
             })
             .collect();
-    for process in crate::codex_process_homes::running_codex_homes() {
+    let running_homes = crate::codex_process_homes::running_codex_homes();
+    // A running Codex process holding a rollout in a home is the clearest
+    // evidence that the home is in use; the quota schedule reads it often.
+    codex_saved_quota::note_running_homes(
+        running_homes
+            .iter()
+            .map(|process| process.auth_home.as_path()),
+        current_unix_seconds(),
+    );
+    for process in running_homes {
         // The process holds a rollout in this exact home. Do not publish a
         // current status row for an unregistered home: it can contain labels.
         let process_binding = process_bindings
@@ -1555,6 +1624,7 @@ fn collect_codex_status_snapshots(
                     },
                     &captured_at,
                     &expires_at,
+                    CodexQuotaRead::Saved,
                 );
                 candidate
                     .binding
@@ -1816,11 +1886,22 @@ fn remember_codex_last_known_reading(
     else {
         return;
     };
+    // Keyed on the read itself, not this collection: a saved reading served
+    // again keeps its original read time, so the age cap still holds.
+    let read_at = snapshot
+        .quota_windows
+        .iter()
+        .filter_map(|window| window.observed_at.as_deref())
+        .filter_map(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+        .filter_map(|at| u64::try_from(at.unix_timestamp()).ok())
+        .min()
+        .unwrap_or(now)
+        .min(now);
     codex_last_known::record(
         &codex_credit_grants::binding_key(account, workspace),
         &snapshot.quota_windows,
         &snapshot.credit_balances,
-        now,
+        read_at,
     );
 }
 
@@ -1980,11 +2061,14 @@ pub(crate) fn collect_registered_codex_slot_for_setup(
         )
     })?;
     let captured_at = crate::current_rfc3339_timestamp();
+    // A setup check needs a fresh provider read; it also refreshes the saved
+    // copy every status read then serves.
     let (snapshot, identity, _) = collect_codex_status_for_home(
         captured_at.clone(),
         captured_at,
         &home,
         CodexHomeTrust::Managed,
+        CodexQuotaRead::Provider,
     );
     let identity = identity.ok_or_else(|| {
         CodexSlotSetupCollectionError::ProviderLoginPending(
@@ -2011,6 +2095,31 @@ fn collect_codex_slot_candidates(
     captured_at: &str,
     expires_at: &str,
 ) -> (CodexAccountsStatusV1, Vec<CodexSlotCandidate>) {
+    let slots = codex_home_slots(&status);
+    let candidates = thread::scope(|scope| {
+        let handles = slots
+            .into_iter()
+            .map(|slot| {
+                scope.spawn(move || {
+                    collect_codex_home_candidate(
+                        slot,
+                        captured_at,
+                        expires_at,
+                        CodexQuotaRead::Saved,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .collect()
+    });
+    (status, candidates)
+}
+
+/// The default Codex home and every accepted managed slot home.
+fn codex_home_slots(status: &CodexAccountsStatusV1) -> Vec<CodexHomeSlot> {
     let store = FileCodexAccountSlotSettingsStore::default();
     let mut slots = vec![CodexHomeSlot {
         slot_id: "default".to_string(),
@@ -2041,25 +2150,14 @@ fn collect_codex_slot_candidates(
             });
         }
     }
-    let candidates = thread::scope(|scope| {
-        let handles = slots
-            .into_iter()
-            .map(|slot| {
-                scope.spawn(move || collect_codex_home_candidate(slot, captured_at, expires_at))
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .filter_map(|handle| handle.join().ok())
-            .collect()
-    });
-    (status, candidates)
+    slots
 }
 
 fn collect_codex_home_candidate(
     slot: CodexHomeSlot,
     captured_at: &str,
     expires_at: &str,
+    quota_read: CodexQuotaRead,
 ) -> CodexSlotCandidate {
     let home_trust = match slot.ownership {
         CodexAccountSlotOwnershipV1::Default => CodexHomeTrust::ProviderDefault,
@@ -2074,6 +2172,7 @@ fn collect_codex_home_candidate(
         expires_at.to_string(),
         &slot.home,
         home_trust,
+        quota_read,
     );
     let mut status = codex_collection_status_from_snapshot(&snapshot);
     let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut status);
@@ -2884,6 +2983,7 @@ fn collect_codex_status_for_home(
     expires_at: String,
     codex_home: &Path,
     home_trust: CodexHomeTrust,
+    quota_read: CodexQuotaRead,
 ) -> (
     AgentStatusSnapshot,
     Option<CodexStrongIdentity>,
@@ -2998,7 +3098,7 @@ fn collect_codex_status_for_home(
     );
     let mut strong_identity = None;
     let mut probe_failed = false;
-    match collect_codex_usage_for_home(codex_home, home_trust) {
+    match collect_codex_usage_for_home(codex_home, home_trust, quota_read) {
         Ok(usage) => {
             if usage.credential_read_failed {
                 append_codex_credential_read_failed_diagnostic(&mut snapshot);
@@ -3006,8 +3106,13 @@ fn collect_codex_status_for_home(
             if let Some(account) = usage.account {
                 snapshot.account = Some(merge_codex_accounts(snapshot.account.take(), account));
             }
-            if let Some(identity) = usage.identity {
-                strong_identity = Some(identity.clone());
+            let identity_hashes = usage
+                .identity
+                .as_ref()
+                .map(CodexIdentityHashes::from)
+                .or(usage.saved_identity);
+            strong_identity = usage.identity;
+            if let Some(identity) = identity_hashes.as_ref() {
                 if let Some(account) = snapshot.account.as_mut() {
                     account.account_identifier_hash =
                         Some(identity.account_identifier_hash.clone());
@@ -3032,7 +3137,7 @@ fn collect_codex_status_for_home(
             });
             if let Some(diagnostic) = codex_app_server_success_diagnostic(
                 usage.response_completed_at.clone(),
-                strong_identity.as_ref(),
+                identity_hashes.as_ref(),
                 !usage.quota_windows.is_empty() || !usage.credit_balances.is_empty(),
             ) {
                 snapshot.diagnostics.push(diagnostic);
@@ -3040,7 +3145,7 @@ fn collect_codex_status_for_home(
             if let Some(summary) = usage.rate_limit_pool_summary {
                 if let Some(mut diagnostic) = codex_app_server_success_diagnostic(
                     usage.response_completed_at.clone(),
-                    strong_identity.as_ref(),
+                    identity_hashes.as_ref(),
                     true,
                 ) {
                     diagnostic.code = "codex_rate_limit_pools_observed".to_string();
@@ -3051,7 +3156,7 @@ fn collect_codex_status_for_home(
             if let Some(summary) = usage.reset_credit_detail_summary {
                 if let Some(mut diagnostic) = codex_app_server_success_diagnostic(
                     usage.response_completed_at,
-                    strong_identity.as_ref(),
+                    identity_hashes.as_ref(),
                     true,
                 ) {
                     diagnostic.code = "codex_reset_credit_details_observed".to_string();
@@ -3077,16 +3182,27 @@ fn collect_codex_status_for_home(
                 );
             }
         }
-        Err(message) => {
-            probe_failed = !message.starts_with(CODEX_CLI_NOT_FOUND_FOR_PROBE);
+        Err(failure) if failure.message == codex_saved_quota::CODEX_QUOTA_NOT_READ_YET => {
+            // No usable saved reading yet (first start, or the local login
+            // changed): the schedule reads it shortly. Not a failed read.
+            snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                "codex_quota_not_read_yet",
+                AgentDiagnosticSeverity::Info,
+                failure.message,
+            ));
+        }
+        Err(failure) => {
+            probe_failed = !failure.message.starts_with(CODEX_CLI_NOT_FOUND_FOR_PROBE);
             snapshot.quota_windows = vec![unsupported_quota_window("usage")];
             snapshot.diagnostics.push(
                 AgentStatusDiagnostic::source(
                     "codex_usage_probe_failed",
                     AgentDiagnosticSeverity::Warning,
-                    message,
+                    failure.message,
                 )
-                .with_observed_at(rfc3339_from_unix_seconds(current_unix_seconds()))
+                // When the read failed, not when it is served.
+                .with_observed_at(rfc3339_from_unix_seconds(failure.at_epoch_seconds))
                 .with_quota_binding(
                     snapshot
                         .account
@@ -3145,6 +3261,29 @@ fn collect_codex_status_for_home(
 }
 
 fn collect_codex_usage_for_home(
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+    quota_read: CodexQuotaRead,
+) -> Result<CodexUsageProbe, codex_saved_quota::CodexQuotaFailure> {
+    match quota_read {
+        CodexQuotaRead::Saved => {
+            codex_saved_quota::serve_saved(codex_home, home_trust, current_unix_seconds())
+        }
+        CodexQuotaRead::Provider => {
+            codex_saved_quota::read_provider_and_save(codex_home, home_trust, |_, _| true)
+                .unwrap_or_else(|| Err(codex_saved_quota::CODEX_QUOTA_NOT_READ_YET.to_string()))
+                .map_err(|message| codex_saved_quota::CodexQuotaFailure {
+                    message,
+                    at_epoch_seconds: current_unix_seconds(),
+                })
+        }
+    }
+}
+
+/// One provider read of a Codex home's quota: the app-server, or the legacy
+/// OAuth endpoint where that is still allowed. Callers go through
+/// [`codex_saved_quota::read_provider_and_save`], which saves the outcome.
+fn read_codex_usage_from_provider(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
 ) -> Result<CodexUsageProbe, String> {
@@ -6587,8 +6726,7 @@ fn local_claude_quota_snapshot_is_fresh_for_account(
         return false;
     };
     let age_seconds = now.unix_timestamp() - represented_at.unix_timestamp();
-    // The same gate the cache serve path labels with, so a 2-3 h idle slot
-    // does not relabel a retained snapshot stale after the default 55-65 min.
+    // The same gate the cache serve path labels with.
     let gate = claude_oauth_usage_serve_gate_seconds(
         account_identifier_hash,
         organization_identifier_hash,
@@ -10156,6 +10294,9 @@ fn collect_claude_oauth_usage_unstamped(
     }) && caller_auth_hold.is_none()
         && access_token.is_some()
         && !claude_access_token_locally_expired(credential_expires_at, now);
+    let breaker_rate_limited = breaker
+        .as_ref()
+        .is_some_and(|breaker| breaker.rate_limit_failures > 0);
     let open_breaker = breaker.filter(|breaker| claude_oauth_usage_breaker_is_open(breaker, now));
 
     // Read cadence (design R7): one read per binding per slot. The
@@ -10171,13 +10312,31 @@ fn collect_claude_oauth_usage_unstamped(
     if read_schedule.observe_activity(latest_activity_at) {
         let _ = claude_credit_pools::write_claude_read_schedule(&account_state_dir, &read_schedule);
     }
-    let slot_seconds = claude_oauth_usage_slot_seconds(
+    let mut slot_seconds = claude_oauth_usage_slot_seconds(
         &read_schedule,
         latest_activity_at,
         account_identifier_hash,
         organization_identifier_hash,
         now,
     );
+    // In use: Claude Code's own statusLine is the free source. While it is
+    // fresh for exactly this binding, the provider is read only at the
+    // unused-account gate (for the meters the statusLine does not carry);
+    // the collection prefers the newer statusLine windows when it serves.
+    // Only the default login's collection merges the statusLine.
+    if slot_seconds == claude_credit_pools::ACTIVE_SLOT_SECONDS
+        && matches!(caller, ClaudeOAuthUsageCaller::Default)
+        && claude_statusline_fresh_for_binding(
+            account_identifier_hash,
+            organization_identifier_hash,
+            now,
+        )
+    {
+        slot_seconds = claude_oauth_usage_fresh_age_seconds(
+            account_identifier_hash,
+            organization_identifier_hash,
+        );
+    }
     let mut last_reading_at = None;
     let mut previous_credit_balances = Vec::new();
 
@@ -10189,6 +10348,7 @@ fn collect_claude_oauth_usage_unstamped(
     }
 
     let mut exact_stale_fallback = None;
+    let mut explicit_refresh_due = false;
     if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
         account_identifier_hash,
         organization_identifier_hash,
@@ -10204,6 +10364,34 @@ fn collect_claude_oauth_usage_unstamped(
             last_reading_at = Some(cache.observed_at_epoch_seconds);
         }
         let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
+        // An explicit refresh reads now, past the slot and the plain spacing
+        // after a successful read, but never inside a Retry-After hold: the
+        // spacing must be exactly the success floor and no rate limit may be
+        // on record, in the breaker or in this run's own 429 record. Every
+        // later hold and breaker check still applies.
+        explicit_refresh_due = claude_explicit_refresh_requested(
+            account_identifier_hash,
+            organization_identifier_hash,
+            cache.observed_at_epoch_seconds,
+            now,
+        ) && (now >= cache.next_refresh_after_epoch_seconds
+            || (!breaker_rate_limited
+                && !claude_rate_limit_held(
+                    account_identifier_hash,
+                    organization_identifier_hash,
+                    now,
+                )
+                && cache.next_refresh_after_epoch_seconds
+                    <= cache
+                        .observed_at_epoch_seconds
+                        .saturating_add(CLAUDE_OAUTH_USAGE_REFRESH_SECONDS)));
+        if explicit_refresh_due {
+            note_claude_explicit_refresh_attempt(
+                account_identifier_hash,
+                organization_identifier_hash,
+                now,
+            );
+        }
         // A window that reset after this reading gets one read shortly after
         // the reset instead of waiting out the slot.
         let reset_read_due = claude_credit_pools::claude_reset_read_due(
@@ -10219,6 +10407,7 @@ fn collect_claude_oauth_usage_unstamped(
         if !cache.windows.is_empty()
             && cache_age <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
             && !reset_read_due
+            && !explicit_refresh_due
             && !claude_credit_pools::claude_reading_due(
                 Some(cache.observed_at_epoch_seconds),
                 cache.next_refresh_after_epoch_seconds,
@@ -10243,7 +10432,7 @@ fn collect_claude_oauth_usage_unstamped(
             }
             return outcome;
         }
-        if now < cache.next_refresh_after_epoch_seconds {
+        if now < cache.next_refresh_after_epoch_seconds && !explicit_refresh_due {
             // A stored reading without windows under the hold: the saved-reset
             // section of a windowless variant read, served for this slot.
             if held.active && cache.windows.is_empty() {
@@ -10259,6 +10448,19 @@ fn collect_claude_oauth_usage_unstamped(
         if !cache.windows.is_empty() && cache_age <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS {
             exact_stale_fallback = Some(cache);
         }
+    } else if claude_explicit_refresh_requested(
+        account_identifier_hash,
+        organization_identifier_hash,
+        0,
+        now,
+    ) {
+        // Nothing stored yet: an explicit refresh may read it now.
+        explicit_refresh_due = true;
+        note_claude_explicit_refresh_attempt(
+            account_identifier_hash,
+            organization_identifier_hash,
+            now,
+        );
     }
 
     // The hold applies even without a stored reading to serve; a servable
@@ -10448,6 +10650,47 @@ fn collect_claude_oauth_usage_unstamped(
             current_unix_seconds(),
         );
     }
+    if claude_transient_failure_held(account_identifier_hash, organization_identifier_hash, now) {
+        let result = match read_claude_oauth_usage_cache_with_legacy_migration(
+            account_identifier_hash,
+            organization_identifier_hash,
+            mirror_legacy_default,
+        )
+        .filter(|cache| {
+            !cache.windows.is_empty()
+                && now.saturating_sub(cache.observed_at_epoch_seconds)
+                    <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
+        }) {
+            Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
+            None => Err(
+                "The latest Claude OAuth quota request failed; it is retried after a minute."
+                    .to_string(),
+            ),
+        };
+        return ClaudeOAuthUsageOutcome::from(result).with_check_outcome(
+            "claude_oauth_usage_check_suppressed",
+            "The latest Claude OAuth quota request failed moments ago; no provider request was made, and any served readings are last-known local readings.",
+            current_unix_seconds(),
+        );
+    }
+    // A status read for the app serves the stored reading: only the daemon's
+    // own passes, an explicit refresh and setup checks call the provider. The
+    // daemon's next pass reads a due account.
+    if claude_pass_saved_only() && !explicit_refresh_due {
+        drop(token);
+        let result = match exact_stale_fallback {
+            Some(cache) => Ok(claude_oauth_usage_from_cache(cache, now)),
+            None => Err(
+                "Claude quota for this account has no stored reading yet; the daemon reads it shortly."
+                    .to_string(),
+            ),
+        };
+        return ClaudeOAuthUsageOutcome::from(result).with_check_outcome(
+            "claude_oauth_usage_cache_reused",
+            "A status read served the stored quota reading; the daemon's own schedule makes the provider requests.",
+            now,
+        );
+    }
     let authorization = format!("Bearer {token}");
     let user_agent = ottto_user_agent();
     // Same endpoint, same slot: the saved-reset variant replaces the plain
@@ -10521,6 +10764,12 @@ fn collect_claude_oauth_usage_unstamped(
         }
         Err(ureq::Error::Status(429, response)) => {
             let retry_after = claude_oauth_retry_after_epoch_seconds(&response, now);
+            set_claude_binding_time(
+                &mut claude_rate_limit_holds(),
+                account_identifier_hash,
+                organization_identifier_hash,
+                retry_after,
+            );
             // A cache belonging to another account is not merely skipped here:
             // `unwrap_or` replaces it with an empty cache for the current
             // account, so the write below also clears the stale payload off
@@ -10600,7 +10849,15 @@ fn collect_claude_oauth_usage_unstamped(
                     now,
                     mirror_legacy_default,
                 ),
-                None => Vec::new(),
+                None => {
+                    set_claude_binding_time(
+                        &mut claude_transient_failures(),
+                        account_identifier_hash,
+                        organization_identifier_hash,
+                        current_unix_seconds(),
+                    );
+                    Vec::new()
+                }
             };
             diagnostics.push(claude_quota_check_diagnostic("claude_oauth_usage_check_failed", "The latest Claude OAuth quota request failed; any served readings remain locally cached evidence.", current_unix_seconds()));
             if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
@@ -11157,7 +11414,8 @@ fn claude_oauth_usage_record_reading(
         account_identifier_hash: reading.account_identifier_hash.to_string(),
         organization_identifier_hash: reading.organization_identifier_hash.to_string(),
         observed_at_epoch_seconds: reading.observed_at_epoch_seconds,
-        next_refresh_after_epoch_seconds: reading.now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
+        next_refresh_after_epoch_seconds: claude_spacing_anchor(reading.now)
+            + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
         windows: usage.windows.clone(),
         credit_balances: usage.credit_balances.clone(),
         account_weekly_not_offered: usage.account_weekly_not_offered,
@@ -11240,7 +11498,8 @@ fn claude_oauth_latest_activity_at(
     )
 }
 
-/// The binding's read slot: active, default (the jittered gate below) or idle.
+/// The binding's read slot: in use (5 min) or unused (the jittered gate
+/// below).
 fn claude_oauth_usage_slot_seconds(
     read_schedule: &claude_credit_pools::ClaudeReadSchedule,
     latest_activity_at: Option<u64>,
@@ -11252,37 +11511,268 @@ fn claude_oauth_usage_slot_seconds(
         read_schedule,
         latest_activity_at,
         claude_oauth_usage_fresh_age_seconds(account_identifier_hash, organization_identifier_hash),
-        claude_credit_pools::claude_idle_slot_seconds(
-            account_identifier_hash,
-            organization_identifier_hash,
-        ),
         claude_credit_pools::CLAUDE_ACTIVITY_CADENCE_ENABLED,
         now,
     )
 }
 
-/// How old a stored reading may be and still be labelled fresh: never less
-/// than the default gate, and the full slot while an idle account waits for
-/// its next read.
+/// How old a stored reading may be and still be labelled fresh: the
+/// unused-account gate. The shorter in-use slot never labels a reading stale
+/// sooner.
 fn claude_oauth_usage_serve_gate_seconds(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
-    now: u64,
+    _now: u64,
 ) -> u64 {
-    let read_schedule =
-        claude_credit_pools::read_claude_read_schedule(&claude_oauth_usage_account_state_dir(
-            account_identifier_hash,
-            organization_identifier_hash,
-        ));
-    claude_oauth_usage_fresh_age_seconds(account_identifier_hash, organization_identifier_hash).max(
-        claude_oauth_usage_slot_seconds(
-            &read_schedule,
-            claude_oauth_latest_activity_at(account_identifier_hash, organization_identifier_hash),
-            account_identifier_hash,
-            organization_identifier_hash,
-            now,
-        ),
+    claude_oauth_usage_fresh_age_seconds(account_identifier_hash, organization_identifier_hash)
+}
+
+/// Whether Claude Code's local statusLine wrote a reading for exactly this
+/// account and organization within the in-use slot: the free local data an
+/// in-use account prefers over a provider read. Only an exact v4 stamp from a
+/// method the serve path attributes (`config_dir`, `session_store`) counts.
+fn claude_statusline_fresh_for_binding(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: u64,
+) -> bool {
+    let Ok(Some(cache)) = read_claude_statusline_cache(&default_support_dir()) else {
+        return false;
+    };
+    !cache.windows.is_empty()
+        && cache.observed_at_epoch_seconds <= now.saturating_add(60)
+        && now.saturating_sub(cache.observed_at_epoch_seconds)
+            <= claude_credit_pools::ACTIVE_SLOT_SECONDS
+        && !account_identifier_hash.is_empty()
+        && cache.observed_under_account_identifier_hash == account_identifier_hash
+        && cache.observed_under_organization_identifier_hash.as_deref()
+            == Some(organization_identifier_hash)
+        && matches!(
+            cache.observed_under_account_method.as_str(),
+            "config_dir" | "session_store"
+        )
+}
+
+/// Explicit refresh requests from the companion's Refresh button, for the
+/// Claude usage gate: refresh every account now, at most once a minute per
+/// account. A request lapses after [`CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS`] so
+/// a request whose read keeps failing never turns into a retry loop.
+const CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS: u64 = 2 * 60;
+const CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS: u64 = 60;
+
+/// When the last explicit refresh was requested (0: never).
+fn claude_explicit_refresh_requested_at() -> std::sync::MutexGuard<'static, u64> {
+    static REQUESTED_AT: Mutex<u64> = Mutex::new(0);
+    REQUESTED_AT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Ask the next Claude collection to read every account now, each only when
+/// its stored reading and its last explicit refresh are both at least a
+/// minute old.
+pub(crate) fn request_claude_explicit_refresh() {
+    *claude_explicit_refresh_requested_at() = current_unix_seconds();
+}
+
+/// Whether an explicit refresh asks to read this binding now: a live request
+/// made after the stored reading and after the last refresh this binding
+/// answered, both at least a minute ago. The read still passes every hold,
+/// breaker and Retry-After check after this.
+fn claude_explicit_refresh_requested(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    reading_observed_at: u64,
+    now: u64,
+) -> bool {
+    let requested_at = *claude_explicit_refresh_requested_at();
+    let last = claude_binding_time(
+        &claude_explicit_refresh_attempts(),
+        account_identifier_hash,
+        organization_identifier_hash,
     )
+    .map_or(reading_observed_at, |at| at.max(reading_observed_at));
+    let skewed = last > now.saturating_add(60);
+    requested_at != 0
+        && now.saturating_sub(requested_at) <= CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS
+        && (skewed || now.saturating_sub(last) >= CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS)
+        && requested_at > last
+}
+
+/// A per-binding time kept in memory (bounded): the last explicit refresh a
+/// binding answered, or its last transient read failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaudeBindingTime {
+    account_identifier_hash: String,
+    organization_identifier_hash: String,
+    at: u64,
+}
+
+const CLAUDE_BINDING_TIMES_MAX: usize = 64;
+
+fn claude_binding_time(
+    times: &[ClaudeBindingTime],
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> Option<u64> {
+    times
+        .iter()
+        .find(|time| {
+            time.account_identifier_hash == account_identifier_hash
+                && time.organization_identifier_hash == organization_identifier_hash
+        })
+        .map(|time| time.at)
+}
+
+fn set_claude_binding_time(
+    times: &mut Vec<ClaudeBindingTime>,
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    at: u64,
+) {
+    times.retain(|time| {
+        time.account_identifier_hash != account_identifier_hash
+            || time.organization_identifier_hash != organization_identifier_hash
+    });
+    times.push(ClaudeBindingTime {
+        account_identifier_hash: account_identifier_hash.to_string(),
+        organization_identifier_hash: organization_identifier_hash.to_string(),
+        at,
+    });
+    let excess = times.len().saturating_sub(CLAUDE_BINDING_TIMES_MAX);
+    times.drain(..excess);
+}
+
+/// The last time each binding answered an explicit refresh, whatever the
+/// read's outcome: a failed read consumes the request and still counts for
+/// the once-a-minute limit.
+fn claude_explicit_refresh_attempts() -> std::sync::MutexGuard<'static, Vec<ClaudeBindingTime>> {
+    static ATTEMPTS: Mutex<Vec<ClaudeBindingTime>> = Mutex::new(Vec::new());
+    ATTEMPTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn note_claude_explicit_refresh_attempt(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: u64,
+) {
+    set_claude_binding_time(
+        &mut claude_explicit_refresh_attempts(),
+        account_identifier_hash,
+        organization_identifier_hash,
+        now,
+    );
+}
+
+/// Until when each binding's last 429 asked us to wait, kept in memory too: an
+/// explicit refresh never reads inside it, even if the persisted breaker is
+/// not usable (for example after a configuration change).
+fn claude_rate_limit_holds() -> std::sync::MutexGuard<'static, Vec<ClaudeBindingTime>> {
+    static HOLDS: Mutex<Vec<ClaudeBindingTime>> = Mutex::new(Vec::new());
+    HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn claude_rate_limit_held(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: u64,
+) -> bool {
+    claude_binding_time(
+        &claude_rate_limit_holds(),
+        account_identifier_hash,
+        organization_identifier_hash,
+    )
+    .is_some_and(|until| now < until)
+}
+
+/// The collection pass running on this thread: set by the status lane around
+/// each collection.
+#[derive(Debug, Clone, Copy)]
+struct ClaudePass {
+    /// An app's status request: serve stored readings. Only an explicit
+    /// refresh reads the provider in such a pass.
+    saved_only: bool,
+    /// When the pass started (unix seconds).
+    started_at: u64,
+}
+
+thread_local! {
+    static CLAUDE_PASS: std::cell::Cell<Option<ClaudePass>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run one collection as a pass that started at `started_at`. `saved_only`
+/// marks a pass an app's status request started.
+pub(crate) fn with_claude_pass<T>(
+    saved_only: bool,
+    started_at: u64,
+    collect: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<ClaudePass>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CLAUDE_PASS.with(|pass| pass.set(self.0));
+        }
+    }
+    let _restore = Restore(CLAUDE_PASS.with(|pass| {
+        pass.replace(Some(ClaudePass {
+            saved_only,
+            started_at,
+        }))
+    }));
+    collect()
+}
+
+/// Whether this thread's collection serves stored Claude readings only.
+pub(crate) fn claude_pass_saved_only() -> bool {
+    CLAUDE_PASS.with(|pass| pass.get().is_some_and(|pass| pass.saved_only))
+}
+
+/// A pass longer than this no longer anchors its reads' spacing.
+const CLAUDE_PASS_ANCHOR_MAX_SECONDS: u64 = 2 * 60;
+
+/// Where the spacing after a successful read is measured from: the start of
+/// the collection pass that read, so the next pass 5 min later finds the
+/// account due wherever in that pass the read falls; `now` outside a pass.
+fn claude_spacing_anchor(now: u64) -> u64 {
+    CLAUDE_PASS
+        .with(|pass| pass.get())
+        .map(|pass| pass.started_at)
+        .filter(|started| *started <= now && now - started <= CLAUDE_PASS_ANCHOR_MAX_SECONDS)
+        .unwrap_or(now)
+}
+
+/// A read that failed without a status the provider asks us to act on (a
+/// server error or a network failure) records no backoff of its own. The
+/// binding then waits [`CLAUDE_TRANSIENT_FAILURE_RETRY_SECONDS`] before the
+/// next provider request, so repeated status passes do not retry it at once.
+/// Every other hold, breaker and Retry-After still applies on top.
+const CLAUDE_TRANSIENT_FAILURE_RETRY_SECONDS: u64 = 60;
+
+fn claude_transient_failures() -> std::sync::MutexGuard<'static, Vec<ClaudeBindingTime>> {
+    static FAILURES: Mutex<Vec<ClaudeBindingTime>> = Mutex::new(Vec::new());
+    FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn claude_transient_failure_held(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    now: u64,
+) -> bool {
+    claude_binding_time(
+        &claude_transient_failures(),
+        account_identifier_hash,
+        organization_identifier_hash,
+    )
+    .is_some_and(|at| {
+        at <= now.saturating_add(60)
+            && now.saturating_sub(at) < CLAUDE_TRANSIENT_FAILURE_RETRY_SECONDS
+    })
 }
 
 impl From<Result<ClaudeOAuthUsage, String>> for ClaudeOAuthUsageOutcome {
@@ -11307,8 +11797,9 @@ fn claude_quota_check_diagnostic(code: &str, detail: &str, now: u64) -> AgentSta
         .with_observed_at(rfc3339_from_unix_seconds(now))
 }
 
-/// Effective freshness gate for the Claude OAuth usage read: the ~60-minute
-/// base cadence spread deterministically across a 55-65 minute band.
+/// Effective freshness gate for the Claude OAuth usage read of an unused
+/// account: the ~40-minute base cadence spread deterministically across a
+/// 38-42 minute band.
 ///
 /// The spread is load-spreading across OUR OWN users - it stops every Ottto
 /// install from refreshing on the same wall-clock minute. It is explicitly NOT
@@ -14525,6 +15016,7 @@ fn codex_usage_probe_from_app_server_observation(
         credit_balances,
         account: codex_app_server_account(&observation.account),
         identity,
+        saved_identity: None,
         credential_read_failed: observation.credential_read_failed,
         response_completed_at: observation.response_completed_at,
         reset_credit_detail_summary,
@@ -14580,7 +15072,7 @@ struct CodexAppServerObservation {
 
 fn codex_app_server_success_diagnostic(
     response_completed_at: Option<String>,
-    identity: Option<&CodexStrongIdentity>,
+    identity: Option<&CodexIdentityHashes>,
     has_usage: bool,
 ) -> Option<AgentStatusDiagnostic> {
     let identity = identity.filter(|_| has_usage)?;
@@ -14654,6 +15146,8 @@ fn call_codex_app_server_rate_limits_for_home(
     home_trust: CodexHomeTrust,
     needs_details: CodexNeedsDetails<'_>,
 ) -> Result<CodexAppServerObservation, String> {
+    #[cfg(test)]
+    CODEX_APP_SERVER_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let Some(program_path) = crate::command_env::executable_path("codex") else {
         return Err(CODEX_CLI_NOT_FOUND_FOR_PROBE.to_string());
     };
@@ -15390,6 +15884,7 @@ fn collect_codex_oauth_usage_at(
         credit_balances,
         account: None,
         identity,
+        saved_identity: None,
         credential_read_failed: false,
         response_completed_at: None,
         reset_credit_detail_summary: None,
@@ -21246,6 +21741,7 @@ for line in sys.stdin:
             "2026-08-26T00:15:00Z".to_string(),
             &home,
             CodexHomeTrust::ProviderDefault,
+            CodexQuotaRead::Provider,
         );
 
         assert!(
@@ -21307,6 +21803,211 @@ for line in sys.stdin:
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A synthetic Codex install whose provider home is the default home
+    /// (`$HOME/.codex`), with the daemon support dir beside it. The guards
+    /// restore the environment.
+    #[cfg(unix)]
+    fn synthetic_default_codex_install(label: &str) -> (PathBuf, PathBuf, Vec<EnvVarGuard>) {
+        let (root, provider_home) = synthetic_codex_collector_home(label, 0o600);
+        let home = root.join(".codex");
+        std::fs::rename(&provider_home, &home).expect("default Codex home");
+        let support = root.join("support");
+        std::fs::create_dir(&support).expect("support dir");
+        let guards = vec![
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string()),
+            EnvVarGuard::set_os("HOME", root.as_os_str().to_os_string()),
+            EnvVarGuard::set_os(
+                "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+                support.as_os_str().to_os_string(),
+            ),
+        ];
+        (root, home, guards)
+    }
+
+    fn codex_app_server_runs() -> usize {
+        CODEX_APP_SERVER_RUNS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn default_codex_slot(home: &Path) -> CodexHomeSlot {
+        CodexHomeSlot {
+            slot_id: "default".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Default,
+            home: home.to_path_buf(),
+            registered_binding: None,
+        }
+    }
+
+    /// Every status read serves the saved reading: the accounts status (the
+    /// companion's 3 s poll) and the per-home reads of the collection lane
+    /// start no `codex app-server`, before and after a provider read, and
+    /// show exactly what the provider read saved.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_status_reads_serve_the_saved_reading_and_never_start_app_server() {
+        let (root, home, _guards) = synthetic_default_codex_install("saved-reads");
+        let read = |quota_read| {
+            collect_codex_home_candidate(
+                default_codex_slot(&home),
+                "2026-08-26T00:00:00Z",
+                "2026-08-26T00:15:00Z",
+                quota_read,
+            )
+        };
+
+        // Before any provider read: nothing saved, no app-server, and an
+        // honest "not read yet" rather than a failed read.
+        let before = codex_app_server_runs();
+        let unread = read(CodexQuotaRead::Saved);
+        let annotated = annotate_codex_accounts_status(empty_codex_accounts_status());
+        assert_eq!(codex_app_server_runs(), before);
+        assert!(unread.binding.is_none());
+        assert!(unread
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_quota_not_read_yet"));
+        assert!(!unread
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_usage_probe_failed"));
+        assert_ne!(unread.snapshot.status, AgentStatusState::Degraded);
+        assert!(annotated.default_slot.collection.quota_snapshot.is_none());
+
+        // One provider read (the schedule's) saves the reading.
+        let fresh = read(CodexQuotaRead::Provider);
+        assert_eq!(codex_app_server_runs(), before + 1);
+        assert_eq!(fresh.status.state, CodexAccountSlotCollectionStateV1::Fresh);
+
+        // Status reads now show it, still without any app-server run.
+        let saved = read(CodexQuotaRead::Saved);
+        let annotated = annotate_codex_accounts_status(empty_codex_accounts_status());
+        assert_eq!(codex_app_server_runs(), before + 1);
+        assert_eq!(saved.status.state, CodexAccountSlotCollectionStateV1::Fresh);
+        assert_eq!(saved.binding, fresh.binding);
+        assert_eq!(saved.snapshot.quota_windows, fresh.snapshot.quota_windows);
+        assert_eq!(
+            saved.snapshot.credit_balances,
+            fresh.snapshot.credit_balances
+        );
+        assert_eq!(
+            saved
+                .snapshot
+                .account
+                .as_ref()
+                .map(|account| &account.plan_type),
+            fresh
+                .snapshot
+                .account
+                .as_ref()
+                .map(|account| &account.plan_type)
+        );
+        let default_slot = &annotated.default_slot.collection;
+        assert_eq!(default_slot.state, CodexAccountSlotCollectionStateV1::Fresh);
+        assert_eq!(
+            default_slot.account_identifier_hash,
+            fresh.status.account_identifier_hash
+        );
+
+        // A failed provider read is served as that failure by status reads.
+        fail_synthetic_codex_app_server(&root);
+        let failed = read(CodexQuotaRead::Provider);
+        let failed_runs = codex_app_server_runs();
+        let served_failure = read(CodexQuotaRead::Saved);
+        assert_eq!(codex_app_server_runs(), failed_runs);
+        assert_eq!(served_failure.status.state, failed.status.state);
+        assert!(served_failure
+            .snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "codex_usage_probe_failed"));
+
+        if let Some((account, workspace)) = fresh.binding.as_ref() {
+            codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
+                account, workspace,
+            ));
+        }
+        drop(_guards);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The explicit refresh reads now, at most once a minute per home; the
+    /// schedule reads an unused home again only after 15 minutes.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_explicit_refresh_is_rate_limited_and_the_schedule_waits_its_interval() {
+        let (root, home, _guards) = synthetic_default_codex_install("explicit-refresh");
+        let support = root.join("support");
+        codex_saved_quota::forget_running_homes();
+        let before = codex_app_server_runs();
+
+        let first = refresh_codex_quota_now(0);
+        assert_eq!(first.read, 1);
+        assert_eq!(first.rate_limited, 0);
+        assert_eq!(codex_app_server_runs(), before + 1);
+
+        // A second press within the minute reads nothing.
+        let second = refresh_codex_quota_now(0);
+        assert_eq!(second.read, 0);
+        assert_eq!(second.rate_limited, 1);
+        assert_eq!(codex_app_server_runs(), before + 1);
+
+        // The schedule: the home is not in use, so it is not due before 15
+        // minutes, and due at 15.
+        let now = current_unix_seconds();
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, now + 14 * 60),
+            0
+        );
+        assert_eq!(codex_app_server_runs(), before + 1);
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, now + 15 * 60 + 1),
+            1
+        );
+        assert_eq!(codex_app_server_runs(), before + 2);
+
+        let binding = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
+            .ok()
+            .flatten()
+            .and_then(|credentials| codex_credential_claimed_binding(&credentials));
+        if let Some(binding) = binding {
+            codex_credit_grants::forget_binding_cadence(&binding);
+        }
+        drop(_guards);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An older app's status refresh stands in for Refresh with a 5-minute
+    /// gap: one read per home, then the saved copy, even for the one-minute
+    /// Refresh, until the home's last read is 5 minutes old.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_older_app_status_refresh_reads_each_home_once_per_five_minutes() {
+        let (root, home, _guards) = synthetic_default_codex_install("legacy-status-refresh");
+        codex_saved_quota::forget_running_homes();
+        let before = codex_app_server_runs();
+
+        let first = refresh_codex_quota_now(5 * 60);
+        assert_eq!((first.read, first.rate_limited), (1, 0));
+        assert_eq!(codex_app_server_runs(), before + 1);
+        let second = refresh_codex_quota_now(5 * 60);
+        assert_eq!((second.read, second.rate_limited), (0, 1));
+        assert_eq!(codex_app_server_runs(), before + 1);
+
+        let binding = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
+            .ok()
+            .flatten()
+            .and_then(|credentials| codex_credential_claimed_binding(&credentials));
+        if let Some(binding) = binding {
+            codex_credit_grants::forget_binding_cadence(&binding);
+        }
+        drop(_guards);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -21322,6 +22023,7 @@ for line in sys.stdin:
                 "2026-08-26T00:15:00Z".to_string(),
                 &home,
                 CodexHomeTrust::ProviderDefault,
+                CodexQuotaRead::Provider,
             )
         };
 
@@ -21398,6 +22100,162 @@ for line in sys.stdin:
         .expect("failing app-server");
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
             .expect("fake Codex mode");
+    }
+
+    /// Make the fake app-server rewrite the home's `auth.json` with `body`
+    /// while it answers `account/read`, as Codex does when that read
+    /// refreshes the token.
+    #[cfg(unix)]
+    fn rewrite_auth_during_synthetic_codex_read(root: &Path, home: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let replacement = root.join("auth-after-read.json");
+        std::fs::write(&replacement, body).expect("auth written by the read");
+        let executable = root.join("codex");
+        let script = std::fs::read_to_string(&executable).expect("fake Codex");
+        let rewrite = format!(
+            "        open({}, 'w').write(open({}).read())\n",
+            serde_json::Value::from(home.join("auth.json").to_str().unwrap()),
+            serde_json::Value::from(replacement.to_str().unwrap()),
+        );
+        let marker = "    elif '\"id\":\"ottto_account\"' in line:\n";
+        assert!(script.contains(marker), "fake Codex answers account/read");
+        std::fs::write(
+            &executable,
+            script.replace(marker, &format!("{marker}{rewrite}")),
+        )
+        .expect("rewriting app-server");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("fake Codex mode");
+    }
+
+    /// A synthetic `auth.json` for `user` in `workspace`, with tokens that
+    /// expire at `expires_at` (a new value is a new token).
+    fn synthetic_codex_auth_body(user: &str, workspace: &str, expires_at: i64) -> String {
+        serde_json::json!({
+            "tokens": {
+                "access_token": synthetic_codex_access_jwt_with_profile_email(
+                    user,
+                    workspace,
+                    "synthetic-account",
+                    "pro",
+                    expires_at,
+                ),
+                "id_token": synthetic_codex_jwt(
+                    user,
+                    workspace,
+                    "synthetic-account",
+                    "pro",
+                    expires_at,
+                ),
+            },
+            "account_id": workspace,
+        })
+        .to_string()
+    }
+
+    /// Every real provider read refreshes the token, so Codex rewrites
+    /// `auth.json` during it. A rewrite for the same account and workspace
+    /// keeps the reading and the home waits its full interval; a rewrite to
+    /// another login discards the reading and that login is read after a
+    /// minute, then kept.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_auth_rewritten_by_the_read_keeps_the_reading_for_the_same_login() {
+        let (root, home, _guards) = synthetic_default_codex_install("auth-rewrite");
+        let support = root.join("support");
+        codex_saved_quota::forget_running_homes();
+        let later = OffsetDateTime::now_utc().unix_timestamp() + 7_200;
+        rewrite_auth_during_synthetic_codex_read(
+            &root,
+            &home,
+            &synthetic_codex_auth_body("synthetic-user", "synthetic-workspace", later),
+        );
+        let witness = || {
+            std::fs::metadata(home.join("auth.json"))
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        let before_read = witness();
+        let before = codex_app_server_runs();
+
+        // One scheduled read: the token is rewritten, the reading is kept. A
+        // little ahead of the clock, so every attempt is stamped `now` however
+        // long the fake read takes.
+        let now = current_unix_seconds() + 30;
+        assert_eq!(codex_saved_quota::scheduled_round(&support, now), 1);
+        assert_eq!(codex_app_server_runs(), before + 1);
+        assert_ne!(witness(), before_read, "the read rewrote auth.json");
+        let served = codex_saved_quota::serve_saved(&home, CodexHomeTrust::ProviderDefault, now)
+            .expect("the reading is served");
+        assert!(!served.quota_windows.is_empty());
+        let reading_binding = served.saved_identity.as_ref().map(|identity| {
+            codex_credit_grants::binding_key(
+                &identity.account_identifier_hash,
+                &identity.workspace_identifier_hash,
+            )
+        });
+        // Not read again a minute later, nor before the unused interval.
+        assert_eq!(codex_saved_quota::scheduled_round(&support, now + 61), 0);
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, now + 15 * 60 - 30),
+            0
+        );
+        assert_eq!(codex_app_server_runs(), before + 1);
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, now + 15 * 60 + 1),
+            1
+        );
+        assert_eq!(codex_app_server_runs(), before + 2);
+
+        // The next read switches the home to another account: that reading
+        // cannot be told apart, so it is not saved, and the old account's
+        // reading is not served for the new login.
+        rewrite_auth_during_synthetic_codex_read(
+            &root,
+            &home,
+            &synthetic_codex_auth_body("another-user", "another-workspace", later),
+        );
+        let switch_at = now + 30 * 60 + 2;
+        assert_eq!(codex_saved_quota::scheduled_round(&support, switch_at), 1);
+        assert_eq!(
+            codex_saved_quota::serve_saved(&home, CodexHomeTrust::ProviderDefault, switch_at)
+                .err()
+                .map(|failure| failure.message),
+            Some(codex_saved_quota::CODEX_QUOTA_NOT_READ_YET.to_string())
+        );
+        // The new login is read after a minute, and that reading is kept.
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, switch_at + 30),
+            0
+        );
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, switch_at + 61),
+            1
+        );
+        let rebound =
+            codex_saved_quota::serve_saved(&home, CodexHomeTrust::ProviderDefault, switch_at + 61)
+                .expect("the new login's reading is served");
+        let rebound_binding = rebound.saved_identity.as_ref().map(|identity| {
+            codex_credit_grants::binding_key(
+                &identity.account_identifier_hash,
+                &identity.workspace_identifier_hash,
+            )
+        });
+        assert!(rebound_binding.is_some());
+        assert_ne!(rebound_binding, reading_binding);
+        assert_eq!(
+            codex_saved_quota::scheduled_round(&support, switch_at + 5 * 60),
+            0
+        );
+
+        for binding in [reading_binding, rebound_binding].into_iter().flatten() {
+            codex_credit_grants::forget_binding_cadence(&binding);
+        }
+        drop(_guards);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn has_stale_meters(snapshot: &AgentStatusSnapshot) -> bool {
@@ -21683,6 +22541,7 @@ for line in sys.stdin:
                     },
                     "2026-08-26T00:00:00Z",
                     "2026-08-26T00:15:00Z",
+                    CodexQuotaRead::Provider,
                 )
             };
             let fresh = collect();
@@ -21709,6 +22568,7 @@ for line in sys.stdin:
                 },
                 "2026-08-26T00:05:00Z",
                 "2026-08-26T00:20:00Z",
+                CodexQuotaRead::Provider,
             )
         };
         let mut fresh = collect("codex_slot_mac", None);
@@ -21867,6 +22727,7 @@ for line in sys.stdin:
                 slot(registered_binding),
                 "2026-08-26T00:05:00Z",
                 "2026-08-26T00:20:00Z",
+                CodexQuotaRead::Provider,
             )
         };
 
@@ -21953,6 +22814,7 @@ for line in sys.stdin:
             "2026-08-26T00:15:00Z".to_string(),
             &home,
             CodexHomeTrust::ProviderDefault,
+            CodexQuotaRead::Provider,
         );
 
         assert!(identity.is_none());
@@ -21999,9 +22861,12 @@ for line in sys.stdin:
             superseded_account_identifier_hash: None,
             superseded_organization_identifier_hash: None,
         };
-        let diagnostic =
-            codex_app_server_success_diagnostic(Some(completed_at.clone()), Some(&identity), true)
-                .expect("bound check");
+        let diagnostic = codex_app_server_success_diagnostic(
+            Some(completed_at.clone()),
+            Some(&CodexIdentityHashes::from(&identity)),
+            true,
+        )
+        .expect("bound check");
         assert_eq!(
             diagnostic.observed_at.as_deref(),
             Some(completed_at.as_str())
@@ -22010,17 +22875,24 @@ for line in sys.stdin:
             diagnostic.organization_identifier_hash.as_deref(),
             Some("workspace-a")
         );
-        assert!(codex_app_server_success_diagnostic(None, Some(&identity), true).is_none());
+        assert!(codex_app_server_success_diagnostic(
+            None,
+            Some(&CodexIdentityHashes::from(&identity)),
+            true
+        )
+        .is_none());
         assert!(
             codex_app_server_success_diagnostic(Some(completed_at.clone()), None, true).is_none()
         );
-        assert!(
-            codex_app_server_success_diagnostic(Some(completed_at), Some(&identity), false)
-                .is_none()
-        );
+        assert!(codex_app_server_success_diagnostic(
+            Some(completed_at),
+            Some(&CodexIdentityHashes::from(&identity)),
+            false
+        )
+        .is_none());
         assert!(codex_app_server_success_diagnostic(
             Some("2099-01-01T00:00:00Z".to_string()),
-            Some(&identity),
+            Some(&CodexIdentityHashes::from(&identity)),
             true
         )
         .is_none());
@@ -23934,6 +24806,7 @@ for line in sys.stdin:
                 },
                 "2026-08-26T00:00:00Z",
                 "2026-08-26T00:15:00Z",
+                CodexQuotaRead::Provider,
             )
         };
 
@@ -28271,7 +29144,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_oauth_usage_cadence_is_hourly_within_a_five_minute_spread() {
+    fn claude_oauth_usage_cadence_is_forty_minutes_within_a_two_minute_spread() {
         // The spread is load-spreading across our own installs, so it must be
         // bounded and deterministic -- never an open-ended random delay.
         for seed in [
@@ -28282,8 +29155,8 @@ for line in sys.stdin:
         ] {
             let gate = claude_oauth_usage_fresh_age_seconds(seed, "organization-test");
             assert!(
-                (55 * 60..=65 * 60).contains(&gate),
-                "gate for {seed:?} out of the 55-65 minute band: {gate}"
+                (38 * 60..=42 * 60).contains(&gate),
+                "gate for {seed:?} out of the 38-42 minute band: {gate}"
             );
             assert_eq!(
                 gate,
@@ -28296,8 +29169,9 @@ for line in sys.stdin:
             claude_oauth_usage_fresh_age_seconds("account-a", "organization-test"),
             claude_oauth_usage_fresh_age_seconds("account-b", "organization-test")
         );
-        // Sanity on the base cadence itself: ~24 calls/day, not ~96.
-        assert_eq!(CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS, 60 * 60);
+        // Sanity on the base cadence itself: ~36 calls/day for an unused
+        // account, not ~288.
+        assert_eq!(CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS, 40 * 60);
         // The 24h max age stays a display fallback, well clear of the gate.
         assert!(
             CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS

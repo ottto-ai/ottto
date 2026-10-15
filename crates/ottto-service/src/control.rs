@@ -354,7 +354,15 @@ pub fn handle_request_with_peer(
     let client_install_owner = request
         .client_install_owner
         .unwrap_or(InstallOwner::Unknown);
-    match handle_command(daemon, authorization, request.command, client_install_owner) {
+    let status_refresh_quota_source =
+        status_refresh_quota_source(request.client_kind, request.protocol_version);
+    match handle_command(
+        daemon,
+        authorization,
+        request.command,
+        client_install_owner,
+        status_refresh_quota_source,
+    ) {
         Ok(payload) => LocalControlResponse {
             request_id,
             ok: true,
@@ -807,17 +815,46 @@ fn daemon_is_release_signed() -> bool {
     })
 }
 
+/// Companion apps up to this protocol version have no `quota_refresh`: their
+/// Refresh button sends `status` with `refresh_agent_status`, the same request
+/// as their 5-minute scan. Those requests stand in for an explicit refresh of
+/// every Codex home, at most once per
+/// [`LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS`] per home. Claude is left out:
+/// its Refresh never forced a provider read, and its accounts are served the
+/// stored reading the daemon's schedule keeps current.
+const LEGACY_APP_QUOTA_REFRESH_MAX_PROTOCOL_VERSION: u16 = 15;
+const LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS: u64 = 5 * 60;
+
+/// The source whose quota a `status` refresh from this client refreshes
+/// explicitly, if any.
+fn status_refresh_quota_source(
+    client_kind: Option<LocalClientKind>,
+    protocol_version: u16,
+) -> Option<SourceKind> {
+    (client_kind == Some(LocalClientKind::CompanionApp)
+        && protocol_version <= LEGACY_APP_QUOTA_REFRESH_MAX_PROTOCOL_VERSION)
+        .then_some(SourceKind::Codex)
+}
+
 fn handle_command(
     daemon: &LocalDaemon,
     authorization: RequestAuthorization,
     command: LocalControlCommand,
     client_install_owner: InstallOwner,
+    status_refresh_quota_source: Option<SourceKind>,
 ) -> Result<serde_json::Value, LocalApiError> {
     match command {
         LocalControlCommand::Status {
             refresh_agent_status,
         } => {
             if refresh_agent_status {
+                if let Some(source) = status_refresh_quota_source.as_ref() {
+                    require_authorized_local_client(daemon, &authorization)?;
+                    request_explicit_quota_refresh(
+                        Some(source),
+                        LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS,
+                    );
+                }
                 refresh_agent_status_for(daemon, &authorization, None)?;
             }
             let mut status = status_for(daemon, &authorization)?;
@@ -865,7 +902,14 @@ fn handle_command(
             )
         }
         LocalControlCommand::AuthStatus => to_value(status_for(daemon, &authorization)?),
-        LocalControlCommand::AgentStatusRefresh { source } => {
+        LocalControlCommand::AgentStatusRefresh {
+            source,
+            quota_refresh,
+        } => {
+            if quota_refresh {
+                require_authorized_local_client(daemon, &authorization)?;
+                request_explicit_quota_refresh(source.as_ref(), 0);
+            }
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
         }
         LocalControlCommand::PersonalMeterLocalSnapshot { source } => {
@@ -2557,22 +2601,24 @@ fn load_codex_account_settings() -> Result<ottto_protocol::CodexAccountsStatusV1
 }
 
 /// How long a status read may reuse the last annotated Codex accounts status.
-/// Annotation starts one `codex app-server` per connected Codex home, and each
-/// of those asks the provider for rate limits. The companion polls this read
-/// every few seconds while an accounts surface is visible, so without reuse a
-/// Mac with four homes ran four app-servers several times a minute.
+/// Annotation serves each home's saved quota (it never starts `codex
+/// app-server`), but it still runs the local `codex login status` and model
+/// listing per home. The companion polls this read every few seconds while an
+/// accounts surface is visible, so the reuse bounds those local runs.
 const CODEX_ACCOUNTS_STATUS_READ_REUSE: Duration = Duration::from_secs(30);
 
 struct CachedCodexAccountsStatus {
     settings: ottto_protocol::CodexAccountsStatusV1,
+    /// [`crate::agent_status::saved_codex_quota_generation`] when annotated.
+    saved_quota_generation: u64,
     annotated: ottto_protocol::CodexAccountsStatusV1,
     annotated_at: Instant,
 }
 
-/// The polled read. Reuses a recent annotation while the stored settings are
-/// unchanged; any settings change (connect, remove, prepare) misses the cache.
-/// Holding the lock across annotation also collapses concurrent polls into one
-/// set of app-server runs.
+/// The polled read. Reuses a recent annotation while the stored settings and
+/// the saved quota readings are unchanged; any settings change (connect,
+/// remove, prepare) or newly saved reading misses the cache. Holding the lock
+/// across annotation also collapses concurrent polls into one annotation.
 fn load_codex_account_settings_for_status_read(
 ) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
     static CACHE: Mutex<Option<CachedCodexAccountsStatus>> = Mutex::new(None);
@@ -2582,11 +2628,12 @@ fn load_codex_account_settings_for_status_read(
     let mut cache = CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let saved_quota_generation = crate::agent_status::saved_codex_quota_generation();
     if let Some(cached) = cache.as_ref() {
         if status_read_reusable(
-            &cached.settings,
+            &(&cached.settings, cached.saved_quota_generation),
             cached.annotated_at,
-            &settings,
+            &(&settings, saved_quota_generation),
             Instant::now(),
         ) {
             return Ok(cached.annotated.clone());
@@ -2595,6 +2642,7 @@ fn load_codex_account_settings_for_status_read(
     let annotated = crate::agent_status::annotate_codex_accounts_status(settings.clone());
     *cache = Some(CachedCodexAccountsStatus {
         settings,
+        saved_quota_generation,
         annotated: annotated.clone(),
         annotated_at: Instant::now(),
     });
@@ -4729,6 +4777,27 @@ fn refresh_agent_status_for(
         upload_agent_status_snapshots_in_background(snapshots.clone());
     }
     Ok(snapshots)
+}
+
+/// Explicit quota refresh (a user's Refresh action) of every account of the
+/// source(s). Codex homes are read here, each at most once a minute or
+/// `min_gap_seconds` if longer (one `codex app-server` run per home, up to its
+/// timeout, before the reply). Claude accounts are marked for the collection
+/// that follows, whose usage gate reads them at most once a minute and keeps
+/// every hold, breaker and Retry-After; the lane's next own pass answers a
+/// mark that collection missed (one already in flight).
+fn request_explicit_quota_refresh(source: Option<&SourceKind>, min_gap_seconds: u64) {
+    if source.map_or(true, |source| source == &SourceKind::ClaudeCode) {
+        crate::agent_status::request_claude_explicit_refresh();
+        crate::agent_status_refresh::request(&SourceKind::ClaudeCode);
+    }
+    if source.map_or(true, |source| source == &SourceKind::Codex) {
+        let outcome = crate::agent_status::refresh_codex_quota_now(min_gap_seconds);
+        eprintln!(
+            "explicit Codex quota refresh: read={} rate_limited={}",
+            outcome.read, outcome.rate_limited
+        );
+    }
 }
 
 fn reconcile_agent_status_config_for_refresh(
@@ -17868,6 +17937,32 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    /// Only an app without `quota_refresh` (protocol 15 or older) has its
+    /// status refresh stand in for Refresh, and only for Codex; the CLI and
+    /// newer apps do not.
+    #[test]
+    fn only_older_companion_apps_status_refresh_reads_codex_quota() {
+        for version in [15, 14] {
+            assert_eq!(
+                status_refresh_quota_source(Some(LocalClientKind::CompanionApp), version),
+                Some(SourceKind::Codex)
+            );
+        }
+        assert_eq!(
+            status_refresh_quota_source(Some(LocalClientKind::CompanionApp), 16),
+            None
+        );
+        assert_eq!(
+            status_refresh_quota_source(Some(LocalClientKind::Cli), 15),
+            None
+        );
+        assert_eq!(
+            status_refresh_quota_source(Some(LocalClientKind::WebUi), 15),
+            None
+        );
+        assert_eq!(status_refresh_quota_source(None, 15), None);
     }
 
     #[test]

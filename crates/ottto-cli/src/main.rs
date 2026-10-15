@@ -2077,10 +2077,12 @@ fn local_command(command: Command) -> LocalControlCommand {
             },
             Some(AppsCommand::Status(args)) => LocalControlCommand::AgentStatusRefresh {
                 source: Some(args.app.into()),
+                quota_refresh: false,
             },
         },
         Command::AgentStatus(args) => LocalControlCommand::AgentStatusRefresh {
             source: Some(args.selected_source()),
+            quota_refresh: false,
         },
         Command::Context(args) => LocalControlCommand::AgentContext {
             query: args.query(),
@@ -2603,7 +2605,10 @@ mod tests {
             LocalControlCommand::Status {
                 refresh_agent_status: true,
             },
-            LocalControlCommand::AgentStatusRefresh { source: None },
+            LocalControlCommand::AgentStatusRefresh {
+                source: None,
+                quota_refresh: false,
+            },
             LocalControlCommand::AgentContext {
                 query: AgentContextQuery::default(),
             },
@@ -3944,7 +3949,8 @@ mod tests {
         assert_eq!(
             invocation.request.command,
             LocalControlCommand::AgentStatusRefresh {
-                source: Some(SourceKind::Codex)
+                source: Some(SourceKind::Codex),
+                quota_refresh: false,
             }
         );
     }
@@ -4490,7 +4496,8 @@ mod tests {
         assert_eq!(
             invocation.request.command,
             LocalControlCommand::AgentStatusRefresh {
-                source: Some(SourceKind::Pi)
+                source: Some(SourceKind::Pi),
+                quota_refresh: false,
             }
         );
     }
