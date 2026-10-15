@@ -36,6 +36,7 @@ pub mod mcp_inventory;
 pub(crate) mod net_resilience;
 pub mod net_transition;
 pub mod otlp_relay;
+pub(crate) mod provider_calls;
 pub mod provider_daily_reference;
 pub(crate) mod quota_credit_model;
 mod retry_tls;

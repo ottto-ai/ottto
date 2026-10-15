@@ -2889,7 +2889,7 @@ mod tests {
             super::super::CLAUDE_OAUTH_PROVIDER_CALLS_FORBIDDEN
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             REQUESTED.lock().unwrap().clear();
-            *super::super::claude_explicit_refresh_requested_at() = 0;
+            super::super::claude_explicit_refresh_request().at = 0;
             super::super::claude_explicit_refresh_attempts().clear();
             super::super::claude_transient_failures().clear();
             super::super::claude_rate_limit_holds().clear();
@@ -2989,8 +2989,8 @@ mod tests {
         /// keeping only the plain spacing after a successful read.
         fn age_reading(&self, seconds: u64) {
             {
-                let mut requested_at = super::super::claude_explicit_refresh_requested_at();
-                *requested_at = requested_at.saturating_sub(seconds);
+                let mut request = super::super::claude_explicit_refresh_request();
+                request.at = request.at.saturating_sub(seconds);
             }
             for attempt in super::super::claude_explicit_refresh_attempts().iter_mut() {
                 attempt.at -= seconds;
@@ -3054,6 +3054,62 @@ mod tests {
         }
         harness.collect(respond_recognized);
         assert_eq!(harness.requests(), 2);
+    }
+
+    /// Each Anthropic usage request is one provider-call log line saying why
+    /// it ran and how it ended; a reading served from storage logs nothing.
+    #[test]
+    #[serial_test::serial]
+    fn each_usage_request_is_one_provider_call_line() {
+        use crate::provider_calls::{with_trigger, CallKind, Trigger};
+        let mut harness = VariantHarness::new("call-log");
+        harness.account = "c1a0de0100000000000000000000000000000000000000000000000000000000";
+        harness.due(ClaudeReadSchedule::default());
+        with_trigger(Trigger::Setup, || harness.collect(respond_recognized));
+        // A fresh reading inside its slot: served, no request, no line.
+        harness.collect(respond_recognized);
+        // An older app's status refresh marks the read; the lane thread that
+        // makes it keeps that label.
+        harness.age_reading(90);
+        with_trigger(
+            Trigger::OlderAppCompat,
+            super::super::request_claude_explicit_refresh,
+        );
+        harness.collect(respond_recognized);
+        harness.age_reading(90);
+        super::super::request_claude_explicit_refresh();
+        harness.collect(respond_server_error);
+        assert_eq!(harness.requests(), 3);
+        let lines = crate::provider_calls::test_lines(CallKind::ClaudeOauthUsage, harness.account);
+        let summary = lines
+            .iter()
+            .map(|line| {
+                (
+                    line.provider.as_str(),
+                    line.trigger.as_str(),
+                    line.result.as_str(),
+                    line.basis.as_str(),
+                    line.requests_at_least,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                ("anthropic", "setup", "ok", "observed", 1),
+                ("anthropic", "older_app_compat", "ok", "observed", 1),
+                ("anthropic", "explicit_refresh", "http_500", "observed", 1),
+            ]
+        );
+        let raw = crate::provider_calls::test_raw_log();
+        for secret in [
+            "fixture-token",
+            "Bearer",
+            "api.anthropic.com",
+            "organization-variant",
+        ] {
+            assert!(!raw.contains(secret), "{secret} in the provider-call log");
+        }
     }
 
     /// The Refresh button reads an account now, at most once a minute, and

@@ -396,6 +396,7 @@ fn maybe_refresh_with(
     };
     let mut keep_awake = keep_awake_while(&child);
     eprintln!("claude_refresher result=started target={slot_id}");
+    let trigger = crate::provider_calls::trigger_or(crate::provider_calls::Trigger::Schedule);
     let caller_slot_id = slot_id;
     let slot_id = slot_id.to_string();
     let slot = slot.clone();
@@ -406,9 +407,10 @@ fn maybe_refresh_with(
             // Never killed: wait for the CLI to finish on its own.
             let started = Instant::now();
             let mut reported = false;
-            loop {
+            let exit = loop {
                 match child.try_wait() {
-                    Ok(Some(_)) | Err(_) => break,
+                    Ok(Some(status)) => break Some(status),
+                    Err(_) => break None,
                     Ok(None) => {
                         if !reported && started.elapsed() >= REFRESH_REPORT_AFTER {
                             reported = true;
@@ -420,7 +422,7 @@ fn maybe_refresh_with(
                         std::thread::sleep(POLL_INTERVAL);
                     }
                 }
-            }
+            };
             drop(cwd);
             // `caffeinate -w` exits with the refresher; reap it.
             if let Some(caffeinate) = keep_awake.as_mut() {
@@ -432,6 +434,23 @@ fn maybe_refresh_with(
                 metadata.has_refresh_token && !metadata.cleared_by_cli
             });
             let mdat_changed = credential_modified_marker(&slot) != before_mdat;
+            // At least the token refresh this run exists for. A clean exit
+            // that did not move the expiry is logged with that outcome.
+            let result = match crate::provider_calls::exit_result(exit, false) {
+                crate::provider_calls::CallResult::Ok if outcome != RefreshOutcome::Refreshed => {
+                    crate::provider_calls::CallResult::Error(outcome_code(outcome))
+                }
+                result => result,
+            };
+            crate::provider_calls::record(crate::provider_calls::ProviderCall::subprocess(
+                crate::provider_calls::Provider::Anthropic,
+                crate::provider_calls::CallKind::ClaudeLoginRefresh,
+                trigger,
+                crate::provider_calls::claude_slot_account_hash(&slot).as_deref(),
+                result,
+                started.elapsed(),
+                1,
+            ));
             eprintln!(
                 "claude_refresher result={} target={slot_id} keychain_modified={mdat_changed} seconds={}",
                 outcome_code(outcome),
@@ -1314,6 +1333,16 @@ mod tests {
             }
         };
 
+        // The slot's account, for the provider-call log.
+        std::fs::write(
+            slot_dir.join(".claude.json"),
+            serde_json::json!({"oauthAccount": {"accountUuid": "refresher-account-uuid"}})
+                .to_string(),
+        )
+        .expect("account");
+        let account =
+            ottto_core::claude_account_identifier_hash(Some("refresher-account-uuid"), None, None);
+
         // Expiring in 2 minutes; the refresh works.
         std::fs::write(root.join("refresh-works"), "").expect("flag");
         std::fs::write(
@@ -1372,6 +1401,29 @@ mod tests {
         wait("slot-a");
         let first = load_state(&support).failed["slot-a"].clone();
         assert_eq!(first.outcome, "expiry_unchanged");
+        // One provider-call line per refresher run: at least the refresh
+        // request, with the outcome; never the token.
+        let lines = crate::provider_calls::test_lines(
+            crate::provider_calls::CallKind::ClaudeLoginRefresh,
+            &account,
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (
+                    line.provider.as_str(),
+                    line.trigger.as_str(),
+                    line.result.as_str(),
+                    line.requests_at_least
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("anthropic", "schedule", "ok", 1),
+                ("anthropic", "schedule", "expiry_unchanged", 1),
+            ]
+        );
+        let raw = crate::provider_calls::test_raw_log();
+        assert!(!raw.contains("fixture-access") && !raw.contains("fixture-refresh"));
         assert!(first.retry_allowed, "the login is intact: one retry");
         let again = crate::agent_status::read_claude_live_login_for_slot(&slot);
         assert_eq!(

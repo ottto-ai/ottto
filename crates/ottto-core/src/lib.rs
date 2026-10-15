@@ -6,6 +6,7 @@ pub mod codex_account_slots;
 pub mod lifecycle;
 pub mod local_client;
 pub mod local_service;
+pub mod provider_call_log;
 pub mod redaction;
 pub mod status;
 pub mod token_store;

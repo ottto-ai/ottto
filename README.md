@@ -242,6 +242,8 @@ ottto status --json
 ottto status --json --watch
 ottto receipts --json
 ottto receipts --json --limit 20 --since 2026-09-10T00:00:00Z --source codex
+ottto provider-requests --json
+ottto provider-requests --json --since 24h
 ottto status --refresh-agent-status --json
 ottto context --json
 ottto context --json --range today --source codex

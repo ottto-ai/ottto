@@ -2063,13 +2063,16 @@ pub(crate) fn collect_registered_codex_slot_for_setup(
     let captured_at = crate::current_rfc3339_timestamp();
     // A setup check needs a fresh provider read; it also refreshes the saved
     // copy every status read then serves.
-    let (snapshot, identity, _) = collect_codex_status_for_home(
-        captured_at.clone(),
-        captured_at,
-        &home,
-        CodexHomeTrust::Managed,
-        CodexQuotaRead::Provider,
-    );
+    let (snapshot, identity, _) =
+        crate::provider_calls::with_trigger(crate::provider_calls::Trigger::Setup, || {
+            collect_codex_status_for_home(
+                captured_at.clone(),
+                captured_at,
+                &home,
+                CodexHomeTrust::Managed,
+                CodexQuotaRead::Provider,
+            )
+        });
     let identity = identity.ok_or_else(|| {
         CodexSlotSetupCollectionError::ProviderLoginPending(
             "Codex sign-in has not produced a complete account and workspace identity.".to_string(),
@@ -10711,8 +10714,26 @@ fn collect_claude_oauth_usage_unstamped(
         .map(|respond| respond(&endpoint));
     #[cfg(not(test))]
     let injected: Option<Result<Value, u16>> = None;
+    let call_started = Instant::now();
+    let record_call = |result: crate::provider_calls::CallResult| {
+        use crate::provider_calls::{CallKind, Provider, ProviderCall, Trigger};
+        let trigger = if explicit_refresh_due {
+            claude_explicit_refresh_request().trigger
+        } else {
+            crate::provider_calls::trigger_or(Trigger::Schedule)
+        };
+        crate::provider_calls::record(ProviderCall::observed(
+            Provider::Anthropic,
+            CallKind::ClaudeOauthUsage,
+            trigger,
+            Some(account_identifier_hash),
+            result,
+            call_started.elapsed(),
+        ));
+    };
     let response = match injected {
         Some(Ok(value)) => {
+            record_call(crate::provider_calls::CallResult::Ok);
             return claude_oauth_usage_after_response(
                 ClaudeOAuthReading {
                     account_identifier_hash,
@@ -10744,6 +10765,7 @@ fn collect_claude_oauth_usage_unstamped(
             .timeout(COMMAND_TIMEOUT)
             .call(),
     };
+    record_call(crate::provider_calls::http_result(&response));
     let response = match response {
         Ok(response) => response,
         // The provider rejected the saved-reset variant itself (not auth, not
@@ -11560,19 +11582,34 @@ fn claude_statusline_fresh_for_binding(
 const CLAUDE_EXPLICIT_REFRESH_TTL_SECONDS: u64 = 2 * 60;
 const CLAUDE_EXPLICIT_REFRESH_MIN_GAP_SECONDS: u64 = 60;
 
-/// When the last explicit refresh was requested (0: never).
-fn claude_explicit_refresh_requested_at() -> std::sync::MutexGuard<'static, u64> {
-    static REQUESTED_AT: Mutex<u64> = Mutex::new(0);
-    REQUESTED_AT
+/// The last explicit refresh request: when it was made (0: never) and why,
+/// for the provider-call log of the reads it causes on the lane thread.
+struct ClaudeExplicitRefreshRequest {
+    at: u64,
+    trigger: crate::provider_calls::Trigger,
+}
+
+fn claude_explicit_refresh_request() -> std::sync::MutexGuard<'static, ClaudeExplicitRefreshRequest>
+{
+    static REQUEST: Mutex<ClaudeExplicitRefreshRequest> =
+        Mutex::new(ClaudeExplicitRefreshRequest {
+            at: 0,
+            trigger: crate::provider_calls::Trigger::ExplicitRefresh,
+        });
+    REQUEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Ask the next Claude collection to read every account now, each only when
 /// its stored reading and its last explicit refresh are both at least a
-/// minute old.
+/// minute old. The caller's trigger (an older app's status refresh) labels
+/// those reads; a person's Refresh is the default.
 pub(crate) fn request_claude_explicit_refresh() {
-    *claude_explicit_refresh_requested_at() = current_unix_seconds();
+    *claude_explicit_refresh_request() = ClaudeExplicitRefreshRequest {
+        at: current_unix_seconds(),
+        trigger: crate::provider_calls::trigger_or(crate::provider_calls::Trigger::ExplicitRefresh),
+    };
 }
 
 /// Whether an explicit refresh asks to read this binding now: a live request
@@ -11585,7 +11622,7 @@ fn claude_explicit_refresh_requested(
     reading_observed_at: u64,
     now: u64,
 ) -> bool {
-    let requested_at = *claude_explicit_refresh_requested_at();
+    let requested_at = claude_explicit_refresh_request().at;
     let last = claude_binding_time(
         &claude_explicit_refresh_attempts(),
         account_identifier_hash,
@@ -14680,6 +14717,57 @@ fn codex_credential_claimed_ids(credentials: &CodexAuthCredentials) -> Option<(S
     Some((account_id, raw_workspace_id))
 }
 
+/// The account identifier hash the credential claims (not validated), for
+/// the provider-call log.
+fn codex_credential_claimed_account_hash(credentials: &CodexAuthCredentials) -> Option<String> {
+    let (account_id, _) = codex_credential_claimed_ids(credentials)?;
+    billing_identity_hash("openai", "account", &account_id)
+}
+
+/// The account identifier hash a home's credential claims, for the
+/// provider-call log. `None` when it names none or cannot be read (and, in
+/// unit tests, for any home outside the scratch dir).
+pub(crate) fn codex_home_claimed_account_hash(
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+) -> Option<String> {
+    if !crate::provider_calls::readable_for_account(codex_home) {
+        return None;
+    }
+    let credentials = read_codex_auth_credentials_at(codex_home, home_trust).ok()??;
+    codex_credential_claimed_account_hash(&credentials)
+}
+
+/// The account the default Codex home's credential claims, for the
+/// provider-call log of reads that use `~/.codex` itself.
+pub(crate) fn default_codex_home_claimed_account_hash() -> Option<String> {
+    codex_home_claimed_account_hash(&default_codex_home(), CodexHomeTrust::ProviderDefault)
+}
+
+/// The account a Codex CLI run started with the daemon's environment signs
+/// in as (its `CODEX_HOME`, else `~/.codex`), for the provider-call log.
+pub(crate) fn codex_cli_home_claimed_account_hash() -> Option<String> {
+    let home = std::env::var_os("CODEX_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from);
+    match home {
+        Some(home) => codex_home_claimed_account_hash(&home, CodexHomeTrust::ProviderDefault),
+        None => default_codex_home_claimed_account_hash(),
+    }
+}
+
+/// The user a Codex access token claims (not validated), hashed like
+/// [`codex_credential_claimed_account_hash`], for the provider-call log of a
+/// request made with exactly that token.
+pub(crate) fn codex_access_token_claimed_account_hash(access_token: &str) -> Option<String> {
+    let claims = structurally_valid_live_codex_jwt_claims(access_token)?;
+    let account_id = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|value| first_json_string(value, &["chatgpt_user_id", "user_id"]))
+        .or_else(|| first_json_string(&claims, &["sub"]))?;
+    billing_identity_hash("openai", "account", &account_id)
+}
+
 /// The binding key ([`codex_credit_grants::binding_key`]) a local Codex
 /// credential claims. Only a key to compare with an earlier provider-validated
 /// binding; it is never an identity and grants no authority.
@@ -15141,10 +15229,63 @@ fn codex_app_server_end_failure(
     format!("Codex app-server stdout closed during {phase}; child termination was not observed before cleanup.")
 }
 
+/// What one `codex app-server` run asked of the provider, for the
+/// provider-call log.
+#[derive(Debug, Default)]
+struct CodexAppServerRun {
+    spawned: bool,
+    /// Whether the session asked for the detailed rate-limits read.
+    detail_read_sent: bool,
+    timed_out: bool,
+}
+
+/// Provider requests a started `codex app-server` quota session counts at
+/// least, sent whether or not they were answered: the token refresh and the
+/// rate-limits read.
+const CODEX_APP_SERVER_MIN_REQUESTS: u32 = 2;
+
+/// One `codex app-server` quota session for `codex_home`, logged as one
+/// provider-call line when the CLI started.
 fn call_codex_app_server_rate_limits_for_home(
     codex_home: &Path,
     home_trust: CodexHomeTrust,
     needs_details: CodexNeedsDetails<'_>,
+) -> Result<CodexAppServerObservation, String> {
+    use crate::provider_calls::{CallKind, CallResult, Provider, ProviderCall, Trigger};
+    let account_before = codex_home_claimed_account_hash(codex_home, home_trust);
+    let started = Instant::now();
+    let mut run = CodexAppServerRun::default();
+    let result =
+        run_codex_app_server_rate_limits_for_home(codex_home, home_trust, needs_details, &mut run);
+    if run.spawned {
+        let result_class = match &result {
+            Ok(_) => CallResult::Ok,
+            Err(_) if run.timed_out => CallResult::Timeout,
+            Err(message) if message.contains("RPC failed") => CallResult::Error("rpc_error"),
+            Err(message) if message.contains("stdout closed") => CallResult::Error("exited"),
+            Err(message) if message.contains("exceeded its") => CallResult::Error("output_bound"),
+            Err(_) => CallResult::Error("error"),
+        };
+        let account =
+            account_before.or_else(|| codex_home_claimed_account_hash(codex_home, home_trust));
+        crate::provider_calls::record(ProviderCall::subprocess(
+            Provider::Openai,
+            CallKind::CodexAppServerQuota,
+            crate::provider_calls::trigger_or(Trigger::Other),
+            account.as_deref(),
+            result_class,
+            started.elapsed(),
+            CODEX_APP_SERVER_MIN_REQUESTS + u32::from(run.detail_read_sent),
+        ));
+    }
+    result
+}
+
+fn run_codex_app_server_rate_limits_for_home(
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+    needs_details: CodexNeedsDetails<'_>,
+    run: &mut CodexAppServerRun,
 ) -> Result<CodexAppServerObservation, String> {
     #[cfg(test)]
     CODEX_APP_SERVER_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -15175,6 +15316,7 @@ fn call_codex_app_server_rate_limits_for_home(
     let mut child = command
         .spawn()
         .map_err(|_| "Codex app-server could not be started.".to_string())?;
+    run.spawned = true;
     let stdout = child
         .stdout
         .take()
@@ -15254,6 +15396,7 @@ fn call_codex_app_server_rate_limits_for_home(
     // `Ok(true)`: settled; `Ok(false)`: timed out or the server went away.
     let outcome: Result<bool, String> = loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            run.timed_out = true;
             break Ok(false);
         };
         let message = match receiver.recv_timeout(remaining.min(Duration::from_millis(250))) {
@@ -15350,6 +15493,7 @@ fn call_codex_app_server_rate_limits_for_home(
                 }
                 break Err("Codex app-server quota request failed.".to_string());
             }
+            run.detail_read_sent = true;
             continue;
         }
         if detail_requested
@@ -15866,8 +16010,17 @@ fn collect_codex_oauth_usage_at(
     if let Some(account_id) = credentials.account_id.as_deref() {
         request = request.set("ChatGPT-Account-Id", account_id);
     }
-    let value: Value = request
-        .call()
+    let call_started = Instant::now();
+    let response = request.call();
+    crate::provider_calls::record(crate::provider_calls::ProviderCall::observed(
+        crate::provider_calls::Provider::Openai,
+        crate::provider_calls::CallKind::CodexWhamUsage,
+        crate::provider_calls::trigger_or(crate::provider_calls::Trigger::Other),
+        codex_credential_claimed_account_hash(&credentials).as_deref(),
+        crate::provider_calls::http_result(&response),
+        call_started.elapsed(),
+    ));
+    let value: Value = response
         .map_err(codex_usage_probe_error)?
         .into_json()
         .map_err(|_| "Codex usage endpoint returned an unreadable response.".to_string())?;
@@ -21938,12 +22091,13 @@ for line in sys.stdin:
     #[test]
     #[serial]
     fn codex_explicit_refresh_is_rate_limited_and_the_schedule_waits_its_interval() {
+        use crate::provider_calls::{with_trigger, CallKind, Trigger};
         let (root, home, _guards) = synthetic_default_codex_install("explicit-refresh");
         let support = root.join("support");
         codex_saved_quota::forget_running_homes();
         let before = codex_app_server_runs();
 
-        let first = refresh_codex_quota_now(0);
+        let first = with_trigger(Trigger::ExplicitRefresh, || refresh_codex_quota_now(0));
         assert_eq!(first.read, 1);
         assert_eq!(first.rate_limited, 0);
         assert_eq!(codex_app_server_runs(), before + 1);
@@ -21963,10 +22117,48 @@ for line in sys.stdin:
         );
         assert_eq!(codex_app_server_runs(), before + 1);
         assert_eq!(
-            codex_saved_quota::scheduled_round(&support, now + 15 * 60 + 1),
+            with_trigger(Trigger::Schedule, || codex_saved_quota::scheduled_round(
+                &support,
+                now + 15 * 60 + 1
+            )),
             1
         );
         assert_eq!(codex_app_server_runs(), before + 2);
+
+        // One provider-call line per app-server run, with the reason its
+        // caller gave (the reads run on per-home threads): at least the token
+        // refresh and the rate-limits read each.
+        let account = codex_home_claimed_account_hash(&home, CodexHomeTrust::ProviderDefault)
+            .expect("claimed account");
+        let lines = crate::provider_calls::test_lines(CallKind::CodexAppServerQuota, &account);
+        let summary = lines
+            .iter()
+            .map(|line| {
+                (
+                    line.provider.as_str(),
+                    line.trigger.as_str(),
+                    line.result.as_str(),
+                    line.basis.as_str(),
+                    line.requests_at_least >= 2,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                (
+                    "openai",
+                    "explicit_refresh",
+                    "ok",
+                    "subprocess_lower_bound",
+                    true
+                ),
+                ("openai", "schedule", "ok", "subprocess_lower_bound", true),
+            ]
+        );
+        let raw = crate::provider_calls::test_raw_log();
+        assert!(!raw.contains("synthetic-account") && !raw.contains("synthetic-workspace"));
+        assert!(!raw.contains(&*home.to_string_lossy()));
 
         let binding = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
             .ok()
@@ -23190,6 +23382,67 @@ for line in sys.stdin:
             assert_closed_during(&message, phase, observed_end);
             assert_no_provider_text(&message);
         }
+    }
+
+    /// A request made with a Codex token is logged under the same user hash
+    /// as reads of the home that holds it.
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_token_names_the_same_account_as_its_home() {
+        let (root, home) = synthetic_codex_collector_home("token-account", 0o600);
+        let credentials = read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault)
+            .expect("readable")
+            .expect("credential");
+        let from_token = codex_access_token_claimed_account_hash(
+            credentials.access_token.as_deref().expect("token"),
+        );
+        assert!(from_token.is_some());
+        assert_eq!(
+            from_token,
+            codex_home_claimed_account_hash(&home, CodexHomeTrust::ProviderDefault)
+        );
+        assert_eq!(codex_access_token_claimed_account_hash("not-a-jwt"), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Each app-server run that started is one provider-call line counting
+    /// the requests it sent, answered or not: a failed or timed-out read still
+    /// counts its token refresh and rate-limits read.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_probe_runs_count_sent_provider_requests_even_when_they_fail() {
+        use crate::provider_calls::CallKind;
+        let support = crate::test_scratch::ScratchDir::new("codex-probe-call-log");
+        let _support = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support.as_os_str().to_os_string(),
+        );
+        let modes = [
+            "initialize_error",
+            "account_error",
+            "quota_error",
+            "quota_eof",
+            "success",
+        ];
+        for mode in modes {
+            let _ = run_codex_probe_failure_fake(mode);
+        }
+        let lines = crate::provider_calls::test_lines(CallKind::CodexAppServerQuota, "unknown");
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.result.as_str(), line.requests_at_least))
+                .collect::<Vec<_>>(),
+            [
+                ("rpc_error", 2),
+                ("rpc_error", 2),
+                ("rpc_error", 2),
+                ("exited", 2),
+                ("ok", 2),
+            ]
+        );
+        assert!(!crate::provider_calls::test_raw_log().contains("sensitive-provider-text"));
     }
 
     #[cfg(unix)]

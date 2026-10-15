@@ -1040,6 +1040,17 @@ pub(crate) mod test_support {
             }
         }
 
+        /// Name the default login's account in `~/.claude.json`; returns its
+        /// identifier hash.
+        pub(crate) fn default_account(&self, account_uuid: &str) -> String {
+            std::fs::write(
+                self.root.join("home").join(".claude.json"),
+                serde_json::json!({"oauthAccount": {"accountUuid": account_uuid}}).to_string(),
+            )
+            .expect("write .claude.json");
+            ottto_core::claude_account_identifier_hash(Some(account_uuid), None, None)
+        }
+
         /// The default login as Claude Code stores it, expiring `expires_in`
         /// from now.
         pub(crate) fn default_login_expires_in(&self, expires_in: TimeDuration) {
