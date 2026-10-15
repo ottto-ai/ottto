@@ -6,6 +6,12 @@
 // unrelated session sits alone on the terminal page: the shape in which every
 // complete census used to re-arm the whole family again. Fixtures are
 // synthetic.
+//
+// `establish` runs the same pages, ACKs, saves and reloads under either re-arm
+// rule and asserts only what both rules produce. The quiet-fixpoint assertions
+// are separate and name the optimized rule. Every generation writes one
+// count/hash-only JSON receipt line directly to stderr, outside the test
+// harness capture, so CI runs of different heads can be compared.
 
 const REARM_DESTINATION: &str = "stable-proof-rearm-destination";
 const REARM_MACHINE_ID: &str = "machine-stable-proof-rearm";
@@ -112,10 +118,23 @@ struct RearmPage {
     index: ScanIndex,
     fully_settled: bool,
     held: BTreeSet<String>,
+    /// Bodies handed to the upload, whatever the server answered.
+    offered: BTreeSet<String>,
+    /// Bodies the server acknowledged.
     uploaded: BTreeSet<String>,
 }
 
+/// The converged state that both re-arm rules reach after the first proof
+/// and its cross-page correction.
+struct RearmEstablished {
+    proven: String,
+    /// The accepted reported-usage head of every family member, by session.
+    heads: BTreeMap<String, Option<String>>,
+    index: ScanIndex,
+}
+
 struct RearmFixture {
+    case: &'static str,
     base: PathBuf,
     root: PathBuf,
     support: PathBuf,
@@ -127,8 +146,8 @@ impl RearmFixture {
     /// Traversal order is breadth-first with sorted names, so two pages of two
     /// files hold the family root, its sibling, and both subagents, and the
     /// nested unrelated session is alone on the terminal page.
-    fn new(name: &str) -> Self {
-        let base = test_dir(name);
+    fn new(case: &'static str) -> Self {
+        let base = test_dir(case);
         let root = base.join("projects");
         let support = base.join("support");
         let subagents = root.join(REARM_ROOT).join("subagents");
@@ -137,6 +156,7 @@ impl RearmFixture {
             std::fs::create_dir_all(directory).expect("create synthetic directory");
         }
         let fixture = Self {
+            case,
             index_path: base.join("claude-scan-index.json"),
             progress_path: base.join("claude-upload-progress.json"),
             base,
@@ -218,40 +238,40 @@ impl RearmFixture {
         Self::append(&self.sidecar_path("claude-code-effort"), "{\"truncated\n");
     }
 
-    fn family_keys(index: &ScanIndex) -> Vec<String> {
-        let suffixes = std::iter::once(format!("{REARM_ROOT}.jsonl"))
-            .chain(
-                REARM_AGENTS
-                    .iter()
-                    .map(|agent| format!("agent-{agent}.jsonl")),
-            )
-            .collect::<Vec<_>>();
-        let keys = index
-            .files
-            .keys()
-            .filter(|key| suffixes.iter().any(|suffix| key.ends_with(suffix.as_str())))
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(keys.len(), suffixes.len(), "every family member is indexed");
-        keys
-    }
-
-    /// The accepted head of every family member.
-    fn family_heads(index: &ScanIndex) -> BTreeMap<String, Option<String>> {
-        Self::family_keys(index)
-            .into_iter()
-            .map(|key| {
-                let head = index.files[&key].last_snapshot_fingerprint.clone();
-                (key, head)
+    /// The index key of every indexed family member, by member session.
+    fn family_keys(index: &ScanIndex) -> BTreeMap<String, String> {
+        std::iter::once(None)
+            .chain(REARM_AGENTS.iter().map(|agent| Some(*agent)))
+            .filter_map(|agent| {
+                let suffix = match agent {
+                    Some(agent) => format!("agent-{agent}.jsonl"),
+                    None => format!("{REARM_ROOT}.jsonl"),
+                };
+                let key = index
+                    .files
+                    .keys()
+                    .find(|key| key.ends_with(suffix.as_str()))
+                    .cloned()?;
+                Some((rearm_member_session(agent), key))
             })
             .collect()
     }
 
-    fn family_rearmed(index: &ScanIndex) -> Vec<bool> {
+    /// The accepted head of every family member, by member session.
+    fn family_heads(index: &ScanIndex) -> BTreeMap<String, Option<String>> {
         Self::family_keys(index)
-            .iter()
-            .map(|key| index.files[key].source_file_fingerprint.is_empty())
+            .into_iter()
+            .map(|(session, key)| (session, index.files[&key].last_snapshot_fingerprint.clone()))
             .collect()
+    }
+
+    /// Family members whose source revision is cleared, so the next traversal
+    /// reparses them.
+    fn family_rearm_debt(index: &ScanIndex) -> usize {
+        Self::family_keys(index)
+            .values()
+            .filter(|key| index.files[*key].source_file_fingerprint.is_empty())
+            .count()
     }
 
     /// One page through the production stage order of `finish_sync_source`.
@@ -314,6 +334,7 @@ impl RearmFixture {
             &mut scan,
             &disposition,
         );
+        let mut offered = BTreeSet::new();
         let mut uploaded = BTreeSet::new();
         let mut accepted = 0;
         let result = upload_resumable_batches_with_body_witness(
@@ -323,15 +344,18 @@ impl RearmFixture {
             &mut accepted,
             |snapshot| snapshot.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
-            |items| match upload {
-                RearmUpload::Accept => {
-                    uploaded.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
-                    Ok(accepted_batch(items.len()))
+            |items| {
+                offered.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
+                match upload {
+                    RearmUpload::Accept => {
+                        uploaded.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
+                        Ok(accepted_batch(items.len()))
+                    }
+                    RearmUpload::Shed => Err(anyhow::Error::new(UploadShed {
+                        status: 503,
+                        retry_after: Some(Duration::from_secs(60)),
+                    })),
                 }
-                RearmUpload::Shed => Err(anyhow::Error::new(UploadShed {
-                    status: 503,
-                    retry_after: Some(Duration::from_secs(60)),
-                })),
             },
             |_| Ok(()),
         )
@@ -359,6 +383,7 @@ impl RearmFixture {
                 index: ScanIndex::load(&self.index_path).expect("reload scan index"),
                 fully_settled: false,
                 held: holds.held_fingerprints,
+                offered,
                 uploaded,
             };
         }
@@ -392,6 +417,7 @@ impl RearmFixture {
             index: ScanIndex::load(&self.index_path).expect("reload scan index"),
             fully_settled,
             held: holds.held_fingerprints,
+            offered,
             uploaded,
         }
     }
@@ -416,69 +442,162 @@ impl RearmFixture {
     fn generation(&self, hour: u32) -> Vec<RearmPage> {
         let mut pages = Vec::new();
         self.finish_generation(hour, 0, &mut pages);
+        self.receipt(hour, &pages);
         pages
     }
 
-    /// The first generation proves the family on its terminal page; the next
-    /// one rebuilds every re-armed member from that proof and delivers it.
-    /// Returns the converged index and the proven witness digest.
-    fn converge(&self) -> (ScanIndex, String) {
+    /// One count/hash-only line per generation. Body digests use the semantic
+    /// snapshot fingerprint and, separately, its usage-accounting component;
+    /// session ids and evidence are fixed constants. The fixture's temporary
+    /// paths are never written. The semantic fingerprint also covers display
+    /// identity, so if that ever derives from the temporary scan root, compare
+    /// the usage digest across runs instead.
+    fn receipt(&self, hour: u32, pages: &[RearmPage]) {
+        let last = pages.last().expect("generation page");
+        let family = rearm_family_sessions();
+        let offered = pages
+            .iter()
+            .flat_map(|page| {
+                page.scan
+                    .snapshots
+                    .iter()
+                    .filter(|item| page.offered.contains(&item.snapshot_fingerprint))
+            })
+            .collect::<Vec<_>>();
+        let usage = offered
+            .iter()
+            .map(|item| {
+                crate::snapshots::snapshot_semantic_component_hashes(
+                    SnapshotSource::ClaudeCode,
+                    item,
+                )
+                .get("usage_accounting")
+                .cloned()
+                .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let offered = offered
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        let accepted = offered
+            .iter()
+            .filter(|fingerprint| {
+                last.index
+                    .accepted_snapshot_fingerprint_recorded(fingerprint)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let held = pages
+            .iter()
+            .flat_map(|page| page.held.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let heads = RearmFixture::family_heads(&last.index)
+            .into_iter()
+            .map(|(session, head)| format!("{session}={}", head.unwrap_or_default()))
+            .collect::<Vec<_>>();
+        let line = serde_json::json!({
+            "receipt": "claude_stable_proof_rearm:v1",
+            "case": self.case,
+            "hour": hour,
+            "page_count": pages.len(),
+            "parsed_file_count": rearm_reads(pages),
+            "parsed_family_member_count": rearm_parsed(pages).intersection(&family).count(),
+            "held_body_count": held.len(),
+            "held_semantic_sha256": rearm_digest(&held),
+            "offered_body_count": offered.len(),
+            "offered_semantic_sha256": rearm_digest(&offered),
+            "offered_usage_sha256": rearm_digest(&usage),
+            "accepted_body_count": accepted.len(),
+            "accepted_semantic_sha256": rearm_digest(&accepted),
+            "family_heads_semantic_sha256": rearm_digest(&heads),
+            "family_rearm_debt": RearmFixture::family_rearm_debt(&last.index),
+            "family_witness_sha256": last
+                .index
+                .claude_usage_family_witness_digest_for_test(REARM_ROOT),
+            "family_retry_pending_bound": last
+                .index
+                .bound_retry_pending_claude_authority_for_test(REARM_ROOT),
+            "census_complete": last.scan.census_complete,
+            "fully_settled": last.fully_settled,
+        });
+        std::io::stderr()
+            .write_all(format!("{line}\n").as_bytes())
+            .expect("write receipt");
+    }
+
+    /// The first generation proves the family on its terminal page and
+    /// re-arms its earlier-page members; the next one rebuilds them from that
+    /// proof and delivers the reported bodies. Only what both the original and
+    /// the optimized re-arm rule produce is asserted here.
+    fn establish(&self) -> RearmEstablished {
+        let family = rearm_family_sessions();
         let first = self.generation(8);
         let last = first.last().expect("terminal page");
         assert!(last.scan.census_complete);
         assert!(first.iter().all(|page| page.held.is_empty()));
         assert!(
-            last.parsed.is_disjoint(&rearm_family_sessions()),
+            last.parsed.is_disjoint(&family),
             "the family sits entirely on earlier pages"
         );
-        assert!(rearm_parsed(&first).is_superset(&rearm_family_sessions()));
+        assert!(rearm_parsed(&first).is_superset(&family));
+        assert_eq!(
+            RearmFixture::family_keys(&last.index).len(),
+            family.len(),
+            "every family member is indexed"
+        );
         let proven = last
             .index
             .claude_usage_family_witness_digest_for_test(REARM_ROOT)
             .expect("first exact family proof");
-        assert!(
-            Self::family_rearmed(&last.index)
-                .iter()
-                .all(|rearmed| *rearmed),
-            "the first exact proof re-arms every earlier-page member once"
+        assert_eq!(
+            RearmFixture::family_rearm_debt(&last.index),
+            family.len(),
+            "the first exact proof re-arms every earlier-page member"
         );
 
         let corrected = self.generation(9);
         let last = corrected.last().expect("terminal page");
         assert!(last.scan.census_complete);
         assert!(last.fully_settled);
-        assert_eq!(rearm_parsed(&corrected), rearm_family_sessions());
-        let mut corrected_bodies = 0;
+        assert_eq!(rearm_parsed(&corrected), family);
+        let mut reported = BTreeMap::new();
         for page in &corrected {
             assert!(page.held.is_empty());
             for item in page
                 .scan
                 .snapshots
                 .iter()
-                .filter(|item| rearm_family_sessions().contains(&item.source_session_id))
+                .filter(|item| family.contains(&item.source_session_id))
             {
                 assert_eq!(item.usage_accounting_contract.as_deref(), REARM_REPORTED);
+                assert!(page.offered.contains(&item.snapshot_fingerprint));
                 assert!(page.uploaded.contains(&item.snapshot_fingerprint));
                 assert!(last
                     .index
                     .accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint));
-                corrected_bodies += 1;
+                reported.insert(
+                    item.source_session_id.clone(),
+                    Some(item.snapshot_fingerprint.clone()),
+                );
             }
         }
-        assert_eq!(corrected_bodies, rearm_family_sessions().len());
+        let heads = RearmFixture::family_heads(&last.index);
+        assert_eq!(
+            heads, reported,
+            "every member's head is its ACKed reported body"
+        );
         assert_eq!(
             last.index
                 .claude_usage_family_witness_digest_for_test(REARM_ROOT)
                 .as_deref(),
             Some(proven.as_str())
         );
-        assert!(
-            Self::family_rearmed(&last.index)
-                .iter()
-                .all(|rearmed| !rearmed),
-            "re-proving the unchanged witness keeps the corrected members settled"
-        );
-        (last.index.clone(), proven)
+        RearmEstablished {
+            proven,
+            heads,
+            index: last.index.clone(),
+        }
     }
 }
 
@@ -499,71 +618,92 @@ fn rearm_reads(pages: &[RearmPage]) -> usize {
     pages.iter().map(|page| page.scan.scanned_file_count).sum()
 }
 
-/// After the cross-page correction, the terminal census re-proves the same
-/// family witness on every generation. It must not re-arm the corrected
-/// members again: later generations read no file and upload nothing.
+/// SHA-256 over the sorted values, one per line.
+fn rearm_digest<T: AsRef<str>>(values: impl IntoIterator<Item = T>) -> String {
+    use sha2::{Digest, Sha256};
+    let values = values
+        .into_iter()
+        .map(|value| value.as_ref().to_string())
+        .collect::<BTreeSet<_>>();
+    let mut digest = Sha256::new();
+    for value in values {
+        digest.update(value.as_bytes());
+        digest.update(b"\n");
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// The optimized rule only: the terminal census re-proves the same family
+/// witness after the cross-page correction and keeps the corrected members
+/// settled, so later generations read no file and offer nothing. The original
+/// unconditional re-arm fails here by design.
 #[test]
 #[serial(source_manifests)]
 fn stable_claude_family_proof_stops_rereading_after_cross_page_correction() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = RearmFixture::new("claude-stable-proof-rearm-converges");
-    let (_, proven) = fixture.converge();
+    let established = fixture.establish();
+    assert_eq!(
+        RearmFixture::family_rearm_debt(&established.index),
+        0,
+        "re-proving the unchanged witness keeps the corrected members settled"
+    );
     for hour in [10, 11] {
         let stable = fixture.generation(hour);
         let last = stable.last().expect("terminal page");
         assert!(last.scan.census_complete, "hour {hour}");
         assert!(last.fully_settled, "hour {hour}");
         assert_eq!(rearm_reads(&stable), 0, "hour {hour}: no recurring reads");
-        assert!(stable.iter().all(|page| page.uploaded.is_empty()));
+        assert!(stable.iter().all(|page| page.offered.is_empty()));
+        assert_eq!(
+            RearmFixture::family_heads(&last.index),
+            established.heads,
+            "hour {hour}"
+        );
         assert_eq!(
             last.index
                 .claude_usage_family_witness_digest_for_test(REARM_ROOT)
                 .as_deref(),
-            Some(proven.as_str())
+            Some(established.proven.as_str())
         );
     }
 }
 
 /// One appended subagent request, with its paired evidence, after the family
-/// converged. The sidecar change selects only this family, once. The family is
-/// not re-proven in that generation: the root, parsed on an earlier page, no
+/// converged. The sidecar change selects only this family. The family is not
+/// re-proven in that generation: the root, parsed on an earlier page, no
 /// longer reconstructs from the retained witness, so it is demoted into a
 /// RetryPending authority quarantine, and any RetryPending family keeps the
 /// census incomplete (`LocalHoldSettlement::progress_blocking`). Until the
-/// quarantine's wall-clock retry, the changed bodies stay held, the accepted
-/// heads stay current, and later generations read nothing. This pins the
-/// existing authority contract that bounds the delay; prompt reproof needs a
-/// separate decision about that contract, not a re-arm.
+/// quarantine's wall-clock retry, the changed bodies stay held and are never
+/// offered, the ACKed heads stay current, and later generations read nothing.
+/// This characterizes the existing authority contract under either re-arm
+/// rule; it does not accept the retry delay as a freshness bound.
 #[test]
 #[serial(source_manifests)]
 fn changed_family_member_after_stable_proof_is_held_by_the_authority_retry() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = RearmFixture::new("claude-stable-proof-rearm-member-change");
-    let (converged, proven) = fixture.converge();
-    let heads = RearmFixture::family_heads(&converged);
+    let established = fixture.establish();
     fixture.append_family_request(Some(REARM_AGENTS[0]), "req_agent_a_2", 4, 5);
-    assert_family_held_without_rereads(&fixture, &proven, &heads);
+    assert_family_held_without_rereads(&fixture, &established);
 }
 
-/// Malformed evidence after convergence selects the family once through the
-/// sidecar fingerprint. The family stays held under its bounded quarantine and
-/// is not read again while the evidence is unchanged.
+/// Malformed evidence after convergence selects the family through the
+/// sidecar fingerprint. Under either re-arm rule the family stays held under
+/// its bounded quarantine and is not read again while the evidence is
+/// unchanged.
 #[test]
 #[serial(source_manifests)]
 fn unhealthy_family_evidence_stays_held_without_renewed_family_reads() {
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = RearmFixture::new("claude-stable-proof-rearm-unhealthy");
-    let (converged, proven) = fixture.converge();
-    let heads = RearmFixture::family_heads(&converged);
+    let established = fixture.establish();
     fixture.corrupt_api_sidecar();
-    assert_family_held_without_rereads(&fixture, &proven, &heads);
+    assert_family_held_without_rereads(&fixture, &established);
 }
 
-fn assert_family_held_without_rereads(
-    fixture: &RearmFixture,
-    proven: &str,
-    heads: &BTreeMap<String, Option<String>>,
-) {
+fn assert_family_held_without_rereads(fixture: &RearmFixture, established: &RearmEstablished) {
     let changed = fixture.generation(10);
     let parsed = rearm_parsed(&changed);
     assert!(parsed.contains(REARM_ROOT));
@@ -576,10 +716,7 @@ fn assert_family_held_without_rereads(
         .flat_map(|page| page.held.iter().cloned())
         .collect::<BTreeSet<_>>();
     assert!(!held.is_empty(), "the changed family bodies are held");
-    for page in &changed {
-        assert!(page.uploaded.is_disjoint(&held));
-    }
-    assert_family_held_state(&changed, 10, proven, heads, &held);
+    assert_family_held_state(&changed, 10, established, &held);
     for hour in [11, 12] {
         let pages = fixture.generation(hour);
         assert_eq!(
@@ -587,18 +724,20 @@ fn assert_family_held_without_rereads(
             0,
             "hour {hour}: no renewed family reads"
         );
-        assert!(pages.iter().all(|page| page.uploaded.is_empty()));
-        assert_family_held_state(&pages, hour, proven, heads, &held);
+        assert!(pages.iter().all(|page| page.offered.is_empty()));
+        assert_family_held_state(&pages, hour, established, &held);
     }
 }
 
 fn assert_family_held_state(
     pages: &[RearmPage],
     hour: u32,
-    proven: &str,
-    heads: &BTreeMap<String, Option<String>>,
+    established: &RearmEstablished,
     held: &BTreeSet<String>,
 ) {
+    for page in pages {
+        assert!(page.offered.is_disjoint(held), "hour {hour}");
+    }
     let last = pages.last().expect("terminal page");
     assert!(!last.scan.census_complete, "hour {hour}");
     assert!(!last.fully_settled, "hour {hour}");
@@ -609,9 +748,13 @@ fn assert_family_held_state(
         last.index
             .claude_usage_family_witness_digest_for_test(REARM_ROOT)
             .as_deref(),
-        Some(proven)
+        Some(established.proven.as_str())
     );
-    assert_eq!(&RearmFixture::family_heads(&last.index), heads);
+    assert_eq!(
+        RearmFixture::family_heads(&last.index),
+        established.heads,
+        "hour {hour}: the ACKed heads stay current"
+    );
     for fingerprint in held {
         assert!(!last
             .index
@@ -621,8 +764,9 @@ fn assert_family_held_state(
 
 /// The first proof's re-arm is durable debt. A correction page whose upload is
 /// shed checkpoints only accepted work, so the re-armed root stays re-armed
-/// across the save and reload. A later generation delivers the corrected body
-/// after its exact ACK, and the generations after that read nothing.
+/// across the save and reload, and a later generation delivers the corrected
+/// body after its exact ACK; both re-arm rules do this. The final quiet
+/// generations are the optimized rule only.
 #[test]
 #[serial(source_manifests)]
 fn rearm_debt_survives_a_shed_correction_and_reload_until_accepted() {
@@ -644,17 +788,13 @@ fn rearm_debt_survives_a_shed_correction_and_reload_until_accepted() {
         .snapshots
         .iter()
         .find(|item| item.source_session_id == REARM_ROOT)
-        .expect("corrected root body")
-        .snapshot_fingerprint
-        .clone();
+        .expect("corrected root body");
     assert_eq!(
-        shed.scan
-            .snapshots
-            .iter()
-            .find(|item| item.source_session_id == REARM_ROOT)
-            .and_then(|item| item.usage_accounting_contract.as_deref()),
+        corrected_root.usage_accounting_contract.as_deref(),
         REARM_REPORTED
     );
+    let corrected_root = corrected_root.snapshot_fingerprint.clone();
+    assert!(shed.offered.contains(&corrected_root));
     assert!(shed.uploaded.is_empty());
     assert!(!shed.fully_settled);
     assert!(shed.index.bounded_sweep_had_unsettled_upload());
@@ -662,8 +802,7 @@ fn rearm_debt_survives_a_shed_correction_and_reload_until_accepted() {
         .index
         .accepted_snapshot_fingerprint_recorded(&corrected_root));
     let root_key = RearmFixture::family_keys(&shed.index)
-        .into_iter()
-        .find(|key| key.ends_with(&format!("{REARM_ROOT}.jsonl")))
+        .remove(REARM_ROOT)
         .expect("root key");
     assert!(
         shed.index.files[&root_key]
@@ -671,9 +810,10 @@ fn rearm_debt_survives_a_shed_correction_and_reload_until_accepted() {
             .is_empty(),
         "the shed correction keeps the re-arm debt after reload"
     );
+    let mut correction = vec![shed];
+    fixture.finish_generation(9, 1, &mut correction);
+    fixture.receipt(9, &correction);
 
-    let mut rest = Vec::new();
-    fixture.finish_generation(9, 1, &mut rest);
     let delivered = fixture.generation(10);
     let last = delivered.last().expect("terminal page");
     assert!(last.scan.census_complete);
@@ -690,9 +830,9 @@ fn rearm_debt_survives_a_shed_correction_and_reload_until_accepted() {
             .as_deref(),
         Some(corrected_root.as_str())
     );
-    assert!(RearmFixture::family_rearmed(&last.index)
-        .iter()
-        .all(|rearmed| !rearmed));
+
+    // Optimized rule only from here: the unchanged re-proof leaves no debt.
+    assert_eq!(RearmFixture::family_rearm_debt(&last.index), 0);
     for hour in [11, 12] {
         let stable = fixture.generation(hour);
         let last = stable.last().expect("terminal page");

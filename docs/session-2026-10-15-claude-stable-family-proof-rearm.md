@@ -34,27 +34,34 @@ The terminal census now writes one aggregate log line when it re-arms anything, 
 
 ## Freshness after a member change
 
-This change adds no delay to a changed family. The existing authority contract bounds that delay, before and after this change:
+This change does not alter the path a changed family takes. Read from the source, the existing authority contract decides when a family that spans pages can be re-proven, under either re-arm rule:
 
-- A new request in any member also appends the root's API and trace sidecars. The sidecar stat is part of every member's source fingerprint, so the next traversal selects the whole family once.
+- A new request in any member also appends the root's API and trace sidecars. The sidecar stat is part of every member's source fingerprint, so the next traversal selects the whole family.
 - The root, parsed on an earlier page, no longer reconstructs from the retained witness, because the evidence digest changed. It is demoted into a `RetryPending` authority quarantine, and its new body is held while the accepted body stays current.
 - Any `RetryPending` family makes the page's local holds progress-blocking (`LocalHoldSettlement::progress_blocking`). The traversal then owes a clean follow-up, so no census completes and no family can be re-proven while the quarantine is pending.
-- Each failed reconstruction sets a wall-clock retry deadline 6 to 12 hours ahead. The quarantine becomes terminal, and stops blocking, on the fourth failure. A member change can count as a failure too, so a family that spans two pages usually reaches the fourth failure after two retry windows, 12 to 24 hours. Only then can a complete census prove the changed witness.
+- Each failed reconstruction sets a wall-clock retry deadline 6 to 12 hours ahead, and the quarantine becomes terminal, and stops blocking, on the fourth failure. Only then can a complete census prove the changed witness.
 
-The old loop did not shorten this. Its reparse happened on earlier pages, and the census that would have proven the change was blocked the same way. Only a family that sits entirely on the terminal page is re-proven in the same traversal. Prompt reproof for families that span pages needs a separate decision about the progress-blocking rule for a bound `RetryPending` hold. It is not a re-arm question.
+The old loop did not take another path: its reparse also happened on earlier pages, before the blocked census. Only a family that sits entirely on the terminal page is re-proven in the same traversal. This note describes the contract; it does not accept the resulting delay as a freshness bound, and nothing here measures it. Changing it is a separate decision about the progress-blocking rule for a bound `RetryPending` hold, not a re-arm question.
 
 A changed body without a family witness change is the other consequence. A release that changes the uploaded body of a reported-usage member, but not its witness, used to reach every proven multi-page family through this loop. After this change it does not. Such a change needs its own re-offer path, or it must ship and be verified before this change.
 
 ## Tests
 
-`snapshots/claude_usage_proof_rearm_tests.rs` drives the production `apply_claude_reported_usage_with_index` fold with a synthetic two-member family and a save and load between traversals. It covers the first proof, an unchanged re-proof, changed evidence, and a child that changes alone.
+`snapshots/claude_usage_proof_rearm_tests.rs` drives the production `apply_claude_reported_usage_with_index` fold with a synthetic two-member family and a save and load between traversals. It covers the first proof, an unchanged re-proof, changed evidence, and a child that changes alone. It passes the census flag directly, so it does not show what a full traversal can reach.
 
-`snapshot_sync/stable_proof_rearm_pipeline_tests.rs` runs bounded traversals through the production page order: scan with the local OTEL support directory, local evidence, account binding, upload policy, finalization, hold classification, an in-process upload, settlement, and the durable save and reload. The family root and both subagents are on earlier pages; an unrelated session is alone on the terminal page.
+`snapshot_sync/stable_proof_rearm_pipeline_tests.rs` runs bounded traversals through the production page order: scan with the local OTEL support directory, local evidence, account binding, upload policy, finalization, hold classification, an in-process upload, settlement, and the durable save and reload. The family root and both subagents are on earlier pages; an unrelated session is alone on the terminal page. No test edits fingerprints, quarantines or clocks.
 
-- `stable_claude_family_proof_stops_rereading_after_cross_page_correction`: the first proof re-arms the family, the next generation delivers reported bodies after their ACK, and the two generations after that read no file and upload nothing.
-- `changed_family_member_after_stable_proof_is_held_by_the_authority_retry`: an appended subagent request selects only that family. Its bodies are held under a bound `RetryPending` quarantine, the accepted heads stay current, and later generations read nothing. This pins the existing contract described above.
-- `unhealthy_family_evidence_stays_held_without_renewed_family_reads`: malformed evidence holds the family the same way, without renewed reads.
-- `rearm_debt_survives_a_shed_correction_and_reload_until_accepted`: a shed correction keeps the re-arm debt across the save and reload, and a later generation delivers the corrected body after its exact ACK.
+A shared setup runs the first proof and its cross-page correction and asserts only what the original and the new re-arm rule both produce: the first proof re-arms every member, and the correction delivers each member's reported body, whose ACK makes it the member's head. Each generation writes one count- and hash-only JSON receipt line to stderr, so test runs of different heads can be compared.
+
+- `stable_claude_family_proof_stops_rereading_after_cross_page_correction` (new rule only): the unchanged re-proof keeps the corrected members settled, and the next two generations read no file and offer nothing.
+- `changed_family_member_after_stable_proof_is_held_by_the_authority_retry` (either rule): an appended subagent request selects only that family. Its bodies are held under a bound `RetryPending` quarantine and never offered, the ACKed heads stay current, and later generations read nothing.
+- `unhealthy_family_evidence_stays_held_without_renewed_family_reads` (either rule): malformed evidence holds the family the same way, without renewed reads.
+- `rearm_debt_survives_a_shed_correction_and_reload_until_accepted`: under either rule, a shed correction keeps the re-arm debt across the save and reload, and a later generation delivers the corrected body after its exact ACK. Its final quiet generations are the new rule only.
+
+## Open items
+
+- Running the shared setup under the original re-arm rule, for comparison through the receipts, has not been done yet.
+- When a changed proof is created while a member is still held under a quarantine bound to the previous witness, the saved index may fail its load validation and be rebuilt. This predates the change and is being characterized separately.
 
 ## Limits
 
