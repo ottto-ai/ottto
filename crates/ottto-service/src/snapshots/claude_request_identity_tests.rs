@@ -958,6 +958,7 @@ fn facts<'a>(request_id: &'a str, at: Option<u64>, marker: MarkerVerdict<'a>) ->
         scan_unix_seconds: Some(1_000_000),
         email_home: None,
         session_start_unix_seconds: None,
+        duplicated_elsewhere: false,
     }
 }
 
@@ -1285,10 +1286,14 @@ fn contract5_permit_needs_emission_claude_code_and_the_exact_hint_token() {
         identity::permit_when(false, SnapshotSource::ClaudeCode, token),
         Err(CohortDenial::EmissionDisabled)
     );
-    // This build: even the exact token is denied while emission is off.
+    // This build: emission is compiled on, so only the exact token permits.
+    assert!(identity::emission_permit(SnapshotSource::ClaudeCode, token).is_ok());
+    for offered in [None, Some(""), Some(" own_request_identity_rows:v1")] {
+        assert!(identity::emission_permit(SnapshotSource::ClaudeCode, offered).is_err());
+    }
     assert_eq!(
-        identity::emission_permit(SnapshotSource::ClaudeCode, token),
-        Err(CohortDenial::EmissionDisabled)
+        identity::emission_permit(SnapshotSource::Codex, token),
+        Err(CohortDenial::OtherSource)
     );
 }
 
@@ -2383,11 +2388,12 @@ fn coverage(
     ledger
 }
 
-// Released builds keep `transcript_email` and its feed compiled out, and
+// Released builds compile contract-5 emission on (still gated per cycle by the
+// cohort hint token) and keep `transcript_email` and its feed compiled out, and
 // `transcript_sole_login` suppressed independently of the email gate.
 const _: () = assert!(
-    !identity::TRANSCRIPT_EMAIL_ENABLED
-        && !identity::EMISSION_ENABLED
+    identity::EMISSION_ENABLED
+        && !identity::TRANSCRIPT_EMAIL_ENABLED
         && !identity::TRANSCRIPT_SOLE_LOGIN_ENABLED
 );
 
@@ -2875,5 +2881,200 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
     desktop.session_start_unix_seconds = Some(start);
     desktop.desktop = true;
     assert_eq!(identity::classify(&evidence, &desktop), org_only, "Desktop");
+    let _ = fs::remove_dir_all(dir);
+}
+
+// --- Cross-root ownership and settled transcript markers ----------------------
+
+const OTHER_ROOT: &str = "2448b91b-a47d-4dcd-b6cc-61ad77541cb6";
+const THIRD_ROOT: &str = "3558ca2c-b58e-4ede-87dd-72be88652dc7";
+
+/// Telemetry and trace rows are keyed by trace root, so a fork or resume copy
+/// under another root holds a request whose rows sit under the original root.
+/// Those rows own the request: the copy never tags it from its own markers,
+/// and rows under two other roots leave no single owner. A root's own rows
+/// still decide its own requests.
+#[test]
+fn rows_under_another_root_own_the_request() {
+    let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+    let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+    for (root, request_ids) in [
+        (ROOT, &["req_own", "req_both"][..]),
+        (OTHER_ROOT, &["req_foreign", "req_both", "req_two"][..]),
+        (THIRD_ROOT, &["req_two"][..]),
+    ] {
+        api_report.evidence.insert(
+            root.to_string(),
+            request_ids
+                .iter()
+                .enumerate()
+                .map(|(n, id)| signed(complete_api_row(root, id, n as u64 + 1, 10, 1, 0)))
+                .collect(),
+        );
+        trace_report.evidence.insert(
+            root.to_string(),
+            request_ids
+                .iter()
+                .map(|id| complete_trace_row(root, id, ""))
+                .collect(),
+        );
+    }
+    // A trace owner alone, with no telemetry row anywhere.
+    trace_report
+        .evidence
+        .get_mut(OTHER_ROOT)
+        .unwrap()
+        .push(complete_trace_row(OTHER_ROOT, "req_traced", ""));
+    let evidence = ScanEvidence::new(&api_report, &trace_report, BTreeSet::new(), None);
+    let from = |root: &'static str, request_id: &'static str| {
+        let mut request = facts(request_id, Some(900_000), MarkerVerdict::Trusted(D64));
+        request.root = root;
+        request.source_session_id = root;
+        identity::classify(&evidence, &request)
+    };
+    let refused = RequestIdentity::Refused;
+    // The copy under ROOT: its own markers never claim another root's request.
+    assert_eq!(from(ROOT, "req_foreign"), refused(Refusal::ForeignOwner));
+    assert_eq!(from(ROOT, "req_traced"), refused(Refusal::ForeignOwner));
+    assert_eq!(from(ROOT, "req_two"), refused(Refusal::ConflictingDuplicate));
+    // Controls: each root's own rows decide its own requests, and a request
+    // no root's rows name keeps the transcript bases.
+    let login_only = RequestIdentity::Tagged(AuthorityKey {
+        login: Some(OWNER_A.to_string()),
+        org: None,
+        basis: identity::TELEMETRY_LOGIN,
+    });
+    assert_eq!(from(ROOT, "req_own"), login_only);
+    assert_eq!(from(ROOT, "req_both"), login_only);
+    assert_eq!(from(OTHER_ROOT, "req_foreign"), login_only);
+    assert_eq!(from(THIRD_ROOT, "req_two"), login_only);
+    assert_eq!(
+        from(ROOT, "req_unrowed"),
+        RequestIdentity::Tagged(AuthorityKey {
+            login: None,
+            org: Some(D64.to_string()),
+            basis: identity::TRANSCRIPT_ORG,
+        })
+    );
+}
+
+/// A transcript request without its own telemetry is this transcript's alone
+/// only when the pass's duplicate census compared every indexed transcript and
+/// found no other holder. A witnessed duplicate refuses; an unsettled pass
+/// withdraws every marker-derived tag (org-only, and a marker org joined to
+/// login-only telemetry) to missing or login-only. Usage never moves.
+#[test]
+fn transcript_markers_tag_only_requests_a_settled_census_shows_unduplicated() {
+    use crate::snapshots::ClaudeDuplicateCensusCounts;
+    let dir = temp_dir("claude-request-identity-ownership");
+    let org = org_hash(ORG_1);
+    let mut lines = email_session(false, false);
+    // A second request whose login-only telemetry joins the marker org.
+    lines.push(json!({"timestamp": "2026-08-02T07:00:02Z", "type": "assistant", "sessionId": ROOT,
+        "requestId": "req_2", "message": {"id": "m2", "model": "claude-haiku-4-5",
+        "usage": {"input_tokens": 20, "output_tokens": 2}}}));
+    let mut member = complete_api_row(ROOT, "req_member", 9, 10, 1, 0);
+    member.request_identity = Some(org_identity(&org));
+    let (api, trace) = reports(
+        vec![signed(member), signed(complete_api_row(ROOT, "req_2", 2, 20, 2, 0))],
+        vec![
+            complete_trace_row(ROOT, "req_member", ""),
+            complete_trace_row(ROOT, "req_2", ""),
+        ],
+    );
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let before = parse_session(&dir, &lines).remove(0);
+    let run = |index: &ScanIndex, census: &ClaudeDuplicateCensusCounts, compared: bool| {
+        let mut items = parse_session(&dir, &lines);
+        let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition {
+            duplicate_census: *census,
+            transcript_ownership_complete: compared,
+            ..Default::default()
+        };
+        let ownership = identity::TranscriptOwnership::after_census(index, &disposition);
+        identity::apply_scan_with_ownership(&mut items, &evidence, BTreeMap::new(), &ownership);
+        items.remove(0)
+    };
+    let conserved = |item: &SnapshotItem| {
+        let rows = |item: &SnapshotItem| {
+            item.usage_buckets
+                .iter()
+                .flat_map(|bucket| &bucket.model_usage)
+                .chain(&item.model_usage)
+                .map(|row| (row.request_count, row.input_tokens, row.output_tokens, row.cost_usd.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(item), rows(&before));
+        assert_eq!(
+            (item.input_tokens, item.output_tokens, item.request_count),
+            (before.input_tokens, before.output_tokens, before.request_count)
+        );
+        assert_eq!(item.cost, before.cost);
+    };
+    let bases = |item: &SnapshotItem| {
+        item.request_evidence
+            .iter()
+            .map(|evidence| (evidence.identity_basis.clone(), evidence.provider_workspace_hash.clone()))
+            .collect::<BTreeSet<_>>()
+    };
+    let settled = ClaudeDuplicateCensusCounts {
+        census_complete: true,
+        coverage_complete: true,
+        ..Default::default()
+    };
+    let clean = ScanIndex::default();
+
+    // Settled and unduplicated: today's contract-5 tags, as `apply_scan`.
+    let tagged = run(&clean, &settled, true);
+    assert_eq!(
+        bases(&tagged),
+        BTreeSet::from([
+            (identity::TRANSCRIPT_ORG.to_string(), Some(org.clone())),
+            (identity::TELEMETRY_LOGIN.to_string(), Some(org.clone())),
+        ])
+    );
+    assert_eq!(tagged.request_identity_refusals, 0);
+    let mut via_default = parse_session(&dir, &lines);
+    identity::apply_scan(&mut via_default, &evidence, BTreeMap::new());
+    assert_eq!(serde_json::to_vec(&via_default[0]).unwrap(), serde_json::to_vec(&tagged).unwrap());
+    conserved(&tagged);
+
+    // A witnessed duplicate of the unrowed request refuses it, never borrows.
+    let mut duplicated = ScanIndex::default();
+    duplicated.claude_duplicate_request_owners.insert(
+        format!("{:x}", Sha256::digest(b"req_1")),
+        BTreeSet::from([
+            claude_duplicate_request_owner(ROOT, ROOT),
+            claude_duplicate_request_owner(OTHER_ROOT, OTHER_ROOT),
+        ]),
+    );
+    let refused = run(&duplicated, &settled, true);
+    assert!(refused.request_identity_refusals >= 1);
+    assert!(!bases(&refused).iter().any(|(basis, _)| basis == identity::TRANSCRIPT_ORG));
+    conserved(&refused);
+
+    // Unsettled passes: no marker reaches the wire, nothing is refused that
+    // was not, and the refusal above survives. The last case passes every
+    // census flag but left an indexed member uncompared (a quarantined
+    // original): ownership alone withdraws.
+    for (census, compared) in [
+        (ClaudeDuplicateCensusCounts::default(), false),
+        (ClaudeDuplicateCensusCounts { coverage_complete: false, ..settled }, true),
+        (ClaudeDuplicateCensusCounts { census_invalid: true, ..settled }, true),
+        (ClaudeDuplicateCensusCounts { fence_after: true, ..settled }, true),
+        (settled, false),
+    ] {
+        let withdrawn = run(&clean, &census, compared);
+        assert_eq!(
+            bases(&withdrawn),
+            BTreeSet::from([(identity::TELEMETRY_LOGIN.to_string(), None)]),
+            "{census:?} compared={compared}"
+        );
+        assert_eq!(withdrawn.request_identity_refusals, 0, "{census:?} compared={compared}");
+        conserved(&withdrawn);
+        let still_refused = run(&duplicated, &census, compared);
+        assert!(still_refused.request_identity_refusals >= 1, "{census:?} compared={compared}");
+        conserved(&still_refused);
+    }
     let _ = fs::remove_dir_all(dir);
 }

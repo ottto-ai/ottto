@@ -1138,3 +1138,140 @@ fn candidate_parse_reasons_name_the_selecting_gate() {
         parse(CandidateParseReason::SourceChanged)
     );
 }
+
+// Contract 5 reads this pass's census to decide whether transcript markers may
+// tag a request that has no telemetry of its own. Fence coverage excuses a
+// family held by a bound authority quarantine, but that family's requests were
+// not compared in this window. An unmarked copy of such an original under a
+// new root carries the original's request and org marker, and must not tag it.
+fn transcript_ownership<'i>(
+    index: &'i ScanIndex,
+    disposition: &ClaudeUsageAuthorityDisposition,
+) -> crate::snapshots::claude_request_identity::TranscriptOwnership<'i> {
+    crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(index, disposition)
+}
+
+#[test]
+fn transcript_ownership_needs_quarantined_originals_observed() {
+    use crate::snapshots::claude_request_identity as identity;
+    const ORIGINAL: &str = "4669db3d-c69f-4f0f-98ee-83cf99763ed8";
+    const COPY: &str = "577aec4e-d7a0-4a10-a9ff-940da0874fe9";
+    const ORG: &str = "11111111-1111-4111-8111-111111111111";
+    let dir = temp_dir("c5-quarantined-original");
+    let path = dir.join(format!("{COPY}.jsonl"));
+    std::fs::write(
+        &path,
+        [
+            json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": COPY,
+                "attachment": {"type": "credential_org", "organizationUuid": ORG}}),
+            json!({"timestamp": "2026-08-02T07:00:01Z", "type": "assistant", "sessionId": COPY,
+                "requestId": "req_copied", "message": {"id": "m1", "model": "claude-haiku-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 1}}}),
+        ]
+        .iter()
+        .map(|line| line.to_string() + "\n")
+        .collect::<String>(),
+    )
+    .expect("write copy transcript");
+    let parse = || {
+        parse_claude_code_jsonl_file(&path, "2026-08-02T07:01:00Z", "fp".into())
+            .expect("parse copy")
+    };
+    let (api, trace) = (
+        crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+    );
+    let evidence = identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    // One terminal pass over `index`, then contract 5 under its ownership.
+    let run = |mut index: ScanIndex| {
+        let mut items = parse();
+        let disposition = apply_claude_reported_usage_with_index_and_limits(
+            &mut items,
+            &api,
+            &trace,
+            &mut index,
+            true,
+            WINDOW,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+            None,
+        );
+        identity::apply_scan_with_ownership(
+            &mut items,
+            &evidence,
+            BTreeMap::new(),
+            &transcript_ownership(&index, &disposition),
+        );
+        (disposition.duplicate_census, index, items.remove(0))
+    };
+    let bases = |item: &SnapshotItem| {
+        item.request_evidence
+            .iter()
+            .map(|evidence| evidence.identity_basis.clone())
+            .collect::<Vec<_>>()
+    };
+    let before = parse().remove(0);
+    let conserved = |item: &SnapshotItem| {
+        assert_eq!(
+            (item.request_count, item.input_tokens, item.output_tokens),
+            (
+                before.request_count,
+                before.input_tokens,
+                before.output_tokens
+            )
+        );
+        assert_eq!(item.usage_buckets.len(), before.usage_buckets.len());
+        assert_eq!(item.cost, before.cost);
+    };
+
+    // Control: every indexed member was compared, so the copy's marker org
+    // stands.
+    let (counts, _, copy) = run(ScanIndex::default());
+    assert!(
+        counts.census_complete && counts.coverage_complete,
+        "{counts:?}"
+    );
+    assert_eq!(bases(&copy), [identity::TRANSCRIPT_ORG]);
+    conserved(&copy);
+
+    // The original is indexed, held by a bound terminal quarantine, and its
+    // retained pending (which names the copied request) is from an older
+    // window, so this census never compared it.
+    let mut held = ScanIndex::default();
+    held.files.insert(
+        format!("/opaque/{ORIGINAL}.jsonl"),
+        manifest_index_entry(Some("original")),
+    );
+    bind_authority_quarantine(
+        &mut held,
+        ORIGINAL,
+        ORIGINAL,
+        &hex64('a'),
+        ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+    );
+    let mut retained = current_pending(ORIGINAL, &format!("{:x}", Sha256::digest(b"req_copied")));
+    retained.census_window_end = OLDER_WINDOW.to_string();
+    held.claude_usage_family_pending
+        .insert(ORIGINAL.to_string(), retained);
+    let (counts, after, copy) = run(held);
+    // Every fence flag passes: the quarantine excuses the original.
+    assert!(
+        counts.census_complete
+            && counts.coverage_complete
+            && !counts.census_invalid
+            && !counts.fence_after,
+        "{counts:?}"
+    );
+    assert!(after.claude_duplicate_request_owners.is_empty());
+    // The census pruned this window's pending before contract 5 ran; only the
+    // quarantined family's retained pending remains.
+    assert!(after.claude_usage_family_pending.contains_key(ORIGINAL));
+    assert!(!after.claude_usage_family_pending.contains_key(COPY));
+    // The copied marker never tags the original's request: withdrawn to
+    // missing, not refused, usage unchanged.
+    assert!(bases(&copy).is_empty(), "{:?}", bases(&copy));
+    assert_eq!(copy.request_identity_refusals, 0);
+    conserved(&copy);
+
+    let _ = std::fs::remove_dir_all(dir);
+}

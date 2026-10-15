@@ -80,6 +80,11 @@ impl OwnedJsonlParser {
         );
         let old = old.filter(|old| {
             old.state.accumulator.source == self.source
+                // Marker state covers the whole file only in the capture mode
+                // it was built in: a non-capture prefix holds no markers, which
+                // is not the same as a prefix without markers.
+                && old.state.accumulator.claude_request_identity_capture
+                    == self.accumulator.claude_request_identity_capture
                 && (self.source != SnapshotSource::Codex
                     || old
                         .state

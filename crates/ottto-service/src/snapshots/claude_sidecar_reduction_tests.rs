@@ -127,9 +127,21 @@ fn raw_scan(
     fixture: &Fixture,
     index: ScanIndex,
     cache: Option<Arc<SharedCache>>,
+    after_start: impl FnMut(&mut OwnedSourceScan),
+) -> Run {
+    raw_scan_capturing(fixture, index, cache, capture_by_default(), after_start)
+}
+fn capture_by_default() -> bool {
+    crate::snapshots::claude_request_identity::capture_by_default()
+}
+fn raw_scan_capturing(
+    fixture: &Fixture,
+    index: ScanIndex,
+    cache: Option<Arc<SharedCache>>,
+    identity_capture: bool,
     mut after_start: impl FnMut(&mut OwnedSourceScan),
 ) -> Run {
-    let mut scan = OwnedSourceScan::new(
+    let mut scan = OwnedSourceScan::new_with_identity_capture(
         SOURCE,
         std::slice::from_ref(&fixture.dir),
         index,
@@ -141,6 +153,7 @@ fn raw_scan(
         &[],
         false,
         true,
+        identity_capture,
     );
     if let Some(cache) = cache {
         scan = scan.with_sampled_acquisition(cache, Scope("sidecar-fixture".into()));
@@ -732,4 +745,76 @@ fn cold_full_mid_read_sidecars_complete_but_true_scope_and_object_changes_refuse
             assert!(!candidate.result.census_complete);
         }
     }
+}
+
+/// Retained native state is reused only in the capture mode it was built in.
+/// A prefix parsed without contract-5 capture holds no markers, so a capturing
+/// cycle under the same cache scope re-reads the file in full instead of
+/// tailing it as if the prefix had none; same-mode appends still tail.
+#[test]
+fn identity_capture_mode_change_rereads_instead_of_reusing_a_markerless_prefix() {
+    const ORG: &str = "11111111-1111-4111-8111-111111111111";
+    let org = ottto_core::billing_identity_hash(
+        "anthropic",
+        "organization",
+        &crate::claude_local_otel::canonical_uuid(ORG).unwrap(),
+    )
+    .unwrap();
+    let marked = |f: &Fixture| {
+        let first: Value = serde_json::from_str(&f.lines[0]).unwrap();
+        let marker = json!({"timestamp": first["timestamp"], "type": "attachment",
+            "sessionId": f.session, "attachment": {"type": "credential_org", "organizationUuid": ORG}});
+        fs::write(&f.path, format!("{marker}\n{}\n", f.lines[0])).unwrap();
+    };
+    let markers_trusted = |run: &Run, f: &Fixture| {
+        let item = run
+            .result
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == f.session)
+            .unwrap();
+        assert!(item.claude_usage_occurrences.len() >= 2);
+        item.claude_usage_occurrences.values().all(|occurrence| {
+            item.claude_org_markers.as_deref().is_some_and(|markers| {
+                markers.verdict(occurrence.sequence, false)
+                    == crate::snapshots::claude_request_identity::MarkerVerdict::Trusted(&org)
+            })
+        })
+    };
+    let seed = |f: &Fixture, cache: &Arc<SharedCache>, capture: bool| {
+        settle(enriched(
+            f,
+            raw_scan_capturing(
+                f,
+                ScanIndex::default(),
+                Some(cache.clone()),
+                capture,
+                |_| {},
+            ),
+        ))
+    };
+
+    // A dark cycle seeds the cache; the next cycle holds a permit.
+    let f = Fixture::new(1);
+    marked(&f);
+    let cache = Arc::new(SharedCache::default());
+    let prior = seed(&f, &cache, false);
+    f.append_transcript(1);
+    let flipped = raw_scan_capturing(&f, prior, Some(cache), true, |_| {});
+    assert_eq!(flipped.modes, (1, 0, 0));
+    assert_eq!(flipped.reasons[FullReason::StateMissing.slot()], 1);
+    assert!(
+        markers_trusted(&flipped, &f),
+        "the full re-read captures the prefix's marker"
+    );
+
+    // Control: same capture mode on both cycles keeps tail reuse.
+    let g = Fixture::new(1);
+    marked(&g);
+    let cache = Arc::new(SharedCache::default());
+    let prior = seed(&g, &cache, true);
+    g.append_transcript(1);
+    let steady = raw_scan_capturing(&g, prior, Some(cache), true, |_| {});
+    assert_layout_mode(steady.modes, (0, 1, 0));
+    assert!(markers_trusted(&steady, &g));
 }

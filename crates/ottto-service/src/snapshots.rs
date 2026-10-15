@@ -2346,6 +2346,11 @@ pub struct ClaudeUsageAuthorityDisposition {
     /// Contract-5 only: each rebuilt item's requests, classified and folded
     /// into bounded row x authority-key groups during the rebuild.
     pub(crate) request_groupings: BTreeMap<String, claude_request_identity::Grouping>,
+    /// Contract-5 only: this terminal census compared every indexed Claude
+    /// family member's current requests. Unlike fence coverage, a bound
+    /// authority quarantine excuses nothing. Taken before the census prunes
+    /// this window's pending; never a census, fence or upload input.
+    pub(crate) transcript_ownership_complete: bool,
 }
 
 impl ClaudeUsageAuthorityDisposition {
@@ -2610,7 +2615,10 @@ fn claude_duplicate_request_witness_within_bound(
 
 /// Content-free cause counters for one duplicate-census fold call, reported
 /// only in the local Claude evidence log line. They are observed alongside the
-/// fence and never read back: no gate, hash, index, or upload depends on them.
+/// fence and never read back by the census: no gate, hash, or index depends on
+/// them. Contract 5 alone reads one pass's counts, beside its own ownership
+/// qualification, to withhold transcript-marker tags from a pass whose census
+/// did not settle (`claude_request_identity::TranscriptOwnership`).
 /// `fence_after && census_invalid` is an invalid census; `fence_after` without
 /// it is the owner bound. On a terminal pass, an invalid census with no invalid
 /// current-window family came from stale unquarantined pending. Page counters
@@ -4480,6 +4488,8 @@ fn apply_claude_reported_usage_with_index_and_limits(
             claude_duplicate_fence_coverage_missing_member_count(index, census_window_end);
         duplicate_census.coverage_complete = coverage_missing_member_count == 0;
         duplicate_census.coverage_missing_member_count = coverage_missing_member_count;
+        disposition.transcript_ownership_complete =
+            claude_family_members_unobserved_count(index, census_window_end, false) == 0;
         if duplicate_census_invalid
             || !claude_duplicate_request_witness_within_bound(
                 &duplicate_witnesses_after,
@@ -4787,6 +4797,18 @@ fn claude_duplicate_fence_coverage_missing_member_count(
     index: &ScanIndex,
     census_window_end: &str,
 ) -> usize {
+    claude_family_members_unobserved_count(index, census_window_end, true)
+}
+
+/// Indexed Claude family members whose current requests this census window did
+/// not observe. Confirmed-empty files hold none. The fence also excuses a
+/// family held by a bound authority quarantine (`quarantine_excused`), whose
+/// retained pending the census excludes; transcript ownership does not.
+fn claude_family_members_unobserved_count(
+    index: &ScanIndex,
+    census_window_end: &str,
+    quarantine_excused: bool,
+) -> usize {
     let covered = index
         .claude_usage_family_pending
         .values()
@@ -4809,13 +4831,14 @@ fn claude_duplicate_fence_coverage_missing_member_count(
             };
             !(covered.contains(&member)
                 || index.confirmed_empty_files.contains(*index_key)
-                || index
-                    .claude_usage_authority_quarantine
-                    .get(&root_session_id)
-                    .zip(index.claude_usage_family_witnesses.get(&root_session_id))
-                    .is_some_and(|(quarantine, witness)| {
-                        claude_usage_authority_preserves_pending(quarantine, witness)
-                    }))
+                || (quarantine_excused
+                    && index
+                        .claude_usage_authority_quarantine
+                        .get(&root_session_id)
+                        .zip(index.claude_usage_family_witnesses.get(&root_session_id))
+                        .is_some_and(|(quarantine, witness)| {
+                            claude_usage_authority_preserves_pending(quarantine, witness)
+                        })))
         })
         .count()
 }
@@ -37422,9 +37445,11 @@ mod tests {
             None,
         );
         let counts = disposition.duplicate_census;
-        // The counters are the only disposition output of these report-free
-        // folds, and they never reach persisted index or emitted item bytes.
+        // The counters (and contract 5's ownership qualification, read beside
+        // them) are the only disposition output of these report-free folds,
+        // and they never reach persisted index or emitted item bytes.
         disposition.duplicate_census = ClaudeDuplicateCensusCounts::default();
+        disposition.transcript_ownership_complete = false;
         assert_eq!(disposition, ClaudeUsageAuthorityDisposition::default());
         let index_json = serde_json::to_string(&index).expect("serialize index");
         let items_json = serde_json::to_string(&items).expect("serialize items");

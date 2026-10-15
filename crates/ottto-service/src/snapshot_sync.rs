@@ -3378,6 +3378,20 @@ impl SourcePreparation {
         }
     }
 }
+/// This cycle's contract-5 permit, from its authenticated hint only. Never
+/// cached across cycles, so a revoked token takes effect on the next fetch;
+/// prepare (capture) and finish (emission) both derive it here.
+fn cycle_request_identity_permit(
+    source: SnapshotSource,
+    activity_hint: &crate::snapshot_client::ActivityHintResponse,
+) -> Option<crate::snapshots::claude_request_identity::EmissionPermit> {
+    crate::snapshots::claude_request_identity::emission_permit(
+        source,
+        activity_hint.session_request_identity_contract.as_deref(),
+    )
+    .ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_sync_source(
     client: &SnapshotApiClient,
@@ -3422,11 +3436,7 @@ fn prepare_sync_source(
     // Contract-5 marker capture and the Desktop census witness are local work
     // only an emitting cycle uses, so they follow this cycle's permit, not the
     // compiled switch alone. Finish recomputes the permit from the same hint.
-    let request_identity_capture = crate::snapshots::claude_request_identity::emission_permit(
-        source,
-        activity_hint.session_request_identity_contract.as_deref(),
-    )
-    .is_ok();
+    let request_identity_capture = cycle_request_identity_permit(source, &activity_hint).is_some();
     // The server's scan directive was parsed and discarded before this. It is a
     // cost lever, so it may only lengthen the local cadence (see
     // `negotiated_wait`), never shorten it.
@@ -3950,13 +3960,7 @@ fn finish_sync_source(
             support_dir,
             &mut scan_result,
             &mut index,
-            // This cycle's authenticated hint only; never cached across
-            // cycles, so a revoked token takes effect on the next fetch.
-            crate::snapshots::claude_request_identity::emission_permit(
-                source,
-                activity_hint.session_request_identity_contract.as_deref(),
-            )
-            .ok(),
+            cycle_request_identity_permit(source, &activity_hint),
         );
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
@@ -5128,12 +5132,20 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
         identity_evidence.as_ref(),
     );
     if let Some(evidence) = &identity_evidence {
-        // Contract 5 first: D1 below leaves new-collector items untouched.
-        let _request_identity = crate::snapshots::claude_request_identity::apply_scan(
-            &mut scan_result.snapshots,
-            evidence,
-            std::mem::take(&mut disposition.request_groupings),
-        );
+        // Contract 5 first: D1 below leaves new-collector items untouched. The
+        // rebuild above has just settled this pass's duplicate census.
+        let ownership =
+            crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(
+                index,
+                &disposition,
+            );
+        let _request_identity =
+            crate::snapshots::claude_request_identity::apply_scan_with_ownership(
+                &mut scan_result.snapshots,
+                evidence,
+                std::mem::take(&mut disposition.request_groupings),
+                &ownership,
+            );
     }
     let qualification = match &identity_evidence {
         Some(evidence) => crate::snapshots::claude_request_accounts::apply_with_shared_index(
@@ -16655,6 +16667,7 @@ mod tests {
     include!("retry_bounded_native_tests.rs");
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
+    include!("snapshot_sync/request_identity_pipeline_tests.rs");
     #[test]
     fn codex_union_native_transport_common_ack_crash_checkpoint_and_restart() {
         codex_union_native_transport_restart(false, false);

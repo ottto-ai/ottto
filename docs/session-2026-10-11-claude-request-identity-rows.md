@@ -26,6 +26,8 @@ scan hook and every new field stay inert until a compatible receiver is
 confirmed, and flipping the constant is a separate change. Tests exercise the
 same code through `capture_by_default()` (`cfg(test)`).
 
+Since 2026-10-15 the constant is `true`
+([master-on](session-2026-10-15-claude-request-identity-master-on.md)).
 Flipping the constant alone still emits nothing: each sync cycle also needs
 the exact cohort token in that cycle's activity hint (`emission_permit`). See
 [the activation-readiness note](session-2026-10-14-claude-request-identity-activation-readiness.md).
