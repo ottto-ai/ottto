@@ -850,9 +850,14 @@ fn handle_command(
             if refresh_agent_status {
                 if let Some(source) = status_refresh_quota_source.as_ref() {
                     require_authorized_local_client(daemon, &authorization)?;
-                    request_explicit_quota_refresh(
-                        Some(source),
-                        LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS,
+                    crate::provider_calls::with_trigger(
+                        crate::provider_calls::Trigger::OlderAppCompat,
+                        || {
+                            request_explicit_quota_refresh(
+                                Some(source),
+                                LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS,
+                            )
+                        },
                     );
                 }
                 refresh_agent_status_for(daemon, &authorization, None)?;
@@ -908,7 +913,10 @@ fn handle_command(
         } => {
             if quota_refresh {
                 require_authorized_local_client(daemon, &authorization)?;
-                request_explicit_quota_refresh(source.as_ref(), 0);
+                crate::provider_calls::with_trigger(
+                    crate::provider_calls::Trigger::ExplicitRefresh,
+                    || request_explicit_quota_refresh(source.as_ref(), 0),
+                );
             }
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
         }
@@ -8654,7 +8662,18 @@ fn process_setup_actions(
             }
             "verify_source" => {
                 if let Some(source) = source.clone() {
-                    run_verify_source_action(daemon, api_base_url, credentials, &action, source)
+                    crate::provider_calls::with_trigger(
+                        crate::provider_calls::Trigger::Setup,
+                        || {
+                            run_verify_source_action(
+                                daemon,
+                                api_base_url,
+                                credentials,
+                                &action,
+                                source,
+                            )
+                        },
+                    )
                 } else {
                     Ok((
                         "failed".to_string(),
@@ -11472,8 +11491,59 @@ fn run_smoke_prompt(source: &SourceKind) -> SmokeResult {
         source_display_name(source),
         before_session_count,
     );
+    match source {
+        SourceKind::Codex => record_smoke_prompt(
+            crate::provider_calls::Provider::Openai,
+            crate::provider_calls::CallKind::CodexSmokePrompt,
+            crate::agent_status::default_codex_home_claimed_account_hash(),
+            &result,
+        ),
+        SourceKind::ClaudeCode => record_smoke_prompt(
+            crate::provider_calls::Provider::Anthropic,
+            crate::provider_calls::CallKind::ClaudeSmokePrompt,
+            crate::provider_calls::claude_slot_account_hash(
+                &ottto_core::ClaudeConfigDirSlot::Default,
+            ),
+            &result,
+        ),
+        // Pi's default route names no provider; only a routed smoke is
+        // known to reach OpenAI or Anthropic.
+        SourceKind::Pi => {}
+    }
     classify_source_smoke_failure(source, &mut result);
     result
+}
+
+/// One provider-call log line per smoke prompt that started: at least one
+/// request carrying the prompt.
+fn record_smoke_prompt(
+    provider: crate::provider_calls::Provider,
+    kind: crate::provider_calls::CallKind,
+    account_identifier_hash: Option<String>,
+    result: &SmokeResult,
+) {
+    use crate::provider_calls::{CallResult, ProviderCall, Trigger};
+    if !result.command_found {
+        return;
+    }
+    let outcome = if result.succeeded {
+        CallResult::Ok
+    } else if result.error_code.as_deref() == Some("smoke_timeout") {
+        CallResult::Timeout
+    } else {
+        result
+            .exit_status
+            .map_or(CallResult::Error("not_observed"), CallResult::Exit)
+    };
+    crate::provider_calls::record(ProviderCall::subprocess(
+        provider,
+        kind,
+        crate::provider_calls::trigger_or(Trigger::Other),
+        account_identifier_hash.as_deref(),
+        outcome,
+        Duration::from_millis(u64::try_from(result.duration_ms).unwrap_or(u64::MAX)),
+        1,
+    ));
 }
 
 struct SmokeCommand {
@@ -14035,7 +14105,10 @@ pub(crate) fn reverify_failed_source(
     source: SourceKind,
 ) -> Result<SourceVerificationResult, LocalApiError> {
     let authorization = RequestAuthorization::TrustedCompanionApp;
-    let result = verify_source(daemon, &authorization, source, false)?;
+    let result =
+        crate::provider_calls::with_trigger(crate::provider_calls::Trigger::Schedule, || {
+            verify_source(daemon, &authorization, source, false)
+        })?;
     if verification_result_should_refresh_agent_status(&result) {
         if let Err(error) =
             refresh_agent_status_for(daemon, &authorization, Some(result.source.clone()))
@@ -14538,13 +14611,27 @@ fn run_pi_route_smoke_prompt(
     before_session_count: Option<usize>,
 ) -> SmokeResult {
     let command = pi_smoke_command(Some(route));
-    run_bounded_command(
+    let result = run_bounded_command(
         command.program,
         &command.args,
         PI_SMOKE_COMMAND_TIMEOUT,
         "Pi",
         before_session_count,
-    )
+    );
+    let provider = match route.classification.model_provider.as_deref() {
+        Some("openai") => Some(crate::provider_calls::Provider::Openai),
+        Some("anthropic") => Some(crate::provider_calls::Provider::Anthropic),
+        _ => None,
+    };
+    if let Some(provider) = provider {
+        record_smoke_prompt(
+            provider,
+            crate::provider_calls::CallKind::PiSmokePrompt,
+            pi_route_billing_identity_hints(route).account_identifier_hash,
+            &result,
+        );
+    }
+    result
 }
 
 fn pi_route_billing_identity_hints(route: &PiModelRoute) -> BillingIdentityHints {
@@ -25995,7 +26082,9 @@ mod tests {
     #[test]
     #[serial]
     fn claude_smoke_waits_inside_the_quiet_window() {
+        use crate::provider_calls::CallKind;
         let fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("smoke");
+        let account = fake.default_account("smoke-account-uuid");
         fake.default_login_expires_in(time::Duration::minutes(10));
         let smoke = run_smoke_prompt(&SourceKind::ClaudeCode);
         assert!(!smoke.succeeded);
@@ -26007,10 +26096,29 @@ mod tests {
         let result = smoke_failure_verification_result(SourceKind::ClaudeCode, &smoke, None);
         assert_eq!(result.status, SourceVerificationStatus::Warning);
 
+        assert!(
+            crate::provider_calls::test_lines(CallKind::ClaudeSmokePrompt, &account).is_empty()
+        );
+
         fake.default_login_expires_in(time::Duration::hours(2));
         let smoke = run_smoke_prompt(&SourceKind::ClaudeCode);
         assert!(smoke.succeeded, "{}", smoke.message);
         assert_eq!(fake.spawns().len(), 1);
+        // Only the run that started is a provider call: a prompt sent to
+        // Anthropic, from a person's Verify unless a caller says otherwise.
+        let lines = crate::provider_calls::test_lines(CallKind::ClaudeSmokePrompt, &account);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            (
+                lines[0].provider.as_str(),
+                lines[0].trigger.as_str(),
+                lines[0].result.as_str(),
+                lines[0].basis.as_str(),
+                lines[0].requests_at_least
+            ),
+            ("anthropic", "other", "ok", "subprocess_lower_bound", 1)
+        );
+        assert!(!crate::provider_calls::test_raw_log().contains("fixture-access"));
     }
 
     #[test]

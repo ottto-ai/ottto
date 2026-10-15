@@ -459,7 +459,10 @@ fn run_claude_context(
     let command_timeout = configure_claude_context_command(&mut command, include_mcp_servers);
     #[cfg(unix)]
     {
-        capture_claude_context(command, &login, command_timeout)
+        let started = Instant::now();
+        let result = capture_claude_context(command, &login, command_timeout);
+        record_claude_context_run(&result, &login, started);
+        result
     }
     #[cfg(not(unix))]
     {
@@ -488,6 +491,37 @@ fn run_claude_context(
             }
         }
     }
+}
+
+/// One provider-call log line per `/context` run that started. `/context`
+/// itself is local, but Claude Code may contact Anthropic while starting:
+/// counted as at least zero requests.
+#[cfg(unix)]
+fn record_claude_context_run(
+    result: &Result<String>,
+    login: &ottto_core::ClaudeConfigDirSlot,
+    started: Instant,
+) {
+    use crate::provider_calls::{CallKind, CallResult, Provider, ProviderCall, Trigger};
+    let result = match result {
+        Ok(_) => CallResult::Ok,
+        Err(error) if error.downcast_ref::<ClaudeContextRefused>().is_some() => return,
+        Err(error) if error.to_string().ends_with("could not be started") => return,
+        Err(error) if error.to_string().ends_with("timed out") => CallResult::Timeout,
+        Err(error) if error.to_string().ends_with("exited unsuccessfully") => {
+            CallResult::Error("exited")
+        }
+        Err(_) => CallResult::Error("error"),
+    };
+    crate::provider_calls::record(ProviderCall::subprocess(
+        Provider::Anthropic,
+        CallKind::ClaudeContextProbe,
+        crate::provider_calls::trigger_or(Trigger::Schedule),
+        crate::provider_calls::claude_slot_account_hash(login).as_deref(),
+        result,
+        started.elapsed(),
+        0,
+    ));
 }
 
 #[cfg(unix)]
@@ -1997,7 +2031,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn context_run_waits_inside_the_quiet_window() {
+        use crate::provider_calls::CallKind;
         let fake = crate::claude_spawn_gate::test_support::FakeClaudeEnv::new("context");
+        let account = fake.default_account("context-account-uuid");
         let workspace = temp_dir("context-gate-workspace");
         let env = SpawnEnv {
             path: crate::command_env::path_env(),
@@ -2010,6 +2046,19 @@ mod tests {
         let error = run_claude_context(&workspace, &env, false).expect_err("refused");
         assert!(error.downcast_ref::<ClaudeContextRefused>().is_some());
         assert_eq!(fake.spawns().len(), 1, "the refused run never started");
+        // The started run is logged as a possible Anthropic contact (at
+        // least zero requests); the refused one is not logged.
+        let lines = crate::provider_calls::test_lines(CallKind::ClaudeContextProbe, &account);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            (
+                lines[0].provider.as_str(),
+                lines[0].trigger.as_str(),
+                lines[0].result.as_str(),
+                lines[0].requests_at_least
+            ),
+            ("anthropic", "schedule", "ok", 0)
+        );
         assert_eq!(next_context_cycle_delay(true), Duration::from_secs(30 * 60));
         let _ = fs::remove_dir_all(workspace);
     }

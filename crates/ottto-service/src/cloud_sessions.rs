@@ -2256,6 +2256,31 @@ impl Drop for CodexCloudChild {
     }
 }
 
+/// One provider-call log line per `codex cloud list` run that started: at
+/// least one OpenAI request.
+#[cfg(unix)]
+fn record_codex_cloud_list(result: &Result<String>, started: Instant) {
+    use crate::provider_calls::{CallKind, CallResult, Provider, ProviderCall, Trigger};
+    let result = match result {
+        Ok(_) => CallResult::Ok,
+        Err(error) if error.to_string().ends_with("could not be started") => return,
+        Err(error) if error.to_string().ends_with("timed out") => CallResult::Timeout,
+        Err(error) if error.to_string().ends_with("exited unsuccessfully") => {
+            CallResult::Error("exited")
+        }
+        Err(_) => CallResult::Error("error"),
+    };
+    crate::provider_calls::record(ProviderCall::subprocess(
+        Provider::Openai,
+        CallKind::CodexCloudList,
+        crate::provider_calls::trigger_or(Trigger::Schedule),
+        crate::agent_status::default_codex_home_claimed_account_hash().as_deref(),
+        result,
+        started.elapsed(),
+        1,
+    ));
+}
+
 #[cfg(unix)]
 fn run_codex_cloud_command(command: &mut Command, deadline: Instant) -> Result<String> {
     use std::os::fd::AsRawFd;
@@ -2404,7 +2429,13 @@ impl CloudSessionRunner for CodexCloudCliRunner {
             .stderr(Stdio::null());
         #[cfg(unix)]
         {
-            run_codex_cloud_command(&mut command, deadline)
+            let started = Instant::now();
+            let result = run_codex_cloud_command(&mut command, deadline);
+            // A deadline already spent starts nothing.
+            if started < deadline {
+                record_codex_cloud_list(&result, started);
+            }
+            result
         }
         #[cfg(not(unix))]
         {
@@ -4697,6 +4728,62 @@ mod tests {
             assert_eq!(output.len(), MAX_PAGE_OUTPUT_BYTES as usize);
             assert!(output.bytes().all(|byte| byte == b'x'));
         }
+    }
+
+    /// Each `codex cloud list` run is one provider-call line: at least one
+    /// OpenAI request, with how the run ended.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn each_cloud_list_run_is_one_provider_call_line() {
+        use crate::provider_calls::CallKind;
+        let scratch = temp_dir("cloud-call-log");
+        let previous_home = std::env::var_os("HOME");
+        let previous_support = std::env::var_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR");
+        std::env::set_var("HOME", scratch.join("home"));
+        std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", scratch.join("support"));
+        {
+            let _fixture = CloudCliFixture::new("output", br#"{"tasks":[]}"#, 0);
+            CodexCloudCliRunner
+                .list_page_bounded(None, PAGE_LIMIT, Duration::from_secs(2))
+                .unwrap();
+        }
+        {
+            let _fixture = CloudCliFixture::new("output", b"", 3);
+            CodexCloudCliRunner
+                .list_page_bounded(None, PAGE_LIMIT, Duration::from_secs(2))
+                .unwrap_err();
+        }
+        let lines = crate::provider_calls::test_lines(CallKind::CodexCloudList, "unknown");
+        let summary = lines
+            .iter()
+            .map(|line| {
+                (
+                    line.provider.as_str(),
+                    line.trigger.as_str(),
+                    line.result.as_str(),
+                    line.basis.as_str(),
+                    line.requests_at_least,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (key, value) in [
+            ("HOME", previous_home),
+            ("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", previous_support),
+        ] {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = fs::remove_dir_all(scratch);
+        assert_eq!(
+            summary,
+            [
+                ("openai", "schedule", "ok", "subprocess_lower_bound", 1),
+                ("openai", "schedule", "exited", "subprocess_lower_bound", 1),
+            ]
+        );
     }
 
     #[cfg(unix)]

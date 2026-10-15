@@ -1354,7 +1354,23 @@ impl ProviderDailyUsageReader for ChatGptDailyUsageReader {
         if let Some(account_id) = self.credential.account_id.as_deref() {
             request = request.set("ChatGPT-Account-Id", account_id);
         }
-        match request.call() {
+        let started = std::time::Instant::now();
+        let response = request.call();
+        crate::provider_calls::record(crate::provider_calls::ProviderCall::observed(
+            crate::provider_calls::Provider::Openai,
+            crate::provider_calls::CallKind::CodexDailyWorkspaceUsage,
+            crate::provider_calls::trigger_or(crate::provider_calls::Trigger::Schedule),
+            self.credential
+                .account_id
+                .as_deref()
+                .and_then(|account_id| {
+                    ottto_core::billing_identity_hash("openai", "account", account_id)
+                })
+                .as_deref(),
+            crate::provider_calls::http_result(&response),
+            started.elapsed(),
+        ));
+        match response {
             Ok(response) => response
                 .into_json::<Value>()
                 .map_err(|error| ProviderReadError::ResponseShape(format!("unreadable: {error}"))),

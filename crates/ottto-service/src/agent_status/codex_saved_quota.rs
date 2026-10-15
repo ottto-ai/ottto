@@ -910,20 +910,28 @@ fn read_homes(
     read: impl Fn(&ScheduledHome) -> Result<CodexUsageProbe, String> + Sync,
 ) -> usize {
     let (due, read) = (&due, &read);
+    // Each read logs the reason its caller gave.
+    let trigger = crate::provider_calls::current_trigger();
     thread::scope(|scope| {
         homes
             .into_iter()
             .map(|home| {
                 scope.spawn(move || {
-                    read_and_save_at(
-                        support_dir,
-                        &home.home,
-                        home.trust,
-                        now,
-                        |saved, now| due(saved, &home, now),
-                        || read(&home),
-                    )
-                    .is_some()
+                    let read_home = || {
+                        read_and_save_at(
+                            support_dir,
+                            &home.home,
+                            home.trust,
+                            now,
+                            |saved, now| due(saved, &home, now),
+                            || read(&home),
+                        )
+                        .is_some()
+                    };
+                    match trigger {
+                        Some(trigger) => crate::provider_calls::with_trigger(trigger, read_home),
+                        None => read_home(),
+                    }
                 })
             })
             .collect::<Vec<_>>()
@@ -1080,7 +1088,10 @@ pub(crate) fn stop_codex_quota_scheduler() {
 }
 
 fn run_scheduler(scheduler: &Scheduler) {
+    use crate::provider_calls::Trigger;
     let support_dir = saved_quota_support_dir();
+    // The first round reads every home the daemon has not read yet.
+    let mut trigger = Trigger::Startup;
     loop {
         if *scheduler
             .stopped
@@ -1092,8 +1103,11 @@ fn run_scheduler(scheduler: &Scheduler) {
         // New readings reach the upload with the lane's next timer pass; a
         // status read serves them at once.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            scheduled_round(&support_dir, current_unix_seconds())
+            crate::provider_calls::with_trigger(trigger, || {
+                scheduled_round(&support_dir, current_unix_seconds())
+            })
         }));
+        trigger = Trigger::Schedule;
         let stopped = scheduler
             .stopped
             .lock()

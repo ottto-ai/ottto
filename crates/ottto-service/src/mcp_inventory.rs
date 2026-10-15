@@ -763,7 +763,8 @@ fn harvest_stdio_bounded(
     timeout: Duration,
 ) -> Result<Vec<McpToolInput>> {
     use crate::claude_spawn_gate::probe::{ChildProbe, Origin, Reader, StartError, Writer};
-    let deadline = Instant::now() + timeout.min(HANDSHAKE_TIMEOUT);
+    let started = Instant::now();
+    let deadline = started + timeout.min(HANDSHAKE_TIMEOUT);
     let command = env.command_in(command, args, cwd, config_dir, server_env);
     let mut child = ChildProbe::spawn(command, claude_login, Origin::McpInventory, deadline)
         .map_err(|error| match error {
@@ -779,6 +780,24 @@ fn harvest_stdio_bounded(
     );
     let timed_out = Instant::now() >= deadline;
     child.finish(deadline);
+    // A Claude Code server may contact Anthropic while starting (at least
+    // zero requests); other servers are not provider calls.
+    if let Some(login) = claude_login {
+        use crate::provider_calls::{CallKind, CallResult, Provider, ProviderCall, Trigger};
+        crate::provider_calls::record(ProviderCall::subprocess(
+            Provider::Anthropic,
+            CallKind::ClaudeMcpInventoryProbe,
+            crate::provider_calls::trigger_or(Trigger::Schedule),
+            crate::provider_calls::claude_slot_account_hash(login).as_deref(),
+            match (&result, timed_out) {
+                (_, true) => CallResult::Timeout,
+                (Ok(_), false) => CallResult::Ok,
+                (Err(_), false) => CallResult::Error("handshake_error"),
+            },
+            started.elapsed(),
+            0,
+        ));
+    }
     if timed_out {
         Err(anyhow!("mcp handshake timed out"))
     } else {
@@ -1739,9 +1758,24 @@ mod tests {
         let response = json!({"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"fixture","description":"complete","inputSchema":schema}]}}).to_string();
         let fixture = ProbeFixture::new("probe-mcp-fidelity", "mcp", response.as_bytes(), 0);
         fs::write(fixture.fake.root.join("initialize"), "banner\r\n\n{\"jsonrpc\":\"2.0\",\"method\":\"notice\"}\n{\"id\":99,\"result\":{}}\n{\"id\":1,\"result\":{}}\n").unwrap();
+        let account = fixture.fake.default_account("mcp-account-uuid");
         let tools = probe_mcp(&fixture, true, Duration::from_secs(3)).unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "fixture");
+        // Claude Code as an MCP server may contact Anthropic while starting.
+        let lines = crate::provider_calls::test_lines(
+            crate::provider_calls::CallKind::ClaudeMcpInventoryProbe,
+            &account,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            (
+                lines[0].provider.as_str(),
+                lines[0].result.as_str(),
+                lines[0].requests_at_least
+            ),
+            ("anthropic", "ok", 0)
+        );
         assert_eq!(tools[0].description, "complete");
         assert_eq!(tools[0].input_schema, schema);
         let requests: Vec<Value> = fs::read_to_string(fixture.fake.root.join("requests"))

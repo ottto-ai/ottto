@@ -1443,6 +1443,7 @@ fn run_worker(operation_id: &str) {
         fail_operation(operation_id, ClaudeBrowserAuthOutcomeV1::LoginFailed);
         return;
     };
+    let mut sign_in_call = SignInCall::started(&config_dir);
     let Ok((_submission_registration, submissions)) = register_code_submissions(operation_id)
     else {
         cancel_provider_before_terminal(&mut child, operation_id);
@@ -1488,18 +1489,21 @@ fn run_worker(operation_id: &str) {
             return;
         }
         if cancel_requested(operation_id) {
+            sign_in_call.finish(crate::provider_calls::CallResult::Error("cancelled"));
             cancel_provider_before_terminal(&mut child, operation_id);
             fail_operation(operation_id, ClaudeBrowserAuthOutcomeV1::Cancelled);
             return;
         }
         match child.try_wait() {
             Ok(Some(status)) => {
+                sign_in_call.finish(crate::provider_calls::exit_result(Some(status), false));
                 if !status.success() {
                     cancel_provider_before_terminal(&mut child, operation_id);
                 }
                 break status.success();
             }
             Ok(None) if start.elapsed() >= LOGIN_TIMEOUT => {
+                sign_in_call.finish(crate::provider_calls::CallResult::Timeout);
                 cancel_provider_before_terminal(&mut child, operation_id);
                 fail_operation(operation_id, ClaudeBrowserAuthOutcomeV1::TimedOut);
                 return;
@@ -1545,6 +1549,50 @@ fn run_worker(operation_id: &str) {
             .is_none()
     {
         fail_operation(operation_id, ClaudeBrowserAuthOutcomeV1::LoginFailed);
+    }
+}
+
+/// The provider-call log line of one `claude auth login` run: written when
+/// the run ends, or when the worker gives up on it. A completed sign-in made
+/// at least the token exchange; an unfinished one may have made none.
+struct SignInCall<'a> {
+    config_dir: &'a str,
+    started: Instant,
+    pending: bool,
+}
+
+impl<'a> SignInCall<'a> {
+    fn started(config_dir: &'a str) -> Self {
+        Self {
+            config_dir,
+            started: Instant::now(),
+            pending: true,
+        }
+    }
+
+    fn finish(&mut self, result: crate::provider_calls::CallResult) {
+        use crate::provider_calls::{CallKind, CallResult, Provider, ProviderCall, Trigger};
+        if !std::mem::take(&mut self.pending) {
+            return;
+        }
+        let account = ottto_core::claude_cli_account_identifier_hash_at(
+            &Path::new(self.config_dir).join(".claude.json"),
+        );
+        crate::provider_calls::record(ProviderCall::subprocess(
+            Provider::Anthropic,
+            CallKind::ClaudeSignIn,
+            Trigger::Setup,
+            (!account.is_empty()).then_some(account.as_str()),
+            result,
+            self.started.elapsed(),
+            u32::from(result == CallResult::Ok),
+        ));
+    }
+}
+
+impl Drop for SignInCall<'_> {
+    fn drop(&mut self) {
+        self.finish(crate::provider_calls::CallResult::Error("abandoned"));
     }
 }
 
@@ -2041,11 +2089,9 @@ fn collect_allowed_quota(store: &FileClaudeConfigSlotSettingsStore, slot_id: &st
     let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::minutes(15))
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| captured_at.clone());
-    let quota = crate::agent_status::collect_registered_claude_slot_status(
-        slot_id,
-        captured_at,
-        expires_at,
-    );
+    let quota = crate::provider_calls::with_trigger(crate::provider_calls::Trigger::Setup, || {
+        crate::agent_status::collect_registered_claude_slot_status(slot_id, captured_at, expires_at)
+    });
     // Identity admission is durable independently of quota availability.
     // The collector itself returns typed unavailable/paused state; a local
     // persistence failure must not discard a valid provider connection.
@@ -4886,6 +4932,50 @@ mod tests {
         let retry_id = "claude_setup_11111111111111111111111111111111";
         assert!(claim_ceremony(retry_id).expect("recovery released ceremony"));
         release_ceremony(retry_id);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A sign-in run is one provider-call line for setup: a completed one
+    /// made at least the token exchange; one given up on is still logged.
+    #[test]
+    #[serial]
+    fn each_sign_in_run_is_one_provider_call_line() {
+        use crate::provider_calls::{CallKind, CallResult};
+        let root = temp_dir("sign-in-call-log");
+        let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", root.join("support"));
+        let config_dir = root.join("slot");
+        fs::create_dir_all(&config_dir).expect("slot");
+        fs::write(
+            config_dir.join(".claude.json"),
+            serde_json::json!({"oauthAccount": {"accountUuid": "sign-in-account-uuid"}})
+                .to_string(),
+        )
+        .expect("account");
+        let account =
+            ottto_core::claude_account_identifier_hash(Some("sign-in-account-uuid"), None, None);
+        let config = config_dir.to_str().expect("utf8");
+        SignInCall::started(config).finish(CallResult::Ok);
+        let mut cancelled = SignInCall::started(config);
+        cancelled.finish(CallResult::Error("cancelled"));
+        cancelled.finish(CallResult::Ok);
+        drop(SignInCall::started(config));
+        let lines = crate::provider_calls::test_lines(CallKind::ClaudeSignIn, &account);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (
+                    line.provider.as_str(),
+                    line.trigger.as_str(),
+                    line.result.as_str(),
+                    line.requests_at_least
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("anthropic", "setup", "ok", 1),
+                ("anthropic", "setup", "cancelled", 0),
+                ("anthropic", "setup", "abandoned", 0),
+            ]
+        );
         let _ = fs::remove_dir_all(root);
     }
 

@@ -259,6 +259,43 @@ backend publication or customer-page freshness completed. Legacy count-only
 responses and missing or truncated proof remain explicitly unproved; private
 evidence is diagnostic and never authorizes delivery or a retry.
 
+## Provider Requests
+
+The daemon keeps a local log of every call it makes to OpenAI and Anthropic:
+quota reads, sign-in and login-refresh runs of the provider CLIs, Codex cloud
+task listing, Codex daily usage totals, and Verify smoke prompts. Use it to
+count those calls per day and see why they ran:
+
+```bash
+ottto provider-requests
+ottto provider-requests --json --since 24h
+```
+
+Each call is one JSON line in `provider-calls/YYYY-MM-DD.jsonl` (UTC day) in
+the Ottto support directory, readable only by the user:
+
+```json
+{"v":1,"at":"2026-10-15T12:00:00Z","provider":"openai","kind":"codex_app_server_quota","trigger":"schedule","account":"01234567","result":"ok","duration_ms":1250,"basis":"subprocess_lower_bound","requests_at_least":2}
+```
+
+- `trigger` is `schedule`, `explicit_refresh`, `older_app_compat`, `setup`,
+  `startup` or `other`.
+- `account` is the first 8 hex characters of the account identifier hash, or
+  `unknown`.
+- `result` is `ok`, `http_<status>`, `timeout`, `exit_<code>` or a short
+  error class.
+- `basis` is `observed` for an HTTP request the daemon made itself (one
+  request), or `subprocess_lower_bound` for a provider CLI run, which makes at
+  least `requests_at_least` requests the daemon cannot see. A Codex quota read
+  through `codex app-server` asks for at least two: a token refresh and a
+  rate-limits read.
+
+Lines never contain tokens, URLs, prompts, emails or provider responses. Days
+older than 7 are deleted. A day holds at most 30,000 lines and 8 MiB, and the
+directory at most 32 MiB; a day that reaches its bound ends with one
+`log_full` line and the summary marks it. Logging is best effort and never
+fails or delays a provider call.
+
 ## Common Diagnostics Flow
 
 ```bash
