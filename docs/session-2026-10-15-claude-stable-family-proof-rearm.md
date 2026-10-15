@@ -20,7 +20,7 @@ At the terminal census, a proven family re-arms its earlier-page members only wh
 
 When the witness is unchanged, every earlier page already had it. Each member on those pages was either rebuilt from the reconstructed witness (same evidence digest, so the same rows) or demoted into the bounded authority quarantine, which owns that retry and is unchanged.
 
-All other terms of the clear are unchanged: the duplicate-fence full re-arm, an invalidated witness, a changed duplicate owner, and a member that owns a changed duplicated request.
+The clear still preserves the duplicate-fence full re-arm, invalidated witnesses, changed duplicate owners, and members that own a changed duplicated request. The duplicate-fence admission is tightened as described below.
 
 The terminal census now writes one aggregate log line when it re-arms anything, or keeps anything that the old rule would have re-armed. The line has file counts by first cause: full re-arm, new or changed family proof, invalidated witness, or changed request duplicate. It also has the number of unchanged proofs and the earlier-page files they kept, and the number of owned-start members re-armed in the pass. It has no identifiers or paths, reads nothing extra, and stores nothing.
 
@@ -29,8 +29,16 @@ The terminal census now writes one aggregate log line when it re-arms anything, 
 - A family proven for the first time re-arms its earlier-page members once.
 - A changed proof re-arms them once. This covers changed reported evidence, a changed member request set or occurrence, and a changed legacy exclusion.
 - A demoted body is still held and never uploaded; quarantine records, their retry cadence and their binding are unchanged.
-- Settlement, the stale-pending traversal-start re-arm, owned-start re-arm, duplicate witnesses, fence coverage and backoff, upload authority and body witnesses are unchanged.
+- Settlement, stale-pending traversal-start and owned-start re-arms, duplicate witnesses, full-rearm backoff, upload authority and body witnesses are unchanged. Fence coverage now requires actual current request observations.
 - Fingerprints already cleared by an older daemon stay cleared, so debt that exists when this change is installed is still reparsed once.
+
+## Request-owner coverage after an import
+
+A stable family witness binds aggregate request sets; it does not retain an index of individual request owners. Suppressing recurring reparses must not let a late copied transcript appear unique against a skipped family.
+
+Before updating witnesses, compare each nonempty observed member request set with its retained exact member digest, excluding only its already proven legacy prefix. A new or changed set needs actual current request-owner coverage. Partial pages suppress unique context posture while that comparison is incomplete. A terminal census with skipped indexed members closes the existing duplicate fence and uses its existing bounded full-rearm/backoff path. A bound quarantine preserves a hold but cannot substitute its stale pending evidence for actual current request observations. Only a full current comparison reopens the fence; exact duplicate ownership remains durable afterward. No new persisted field or file read is added.
+
+This optimizes idle/stable workloads. Frequent genuinely new request sets can still require repeated full censuses. It is not a general scan CPU cure or an installed performance result.
 
 ## Freshness after a member change
 
@@ -58,6 +66,8 @@ A shared setup runs the first proof and its cross-page correction and asserts on
 - `unhealthy_family_evidence_stays_held_without_renewed_family_reads` (either rule): malformed evidence holds the family the same way, without renewed reads.
 - `rearm_debt_survives_a_shed_correction_and_reload_until_accepted`: under either rule, a shed correction keeps the re-arm debt across the save and reload, and a later generation delivers the corrected body after its exact ACK. Its final quiet generations are the new rule only.
 
+The review correction adds real late-copy and novel-import pipeline cases through bounded pages, offers/ACKs and save/reload. They require fail-closed posture until actual owner coverage, exact duplicate detection, eventual novel-import recovery, and quiet stable generations. A fold test also requires a closed fence to survive a bound quarantine/reload and reopen only after actual current observations, retaining bounded backoff.
+
 ## Open items
 
 - The actual original-predicate baseline ran in CI38792771424 at ebf2fa99: both changed/unhealthy lifecycle tests passed, while the five stable-rule assertions failed as expected. Count/hash receipts include exact accepted correction and shed recovery; final optimized receipt comparison remains pending.
@@ -65,4 +75,4 @@ A shared setup runs the first proof and its cross-page correction and asserts on
 
 ## Limits
 
-This changes when the terminal census re-arms earlier-page members, and nothing else. It makes no claim about how much I/O is saved on any machine. It does not change the stale-pending or owned-start re-arms, the duplicate-fence full re-arm, the authority quarantine, or settlement.
+This changes stable family re-arm and requires current request-owner coverage before treating a newly observed request set as disjoint. It makes no claim about installed I/O savings. Stale-pending and owned-start re-arms, full-rearm scheduling/backoff, authority quarantine and upload settlement remain unchanged; a quarantine no longer excuses missing request-owner coverage.

@@ -335,3 +335,55 @@ fn member_change_after_unchanged_proof_fails_closed_until_family_reparse() {
         .claude_usage_authority_quarantine
         .contains_key(&root_session_id));
 }
+
+#[test]
+fn closed_owner_fence_does_not_treat_bound_quarantine_as_current_coverage() {
+    let mut family = Family::new();
+    let witness = family.proven_and_corrected();
+    family.index.claude_usage_authority_quarantine.insert(
+        family.root_session_id.clone(),
+        ClaudeUsageAuthorityQuarantineRecord {
+            contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
+            proven_witness_fingerprint: claude_usage_family_witness_fingerprint(&witness),
+            member_source_file_fingerprints: BTreeMap::from([
+                (family.root_session_id.clone(), revision(1)),
+                (
+                    format!("{}_agent-{CHILD_AGENT}", family.root_session_id),
+                    revision(2),
+                ),
+            ]),
+            failed_reconstruction_count: MAX_CLAUDE_USAGE_AUTHORITY_FAILURES,
+            disposition: ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+            retry_after_unix_seconds: claude_usage_authority_retry_deadline(
+                &family.root_session_id,
+                &claude_usage_family_witness_fingerprint(&witness),
+            ),
+        },
+    );
+    family.index.claude_duplicate_request_witness_overflowed = true;
+    family.reload();
+    let counts = family
+        .page(&mut [], true, "2026-08-02T07:30:00Z")
+        .duplicate_census;
+    assert!(counts.fence_after);
+    assert_eq!(counts.coverage_missing_member_count, 2);
+    assert!(counts.full_rearm);
+    family.reload();
+    let counts = family
+        .page(&mut [], true, "2026-08-02T07:30:01Z")
+        .duplicate_census;
+    assert!(counts.fence_after);
+    assert!(!counts.full_rearm, "existing retry backoff remains bounded");
+    family.reload();
+    let window = "2026-08-02T07:40:00Z";
+    let mut parent = family.parent(window);
+    family.page(&mut parent, false, window);
+    let mut child = family.child(window, 2);
+    let counts = family.page(&mut child, true, window).duplicate_census;
+    assert!(counts.coverage_complete);
+    assert!(
+        !counts.fence_after,
+        "only actual current request observations reopen the fence"
+    );
+    family.reload();
+}

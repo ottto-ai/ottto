@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 654,
-  "content_sha256": "477309836c11befdbb01b4c24bbd128ba1904db270fe13cdabe7c777f3b4b44d",
+  "content_sha256": "45b8d87040a89869a65d715d822c21a5a3b3f1fc0f8880f399d886295b0f19bb",
   "files": [
     {
       "executable": false,
@@ -1210,8 +1210,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/stable_proof_rearm_pipeline_tests.rs",
-      "sha256": "8064ee631f7cdc8530286ef73af8dc8505cab99c14182e3bbea82f5cd9776de4",
-      "size_bytes": 33765
+      "sha256": "77d270e785656cb26db59527a90b5a8c611f04b1bea43c230f053ea14e058699",
+      "size_bytes": 39402
     },
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "3faa4f93ead7ae275802ce5ddf7feee1bb420170ed996138253d31d4a245ff6e",
-      "size_bytes": 2455870
+      "sha256": "6b06466bb6ac7f145662f9d5231be0ebc87770de91b7db94cc15633cd5e89953",
+      "size_bytes": 2458439
     },
     {
       "executable": false,
@@ -1245,8 +1245,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/census_convergence_tests.rs",
-      "sha256": "592a1322e16d9bac54d3718b237b46d9d5494f2ec98b47c0664f7d631e485bcb",
-      "size_bytes": 46670
+      "sha256": "91ba25478b2c51ce109378699e9ec3e82f26332f6663f13a1228664785cc70ba",
+      "size_bytes": 46767
     },
     {
       "executable": false,
@@ -1287,8 +1287,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_usage_proof_rearm_tests.rs",
-      "sha256": "15c8c6dca29ec0fee3137da0d603faea81f6e19261980787614ada62e9b36958",
-      "size_bytes": 14056
+      "sha256": "efd1a6306a915fda87f75eac02634bffc3a96f0eaf50c01209e5ddc7928e76b6",
+      "size_bytes": 16221
     },
     {
       "executable": false,
@@ -2820,8 +2820,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-15-claude-stable-family-proof-rearm.md",
-      "sha256": "652e53076968128645895275b3870874cc3562f8f8d8eb9ecf4573d63dd0bb8e",
-      "size_bytes": 8537
+      "sha256": "2ad5b57eccd6b714a0ab5c6f894fd2cd98ff5fba85533c5ae49864cdc8ff6161",
+      "size_bytes": 10336
     },
     {
       "executable": false,
@@ -4581,7 +4581,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-15T19:37:49+00:00",
+  "generated_at": "2026-10-15T20:06:04+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 655,
   "public_roots": [
@@ -4620,5 +4620,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ebf2fa998c25aa1c338287d264a52c89fb5fa696"
+  "source_commit": "e8c97724deebe541151bc07ba090490338a614af"
 }

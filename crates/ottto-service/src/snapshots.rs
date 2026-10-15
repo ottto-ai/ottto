@@ -2713,8 +2713,9 @@ impl ClaudeUsageFamilyRearmCounts {
 /// current-window family came from stale unquarantined pending. Page counters
 /// name which pending check invalidated a family during this call. On a
 /// terminal pass, `coverage_complete` says whether every indexed Claude family
-/// member was observed in this census window (or is confirmed empty or held
-/// under a bound quarantine); a closed fence stays closed without it.
+/// member was observed in this census window (or is confirmed empty); a bound
+/// quarantine is not request-owner evidence. A closed fence stays closed without
+/// actual coverage.
 /// `full_rearm` names a full corrective re-arm on this pass, and
 /// `full_rearm_deferred_until` the persisted backoff deadline after it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -3852,6 +3853,43 @@ fn apply_claude_reported_usage_with_index_and_limits(
         BTreeMap::new()
     };
     let mut proven = BTreeMap::new();
+    // Retained family witnesses bind whole request sets, not an individual
+    // request-owner index. A newly observed set cannot be compared with a
+    // skipped member until a complete request census actually reads it. Take
+    // this comparison before replacing any family witness on this page.
+    let unobserved_request_owners =
+        index
+            .claude_usage_family_pending
+            .iter()
+            .any(|(root, pending)| {
+                !pending.invalid
+                    && pending.census_window_end == census_window_end
+                    && pending
+                        .member_request_id_hashes
+                        .iter()
+                        .any(|(member, hashes)| {
+                            if hashes.is_empty() {
+                                return false;
+                            }
+                            let Some(witness) = index.claude_usage_family_witnesses.get(root)
+                            else {
+                                return true;
+                            };
+                            // The retained member digest excludes an exactly
+                            // proven legacy prefix; compare the same request set.
+                            let excluded = witness.legacy_excluded_request_id_hashes.get(member);
+                            let observed = excluded.map(|excluded| {
+                                hashes
+                                    .difference(excluded)
+                                    .cloned()
+                                    .collect::<BTreeSet<_>>()
+                            });
+                            witness.member_request_id_fingerprints.get(member)
+                                != Some(&claude_request_id_set_fingerprint(
+                                    observed.as_ref().unwrap_or(hashes),
+                                ))
+                        })
+            });
     let reports_healthy = api_report.health.is_complete() && trace_report.is_complete();
     let legacy_request_owners = reports_healthy
         .then(|| claude_legacy_request_owners(api_report, trace_report))
@@ -4091,6 +4129,18 @@ fn apply_claude_reported_usage_with_index_and_limits(
                     })
             });
     duplicate_census.census_invalid = duplicate_census_invalid;
+    let coverage_missing_member_count = if census_complete {
+        claude_duplicate_fence_coverage_missing_member_count(index, census_window_end)
+    } else {
+        0
+    };
+    let request_ownership_needs_census =
+        unobserved_request_owners && (!census_complete || coverage_missing_member_count > 0);
+    if census_complete && request_ownership_needs_census {
+        eprintln!(
+            "local snapshot census requires current request-owner coverage for a new request set: {coverage_missing_member_count} indexed member(s) unobserved; duplicate fence stays closed"
+        );
+    }
     let detected_duplicate_request_owners = if census_complete && !duplicate_census_invalid {
         let mut owners = BTreeMap::<String, BTreeSet<(String, String)>>::new();
         for (root_session_id, pending) in &index.claude_usage_family_pending {
@@ -4142,6 +4192,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
     }
     if census_complete
         && !duplicate_census_invalid
+        && !request_ownership_needs_census
         && !index.claude_duplicate_request_witness_overflowed
     {
         let verified = index
@@ -4189,6 +4240,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
             .cloned()
             .unwrap_or_default();
         let unresolved_duplicate = duplicate_census_invalid
+            || request_ownership_needs_census
             || index.claude_duplicate_request_witness_overflowed
             || item.claude_usage_request_ids.iter().any(|request_id| {
                 let request_hash = format!("{:x}", Sha256::digest(request_id.as_bytes()));
@@ -4574,13 +4626,12 @@ fn apply_claude_reported_usage_with_index_and_limits(
             })
             .flat_map(|(_, owners)| owners.iter().cloned())
             .collect::<BTreeSet<_>>();
-        let coverage_missing_member_count =
-            claude_duplicate_fence_coverage_missing_member_count(index, census_window_end);
         duplicate_census.coverage_complete = coverage_missing_member_count == 0;
         duplicate_census.coverage_missing_member_count = coverage_missing_member_count;
         disposition.transcript_ownership_complete =
             claude_family_members_unobserved_count(index, census_window_end, false) == 0;
         if duplicate_census_invalid
+            || request_ownership_needs_census
             || !claude_duplicate_request_witness_within_bound(
                 &duplicate_witnesses_after,
                 max_duplicate_owners,
@@ -4907,20 +4958,20 @@ fn claude_pending_occurrence_count_after_replace(
 /// Indexed Claude family members a terminal pass did not observe in this exact
 /// census window. Pending is reset whenever its window changes, so a
 /// current-window, non-invalid member entry exists only if that member was
-/// parsed in this window. Confirmed-empty files carry no request, and members
-/// of a root held by a bound quarantine are excluded exactly as
-/// `duplicate_census_invalid` excludes that root's retained pending.
+/// parsed in this window. Confirmed-empty files carry no request. A bound
+/// quarantine can preserve a hold but cannot prove request-owner disjointness
+/// against a newly observed request set, so its stale evidence excuses nothing.
 fn claude_duplicate_fence_coverage_missing_member_count(
     index: &ScanIndex,
     census_window_end: &str,
 ) -> usize {
-    claude_family_members_unobserved_count(index, census_window_end, true)
+    claude_family_members_unobserved_count(index, census_window_end, false)
 }
 
 /// Indexed Claude family members whose current requests this census window did
-/// not observe. Confirmed-empty files hold none. The fence also excuses a
-/// family held by a bound authority quarantine (`quarantine_excused`), whose
-/// retained pending the census excludes; transcript ownership does not.
+/// not observe. Confirmed-empty files hold none. The optional quarantine
+/// exemption applies only to callers that do not establish request ownership;
+/// neither duplicate-fence nor transcript-owner coverage permits it.
 fn claude_family_members_unobserved_count(
     index: &ScanIndex,
     census_window_end: &str,

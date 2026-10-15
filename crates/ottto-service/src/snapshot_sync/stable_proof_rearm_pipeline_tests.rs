@@ -112,6 +112,7 @@ enum RearmUpload {
 
 struct RearmPage {
     scan: crate::snapshots::SourceScanResult,
+    duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
     /// Sessions the page parsed, before any hold removed a body.
     parsed: BTreeSet<String>,
     /// The index reloaded from disk after the page's durable save.
@@ -305,6 +306,7 @@ impl RearmFixture {
             .collect();
         let (mut disposition, _, _) =
             apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
+        let duplicate_census = disposition.duplicate_census;
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,
             REARM_MACHINE_ID,
@@ -386,6 +388,7 @@ impl RearmFixture {
             .expect("checkpoint shed page");
             return RearmPage {
                 scan,
+                duplicate_census,
                 parsed,
                 index: ScanIndex::load(&self.index_path).expect("reload scan index"),
                 fully_settled: false,
@@ -420,6 +423,7 @@ impl RearmFixture {
         .expect("save index and publish manifest");
         RearmPage {
             scan,
+            duplicate_census,
             parsed,
             index: ScanIndex::load(&self.index_path).expect("reload scan index"),
             fully_settled,
@@ -867,4 +871,152 @@ fn rearm_debt_survives_a_shed_correction_and_reload_until_accepted() {
             Some(proven.as_str())
         );
     }
+}
+
+// Both imports have independently complete provider evidence. The copied
+// request therefore looks owned in isolation, making this a regression oracle
+// for comparing the import against a settled family on earlier pages.
+fn assert_late_import_checks_settled_request_owners(copied: bool) {
+    use sha2::{Digest, Sha256};
+    const IMPORT: &str = "d4444444-4444-4444-8444-444444444444";
+    let fixture = RearmFixture::new(if copied {
+        "claude-stable-proof-rearm-late-copy"
+    } else {
+        "claude-stable-proof-rearm-novel-import"
+    });
+    let established = fixture.establish();
+    assert_eq!(rearm_reads(&fixture.generation(10)), 0);
+    let request = if copied {
+        "req_root_1"
+    } else {
+        "req_novel_import"
+    };
+    let path = fixture
+        .root
+        .join("zz-import")
+        .join("nested")
+        .join(format!("{IMPORT}.jsonl"));
+    RearmFixture::append(&path, &rearm_transcript_line(IMPORT, None, request, 0));
+    let (api, trace) = rearm_evidence_lines(None, request, 1);
+    let mut api: crate::claude_local_otel::ClaudeLocalOtelEvidence =
+        serde_json::from_str(&api).expect("synthetic API row");
+    let mut trace: crate::claude_local_otel::ClaudeTraceOwnershipEvidence =
+        serde_json::from_str(&trace).expect("synthetic trace row");
+    api.session_id = IMPORT.to_string();
+    api.fingerprint.clear();
+    api.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&api).unwrap())
+    );
+    trace.session_id = IMPORT.to_string();
+    trace.fingerprint.clear();
+    trace.fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&trace).unwrap())
+    );
+    for (kind, row) in [
+        ("claude-code-effort", serde_json::to_string(&api).unwrap()),
+        (
+            "claude-code-trace-ownership",
+            serde_json::to_string(&trace).unwrap(),
+        ),
+    ] {
+        let path = fixture
+            .support
+            .join("local-otel")
+            .join(kind)
+            .join(format!("{:x}.jsonl", Sha256::digest(IMPORT.as_bytes())));
+        RearmFixture::append(&path, &(row + "\n"));
+    }
+
+    let imported = fixture.generation(11);
+    let last = imported.last().unwrap();
+    assert!(
+        imported.len() > 1,
+        "the actual traversal crosses page boundaries"
+    );
+    assert!(last.scan.census_complete);
+    assert!(
+        last.duplicate_census.fence_after,
+        "unknown owner set cannot excuse skipped members"
+    );
+    assert!(!last.duplicate_census.coverage_complete);
+    assert!(last.duplicate_census.full_rearm);
+    assert_eq!(RearmFixture::family_heads(&last.index), established.heads);
+    assert_eq!(RearmFixture::family_rearm_debt(&last.index), 3);
+    let item = imported
+        .iter()
+        .flat_map(|page| &page.scan.snapshots)
+        .find(|item| item.source_session_id == IMPORT)
+        .expect("imported body");
+    assert_eq!(item.usage_accounting_contract.as_deref(), REARM_REPORTED);
+    assert_eq!(
+        item.first_turn_context_tokens, None,
+        "no falsely unique posture is offered before comparison"
+    );
+    assert_eq!(item.peak_context_fill_tokens, None);
+    assert_eq!(item.last_turn_context_tokens, None);
+
+    let covered = fixture.generation(12);
+    let last = covered.last().unwrap();
+    assert!(last.duplicate_census.coverage_complete);
+    assert!(!last.duplicate_census.fence_after);
+    let saved = serde_json::to_value(&last.index).unwrap();
+    let owners = saved["claude_duplicate_request_owners"]
+        .as_object()
+        .unwrap();
+    if copied {
+        let hash = format!("{:x}", Sha256::digest(request.as_bytes()));
+        assert_eq!(
+            owners[&hash].as_array().unwrap().len(),
+            2,
+            "current request observations identify both owners after restart"
+        );
+    } else {
+        assert!(
+            saved.get("claude_duplicate_request_owners").is_none(),
+            "an empty duplicate map is omitted from the saved index"
+        );
+    }
+    let corrected = fixture.generation(13);
+    let last = corrected.last().unwrap();
+    assert!(last.duplicate_census.coverage_complete);
+    assert!(!last.duplicate_census.fence_after);
+    let item = corrected
+        .iter()
+        .flat_map(|page| &page.scan.snapshots)
+        .find(|item| item.source_session_id == IMPORT)
+        .expect("corrective import body");
+    assert_eq!(
+        item.first_turn_context_tokens,
+        if copied { None } else { Some(10) }
+    );
+    assert!(
+        last.index
+            .accepted_snapshot_fingerprint_recorded(&item.snapshot_fingerprint),
+        "only the exact offered corrective body becomes accepted"
+    );
+    for hour in [14, 15] {
+        let quiet = fixture.generation(hour);
+        assert_eq!(
+            rearm_reads(&quiet),
+            0,
+            "hour {hour}: stable imports go quiet"
+        );
+        assert!(quiet.iter().all(|page| page.offered.is_empty()));
+    }
+}
+
+#[test]
+#[serial(source_manifests)]
+fn late_copied_request_requires_current_owner_coverage_across_pages_and_reload() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    assert_late_import_checks_settled_request_owners(true);
+}
+
+#[test]
+#[serial(source_manifests)]
+fn novel_import_recovers_after_owner_coverage_then_stops_reading() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    assert_late_import_checks_settled_request_owners(false);
 }
