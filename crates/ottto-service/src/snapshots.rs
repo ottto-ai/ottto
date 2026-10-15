@@ -5349,7 +5349,7 @@ fn reduce_claude_usage_ledger(
             || row.request_count != 1
             || !claude_api_evidence_fingerprint_is_valid(row)
             || OffsetDateTime::parse(&row.observed_at, &Rfc3339).is_err()
-            || api_by_request.insert(row.request_id.clone(), row).is_some()
+            || !insert_identical_claude_ledger_row(&mut api_by_request, &row.request_id, row)
         {
             return None;
         }
@@ -5361,9 +5361,7 @@ fn reduce_claude_usage_ledger(
             || row.request_id.is_empty()
             || !claude_trace_evidence_fingerprint_is_valid(row)
             || OffsetDateTime::parse(&row.observed_at, &Rfc3339).is_err()
-            || trace_by_request
-                .insert(row.request_id.clone(), row)
-                .is_some()
+            || !insert_identical_claude_ledger_row(&mut trace_by_request, &row.request_id, row)
         {
             return None;
         }
@@ -5413,6 +5411,24 @@ fn reduce_claude_usage_ledger(
         assigned_request_id_hashes: assigned_hashes,
         rows_by_member,
     })
+}
+
+/// Keep one ledger row per request id. A repeat is idempotent only when it is
+/// the same evidence in every field (a replayed capture of an already-validated
+/// row); a repeat that differs anywhere, even with a matching fingerprint
+/// string, refuses the ledger.
+fn insert_identical_claude_ledger_row<'r, T: PartialEq>(
+    rows_by_request: &mut BTreeMap<String, &'r T>,
+    request_id: &str,
+    row: &'r T,
+) -> bool {
+    match rows_by_request.entry(request_id.to_string()) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(row);
+            true
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => *entry.get() == row,
+    }
 }
 
 fn claude_trace_owner_session_id(root_session_id: &str, agent_id: &str) -> String {
@@ -37129,6 +37145,225 @@ mod tests {
         row.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
         row
     }
+
+    type ClaudeLedgerFixture = (
+        String,
+        BTreeSet<String>,
+        Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>,
+        Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>,
+    );
+
+    fn claude_ledger_duplicate_fixture() -> ClaudeLedgerFixture {
+        let root = "5d0c8a62-3f41-4b7e-9a10-0c1d2e3f4a5b".to_string();
+        let agent = "a4d1585d310070d0f";
+        let members = BTreeSet::from([root.clone(), claude_trace_owner_session_id(&root, agent)]);
+        let api = vec![
+            complete_api_row(&root, "req_1", 1, 10, 1, 0),
+            complete_api_row(&root, "req_2", 2, 20, 2, 5),
+            complete_api_row(&root, "req_3", 3, 30, 3, 0),
+        ];
+        let trace = vec![
+            complete_trace_row(&root, "req_1", ""),
+            complete_trace_row(&root, "req_2", agent),
+            complete_trace_row(&root, "req_3", ""),
+        ];
+        (root, members, api, trace)
+    }
+
+    fn refingerprint_claude_api_row(row: &mut crate::claude_local_otel::ClaudeLocalOtelEvidence) {
+        row.fingerprint.clear();
+        row.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&row).unwrap())
+        );
+    }
+
+    fn refingerprint_claude_trace_row(
+        row: &mut crate::claude_local_otel::ClaudeTraceOwnershipEvidence,
+    ) {
+        row.fingerprint.clear();
+        row.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&row).unwrap())
+        );
+    }
+
+    type ClaudeLedgerOutcome = (
+        String,
+        BTreeMap<String, BTreeSet<String>>,
+        BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
+        BTreeMap<String, [u64; 6]>,
+    );
+
+    fn claude_ledger_outcome(ledger: &ReducedClaudeUsageLedger) -> ClaudeLedgerOutcome {
+        let totals = ledger
+            .rows_by_member
+            .iter()
+            .map(|(member, rows)| {
+                let mut total = [0u64; 6];
+                for row in rows {
+                    total[0] += row.request_count;
+                    total[1] += row.input_tokens;
+                    total[2] += row.output_tokens;
+                    total[3] += row.cache_read_tokens;
+                    total[4] += row.cache_creation_tokens;
+                    total[5] += row.cost_usd_micros.unwrap_or_default();
+                }
+                (member.clone(), total)
+            })
+            .collect();
+        (
+            ledger.evidence_fingerprint.clone(),
+            ledger.assigned_request_id_hashes.clone(),
+            ledger.rows_by_member.clone(),
+            totals,
+        )
+    }
+
+    #[test]
+    fn claude_usage_ledger_identical_repeats_are_idempotent_and_order_invariant() {
+        let (root, members, api, trace) = claude_ledger_duplicate_fixture();
+        let unique = claude_ledger_outcome(
+            &reduce_claude_usage_ledger(&root, &members, &api, &trace)
+                .expect("unique evidence proves the ledger"),
+        );
+        let child = claude_trace_owner_session_id(&root, "a4d1585d310070d0f");
+        assert_eq!(unique.3[&root], [2, 40, 4, 0, 0, 200]);
+        assert_eq!(unique.3[&child], [1, 20, 2, 0, 5, 100]);
+
+        fn rev<T: Clone>(rows: &[T]) -> Vec<T> {
+            rows.iter().rev().cloned().collect()
+        }
+        fn doubled<T: Clone>(rows: &[T]) -> Vec<T> {
+            rows.iter().chain(rows).cloned().collect()
+        }
+        fn interleaved<T: Clone>(rows: &[T]) -> Vec<T> {
+            rows.iter().flat_map(|row| [row, row]).cloned().collect()
+        }
+        let api_rotated = [&api[1..], &api[..1], &api[1..2], &api[1..2]].concat();
+        let trace_rotated = [&trace[2..], &trace[..2], &trace[..1]].concat();
+        let variants = [
+            ("reversed_unique", rev(&api), rev(&trace)),
+            ("doubled", doubled(&api), doubled(&trace)),
+            (
+                "interleaved_reversed",
+                rev(&interleaved(&api)),
+                interleaved(&rev(&trace)),
+            ),
+            ("api_only_repeated", doubled(&api), trace.clone()),
+            ("trace_only_repeated", api.clone(), doubled(&trace)),
+            ("rotated_triple", api_rotated, trace_rotated),
+        ];
+        for (name, api_rows, trace_rows) in variants {
+            let before = claude_evidence_fingerprint_checks();
+            let reduced = reduce_claude_usage_ledger(&root, &members, &api_rows, &trace_rows)
+                .unwrap_or_else(|| panic!("{name}: identical repeats must prove"));
+            let after = claude_evidence_fingerprint_checks();
+            assert_eq!(
+                (after.0 - before.0, after.1 - before.1),
+                (api_rows.len() as u64, trace_rows.len() as u64),
+                "{name}: every row, repeated or not, is validated"
+            );
+            assert_eq!(
+                claude_ledger_outcome(&reduced),
+                unique,
+                "{name}: totals, digest and ownership match unique input"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_usage_ledger_non_identical_or_invalid_repeats_fail_closed() {
+        let (root, members, api, trace) = claude_ledger_duplicate_fixture();
+        let base_api = [api.clone(), api.clone()].concat();
+        let base_trace = [trace.clone(), trace.clone()].concat();
+        let cases: [(&str, ClaudeLedgerMutation); 12] = [
+            ("conflicting_api", |api, _| {
+                let mut row = api[1].clone();
+                row.output_tokens += 1;
+                refingerprint_claude_api_row(&mut row);
+                api.push(row);
+            }),
+            ("conflicting_trace_owner", |_, trace| {
+                let mut row = trace[1].clone();
+                row.agent_id.clear();
+                refingerprint_claude_trace_row(&mut row);
+                trace.push(row);
+            }),
+            ("api_copied_fingerprint", |api, _| {
+                // Same request id and fingerprint string, different evidence.
+                let mut row = api[1].clone();
+                row.cost_usd_micros = Some(999);
+                api.push(row);
+            }),
+            ("trace_copied_fingerprint", |_, trace| {
+                let mut row = trace[1].clone();
+                row.workflow_run_id = "other-run".into();
+                trace.push(row);
+            }),
+            ("identical_invalid_fingerprint", |api, _| {
+                for row in api.iter_mut().filter(|row| row.request_id == "req_2") {
+                    row.fingerprint = "bad".into();
+                }
+            }),
+            ("identical_malformed_rows", |api, _| {
+                for row in api.iter_mut().filter(|row| row.request_id == "req_2") {
+                    row.observed_at = "not-a-time".into();
+                    refingerprint_claude_api_row(row);
+                }
+            }),
+            ("identical_foreign_owner", |_, trace| {
+                for row in trace.iter_mut().filter(|row| row.request_id == "req_3") {
+                    row.agent_id = "foreign".into();
+                    refingerprint_claude_trace_row(row);
+                }
+            }),
+            ("foreign_root_repeat", |api, _| {
+                let mut row = api[2].clone();
+                row.session_id = "other-root".into();
+                refingerprint_claude_api_row(&mut row);
+                api.push(row);
+            }),
+            ("wrong_revision_repeat", |api, _| {
+                let mut row = api[0].clone();
+                row.capture_revision = "claude_api_request:v1".into();
+                refingerprint_claude_api_row(&mut row);
+                api.push(row);
+            }),
+            ("missing_api_partner", |api, _| {
+                api.retain(|row| row.request_id != "req_3");
+            }),
+            ("missing_trace_partner", |_, trace| {
+                trace.retain(|row| row.request_id != "req_3");
+            }),
+            ("identical_client_mismatch", |_, trace| {
+                for row in trace.iter_mut().filter(|row| row.request_id == "req_1") {
+                    row.client_request_id = "client-other".into();
+                    refingerprint_claude_trace_row(row);
+                }
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut api_rows = base_api.clone();
+            let mut trace_rows = base_trace.clone();
+            mutate(&mut api_rows, &mut trace_rows);
+            assert!(
+                reduce_claude_usage_ledger(&root, &members, &api_rows, &trace_rows).is_none(),
+                "{name}"
+            );
+            api_rows.reverse();
+            trace_rows.reverse();
+            assert!(
+                reduce_claude_usage_ledger(&root, &members, &api_rows, &trace_rows).is_none(),
+                "{name} reversed"
+            );
+        }
+    }
+
+    type ClaudeLedgerMutation = fn(
+        &mut Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>,
+        &mut Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>,
+    );
 
     #[test]
     fn claude_pending_usage_occurrence_limit_is_replacement_aware() {
