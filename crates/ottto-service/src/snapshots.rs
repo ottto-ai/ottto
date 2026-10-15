@@ -45846,7 +45846,9 @@ mod tests {
         metadata: &ClaudeTitleMetadata,
         prefix: &str,
     ) -> SnapshotItem {
-        let root = temp_dir("claude-original-carrier");
+        // Several tests call this helper concurrently. Timestamp-only names
+        // plus create_dir_all can adopt another call's transcript directory.
+        let root = crate::test_scratch::ScratchDir::new("claude-original-carrier");
         let path = root.join("native-session.jsonl");
         let record = json!({"timestamp":"2026-09-30T10:00:00Z", "type":"assistant",
             "sessionId":"native-session", "requestId":"owned-request", "message":{
@@ -45874,12 +45876,11 @@ mod tests {
             true,
             "2026-09-30T10:05:00Z",
         );
-        fs::remove_dir_all(root).unwrap();
         item
     }
 
     fn claude_original_carrier_metadata() -> ClaudeTitleMetadata {
-        let root = temp_dir("claude-original-native-index");
+        let root = crate::test_scratch::ScratchDir::new("claude-original-native-index");
         let path = root
             .join("123e4567-e89b-12d3-a456-426614174000")
             .join("123e4567-e89b-12d3-a456-426614174001")
@@ -45904,7 +45905,6 @@ mod tests {
         let restored: ScanIndex =
             serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
         let metadata = ClaudeTitleMetadata::from_durable_index(&restored, false);
-        fs::remove_dir_all(root).unwrap();
         metadata
     }
 
