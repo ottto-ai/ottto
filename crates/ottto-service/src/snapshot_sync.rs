@@ -367,7 +367,9 @@ struct UploadIndexSettlement {
 /// A persisted account hold was never uploaded, so the backfill and replay it
 /// belongs to stay pending even on a page that did not revisit it.
 fn upload_settled_without_account_holds(index: &ScanIndex, settled: bool) -> bool {
-    settled && index.claude_account_deferred_hold_count() == 0
+    settled
+        && index.claude_account_deferred_hold_count() == 0
+        && !index.claude_authority_proof_correction_pending()
 }
 
 /// Settle a `Completed` upload: every uploaded entity was accepted or
@@ -1608,6 +1610,7 @@ fn checkpoint_partial_snapshot_index(
     committed_index: &ScanIndex,
     progress: &SnapshotUploadProgress,
     snapshots: &[SnapshotItem],
+    correction_scan: Option<&SourceScanResult>,
     locally_held: &BTreeSet<String>,
     index_path: &Path,
     progress_path: &Path,
@@ -1618,6 +1621,7 @@ fn checkpoint_partial_snapshot_index(
         committed_index,
         progress,
         snapshots,
+        correction_scan,
         locally_held,
         index_path,
         progress_path,
@@ -1632,6 +1636,7 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
     committed_index: &ScanIndex,
     progress: &SnapshotUploadProgress,
     snapshots: &[SnapshotItem],
+    correction_scan: Option<&SourceScanResult>,
     locally_held: &BTreeSet<String>,
     index_path: &Path,
     progress_path: &Path,
@@ -1702,6 +1707,11 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
         .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
         .collect();
     let mut committable = index.committable_subset(committed_index, &accepted, &quarantined);
+    if let Some(scan) = correction_scan {
+        // A2: settle no-body grants only against the file/empty/map facts
+        // actually selected for this save, after any old-entry restoration.
+        committable.settle_empty_claude_proof_corrections(scan);
+    }
     committable.mark_bounded_sweep_unsettled();
     validate_destination()?;
     if let Some(cap) = read_limit {
@@ -4036,6 +4046,26 @@ fn finish_sync_source(
         &index,
         &upload_progress.quarantined_fingerprints,
     );
+    // Preserve current-proof/current-revision evidence before the finalizer
+    // removes exact semantic no-ops. Held/account-filtered bodies are excluded.
+    let claude_proof_correction_candidates = if source == SnapshotSource::ClaudeCode {
+        index.capture_claude_proof_corrections(
+            &mut scan_result,
+            &claude_authority_disposition,
+            |snapshot| {
+                effective_snapshot_upload_body_witness(
+                    snapshot,
+                    &upload_progress,
+                    cache_observations_enabled,
+                    activity_hint.snapshot_head_cas_required,
+                    &legacy_reconciliation_pending,
+                    &claude_authority_disposition,
+                )
+            },
+        )
+    } else {
+        Vec::new()
+    };
     finalize_scan_after_policy_with_body_witness(
         source,
         &mut scan_result,
@@ -4051,6 +4081,7 @@ fn finish_sync_source(
             )
         },
     );
+    index.advance_empty_claude_proof_corrections(&scan_result);
     if source == SnapshotSource::Codex {
         capture_codex_recovery_evidence(
             &mut index,
@@ -4351,6 +4382,22 @@ fn finish_sync_source(
     })
     .map(|result| with_bootstrap_deferred(result, bootstrap_deferred));
 
+    // Exact progress is durable before this seam. The same subsequent index
+    // save carries settled file bodies and correction progress; local-state
+    // errors cannot certify an uncertain ACK. UnACKed/held members stay owed.
+    if !upload_result.as_ref().err().is_some_and(|error| {
+        snapshot_upload_error_class(error) == Some(SnapshotUploadErrorClass::LocalState)
+    }) {
+        index.settle_claude_proof_corrections(
+            &committed_index,
+            &claude_proof_correction_candidates,
+            &upload_progress.accepted_fingerprints,
+            &upload_progress.accepted_body_witnesses,
+        );
+    }
+
+    index.log_claude_proof_correction_debt();
+
     // The server may have accepted new entities even when the final result is a
     // timeout, a disabled response, or a later local-state failure. Withdraw
     // the pre-cycle cache for every outcome; completed/shed branches republish
@@ -4413,6 +4460,7 @@ fn finish_sync_source(
                 &committed_index,
                 &upload_progress,
                 &scan_result.snapshots,
+                Some(&scan_result),
                 locally_held_fingerprints,
                 &index_path,
                 &upload_progress_path,
@@ -4521,6 +4569,7 @@ fn finish_sync_source(
                     &committed_index,
                     &upload_progress,
                     &scan_result.snapshots,
+                    Some(&scan_result),
                     locally_held_fingerprints,
                     &index_path,
                     &upload_progress_path,
@@ -4684,6 +4733,9 @@ fn finish_sync_source(
     }
 
     settle_index_after_upload(&mut index, &committed_index, &upload_progress);
+    // Completed/checkpointed outcomes have now selected their retained file
+    // facts. No-body completion must share that exact durable checkpoint.
+    index.settle_empty_claude_proof_corrections(&scan_result);
     // A quiet/delta-only scan still discloses current permanent refusals even
     // though no body needed another upload. The committed census owns scope.
     let current_entities = index.current_snapshot_fingerprints();
@@ -5110,7 +5162,6 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
             trace_report.evidence.insert(root_session_id, rows);
         }
     }
-    let census_window_end = scan_result.census_window_end.clone();
     // Contract-5 evidence exists only under this cycle's permit; the reported
     // rebuild then classifies and groups each request as it places it.
     let identity_evidence = emission_permitted.then(|| {
@@ -5122,13 +5173,11 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
     });
-    let mut disposition = crate::snapshots::apply_claude_reported_usage_with_identity(
-        &mut scan_result.snapshots,
+    let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_identity(
+        scan_result,
         &api_report,
         &trace_report,
         index,
-        census_complete,
-        &census_window_end,
         identity_evidence.as_ref(),
     );
     if let Some(evidence) = &identity_evidence {
@@ -16668,6 +16717,9 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
+    mod authority_proof_correction_pipeline_tests {
+        include!("snapshot_sync/authority_proof_correction_pipeline_tests.rs");
+    }
     #[test]
     fn codex_union_native_transport_common_ack_crash_checkpoint_and_restart() {
         codex_union_native_transport_restart(false, false);
@@ -16901,6 +16953,7 @@ mod tests {
                 &baseline,
                 &progress,
                 &result.snapshots,
+                None,
                 &BTreeSet::new(),
                 &index_path,
                 &progress_path,
@@ -17197,6 +17250,7 @@ mod tests {
             &baseline,
             &restarted_progress,
             &restarted.snapshots,
+            None,
             &BTreeSet::new(),
             &index_path,
             &progress_path,
@@ -17370,6 +17424,7 @@ mod tests {
                 &self.baseline,
                 &self.progress,
                 &self.items,
+                None,
                 &BTreeSet::new(),
                 &self.index_path,
                 &self.progress_path,
@@ -17647,6 +17702,7 @@ mod tests {
             &f.baseline,
             &f.progress,
             &f.items,
+            None,
             &BTreeSet::new(),
             &f.index_path,
             &f.progress_path,

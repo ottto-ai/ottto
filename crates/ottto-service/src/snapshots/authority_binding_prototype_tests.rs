@@ -38,6 +38,7 @@ fn fixture() -> (ScanIndex, [CandidateFile; 2]) {
     index.claude_usage_authority_quarantine.insert(
         ROOT.to_string(),
         ClaudeUsageAuthorityQuarantineRecord {
+            proof_correction: None,
             contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
             proven_witness_fingerprint: claude_usage_family_witness_fingerprint(&witness),
             member_source_file_fingerprints: members.into_iter().zip(revisions.clone()).collect(),

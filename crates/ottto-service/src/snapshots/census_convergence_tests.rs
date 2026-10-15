@@ -79,6 +79,7 @@ fn bind_authority_quarantine(
         }
     };
     let record = ClaudeUsageAuthorityQuarantineRecord {
+        proof_correction: None,
         contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
         proven_witness_fingerprint: claude_usage_family_witness_fingerprint(&witness),
         member_source_file_fingerprints: BTreeMap::from([(

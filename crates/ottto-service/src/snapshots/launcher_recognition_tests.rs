@@ -226,6 +226,7 @@ fn claude_quarantine_preflight_with_launch_keeps_the_physical_identity_fence() {
     index.claude_usage_authority_quarantine.insert(
         WORKER.to_owned(),
         ClaudeUsageAuthorityQuarantineRecord {
+            proof_correction: None,
             contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_owned(),
             proven_witness_fingerprint: "previous-provider-witness".into(),
             member_source_file_fingerprints: BTreeMap::from([(
@@ -572,6 +573,7 @@ fn held_claude_launcher_revision_keeps_retry_cadence_after_restart() {
         held.claude_usage_authority_quarantine.insert(
             WORKER.into(),
             ClaudeUsageAuthorityQuarantineRecord {
+                proof_correction: None,
                 contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.into(),
                 proven_witness_fingerprint: claude_usage_family_witness_fingerprint(&witness),
                 member_source_file_fingerprints: BTreeMap::from([(
@@ -650,6 +652,7 @@ fn launch_family_reconciliation_preserves_deadline_witness_revision_and_membersh
     index.claude_usage_authority_quarantine.insert(
         WORKER.into(),
         ClaudeUsageAuthorityQuarantineRecord {
+            proof_correction: None,
             contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.into(),
             proven_witness_fingerprint: claude_usage_family_witness_fingerprint(&witness),
             member_source_file_fingerprints: BTreeMap::from([(
