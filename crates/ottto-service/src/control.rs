@@ -11495,7 +11495,7 @@ fn run_smoke_prompt(source: &SourceKind) -> SmokeResult {
         SourceKind::Codex => record_smoke_prompt(
             crate::provider_calls::Provider::Openai,
             crate::provider_calls::CallKind::CodexSmokePrompt,
-            crate::agent_status::default_codex_home_claimed_account_hash(),
+            crate::agent_status::codex_cli_home_claimed_account_hash(),
             &result,
         ),
         SourceKind::ClaudeCode => record_smoke_prompt(

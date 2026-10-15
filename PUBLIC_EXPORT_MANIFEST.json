@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 643,
-  "content_sha256": "361fd784bb632d3d1f781c6bdf5b357ae4a81c8c7019642f3c95b475f760db74",
+  "content_sha256": "476bdc6e35fd99b456e2fbef1c4c818e7d23ca7e1274eb50ea5d01ec0fd49ac1",
   "files": [
     {
       "executable": false,
@@ -580,8 +580,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/provider_call_log.rs",
-      "sha256": "328dd09c6a13817df69920961539a3a06d2178fa467bd1f39bf29eb308aa6269",
-      "size_bytes": 44186
+      "sha256": "fbabbbfa0acbc84115725c88fccd31bb5936426e5b541a2dc99ffc324a47c4f6",
+      "size_bytes": 45230
     },
     {
       "executable": false,
@@ -692,8 +692,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "3d47548c62ca6a5568c4cade7441d3cb889a9d6a46f6df94d35ae832ea3274a5",
-      "size_bytes": 1561196
+      "sha256": "e88cf585a9ca8f369ec78a180262193949bff1cd665c98a270f9e27522d89b7c",
+      "size_bytes": 1563678
     },
     {
       "executable": false,
@@ -839,8 +839,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/cloud_sessions.rs",
-      "sha256": "ba53ff32269695164ba942389c43b5ba097f372b391fffcefe67894038e06f6c",
-      "size_bytes": 369254
+      "sha256": "a6e5b1368499fb919ea34369e4643f27b3f55db09368d2eaff7ed283a3726334",
+      "size_bytes": 369250
     },
     {
       "executable": false,
@@ -895,8 +895,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "f7c67cb07f9dd5135eba95f60b072a1f7fcdce1b8ca4ea1535dd392f138e296a",
-      "size_bytes": 1216260
+      "sha256": "4e079fca3a54240b38a9394da103a1dfe23902e725a4450a4f03b538c86b67ef",
+      "size_bytes": 1216256
     },
     {
       "executable": false,
@@ -1056,8 +1056,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/provider_daily_reference.rs",
-      "sha256": "8b444b545e0f3a85d0e9e1c133fc798d5179b55f585736623bd796e00465340c",
-      "size_bytes": 225436
+      "sha256": "4a155c56f6e63a08e1d6115cf811c12cc88f42ada1f3dd812628c025c7ae87ec",
+      "size_bytes": 225419
     },
     {
       "executable": false,
@@ -1455,8 +1455,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/diagnostics.md",
-      "sha256": "4b57790dfe18de6d46987962d1b5e2ce4ecd7d22cc1a74e6f8b2a3951f7d2517",
-      "size_bytes": 15447
+      "sha256": "c24ea058632d3bbf65ae86144aab4b105513277ff402e37b6786e9e621f549e9",
+      "size_bytes": 15499
     },
     {
       "executable": false,
@@ -4504,7 +4504,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-15T02:08:04+00:00",
+  "generated_at": "2026-10-15T02:22:39+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 644,
   "public_roots": [

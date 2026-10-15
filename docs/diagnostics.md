@@ -287,8 +287,8 @@ the Ottto support directory, readable only by the user:
 - `basis` is `observed` for an HTTP request the daemon made itself (one
   request), or `subprocess_lower_bound` for a provider CLI run, which makes at
   least `requests_at_least` requests the daemon cannot see. A Codex quota read
-  through `codex app-server` asks for at least two: a token refresh and a
-  rate-limits read.
+  through `codex app-server` counts the requests the CLI answered: two (a token
+  refresh and a rate-limits read) or three for a successful read.
 
 Lines never contain tokens, URLs, prompts, emails or provider responses. Days
 older than 7 are deleted. A day holds at most 30,000 lines and 8 MiB, and the

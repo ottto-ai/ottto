@@ -1360,13 +1360,9 @@ impl ProviderDailyUsageReader for ChatGptDailyUsageReader {
             crate::provider_calls::Provider::Openai,
             crate::provider_calls::CallKind::CodexDailyWorkspaceUsage,
             crate::provider_calls::trigger_or(crate::provider_calls::Trigger::Schedule),
-            self.credential
-                .account_id
-                .as_deref()
-                .and_then(|account_id| {
-                    ottto_core::billing_identity_hash("openai", "account", account_id)
-                })
-                .as_deref(),
+            // The credential comes from `~/.codex/auth.json`: name its user as
+            // every other Codex line does (`account_id` is the workspace).
+            crate::agent_status::default_codex_home_claimed_account_hash().as_deref(),
             crate::provider_calls::http_result(&response),
             started.elapsed(),
         ));

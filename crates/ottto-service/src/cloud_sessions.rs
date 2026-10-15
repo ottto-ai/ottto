@@ -2274,7 +2274,7 @@ fn record_codex_cloud_list(result: &Result<String>, started: Instant) {
         Provider::Openai,
         CallKind::CodexCloudList,
         crate::provider_calls::trigger_or(Trigger::Schedule),
-        crate::agent_status::default_codex_home_claimed_account_hash().as_deref(),
+        crate::agent_status::codex_cli_home_claimed_account_hash().as_deref(),
         result,
         started.elapsed(),
         1,

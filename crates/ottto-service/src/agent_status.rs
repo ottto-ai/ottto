@@ -14723,12 +14723,29 @@ pub(crate) fn codex_home_claimed_account_hash(
 }
 
 /// The account the default Codex home's credential claims, for the
-/// provider-call log of Codex CLI runs that use that home.
+/// provider-call log of reads that use `~/.codex` itself.
 pub(crate) fn default_codex_home_claimed_account_hash() -> Option<String> {
     if !crate::provider_calls::home_readable_for_account() {
         return None;
     }
     codex_home_claimed_account_hash(&default_codex_home(), CodexHomeTrust::ProviderDefault)
+}
+
+/// The account a Codex CLI run started with the daemon's environment signs
+/// in as (its `CODEX_HOME`, else `~/.codex`), for the provider-call log.
+pub(crate) fn codex_cli_home_claimed_account_hash() -> Option<String> {
+    let home = std::env::var_os("CODEX_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from);
+    match home {
+        Some(home) => {
+            if !crate::provider_calls::home_readable_for_account() {
+                return None;
+            }
+            codex_home_claimed_account_hash(&home, CodexHomeTrust::ProviderDefault)
+        }
+        None => default_codex_home_claimed_account_hash(),
+    }
 }
 
 fn codex_credential_claimed_binding(credentials: &CodexAuthCredentials) -> Option<String> {
@@ -15194,9 +15211,10 @@ fn codex_app_server_end_failure(
 #[derive(Debug, Default)]
 struct CodexAppServerRun {
     spawned: bool,
-    /// Provider requests sent: the account read (it refreshes the token),
-    /// the rate-limits read, and a detailed rate-limits read.
-    requests_sent: u32,
+    /// Provider requests the CLI answered: the account read (it refreshes
+    /// the token), the rate-limits read, and a detailed rate-limits read. A
+    /// request it rejected or never answered may not have left the Mac.
+    requests_answered: u32,
     timed_out: bool,
 }
 
@@ -15231,7 +15249,7 @@ fn call_codex_app_server_rate_limits_for_home(
             account.as_deref(),
             result_class,
             started.elapsed(),
-            run.requests_sent,
+            run.requests_answered,
         ));
     }
     result
@@ -15331,7 +15349,6 @@ fn run_codex_app_server_rate_limits_for_home(
         let _ = child.wait();
         return Err(message);
     }
-    run.requests_sent = 1;
 
     let start = Instant::now();
     let mut deadline = start + CODEX_APP_SERVER_TIMEOUT;
@@ -15390,7 +15407,11 @@ fn run_codex_app_server_rate_limits_for_home(
             (Some("ottto_account"), Some(error)) => {
                 break Err(rpc_failure("account", error));
             }
-            (Some("ottto_account"), None) => account_result = message.get("result").cloned(),
+            (Some("ottto_account"), None) => {
+                let answered = account_result.is_some();
+                account_result = message.get("result").cloned();
+                run.requests_answered += u32::from(!answered && account_result.is_some());
+            }
             (Some("ottto_rate_limits"), Some(error))
                 if !detail_requested && codex_credit_grants::routine_param_rejected(error) =>
             {
@@ -15406,6 +15427,7 @@ fn run_codex_app_server_rate_limits_for_home(
                     .get("result")
                     .cloned()
                     .map(|result| (result, arrived_at()));
+                run.requests_answered += u32::from(rate_limits_result.is_some());
             }
             (Some(codex_credit_grants::DETAIL_READ_ID), Some(error)) => {
                 if rate_limits_result.is_none() {
@@ -15414,10 +15436,12 @@ fn run_codex_app_server_rate_limits_for_home(
                 detail_failed = true;
             }
             (Some(codex_credit_grants::DETAIL_READ_ID), None) => {
+                let answered = detail_result.is_some();
                 detail_result = message
                     .get("result")
                     .cloned()
                     .map(|result| (result, arrived_at()));
+                run.requests_answered += u32::from(!answered && detail_result.is_some());
             }
             _ => {}
         }
@@ -15426,7 +15450,6 @@ fn run_codex_app_server_rate_limits_for_home(
                 break Err("Codex app-server quota request failed.".to_string());
             }
             rate_limits_requested = true;
-            run.requests_sent += 1;
         }
         if !send_details && !detail_requested {
             if let (Some(account), Some((rate_limits, _))) =
@@ -15451,7 +15474,6 @@ fn run_codex_app_server_rate_limits_for_home(
                 }
                 break Err("Codex app-server quota request failed.".to_string());
             }
-            run.requests_sent += 1;
             continue;
         }
         if detail_requested
@@ -23340,6 +23362,46 @@ for line in sys.stdin:
             assert_closed_during(&message, phase, observed_end);
             assert_no_provider_text(&message);
         }
+    }
+
+    /// Each app-server run that started is one provider-call line, counting
+    /// only the provider requests the CLI answered: a run that failed before
+    /// the account read answered counts none.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_probe_runs_count_only_answered_provider_requests() {
+        use crate::provider_calls::CallKind;
+        let support = crate::test_scratch::ScratchDir::new("codex-probe-call-log");
+        let _support = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support.as_os_str().to_os_string(),
+        );
+        let modes = [
+            "initialize_error",
+            "account_error",
+            "quota_error",
+            "quota_eof",
+            "success",
+        ];
+        for mode in modes {
+            let _ = run_codex_probe_failure_fake(mode);
+        }
+        let lines = crate::provider_calls::test_lines(CallKind::CodexAppServerQuota, "unknown");
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.result.as_str(), line.requests_at_least))
+                .collect::<Vec<_>>(),
+            [
+                ("rpc_error", 0),
+                ("rpc_error", 0),
+                ("rpc_error", 1),
+                ("exited", 1),
+                ("ok", 2),
+            ]
+        );
+        assert!(!crate::provider_calls::test_raw_log().contains("sensitive-provider-text"));
     }
 
     #[cfg(unix)]

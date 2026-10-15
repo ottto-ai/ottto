@@ -67,7 +67,8 @@ pub enum CallKind {
     /// `GET chatgpt.com/.../daily-workspace-usage-counts` (Codex daily totals).
     CodexDailyWorkspaceUsage,
     /// One `codex app-server` quota read: a token refresh and a rate-limits
-    /// read, plus a detailed rate-limits read when due.
+    /// read, plus a detailed rate-limits read when due. Counts the requests
+    /// the CLI answered (2 or 3 for a successful read).
     CodexAppServerQuota,
     /// One `codex cloud list` page.
     CodexCloudList,
@@ -761,7 +762,15 @@ pub fn summarize_provider_calls(
                 summary.skipped_lines += 1;
                 continue;
             };
-            if at < since_at || at > now.saturating_add(SECONDS_PER_DAY) {
+            let is_log_full = line.kind == LOG_FULL_KIND;
+            // A full day drops every later call that day: it concerns any
+            // window that reaches past the marker into that day.
+            let in_window = if is_log_full {
+                at <= now && since_at < (epoch_day(at) as u64 + 1) * SECONDS_PER_DAY
+            } else {
+                at >= since_at && at <= now.saturating_add(SECONDS_PER_DAY)
+            };
+            if !in_window {
                 continue;
             }
             let day = days
@@ -772,7 +781,7 @@ pub fn summarize_provider_calls(
                         .to_string(),
                     ..ProviderCallDay::default()
                 });
-            if line.kind == LOG_FULL_KIND {
+            if is_log_full {
                 day.log_full = true;
                 continue;
             }
@@ -1047,6 +1056,19 @@ mod tests {
         assert_eq!(summary.days.len(), 1);
         assert!(summary.days[0].log_full);
         assert_eq!(summary.calls, MAX_ENTRIES_PER_DAY);
+        // A window that starts after the day filled still says so.
+        let later =
+            summarize_provider_calls(&support, Some(Duration::from_secs(600)), at(NOON + 7_200));
+        assert_eq!(later.calls, 0);
+        assert_eq!(later.days.len(), 1);
+        assert!(later.days[0].log_full);
+        // A window that starts the next day does not.
+        let next_day = summarize_provider_calls(
+            &support,
+            Some(Duration::from_secs(60)),
+            at(NOON + SECONDS_PER_DAY),
+        );
+        assert!(next_day.days.iter().all(|day| !day.log_full));
         // The next day starts a new file.
         record_provider_call(
             &support,
