@@ -60,8 +60,8 @@ A shared setup runs the first proof and its cross-page correction and asserts on
 
 ## Open items
 
-- Running the shared setup under the original re-arm rule, for comparison through the receipts, has not been done yet.
-- When a changed proof is created while a member is still held under a quarantine bound to the previous witness, the saved index may fail its load validation and be rebuilt. This predates the change and is being characterized separately.
+- The actual original-predicate baseline ran in CI38792771424 at ebf2fa99: both changed/unhealthy lifecycle tests passed, while the five stable-rule assertions failed as expected. Count/hash receipts include exact accepted correction and shed recovery; final optimized receipt comparison remains pending.
+- A separate diagnostic baseline test reproduced saved-index quarantine/rebuild after repeated genuine member appends, at synthetic hour12. The family had three indexed files before reload and none afterward. This predates the change; its failing test and CI evidence are retained separately for recovery repair. It is not fixed by this optimization.
 
 ## Limits
 

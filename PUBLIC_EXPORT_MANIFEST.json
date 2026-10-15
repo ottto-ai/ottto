@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 654,
-  "content_sha256": "9d9e84be9ded273f0133e30542d9593d71ebf8127aa0ff75282b0dd744095615",
+  "content_sha256": "477309836c11befdbb01b4c24bbd128ba1904db270fe13cdabe7c777f3b4b44d",
   "files": [
     {
       "executable": false,
@@ -1210,8 +1210,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/stable_proof_rearm_pipeline_tests.rs",
-      "sha256": "a67439c98724433bbd76cd7a64ee023f6f7709b8193cd3a2351da39bfd1eb034",
-      "size_bytes": 35561
+      "sha256": "8064ee631f7cdc8530286ef73af8dc8505cab99c14182e3bbea82f5cd9776de4",
+      "size_bytes": 33765
     },
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "5dd5ee0c125dbd6030179346a011dbc2ba25ab88ea822075d7aa97efe62386b3",
-      "size_bytes": 2455804
+      "sha256": "3faa4f93ead7ae275802ce5ddf7feee1bb420170ed996138253d31d4a245ff6e",
+      "size_bytes": 2455870
     },
     {
       "executable": false,
@@ -2820,8 +2820,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-15-claude-stable-family-proof-rearm.md",
-      "sha256": "a2e9be649fb17156279251249c79b3629b4d6ce0588d50a9d62bfb0c0ebec6c2",
-      "size_bytes": 8238
+      "sha256": "652e53076968128645895275b3870874cc3562f8f8d8eb9ecf4573d63dd0bb8e",
+      "size_bytes": 8537
     },
     {
       "executable": false,
@@ -4581,7 +4581,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-15T19:17:20+00:00",
+  "generated_at": "2026-10-15T19:37:49+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 655,
   "public_roots": [
@@ -4620,5 +4620,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ad7f19f7c7d1d178c77be1fd0e613f4a5e0c124a"
+  "source_commit": "ebf2fa998c25aa1c338287d264a52c89fb5fa696"
 }

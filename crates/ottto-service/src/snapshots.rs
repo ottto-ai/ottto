@@ -4669,7 +4669,8 @@ fn apply_claude_reported_usage_with_index_and_limits(
                 });
             let earlier_page_member = proven.contains_key(&root_session_id)
                 && !current_ids.contains(source_session_id.as_str());
-            let proof_changed = earlier_page_member;
+            let proof_changed =
+                earlier_page_member && changed_proof_roots.contains(&root_session_id);
             let witness_invalidated = invalidated_witness_roots.contains(&root_session_id);
             let duplicate_changed = changed_duplicate_owners.contains(&duplicate_owner)
                 || current_member_owns_changed_request;
