@@ -355,6 +355,10 @@ pub(crate) struct Grouping {
     keys: BTreeSet<AuthorityKey>,
     keys_over_cap: bool,
     failed: Option<Ineligible>,
+    /// Requests a `RequestSink` admitted: those the item's transcript holds,
+    /// and telemetry-only (auxiliary) ones the reported rebuild added.
+    transcript_requests: u64,
+    telemetry_only_requests: u64,
 }
 
 impl Grouping {
@@ -366,6 +370,8 @@ impl Grouping {
             keys: BTreeSet::new(),
             keys_over_cap: false,
             failed: None,
+            transcript_requests: 0,
+            telemetry_only_requests: 0,
         }
     }
 
@@ -470,6 +476,20 @@ impl Grouping {
 
     fn rows(&self) -> impl Iterator<Item = (&RowKey, &RowGroup)> {
         self.groups.values().flatten()
+    }
+
+    /// The reported rebuild counted exactly the requests it admitted: every
+    /// transcript request of the item (none excluded), plus telemetry-only
+    /// requests, each once (the ledger holds one row per request id). Those
+    /// telemetry-only requests are classified on their own rows; the
+    /// transcript request-id set itself is not widened.
+    fn admitted_reported_requests(&self, item: &SnapshotItem) -> bool {
+        u64::try_from(item.claude_usage_request_ids.len())
+            .is_ok_and(|transcript| transcript > 0 && self.transcript_requests == transcript)
+            && self
+                .transcript_requests
+                .checked_add(self.telemetry_only_requests)
+                == Some(item.request_count)
     }
 }
 
@@ -1789,6 +1809,11 @@ impl<'s, 'a> RequestSink<'s, 'a> {
         if self.grouping.failed.is_some() {
             return;
         }
+        let admitted = match request.occurrence {
+            Some(_) => &mut self.grouping.transcript_requests,
+            None => &mut self.grouping.telemetry_only_requests,
+        };
+        *admitted = admitted.saturating_add(1);
         let (sequence, event_clock_complete) = request.occurrence.unzip();
         let duplicated_elsewhere = self.duplicates.is_some_and(|duplicates| {
             !duplicates.is_empty()
@@ -1998,8 +2023,11 @@ fn tag_item(
     ownership: &TranscriptOwnership<'_>,
 ) -> Option<Result<Tagged, Ineligible>> {
     let root = owner_root(item)?;
+    let reported_usage = item.usage_accounting_contract.as_deref() == Some(REPORTED);
     if !item.claude_context_curve_request_index_complete
-        || claude_snapshot_request_id_hashes(item).is_none()
+        // A reported item also counts telemetry-only requests; its rebuild's
+        // admitted requests are checked against its grouping below instead.
+        || (!reported_usage && claude_snapshot_request_id_hashes(item).is_none())
         || item
             .attribution_facts
             .iter()
@@ -2016,8 +2044,12 @@ fn tag_item(
     {
         return None;
     }
-    let mut grouping = if item.usage_accounting_contract.as_deref() == Some(REPORTED) {
-        reported.remove(&item.source_session_id)?
+    let mut grouping = if reported_usage {
+        let grouping = reported.remove(&item.source_session_id)?;
+        if !grouping.admitted_reported_requests(item) {
+            return None;
+        }
+        grouping
     } else {
         let mut sink = RequestSink::for_item(evidence, item, bucket_row_count(item))?
             .with_duplicates(ownership.duplicates);

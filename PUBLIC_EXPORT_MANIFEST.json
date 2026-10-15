@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 649,
-  "content_sha256": "bc3322fe471407dc3ccceeb5bf3e708007f7237ed452a516f272fb898f8b3a32",
+  "candidate_file_count": 650,
+  "content_sha256": "e0134d9a556da5db8d1b8e60ab474b580bfb3fb63d044221a97f682af17ce429",
   "files": [
     {
       "executable": false,
@@ -1259,15 +1259,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_identity.rs",
-      "sha256": "b5ec2537fb2a97765f7b47384f366c2915d8a4ac6bb570cec2daf560469b0b3e",
-      "size_bytes": 78383
+      "sha256": "9d931ac381140b6a40094c275fce931d43af8e4256653ed2683fe12825027eb6",
+      "size_bytes": 79999
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_identity_tests.rs",
-      "sha256": "41849b6f009213d564e0917d8a9c28483ec7260fa8126523ac231b1ace1541ff",
-      "size_bytes": 125708
+      "sha256": "3882d4b5c975dedecafe611f74ff0dbc46c48458b9c1f43454b16299687f9811",
+      "size_bytes": 134877
     },
     {
       "executable": false,
@@ -2780,6 +2780,13 @@
       "path": "docs/session-2026-10-14-stale-older-rejection-reason.md",
       "sha256": "d0d32bc3dbfa2c5041603debed5db2a136fdb83256c0cbe3ae65b1b4a67592db",
       "size_bytes": 1344
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-15-claude-reported-telemetry-only-requests.md",
+      "sha256": "7e34045c5c7f0c6cc72405284a3d80dd1295f6c337258961c3b52617f6e79a17",
+      "size_bytes": 7054
     },
     {
       "executable": false,
@@ -4548,7 +4555,7 @@
   ],
   "generated_at": "2026-10-15T09:37:57+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 650,
+  "output_file_count": 651,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
