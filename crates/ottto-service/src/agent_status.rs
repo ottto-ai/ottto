@@ -3406,6 +3406,7 @@ fn build_codex_runtime_defaults_at(
         fast_mode_enabled,
         priority_enabled: None,
         reasoning_effort: defaults.reasoning_effort,
+        reasoning_effort_by_model: BTreeMap::new(),
         approval_policy: defaults.approval_policy,
         sandbox_mode: None,
         selector_context: defaults.selector_context,
@@ -3483,10 +3484,11 @@ fn claude_runtime_defaults_from_paths(
                     speed_mode: None,
                     fast_mode_enabled: defaults.fast_mode_enabled,
                     priority_enabled: None,
-                    // Claude Code's durable `effortLevel` setting, which
-                    // `/effort` writes. Reported exactly as configured; absent
-                    // means absent, never an invented default.
+                    // The saved model's `/effort` (or the legacy top-level
+                    // `effortLevel`), plus every model's saved effort. Reported
+                    // exactly as configured; absent means absent.
                     reasoning_effort: defaults.reasoning_effort,
+                    reasoning_effort_by_model: defaults.reasoning_effort_by_model,
                     approval_policy: defaults.approval_policy,
                     sandbox_mode: defaults.sandbox_mode,
                     selector_context: defaults.selector_context,

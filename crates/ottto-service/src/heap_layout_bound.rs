@@ -367,7 +367,7 @@ impl HeapLayoutBound for serde_json::Value {
 
 crate::heap_layout_bound::fields!(ottto_protocol::AgentStatusSnapshot; source, status, collection_method, captured_at, expires_at, account, model, quota_windows, credit_balances, context, capabilities, plan_observations, diagnostics, runtime_defaults);
 
-crate::heap_layout_bound::fields!(ottto_protocol::AgentRuntimeDefaults; captured_at, provenance, machine_id, model, service_tier, speed_mode, fast_mode_enabled, priority_enabled, reasoning_effort, approval_policy, sandbox_mode, selector_context, selector_sources);
+crate::heap_layout_bound::fields!(ottto_protocol::AgentRuntimeDefaults; captured_at, provenance, machine_id, model, service_tier, speed_mode, fast_mode_enabled, priority_enabled, reasoning_effort, reasoning_effort_by_model, approval_policy, sandbox_mode, selector_context, selector_sources);
 
 crate::heap_layout_bound::fields!(ottto_protocol::AgentStatusDiagnostic; code, severity, message, observed_at, retry_after, account_identifier_hash, organization_identifier_hash, account_label, scope);
 
