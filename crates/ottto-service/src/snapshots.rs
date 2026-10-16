@@ -11928,20 +11928,31 @@ impl OwnedSourceScan {
         (&self.index, &self.snapshots)
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_native_comparison(
         &mut self,
         rows: claude_native_comparison::PairedRows<'_>,
     ) -> claude_native_comparison::Qualification {
+        self.prepare_native_comparison_with_window(rows, None)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn prepare_native_comparison_with_window(
+        &mut self,
+        rows: claude_native_comparison::PairedRows<'_>,
+        previous: Option<Box<claude_native_comparison::WindowEligibility>>,
+    ) -> Option<claude_native_comparison::Qualification> {
         let healthy = self.native_comparison_is_healthy();
         let phase = self
             .native_comparison
             .as_mut()
             .expect("native comparison opted in");
-        let qualification = if healthy {
-            phase.qualify(&self.index, &self.snapshots, &self.census_window_end, rows)
-        } else {
-            claude_native_comparison::Qualification::default()
-        };
+        let qualification =
+            if healthy && phase.import_window(previous, &self.index, &self.census_window_end) {
+                Some(phase.qualify(&self.index, &self.snapshots, &self.census_window_end, rows))
+            } else {
+                None
+            };
         phase.resume();
         qualification
     }

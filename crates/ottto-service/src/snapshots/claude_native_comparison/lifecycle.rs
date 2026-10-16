@@ -1,5 +1,6 @@
 //! Process-only bootstrap, owned by the daemon rather than the disk index or
 //! parser cache. Every lease starts fail-closed; errors/drop cannot renew it.
+use super::WindowEligibility;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Default)]
@@ -12,6 +13,7 @@ struct State {
     generation: u64,
     scope: Option<String>,
     valid: bool,
+    window: Option<Box<WindowEligibility>>,
 }
 
 pub(crate) struct Lease {
@@ -24,6 +26,7 @@ pub(crate) struct Lease {
     selected_save: bool,
     native_save: bool,
     finished: bool,
+    window: Option<Box<WindowEligibility>>,
 }
 
 impl Lifecycle {
@@ -38,10 +41,12 @@ impl Lifecycle {
             selected_save: false,
             native_save: false,
             finished: false,
+            window: None,
         };
         if let Ok(mut state) = self.state.lock() {
             lease.previous_valid = state.valid;
             lease.previous_scope = state.scope.take();
+            lease.window = state.window.take();
             state.valid = false;
             if let Some(next) = state.generation.checked_add(1) {
                 state.generation = next;
@@ -49,6 +54,26 @@ impl Lifecycle {
             }
         }
         lease
+    }
+
+    /// Ordinary gate on the actual borrowed graph, under a known lock. Never
+    /// use mutable Arc/Mutex completion sizing or a second rotation allowance.
+    pub(crate) fn retained_bound(&self, limit: usize) -> Option<usize> {
+        let state = self.state.try_lock().ok()?;
+        match state.window.as_ref() {
+            Some(window) => crate::heap_layout_bound::bound(window, limit),
+            None => Some(0),
+        }
+    }
+
+    pub(crate) fn discard_retained(&self) {
+        // Poison may be recovered ONLY to destroy the graph and permission.
+        // All lock holders perform bounded state moves, never I/O/callbacks.
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.window = None;
+        state.scope = None;
+        state.valid = false;
+        state.generation = state.generation.saturating_add(1);
     }
 }
 
@@ -64,6 +89,9 @@ impl Lease {
         // No alternate context or generation can later revive the old grant.
         self.previous_scope = None;
         self.previous_valid = false;
+        if !self.allowed {
+            self.window = None;
+        }
     }
 
     pub(crate) fn allowed(&self) -> bool {
@@ -77,6 +105,29 @@ impl Lease {
         self.allowed = false;
         self.selected_save = false;
         self.native_save = false;
+        self.window = None;
+    }
+
+    pub(crate) fn take_window(&mut self) -> Option<Box<WindowEligibility>> {
+        if !self.allowed() {
+            self.window = None;
+        }
+        self.window.take()
+    }
+
+    pub(crate) fn stage_window_after_save(
+        &mut self,
+        window: Option<Box<WindowEligibility>>,
+        index: &super::ScanIndex,
+        complete: bool,
+    ) {
+        self.window = None;
+        if self.selected_save && self.allowed() && !complete {
+            self.window = window.map(|mut window| {
+                window.retain_current(index);
+                window
+            });
+        }
     }
 
     /// Call only AFTER the actual selected-index save, from the actual native
@@ -94,6 +145,11 @@ impl Lease {
                     && self.scope.is_some()
                     && self.selected_save
                     && (self.native_save || self.allowed);
+                state.window = if state.valid {
+                    self.window.take()
+                } else {
+                    None
+                };
             }
         }
         self.finished = true;
@@ -106,6 +162,7 @@ impl Drop for Lease {
             if let Ok(mut state) = self.owner.state.lock() {
                 if self.generation == Some(state.generation) {
                     state.valid = false;
+                    state.window = None;
                 }
             }
         }
@@ -113,5 +170,5 @@ impl Drop for Lease {
 }
 
 crate::heap_layout_bound::fields!(Lifecycle; state);
-crate::heap_layout_bound::fields!(State; generation, scope, valid);
-crate::heap_layout_bound::fields!(Lease; owner, generation, previous_scope, previous_valid, scope, allowed, selected_save, native_save, finished);
+crate::heap_layout_bound::fields!(State; generation, scope, valid, window);
+crate::heap_layout_bound::fields!(Lease; owner, generation, previous_scope, previous_valid, scope, allowed, selected_save, native_save, finished, window);

@@ -335,3 +335,47 @@ Their declared costs test arithmetic and ownership transfer, not compiler
 layout or RSS. They require hosted CI. The concrete lifecycle certificate graph
 and its owner hooks remain unwired; these tests do not prove actual certificate
 carry, complete root revocation, original optimized oracles or resource savings.
+
+## Concrete process-owned window descriptors
+
+A move-only boxed window now retains actual normal-Skip descriptors, each
+root's frozen proof digest, and sticky revocation names. Provider rows, assigned
+request sets and envelope maps drop before the authoritative fold. The process
+lease moves this graph out of lifecycle state; wrong scope, drop, failed finish
+or explicit revocation destroys permission. A known selected save and clean
+finish can transfer it back for a nonterminal page. Terminal completion closes
+the store. No index/wire format or persistent metadata changes.
+
+The next page imports only the same census window, checks the retained proof,
+membership, exact revisions, context and exclusion state, then reconstructs P
+using that page's own paired rows. Parsed or previously withdrawn roots cannot
+revive from later Skips. A positive target hit records a sticky withdrawal.
+Before retention, the final selected index is rechecked for proof, membership,
+revision, quarantine, held/empty/terminal or context changes. These checks do
+not make an envelope ownership or coverage evidence.
+
+The concrete rotation hooks measure the actual externally retained box with
+the existing ordinary requested-layout gate under a known lock. A moved graph
+is frame-owned and reports zero external charge. Accounting refusal discards
+the whole store and permit and invalidates outstanding lease generations.
+Poisoned state may be recovered only to discard it. Production remains disabled;
+the hooks report zero when the experiment is disabled. No compiler/layout guard
+or allowance changes.
+
+Five new tests require hosted validation. They cover an actual bounded Skip and
+selected save against the real sizing gate, current-row reconstruction across
+two actual page visits, a later native parse withdrawing an earlier sibling,
+proof/membership/empty/context loss, and wrong-window/missing-save/scope/restart
+controls. The direct import checks are source-component tests before lifecycle
+and budget admission; they do not prove the original optimized pipeline. On an
+unsupported compiler the real sizing test must report no admission and revoke
+permission; the supported-layout ownership branch then remains unexecuted.
+
+The preceding parse-event/shared-budget checkpoint
+`63e3d9ec35f0276620c8b1f3bf4c2410720420df`, hosted CI `38942387854`, passed
+all four checks: 2,926 service tests passed, zero failed, 24 ignored, including
+31 native-comparison and five budget tests. That proof does not validate this
+new graph integration. Exhaustive revocation, real parked-sibling/lease graph
+admission, positive end-to-end source bootstrap, both selected-state recovery
+callbacks, the final rearm gate, the unchanged original oracles and measured
+resource benefit remain unfinished. No installed performance acceptance exists.

@@ -1004,13 +1004,16 @@ impl NativePreparationFixture {
         }
     }
     fn paused(&self) -> OwnedSourceScan {
+        self.paused_with_limit(8)
+    }
+    fn paused_with_limit(&self, limit: usize) -> OwnedSourceScan {
         let mut state = OwnedSourceScan::new_with_identity_capture(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&self.dir),
             self.index.clone(),
             WINDOW,
             30,
-            8,
+            limit,
             false,
             None,
             &[],
@@ -2438,4 +2441,227 @@ fn native_comparison_empty_parse_withdraws_sibling_without_native_body() {
         proof_before
     );
     writeln!(std::io::stderr().lock(), "native_comparison_parse_revocation: actual_empty_parse=1 native_bodies=0 sibling_negative_members=0 retained_proof_unchanged=true crosspage_carry_unwired=true").unwrap();
+}
+
+struct NativeWindowPage {
+    index: ScanIndex,
+    scan: SourceScanResult,
+    window: Box<claude_native_comparison::WindowEligibility>,
+    clean: bool,
+}
+
+fn native_window_page(fixture: &NativePreparationFixture) -> NativeWindowPage {
+    let mut state = fixture.paused_with_limit(1);
+    assert_eq!(state.scanned_file_count, 0);
+    let healthy = BTreeSet::from([fixture.parent.clone()]);
+    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+        api: &fixture.api.evidence,
+        trace: &fixture.trace.evidence,
+        healthy_roots: &healthy,
+    });
+    assert_eq!(qualification.certified_member_count(), 1);
+    let mut controller = claude_native_comparison::Controller::new(qualification);
+    assert!(controller.advance(&mut state, true));
+    let mut window = controller.into_window(&state.census_window_end).unwrap();
+    let (mut index, mut scan) = SelectionFixture::run(state);
+    assert!(!scan.census_complete);
+    assert!(scan.snapshots.is_empty());
+    let disposition = apply_claude_reported_usage_with_index(
+        &mut scan.snapshots,
+        &fixture.api,
+        &fixture.trace,
+        &mut index,
+        scan.census_complete,
+        &scan.census_window_end,
+    );
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+    window.retain_current(&index);
+    assert_eq!(window.certified_member_count(), 1);
+    let clean = claude_native_comparison::selected_page_is_clean(&scan, &index, &disposition);
+    assert!(clean);
+    NativeWindowPage {
+        index,
+        scan,
+        window,
+        clean,
+    }
+}
+
+#[test]
+fn native_comparison_window_saved_graph_obeys_real_layout_gate() {
+    let mut fixture = NativePreparationFixture::new();
+    let scratch = crate::test_scratch::ScratchDir::new("native-window-layout");
+    let path = scratch.join("index.json");
+    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut bootstrap = owner.begin();
+    bootstrap.bind("window-source-destination-context".into());
+    fixture.index.save(&path).unwrap();
+    bootstrap.note_selected_save(fixture.native_conjunction);
+    bootstrap.finish(true);
+    let mut lease = owner.begin();
+    lease.bind("window-source-destination-context".into());
+    assert!(lease.allowed());
+    let mut page = native_window_page(&fixture);
+    let pointer = page.window.as_ref() as *const _ as usize;
+    page.index.save(&path).unwrap();
+    lease.note_selected_save(false);
+    lease.stage_window_after_save(Some(page.window), &page.index, page.scan.census_complete);
+    lease.finish(page.clean);
+    let bound = owner.retained_bound(crate::source_rotation::PARKED_BUDGET);
+    if crate::heap_layout_bound::layout_supported() {
+        assert!(bound.is_some_and(|bytes| bytes > 0));
+        let mut next = owner.begin();
+        next.bind("window-source-destination-context".into());
+        assert!(next.allowed());
+        assert_eq!(
+            owner.retained_bound(crate::source_rotation::PARKED_BUDGET),
+            Some(0),
+            "the moved graph is now frame-owned, not external retention"
+        );
+        let graph = next.take_window().unwrap();
+        assert_eq!(graph.as_ref() as *const _ as usize, pointer);
+        assert_eq!(graph.certified_member_count(), 1);
+        drop(next);
+    } else {
+        assert!(bound.is_none(), "unsupported compiler must remain refused");
+        owner.discard_retained();
+        let mut next = owner.begin();
+        next.bind("window-source-destination-context".into());
+        assert!(!next.allowed());
+        assert!(next.take_window().is_none());
+    }
+    writeln!(std::io::stderr().lock(), "native_comparison_window: actual_partial_skip=1 actual_selected_save=true requested_layout={bound:?} supported_move_exercised={} full_driver_proved=false", crate::heap_layout_bound::layout_supported()).unwrap();
+}
+
+#[test]
+fn native_comparison_window_component_reconstructs_same_census_current_rows() {
+    let mut fixture = NativePreparationFixture::new();
+    let page = native_window_page(&fixture);
+    fixture.index = page.index;
+    let mut next = fixture.paused_with_limit(1);
+    let healthy = BTreeSet::from([fixture.parent.clone()]);
+    let qualification = next
+        .prepare_native_comparison_with_window(
+            claude_native_comparison::PairedRows {
+                api: &fixture.api.evidence,
+                trace: &fixture.trace.evidence,
+                healthy_roots: &healthy,
+            },
+            Some(page.window),
+        )
+        .unwrap();
+    assert_eq!(qualification.certified_member_count(), 2);
+    assert!(next.snapshots.is_empty());
+    // A source-component check before lifecycle/budget admission. This cannot
+    // establish that the original optimized pipeline or a layout gate passes.
+    writeln!(std::io::stderr().lock(), "native_comparison_window: actual_skip_pages=2 current_rows_reconstructed=true component_members=2 lifecycle_budget_admission_proved=false original_oracle_passed=false").unwrap();
+}
+
+#[test]
+fn native_comparison_window_later_parse_withdraws_carried_sibling() {
+    let mut fixture = NativePreparationFixture::new();
+    let page = native_window_page(&fixture);
+    let old_key = page.window.first_key_for_test().unwrap().to_owned();
+    fixture.index = page.index;
+    let next_key = fixture
+        .index
+        .files
+        .keys()
+        .find(|key| **key != old_key)
+        .unwrap()
+        .clone();
+    fixture
+        .index
+        .files
+        .get_mut(&next_key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    let mut next = fixture.paused_with_limit(1);
+    assert_eq!(next.scanned_file_count, 1);
+    let healthy = BTreeSet::from([fixture.parent.clone()]);
+    let qualification = next
+        .prepare_native_comparison_with_window(
+            claude_native_comparison::PairedRows {
+                api: &fixture.api.evidence,
+                trace: &fixture.trace.evidence,
+                healthy_roots: &healthy,
+            },
+            Some(page.window),
+        )
+        .unwrap();
+    assert_eq!(qualification.certified_member_count(), 0);
+    let window = claude_native_comparison::Controller::new(qualification)
+        .into_window(&next.census_window_end)
+        .unwrap();
+    assert!(window.root_revoked_for_test(&fixture.parent));
+    writeln!(std::io::stderr().lock(), "native_comparison_window: actual_later_member_parse=1 carried_sibling_members=0 sticky_tombstone=true full_driver_proved=false").unwrap();
+}
+
+#[test]
+fn native_comparison_window_proof_membership_empty_or_context_change_withdraws() {
+    for control in 0..4 {
+        let fixture = NativePreparationFixture::new();
+        let mut page = native_window_page(&fixture);
+        let key = page.window.first_key_for_test().unwrap().to_owned();
+        match control {
+            0 => {
+                page.index
+                    .claude_usage_family_witnesses
+                    .get_mut(&fixture.parent)
+                    .unwrap()
+                    .evidence_fingerprint = hex64('f')
+            }
+            1 => {
+                let other = fixture
+                    .dir
+                    .join(&fixture.parent)
+                    .join("subagents/agent-3333333333333333.jsonl");
+                page.index
+                    .files
+                    .insert(local_index_key(&other), page.index.files[&key].clone());
+            }
+            2 => {
+                page.index.confirmed_empty_files.insert(key);
+            }
+            _ => page.index.active_upload_context_fingerprint = Some("changed-context".into()),
+        }
+        page.window.retain_current(&page.index);
+        assert_eq!(page.window.certified_member_count(), 0);
+        assert!(page.window.root_revoked_for_test(&fixture.parent));
+    }
+}
+
+#[test]
+fn native_comparison_window_wrong_window_scope_restart_or_missing_save_is_base() {
+    let mut fixture = NativePreparationFixture::new();
+    let page = native_window_page(&fixture);
+    let mut phase = claude_native_comparison::NativePhase::default();
+    assert!(!phase.import_window(Some(page.window), &page.index, "different-window"));
+    let scratch = crate::test_scratch::ScratchDir::new("native-window-scope");
+    let path = scratch.join("index.json");
+    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut bootstrap = owner.begin();
+    bootstrap.bind("original-scope".into());
+    fixture.index.save(&path).unwrap();
+    bootstrap.note_selected_save(fixture.native_conjunction);
+    bootstrap.finish(true);
+    let page = native_window_page(&fixture);
+    let mut no_save = owner.begin();
+    no_save.bind("original-scope".into());
+    no_save.stage_window_after_save(Some(page.window), &page.index, false);
+    no_save.finish(true);
+    assert_eq!(
+        owner.retained_bound(crate::source_rotation::PARKED_BUDGET),
+        Some(0)
+    );
+    let mut changed = owner.begin();
+    changed.bind("other-scope".into());
+    assert!(!changed.allowed());
+    assert!(changed.take_window().is_none());
+    let restarted = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut fresh = restarted.begin();
+    fresh.bind("original-scope".into());
+    assert!(!fresh.allowed());
+    assert!(fresh.take_window().is_none());
 }

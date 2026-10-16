@@ -145,11 +145,86 @@ struct NormalSkip {
     candidate: CandidateFile,
 }
 
+/// Eligibility descriptors only. No Clone, rows, assigned request sets or
+/// envelope graph survive the page. A later page must reconstruct P again.
+#[derive(Debug)]
+pub(crate) struct WindowEligibility {
+    census_window_end: String,
+    roots: BTreeMap<String, WindowRoot>,
+    revoked_roots: BTreeSet<String>,
+}
+#[derive(Debug)]
+struct WindowRoot {
+    proof: String,
+    certified: BTreeMap<String, NormalSkip>,
+}
+impl WindowEligibility {
+    fn root_is_current(root: &str, saved: &WindowRoot, index: &ScanIndex) -> bool {
+        let Some(witness) = index.claude_usage_family_witnesses.get(root) else {
+            return false;
+        };
+        !index.claude_usage_authority_quarantine.contains_key(root)
+            && claude_usage_family_witness_fingerprint(witness) == saved.proof
+            && saved.certified.iter().all(|(key, skip)| {
+                index.files.get(key).is_some_and(|entry| {
+                    entry.source_file_fingerprint == skip.revision
+                        && entry.scan_identity_version.as_deref()
+                            == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+                        && entry.last_snapshot_fingerprint.is_some()
+                }) && skip.upload_context == index.active_upload_context_fingerprint
+                    && index.upload_context_fingerprint == index.active_upload_context_fingerprint
+                    && !index.confirmed_empty_files.contains(key)
+                    && !index.terminal_jsonl_dispositions.contains_key(key)
+                    && !index.claude_account_deferred_holds.contains_key(key)
+            })
+    }
+
+    /// Recheck after the authoritative fold/selected rollback, before retention.
+    /// Current-page reconstruction is still required before any later use.
+    pub(crate) fn retain_current(&mut self, index: &ScanIndex) {
+        let members = complete_claude_usage_family_members(index);
+        self.roots.retain(|root, saved| {
+            let current = !self.revoked_roots.contains(root)
+                && Self::root_is_current(root, saved, index)
+                && index
+                    .claude_usage_family_witnesses
+                    .get(root)
+                    .is_some_and(|witness| {
+                        members.get(root).is_some_and(|actual| {
+                            actual
+                                .iter()
+                                .eq(witness.member_request_id_fingerprints.keys())
+                        })
+                    });
+            if !current {
+                self.revoked_roots.insert(root.clone());
+            }
+            current
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) fn certified_member_count(&self) -> usize {
+        self.roots.values().map(|root| root.certified.len()).sum()
+    }
+    #[cfg(test)]
+    pub(super) fn first_key_for_test(&self) -> Option<&str> {
+        self.roots
+            .values()
+            .find_map(|root| root.certified.keys().next().map(String::as_str))
+    }
+    #[cfg(test)]
+    pub(super) fn root_revoked_for_test(&self, root: &str) -> bool {
+        self.revoked_roots.contains(root)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct NativePhase {
     paused: bool,
     prepared: bool,
-    // At most the candidates selected under the existing native page limit.
+    // Actual page Skips plus moved same-window descriptors. Retention uses the
+    // shared rotation budget; positive target reads still obey the page limit.
     skips: BTreeMap<String, NormalSkip>,
     // Eligibility is revoked by the actual parse attempt, including a parse
     // that later fails or produces no body. Body lists cannot recover this.
@@ -159,6 +234,40 @@ pub(crate) struct NativePhase {
 }
 
 impl NativePhase {
+    pub(super) fn import_window(
+        &mut self,
+        previous: Option<Box<WindowEligibility>>,
+        index: &ScanIndex,
+        census_window_end: &str,
+    ) -> bool {
+        let Some(mut previous) = previous else {
+            return true;
+        };
+        if previous.census_window_end != census_window_end {
+            return false;
+        }
+        previous.retain_current(index);
+        self.parsed_roots.extend(previous.revoked_roots);
+        for (root, saved) in previous.roots {
+            if self.parsed_roots.contains(&root) {
+                continue;
+            }
+            let conflict = saved.certified.iter().any(|(key, skip)| {
+                self.skips
+                    .get(key)
+                    .is_some_and(|current| current.revision != skip.revision)
+            });
+            if conflict {
+                self.parsed_roots.insert(root);
+            } else {
+                // Move the old descriptors, never a second provider/S graph.
+                self.skips.extend(saved.certified);
+            }
+        }
+        self.skips
+            .retain(|_, skip| !self.parsed_roots.contains(&skip.root));
+        true
+    }
     pub(super) fn record_parse_attempt(&mut self, candidate: &CandidateFile) {
         if let Some((root, _)) = claude_index_path_family_member(&candidate.path) {
             self.skips.retain(|_, skip| skip.root != root);
@@ -263,13 +372,17 @@ impl NativePhase {
             .map(|skip| skip.root.clone())
             .chain(native_by_root.keys().cloned())
             .collect::<BTreeSet<_>>();
+        let candidate_roots = selected_roots.clone();
         selected_roots.retain(|root| {
             rows.healthy_roots.contains(root)
                 && index.claude_usage_family_witnesses.contains_key(root)
                 && !index.claude_usage_authority_quarantine.contains_key(root)
         });
         if selected_roots.is_empty() {
-            return Qualification::default();
+            return Qualification {
+                revoked_roots: self.parsed_roots.union(&candidate_roots).cloned().collect(),
+                ..Default::default()
+            };
         }
         let indexed_members = complete_claude_usage_family_members(index);
         let needs_legacy_owners = selected_roots.iter().any(|root| {
@@ -413,7 +526,17 @@ impl NativePhase {
             }
             // family.rows_by_member is dropped here; no retained API row graph.
         }
-        Qualification::from_frozen_families(families)
+        let mut qualification = Qualification::from_frozen_families(families);
+        qualification.revoked_roots = self.parsed_roots.clone();
+        qualification
+            .revoked_roots
+            .extend(candidate_roots.into_iter().filter(|root| {
+                !qualification
+                    .families
+                    .get(root)
+                    .is_some_and(|family| !family.certified.is_empty())
+            }));
+        qualification
     }
 }
 
@@ -457,6 +580,13 @@ impl Controller {
 
     pub(crate) fn required_roots(&self) -> &BTreeSet<String> {
         &self.required_roots
+    }
+
+    pub(crate) fn into_window(self, census_window_end: &str) -> Option<Box<WindowEligibility>> {
+        if self.failed || self.awaiting_targets || !self.acquisition.unresolved_sources.is_empty() {
+            return None;
+        }
+        self.qualification.into_window(census_window_end)
     }
 
     /// Called at the initial preparation pause and each subsequent target
@@ -513,6 +643,7 @@ pub(crate) struct Qualification {
     envelope_by_hash: BTreeMap<String, Vec<usize>>,
     pending: BTreeMap<String, PendingComparison>,
     unknown_native_sources: BTreeSet<String>,
+    revoked_roots: BTreeSet<String>,
 }
 
 struct PendingComparison {
@@ -542,6 +673,33 @@ pub(crate) struct TargetSelection {
 }
 
 impl Qualification {
+    fn into_window(self, census_window_end: &str) -> Option<Box<WindowEligibility>> {
+        let mut roots = BTreeMap::new();
+        for (root, family) in self.families {
+            if family.certified.is_empty() || self.revoked_roots.contains(&root) {
+                continue;
+            }
+            if family
+                .certified
+                .values()
+                .any(|skip| skip.census_window_end != census_window_end)
+            {
+                return None;
+            }
+            roots.insert(
+                root,
+                WindowRoot {
+                    proof: claude_usage_family_witness_fingerprint(&family.witness),
+                    certified: family.certified,
+                },
+            );
+        }
+        Some(Box::new(WindowEligibility {
+            census_window_end: census_window_end.to_owned(),
+            roots,
+            revoked_roots: self.revoked_roots,
+        }))
+    }
     fn from_frozen_families(mut families: BTreeMap<String, FrozenFamily>) -> Self {
         let mut envelope_roots = Vec::new();
         let mut envelope_by_hash = BTreeMap::<String, Vec<usize>>::new();
@@ -642,6 +800,7 @@ impl Qualification {
             let Some(family) = self.families.remove(&root) else {
                 continue;
             };
+            self.revoked_roots.insert(root.clone());
             result.matched_roots += 1;
             let mut required_revisions = family
                 .certified
@@ -900,7 +1059,9 @@ crate::heap_layout_bound::fields!(NormalSkip; root, member, revision, census_win
 crate::heap_layout_bound::fields!(NativePhase; paused, prepared, skips, parsed_roots, target_revisions, attempted_targets);
 crate::heap_layout_bound::fields!(FrozenFamily; witness, assigned, certified, prior_native_revisions, paired_roots);
 crate::heap_layout_bound::fields!(Controller; qualification, required_roots, native_frontier, awaiting_targets, failed, acquisition);
-crate::heap_layout_bound::fields!(Qualification; families, envelope_roots, envelope_by_hash, pending, unknown_native_sources);
+crate::heap_layout_bound::fields!(Qualification; families, envelope_roots, envelope_by_hash, pending, unknown_native_sources, revoked_roots);
+crate::heap_layout_bound::fields!(WindowEligibility; census_window_end, roots, revoked_roots);
+crate::heap_layout_bound::fields!(WindowRoot; proof, certified);
 
 crate::heap_layout_bound::fields!(TargetSelection; queued, matched_roots, unresolved_sources);
 

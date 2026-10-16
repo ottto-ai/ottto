@@ -3166,6 +3166,18 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     fn monotonic(&self) -> Duration {
         self.started.elapsed()
     }
+    fn retained_bound(&self, limit: usize) -> Option<usize> {
+        if crate::snapshots::claude_native_comparison::enabled() {
+            self.daemon.native_comparison.retained_bound(limit)
+        } else {
+            Some(0)
+        }
+    }
+    fn discard_retained(&mut self) {
+        if crate::snapshots::claude_native_comparison::enabled() {
+            self.daemon.native_comparison.discard_retained();
+        }
+    }
     fn boundary(&mut self, busy: impl Iterator<Item = SnapshotSource>) {
         self.retry
             .boundary(busy, self.home, self.support_dir, self.daemon);
@@ -3477,13 +3489,25 @@ impl SourcePreparation {
                         .as_ref()
                         .is_some_and(|lease| lease.allowed())
                     {
-                        let qualification = state.prepare_native_comparison(
+                        let previous = self
+                            .native_comparison_lease
+                            .as_mut()
+                            .and_then(|lease| lease.take_window());
+                        let qualification = state.prepare_native_comparison_with_window(
                             self.prepared_claude_evidence.as_ref().unwrap().rows(),
+                            previous,
                         );
-                        self.native_comparison_controller =
-                            Some(crate::snapshots::claude_native_comparison::Controller::new(
-                                qualification,
-                            ));
+                        if let Some(qualification) = qualification {
+                            self.native_comparison_controller =
+                                Some(crate::snapshots::claude_native_comparison::Controller::new(
+                                    qualification,
+                                ));
+                        } else {
+                            state.disable_native_comparison();
+                            if let Some(lease) = self.native_comparison_lease.as_mut() {
+                                lease.revoke();
+                            }
+                        }
                     }
                 }
                 if let Some(controller) = self.native_comparison_controller.as_mut() {
@@ -4110,7 +4134,10 @@ fn finish_sync_source(
             }
         }
     }
-    drop(native_comparison_controller);
+    // Move only normal-Skip descriptors/tombstones; all provider/S graphs drop
+    // before the authoritative fold. A later page reconstructs its own rows.
+    let native_window = native_comparison_controller
+        .and_then(|controller| controller.into_window(&scan_result.census_window_end));
     // The terminal graph moves separately from Clone-able results. Selected
     // fallback is not wired yet, so do not retain an unused graph during upload.
     drop(terminal_native_traversal);
@@ -5111,7 +5138,8 @@ fn finish_sync_source(
             state: CollectorState::Success,
         },
     )?;
-    if let Some(lease) = native_comparison_lease {
+    if let Some(mut lease) = native_comparison_lease {
+        lease.stage_window_after_save(native_window, &index, scan_result.census_complete);
         // Only an existing permit may survive a known, saved bounded page.
         // The actual terminal native conjunction remains the sole bootstrap.
         lease.finish(
