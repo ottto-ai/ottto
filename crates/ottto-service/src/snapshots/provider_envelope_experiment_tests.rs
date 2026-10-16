@@ -2,7 +2,6 @@
 // Uses the real native parser, usage/owner fold, candidate decision, selected
 // checkpoint and locked save/load. It is NOT the complete two-phase scanner.
 use super::*;
-use std::io::Write as _;
 
 type Api = crate::claude_local_otel::ClaudeLocalOtelLoadReport;
 type Trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport;
@@ -521,6 +520,6 @@ fn envelope_experiment_selected_restore_rearm_survives_reload_without_age_proof(
     );
     // Different deferral ages (or a process stopped >15 min) have identical
     // persisted state. The window timestamps date a census, not a deferral.
-    // This receipt proves retry eligibility, NOT priority or wall time.
+    // This receipt proves explicit queue priority and retry eligibility, not wall time.
     writeln!(std::io::stderr().lock(), "envelope_experiment_deferral: selected_old_b=true new_c_uncommitted=true durable_target_rearm=true explicit_durable_queue_priority=true deferral_age=unknown wall_completion=unknown").unwrap();
 }
