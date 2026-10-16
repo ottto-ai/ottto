@@ -76,8 +76,8 @@ fn copy_containment_membership_reverse_removal_visits_only_held_links() {
     assert_eq!(pool.remove(key(1)), 2);
     assert_eq!(pool.memberships, 2);
     assert_eq!(pool.by_held.len(), 1);
-    assert!(pool.by_id.contains_key(&"req_shared".to_string()));
-    assert!(!pool.by_id.contains_key(&"req_a".to_string()));
+    assert!(pool.by_id.keys().any(|id| id.as_str() == "req_shared"));
+    assert!(!pool.by_id.keys().any(|id| id.as_str() == "req_a"));
     assert_eq!(
         pool.by_id[&Arc::new("req_shared".to_string())],
         BTreeSet::from([key(2)])

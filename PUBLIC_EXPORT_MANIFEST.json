@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 663,
-  "content_sha256": "11ca95b2c3f59d1407f8892704f0b4206fbfc7c9d382ee0898c153a5ddc89adf",
+  "content_sha256": "c456a558cd56d0f243841f7e9093c595ed5cd3280c5f564506bcf59c7789efc3",
   "files": [
     {
       "executable": false,
@@ -1280,15 +1280,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_copy_containment/membership.rs",
-      "sha256": "bb91962fbb53f8714f8c03663634bab794e52b4c262ecc57ededb08dad906d9c",
-      "size_bytes": 13119
+      "sha256": "e5df8f678fa6959240b0fe1c7e98e9c621077807c545f694d79aeaf879f56b38",
+      "size_bytes": 13125
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_copy_containment/membership/tests.rs",
-      "sha256": "20ccf68ef8435f011ff2c0d270722e03631084e1facd617ea2824f43a066fa2f",
-      "size_bytes": 6952
+      "sha256": "fb8f6db4326731ea8447265f0f209f9f7202d10ec9f5e38dc6ef4d1acd8e368f",
+      "size_bytes": 6962
     },
     {
       "executable": false,
@@ -4683,5 +4683,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "2b162a9629cab52a7a075d1656ed4eb698a849b2"
+  "source_commit": "7e53494ff11724e43f4681ed96f5262aab2c8ffd"
 }

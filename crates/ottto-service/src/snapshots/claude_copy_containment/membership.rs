@@ -115,7 +115,7 @@ impl MembershipIndex {
                 .memberships
                 .checked_add(self.peer_witnesses)
                 .and_then(|count| count.checked_add(ids.len()))
-                .is_none_or(|count| count > allowance.owner_slots)
+                .map_or(true, |count| count > allowance.owner_slots)
         {
             return Err(Refused::OwnerBudget);
         }
@@ -299,14 +299,14 @@ impl MembershipIndex {
             .memberships
             .checked_add(self.peer_witnesses)
             .and_then(|n| n.checked_add(new_witnesses))
-            .is_none_or(|n| n > allowance.owner_slots)
+            .map_or(true, |n| n > allowance.owner_slots)
         {
             return Err(Refused::OwnerBudget);
         }
         let final_bound = old.checked_add(additions).ok_or(Refused::HeapBudget)?;
         if final_bound
             .checked_add(input)
-            .is_none_or(|n| n > allowance.heap_bytes)
+            .map_or(true, |n| n > allowance.heap_bytes)
         {
             return Err(Refused::HeapBudget);
         }
