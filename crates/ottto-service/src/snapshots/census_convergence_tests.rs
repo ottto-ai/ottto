@@ -1284,3 +1284,7 @@ mod owned_held_index_allocation {
 mod authority_binding_prototype {
     include!("authority_binding_prototype_tests.rs");
 }
+
+mod provider_envelope_experiment_tests {
+    include!("provider_envelope_experiment_tests.rs");
+}

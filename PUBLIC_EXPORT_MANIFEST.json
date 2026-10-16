@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 658,
-  "content_sha256": "01cd56bb688080826a296d2db590d51754d1b5f320941fea0d417d11c289e55e",
+  "candidate_file_count": 660,
+  "content_sha256": "bcfd4f87c746e912522740bea06f9063080281ae18a301dabbfc2114d01ed628",
   "files": [
     {
       "executable": false,
@@ -1266,8 +1266,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/census_convergence_tests.rs",
-      "sha256": "ad255eb023d40a2c61fbc3b2217dcffceeaa8be0b03d3ad7993cdc2552f0327b",
-      "size_bytes": 46884
+      "sha256": "56f9fe82cc5cfda16ac8db1592c8798162bd09647b0b2cfdb0bad22851d436d7",
+      "size_bytes": 46983
     },
     {
       "executable": false,
@@ -1352,6 +1352,13 @@
       "path": "crates/ottto-service/src/snapshots/owned_held_index_allocation_tests.rs",
       "sha256": "bab59f1cdafcb4e7b13163d795181017a0fb00057500e7d724f7502f20ce5e20",
       "size_bytes": 11207
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/provider_envelope_experiment_tests.rs",
+      "sha256": "bd7535d217f9e39e4e3626f34adcdfe1265a0b9917d1e01af246698a3e1802be",
+      "size_bytes": 19466
     },
     {
       "executable": false,
@@ -1506,6 +1513,13 @@
       "path": "docs/connectors.md",
       "sha256": "296177f70537e93cd8fef23b3980ea7114449179c67c5202c825fb2796b4ddd5",
       "size_bytes": 1982
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/development/provider-envelope-boundary-experiment.md",
+      "sha256": "9b9ae7b9e4d371f702f7e9051ef3e0a43d1e618bb68c64203523624dfc25c924",
+      "size_bytes": 2552
     },
     {
       "executable": false,
@@ -4609,9 +4623,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-16T02:37:36+00:00",
+  "generated_at": "2026-10-16T11:28:50+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 659,
+  "output_file_count": 661,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4648,5 +4662,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b3947d471967189e9021709bb915d50904f68009"
+  "source_commit": "bdd504a11fa5e919e29b5ae228bf34ca65bec344"
 }
