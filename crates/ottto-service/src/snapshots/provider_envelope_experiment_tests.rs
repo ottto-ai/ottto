@@ -1257,3 +1257,195 @@ fn native_comparison_lifecycle_failed_cas_never_mints_a_grant() {
     )
     .unwrap();
 }
+
+fn pause_native_comparison(mut state: OwnedSourceScan) -> OwnedSourceScan {
+    for _ in 0..1024 {
+        if state.native_comparison_ready() {
+            return state;
+        }
+        match state.step(None) {
+            OwnedSourceScanStep::Pending(next) => state = next,
+            OwnedSourceScanStep::Complete { .. } => {
+                panic!("target phase finalized before comparison")
+            }
+        }
+    }
+    panic!("target phase did not reach bounded pause");
+}
+
+#[test]
+fn native_comparison_q5_keeps_old_proof_and_checks_revision_and_occurrences() {
+    let mut fixture = NativePreparationFixture::new();
+    let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
+    fixture
+        .index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    let mut state = fixture.paused();
+    assert_eq!(state.scanned_file_count, 1);
+    let native = state
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == fixture.parent)
+        .unwrap()
+        .clone();
+    let healthy = BTreeSet::from([fixture.parent.clone()]);
+    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+        api: &fixture.api.evidence,
+        trace: &fixture.trace.evidence,
+        healthy_roots: &healthy,
+    });
+    assert_eq!(qualification.certified_member_count(), 1);
+    assert!(qualification.new_native_hashes(&native).unwrap().is_empty());
+    // Changing the live index proof after qualification cannot turn P_new into
+    // the old prior. This immutable plan never consults the live proof map.
+    state.index.claude_usage_family_witnesses.clear();
+    assert!(qualification.new_native_hashes(&native).unwrap().is_empty());
+    let mut changed = native.clone();
+    changed.source_file_fingerprint = Some(hex64('d'));
+    assert_eq!(
+        qualification.new_native_hashes(&changed).unwrap(),
+        raw_hashes(&changed)
+    );
+    changed = native.clone();
+    changed
+        .claude_usage_occurrences
+        .values_mut()
+        .next()
+        .unwrap()
+        .usage
+        .input_tokens += 1;
+    assert_eq!(
+        qualification.new_native_hashes(&changed).unwrap(),
+        raw_hashes(&changed)
+    );
+    changed = native;
+    changed
+        .claude_usage_request_ids
+        .insert("novel-after-freeze".into());
+    changed.request_count += 1;
+    assert_eq!(
+        qualification.new_native_hashes(&changed).unwrap(),
+        raw_hashes(&changed)
+    );
+    writeln!(std::io::stderr().lock(), "native_comparison_q5: frozen_old_p=true live_proof_replacement_ignored=true changed_revision_or_occurrence_or_request_set_uses_all=true").unwrap();
+}
+
+fn native_comparison_positive_hit_fixture() -> (
+    NativePreparationFixture,
+    OwnedSourceScan,
+    claude_native_comparison::Qualification,
+) {
+    let fixture = NativePreparationFixture::new();
+    let c = "c3333333-3333-4333-8333-333333333333";
+    fs::write(fixture.dir.join(format!("{c}.jsonl")), format!("{{\"timestamp\":\"2026-08-02T07:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"{c}\",\"requestId\":\"req_1\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n")).unwrap();
+    let mut state = fixture.paused();
+    assert_eq!(state.scanned_file_count, 1);
+    assert_eq!(state.snapshots.len(), 1);
+    let healthy = BTreeSet::from([fixture.parent.clone()]);
+    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+        api: &fixture.api.evidence,
+        trace: &fixture.trace.evidence,
+        healthy_roots: &healthy,
+    });
+    assert_eq!(qualification.certified_member_count(), 2);
+    assert_eq!(
+        qualification.possible_targets(&state.snapshots[0]).unwrap(),
+        BTreeSet::from([fixture.parent.clone()])
+    );
+    (fixture, state, qualification)
+}
+
+#[test]
+fn native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold() {
+    let (_fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
+    let scope_before = state.native_comparison_context().unwrap().to_owned();
+    let requested_layout_bytes =
+        crate::heap_layout_bound::completed_bound(&qualification, usize::MAX)
+            .expect("frozen plan has an exhaustively accounted owned graph");
+    assert!(requested_layout_bytes > 0);
+    let limit = state.file_limit;
+    let selection = state.acquire_native_comparison_targets(&mut qualification);
+    assert_eq!(selection.matched_roots, 1);
+    assert_eq!(selection.queued, 2);
+    assert!(selection.unresolved_sources.is_empty());
+    assert_eq!(
+        qualification.certified_member_count(),
+        0,
+        "positive hit withdraws S"
+    );
+    assert_eq!(
+        state.scanned_file_count, 1,
+        "enqueue is not a successful read"
+    );
+    let mut state = pause_native_comparison(state);
+    assert_eq!(state.scanned_file_count, 3);
+    assert_eq!(state.snapshots.len(), 3);
+    assert_eq!(state.pending_finalization.len(), 3);
+    assert!(state
+        .pending_finalization
+        .iter()
+        .all(|entry| entry.parse_complete));
+    assert_eq!(
+        state.native_comparison_context(),
+        Some(scope_before.as_str())
+    );
+    assert_eq!(state.file_limit, limit);
+    assert!(state.scanned_file_count <= limit);
+    assert!(state
+        .snapshots
+        .iter()
+        .all(|item| item.usage_accounting_contract.is_none()));
+    let again = state.acquire_native_comparison_targets(&mut qualification);
+    assert_eq!(
+        again.queued, 0,
+        "withdrawn family cannot target twice in a pass"
+    );
+    state.resume_native_comparison_base();
+    let (_, scan) = SelectionFixture::run(state);
+    assert_eq!(scan.scanned_file_count, 3);
+    writeln!(std::io::stderr().lock(), "native_comparison_target: initial_native=1 matched_roots=1 queued=2 actual_target_reads=2 same_scanner_context=true existing_file_budget=true before_body_fold=true repeated_targets=0 requested_layout_bytes={requested_layout_bytes} rss_measured=false").unwrap();
+}
+
+#[test]
+fn native_comparison_insufficient_remaining_budget_withdraws_and_reports_unresolved() {
+    let (_fixture, state, mut qualification) = native_comparison_positive_hit_fixture();
+    let before = state.scanned_file_count;
+    let (candidates, selection) = qualification.take_target_candidates(&state.snapshots, 1);
+    assert!(candidates.is_empty());
+    assert_eq!(selection.matched_roots, 1);
+    assert_eq!(selection.queued, 0);
+    assert_eq!(
+        selection.unresolved_sources,
+        BTreeSet::from(["c3333333-3333-4333-8333-333333333333".to_owned()])
+    );
+    assert_eq!(qualification.certified_member_count(), 0);
+    assert_eq!(state.scanned_file_count, before);
+}
+
+#[test]
+fn native_comparison_replaced_target_keeps_safe_open_failure_visible() {
+    let (fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
+    let selection = state.acquire_native_comparison_targets(&mut qualification);
+    assert_eq!(selection.queued, 2);
+    let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
+    let replacement = fixture.dir.join("replacement.tmp");
+    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+    fs::rename(&replacement, &path).unwrap();
+    let mut state = pause_native_comparison(state);
+    assert!(
+        state.census.disappeared_file_count + state.census.unreadable_path_count > 0,
+        "the existing safe open must reject a replaced frozen object"
+    );
+    assert!(
+        state.scanned_file_count < 3,
+        "failed target is not a successful native read"
+    );
+    assert_eq!(qualification.certified_member_count(), 0);
+    state.resume_native_comparison_base();
+    let (_, scan) = SelectionFixture::run(state);
+    assert!(!scan.census_complete);
+}

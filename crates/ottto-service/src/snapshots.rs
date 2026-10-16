@@ -5440,6 +5440,29 @@ fn reconstruct_claude_usage_family_from_rows(
     trace_rows: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
     legacy_request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
 ) -> Option<ProvenClaudeUsageFamily> {
+    let reduced = reconstruct_claude_usage_ledger_from_rows(
+        root_session_id,
+        witness,
+        api_rows,
+        trace_rows,
+        legacy_request_owners,
+    )?;
+    Some(ProvenClaudeUsageFamily {
+        witness: witness.clone(),
+        rows_by_member: reduced.rows_by_member,
+    })
+}
+
+// Share the exact validation without retaining a second copy of the API rows
+// in the moving comparison plan. The base caller discards assigned hashes as
+// before; preparation moves them into its small, negative-only envelope.
+fn reconstruct_claude_usage_ledger_from_rows(
+    root_session_id: &str,
+    witness: &ClaudeUsageFamilyWitness,
+    api_rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+    trace_rows: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
+    legacy_request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
+) -> Option<ReducedClaudeUsageLedger> {
     let members = witness
         .member_request_id_fingerprints
         .keys()
@@ -5457,10 +5480,7 @@ fn reconstruct_claude_usage_family_from_rows(
     {
         return None;
     }
-    Some(ProvenClaudeUsageFamily {
-        witness: witness.clone(),
-        rows_by_member: reduced.rows_by_member,
-    })
+    Some(reduced)
 }
 
 fn reduce_claude_usage_ledger(
@@ -11885,6 +11905,30 @@ impl OwnedSourceScan {
         qualification
     }
 
+    // The inactive driver still needs emission/settlement integration before
+    // SourcePreparation may use this seam. Component tests exercise real native
+    // acquisition now; this is not a second scanner or a new budget.
+    #[allow(dead_code)]
+    pub(crate) fn acquire_native_comparison_targets(
+        &mut self,
+        qualification: &mut claude_native_comparison::Qualification,
+    ) -> claude_native_comparison::TargetSelection {
+        assert!(self.active_file.is_none() && self.identified_candidates.is_empty());
+        let (candidates, selection) = qualification.take_target_candidates(
+            &self.snapshots,
+            self.file_limit.saturating_sub(self.scanned_file_count),
+        );
+        if !candidates.is_empty() {
+            let phase = self
+                .native_comparison
+                .as_mut()
+                .expect("native comparison opted in");
+            phase.start_targets(&candidates);
+            self.identified_candidates.extend(candidates);
+        }
+        selection
+    }
+
     #[cfg(test)]
     pub(crate) fn test_active_physical_lines(&self) -> usize {
         self.active_file
@@ -13958,6 +14002,20 @@ impl OwnedSourceScan {
                     )
                 })
                 .unwrap_or_else(|| index.candidate_decision_with_reason(&candidate));
+            let target_match = native_comparison
+                .as_ref()
+                .and_then(|phase| phase.target_revision_matches(&candidate));
+            if target_match == Some(false) {
+                // Comparison requires this exact frozen object and sidecars.
+                // The ordinary path may reparse replacements, but a target
+                // cannot silently claim that it compared the frozen revision.
+                census.disappeared_file_count += 1;
+                pending!();
+            }
+            let comparison_target = target_match == Some(true);
+            if comparison_target {
+                decision = CandidateDecision::Parse;
+            }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
                     let count = &mut census.claude_parse_reasons[reason as usize];
@@ -14077,6 +14135,7 @@ impl OwnedSourceScan {
                         && index.files.contains_key(&key)
                         && !protected
                         && !forced_family
+                        && !comparison_target
                         && !parent_proof_required
                         && (debt.is_some() || context.audit_slots > 0);
                         let scope = context.file_scope(

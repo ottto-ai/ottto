@@ -21,13 +21,14 @@ pub(crate) struct PairedRows<'a> {
     pub(crate) healthy_roots: &'a BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct NormalSkip {
     root: String,
     member: String,
     revision: String,
     census_window_end: String,
     upload_context: Option<String>,
+    candidate: CandidateFile,
 }
 
 #[derive(Default)]
@@ -36,6 +37,8 @@ pub(crate) struct NativePhase {
     prepared: bool,
     // At most the candidates selected under the existing native page limit.
     skips: BTreeMap<String, NormalSkip>,
+    target_revisions: BTreeMap<String, String>,
+    attempted_targets: BTreeSet<String>,
 }
 
 impl NativePhase {
@@ -76,6 +79,7 @@ impl NativePhase {
                 revision: candidate.source_file_fingerprint.clone(),
                 census_window_end: census_window_end.to_owned(),
                 upload_context: index.active_upload_context_fingerprint.clone(),
+                candidate: candidate.clone(),
             },
         );
     }
@@ -94,6 +98,26 @@ impl NativePhase {
     pub(super) fn resume(&mut self) {
         self.prepared = true;
         self.paused = false;
+    }
+
+    pub(super) fn start_targets(&mut self, candidates: &[CandidateFile]) {
+        for candidate in candidates {
+            let key = local_index_key(&candidate.path);
+            assert!(
+                self.attempted_targets.insert(key.clone()),
+                "one target attempt per pass"
+            );
+            self.target_revisions
+                .insert(key, candidate.source_file_fingerprint.clone());
+        }
+        self.prepared = false;
+        self.paused = false;
+    }
+
+    pub(super) fn target_revision_matches(&self, candidate: &CandidateFile) -> Option<bool> {
+        self.target_revisions
+            .get(&local_index_key(&candidate.path))
+            .map(|expected| expected == &candidate.source_file_fingerprint)
     }
 
     pub(super) fn qualify(
@@ -125,7 +149,7 @@ impl NativePhase {
             let Some(trace) = rows.trace.get(root) else {
                 continue;
             };
-            let Some(family) = reconstruct_claude_usage_family_from_rows(
+            let Some(ledger) = reconstruct_claude_usage_ledger_from_rows(
                 root,
                 retained,
                 api,
@@ -133,6 +157,10 @@ impl NativePhase {
                 owners.as_ref(),
             ) else {
                 continue;
+            };
+            let family = ProvenClaudeUsageFamily {
+                witness: retained.clone(),
+                rows_by_member: ledger.rows_by_member,
             };
             // Current members that would fail the exact authoritative rebuild
             // make this family ineligible. Shared checks include native set and
@@ -165,17 +193,65 @@ impl NativePhase {
                 })
                 .map(|(key, skip)| (key.clone(), skip.clone()))
                 .collect::<BTreeMap<_, _>>();
-            if !certified.is_empty() {
-                families.insert(root.clone(), FrozenFamily { family, certified });
+            let certified_members = certified
+                .values()
+                .map(|skip| skip.member.as_str())
+                .collect::<BTreeSet<_>>();
+            let native_members = native
+                .iter()
+                .filter(|item| claude_snapshot_family_root(item) == *root)
+                .map(|item| item.source_session_id.as_str())
+                .collect::<Vec<_>>();
+            if certified_members.len() != certified.len()
+                || native_members
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != native_members.len()
+            {
+                continue; // Ambiguous physical member paths cannot certify negatives.
             }
+            let prior_native_revisions = native
+                .iter()
+                .filter(|item| claude_snapshot_family_root(item) == *root)
+                // Q5 initially covers only exact pre-mutation P with E empty.
+                // Full request-set/occurrence/projection checks ran above.
+                .filter(|item| {
+                    retained
+                        .legacy_excluded_request_id_hashes
+                        .get(&item.source_session_id)
+                        .map_or(true, BTreeSet::is_empty)
+                })
+                .filter_map(|item| {
+                    item.source_file_fingerprint
+                        .as_ref()
+                        .filter(|revision| !revision.is_empty())
+                        .map(|revision| (item.source_session_id.clone(), revision.clone()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            if !certified.is_empty() || !prior_native_revisions.is_empty() {
+                families.insert(
+                    root.clone(),
+                    FrozenFamily {
+                        witness: family.witness,
+                        assigned: ledger.assigned_request_id_hashes,
+                        certified,
+                        prior_native_revisions,
+                    },
+                );
+            }
+            // family.rows_by_member is dropped here; no retained API row graph.
         }
         Qualification { families }
     }
 }
 
 struct FrozenFamily {
-    family: ProvenClaudeUsageFamily,
+    witness: ClaudeUsageFamilyWitness,
+    assigned: BTreeMap<String, BTreeSet<String>>,
     certified: BTreeMap<String, NormalSkip>,
+    prior_native_revisions: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -183,7 +259,142 @@ pub(crate) struct Qualification {
     families: BTreeMap<String, FrozenFamily>,
 }
 
+#[derive(Default)]
+pub(crate) struct TargetSelection {
+    pub(crate) queued: usize,
+    pub(crate) matched_roots: usize,
+    pub(crate) unresolved_sources: BTreeSet<String>,
+}
+
 impl Qualification {
+    pub(super) fn take_target_candidates(
+        &mut self,
+        native: &[SnapshotItem],
+        remaining_files: usize,
+    ) -> (Vec<CandidateFile>, TargetSelection) {
+        let mut sources_by_root = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut result = TargetSelection::default();
+        for item in native {
+            match self.possible_targets(item) {
+                Some(roots) => {
+                    for root in roots {
+                        sources_by_root
+                            .entry(root)
+                            .or_default()
+                            .insert(item.source_session_id.clone());
+                    }
+                }
+                None => {
+                    result
+                        .unresolved_sources
+                        .insert(item.source_session_id.clone());
+                }
+            }
+        }
+        let mut candidates = Vec::new();
+        for (root, sources) in sources_by_root {
+            // A possible hit withdraws S before any native attempt. It never
+            // becomes an exact owner or renews the frozen prior-P shortcut.
+            let Some(family) = self.families.remove(&root) else {
+                continue;
+            };
+            result.matched_roots += 1;
+            let certified_members = family
+                .certified
+                .values()
+                .map(|skip| skip.member.as_str())
+                .collect::<BTreeSet<_>>();
+            let native_members = native
+                .iter()
+                .filter(|item| claude_snapshot_family_root(item) == root)
+                .map(|item| item.source_session_id.as_str())
+                .collect::<BTreeSet<_>>();
+            let complete_selected_family = family
+                .witness
+                .member_request_id_fingerprints
+                .keys()
+                .all(|member| {
+                    certified_members.contains(member.as_str())
+                        || native_members.contains(member.as_str())
+                });
+            if !complete_selected_family
+                || candidates.len().saturating_add(family.certified.len()) > remaining_files
+            {
+                result.unresolved_sources.extend(sources);
+                continue;
+            }
+            candidates.extend(family.certified.into_values().map(|skip| skip.candidate));
+        }
+        result.queued = candidates.len();
+        (candidates, result)
+    }
+
+    /// Q5 novelty is a read-only subtraction from the frozen PRE-MUTATION P.
+    /// A changed revision, missing occurrence, E != empty, unknown member, or
+    /// changed native set uses ALL actual native IDs. No post-fold proof lookup.
+    pub(crate) fn new_native_hashes(&self, item: &SnapshotItem) -> Option<BTreeSet<String>> {
+        let hashes = claude_snapshot_request_id_hashes(item)?;
+        let Some(family) = self.families.get(&claude_snapshot_family_root(item)) else {
+            return Some(hashes);
+        };
+        let member = &item.source_session_id;
+        let prior = family.prior_native_revisions.get(member);
+        if prior.is_none()
+            || prior != item.source_file_fingerprint.as_ref()
+            || family
+                .witness
+                .legacy_excluded_request_id_hashes
+                .get(member)
+                .is_some_and(|excluded| !excluded.is_empty())
+            || family.witness.member_request_id_fingerprints.get(member)
+                != Some(&claude_request_id_set_fingerprint(&hashes))
+        {
+            return Some(hashes);
+        }
+        let occurrences = item
+            .claude_usage_occurrences
+            .iter()
+            .map(|(id, occurrence)| {
+                (
+                    format!("{:x}", Sha256::digest(id.as_bytes())),
+                    ClaudeTranscriptUsageOccurrenceWitness::from(occurrence),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if family.witness.member_occurrence_fingerprints.get(member)
+            != Some(&claude_occurrence_map_fingerprint(&occurrences))
+        {
+            return Some(hashes);
+        }
+        let Some(prior_s) = family.assigned.get(member) else {
+            return Some(hashes);
+        };
+        Some(hashes.difference(prior_s).cloned().collect())
+    }
+
+    /// Roots hit by actual native novelty. A hit is only a request for native
+    /// comparison. It never changes duplicate ownership, coverage or posture.
+    pub(crate) fn possible_targets(&self, item: &SnapshotItem) -> Option<BTreeSet<String>> {
+        let novel = self.new_native_hashes(item)?;
+        let mut roots = BTreeSet::new();
+        for (root, family) in &self.families {
+            if family.certified.values().any(|skip| {
+                family
+                    .assigned
+                    .get(&skip.member)
+                    .is_some_and(|assigned| !novel.is_disjoint(assigned))
+                    || family
+                        .witness
+                        .legacy_excluded_request_id_hashes
+                        .get(&skip.member)
+                        .is_some_and(|excluded| !novel.is_disjoint(excluded))
+            }) {
+                roots.insert(root.clone());
+            }
+        }
+        Some(roots)
+    }
+
     /// Count-only preparation receipt; not a bootstrap or reuse permit.
     pub(crate) fn certified_member_count(&self) -> usize {
         self.families
@@ -196,7 +407,6 @@ impl Qualification {
                     .values()
                     .filter(|skip| {
                         family
-                            .family
                             .witness
                             .member_request_id_fingerprints
                             .contains_key(&skip.member)
@@ -235,7 +445,9 @@ impl Drop for TestScope {
     }
 }
 
-crate::heap_layout_bound::fields!(NormalSkip; root, member, revision, census_window_end, upload_context);
-crate::heap_layout_bound::fields!(NativePhase; paused, prepared, skips);
-crate::heap_layout_bound::fields!(FrozenFamily; family, certified);
+crate::heap_layout_bound::fields!(NormalSkip; root, member, revision, census_window_end, upload_context, candidate);
+crate::heap_layout_bound::fields!(NativePhase; paused, prepared, skips, target_revisions, attempted_targets);
+crate::heap_layout_bound::fields!(FrozenFamily; witness, assigned, certified, prior_native_revisions);
 crate::heap_layout_bound::fields!(Qualification; families);
+
+crate::heap_layout_bound::fields!(TargetSelection; queued, matched_roots, unresolved_sources);

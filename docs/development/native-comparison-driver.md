@@ -36,7 +36,8 @@ coverage, settled body, or authorization to skip a later read.
 ## Remaining integration
 
 The initial qualification is deliberately discarded before finish. The lifecycle
-bootstrap component below is implemented but requires its own hosted acceptance.
+bootstrap component below passed its scoped hosted tests. Positive end-to-end
+source bootstrap is still an integration gate.
 The candidate still needs actual same-census targeted acquisition under the
 existing budgets, negative-only target intersection, pre-offer B/C withholding when comparison cannot finish,
 atomic selected-state restore/rearm/save, and one authoritative final fold.
@@ -70,5 +71,41 @@ normal selected-index save; any later finish failure revokes it. A clean complet
 finish may retain an already valid lease. These internal gates do not themselves
 activate envelopes or suppress rearming. New lifecycle tests exercise real native
 collection/fold and an actual index save, then context/restart/drop and a real
-failed index CAS. Their current head needs its own hosted validation; the prior
-first-checkpoint CI is not lifecycle-test acceptance.
+failed index CAS. Hosted CI `38917089098` at
+`0e98ea45785726b3e3cbbb5ad495683946c4ceb0` passed all four checks,
+including all eight preparation/lifecycle tests (2,898 passed, zero failed,
+24 ignored). This component evidence is not full-driver or installed acceptance.
+
+
+## Frozen hashes and same-owner target seam
+
+Preparation now retains the old witness, assigned request hashes and exact native
+prior revisions, dropping the temporary reduced API rows after validation.
+The authoritative reconstruction shares the exact ledger validator and keeps its
+previous output shape. The frozen plan never reads a replacement proof from the
+live index. The initial Q5 subtraction requires the old proof, empty legacy
+exclusions, exact native request-set and occurrence fingerprints and the same
+revision. Unsupported or changed inputs use all actual native IDs.
+
+A possible intersection with assigned or legacy-excluded IDs only requests
+comparison. It withdraws the affected family's negative eligibility; it cannot
+add an exact duplicate owner, change authority or mark coverage complete.
+All family members must already be present natively or have actual normal-Skip
+certificates on this page. Incomplete families or insufficient remaining file
+budget return an explicit unresolved source set.
+
+The same owned scanner can enqueue those frozen canonical candidates and pause
+again after parsing. It reuses the existing safe-open path, parser and remaining
+file budget, disallows sampled restore for targets, rejects a replaced frozen
+object/revision, and attempts each selected path at most once per pass. Real
+native observations remain present before any body enrichment. The new tests
+exercise Q5 changes, a copied-prefix hit with two real target reads, budget
+refusal and replacement between target selection and safe open. Their new head
+requires hosted validation; previous lifecycle CI does not validate these tests.
+
+This seam is intentionally not called by source preparation yet. Pre-offer
+emission separation, fallback/selected settlement and final-fold integration
+must be complete first. A component test manually drives the same moving owner;
+that is not a shipping optimization or a positive lifecycle bootstrap proof.
+No reread, CPU, RSS or interaction improvement is claimed. Requested layout
+accounting in a synthetic test describes the retained plan, not process memory.
