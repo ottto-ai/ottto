@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 663,
-  "content_sha256": "c456a558cd56d0f243841f7e9093c595ed5cd3280c5f564506bcf59c7789efc3",
+  "content_sha256": "364b43f47e56f4873c5437781ca870afcc22e9fa29d10b2172bf38df611b03fc",
   "files": [
     {
       "executable": false,
@@ -1287,8 +1287,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_copy_containment/membership/tests.rs",
-      "sha256": "fb8f6db4326731ea8447265f0f209f9f7202d10ec9f5e38dc6ef4d1acd8e368f",
-      "size_bytes": 6962
+      "sha256": "e829f2ba4aacc0c6eb7e3863480b8e920150e136121c42198648b96aba7503ea",
+      "size_bytes": 7705
     },
     {
       "executable": false,
@@ -4683,5 +4683,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "7e53494ff11724e43f4681ed96f5262aab2c8ffd"
+  "source_commit": "da92e73dc4b467650350d07490fd018bbb394184"
 }

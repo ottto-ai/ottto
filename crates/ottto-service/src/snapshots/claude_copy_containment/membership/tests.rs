@@ -93,13 +93,28 @@ fn copy_containment_membership_refuses_before_allocating_when_layout_or_peak_unk
     let ids = observed(A, &["req1", "req2"]);
     let mut budget = allowance();
     budget.heap_bytes = 0;
-    let (outcome, allocations) =
-        crate::retry_allocation_probe::measure(|| pool.insert(key(1), ids, &budget));
+    // The owned input is consumed/dropped even on refusal. Allocate that
+    // fixture INSIDE the probe so retiring it cannot produce negative live
+    // bytes. Measure admission's allocation delta separately from input setup.
+    let ((outcome, admission_allocations), allocations) =
+        crate::retry_allocation_probe::measure(|| {
+            let owned = ids.clone();
+            let before = crate::retry_allocation_probe::stats().allocations;
+            let outcome = pool.insert(key(1), owned, &budget);
+            let admission_allocations = crate::retry_allocation_probe::stats().allocations - before;
+            (outcome, admission_allocations)
+        });
     assert!(matches!(
         outcome,
         Err(Refused::UnavailableLayout | Refused::HeapBudget)
     ));
-    assert_eq!(allocations.allocations, 0);
+    assert_eq!(admission_allocations, 0);
+    assert_eq!(allocations.requested_live, 0);
+    assert_eq!(allocations.usable_live, 0);
+    assert!(
+        allocations.allocations > 0,
+        "owned-input setup was measured"
+    );
     assert!(pool.by_id.is_empty() && pool.by_held.is_empty());
     assert_eq!(pool.memberships, 0);
 }
