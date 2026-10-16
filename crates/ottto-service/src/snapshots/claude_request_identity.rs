@@ -2049,6 +2049,7 @@ impl<'i> TranscriptOwnership<'i> {
         Self {
             duplicates: &index.claude_duplicate_request_owners,
             settled: index.copy_hold_count() == 0
+                && disposition.copied_source_session_ids.is_empty()
                 && census.census_complete
                 && census.coverage_complete
                 && disposition.transcript_ownership_complete

@@ -134,8 +134,171 @@ fn install_hold(index: &mut ScanIndex, path: &Path, source: &str, evidence: &str
             )
             .unwrap(),
             peers: BTreeSet::from(["e".repeat(64)]),
+            observed: HoldObservation::default(),
         },
     );
+}
+
+#[test]
+fn copy_containment_status_has_unique_park_counts_explicit_unknowns_and_no_content() {
+    let f = Fixture::new();
+    f.write(A, &["req_status"], false);
+    let mut index = ScanIndex::default();
+    let mut initial = f.scan(&mut index);
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut initial, &mut index);
+    let accepted = index.current_snapshot_fingerprints();
+    index.record_accepted_snapshot_fingerprints(&accepted);
+    let key = local_index_key(&f.path(A));
+    let revision = index.files[&key].source_file_fingerprint.clone();
+    install_hold(&mut index, &f.path(A), &revision, &"b".repeat(64));
+    install_hold(&mut index, &f.path(B), &"c".repeat(64), &"b".repeat(64));
+    index
+        .claude_copy_holds
+        .entries
+        .get_mut(&local_index_key(&f.path(B)))
+        .unwrap()
+        .revision
+        .first_observed_unix_seconds = None;
+    install_hold(&mut index, &f.path(C), &"c".repeat(64), &"b".repeat(64));
+    index
+        .claude_copy_holds
+        .entries
+        .get_mut(&local_index_key(&f.path(C)))
+        .unwrap()
+        .revision
+        .first_observed_unix_seconds = Some(200);
+    index.attach_copy_scan_context(context(&key, None));
+    let debt = serde_json::to_value(&index).unwrap()["claude_copy_holds"].clone();
+    for _ in 0..3 {
+        assert_eq!(f.scan(&mut index).scanned_file_count, 0);
+    }
+    assert_eq!(index.copy_parked_count(), 3);
+    let (status, allocations) =
+        crate::retry_allocation_probe::measure(|| index.copy_containment_status(Some(130)));
+    assert_eq!(
+        allocations.allocations, 0,
+        "fixed aggregate projection needs no key/ID clones"
+    );
+    assert_eq!(status.held_revision_count, 3);
+    assert_eq!(
+        status.parked_held_revision_count,
+        Some(1),
+        "distinct held keys, not3visits"
+    );
+    assert_eq!(status.retained_prior_local_ack_count, 1);
+    assert_eq!(status.past_acceptance_unknown_count, 2);
+    assert_eq!(status.new_without_prior_local_ack_count, None);
+    assert_eq!(status.oldest_known_observed_age_seconds, Some(30));
+    assert_eq!(
+        status.observation_age_unknown_count, 2,
+        "unknown/future clocks never become0age"
+    );
+    assert_eq!(status.parked_while_w4_unavailable_count, Some(1));
+    assert_eq!(status.reasons.copied_overlap_unproven, 3);
+    assert!(status.marker_settled_suppressed_by_recorded_holds);
+    let encoded = serde_json::to_string(&status).unwrap();
+    for forbidden in [key.as_str(), A, B, C, revision.as_str(), "req_status"] {
+        assert!(!encoded.contains(forbidden));
+    }
+    assert_eq!(
+        serde_json::to_value(&index).unwrap()["claude_copy_holds"],
+        debt,
+        "ephemeral observations never change held storage"
+    );
+    let restored: ScanIndex =
+        serde_json::from_value(serde_json::to_value(&index).unwrap()).unwrap();
+    assert_eq!(
+        restored
+            .copy_containment_status(Some(130))
+            .parked_held_revision_count,
+        None
+    );
+    let mut invalid = serde_json::to_value(&index).unwrap();
+    invalid["claude_copy_holds"][&key]["observed"] = json!({"parked":true});
+    assert!(
+        serde_json::from_value::<ScanIndex>(invalid).is_err(),
+        "localflags cannot be injected through durableJSON"
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_local_status: holds=3 unique_parked=1 visits=3 prior_local_ack=1 past_acceptance_unknown=2 new_without_ack=UNKNOWN known_oldest_seconds=30 unknown_age=2 projection_allocations=0 no_content=true observations_not_persisted=true").unwrap();
+}
+
+#[test]
+fn copy_containment_status_exposes_closed_reasons_and_unknown_unrecorded_debt() {
+    let f = Fixture::new();
+    let mut index = ScanIndex::default();
+    install_hold(&mut index, &f.path(A), &"c".repeat(64), &"b".repeat(64));
+    let key = local_index_key(&f.path(A));
+    let held = index.claude_copy_holds.entries.get_mut(&key).unwrap();
+    held.revision.reason = HoldReason::ComparisonUnavailable;
+    index.attach_copy_scan_context(context(&key, None));
+    let context = index.active_copy_scan.as_mut().unwrap();
+    context.hold_record_limit_refusals = 2;
+    context.hold_peer_limit_refusals = 1;
+    let status = index.copy_containment_status(None);
+    assert_eq!(status.reasons.comparison_unavailable, 1);
+    assert_eq!(status.reasons.copied_overlap_unproven, 0);
+    assert_eq!(status.hold_record_limit_refusals, Some(2));
+    assert_eq!(status.hold_peer_limit_refusals, Some(1));
+    assert_eq!(
+        status.unrecorded_held_revision_count, None,
+        "refusals are not a unique-count witness"
+    );
+    assert_eq!(status.oldest_known_observed_age_seconds, None);
+    assert_eq!(status.observation_age_unknown_count, 1);
+    assert_eq!(status.new_without_prior_local_ack_count, None);
+}
+
+#[test]
+fn copy_containment_retained_peer_cap_withholds_native_candidate_without_growing_ledger() {
+    let f = Fixture::new();
+    f.write(B, &["req_peer_cap"], false);
+    let mut index = ScanIndex::default();
+    let scan = f.scan(&mut index);
+    assert_eq!(scan.snapshots.len(), 1);
+    assert!(scan.snapshots[0]
+        .claude_usage_request_ids
+        .contains("req_peer_cap"));
+    let key = local_index_key(&f.path(B));
+    let revision = index.files[&key].source_file_fingerprint.clone();
+    install_hold(&mut index, &f.path(A), &"c".repeat(64), &"b".repeat(64));
+    index
+        .claude_copy_holds
+        .entries
+        .get_mut(&local_index_key(&f.path(A)))
+        .unwrap()
+        .peers = (0..MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS)
+        .map(|n| format!("{n:064x}"))
+        .collect();
+    assert!(index.claude_copy_holds.valid());
+    index.attach_copy_scan_context(context(&key, None));
+    index.claude_duplicate_request_owners.insert(
+        format!("{:x}", sha2::Sha256::digest(b"req_peer_cap")),
+        BTreeSet::from([
+            claude_duplicate_request_owner(B, B),
+            claude_duplicate_request_owner(C, C),
+        ]),
+    );
+    let withheld =
+        index.record_known_copy_holds(&scan.snapshots, &[(&key, &revision)], |_, _| false);
+    assert_eq!(withheld, BTreeSet::from([B.to_string()]));
+    assert_eq!(index.copy_hold_count(), 1);
+    assert!(!index.claude_copy_holds.entries.contains_key(&key));
+    assert_eq!(
+        index.claude_copy_holds.entries[&local_index_key(&f.path(A))]
+            .peers
+            .len(),
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS
+    );
+    let status = index.copy_containment_status(None);
+    assert_eq!(status.hold_peer_limit_refusals, Some(1));
+    assert_eq!(status.hold_record_limit_refusals, Some(0));
+    assert_eq!(status.withheld_candidates_observed, Some(true));
+    assert_eq!(status.unrecorded_held_revision_count, None);
+    assert!(status.marker_settled_suppressed_by_recorded_holds);
+    // With zero retained holds the count is0. A valid duplicate map cannot
+    // provide more peers than its own owner-link cap, so zero-hold peer-cap
+    // refusal is unreachable under production limits (unlike account slots).
+    writeln!(std::io::stderr().lock(), "copy_containment_peer_cap: existing_retained_peer_links={} actual_native_candidate_withheld=1 copy_hold_count=1 ledger_growth=0 unrecorded_distinct_count=UNKNOWN no_test_limit_override=true", MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS).unwrap();
 }
 
 #[test]

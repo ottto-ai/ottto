@@ -40,6 +40,39 @@ held revision. Real process-owner context acquisition and all W1–W5 bindings
 remain unfinished. Restart alone need not grant a read: a lost W4 cache is a
 qualified disclosed residual, not a reason to add automatic retry work.
 
+## Bounded local observation and marker safety
+
+The inactive required-policy path projects a content-free aggregate through the
+existing local health-event envelope. It retains one current observation, replacing
+its previous observation rather than growing a per-pass history. Identical payloads
+do not create a new event. The event stays in local status; its exact type is omitted
+from canonical backend health evidence, while unrelated evidence remains unchanged.
+No protocol field, server upload, endpoint or new state file is added.
+
+Counts distinguish recorded held revisions, unique parked revisions, unavailable
+or repeated process attempts, closed reasons, retained prior local ACK evidence,
+and unknown past acceptance. Missing ACK evidence never means a session is known
+new. Missing or future observation time stays UNKNOWN. Per-pass observations are
+not persisted and become UNKNOWN after reload. W4 currently reports unavailable
+because native capture is not connected. Overflow decisions are counted; the
+number of distinct unrecorded held revisions remains UNKNOWN because refused keys
+are not retained. Projection visits only the existing bounded hold ledger and
+allocates no key or native-ID graph.
+
+Transcript marker ownership requires both no recorded copy hold and no withheld
+copy in the current disposition. The shared account-hold cap can prevent a copy
+record from being inserted while its body remains withheld; zero recorded copy
+holds alone cannot certify settled ownership. The native regression fills that
+actual cap, withholds an overlapping copy and compares the healthy session against
+the matched unsettled base: own telemetry bytes and accepted witnesses are
+unchanged, markers stay suppressed, and the no-copy control still permits markers.
+A separate test exercises the real peer-link cap with retained holds and no ledger
+growth. With zero retained holds, peer-cap refusal is unreachable under valid
+production duplicate-map limits; no artificial lower-limit seam is used.
+
+These new source tests require exact-head CI. They do not activate the policy or
+establish installed tag share, memory, read-admission or whole-frame peak behavior.
+
 ## Inactive process-attempt integration
 
 A positively observed own-file or sidecar revision change can request native
@@ -64,7 +97,7 @@ branches require supported layout admission. An unavailable layout must report
 those branches as unexecuted; refused reads and passing test names do not establish
 successful event handling or peak-memory acceptance. This integration remains
 unvalidated until exact-head CI executes its tests. It remains inactive afterward
-until settlement, status and resource gates are complete.
+until settlement, full status acceptance and resource gates are complete.
 
 Process attempt memory does not guarantee no repeated attempt across a crash when
 the durable input witness was never saved. No automatic restart read, retry timer

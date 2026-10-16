@@ -2104,6 +2104,9 @@ pub fn refresh_canonical_local_health_with_started_at(status: &mut DaemonStatus,
     let overall = local_health_overall(&blockers, &runtime, &account, &sources);
     let evidence = events
         .iter()
+        // This aggregate observation is local status only. Preserve the event
+        // locally without adding its type/id to any backend health evidence.
+        .filter(|event| event.event_type != snapshot_sync::COPY_CONTAINMENT_EVENT_TYPE)
         .map(|event| LocalHealthEvidenceRefV1 {
             event_id: event.event_id.clone(),
             event_type: event.event_type.clone(),

@@ -47,6 +47,52 @@ use zeroize::Zeroize;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
+pub(crate) const COPY_CONTAINMENT_EVENT_TYPE: &str = "ClaudeCopyContainmentObserved";
+
+/// Existing local event envelope only. The canonical health projection omits
+/// this event's evidence reference, so neither status path uploads a new field.
+/// Replace one current observation; never accumulate an event for each scan.
+fn record_copy_containment_status(
+    daemon: &LocalDaemon,
+    index: &ScanIndex,
+    basis: &'static str,
+) -> Result<()> {
+    if !daemon.transcript_cache.copy_containment_required() {
+        return Ok(());
+    }
+    let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).ok();
+    let observation = index.copy_containment_status(now);
+    let payload = serde_json::json!({
+        "kind": "claude_copy_containment", "current": true,
+        "basis": basis, "observation": observation,
+        "message": "Claude copy containment source checkpoint; held usage remains unresolved, never zero."
+    });
+    let mut state = daemon.state()?;
+    if state
+        .local_health_events
+        .iter()
+        .any(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE && event.payload == payload)
+    {
+        return Ok(());
+    }
+    state
+        .local_health_events
+        .retain(|event| event.event_type != COPY_CONTAINMENT_EVENT_TYPE);
+    crate::push_local_health_event(
+        &mut state,
+        COPY_CONTAINMENT_EVENT_TYPE,
+        "claude_copy_containment",
+        ottto_protocol::LocalHealthAuthority::Runtime,
+        payload,
+    );
+    Ok(())
+}
+
+fn observe_copy_containment_status(daemon: &LocalDaemon, index: &ScanIndex, basis: &'static str) {
+    if record_copy_containment_status(daemon, index, basis).is_err() {
+        eprintln!("local copied-request status observation unavailable");
+    }
+}
 const SNAPSHOT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 // Non-terminal collector check-in cadence. The sync loop sleeps a fixed
 // SNAPSHOT_SYNC_INTERVAL AFTER a cycle completes, so terminal status receipts
@@ -4063,6 +4109,7 @@ fn finish_sync_source(
             );
         }
         claude_authority_disposition = disposition;
+        observe_copy_containment_status(daemon, &index, "uncommitted_scan_observation");
         if census_withheld {
             backfill_succeeded = false;
         }
@@ -4577,6 +4624,9 @@ fn finish_sync_source(
                     committed_index.clone()
                 }
             };
+            if checkpoint_succeeded && source == SnapshotSource::ClaudeCode {
+                observe_copy_containment_status(daemon, &committable, "durable_partial_selection");
+            }
             if retry.enabled()
                 && checkpoint_succeeded
                 && locally_held_fingerprints.is_empty()
@@ -4675,7 +4725,16 @@ fn finish_sync_source(
                         scan_result.validate_codex_checkpoint()
                     },
                 ) {
-                    Ok(committable) => index = committable,
+                    Ok(committable) => {
+                        if source == SnapshotSource::ClaudeCode {
+                            observe_copy_containment_status(
+                                daemon,
+                                &committable,
+                                "durable_partial_selection",
+                            );
+                        }
+                        index = committable;
+                    }
                     Err(checkpoint_error) => eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",
                         source.api_slug(),
@@ -4872,6 +4931,9 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    if source == SnapshotSource::ClaudeCode {
+        observe_copy_containment_status(daemon, &index, "durable_selected_index");
+    }
     // A completed cycle is what moves the tier: uploads keep a source warm, a
     // quiet cycle lets it fall to idle and then cold. A conflict pass has still
     // durably committed its accepted siblings, but remains a source failure so

@@ -452,3 +452,125 @@ fn copy_containment_real_losing_selected_save_same_event_does_not_repeat() {
     );
     writeln!(std::io::stderr().lock(), "copy_containment_failed_save_attempt: actual_LocalDaemon_preparations=3 real_generation_CAS_losers={losers} held_native_attempts={attempts} no_ACK_or_debt_drain=true healthy_progress=true optional_clear_and_connection_churn=true positive_failure_suppression_executed={} crash_lifetime_unproved=true", crate::heap_layout_bound::layout_supported()).unwrap();
 }
+
+#[test]
+#[serial]
+fn copy_containment_local_status_is_bounded_deduplicated_and_absent_from_backend_evidence() {
+    let fixture = IdentityPipelineHome::new();
+    let support = fixture.base.join("support-copy-local-status");
+    let (path, key) = copy_owner_seed(&fixture, &support);
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    let index = ScanIndex::load_for_copy_containment(&path).unwrap();
+    let daemon = test_daemon("otm_test");
+    let unrelated = {
+        let mut state = daemon.state().unwrap();
+        crate::push_local_health_event(
+            &mut state,
+            "UnrelatedSyntheticEvidence",
+            "unrelated",
+            ottto_protocol::LocalHealthAuthority::Runtime,
+            serde_json::json!({"unchanged":true}),
+        );
+        state.local_health_events.last().unwrap().clone()
+    };
+    record_copy_containment_status(&daemon, &index, "uncommitted_scan_observation").unwrap();
+    assert_eq!(
+        daemon.state().unwrap().local_health_events.len(),
+        1,
+        "defaultdisabled creates no event"
+    );
+    let before = crate::status_from_state(&daemon.state().unwrap());
+    let original_ref = before
+        .canonical_health
+        .unwrap()
+        .evidence
+        .into_iter()
+        .find(|value| value.event_id == unrelated.event_id)
+        .unwrap();
+    let original_bytes = serde_json::to_vec(&original_ref).unwrap();
+    daemon.transcript_cache.require_copy_containment_for_test();
+    record_copy_containment_status(&daemon, &index, "uncommitted_scan_observation").unwrap();
+    let first_id = daemon
+        .state()
+        .unwrap()
+        .local_health_events
+        .iter()
+        .find(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE)
+        .unwrap()
+        .event_id
+        .clone();
+    for _ in 0..200 {
+        record_copy_containment_status(&daemon, &index, "uncommitted_scan_observation").unwrap();
+    }
+    {
+        let state = daemon.state().unwrap();
+        assert_eq!(
+            state.local_health_events.len(),
+            2,
+            "one aggregate, no event-per-pass history"
+        );
+        let event = state
+            .local_health_events
+            .iter()
+            .find(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE)
+            .unwrap();
+        assert_eq!(event.event_id, first_id, "unchanged payload deduplicates");
+        assert_eq!(event.payload["observation"]["held_revision_count"], 1);
+        assert_eq!(
+            event.payload["observation"]["past_acceptance_unknown_count"],
+            1
+        );
+        assert!(event.payload["observation"]["new_without_prior_local_ack_count"].is_null());
+        assert!(!serde_json::to_string(&event.payload)
+            .unwrap()
+            .contains(&key));
+        assert!(!serde_json::to_string(&event.payload)
+            .unwrap()
+            .contains(IDENTITY_PIPELINE_ROOT));
+    }
+    record_copy_containment_status(&daemon, &index, "durable_selected_index").unwrap();
+    let state = daemon.state().unwrap();
+    assert_eq!(
+        state.local_health_events.len(),
+        2,
+        "changed basis replaces one event"
+    );
+    assert_eq!(
+        state
+            .local_health_events
+            .iter()
+            .find(|event| event.event_type == "UnrelatedSyntheticEvidence")
+            .unwrap(),
+        &unrelated
+    );
+    let mut status = crate::status_from_state(&state);
+    drop(state);
+    let local_event = status
+        .local_health_events
+        .iter()
+        .find(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE)
+        .unwrap()
+        .clone();
+    assert_eq!(local_event.payload["basis"], "durable_selected_index");
+    // Both actual backend projection and browser health paths consume only
+    // canonical_health. Reprojection must not reintroduce the local reference.
+    for _ in 0..2 {
+        let health = status.canonical_health.as_ref().unwrap();
+        let bytes = serde_json::to_vec(health).unwrap();
+        let wire = String::from_utf8(bytes).unwrap();
+        assert!(!wire.contains(COPY_CONTAINMENT_EVENT_TYPE));
+        assert!(!wire.contains(&local_event.event_id));
+        let kept = health
+            .evidence
+            .iter()
+            .find(|value| value.event_id == unrelated.event_id)
+            .unwrap();
+        assert_eq!(serde_json::to_vec(kept).unwrap(), original_bytes);
+        assert!(status
+            .local_health_events
+            .iter()
+            .any(|event| event.event_id == local_event.event_id));
+        crate::refresh_canonical_local_health(&mut status);
+    }
+    writeln!(std::io::stderr().lock(), "copy_containment_status_envelope: default_disabled_no_event=true repeated_observations=200 own_retained_events=1 unchanged_payload_dedup=true changed_basis_replaces=true local_event_retained=true canonical_backend_type_and_id_absent=true unrelated_evidence_bytes_unchanged=true no_content=true").unwrap();
+}

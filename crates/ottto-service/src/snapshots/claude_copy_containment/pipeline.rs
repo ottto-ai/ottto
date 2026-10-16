@@ -11,8 +11,48 @@ pub(crate) struct HeldFile {
     revision: HoldRevision,
     /// Full duplicate-census source handles, scoped by the enclosing context.
     peers: BTreeSet<String>,
+    #[serde(skip)]
+    observed: HoldObservation,
 }
-crate::heap_layout_bound::fields!(HeldFile; revision, peers);
+#[derive(Debug, Clone, Default)]
+struct HoldObservation {
+    parked: bool,
+    attempt_unavailable: bool,
+    attempt_repeated: bool,
+}
+crate::heap_layout_bound::fields!(HoldObservation; parked, attempt_unavailable, attempt_repeated);
+crate::heap_layout_bound::fields!(HeldFile; revision, peers, observed);
+
+/// Bounded content-free local projection, not a server upload or ownership
+/// witness. Unknown observations and missing historical ACK evidence stay null.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CopyContainmentStatus {
+    mode: &'static str,
+    held_revision_count: usize,
+    parked_held_revision_count: Option<usize>,
+    attempt_unavailable_revision_count: Option<usize>,
+    attempt_repeated_revision_count: Option<usize>,
+    retained_prior_local_ack_count: usize,
+    past_acceptance_unknown_count: usize,
+    new_without_prior_local_ack_count: Option<usize>,
+    oldest_known_observed_age_seconds: Option<u64>,
+    observation_age_unknown_count: usize,
+    marker_settled_suppressed_by_recorded_holds: bool,
+    withheld_candidates_observed: Option<bool>,
+    w4_cache_state: &'static str,
+    parked_while_w4_unavailable_count: Option<usize>,
+    hold_record_limit_refusals: Option<usize>,
+    hold_peer_limit_refusals: Option<usize>,
+    unrecorded_held_revision_count: Option<usize>,
+    reasons: HoldReasonCounts,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct HoldReasonCounts {
+    copied_overlap_unproven: usize,
+    comparison_unavailable: usize,
+    owner_budget_exceeded: usize,
+    incident_copy_safety: usize,
+}
 
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(transparent)]
@@ -50,9 +90,13 @@ pub(crate) struct ScanContext {
     parked: usize,
     attempt_unavailable: usize,
     attempt_repeated: usize,
+    hold_record_limit_refusals: usize,
+    hold_peer_limit_refusals: usize,
+    withheld_candidates_observed: bool,
 }
 crate::heap_layout_bound::fields!(ScanContext; scope, contexts, registered_slot_fingerprint,
-    attempt_scope, parked, attempt_unavailable, attempt_repeated);
+    attempt_scope, parked, attempt_unavailable, attempt_repeated,
+    hold_record_limit_refusals, hold_peer_limit_refusals, withheld_candidates_observed);
 
 impl ScanContext {
     pub(crate) fn new(scope: String, contexts: BTreeMap<String, Option<String>>) -> Option<Self> {
@@ -65,6 +109,9 @@ impl ScanContext {
                 parked: 0,
                 attempt_unavailable: 0,
                 attempt_repeated: 0,
+                hold_record_limit_refusals: 0,
+                hold_peer_limit_refusals: 0,
+                withheld_candidates_observed: false,
             })
     }
 }
@@ -130,7 +177,69 @@ impl ScanIndex {
     }
 
     pub(crate) fn attach_copy_scan_context(&mut self, context: ScanContext) {
+        // Fixed inline flags, no per-visit key/graph allocation or persistence.
+        for held in self.claude_copy_holds.entries.values_mut() {
+            held.observed = HoldObservation::default();
+        }
         self.active_copy_scan = Some(context);
+    }
+    pub(crate) fn copy_containment_status(&self, now: Option<u64>) -> CopyContainmentStatus {
+        let mut reasons = HoldReasonCounts::default();
+        let mut parked = 0;
+        let mut unavailable = 0;
+        let mut repeated = 0;
+        let mut prior_ack = 0;
+        let mut oldest = None::<u64>;
+        let mut unknown_age = 0;
+        for (key, held) in &self.claude_copy_holds.entries {
+            match held.revision.reason {
+                HoldReason::CopiedOverlapUnproven => reasons.copied_overlap_unproven += 1,
+                HoldReason::ComparisonUnavailable => reasons.comparison_unavailable += 1,
+                HoldReason::OwnerBudgetExceeded => reasons.owner_budget_exceeded += 1,
+                HoldReason::IncidentCopySafety => reasons.incident_copy_safety += 1,
+            }
+            parked += usize::from(held.observed.parked);
+            unavailable += usize::from(held.observed.attempt_unavailable);
+            repeated += usize::from(held.observed.attempt_repeated);
+            // Prior local acceptance only, never current request membership.
+            prior_ack += usize::from(self.file_snapshot_fingerprints.get(key).is_some_and(
+                |values| {
+                    values
+                        .iter()
+                        .any(|value| self.accepted_snapshot_fingerprints.contains(value))
+                },
+            ));
+            match now.and_then(|now| held.revision.known_observed_age_seconds(now)) {
+                Some(age) => oldest = Some(oldest.map_or(age, |old| old.max(age))),
+                None => unknown_age += 1,
+            }
+        }
+        let context = self.active_copy_scan.as_ref();
+        let record_limit = context.map(|value| value.hold_record_limit_refusals);
+        let peer_limit = context.map(|value| value.hold_peer_limit_refusals);
+        let overflow = record_limit.unwrap_or(0) > 0 || peer_limit.unwrap_or(0) > 0;
+        CopyContainmentStatus {
+            mode: "inactive_incomplete_source_checkpoint",
+            held_revision_count: self.copy_hold_count(),
+            parked_held_revision_count: context.map(|_| parked),
+            attempt_unavailable_revision_count: context.map(|_| unavailable),
+            attempt_repeated_revision_count: context.map(|_| repeated),
+            retained_prior_local_ack_count: prior_ack,
+            past_acceptance_unknown_count: self.copy_hold_count() - prior_ack,
+            // No durable historical-newness witness exists in this version.
+            new_without_prior_local_ack_count: None,
+            oldest_known_observed_age_seconds: oldest,
+            observation_age_unknown_count: unknown_age,
+            marker_settled_suppressed_by_recorded_holds: self.copy_hold_count() > 0,
+            withheld_candidates_observed: context.map(|value| value.withheld_candidates_observed),
+            w4_cache_state: "unavailable_native_capture_not_connected",
+            parked_while_w4_unavailable_count: context.map(|_| parked),
+            hold_record_limit_refusals: record_limit,
+            hold_peer_limit_refusals: peer_limit,
+            // Refused keys are not retained: do not invent a distinct count.
+            unrecorded_held_revision_count: (!overflow && context.is_some()).then_some(0),
+            reasons,
+        }
     }
     pub(crate) fn attach_copy_attempt_scope(&mut self, scope: String) -> anyhow::Result<()> {
         anyhow::ensure!(digest_valid(&scope), "invalid copied-request attempt scope");
@@ -159,7 +268,7 @@ impl ScanIndex {
             return false;
         };
         let key = local_index_key(&candidate.path);
-        let Some(held) = self.claude_copy_holds.entries.get(&key) else {
+        let Some(held) = self.claude_copy_holds.entries.get_mut(&key) else {
             return false;
         };
         // W1/W2 are independent positive events. This seam follows the
@@ -203,16 +312,19 @@ impl ScanIndex {
             match result {
                 crate::snapshots::sampled_scan::CopyAttemptResult::Claimed => {}
                 crate::snapshots::sampled_scan::CopyAttemptResult::Repeated => {
+                    held.observed.attempt_repeated = true;
                     context.attempt_repeated = context.attempt_repeated.saturating_add(1);
                     park = true;
                 }
                 crate::snapshots::sampled_scan::CopyAttemptResult::Unavailable => {
+                    held.observed.attempt_unavailable = true;
                     context.attempt_unavailable = context.attempt_unavailable.saturating_add(1);
                     park = true;
                 }
             }
         }
         if park {
+            held.observed.parked = true;
             context.parked = context.parked.saturating_add(1);
         }
         park
@@ -308,6 +420,8 @@ impl ScanIndex {
             .map(|held| held.peers.len())
             .fold(0usize, usize::saturating_add);
         let mut withheld = BTreeSet::new();
+        let mut record_limit_refusals = 0usize;
+        let mut peer_limit_refusals = 0usize;
         for item in items {
             let Some(revision) = item.source_file_fingerprint.as_deref() else {
                 continue;
@@ -378,12 +492,14 @@ impl ScanIndex {
                     .saturating_add(self.claude_account_deferred_holds.len())
                     >= crate::snapshots::MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS
                 {
+                    record_limit_refusals = record_limit_refusals.saturating_add(1);
                     continue;
                 }
                 if retained_peer_count
                     .checked_add(peers.len())
                     .map_or(true, |count| count > MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS)
                 {
+                    peer_limit_refusals = peer_limit_refusals.saturating_add(1);
                     continue;
                 }
                 let evidence = context
@@ -403,10 +519,20 @@ impl ScanIndex {
                         HeldFile {
                             revision,
                             peers: peers.clone(),
+                            observed: HoldObservation::default(),
                         },
                     );
                 }
             }
+        }
+        if let Some(context) = self.active_copy_scan.as_mut() {
+            context.withheld_candidates_observed |= !withheld.is_empty();
+            context.hold_record_limit_refusals = context
+                .hold_record_limit_refusals
+                .saturating_add(record_limit_refusals);
+            context.hold_peer_limit_refusals = context
+                .hold_peer_limit_refusals
+                .saturating_add(peer_limit_refusals);
         }
         withheld
     }
