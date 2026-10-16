@@ -3820,6 +3820,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
         max_duplicate_owners,
         identity,
         &BTreeSet::new(),
+        None,
     )
 }
 
@@ -3832,6 +3833,50 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_identity(
     trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
     index: &mut ScanIndex,
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
+) -> ClaudeUsageAuthorityDisposition {
+    apply_claude_reported_usage_to_scan_with_observations(
+        scan,
+        api_report,
+        trace_report,
+        index,
+        identity,
+        None,
+    )
+}
+
+// A consumed receipt, not a second graph of snapshots or provider rows. It can
+// only be minted by accumulating actual native occurrences into this index.
+// No S/possible-owner input and no Clone implementation exist.
+pub(crate) struct ClaudeNativeObservations {
+    counts: ClaudeDuplicateCensusCounts,
+    census_window_end: String,
+    index_generation: u64,
+}
+
+#[allow(dead_code)] // The inactive driver's pre-offer path is not integrated yet.
+pub(crate) fn record_claude_native_observations(
+    scan: &SourceScanResult,
+    index: &mut ScanIndex,
+) -> ClaudeNativeObservations {
+    ClaudeNativeObservations {
+        counts: accumulate_claude_usage_family_pending_with_limit(
+            &scan.snapshots,
+            &mut index.claude_usage_family_pending,
+            &scan.census_window_end,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        ),
+        census_window_end: scan.census_window_end.clone(),
+        index_generation: index.generation,
+    }
+}
+
+pub(crate) fn apply_claude_reported_usage_to_scan_with_observations(
+    scan: &mut SourceScanResult,
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    index: &mut ScanIndex,
+    identity: Option<&claude_request_identity::ScanEvidence<'_>>,
+    observations: Option<ClaudeNativeObservations>,
 ) -> ClaudeUsageAuthorityDisposition {
     let current_files = if index.claude_usage_authority_quarantine.is_empty() {
         BTreeSet::new()
@@ -3852,6 +3897,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_identity(
         MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
         identity,
         &current_files,
+        observations,
     )
 }
 
@@ -3867,13 +3913,27 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     max_duplicate_owners: usize,
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
     current_files: &BTreeSet<String>,
+    observations: Option<ClaudeNativeObservations>,
 ) -> ClaudeUsageAuthorityDisposition {
-    let mut duplicate_census = accumulate_claude_usage_family_pending_with_limit(
-        snapshots,
-        &mut index.claude_usage_family_pending,
-        census_window_end,
-        max_pending_occurrences,
-    );
+    let mut duplicate_census = match observations {
+        Some(observed) => {
+            assert_eq!(
+                observed.census_window_end, census_window_end,
+                "native observations cannot cross census windows"
+            );
+            assert_eq!(
+                observed.index_generation, index.generation,
+                "native observations cannot cross selected-index saves"
+            );
+            observed.counts
+        }
+        None => accumulate_claude_usage_family_pending_with_limit(
+            snapshots,
+            &mut index.claude_usage_family_pending,
+            census_window_end,
+            max_pending_occurrences,
+        ),
+    };
     duplicate_census.census_complete = census_complete;
     duplicate_census.fence_before = index.claude_duplicate_request_witness_overflowed;
 
@@ -11870,14 +11930,25 @@ impl OwnedSourceScan {
         &mut self,
         rows: claude_native_comparison::PairedRows<'_>,
     ) -> claude_native_comparison::Qualification {
+        let healthy = self.native_comparison_is_healthy();
         let phase = self
             .native_comparison
             .as_mut()
             .expect("native comparison opted in");
+        let qualification = if healthy {
+            phase.qualify(&self.index, &self.snapshots, &self.census_window_end, rows)
+        } else {
+            claude_native_comparison::Qualification::default()
+        };
+        phase.resume();
+        qualification
+    }
+
+    fn native_comparison_is_healthy(&self) -> bool {
         // Before census counters are folded into traversal, require no local
         // read/parser loss and a healthy retained traversal. Unknown is base.
         let local = &self.census;
-        let healthy = self.state_census_complete
+        self.state_census_complete
             && self.sidecar_census_complete
             && local.directory_entry_cap_exceeded_count == 0
             && local.symlink_rejected_count == 0
@@ -11895,14 +11966,20 @@ impl OwnedSourceScan {
                 .index
                 .traversal
                 .as_ref()
-                .is_some_and(|traversal| !traversal.counts.has_errors());
-        let qualification = if healthy {
-            phase.qualify(&self.index, &self.snapshots, &self.census_window_end, rows)
-        } else {
-            claude_native_comparison::Qualification::default()
-        };
-        phase.resume();
-        qualification
+                .is_some_and(|traversal| !traversal.counts.has_errors())
+    }
+
+    #[allow(dead_code)] // Pending controller/selected-settlement integration.
+    pub(crate) fn take_native_comparison_acquisition(
+        &self,
+        qualification: &mut claude_native_comparison::Qualification,
+    ) -> claude_native_comparison::TargetAcquisition {
+        assert!(self.active_file.is_none() && self.identified_candidates.is_empty());
+        qualification.take_native_acquisition(
+            &self.snapshots,
+            &self.pending_finalization,
+            self.native_comparison_is_healthy(),
+        )
     }
 
     // The inactive driver still needs emission/settlement integration before
@@ -56620,3 +56697,6 @@ mod census_unreadable_tests {
 }
 
 crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_member);
+
+crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
+crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until);

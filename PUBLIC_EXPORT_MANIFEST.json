@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 668,
-  "content_sha256": "da4147f9a884959eef7f930be5d92e55dfd278ae58c516535b0f7efb0ae8f852",
+  "content_sha256": "802a1981cd35c62da90dcbd3183702d882042f2dde8d4c14556b5ec482d5f667",
   "files": [
     {
       "executable": false,
@@ -1238,8 +1238,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "8fc856fd256761b82d311d2d9b22a48be9a5c4d35186d147d943bb89e64e86b5",
-      "size_bytes": 2472983
+      "sha256": "af4f4b5607c1df0857a865785f5012f32c726a3995ec084edac98a39a8ab8f5a",
+      "size_bytes": 2476308
     },
     {
       "executable": false,
@@ -1287,8 +1287,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison.rs",
-      "sha256": "74bb8fc7e336461e7308400d22a63c0870d6970206248c37ba70f1218f11a60e",
-      "size_bytes": 17389
+      "sha256": "3d9bef5d98403cb5e5d8cfec5fde0ff4e9a71a0c0572f0f6441036219ea276cb",
+      "size_bytes": 26328
     },
     {
       "executable": false,
@@ -1406,8 +1406,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/provider_envelope_experiment_tests.rs",
-      "sha256": "1eb69d4c6c7b029c736831311f3786139f96d93356e901cbb64bbf581ff16eb1",
-      "size_bytes": 56275
+      "sha256": "f53c96a306f0621efbcd022f6a1eb626166ce6aa5421ae244a0d0ff649e2a3d6",
+      "size_bytes": 70581
     },
     {
       "executable": false,
@@ -1567,8 +1567,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/native-comparison-driver.md",
-      "sha256": "8fef48249ae7405d3aa49b19768f3c40e5cfb1a15b5bf13f6da73570a1ccbbed",
-      "size_bytes": 7407
+      "sha256": "4657821758afbfc6649b0acd93b54b6755615c4d74c201c27e02ad5ea89dc068",
+      "size_bytes": 10836
     },
     {
       "executable": false,
@@ -4718,5 +4718,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "a3acb45ba871720b417e5eb9f25614b76fe4b5fa"
+  "source_commit": "7e175a184219494f563437276042c7f48fb6a9e6"
 }

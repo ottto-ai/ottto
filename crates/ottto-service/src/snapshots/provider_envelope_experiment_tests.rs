@@ -1455,3 +1455,379 @@ fn native_comparison_replaced_target_keeps_safe_open_failure_visible() {
     let (_, scan) = SelectionFixture::run(state);
     assert!(!scan.census_complete);
 }
+
+fn native_observation_duplicate_fixture() -> (
+    crate::test_scratch::ScratchDir,
+    ScanIndex,
+    SourceScanResult,
+    String,
+    String,
+) {
+    let dir = crate::test_scratch::ScratchDir::new("native-observation-emission-split");
+    let b = "b2222222-2222-4222-8222-222222222222".to_owned();
+    let d = "d4444444-4444-4444-8444-444444444444".to_owned();
+    for (session, own) in [(&b, "b_unique"), (&d, "d_unique")] {
+        let rows = [own, "shared_second"].into_iter().enumerate().map(|(i, request)| {
+            format!("{{\"timestamp\":\"2026-08-02T07:00:0{i}Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"requestId\":\"{request}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n")
+        }).collect::<String>();
+        fs::write(dir.join(format!("{session}.jsonl")), rows).unwrap();
+    }
+    let native = OwnedSourceScan::new_with_identity_capture(
+        SnapshotSource::ClaudeCode,
+        &[dir.to_path_buf()],
+        ScanIndex::default(),
+        WINDOW,
+        30,
+        8,
+        false,
+        None,
+        &[],
+        false,
+        false,
+        false,
+    );
+    let (index, scan) = SelectionFixture::run(native);
+    assert!(scan.census_complete);
+    assert_eq!(scan.scanned_file_count, 2);
+    assert_eq!(scan.snapshots.len(), 2);
+    (dir, index, scan, b, d)
+}
+
+#[test]
+fn native_comparison_withheld_body_keeps_actual_duplicate_against_unaffected_body() {
+    let (_dir, mut index, mut scan, b, d) = native_observation_duplicate_fixture();
+    let mut base_index = index.clone();
+    let mut base_scan = scan.clone();
+    let api = Api::default();
+    let trace = Trace::default();
+    let base = apply_claude_reported_usage_to_scan_with_identity(
+        &mut base_scan,
+        &api,
+        &trace,
+        &mut base_index,
+        None,
+    );
+    let shared = format!("{:x}", Sha256::digest(b"shared_second"));
+    let expected = BTreeSet::from([
+        claude_duplicate_request_owner(&b, &b),
+        claude_duplicate_request_owner(&d, &d),
+    ]);
+    assert_eq!(
+        base_index.claude_duplicate_request_owners.get(&shared),
+        Some(&expected)
+    );
+    let mut bad_index = index.clone();
+    let mut bad_scan = scan.clone();
+    bad_scan
+        .snapshots
+        .retain(|item| item.source_session_id != b);
+    apply_claude_reported_usage_to_scan_with_identity(
+        &mut bad_scan,
+        &api,
+        &trace,
+        &mut bad_index,
+        None,
+    );
+    assert!(
+        !bad_index
+            .claude_duplicate_request_owners
+            .contains_key(&shared),
+        "control demonstrates why filtering before native accumulation is wrong"
+    );
+    let observed = record_claude_native_observations(&scan, &mut index);
+    scan.snapshots.retain(|item| item.source_session_id != b);
+    scan.pending_finalization.retain(|pending| {
+        claude_index_path_family_member(Path::new(&pending.index_key))
+            .is_some_and(|(_, member)| member != b)
+    });
+    let split = apply_claude_reported_usage_to_scan_with_observations(
+        &mut scan,
+        &api,
+        &trace,
+        &mut index,
+        None,
+        Some(observed),
+    );
+    assert_eq!(scan.snapshots.len(), 1);
+    assert_eq!(scan.snapshots[0].source_session_id, d);
+    assert_eq!(
+        index.claude_duplicate_request_owners.get(&shared),
+        Some(&expected)
+    );
+    assert_eq!(
+        index.claude_duplicate_request_owners,
+        base_index.claude_duplicate_request_owners
+    );
+    assert_eq!(split.duplicate_census, base.duplicate_census);
+    assert_eq!(
+        split.transcript_ownership_complete,
+        base.transcript_ownership_complete
+    );
+    // Effective terminality changes only AFTER the authoritative actual-native
+    // census, never before duplicate detection. Final selected restore/rearm is
+    // still a separate required integration gate.
+    scan.census_complete = false;
+    index.mark_bounded_sweep_unsettled();
+    writeln!(std::io::stderr().lock(), "native_comparison_observations: actual_native_files=2 actual_native_occurrences=4 withheld_bodies=1 emitted_bodies=1 b_d_duplicate_retained=true filter_first_control_misses_duplicate=true actual_fold_once=true selected_settlement_unproved=true").unwrap();
+}
+
+#[test]
+fn native_comparison_consumed_observations_preserve_unfiltered_base_fold() {
+    let (_dir, mut index, mut scan, _, _) = native_observation_duplicate_fixture();
+    let mut base_index = index.clone();
+    let mut base_scan = scan.clone();
+    let api = Api::default();
+    let trace = Trace::default();
+    let base = apply_claude_reported_usage_to_scan_with_identity(
+        &mut base_scan,
+        &api,
+        &trace,
+        &mut base_index,
+        None,
+    );
+    let observed = record_claude_native_observations(&scan, &mut index);
+    let split = apply_claude_reported_usage_to_scan_with_observations(
+        &mut scan,
+        &api,
+        &trace,
+        &mut index,
+        None,
+        Some(observed),
+    );
+    assert_eq!(
+        serde_json::to_value(&index).unwrap(),
+        serde_json::to_value(&base_index).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&scan.snapshots).unwrap(),
+        serde_json::to_value(&base_scan.snapshots).unwrap()
+    );
+    assert_eq!(split.duplicate_census, base.duplicate_census);
+    assert_eq!(
+        split.transcript_ownership_complete,
+        base.transcript_ownership_complete
+    );
+}
+
+#[test]
+fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
+    let mut fixture = NativePreparationFixture::new();
+    let c = "c3333333-3333-4333-8333-333333333333";
+    let path = fixture.dir.join(format!("{c}.jsonl"));
+    let parent_rows =
+        fs::read_to_string(fixture.dir.join(format!("{}.jsonl", fixture.parent))).unwrap();
+    let mut child_rows = parent_rows
+        .lines()
+        .take(2)
+        .map(|line| line.replace(&fixture.parent, c) + "\n")
+        .collect::<String>();
+    child_rows.push_str(&format!("{{\"timestamp\":\"2026-08-02T07:00:06Z\",\"type\":\"assistant\",\"sessionId\":\"{c}\",\"requestId\":\"req_extra\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"));
+    fs::write(&path, child_rows).unwrap();
+    fixture.api.evidence.insert(
+        c.to_owned(),
+        vec![complete_api_row(c, "req_extra", 6, 10, 10, 0)],
+    );
+    fixture
+        .trace
+        .evidence
+        .insert(c.to_owned(), vec![complete_trace_row(c, "req_extra", "")]);
+    for entry in fixture.index.files.values_mut() {
+        entry.source_file_fingerprint.clear();
+    }
+    let native = OwnedSourceScan::new_with_identity_capture(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&fixture.dir),
+        fixture.index.clone(),
+        WINDOW,
+        30,
+        8,
+        false,
+        None,
+        &[],
+        false,
+        false,
+        false,
+    );
+    let (mut index, mut scan) = SelectionFixture::run(native);
+    assert_eq!(scan.scanned_file_count, 3);
+    assert!(scan.census_complete);
+    apply_claude_reported_usage_with_index(
+        &mut scan.snapshots,
+        &fixture.api,
+        &fixture.trace,
+        &mut index,
+        true,
+        WINDOW,
+    );
+    let excluded =
+        index.claude_usage_family_witnesses[c].legacy_excluded_request_id_hashes[c].clone();
+    assert_eq!(
+        excluded,
+        ["req_1", "req_2"]
+            .into_iter()
+            .map(|id| format!("{:x}", Sha256::digest(id.as_bytes())))
+            .collect::<BTreeSet<_>>()
+    );
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+    fixture.index = index;
+    let stable_index = fixture.index.clone();
+    fixture
+        .index
+        .files
+        .get_mut(&local_index_key(&path))
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    let mut state = fixture.paused();
+    assert_eq!(state.scanned_file_count, 1);
+    let native = state
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == c)
+        .unwrap()
+        .clone();
+    let healthy = BTreeSet::from([fixture.parent.clone(), c.to_owned()]);
+    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+        api: &fixture.api.evidence,
+        trace: &fixture.trace.evidence,
+        healthy_roots: &healthy,
+    });
+    assert_eq!(qualification.certified_member_count(), 2);
+    assert_eq!(
+        qualification.new_native_hashes(&native).unwrap(),
+        raw_hashes(&native),
+        "E nonempty cannot subtract a prior S even under the exact retained P"
+    );
+    assert_eq!(
+        qualification.possible_targets(&native).unwrap(),
+        BTreeSet::from([fixture.parent.clone()])
+    );
+    fixture.index = stable_index;
+    let d = "d4444444-4444-4444-8444-444444444444";
+    fs::write(
+        fixture.dir.join(format!("{d}.jsonl")),
+        parent_rows
+            .lines()
+            .next()
+            .unwrap()
+            .replace(&fixture.parent, d)
+            + "\n",
+    )
+    .unwrap();
+    let mut state = fixture.paused();
+    assert_eq!(state.scanned_file_count, 1);
+    let native_d = state.snapshots[0].clone();
+    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+        api: &fixture.api.evidence,
+        trace: &fixture.trace.evidence,
+        healthy_roots: &healthy,
+    });
+    assert_eq!(qualification.certified_member_count(), 3);
+    assert_eq!(
+        qualification.possible_targets(&native_d).unwrap(),
+        BTreeSet::from([fixture.parent.clone(), c.to_owned()]),
+        "C is a target only because its certified S also contains E, not just assigned req_extra"
+    );
+    writeln!(std::io::stderr().lock(), "native_comparison_legacy: actual_prefix_exclusion=2 e_nonempty_q5_prior=false copied_native_requests_hit_predecessor=true certified_exclusion_is_target=true body_offer_unproved=true").unwrap();
+}
+
+#[test]
+fn native_comparison_acquisition_requires_actual_completed_target_reads() {
+    let (fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
+    let selection = state.acquire_native_comparison_targets(&mut qualification);
+    assert_eq!(selection.queued, 2);
+    let mut state = pause_native_comparison(state);
+    let acquired = state.take_native_comparison_acquisition(&mut qualification);
+    assert_eq!(acquired.completed_target_files, 2);
+    assert_eq!(
+        acquired.acquired_roots,
+        BTreeSet::from([fixture.parent.clone()])
+    );
+    assert_eq!(
+        acquired.ready_for_fold_sources,
+        BTreeSet::from(["c3333333-3333-4333-8333-333333333333".to_owned()])
+    );
+    assert!(acquired.unresolved_sources.is_empty());
+    assert!(acquired.rearm_roots.is_empty());
+    assert!(acquired.known_rearm_candidates.is_empty());
+    assert!(state
+        .snapshots
+        .iter()
+        .all(|item| item.usage_accounting_contract.is_none()));
+    let consumed = state.take_native_comparison_acquisition(&mut qualification);
+    assert_eq!(
+        consumed.completed_target_files, 0,
+        "actual acquisition receipt is consumed once"
+    );
+    assert!(consumed.ready_for_fold_sources.is_empty());
+    state.resume_native_comparison_base();
+    SelectionFixture::run(state);
+    writeln!(std::io::stderr().lock(), "native_comparison_acquisition: queued=2 actual_full_reads=2 ready_for_exact_fold=1 body_authority_granted=false receipt_consumed_once=true").unwrap();
+}
+
+#[test]
+fn native_comparison_failed_target_keeps_dependent_source_unresolved() {
+    let (fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
+    assert_eq!(
+        state
+            .acquire_native_comparison_targets(&mut qualification)
+            .queued,
+        2
+    );
+    let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
+    let replacement = fixture.dir.join("acquisition-replacement.tmp");
+    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+    fs::rename(replacement, path).unwrap();
+    let mut state = pause_native_comparison(state);
+    let acquired = state.take_native_comparison_acquisition(&mut qualification);
+    assert_eq!(
+        acquired.completed_target_files, 1,
+        "only the unchanged child completed"
+    );
+    assert!(acquired.acquired_roots.is_empty());
+    assert!(acquired.ready_for_fold_sources.is_empty());
+    assert_eq!(
+        acquired.unresolved_sources,
+        BTreeSet::from(["c3333333-3333-4333-8333-333333333333".to_owned()])
+    );
+    assert_eq!(
+        acquired.rearm_roots,
+        BTreeSet::from([fixture.parent.clone()])
+    );
+    assert_eq!(acquired.known_rearm_candidates.len(), 2);
+    assert!(state
+        .snapshots
+        .iter()
+        .all(|item| item.usage_accounting_contract.is_none()));
+    state.resume_native_comparison_base();
+    let (_, scan) = SelectionFixture::run(state);
+    assert!(!scan.census_complete);
+    writeln!(std::io::stderr().lock(), "native_comparison_acquisition: queued=2 actual_full_reads=1 unresolved_sources=1 fallback_roots=1 queue_is_not_success=true body_authority_granted=false").unwrap();
+}
+
+#[test]
+fn native_comparison_ambiguous_index_member_withdraws_frozen_family() {
+    let fixture = NativePreparationFixture::new();
+    let mut state = fixture.paused();
+    let original = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
+    let duplicate = fixture
+        .dir
+        .join("other-project")
+        .join(format!("{}.jsonl", fixture.parent));
+    fs::create_dir_all(duplicate.parent().unwrap()).unwrap();
+    fs::write(&duplicate, fs::read(&original).unwrap()).unwrap();
+    // Model an indexed duplicate from an earlier bounded page. The genuine
+    // normal-Skip certificates above cannot make ambiguous member paths unique.
+    state.index.files.insert(
+        local_index_key(&duplicate),
+        state.index.files[&original].clone(),
+    );
+    let healthy = BTreeSet::from([fixture.parent.clone()]);
+    let qualified = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+        api: &fixture.api.evidence,
+        trace: &fixture.trace.evidence,
+        healthy_roots: &healthy,
+    });
+    assert_eq!(qualified.certified_member_count(), 0);
+    assert!(state.snapshots.is_empty());
+}

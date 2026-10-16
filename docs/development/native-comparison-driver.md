@@ -119,3 +119,57 @@ test keeps the guard closed, reports the optional bound as unavailable and still
 executes the target acquisition assertions. No compiler allowlist or heap policy
 was changed. That failed run passed 2,901 service tests and failed one; it is not
 target-read or resource-cost acceptance. The correction needs its own CI.
+
+## Observation and acquisition source boundary
+
+The next component separates actual native observations from emission bodies.
+A non-cloneable receipt carries bounded occurrence counts, census window and
+index generation into the same authoritative fold. The existing entry points
+still accumulate the full body vector as before. The new entry point can consume
+all raw observations once even if an unresolved current body is withheld.
+It cannot receive provider envelopes or possible-owner identities.
+
+A fixture with two actual native files sharing a second request compares full
+base behavior with one withheld body. A filter-first control demonstrates the
+lost duplicate; the observation receipt keeps both actual owners visible to the
+same final fold. Another test compares the unfiltered receipt path with base
+index/body/count output. The effective upload is marked unsettled only after
+that actual-native fold; marking it incomplete beforehand would prevent existing
+complete-census duplicate detection from seeing a new duplicate.
+
+Pending target plans now retain their dependent sources and expected member
+revisions. Acquisition succeeds only after this pass's real full target reads
+complete at those revisions with healthy census/sidecar state. Enqueueing,
+restored entries and partial or replaced targets cannot release a dependency.
+An acquisition result permits the next exact fold, not a body offer or ownership.
+Unresolved results retain known rearm paths and family roots for the later
+selected-state callback. No callback is active yet.
+
+Qualification groups native references once, limits reconstruction to selected
+roots and rejects ambiguous indexed family membership. A hash-to-root-slot lookup
+moves certified assigned hash strings into one index and includes legacy-excluded
+IDs. Withdrawn roots are ignored by that lookup. Current native prior sets remain
+separate for Q5. The empty-exclusion validator does not use a legacy-owner graph,
+so preparation avoids building that graph when no selected proof needs it.
+This removes repeated family scans without cloning decoded rows or snapshots.
+
+Six additional tests cover native/emission parity, the real copied-prefix
+exclusion, successful and failed native acquisition, and ambiguous membership.
+These follow-on changes require their own hosted validation. CI for the earlier
+layout-test correction does not validate them. Positive source bootstrap,
+permit-bound controller, selected restore/rearm/save and original optimized
+oracles remain unfinished. In particular the final callback must reconcile
+terminal traversal retirement, next-pass target priority before audits and
+unsettled follow-up rules without weakening census or settlement evidence.
+
+
+Corrected target checkpoint: CI `38923150184` at
+`7e175a184219494f563437276042c7f48fb6a9e6` passed all four checks,
+with 2,902 service tests passed, zero failed and 24 ignored. All twelve new
+preparation/lifecycle/Q5/target tests passed. The actual target test observed
+one initial native file, two queued targets and two completed target reads in
+the same scanner/context and file budget before enrichment; repeated targets
+were zero. Requested layout remained unavailable on Rust1.98.1, as required.
+The nine base-exit receipts and four blocked controls passed; two original
+optimized-prelude bodies remain compiled and ignored. No installed or CPU/RSS
+benefit follows from this source checkpoint.
