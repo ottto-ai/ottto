@@ -317,9 +317,17 @@ fn envelope_experiment_native_save_bootstrap_restart_matches_base_owners() {
     // the base native comparison before its first body, including copied prefix.
     let c = "c3333333-3333-4333-8333-333333333333";
     let c_path = dir.join(format!("{c}.jsonl"));
+    // The existing legacy proof requires divergent suffixes on BOTH roots.
+    // Copying all four parent requests leaves no parent-side divergence and
+    // correctly does not qualify for exclusion. Fork after the first two.
     let prefix = fs::read_to_string(dir.join(format!("{parent}.jsonl")))
         .unwrap()
-        .replace(&parent, c);
+        .lines()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace(&parent, c)
+        + "\n";
     fs::write(&c_path, format!("{prefix}{{\"timestamp\":\"2026-08-02T07:00:07Z\",\"type\":\"assistant\",\"sessionId\":\"{c}\",\"requestId\":\"req_c\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n")).unwrap();
     let c_native = parse_claude_code_jsonl_file(&c_path, WINDOW, hex64('c'))
         .unwrap()
