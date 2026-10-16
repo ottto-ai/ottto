@@ -7,13 +7,13 @@ use std::mem::{align_of, size_of};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct ScopedSession {
+pub(in crate::snapshots) struct ScopedSession {
     destination: [u8; 32],
     session: [u8; 32],
 }
 
 impl ScopedSession {
-    pub(super) fn new(destination: [u8; 32], session: [u8; 32]) -> Self {
+    pub(in crate::snapshots) fn new(destination: [u8; 32], session: [u8; 32]) -> Self {
         Self {
             destination,
             session,
@@ -30,7 +30,7 @@ struct HeldMembership {
 }
 
 #[derive(Default)]
-pub(super) struct MembershipIndex {
+pub(in crate::snapshots) struct MembershipIndex {
     by_id: BTreeMap<Arc<String>, BTreeSet<ScopedSession>>,
     by_held: BTreeMap<ScopedSession, HeldMembership>,
     memberships: usize,
@@ -57,14 +57,15 @@ impl std::fmt::Debug for MembershipIndex {
 /// graphs from the EXISTING shared allowances first. These are not new caps.
 /// `heap_bytes` bounds this pool PLUS the still-owned incoming input and all
 /// transient insertion allocations, not just the final graph.
-pub(super) struct Allowance {
-    pub(super) owner_slots: usize,
-    pub(super) held_slots: usize,
-    pub(super) heap_bytes: usize,
+pub(in crate::snapshots) struct Allowance {
+    pub(in crate::snapshots) owner_slots: usize,
+    pub(in crate::snapshots) held_slots: usize,
+    pub(in crate::snapshots) heap_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Refused {
+pub(in crate::snapshots) enum Refused {
+    OwnerUnavailable,
     UnavailableLayout,
     OwnerBudget,
     HeapBudget,
@@ -73,6 +74,9 @@ pub(super) enum Refused {
 }
 
 impl MembershipIndex {
+    pub(in crate::snapshots) fn is_empty(&self) -> bool {
+        self.by_held.is_empty()
+    }
     /// A borrowed negative lookup only. Empty output is NOT proof of absence
     /// and callbacks may repeat a held key for multiple matching native IDs.
     pub(super) fn for_each_cached_native_link(
@@ -176,7 +180,7 @@ impl MembershipIndex {
         Ok(charge.bytes)
     }
 
-    pub(super) fn insert(
+    pub(in crate::snapshots) fn insert(
         &mut self,
         held: ScopedSession,
         ids: BTreeSet<String>,
@@ -199,7 +203,10 @@ impl MembershipIndex {
         Ok(peak_bound)
     }
 
-    fn current_charge(&self, limit: usize) -> Option<usize> {
+    /// Cached conservative custody charge. Never traverse the retained ID
+    /// pool in a parser budget check or a new-peer query. The empty initial
+    /// graph alone uses ordinary layout accounting; all mutations precharge.
+    pub(in crate::snapshots) fn current_charge(&self, limit: usize) -> Option<usize> {
         if self.charged_heap_upper_bound != 0 {
             return (self.charged_heap_upper_bound <= limit)
                 .then_some(self.charged_heap_upper_bound);

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 666,
-  "content_sha256": "1434448ba3a28d854336505b7821854f2bd094e1e8795cf3da22b42fe9cf3f0d",
+  "content_sha256": "eafc6c698b7e4aa2e6ff1a633ec7a5cda847ee8b70f5edc78251d9ca9ea3a67c",
   "files": [
     {
       "executable": false,
@@ -1280,15 +1280,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_copy_containment.rs",
-      "sha256": "c37b5607a8b997febb71d331636d424e527d96756885a6a94de93feaaa3b99b1",
-      "size_bytes": 6532
+      "sha256": "abbad0929ba29375c1467aef21f4aa7e147e19f692cb6f2089b6bf55d72be694",
+      "size_bytes": 6557
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_copy_containment/membership.rs",
-      "sha256": "e5df8f678fa6959240b0fe1c7e98e9c621077807c545f694d79aeaf879f56b38",
-      "size_bytes": 13125
+      "sha256": "bceba1283e616cd61444f76f439f7ff1f68fe4507beffc2aa9f39af57d6ac65e",
+      "size_bytes": 13624
     },
     {
       "executable": false,
@@ -1350,8 +1350,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_sidecar_reduction_tests.rs",
-      "sha256": "2752a9f972953f2fe614895d0acd2ef31cbe0b725731d95d36168c3fdaa30e76",
-      "size_bytes": 29018
+      "sha256": "ddcf84f178d06d7d30b29e89d29af3e075f55ac31aef1914b7b91c9a5db010b9",
+      "size_bytes": 33117
     },
     {
       "executable": false,
@@ -1420,8 +1420,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan.rs",
-      "sha256": "e5a24bcedfb040e8f2a7895e3a3faf5667100efa985f42a746bd759513685ce8",
-      "size_bytes": 14001
+      "sha256": "c022f8b6b0c244fdd84921b6d2b19e7af9bbb1016cc4bb5a014fda4f2d1de6a6",
+      "size_bytes": 17190
     },
     {
       "executable": false,
@@ -1462,8 +1462,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/transcript_cache.rs",
-      "sha256": "a9ae44aec20403b161649519016f04241d8454f54e44c763fdeb737e7b7b11dc",
-      "size_bytes": 18157
+      "sha256": "a2de6fa500e43fa46ce901d325ad7ca0f3382b22323a6104604ddc4ab25a92e4",
+      "size_bytes": 24009
     },
     {
       "executable": false,
@@ -1560,8 +1560,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/claude-copy-containment.md",
-      "sha256": "b99c377f8bec820c258f4ac182ea0eb6c94827dec93bcc9f2878a100cc27688c",
-      "size_bytes": 13738
+      "sha256": "dd67fd8c6e40587d77f457886ec51ef4c0c33d8d5929002d30fa2a629e9b853a",
+      "size_bytes": 16132
     },
     {
       "executable": false,
@@ -4665,7 +4665,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-16T22:00:35+00:00",
+  "generated_at": "2026-10-16T22:19:58+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 667,
   "public_roots": [
@@ -4704,5 +4704,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "6f93fb8e435ed3fff6e49a9c174f4abec0b095cc"
+  "source_commit": "502267482854abb5bfb1f71cb1ecd9d636825108"
 }

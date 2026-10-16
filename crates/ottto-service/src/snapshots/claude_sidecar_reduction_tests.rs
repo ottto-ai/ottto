@@ -332,7 +332,7 @@ fn seed_predecessor(fixture: &Fixture, cache: &Arc<SharedCache>) -> ScanIndex {
         fixture,
         raw_scan(fixture, ScanIndex::default(), Some(cache.clone()), |_| {}),
     ));
-    let bound = cache.inner.lock().unwrap().resident_bound();
+    let bound = cache.inner.lock().unwrap().reductions.resident_bound();
     if crate::heap_layout_bound::layout_supported() {
         assert!(bound.unwrap() <= STATE_BYTES);
     } else {
@@ -566,7 +566,7 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
         let prior = seed_predecessor(&f, &cache);
         let cache = if retained_budget {
             Arc::new(SharedCache {
-                inner: Mutex::new(TranscriptCache::with_byte_limit(0)),
+                inner: Mutex::new(SharedState::with_byte_limit(0)),
                 copy_containment_required: AtomicBool::new(false),
             })
         } else {
@@ -818,4 +818,95 @@ fn identity_capture_mode_change_rereads_instead_of_reusing_a_markerless_prefix()
     let steady = raw_scan_capturing(&g, prior, Some(cache), true, |_| {});
     assert_layout_mode(steady.modes, (0, 1, 0));
     assert!(markers_trusted(&steady, &g));
+}
+
+fn copy_shared_allowance() -> Allowance {
+    Allowance {
+        owner_slots: MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        held_slots: MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS,
+        heap_bytes: STATE_BYTES,
+    }
+}
+
+#[test]
+fn copy_containment_shared_cache_disabled_busy_and_live_overlap_refuse_before_membership_allocation(
+) {
+    let cache = SharedCache::default();
+    let held = ScopedSession::new([1; 32], [2; 32]);
+    let ids = BTreeSet::from(["req_shared_cache".to_string()]);
+    assert_eq!(
+        cache.retain_copy_membership(held, ids.clone(), copy_shared_allowance(), 0),
+        Err(Refused::OwnerUnavailable)
+    );
+    cache.require_copy_containment_for_test();
+    let guard = cache.inner.lock().unwrap();
+    let ((result, admission_allocations), allocations) =
+        crate::retry_allocation_probe::measure(|| {
+            // Input setup/drop is inside the probe; only admission is expected to
+            // allocate nothing. A busy actual owner must not wait or emit a wake.
+            let owned = ids.clone();
+            let before = crate::retry_allocation_probe::stats().allocations;
+            let result = cache.retain_copy_membership(held, owned, copy_shared_allowance(), 0);
+            (
+                result,
+                crate::retry_allocation_probe::stats().allocations - before,
+            )
+        });
+    assert_eq!(result, Err(Refused::OwnerUnavailable));
+    assert_eq!(admission_allocations, 0);
+    assert_eq!(allocations.requested_live, 0);
+    drop(guard);
+    assert!(matches!(
+        cache.retain_copy_membership(held, ids, copy_shared_allowance(), STATE_BYTES),
+        Err(Refused::HeapBudget | Refused::UnavailableLayout)
+    ));
+    assert!(cache.copy_containment_required());
+    cache.clear();
+    assert!(cache.copy_containment_required());
+}
+
+#[test]
+fn copy_containment_shared_cache_native_reduction_and_membership_use_one_existing_remainder() {
+    let fixture = Fixture::new(1);
+    let cache = Arc::new(SharedCache::default());
+    cache.require_copy_containment_for_test();
+    let _accepted = seed_predecessor(&fixture, &cache);
+    let native = raw_scan_capturing(&fixture, ScanIndex::default(), None, true, |_| {});
+    let ids = native.result.snapshots[0].claude_usage_request_ids.clone();
+    assert!(
+        !ids.is_empty(),
+        "actual native acquisition supplies membership"
+    );
+    let admitted = cache.retain_copy_membership(
+        ScopedSession::new([1; 32], [2; 32]),
+        ids,
+        copy_shared_allowance(),
+        0,
+    );
+    if !crate::heap_layout_bound::layout_supported() {
+        assert_eq!(admitted, Err(Refused::UnavailableLayout));
+        assert!(crate::heap_layout_bound::bound(cache.as_ref(), STATE_BYTES).is_none());
+        writeln!(std::io::stderr().lock(), "copy_containment_shared_cache: actual_shared_process_cache=true same_remainder_bytes={STATE_BYTES} layout_unavailable=true positive_membership_admission_executed=false frame_peak_unproved=true").unwrap();
+        return;
+    }
+    let member_peak = admitted.expect("native tiny membership must fit remaining shared custody");
+    let mut counter = Counter::new(STATE_BYTES);
+    cache.heap_bound(&mut counter).unwrap();
+    assert!(counter.bytes <= STATE_BYTES);
+    assert!(
+        counter.visits_for_test() < 100,
+        "no retained ID graph walk in parser budget checks"
+    );
+    let key = local_index_key(&fixture.path);
+    assert!(
+        cache.take(&key).is_some(),
+        "membership must preserve the retained native sibling"
+    );
+    assert!(crate::heap_layout_bound::bound(cache.as_ref(), STATE_BYTES).unwrap() <= counter.bytes);
+    cache.clear();
+    assert!(
+        cache.copy_containment_required(),
+        "optional eviction never cancels debt policy"
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_shared_cache: actual_shared_process_cache=true same_remainder_bytes={STATE_BYTES} member_peak_bound={member_peak} combined_heap_bound={} positive_membership_admission_executed=true frame_peak_unproved=true native_completion_wiring_unproved=true", counter.bytes).unwrap();
 }

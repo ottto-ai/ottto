@@ -1,5 +1,8 @@
 //! Production glue. One process-owned cache is shared by background and manual
 //! cycles; provider parsing, durable index/CAS and delivery remain native.
+use super::claude_copy_containment::membership::MembershipIndex;
+#[cfg(test)]
+use super::claude_copy_containment::membership::{Allowance, Refused, ScopedSession};
 use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::transcript_acquisition::{ReadMode, Scope};
@@ -14,15 +17,41 @@ const STATE_BYTES: usize =
     CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - AUDIT_AND_SCRATCH_BYTES;
 
 pub(crate) struct SharedCache {
-    inner: Mutex<TranscriptCache<sampled_jsonl::CachedJsonlReduction>>,
+    inner: Mutex<SharedState>,
     // Policy only, never evidence/coverage or a read grant. Production stays
     // disabled until the complete containment integration is validated.
     copy_containment_required: AtomicBool,
 }
+/// One lock and one retained budget for both optional graphs. The membership
+/// pool is negative-only; owning it establishes no read/upload permission.
+struct SharedState {
+    reductions: TranscriptCache<sampled_jsonl::CachedJsonlReduction>,
+    copy_membership: MembershipIndex,
+}
+impl SharedState {
+    fn with_byte_limit(bytes: usize) -> Self {
+        Self {
+            reductions: TranscriptCache::with_byte_limit(bytes),
+            copy_membership: MembershipIndex::default(),
+        }
+    }
+}
+impl HeapLayoutBound for SharedState {
+    fn heap_bound(&self, counter: &mut Counter) -> Option<()> {
+        let Self {
+            reductions,
+            copy_membership,
+        } = self;
+        reductions.heap_bound(counter)?;
+        // Includes conservative inline/root overhead twice if necessary. Never
+        // replace this with a complete ID graph walk on every parser check.
+        counter.add(copy_membership.current_charge(STATE_BYTES)?)
+    }
+}
 impl Default for SharedCache {
     fn default() -> Self {
         Self {
-            inner: Mutex::new(TranscriptCache::with_byte_limit(STATE_BYTES)),
+            inner: Mutex::new(SharedState::with_byte_limit(STATE_BYTES)),
             copy_containment_required: AtomicBool::new(false),
         }
     }
@@ -55,14 +84,52 @@ impl SharedCache {
 
     pub(crate) fn clear(&self) {
         if let Ok(mut cache) = self.inner.lock() {
-            cache.clear();
+            cache.reductions.clear();
+            cache.copy_membership = MembershipIndex::default();
         }
+    }
+    /// Exercise custody on the actual process cache before native completion
+    /// supplies the production admission call. The caller must move an already
+    /// owned input, not infer a permission to clone an unbounded native graph.
+    #[cfg(test)]
+    fn retain_copy_membership(
+        &self,
+        held: ScopedSession,
+        ids: BTreeSet<String>,
+        remaining: Allowance,
+        live_bytes: usize,
+    ) -> Result<usize, Refused> {
+        if !self.copy_containment_required() {
+            return Err(Refused::OwnerUnavailable);
+        }
+        let mut cache = self
+            .inner
+            .try_lock()
+            .map_err(|_| Refused::OwnerUnavailable)?;
+        let resident = crate::heap_layout_bound::bound(&cache.reductions, STATE_BYTES)
+            .ok_or(Refused::UnavailableLayout)?;
+        let heap_bytes = remaining
+            .heap_bytes
+            .min(STATE_BYTES)
+            .checked_sub(std::mem::size_of::<Self>())
+            .and_then(|bytes| bytes.checked_sub(resident))
+            .and_then(|bytes| bytes.checked_sub(live_bytes))
+            .ok_or(Refused::HeapBudget)?;
+        cache.copy_membership.insert(
+            held,
+            ids,
+            &Allowance {
+                owner_slots: remaining.owner_slots,
+                held_slots: remaining.held_slots,
+                heap_bytes,
+            },
+        )
     }
     pub(super) fn take(
         &self,
         key: &str,
     ) -> Option<crate::transcript_cache::Retained<sampled_jsonl::CachedJsonlReduction>> {
-        self.inner.lock().ok()?.take(key)
+        self.inner.lock().ok()?.reductions.take(key)
     }
     pub(super) fn insert(
         &self,
@@ -72,14 +139,26 @@ impl SharedCache {
     ) {
         if let Some(state) = completed.reduction {
             if let Ok(mut cache) = self.inner.lock() {
-                cache.insert_reserving(
-                    key,
-                    crate::transcript_cache::Retained {
-                        checkpoint: completed.checkpoint,
-                        state,
-                    },
-                    live_bytes,
-                );
+                let Some(live_bytes) = cache
+                    .copy_membership
+                    .current_charge(STATE_BYTES)
+                    .and_then(|membership| membership.checked_add(live_bytes))
+                    .and_then(|live| live.checked_add(std::mem::size_of::<Self>()))
+                    .filter(|all_live| *all_live <= STATE_BYTES)
+                else {
+                    return;
+                };
+                let retained = crate::transcript_cache::Retained {
+                    checkpoint: completed.checkpoint,
+                    state,
+                };
+                if cache.copy_membership.is_empty() {
+                    cache.reductions.insert_reserving(key, retained, live_bytes);
+                } else {
+                    cache
+                        .reductions
+                        .insert_reserving_peak(key, retained, live_bytes);
+                }
             }
         }
     }

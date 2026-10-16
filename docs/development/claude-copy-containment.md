@@ -178,8 +178,8 @@ copy debt is required: rebuilding could forget a known hold before comparison.
 An inactive strict load entry point preserves invalid original bytes and returns
 an error instead of rebuilding. Its test covers unknown hold version/reason,
 an invalid unrelated required index fact, truncated JSON and restoration of the
-valid debt. This follow-up is unvalidated until its exact source passes CI, and
-the ordinary production owner does not call it yet. Runtime attachment must use
+valid debt. The strict-load controls passed on exact `ce33e88d`, CI `38968604971`;
+the ordinary production owner remains disabled. Runtime attachment must use
 this policy before it can claim malformed debt is fail-closed; decoder rejection
 alone is not containment.
 
@@ -202,7 +202,41 @@ admission or new ID graph is implemented by this step.
 Two synthetic real-preparation tests check default-disabled base scanning,
 required parked debt with healthy native progress, shared process ownership,
 cache clear/generation/reload without a new read grant, and strict failure before
-scanner construction while invalid bytes remain intact. They are unvalidated
-until this exact source passes CI. Healthy wire ACK, normal/partial settlement,
+scanner construction while invalid bytes remain intact. Exact `50226748`, automatic CI `38973116004`, passed all four checks,
+all 25 containment tests and 2,894 service tests (0 failed, 22 ignored). The
+actual preparation receipt records two base reads versus zero held reads plus
+one healthy read per cycle. These are synthetic owner tests. Healthy wire ACK, normal/partial settlement,
 positive meaningful wake detection, shared peak admission, status and installed
 performance remain separate gates. This is not production activation.
+
+## Shared optional cache custody checkpoint
+
+The actual process-owned `SharedCache` now places reduction and negative-ID
+graphs under the same mutex. Both compete inside the existing 31 MiB retained
+remainder; there is no second budget, copied graph owner or persisted cache.
+A parser budget check consumes the membership pool's cached conservative charge
+instead of traversing every native ID. Reduction admission reserves that charge
+and live finalization room; membership admission subtracts frozen reduction
+resident bytes and live/owner room before existing peak preflight. The latter
+admission call remains test-only until the real native completion supplies its
+scoped input and all W1-W5 bindings. No production positive cache capture or
+permissive coverage follows from constructing the shared owner.
+
+When membership is resident, reduction insertion preflights the existing cache,
+incoming owned state, reserved sibling graphs and prospective map/key allocation
+peak before inserting. It retires optional entries without cloning victim keys.
+The caller still must preflight creating the incoming graph; this is not a
+post-allocation license or a bound for the whole index/scan. Unsupported layout,
+lock failure or insufficient room cannot grant a wake or clear durable debt.
+Eviction drops optional negative observations and leaves the required policy
+intact; unavailable W4 detection remains the qualified, disclosed residual.
+
+Four new tests exercise disabled/busy/live-overlap refusal on the actual shared
+cache, native reduction and membership custody, and strict reduction insertion's
+refusal and combined resident/input/eviction allocation peak. This checkpoint
+requires its own exact-head CI; the previous 25-test green does not validate it.
+On an unsupported compiler the positive peak/admission branches remain explicitly
+unexecuted. Conservative monotone membership charges can refuse earlier than
+actual residency; capacity/eviction cost remains unmeasured there. All-frame and
+index-clone/decode peaks, actual native capture, positive wakes, drain, status and
+installed acceptance are still separate unfinished gates. Production remains off.
