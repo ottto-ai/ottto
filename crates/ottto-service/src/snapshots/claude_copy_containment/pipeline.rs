@@ -85,6 +85,17 @@ impl Holds {
     }
 }
 impl ScanIndex {
+    /// Actual process/source/destination attachment with no invented positive
+    /// wake witness. Until the owner has acquired all required W1-W5 inputs,
+    /// every existing hold remains UNKNOWN/parked, even after a cache eviction
+    /// or index reload. This does not mint membership, a permit or a read grant.
+    pub(crate) fn attach_unknown_copy_owner(&mut self, scope: String) -> anyhow::Result<()> {
+        let context = ScanContext::new(scope, BTreeMap::new())
+            .ok_or_else(|| anyhow::anyhow!("invalid copied-request comparison scope"))?;
+        self.attach_copy_scan_context(context);
+        Ok(())
+    }
+
     pub(crate) fn attach_copy_scan_context(&mut self, context: ScanContext) {
         self.active_copy_scan = Some(context);
     }

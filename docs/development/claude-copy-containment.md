@@ -182,3 +182,27 @@ valid debt. This follow-up is unvalidated until its exact source passes CI, and
 the ordinary production owner does not call it yet. Runtime attachment must use
 this policy before it can claim malformed debt is fail-closed; decoder rejection
 alone is not containment.
+
+## Real preparation policy checkpoint
+
+The existing `LocalDaemon` shared transcript-cache lifecycle now carries an
+internal required-debt policy. It defaults to false in production and has only
+a test opt-in, with no CLI, environment, wire or installer switch. It is policy,
+not native evidence, permission, settled coverage or a read allowance. Clones
+share the same process owner; clearing optional reductions cannot disable it.
+
+When required, the real `prepare_sync_source` selects strict loading and attaches
+an UNKNOWN comparison context after the committed baseline clone. The scope
+binds source/destination/account/capture inputs; those are not complete Claude
+slot, peer or W1–W5 witnesses. Existing holds stay parked, including after cache
+clear, an index generation/reload or a new process under the required policy.
+New no-known-overlap candidates keep interim base behavior. No positive cache
+admission or new ID graph is implemented by this step.
+
+Two synthetic real-preparation tests check default-disabled base scanning,
+required parked debt with healthy native progress, shared process ownership,
+cache clear/generation/reload without a new read grant, and strict failure before
+scanner construction while invalid bytes remain intact. They are unvalidated
+until this exact source passes CI. Healthy wire ACK, normal/partial settlement,
+positive meaningful wake detection, shared peak admission, status and installed
+performance remain separate gates. This is not production activation.

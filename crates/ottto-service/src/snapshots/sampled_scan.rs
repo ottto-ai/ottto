@@ -4,6 +4,7 @@ use super::*;
 use crate::heap_layout_bound::{Counter, HeapLayoutBound};
 use crate::transcript_acquisition::{ReadMode, Scope};
 use crate::transcript_cache::{TranscriptCache, CACHE_BYTES, CACHE_ENTRIES};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // The existing owner enforces aggregate parked/optional-send overlap. The
 // separate 1MiB reserve covers bounded marker strings in existing index copies
@@ -14,11 +15,15 @@ const STATE_BYTES: usize =
 
 pub(crate) struct SharedCache {
     inner: Mutex<TranscriptCache<sampled_jsonl::CachedJsonlReduction>>,
+    // Policy only, never evidence/coverage or a read grant. Production stays
+    // disabled until the complete containment integration is validated.
+    copy_containment_required: AtomicBool,
 }
 impl Default for SharedCache {
     fn default() -> Self {
         Self {
             inner: Mutex::new(TranscriptCache::with_byte_limit(STATE_BYTES)),
+            copy_containment_required: AtomicBool::new(false),
         }
     }
 }
@@ -29,11 +34,26 @@ impl std::fmt::Debug for SharedCache {
 }
 impl HeapLayoutBound for SharedCache {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
-        self.inner.heap_bound(c)
+        let Self {
+            inner,
+            copy_containment_required: _, // Inline atomic, no owned allocation.
+        } = self;
+        inner.heap_bound(c)
     }
 }
 impl SharedCache {
-    pub(super) fn clear(&self) {
+    pub(crate) fn copy_containment_required(&self) -> bool {
+        self.copy_containment_required.load(Ordering::Relaxed)
+    }
+    // No CLI, environment or production switch. Exercise the real process
+    // owner and preparation path without enabling an incomplete release.
+    #[cfg(test)]
+    pub(crate) fn require_copy_containment_for_test(&self) {
+        self.copy_containment_required
+            .store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn clear(&self) {
         if let Ok(mut cache) = self.inner.lock() {
             cache.clear();
         }

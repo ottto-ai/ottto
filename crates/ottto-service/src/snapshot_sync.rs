@@ -3692,7 +3692,13 @@ fn prepare_sync_source(
         &upload_destination_namespace,
         snapshot_quarantine_witness(source),
     )?;
-    let mut index = ScanIndex::load(&index_path)?;
+    let copy_containment_required =
+        source == SnapshotSource::ClaudeCode && daemon.transcript_cache.copy_containment_required();
+    let mut index = if copy_containment_required {
+        ScanIndex::load_for_copy_containment(&index_path)?
+    } else {
+        ScanIndex::load(&index_path)?
+    };
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
@@ -3832,6 +3838,16 @@ fn prepare_sync_source(
         // A retained parser never crosses capture modes; the dark scope bytes
         // are unchanged.
         sampled_scope.push_str(":request_identity");
+    }
+    if copy_containment_required {
+        // Attach after the committed baseline clone: process context is not
+        // persisted/accepted evidence. Source/destination/account/capture bind
+        // the owner, but are NOT complete Claude slot/peer/W1-W5 witnesses.
+        // Missing witnesses stay UNKNOWN; no per-cycle/restart read allowance.
+        index.attach_unknown_copy_owner(format!(
+            "{:x}",
+            Sha256::digest(format!("copy_containment_owner:v1:{sampled_scope}"))
+        ))?;
     }
     let scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
         source,
@@ -16795,6 +16811,7 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
+    include!("snapshot_sync/copy_containment_owner_tests.rs");
     mod authority_proof_correction_pipeline_tests {
         include!("snapshot_sync/authority_proof_correction_pipeline_tests.rs");
     }
