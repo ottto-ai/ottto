@@ -43,9 +43,11 @@ impl<'de> Deserialize<'de> for Holds {
 pub(crate) struct ScanContext {
     scope: String,
     contexts: BTreeMap<String, Option<String>>,
+    // One required semantic input, never a complete W5 or read permission.
+    registered_slot_fingerprint: Option<String>,
     parked: usize,
 }
-crate::heap_layout_bound::fields!(ScanContext; scope, contexts, parked);
+crate::heap_layout_bound::fields!(ScanContext; scope, contexts, registered_slot_fingerprint, parked);
 
 impl ScanContext {
     pub(crate) fn new(scope: String, contexts: BTreeMap<String, Option<String>>) -> Option<Self> {
@@ -53,6 +55,7 @@ impl ScanContext {
             .then_some(Self {
                 scope,
                 contexts,
+                registered_slot_fingerprint: None,
                 parked: 0,
             })
     }
@@ -90,10 +93,32 @@ impl ScanIndex {
     /// every existing hold remains UNKNOWN/parked, even after a cache eviction
     /// or index reload. This does not mint membership, a permit or a read grant.
     pub(crate) fn attach_unknown_copy_owner(&mut self, scope: String) -> anyhow::Result<()> {
-        let context = ScanContext::new(scope, BTreeMap::new())
+        self.attach_unknown_copy_owner_with_registered_slots(scope, None)
+    }
+
+    pub(crate) fn attach_unknown_copy_owner_with_registered_slots(
+        &mut self,
+        scope: String,
+        registered_slot_fingerprint: Option<String>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            registered_slot_fingerprint
+                .as_deref()
+                .map_or(true, digest_valid),
+            "invalid registered-slot wake fingerprint"
+        );
+        let mut context = ScanContext::new(scope, BTreeMap::new())
             .ok_or_else(|| anyhow::anyhow!("invalid copied-request comparison scope"))?;
+        context.registered_slot_fingerprint = registered_slot_fingerprint;
         self.attach_copy_scan_context(context);
         Ok(())
+    }
+
+    pub(crate) fn copy_registered_slot_fingerprint(&self) -> Option<&str> {
+        self.active_copy_scan
+            .as_ref()?
+            .registered_slot_fingerprint
+            .as_deref()
     }
 
     pub(crate) fn attach_copy_scan_context(&mut self, context: ScanContext) {

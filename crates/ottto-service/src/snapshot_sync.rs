@@ -3844,10 +3844,16 @@ fn prepare_sync_source(
         // persisted/accepted evidence. Source/destination/account/capture bind
         // the owner, but are NOT complete Claude slot/peer/W1-W5 witnesses.
         // Missing witnesses stay UNKNOWN; no per-cycle/restart read allowance.
-        index.attach_unknown_copy_owner(format!(
-            "{:x}",
-            Sha256::digest(format!("copy_containment_owner:v1:{sampled_scope}"))
-        ))?;
+        let registered_slots = ottto_core::FileClaudeConfigSlotSettingsStore::default()
+            .transcript_binding_fingerprint()
+            .ok(); // Missing/unreadable required storage remains UNKNOWN.
+        index.attach_unknown_copy_owner_with_registered_slots(
+            format!(
+                "{:x}",
+                Sha256::digest(format!("copy_containment_owner:v1:{sampled_scope}"))
+            ),
+            registered_slots,
+        )?;
     }
     let scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
         source,

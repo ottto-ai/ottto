@@ -233,10 +233,45 @@ intact; unavailable W4 detection remains the qualified, disclosed residual.
 
 Four new tests exercise disabled/busy/live-overlap refusal on the actual shared
 cache, native reduction and membership custody, and strict reduction insertion's
-refusal and combined resident/input/eviction allocation peak. This checkpoint
-requires its own exact-head CI; the previous 25-test green does not validate it.
+refusal and combined resident/input/eviction allocation peak. Exact `ce146c70`, automatic CI `38975130480`, passed all four checks,
+all 29 containment tests and 2,898 service tests (0 failed, 22 ignored).
+The refusal controls ran; positive admission/peak paths were unexecuted because
+the hosted layout was unsupported.
 On an unsupported compiler the positive peak/admission branches remain explicitly
 unexecuted. Conservative monotone membership charges can refuse earlier than
 actual residency; capacity/eviction cost remains unmeasured there. All-frame and
 index-clone/decode peaks, actual native capture, positive wakes, drain, status and
 installed acceptance are still separate unfinished gates. Production remains off.
+
+## Bounded registered-slot input checkpoint
+
+The core registration store exposes a read-only semantic fingerprint for one
+required wake input. It uses the existing strict 1 MiB regular-file/no-follow
+decoder, without credentials or the retired reconnect sidecar. Required missing
+storage returns unavailable; it cannot become an inferred empty approval set.
+An explicit validated empty registry is distinguishable. Existing discovery's
+missing-is-empty contract and all settings writers/sign-in/upkeep callers retain
+their behavior.
+
+The fingerprint sorts at most nine borrowed registration references and streams
+length-delimited scope, approval/provenance and effective pending identity fields
+into a digest. It does not copy/serialize another settings graph. Operation
+progress, nonce, upkeep and maintenance timestamps are excluded; selection of
+the effective pending binding continues to use the existing policy. This is
+registered-slot metadata, not default-slot/Desktop evidence or an account permit.
+
+The actual required preparation path acquires this optional fingerprint from
+the same registration store used by transcript-root discovery. It attaches the
+signal only after the committed baseline clone, in the ephemeral context; no
+new persisted/wire field is introduced. Missing/error inputs stay UNKNOWN. A
+known slot input alone cannot complete per-key W1-W5 context, grant reads, offer
+bodies or settle debt. Production remains disabled.
+
+Five core tests cover unavailable versus explicit empty, malformed/oversize/IO
+state, canonical reordering and irrelevant maintenance, and meaningful approval
+or pending identity changes. One real preparation test acquires the signal
+without granting reads while other required inputs remain UNKNOWN. They require
+the new exact head's CI; the previous 29-test green is not acceptance. An actual
+meaningful W5 change waking exactly once, the other wake inputs, native comparison
+and durable body/no-op settlement remain unfinished. Whole decoder/frame/index
+allocation peaks are not inferred from the bounded metadata input.

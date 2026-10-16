@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 666,
-  "content_sha256": "eafc6c698b7e4aa2e6ff1a633ec7a5cda847ee8b70f5edc78251d9ca9ea3a67c",
+  "content_sha256": "935f04bde7ce4c7f72ef576312ca6ac725307f96a6ecd217b801597355d83b4f",
   "files": [
     {
       "executable": false,
@@ -531,8 +531,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/claude_config_slots.rs",
-      "sha256": "cda9bd7c5592cab60f7c281e29c2c2d8dccf837f6aea3f61e6bfc2df91693119",
-      "size_bytes": 183610
+      "sha256": "89cce1601fc8ed57edcbfdc5b435e75b5b141eb863ea769009e246eb6336a214",
+      "size_bytes": 196700
     },
     {
       "executable": false,
@@ -1182,8 +1182,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "707b43fd5a4b27a197b2fc5a112b218669e28f194e739f5a0d9156e3a04db8f5",
-      "size_bytes": 767523
+      "sha256": "e32c58efd85531e13aa315b4cfcfe9ab278331d8eec7ba1fa32242176e921d9a",
+      "size_bytes": 767819
     },
     {
       "executable": false,
@@ -1203,8 +1203,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/copy_containment_owner_tests.rs",
-      "sha256": "e5a574b9f49c30cda62329f0eb5b68fcac57feab1b1e07680c902884ddcd1c1b",
-      "size_bytes": 8105
+      "sha256": "a8b57cda3d4daa0f20e4eb218f2c617d34191675868a477ca0d0a7576b00b836",
+      "size_bytes": 10617
     },
     {
       "executable": false,
@@ -1301,8 +1301,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_copy_containment/pipeline.rs",
-      "sha256": "71eb57cc0b02b4c79f48a05696a4642077e192d271cc89d7fa22338fb26b0d16",
-      "size_bytes": 13186
+      "sha256": "776144d12483cf8f14144f816b25d209c376aa4ac0516bf87e45152ec7b0f640",
+      "size_bytes": 14148
     },
     {
       "executable": false,
@@ -1560,8 +1560,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/claude-copy-containment.md",
-      "sha256": "dd67fd8c6e40587d77f457886ec51ef4c0c33d8d5929002d30fa2a629e9b853a",
-      "size_bytes": 16132
+      "sha256": "f371edc5c877868aa4852e7cd7280e46f1300a3816fa1ba90a4ab891f09a9b4c",
+      "size_bytes": 18371
     },
     {
       "executable": false,
@@ -4665,7 +4665,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-16T22:19:58+00:00",
+  "generated_at": "2026-10-16T22:37:05+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 667,
   "public_roots": [
@@ -4704,5 +4704,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "502267482854abb5bfb1f71cb1ecd9d636825108"
+  "source_commit": "ce146c70a57853f5e151cf1680440a5570a6523f"
 }

@@ -184,3 +184,55 @@ fn copy_containment_real_preparation_rejects_invalid_required_index_without_rebu
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     assert!(ScanIndex::load_for_copy_containment(&path).is_err());
 }
+
+#[test]
+#[serial]
+fn copy_containment_real_preparation_reads_semantic_slot_input_without_granting_unknown_other_wakes(
+) {
+    let fixture = IdentityPipelineHome::new();
+    let support = fixture.base.join("support-copy-owner-slots");
+    let (path, _) = copy_owner_seed(&fixture, &support);
+    let daemon = test_daemon("otm_test");
+    daemon.transcript_cache.require_copy_containment_for_test();
+    let (index, scan) =
+        copy_owner_complete(copy_owner_prepare(&fixture, &support, &daemon).unwrap());
+    assert!(
+        index.copy_registered_slot_fingerprint().is_none(),
+        "missing required registry is UNKNOWN"
+    );
+    assert_eq!(index.copy_parked_count(), 1);
+    assert_eq!(scan.scanned_file_count, 1);
+    let before = std::fs::read(&path).unwrap();
+    let registry = support.join(ottto_core::CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME);
+    let mut value = serde_json::json!({"schema_version":2, "background_upkeep_consent":false,
+        "registered_slots":[]});
+    std::fs::write(&registry, serde_json::to_vec(&value).unwrap()).unwrap();
+    let (index, scan) =
+        copy_owner_complete(copy_owner_prepare(&fixture, &support, &daemon).unwrap());
+    let known = index.copy_registered_slot_fingerprint().unwrap().to_owned();
+    assert_eq!(known.len(), 64);
+    assert_eq!(
+        index.copy_parked_count(),
+        1,
+        "slot input alone cannot complete W1-W5"
+    );
+    assert_eq!(scan.scanned_file_count, 1);
+    value["background_upkeep_consent"] = serde_json::json!(true);
+    value["background_upkeep_consent_chosen"] = serde_json::json!(true);
+    value["last_poll_at"] = serde_json::json!("2026-10-16T22:00:00Z");
+    std::fs::write(&registry, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let (index, scan) =
+        copy_owner_complete(copy_owner_prepare(&fixture, &support, &daemon).unwrap());
+    assert_eq!(
+        index.copy_registered_slot_fingerprint(),
+        Some(known.as_str())
+    );
+    assert_eq!(index.copy_parked_count(), 1);
+    assert_eq!(scan.scanned_file_count, 1);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "acquisition cannot settle or rewrite debt"
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_registered_binding_owner: actual_prepare_acquisition=true missing_required_unknown=true explicit_empty_registry_known=true maintenance_hash_stable=true held_reads=0 healthy_reads_per_cycle=1 other_required_wakes_unknown=true no_read_grant=true full_W5_unproved=true").unwrap();
+}
