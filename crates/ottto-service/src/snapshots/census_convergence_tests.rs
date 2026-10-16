@@ -79,6 +79,7 @@ fn bind_authority_quarantine(
         }
     };
     let record = ClaudeUsageAuthorityQuarantineRecord {
+        proof_correction: None,
         contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
         proven_witness_fingerprint: claude_usage_family_witness_fingerprint(&witness),
         member_source_file_fingerprints: BTreeMap::from([(
@@ -1278,4 +1279,8 @@ fn transcript_ownership_needs_quarantined_originals_observed() {
 
 mod owned_held_index_allocation {
     include!("owned_held_index_allocation_tests.rs");
+}
+
+mod authority_binding_prototype {
+    include!("authority_binding_prototype_tests.rs");
 }

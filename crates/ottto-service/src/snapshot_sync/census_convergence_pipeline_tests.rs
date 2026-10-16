@@ -227,9 +227,17 @@ impl PipelineFixture {
                 "owned Completed settlement preserves the entire borrowed state"
             );
         }
-        let fully_settled = settlement.fully_settled;
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
+        let fully_settled = settle_upload_corrections_after_selection(
+            &mut index,
+            &scan,
+            &committed_index,
+            &progress,
+            &[],
+            &[],
+            settlement.fully_settled,
+        );
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
             &mut index,

@@ -160,6 +160,7 @@ fn bounded_retry_envelope_competing_state_refusal_preserves_native_files() {
                 &f.baseline,
                 &f.progress,
                 &f.items,
+                None,
                 &BTreeSet::new(),
                 &f.index_path,
                 &f.progress_path,

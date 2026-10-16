@@ -426,6 +426,8 @@ pub const SNAPSHOT_QUARANTINE_CONTRACT_VERSION: &str = "snapshot_quarantine:v1";
 pub const SNAPSHOT_QUARANTINE_RETRY_SECONDS: u64 = 6 * 60 * 60;
 const CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION: &str =
     "claude_usage_authority_quarantine:v1";
+const CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION: &str =
+    "claude_usage_authority_quarantine:v2";
 const CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS: u64 = 6 * 60 * 60;
 /// One initial failed reconstruction plus three deterministic 6-12 hour
 /// retries. This gives transient sidecar lag three recovery windows while
@@ -2367,6 +2369,31 @@ struct ClaudeUsageAuthorityQuarantineRecord {
     #[serde(default)]
     disposition: ClaudeUsageAuthorityQuarantineDisposition,
     retry_after_unix_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proof_correction: Option<ClaudeAuthorityProofCorrection>,
+}
+
+include!("snapshots/authority_proof_correction.rs");
+
+#[cfg(test)]
+pub(crate) const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES_FOR_TEST: u8 =
+    MAX_CLAUDE_USAGE_AUTHORITY_FAILURES;
+
+/// Test-only, content-free copy of one family authority record and its
+/// binding to the retained witness.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeAuthorityRecordForTest {
+    pub(crate) contract: String,
+    pub(crate) proven_witness_fingerprint: String,
+    pub(crate) member_source_file_fingerprints: BTreeMap<String, String>,
+    pub(crate) failed_reconstruction_count: u8,
+    pub(crate) terminal: bool,
+    pub(crate) retry_after_unix_seconds: u64,
+    /// The pending correction's proof digest and owed members.
+    pub(crate) correction: Option<(String, BTreeSet<String>)>,
+    pub(crate) bound_to_retained_witness: bool,
+    pub(crate) family_pending_retained: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2574,7 +2601,7 @@ fn claude_usage_authority_deadline_is_bounded(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
-    record.contract == CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION
+    claude_authority_record_contract_is_valid(record)
         && sha256_hex_is_well_formed(&record.proven_witness_fingerprint)
         && !record.member_source_file_fingerprints.is_empty()
         && (1..=MAX_CLAUDE_USAGE_AUTHORITY_FAILURES).contains(&record.failed_reconstruction_count)
@@ -3782,6 +3809,65 @@ fn apply_claude_reported_usage_with_index_and_limits(
     max_duplicate_owners: usize,
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
 ) -> ClaudeUsageAuthorityDisposition {
+    apply_claude_reported_usage_with_index_limits_and_current_files(
+        snapshots,
+        api_report,
+        trace_report,
+        index,
+        census_complete,
+        census_window_end,
+        max_pending_occurrences,
+        max_duplicate_owners,
+        identity,
+        &BTreeSet::new(),
+    )
+}
+
+/// Current-page reads defer earlier empty-pair completion until finalization
+/// and file selection. In particular a failed newer read cannot certify the
+/// previously stored empty revision as this page's current result.
+pub(crate) fn apply_claude_reported_usage_to_scan_with_identity(
+    scan: &mut SourceScanResult,
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    index: &mut ScanIndex,
+    identity: Option<&claude_request_identity::ScanEvidence<'_>>,
+) -> ClaudeUsageAuthorityDisposition {
+    let current_files = if index.claude_usage_authority_quarantine.is_empty() {
+        BTreeSet::new()
+    } else {
+        scan.pending_finalization
+            .iter()
+            .map(|pending| pending.index_key.clone())
+            .collect()
+    };
+    apply_claude_reported_usage_with_index_limits_and_current_files(
+        &mut scan.snapshots,
+        api_report,
+        trace_report,
+        index,
+        scan.census_complete,
+        &scan.census_window_end,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        identity,
+        &current_files,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_claude_reported_usage_with_index_limits_and_current_files(
+    snapshots: &mut [SnapshotItem],
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    index: &mut ScanIndex,
+    census_complete: bool,
+    census_window_end: &str,
+    max_pending_occurrences: usize,
+    max_duplicate_owners: usize,
+    identity: Option<&claude_request_identity::ScanEvidence<'_>>,
+    current_files: &BTreeSet<String>,
+) -> ClaudeUsageAuthorityDisposition {
     let mut duplicate_census = accumulate_claude_usage_family_pending_with_limit(
         snapshots,
         &mut index.claude_usage_family_pending,
@@ -3889,6 +3975,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
                         || witness_roots_before.contains(root_session_id))
             });
         for (root_session_id, family) in &proven {
+            index.rebind_claude_authority_proof(root_session_id, &family.witness);
             index
                 .claude_usage_family_witnesses
                 .insert(root_session_id.clone(), family.witness.clone());
@@ -4389,7 +4476,21 @@ fn apply_claude_reported_usage_with_index_and_limits(
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     for root_session_id in demoting_members_by_root.keys() {
-        let Some(proven_witness_fingerprint) = witness_fingerprints_before.get(root_session_id)
+        let correction_failed = index
+            .claude_usage_authority_quarantine
+            .get(root_session_id)
+            .is_some_and(|record| record.proof_correction.is_some());
+        let corrected_witness = correction_failed
+            .then(|| {
+                index
+                    .claude_usage_family_witnesses
+                    .get(root_session_id)
+                    .map(claude_usage_family_witness_fingerprint)
+            })
+            .flatten();
+        let Some(proven_witness_fingerprint) = corrected_witness
+            .as_ref()
+            .or_else(|| witness_fingerprints_before.get(root_session_id))
         else {
             continue;
         };
@@ -4421,12 +4522,13 @@ fn apply_claude_reported_usage_with_index_and_limits(
         }
         let existing = index.claude_usage_authority_quarantine.get(root_session_id);
         let same_binding = existing.is_some_and(|existing| {
-            existing.contract == CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION
+            claude_usage_authority_deadline_is_bounded(existing)
                 && existing.proven_witness_fingerprint == *proven_witness_fingerprint
                 && existing.member_source_file_fingerprints == member_source_file_fingerprints
         });
         let retain_existing = existing.is_some_and(|existing| {
-            same_binding
+            !correction_failed
+                && same_binding
                 && (existing.disposition
                     == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
                     || existing.retry_after_unix_seconds > now)
@@ -4442,21 +4544,30 @@ fn apply_claude_reported_usage_with_index_and_limits(
             } else {
                 ClaudeUsageAuthorityQuarantineDisposition::RetryPending
             };
+            let retry_after_unix_seconds = if correction_failed {
+                existing
+                    .expect("correction record exists")
+                    .retry_after_unix_seconds
+            } else {
+                claude_usage_authority_retry_deadline(root_session_id, proven_witness_fingerprint)
+            };
             index.claude_usage_authority_quarantine.insert(
                 root_session_id.clone(),
                 ClaudeUsageAuthorityQuarantineRecord {
+                    proof_correction: None,
                     contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
                     proven_witness_fingerprint: proven_witness_fingerprint.clone(),
                     member_source_file_fingerprints,
                     failed_reconstruction_count,
                     disposition,
-                    retry_after_unix_seconds: claude_usage_authority_retry_deadline(
-                        root_session_id,
-                        proven_witness_fingerprint,
-                    ),
+                    retry_after_unix_seconds,
                 },
             );
         }
+    }
+
+    if census_complete && reports_healthy {
+        index.settle_known_empty_claude_proof_corrections(current_files, snapshots);
     }
 
     if census_complete {
@@ -4622,6 +4733,10 @@ fn apply_claude_reported_usage_with_index_and_limits(
             });
     }
 
+    if census_complete && reports_healthy {
+        index.retire_absent_claude_proof_corrections(&complete_families);
+    }
+
     let current_authority_by_root = snapshots.iter().fold(
         BTreeMap::<String, BTreeMap<String, bool>>::new(),
         |mut by_root, item| {
@@ -4641,6 +4756,20 @@ fn apply_claude_reported_usage_with_index_and_limits(
         .keys()
         .filter(|root_session_id| {
             if demoting_members_by_root.contains_key(*root_session_id) {
+                return false;
+            }
+            // Preserve the existing whole-family disappearance rule even
+            // when provider reports are unavailable. Its witness was pruned
+            // by the same complete filesystem census above.
+            if census_complete && !complete_families.contains_key(*root_session_id) {
+                return true;
+            }
+            // Only exact durable body settlement may drain a correction grant.
+            if index
+                .claude_usage_authority_quarantine
+                .get(*root_session_id)
+                .is_some_and(|record| record.proof_correction.is_some())
+            {
                 return false;
             }
             let expected_members =
@@ -11345,6 +11474,33 @@ pub(crate) fn scan_source_roots_with_test_limit(
         requested_backfill_window_days,
         file_limit,
         artifacts_enabled,
+    )
+}
+
+/// A bounded Claude scan with an explicit local OTEL support directory, so
+/// sidecar changes enter each family member's source fingerprint, and an
+/// injectable page size.
+#[cfg(test)]
+pub(crate) fn scan_source_roots_with_test_limit_and_claude_support(
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    requested_backfill_window_days: u64,
+    file_limit: usize,
+    claude_effort_support_dir: &Path,
+) -> Result<SourceScanResult> {
+    scan_source_roots_with_limit_and_attribution(
+        SnapshotSource::ClaudeCode,
+        roots,
+        index,
+        collected_at,
+        requested_backfill_window_days,
+        file_limit,
+        true,
+        None,
+        Some(claude_effort_support_dir),
+        &[],
+        false,
     )
 }
 
@@ -21858,6 +22014,55 @@ impl ScanIndex {
         .then(|| record.member_source_file_fingerprints.clone())
     }
 
+    /// The content-free digest of the family's retained usage witness.
+    #[cfg(test)]
+    pub(crate) fn claude_usage_family_witness_digest_for_test(
+        &self,
+        root_session_id: &str,
+    ) -> Option<String> {
+        self.claude_usage_family_witnesses
+            .get(root_session_id)
+            .map(claude_usage_family_witness_fingerprint)
+    }
+
+    /// Whether a bounded traversal is still in progress.
+    #[cfg(test)]
+    pub(crate) fn scan_traversal_in_progress_for_test(&self) -> bool {
+        self.traversal.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claude_authority_record_for_test(
+        &self,
+        root_session_id: &str,
+    ) -> Option<ClaudeAuthorityRecordForTest> {
+        let record = self
+            .claude_usage_authority_quarantine
+            .get(root_session_id)?;
+        Some(ClaudeAuthorityRecordForTest {
+            contract: record.contract.clone(),
+            proven_witness_fingerprint: record.proven_witness_fingerprint.clone(),
+            member_source_file_fingerprints: record.member_source_file_fingerprints.clone(),
+            failed_reconstruction_count: record.failed_reconstruction_count,
+            terminal: record.disposition
+                == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+            retry_after_unix_seconds: record.retry_after_unix_seconds,
+            correction: record.proof_correction.as_ref().map(|correction| {
+                (
+                    correction.proof_witness_fingerprint.clone(),
+                    correction.owed_member_ids.clone(),
+                )
+            }),
+            bound_to_retained_witness: self
+                .claude_usage_family_witnesses
+                .get(root_session_id)
+                .is_some_and(|witness| claude_usage_authority_preserves_pending(record, witness)),
+            family_pending_retained: self
+                .claude_usage_family_pending
+                .contains_key(root_session_id),
+        })
+    }
+
     #[cfg(test)]
     fn insert_claude_authority_for_test(
         &mut self,
@@ -21888,6 +22093,7 @@ impl ScanIndex {
             }
         };
         let record = ClaudeUsageAuthorityQuarantineRecord {
+            proof_correction: None,
             contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
             proven_witness_fingerprint: claude_usage_family_witness_fingerprint(&witness),
             member_source_file_fingerprints: BTreeMap::from([(
@@ -23163,6 +23369,7 @@ impl ScanIndex {
         held: &BTreeSet<String>,
         reparse_held: &BTreeSet<String>,
     ) -> ScanIndex {
+        let empty_advances = self.claude_empty_map_advances(previous);
         let held_keys = self.locally_held_keys(held);
         let placeholders =
             self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
@@ -23261,6 +23468,7 @@ impl ScanIndex {
                     .insert(fingerprint.clone());
             }
         }
+        result.restore_claude_empty_map_advances(empty_advances);
         let current = result.current_snapshot_fingerprints();
         result
             .snapshot_activity_at
@@ -23276,6 +23484,7 @@ impl ScanIndex {
         held: &BTreeSet<String>,
         reparse_held: &BTreeSet<String>,
     ) -> ScanIndex {
+        let empty_advances = self.claude_empty_map_advances(previous);
         let held_keys = self.locally_held_keys(held);
         let placeholders =
             self.claude_terminal_member_placeholder_keys(previous, &held_keys, reparse_held);
@@ -23367,6 +23576,7 @@ impl ScanIndex {
                     .insert(fingerprint.clone());
             }
         }
+        self.restore_claude_empty_map_advances(empty_advances);
         let current = self.current_snapshot_fingerprints();
         self.snapshot_activity_at
             .retain(|fingerprint, _| current.contains(fingerprint));
@@ -23379,6 +23589,7 @@ impl ScanIndex {
         accepted: &BTreeSet<String>,
         quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
     ) -> ScanIndex {
+        let empty_advances = self.claude_empty_map_advances(previous);
         let settled = |fingerprint: &str| {
             accepted.contains(fingerprint) || quarantined.contains_key(fingerprint)
         };
@@ -23621,6 +23832,7 @@ impl ScanIndex {
                 }
             }
         }
+        result.restore_claude_empty_map_advances(empty_advances);
         result.retain_quarantined_fingerprints(&retained_quarantine);
         result.reconcile_codex_recovery_settlement(previous, accepted);
         result
@@ -23778,7 +23990,7 @@ impl ScanIndex {
                 Some(CandidateParseReason::NewFile),
             );
         };
-        if let Some((root_session_id, _)) = claude_index_path_family_member(&candidate.path) {
+        if let Some((root_session_id, member)) = claude_index_path_family_member(&candidate.path) {
             if self
                 .claude_usage_authority_quarantine
                 .contains_key(&root_session_id)
@@ -23786,6 +23998,11 @@ impl ScanIndex {
                 if self
                     .claude_usage_authority_candidate_requires_family_reparse(candidate)
                     .is_some()
+                    || self
+                        .claude_usage_authority_quarantine
+                        .get(&root_session_id)
+                        .and_then(|record| record.proof_correction.as_ref())
+                        .is_some_and(|correction| correction.owed_member_ids.contains(&member))
                 {
                     return (
                         CandidateDecision::Parse,
@@ -25080,6 +25297,9 @@ mod tests {
     }
     mod giant_row_measurement_tests {
         include!("snapshots/giant_row_measurement_tests.rs");
+    }
+    mod authority_proof_correction_tests {
+        include!("snapshots/authority_proof_correction_tests.rs");
     }
     use super::*;
     use base64::Engine as _;
@@ -27858,6 +28078,7 @@ mod tests {
         index.claude_usage_authority_quarantine.insert(
             root_session_id.to_string(),
             ClaudeUsageAuthorityQuarantineRecord {
+                proof_correction: None,
                 contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
                 proven_witness_fingerprint: witness_fingerprint.clone(),
                 member_source_file_fingerprints: BTreeMap::from([(
@@ -28009,6 +28230,7 @@ mod tests {
         index.claude_usage_authority_quarantine.insert(
             quarantined_root.to_string(),
             ClaudeUsageAuthorityQuarantineRecord {
+                proof_correction: None,
                 contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
                 proven_witness_fingerprint: "witness".to_string(),
                 member_source_file_fingerprints: BTreeMap::new(),
@@ -28122,6 +28344,7 @@ mod tests {
         index.claude_usage_authority_quarantine.insert(
             root_session_id.to_string(),
             ClaudeUsageAuthorityQuarantineRecord {
+                proof_correction: None,
                 contract: CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION.to_string(),
                 proven_witness_fingerprint: witness_fingerprint,
                 member_source_file_fingerprints: members,
@@ -45623,7 +45846,9 @@ mod tests {
         metadata: &ClaudeTitleMetadata,
         prefix: &str,
     ) -> SnapshotItem {
-        let root = temp_dir("claude-original-carrier");
+        // Several tests call this helper concurrently. Timestamp-only names
+        // plus create_dir_all can adopt another call's transcript directory.
+        let root = crate::test_scratch::ScratchDir::new("claude-original-carrier");
         let path = root.join("native-session.jsonl");
         let record = json!({"timestamp":"2026-09-30T10:00:00Z", "type":"assistant",
             "sessionId":"native-session", "requestId":"owned-request", "message":{
@@ -45651,12 +45876,11 @@ mod tests {
             true,
             "2026-09-30T10:05:00Z",
         );
-        fs::remove_dir_all(root).unwrap();
         item
     }
 
     fn claude_original_carrier_metadata() -> ClaudeTitleMetadata {
-        let root = temp_dir("claude-original-native-index");
+        let root = crate::test_scratch::ScratchDir::new("claude-original-native-index");
         let path = root
             .join("123e4567-e89b-12d3-a456-426614174000")
             .join("123e4567-e89b-12d3-a456-426614174001")
@@ -45680,9 +45904,7 @@ mod tests {
             .insert(local_index_key(&path), entry);
         let restored: ScanIndex =
             serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
-        let metadata = ClaudeTitleMetadata::from_durable_index(&restored, false);
-        fs::remove_dir_all(root).unwrap();
-        metadata
+        ClaudeTitleMetadata::from_durable_index(&restored, false)
     }
 
     fn claude_original_carrier_missing_metadata() -> ClaudeTitleMetadata {
@@ -55811,7 +56033,11 @@ crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
 crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, effective_input_context);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrenceWitness; sequence, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, model, speed_mode, reasoning_effort);
-crate::heap_layout_bound::fields!(ClaudeUsageAuthorityQuarantineRecord; contract, proven_witness_fingerprint, member_source_file_fingerprints, failed_reconstruction_count, disposition, retry_after_unix_seconds);
+crate::heap_layout_bound::fields!(ClaudeUsageAuthorityQuarantineRecord; contract, proven_witness_fingerprint, member_source_file_fingerprints, failed_reconstruction_count, disposition, retry_after_unix_seconds, proof_correction);
+crate::heap_layout_bound::fields!(ClaudeEmptyMapAdvance; root, member, key, revision, previous);
+crate::heap_layout_bound::fields!(ClaudeAuthorityProofCorrection; proof_witness_fingerprint, owed_member_ids);
+crate::heap_layout_bound::fields!(ClaudeProofCorrectionCandidate; index_key, root, member, proof, revision, fingerprint, body_witness);
+crate::heap_layout_bound::fields!(ClaudeCutoffCorrectionCandidate; index_key, root, member, proof, revision);
 crate::heap_layout_bound::fields!(ClaudeUsageFamilyPending; census_window_end, member_request_id_hashes, member_occurrences, invalid);
 crate::heap_layout_bound::fields!(ClaudeUsageFamilyWitness; evidence_fingerprint, member_request_id_fingerprints, member_occurrence_fingerprints, assigned_request_id_fingerprints, legacy_excluded_request_id_hashes, legacy_exclusion_evidence_fingerprint, legacy_owner_roots);
 crate::heap_layout_bound::fields!(CodexParentOwnershipLedger; signatures, scan_complete, opened_object_identity);

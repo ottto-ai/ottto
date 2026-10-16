@@ -356,9 +356,8 @@ impl LocalHoldSettlement {
     }
 }
 
-/// The index an upload outcome commits, and whether that outcome leaves the
-/// upload fully settled. An unsettled outcome keeps backfill and context-curve
-/// replay completion pending.
+/// The index selected by an upload outcome, and its transport/local-hold
+/// settlement. Authority corrections are finalized on that selected index.
 struct UploadIndexSettlement {
     index: ScanIndex,
     fully_settled: bool,
@@ -449,6 +448,60 @@ fn settle_index_after_upload(
     );
     index.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
     index.record_accepted_snapshot_fingerprints(&upload_progress.accepted_fingerprints);
+}
+
+/// Correction completion depends on the final selected file/empty facts. In
+/// particular, the last M2 no-body drain must precede the completion decision.
+fn settle_upload_corrections_after_selection(
+    index: &mut ScanIndex,
+    scan: &SourceScanResult,
+    committed_index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    candidates: &[crate::snapshots::ClaudeProofCorrectionCandidate],
+    cutoff_candidates: &[crate::snapshots::ClaudeCutoffCorrectionCandidate],
+    transport_fully_settled: bool,
+) -> bool {
+    // D1 is deliberately unavailable to partial/deferred/shed/error outcomes.
+    // Both existing durable refusal carriers must bind the exact current body.
+    if transport_fully_settled {
+        index.settle_claude_proof_corrections_with_permanent(
+            committed_index,
+            candidates,
+            &progress.accepted_fingerprints,
+            &progress.accepted_body_witnesses,
+            |fingerprint, body| {
+                progress
+                    .permanent_rejections
+                    .get(fingerprint)
+                    .is_some_and(|rejection| rejection.body_witness == body)
+                    && progress
+                        .quarantined_fingerprints
+                        .get(fingerprint)
+                        .is_some_and(|record| {
+                            record.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
+                                && record.upload_body_witness.as_deref() == Some(body)
+                        })
+            },
+        );
+    }
+    index.settle_cutoff_claude_proof_corrections(cutoff_candidates);
+    index.settle_empty_claude_proof_corrections(scan);
+    transport_fully_settled && !index.claude_authority_proof_correction_pending()
+}
+
+fn apply_backfill_cutoff_with_claude_corrections(
+    scan: &mut SourceScanResult,
+    index: &ScanIndex,
+    disposition: &crate::snapshots::ClaudeUsageAuthorityDisposition,
+    state: &crate::backfill::BackfillState,
+) -> (
+    usize,
+    Vec<crate::snapshots::ClaudeCutoffCorrectionCandidate>,
+) {
+    let mut candidates = index.capture_claude_cutoff_corrections(scan, disposition);
+    let removed = apply_backfill_cutoff(&mut scan.snapshots, state);
+    ScanIndex::retain_fully_cutoff_corrections(&mut candidates, &scan.snapshots);
+    (removed, candidates)
 }
 
 #[derive(Debug)]
@@ -1608,6 +1661,7 @@ fn checkpoint_partial_snapshot_index(
     committed_index: &ScanIndex,
     progress: &SnapshotUploadProgress,
     snapshots: &[SnapshotItem],
+    correction_scan: Option<&SourceScanResult>,
     locally_held: &BTreeSet<String>,
     index_path: &Path,
     progress_path: &Path,
@@ -1618,6 +1672,7 @@ fn checkpoint_partial_snapshot_index(
         committed_index,
         progress,
         snapshots,
+        correction_scan,
         locally_held,
         index_path,
         progress_path,
@@ -1632,6 +1687,7 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
     committed_index: &ScanIndex,
     progress: &SnapshotUploadProgress,
     snapshots: &[SnapshotItem],
+    correction_scan: Option<&SourceScanResult>,
     locally_held: &BTreeSet<String>,
     index_path: &Path,
     progress_path: &Path,
@@ -1702,6 +1758,11 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
         .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
         .collect();
     let mut committable = index.committable_subset(committed_index, &accepted, &quarantined);
+    if let Some(scan) = correction_scan {
+        // A2: settle no-body grants only against the file/empty/map facts
+        // actually selected for this save, after any old-entry restoration.
+        committable.settle_empty_claude_proof_corrections(scan);
+    }
     committable.mark_bounded_sweep_unsettled();
     validate_destination()?;
     if let Some(cap) = read_limit {
@@ -3997,7 +4058,20 @@ fn finish_sync_source(
     // upstream this cycle — sessions whose activity ended strictly before the
     // cutoff are historical by definition, whichever scan produced them; live
     // sessions always have activity at/after the cutoff and pass untouched.
-    let skipped_before_cutoff = apply_backfill_cutoff(&mut scan_result.snapshots, &backfill_state);
+    let (skipped_before_cutoff, claude_cutoff_corrections) = if source == SnapshotSource::ClaudeCode
+    {
+        apply_backfill_cutoff_with_claude_corrections(
+            &mut scan_result,
+            &index,
+            &claude_authority_disposition,
+            &backfill_state,
+        )
+    } else {
+        (
+            apply_backfill_cutoff(&mut scan_result.snapshots, &backfill_state),
+            Vec::new(),
+        )
+    };
     if skipped_before_cutoff > 0 {
         eprintln!(
             "ottto-service: skipped {} historical {} snapshot(s) that ended before the account-switch backfill cutoff",
@@ -4036,6 +4110,26 @@ fn finish_sync_source(
         &index,
         &upload_progress.quarantined_fingerprints,
     );
+    // Preserve current-proof/current-revision evidence before the finalizer
+    // removes exact semantic no-ops. Held/account-filtered bodies are excluded.
+    let claude_proof_correction_candidates = if source == SnapshotSource::ClaudeCode {
+        index.capture_claude_proof_corrections(
+            &mut scan_result,
+            &claude_authority_disposition,
+            |snapshot| {
+                effective_snapshot_upload_body_witness(
+                    snapshot,
+                    &upload_progress,
+                    cache_observations_enabled,
+                    activity_hint.snapshot_head_cas_required,
+                    &legacy_reconciliation_pending,
+                    &claude_authority_disposition,
+                )
+            },
+        )
+    } else {
+        Vec::new()
+    };
     finalize_scan_after_policy_with_body_witness(
         source,
         &mut scan_result,
@@ -4051,6 +4145,7 @@ fn finish_sync_source(
             )
         },
     );
+    index.advance_empty_claude_proof_corrections(&scan_result);
     if source == SnapshotSource::Codex {
         capture_codex_recovery_evidence(
             &mut index,
@@ -4351,6 +4446,22 @@ fn finish_sync_source(
     })
     .map(|result| with_bootstrap_deferred(result, bootstrap_deferred));
 
+    // Exact progress is durable before this seam. The same subsequent index
+    // save carries settled file bodies and correction progress; local-state
+    // errors cannot certify an uncertain ACK. UnACKed/held members stay owed.
+    if !upload_result.as_ref().err().is_some_and(|error| {
+        snapshot_upload_error_class(error) == Some(SnapshotUploadErrorClass::LocalState)
+    }) {
+        index.settle_claude_proof_corrections(
+            &committed_index,
+            &claude_proof_correction_candidates,
+            &upload_progress.accepted_fingerprints,
+            &upload_progress.accepted_body_witnesses,
+        );
+    }
+
+    index.log_claude_proof_correction_debt();
+
     // The server may have accepted new entities even when the final result is a
     // timeout, a disabled response, or a later local-state failure. Withdraw
     // the pre-cycle cache for every outcome; completed/shed branches republish
@@ -4413,6 +4524,7 @@ fn finish_sync_source(
                 &committed_index,
                 &upload_progress,
                 &scan_result.snapshots,
+                Some(&scan_result),
                 locally_held_fingerprints,
                 &index_path,
                 &upload_progress_path,
@@ -4521,6 +4633,7 @@ fn finish_sync_source(
                     &committed_index,
                     &upload_progress,
                     &scan_result.snapshots,
+                    Some(&scan_result),
                     locally_held_fingerprints,
                     &index_path,
                     &upload_progress_path,
@@ -4684,6 +4797,18 @@ fn finish_sync_source(
     }
 
     settle_index_after_upload(&mut index, &committed_index, &upload_progress);
+    // Completed/checkpointed outcomes have now selected their retained file
+    // facts. No-body completion must share that exact durable checkpoint.
+    upload_fully_settled = settle_upload_corrections_after_selection(
+        &mut index,
+        &scan_result,
+        &committed_index,
+        &upload_progress,
+        &claude_proof_correction_candidates,
+        &claude_cutoff_corrections,
+        upload_fully_settled,
+    );
+    backfill_succeeded &= upload_fully_settled;
     // A quiet/delta-only scan still discloses current permanent refusals even
     // though no body needed another upload. The committed census owns scope.
     let current_entities = index.current_snapshot_fingerprints();
@@ -5110,7 +5235,6 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
             trace_report.evidence.insert(root_session_id, rows);
         }
     }
-    let census_window_end = scan_result.census_window_end.clone();
     // Contract-5 evidence exists only under this cycle's permit; the reported
     // rebuild then classifies and groups each request as it places it.
     let identity_evidence = emission_permitted.then(|| {
@@ -5122,13 +5246,11 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
     });
-    let mut disposition = crate::snapshots::apply_claude_reported_usage_with_identity(
-        &mut scan_result.snapshots,
+    let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_identity(
+        scan_result,
         &api_report,
         &trace_report,
         index,
-        census_complete,
-        &census_window_end,
         identity_evidence.as_ref(),
     );
     if let Some(evidence) = &identity_evidence {
@@ -16668,6 +16790,9 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
+    mod authority_proof_correction_pipeline_tests {
+        include!("snapshot_sync/authority_proof_correction_pipeline_tests.rs");
+    }
     #[test]
     fn codex_union_native_transport_common_ack_crash_checkpoint_and_restart() {
         codex_union_native_transport_restart(false, false);
@@ -16901,6 +17026,7 @@ mod tests {
                 &baseline,
                 &progress,
                 &result.snapshots,
+                None,
                 &BTreeSet::new(),
                 &index_path,
                 &progress_path,
@@ -17197,6 +17323,7 @@ mod tests {
             &baseline,
             &restarted_progress,
             &restarted.snapshots,
+            None,
             &BTreeSet::new(),
             &index_path,
             &progress_path,
@@ -17370,6 +17497,7 @@ mod tests {
                 &self.baseline,
                 &self.progress,
                 &self.items,
+                None,
                 &BTreeSet::new(),
                 &self.index_path,
                 &self.progress_path,
@@ -17647,6 +17775,7 @@ mod tests {
             &f.baseline,
             &f.progress,
             &f.items,
+            None,
             &BTreeSet::new(),
             &f.index_path,
             &f.progress_path,
