@@ -1697,7 +1697,7 @@ fn terminal_refusal_requires_current_proof_revision_body_and_nonpartial_outcome(
 }
 
 fn apc_cutoff_item(revision: &str, activity: &str) -> SnapshotItem {
-    let mut item = cache_fixture_item();
+    let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
     item.source_session_id = APC_ROOT.to_string();
     item.source_file_fingerprint = Some(revision.to_string());
     item.attribution_facts.clear();
