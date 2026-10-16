@@ -1994,6 +1994,24 @@ fn transcript_requests(item: &SnapshotItem, mut place: impl FnMut(Request<'_>)) 
     Some(())
 }
 
+/// The transcript path's request-count guard: the parser counted exactly the
+/// owned occurrences that carry usage, each under its own request id. A
+/// response whose every usage field is zero (an API-error record with a
+/// request id) adds no row, token or money and is never placed, so its id
+/// neither counts nor refuses the item; it makes no claim. Any usage counted
+/// without an owned occurrence, or an occurrence the count skipped, still
+/// refuses. The census and D1 keep the plain request-id count guard.
+fn transcript_requests_counted(item: &SnapshotItem) -> bool {
+    let counted = item
+        .claude_usage_occurrences
+        .values()
+        .filter(|occurrence| !occurrence.usage.is_zero())
+        .count();
+    counted > 0
+        && item.claude_usage_occurrences.len() == item.claude_usage_request_ids.len()
+        && u64::try_from(counted) == Ok(item.request_count)
+}
+
 /// The request-owner root for an item, as D1 derives it.
 fn owner_root(item: &SnapshotItem) -> Option<&str> {
     match item.source_session_id.split_once("_agent-") {
@@ -2093,7 +2111,7 @@ fn tag_item(
         // A reported item also counts telemetry-only requests and excludes a
         // legacy fork's inherited prefix; its rebuild's admitted requests are
         // checked against its grouping below instead.
-        || (!reported_usage && claude_snapshot_request_id_hashes(item).is_none())
+        || (!reported_usage && !transcript_requests_counted(item))
         || item
             .attribution_facts
             .iter()
