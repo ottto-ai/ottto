@@ -4,8 +4,9 @@ use serde_json::json;
 
 const A: &str = "0b6b6c2e-0000-4000-8000-0000000000aa";
 const B: &str = "0b6b6c2e-0000-4000-8000-0000000000bb";
+const C: &str = "0b6b6c2e-0000-4000-8000-0000000000cc";
 
-fn native(session: &str, requests: &[&str]) -> SnapshotItem {
+pub(super) fn native(session: &str, requests: &[&str]) -> SnapshotItem {
     let dir = std::env::temp_dir().join(format!(
         "ottto-copy-containment-{}-{}",
         std::process::id(),
@@ -188,7 +189,7 @@ fn copy_containment_observation_borrows_ids_without_allocating_a_second_owner_gr
         NativePairObservation::Overlap { request_count: 1 }
     );
     assert_eq!(allocations.allocations, 0);
-    eprintln!("copy_containment_component: actual_native_pair=true overlap_ids=1 second_owner_graph_allocations={} upload_hold_wiring=false ack_membership=false", allocations.allocations);
+    writeln!(std::io::stderr().lock(), "copy_containment_component: actual_native_pair=true overlap_ids=1 second_owner_graph_allocations={} upload_hold_wiring=false ack_membership=false", allocations.allocations).unwrap();
 }
 
 #[test]
@@ -267,5 +268,72 @@ fn copy_containment_hold_encoded_and_clone_requested_bytes_are_measured_separate
     assert_eq!(record, copy);
     assert!(allocations.requested_peak >= 128);
     let layout = crate::heap_layout_bound::bound(&copy, usize::MAX);
-    eprintln!("copy_containment_hold_component: encoded_bytes={} clone_requested_peak_bytes={} clone_allocations={} requested_layout={layout:?} map_storage_unmeasured=true rss_unmeasured=true", encoded.len(), allocations.requested_peak, allocations.allocations);
+    writeln!(std::io::stderr().lock(), "copy_containment_hold_component: encoded_bytes={} clone_requested_peak_bytes={} clone_allocations={} requested_layout={layout:?} map_storage_unmeasured=true rss_unmeasured=true", encoded.len(), allocations.requested_peak, allocations.allocations).unwrap();
+}
+
+#[test]
+fn copy_containment_early_page_map_miss_is_not_complete_native_coverage() {
+    let original = native(A, &["req1"]);
+    let mut early = vec![native(B, &["req1", "req2"]), native(C, &["req3"])];
+    let healthy_amounts = (
+        early[1].request_count,
+        early[1].input_tokens,
+        early[1].output_tokens,
+    );
+    let mut index = ScanIndex::default();
+    for session in [A, B, C] {
+        index.files.insert(
+            format!("/synthetic/{session}.jsonl"),
+            serde_json::from_value(json!({
+                "size_bytes":1,"modified_unix_seconds":2,
+                "source_file_fingerprint":"f".repeat(64),
+                "last_snapshot_fingerprint":null
+            }))
+            .unwrap(),
+        );
+    }
+    let api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+    let trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+    let window = "2026-10-08T00:00:00Z";
+    let early_outcome = apply_claude_reported_usage_with_identity(
+        &mut early, &api, &trace, &mut index, false, window, None,
+    );
+    assert!(index.claude_duplicate_request_owners.is_empty());
+    assert!(!early_outcome.duplicate_census.census_complete);
+    assert_eq!(early[0].request_count, 2);
+    assert_eq!(
+        observe_native_pair(&early[0], &early[1]),
+        NativePairObservation::NoObservedOverlap,
+        "B vs healthy C is not a comparison against unseen A"
+    );
+    assert_eq!(
+        observe_native_pair(&early[0], &original),
+        NativePairObservation::Overlap { request_count: 1 }
+    );
+    let mut terminal = vec![original];
+    let final_outcome = apply_claude_reported_usage_with_identity(
+        &mut terminal,
+        &api,
+        &trace,
+        &mut index,
+        true,
+        window,
+        None,
+    );
+    assert!(final_outcome.duplicate_census.census_complete);
+    let request_hash = format!("{:x}", Sha256::digest(b"req1"));
+    assert_eq!(index.claude_duplicate_request_owners.len(), 1);
+    assert_eq!(
+        index.claude_duplicate_request_owners[&request_hash].len(),
+        2
+    );
+    assert_eq!(
+        (
+            early[1].request_count,
+            early[1].input_tokens,
+            early[1].output_tokens
+        ),
+        healthy_amounts
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_coverage: actual_native_A_req1=true early_B_req1_req2=true healthy_C_req3=true early_conflict_map_empty=true terminal_exact_duplicate_owners=2 miss_is_not_upload_permission=true candidate_hold_wiring=false sibling_ack_unproved=true").unwrap();
 }

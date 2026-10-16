@@ -32,7 +32,8 @@ fingerprint, which rearm can clear repeatedly. Parking is neither a normal Skip,
 current request evidence, settled coverage nor an ACK. The complete wake context,
 scanner integration and restart semantics still need source review and tests.
 
-Ten new tests require hosted validation. They parse synthetic native transcripts,
+The first ten component tests passed on exact head `2b162a96`, automatic CI
+`38958674335`, with all four checks successful. They parse synthetic native transcripts,
 exercise copied IDs despite rewritten session IDs, preserve the original usage
 while observing a conflict, distinguish equal amounts from ID membership, reject
 truncated state, carry unknown/known age and measure the pair comparison and hold
@@ -42,7 +43,37 @@ the proven/stale rearm controllers, native scan loop, upload or selected saves.
 It is not proof of repeated heavy-read elimination or healthy-sibling progress.
 The full native repeated-pass/ACK/save regression remains the next deliverable.
 
+The next candidate adds an actual native A/B/healthy-C bounded-census
+characterization: B and C on an early page leave the conflict map empty, while
+the terminal A page discovers the exact A/B conflict. A miss before that point
+cannot authorize uniqueness. C's usage is preserved; sibling upload/ACK progress
+is not yet exercised by this characterization.
+
+An inactive process-only membership index shares immutable native ID strings
+between forward and reverse links. New parses look up only their own IDs; reverse
+links remove one held revision without walking the whole pool. The existing
+layout model conservatively preflights the old graph, owned input and prospective
+tree/Arc allocations before mutation. No post-allocation rollback substitutes for
+peak admission. Cached charges only grow until the pool is discarded. Peer events
+preflight all affected records before allocating or invoking any callback and
+emit once per peer/revision. Fixed scratch epochs deduplicate links without a new
+temporary owner set. No peer query traverses every held graph for sizing.
+
+This cache supplies negative wake information, never current native coverage,
+ACK membership or an upload permit. Shared remaining owner/hold/heap allowances
+must come from the real caller; that integration is unfinished. Unsupported
+layout refuses admission. Seeded lookup/removal tests are explicitly component
+tests before admission; positive budget/event tests must disclose when the real
+guard leaves their branch unexecuted. Missing-cache W4 observability remains a
+separate qualified residual; there is no fallback that rereads all held files.
+
 ## Conservative interim and final behavior
+
+The short interim contains **known exact native overlaps**. A session with no
+known overlap retains existing base behavior, without a new uniqueness claim.
+The inherited first-unseen-overlap case can still double count and must remain
+disclosed in status, the PR body and release notes. The interim ends only when
+bounded exact pre-offer coverage and final exclude-and-send are implemented.
 
 An already-qualified exact native/provider/declared-parent exclusion may remove
 copied requests from the copy's usage. Excluded requests supply no tags, names or
@@ -72,9 +103,9 @@ known absence for a deterministic counting tie-break.
 - Parking under actual repeated base/proven/stale rearm, healthy siblings'
   upload/ACK progress, and measured read/owned/clone cost. A generic rearm must
   not replenish the parking allowance every traversal.
-- Exact incident fences require full scoped identities from existing evidence;
-  short display hashes cannot be selectors. No incident fence is installed by
-  this checkpoint.
+- No customer-specific incident selector is permitted. Private full identities
+  are regression evidence only; the generic guard must demonstrate coverage.
+  The currently installed runtime has no new protection from this checkpoint.
 - Local reason/count/oldest-known-age and a separate class for new fully held
   sessions, without presenting unknown cost as zero. Local exclusion receipts
   need count, owning-session display hash and tokens by dimension. No additional
@@ -82,6 +113,9 @@ known absence for a deterministic counting tie-break.
 - Persisted load/default/downgrade policy and actual shared resource bounds.
   An old reader rejecting an index and rebuilding under old unsafe code would
   not enforce a new containment rule. Merely adding a version is insufficient.
+  Containment requires a containment-capable runtime; downgrading below that
+  release is unsupported for containment and the overlap can recur. A rebuild
+  on the new binary must execute its pre-offer guard before offering bodies.
 
 No installed CPU, memory, reread, monetary-conservation, merge or release
 acceptance follows from this checkpoint. Local builds/tests were not run.

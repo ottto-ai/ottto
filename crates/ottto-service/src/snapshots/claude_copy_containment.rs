@@ -4,6 +4,8 @@
 use super::{SnapshotItem, MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS};
 use serde::{Deserialize, Serialize};
 
+mod membership;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NativePairObservation {
     SameSession,
