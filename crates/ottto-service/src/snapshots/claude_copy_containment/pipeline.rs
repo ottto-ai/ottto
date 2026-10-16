@@ -96,7 +96,10 @@ impl ScanIndex {
             .as_ref()
             .map_or(0, |context| context.parked)
     }
-    pub(crate) fn copy_hold_should_park(&mut self, candidate: &CandidateFile) -> bool {
+    pub(in crate::snapshots) fn copy_hold_should_park(
+        &mut self,
+        candidate: &CandidateFile,
+    ) -> bool {
         let Some(context) = self.active_copy_scan.as_mut() else {
             return false;
         };
