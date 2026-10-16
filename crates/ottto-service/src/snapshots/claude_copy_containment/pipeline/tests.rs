@@ -239,6 +239,60 @@ fn copy_containment_unknown_record_fails_load_instead_of_silently_clearing_debt(
 }
 
 #[test]
+fn copy_containment_required_load_preserves_invalid_debt_in_place_and_reads_valid_state() {
+    let f = Fixture::new();
+    let path = f.base.join("required-index.json");
+    let mut index = ScanIndex::default();
+    install_hold(&mut index, &f.path(A), &"c".repeat(64), &"b".repeat(64));
+    index.save(&path).unwrap();
+    assert_eq!(
+        ScanIndex::load_for_copy_containment(&path)
+            .unwrap()
+            .copy_hold_count(),
+        1
+    );
+    let valid = fs::read(&path).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+    let key = local_index_key(&f.path(A));
+    let mut unknown_version = value.clone();
+    unknown_version["claude_copy_holds"][&key]["revision"]["version"] = json!(99);
+    let mut unknown_reason = value.clone();
+    unknown_reason["claude_copy_holds"][&key]["revision"]["reason"] = json!("future_reason");
+    let mut invalid_other_required_fact = value;
+    invalid_other_required_fact["accepted_snapshot_fingerprints"] = json!(["not-a-fingerprint"]);
+    for bytes in [
+        serde_json::to_vec(&unknown_version).unwrap(),
+        serde_json::to_vec(&unknown_reason).unwrap(),
+        serde_json::to_vec(&invalid_other_required_fact).unwrap(),
+        valid[..valid.len() / 2].to_vec(),
+    ] {
+        fs::write(&path, &bytes).unwrap();
+        let error = ScanIndex::load_for_copy_containment(&path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("containment-required scan index"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(!fs::read_dir(&f.base)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains("corrupt")));
+    }
+    // Operator/owner recovery of the original valid state restores the debt;
+    // the failed loader never invented a fresh index or a new read allowance.
+    fs::write(&path, valid).unwrap();
+    assert_eq!(
+        ScanIndex::load_for_copy_containment(&path)
+            .unwrap()
+            .copy_hold_count(),
+        1
+    );
+    let directory = f.base.join("unreadable-as-index.json");
+    fs::create_dir(&directory).unwrap();
+    assert!(ScanIndex::load_for_copy_containment(&directory).is_err());
+    assert!(directory.is_dir());
+}
+
+#[test]
 fn copy_containment_native_fold_withholds_known_copies_before_healthy_wire_ack_and_save() {
     let f = Fixture::new();
     f.write(A, &["req_shared", "req_original"], false);

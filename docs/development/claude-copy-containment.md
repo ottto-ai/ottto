@@ -49,9 +49,9 @@ clone allocations separately. The rearm component control invokes the real base
 candidate gate after repeated fingerprint invalidation. It does **not** execute
 the proven/stale rearm controllers, native scan loop, upload or selected saves.
 It is not proof of repeated heavy-read elimination or healthy-sibling progress.
-The full native repeated-pass/ACK/save regression remains the next deliverable.
+The later native checkpoint below validates injected-context scanner, serialized ACK and save seams; actual controller/owner integration remains unfinished.
 
-The next candidate adds an actual native A/B/healthy-C bounded-census
+The component checkpoint includes an actual native A/B/healthy-C bounded-census
 characterization: B and C on an early page leave the conflict map empty, while
 the terminal A page discovers the exact A/B conflict. A miss before that point
 cannot authorize uniqueness. C's usage is preserved; sibling upload/ACK progress
@@ -130,13 +130,16 @@ acceptance follows from this checkpoint. Local builds/tests were not run.
 
 ## Inactive native integration checkpoint
 
-The next six tests execute the actual native scanner, selected index and identity
+Six tests execute the actual native scanner, selected index and identity
 machinery. They compare twelve committed-fingerprint invalidations on a large
 synthetic transcript, check UNKNOWN-versus-changed wake input, preserve an old
 accepted file/entity/empty checkpoint and new-copy debt across partial selection
 and disk reload, reject an unknown hold record, and send only the healthy native
 sibling through serialization and the actual entity-ACK validator before saving.
-They remain UNRUN until this exact source head passes hosted CI. An in-process
+Exact `204bca94`, automatic CI `38966378133`, passed all four checks,
+all 22 containment tests and 2,891 service tests (0 failed, 22 ignored). The
+1,053,581-byte scanner fixture produced twelve full base reads and zero parked
+reads under twelve committed-fingerprint invalidations. An in-process
 serialized ACK is not an installed service measurement or live server test.
 The identity control compares the same healthy session under the base's
 uncompared census and a census with parked debt: own telemetry must remain
@@ -167,3 +170,15 @@ classes, full normal/partial/shed/CAS tests, and the matched installed healthy
 marker-rate floor. The peer/hold cardinality guards are not a proof
 of shared heap-byte admission. No new retry timers or restart allowances are
 required. No source review, merge, release or installed savings is claimed.
+
+## Required-load follow-up
+
+The ordinary loader's quarantine/fresh-index recovery is not sufficient once
+copy debt is required: rebuilding could forget a known hold before comparison.
+An inactive strict load entry point preserves invalid original bytes and returns
+an error instead of rebuilding. Its test covers unknown hold version/reason,
+an invalid unrelated required index fact, truncated JSON and restoration of the
+valid debt. This follow-up is unvalidated until its exact source passes CI, and
+the ordinary production owner does not call it yet. Runtime attachment must use
+this policy before it can claim malformed debt is fail-closed; decoder rejection
+alone is not containment.

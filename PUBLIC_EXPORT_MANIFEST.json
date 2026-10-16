@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 665,
-  "content_sha256": "dfc4f5e520b423b003a27e6c85184903f014cf8fd9110c9f37b84f639f5f7948",
+  "content_sha256": "d98db62aa861b02a6237e34eaf24e399a55f8c3f66a3440724300ef1fad25774",
   "files": [
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "42f4951e772fb29d2788dab13bb031576350871cbc0d37f79332d9a65b5dbee1",
-      "size_bytes": 2467076
+      "sha256": "426d0d5596d15dee5bc07bfe3a826d130a441d09a69b188222a956c29cf4e815",
+      "size_bytes": 2468128
     },
     {
       "executable": false,
@@ -1301,8 +1301,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_copy_containment/pipeline/tests.rs",
-      "sha256": "7489c2ec93ff91e8737a52e795f8687b8915eb44f2d24f14439bddf8ab5b1aa0",
-      "size_bytes": 13661
+      "sha256": "736d3ead09d854ede3ff601f5d1e4ceb2b76b0e1e935a5c4c043033eb06805e4",
+      "size_bytes": 15960
     },
     {
       "executable": false,
@@ -1553,8 +1553,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/claude-copy-containment.md",
-      "sha256": "5ed2a1d9e3d339f150596e518bcfa7761f3e6227d9545ba726fb3b2aa929230b",
-      "size_bytes": 11247
+      "sha256": "a976280d947dcb97185afd24ad2c4c17606c1eb1b7a33dad2c9a4376df1f0d4d",
+      "size_bytes": 12232
     },
     {
       "executable": false,
@@ -4658,7 +4658,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-16T20:59:58+00:00",
+  "generated_at": "2026-10-16T21:19:21+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 666,
   "public_roots": [
@@ -4697,5 +4697,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "86b578f6094b39c60f54e5daa444ccf5d04418ec"
+  "source_commit": "204bca94f31df845f24b496e8b4c64a1ebd1d87c"
 }

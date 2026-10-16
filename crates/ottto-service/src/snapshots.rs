@@ -22713,12 +22713,40 @@ impl ScanIndex {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        if !path.exists() {
+        Self::load_with_copy_debt_policy(path, false)
+    }
+
+    /// The containment owner must not turn malformed required debt into a
+    /// fresh permissive index. Keep the original bytes and stop preparation;
+    /// recovery is not a normal no-known-overlap candidate. Ordinary owner
+    /// attachment remains inactive until its other safety gates are complete.
+    #[allow(dead_code)]
+    pub(crate) fn load_for_copy_containment(path: &Path) -> Result<Self> {
+        Self::load_with_copy_debt_policy(path, true)
+    }
+
+    fn load_with_copy_debt_policy(path: &Path, copy_debt_required: bool) -> Result<Self> {
+        let exists = if copy_debt_required {
+            path.try_exists()
+                .context("inspect containment-required scan index")?
+        } else {
+            path.exists()
+        };
+        if !exists {
             return Ok(Self::default());
         }
         let _lock = CheckpointLock::acquire(path)?;
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
+        let recover_invalid = || {
+            if copy_debt_required {
+                Err(anyhow::anyhow!(
+                    "invalid containment-required scan index; preparation stopped without rebuilding"
+                ))
+            } else {
+                quarantine_invalid_scan_index(path)
+            }
+        };
         match serde_json::from_reader::<_, Self>(BufReader::new(file)) {
             Ok(mut index)
                 if index.schema_version == SCAN_INDEX_SCHEMA_VERSION
@@ -22774,16 +22802,14 @@ impl ScanIndex {
                 if index.canonicalize_codex_identity_keys() {
                     Ok(index)
                 } else {
-                    quarantine_invalid_scan_index(path)
+                    recover_invalid()
                 }
             }
-            Ok(index) if index.schema_version == SCAN_INDEX_SCHEMA_VERSION => {
-                quarantine_invalid_scan_index(path)
-            }
+            Ok(index) if index.schema_version == SCAN_INDEX_SCHEMA_VERSION => recover_invalid(),
             Ok(_) => Err(anyhow::anyhow!(
                 "unsupported local snapshot scan index schema"
             )),
-            Err(error) if !error.is_io() => quarantine_invalid_scan_index(path),
+            Err(error) if !error.is_io() => recover_invalid(),
             Err(error) => {
                 Err(error).with_context(|| format!("parse scan index {}", path.display()))
             }
