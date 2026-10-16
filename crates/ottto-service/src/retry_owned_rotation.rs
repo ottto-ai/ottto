@@ -184,6 +184,7 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
         Ok(Some(SourcePreparation {
             native_comparison_lease: None,
             prepared_claude_evidence: None,
+            terminal_native_traversal: None,
             native_comparison_qualification: None,
             retry_authority: None,
             source,
