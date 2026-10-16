@@ -25324,6 +25324,13 @@ mod tests {
     mod census_convergence_tests {
         include!("snapshots/census_convergence_tests.rs");
     }
+    mod p12_base_exit_tests {
+        include!("snapshots/p12_base_exit_tests.rs");
+    }
+    mod p12_usage_original_tests {
+        include!("snapshots/p12_usage_original_tests.rs");
+    }
+
     mod giant_row_measurement_tests {
         include!("snapshots/giant_row_measurement_tests.rs");
     }

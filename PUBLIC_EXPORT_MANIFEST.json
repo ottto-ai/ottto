@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 661,
-  "content_sha256": "4d8e2693c728607eec95cfa70f20dd0b530ce1556d18d27b8b770f069a61647d",
+  "candidate_file_count": 666,
+  "content_sha256": "f18e4355e76eb624c7d200b4085cdca05778eb241817a4be84d4dd4a88de1ffb",
   "files": [
     {
       "executable": false,
@@ -1182,8 +1182,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "c7d45de7a22f466f1010474d75bd67b588822d30afcb4df4c61845357a6d0d66",
-      "size_bytes": 767202
+      "sha256": "a71e8d49126430c4879e214b90715a18d3d24fb22caccc130170333947dda833",
+      "size_bytes": 767407
     },
     {
       "executable": false,
@@ -1209,6 +1209,20 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/snapshot_sync/p12_base_exit_tests.rs",
+      "sha256": "3310221e1f9a9ef19252ee6f5472f1c70efff27118bc782f3a5259783b96452a",
+      "size_bytes": 1854
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshot_sync/p12_pipeline_original_tests.rs",
+      "sha256": "1227c8812b4f1a446adae878188a35443ade823a5423947b8a41b6e15de6f6ad",
+      "size_bytes": 32372
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs",
       "sha256": "86f018cb72279b748e5ad81e3aff7ad75be8dddcfe3ad5e7acdadd31965f78bd",
       "size_bytes": 10029
@@ -1224,8 +1238,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "8fef768bdf437c6efcc740c76d476e9085ee6e465d43c84ad0f2f4d290031c69",
-      "size_bytes": 2464585
+      "sha256": "658c531ef76814f539b2d42f10296ea30bc43f748de13bce14cd374a6026c29b",
+      "size_bytes": 2464776
     },
     {
       "executable": false,
@@ -1266,8 +1280,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/census_convergence_tests.rs",
-      "sha256": "56f9fe82cc5cfda16ac8db1592c8798162bd09647b0b2cfdb0bad22851d436d7",
-      "size_bytes": 46983
+      "sha256": "2d454f1947ecad2250509a72366db70d2600c33bd797dba9c4f99fd8399b7e91",
+      "size_bytes": 47482
     },
     {
       "executable": false,
@@ -1359,6 +1373,20 @@
       "path": "crates/ottto-service/src/snapshots/owned_held_index_allocation_tests.rs",
       "sha256": "bab59f1cdafcb4e7b13163d795181017a0fb00057500e7d724f7502f20ce5e20",
       "size_bytes": 11207
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/p12_base_exit_tests.rs",
+      "sha256": "93263b283e3ccfa4bf87eca80edbbbf701412de33ca7080758961fc343b6bff3",
+      "size_bytes": 2944
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/p12_usage_original_tests.rs",
+      "sha256": "74792dd7d1bb400a00eed4419de38ebc9a0e4907ebe827492e1ef371bf3ad00f",
+      "size_bytes": 12098
     },
     {
       "executable": false,
@@ -1527,6 +1555,13 @@
       "path": "docs/development/provider-envelope-boundary-experiment.md",
       "sha256": "f50f029535890ad4601f73c41600c4cf8a6d5f628dbc28fc9fc44d62c79d5be5",
       "size_bytes": 4984
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/development/provider-envelope-p12-oracles.md",
+      "sha256": "a70e46914c07dbb4578b47307437bc1b6b072a584081a63c883287e1a62d56f7",
+      "size_bytes": 5127
     },
     {
       "executable": false,
@@ -4630,9 +4665,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-16T12:34:09+00:00",
+  "generated_at": "2026-10-16T13:16:24+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 662,
+  "output_file_count": 667,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4669,5 +4704,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "cf32dc2a04ef92ec69f9f4bb5244ca8582c5482d"
+  "source_commit": "56bf257637cca3a66db9c7ab8b91ba576470a26f"
 }

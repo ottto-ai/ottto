@@ -16822,6 +16822,13 @@ mod tests {
     include!("retry_bounded_native_tests.rs");
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
+    mod p12_base_exit_tests {
+        include!("snapshot_sync/p12_base_exit_tests.rs");
+    }
+    mod p12_pipeline_original_tests {
+        include!("snapshot_sync/p12_pipeline_original_tests.rs");
+    }
+
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
     mod authority_proof_correction_pipeline_tests {
         include!("snapshot_sync/authority_proof_correction_pipeline_tests.rs");
