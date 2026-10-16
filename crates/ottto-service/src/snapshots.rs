@@ -11971,7 +11971,6 @@ impl OwnedSourceScan {
                 .is_some_and(|traversal| !traversal.counts.has_errors())
     }
 
-    #[allow(dead_code)] // Pending controller/selected-settlement integration.
     pub(crate) fn take_native_comparison_acquisition(
         &self,
         qualification: &mut claude_native_comparison::Qualification,
@@ -11984,17 +11983,23 @@ impl OwnedSourceScan {
         )
     }
 
-    // The inactive driver still needs emission/settlement integration before
-    // SourcePreparation may use this seam. Component tests exercise real native
-    // acquisition now; this is not a second scanner or a new budget.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn acquire_native_comparison_targets(
         &mut self,
         qualification: &mut claude_native_comparison::Qualification,
     ) -> claude_native_comparison::TargetSelection {
+        self.acquire_native_comparison_targets_after(qualification, 0)
+    }
+
+    fn acquire_native_comparison_targets_after(
+        &mut self,
+        qualification: &mut claude_native_comparison::Qualification,
+        frontier: usize,
+    ) -> claude_native_comparison::TargetSelection {
         assert!(self.active_file.is_none() && self.identified_candidates.is_empty());
-        let (candidates, selection) = qualification.take_target_candidates(
+        let (candidates, selection) = qualification.take_target_candidates_after(
             &self.snapshots,
+            frontier,
             self.file_limit.saturating_sub(self.scanned_file_count),
         );
         if !candidates.is_empty() {

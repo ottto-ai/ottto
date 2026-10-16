@@ -2,7 +2,8 @@
 
 This draft implementation begins a moving two-phase Claude scan. There is no
 runtime flag, environment switch, API, or production opt-in. Only a scoped test
-can enable preparation. It does not suppress a rearm or change an upload.
+can enable preparation. Production behavior remains unchanged; no rearm
+suppression or selected-body deferral is activated.
 
 ## Initial checkpoint
 
@@ -35,14 +36,14 @@ coverage, settled body, or authorization to skip a later read.
 
 ## Remaining integration
 
-The initial qualification is deliberately discarded before finish. The lifecycle
-bootstrap component below passed its scoped hosted tests. Positive end-to-end
-source bootstrap is still an integration gate.
-The candidate still needs actual same-census targeted acquisition under the
-existing budgets, negative-only target intersection, pre-offer B/C withholding when comparison cannot finish,
+The moving controller now retains the initial qualification through same-owner
+native target yields, then discards it before finish. The lifecycle bootstrap
+component below passed its scoped hosted tests; positive end-to-end source
+bootstrap is still an integration gate.
+The candidate still needs pre-offer B/C withholding when comparison cannot finish,
 atomic selected-state restore/rearm/save, and one authoritative final fold.
 Revision/context/row changes during that continuation must revoke eligibility.
-No target selection or performance benefit is claimed by this checkpoint.
+Target acquisition remains default inactive; no performance benefit is claimed.
 
 The two pending original regression oracles keep their original expectations.
 They require the complete driver and real scanner/ACK/save lifecycle before they
@@ -103,10 +104,11 @@ exercise Q5 changes, a copied-prefix hit with two real target reads, budget
 refusal and replacement between target selection and safe open. Their new head
 requires hosted validation; previous lifecycle CI does not validate these tests.
 
-This seam is intentionally not called by source preparation yet. Pre-offer
-emission separation, fallback/selected settlement and final-fold integration
-must be complete first. A component test manually drives the same moving owner;
-that is not a shipping optimization or a positive lifecycle bootstrap proof.
+The default-inactive source preparation now calls this seam only under its
+process lease and current frozen paired generations. Pre-offer emission
+separation, fallback/selected settlement and rearm suppression remain inactive.
+Component tests drive the same controller and native owner; they are not a
+shipping optimization or a positive end-to-end lifecycle bootstrap proof.
 No reread, CPU, RSS or interaction improvement is claimed. Requested layout
 accounting in a synthetic test describes the retained plan, not process memory.
 
@@ -181,7 +183,8 @@ before a frozen view can support another negative comparison. It must include
 all required roots, including retained legacy predecessors. Unknown or changed
 pairs return false without issuing a new paired view; checking them never reloads rows or substitutes a new
 proof for the frozen proof. Normal final enrichment retains its existing fresh
-load fallback. The moving controller has not invoked this seam yet.
+load fallback. The moving controller now invokes this seam before every target callback and
+finish. Required legacy predecessor roots are frozen with the original proof.
 
 Scoped tests cover unchanged pairs, independent same-byte API and trace object
 replacement, and an unloaded predecessor. They also count actual evidence opens
@@ -225,3 +228,33 @@ and exercise inactive/wrong-source/incomplete/wrong-window guards. These tests
 need hosted validation; they establish neither selected restoration nor process
 memory savings. No checkpoint is restored, persisted or treated as a permit by
 this component.
+
+## Moving target controller
+
+One controller now owns the original qualification through source preparation.
+It retains one prepared API/trace owner across yields and never requalifies from
+a later proof. A frontier over appended actual native bodies avoids reconsidering
+the initial bodies at each continuation. Only roots hit by that delta require
+whole-page sibling grouping; no-hit steps skip that allocation. Successful target
+acquisition is consumed before examining the new native delta. The scanner,
+context, file limit, safe-open and parse budgets remain the same.
+
+Unknown/replaced generations, a revoked process lease, unhealthy native work,
+an unresolved dependency or insufficient remaining budget disable comparison
+and revoke the lease. All actual native bodies remain available for the base
+authoritative fold; no body is withheld, ownership promoted, rearm suppressed or
+selected state restored by this checkpoint. Finish rechecks the frozen opened
+generations and then drops the controller. Production remains default inactive.
+
+Three new tests cover a copied request followed by two actual target reads
+and a single delta frontier, generation/budget fallback, and safe-open rejection
+of an independently replaced target. They require hosted CI. Full source
+bootstrap, pre-offer filtering, both selected-save callbacks, original optimized
+oracles, per-class cost and installed acceptance remain unfinished.
+
+Terminal-owner checkpoint `36dcfbc18b6a168dd400d656c1cfa79dad50d915`, hosted
+CI `38935288344`, passed all four checks: 2,914 service tests passed, zero failed,
+24 ignored, including all 24 new tests. The original traversal allocation moved
+outside the cloned result and base index/body parity held. This validates that
+carrier, not selected restoration. The controller continuation above needs its
+own hosted CI; this prior result is not its acceptance.

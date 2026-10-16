@@ -3424,8 +3424,7 @@ struct SourcePreparation {
     prepared_claude_evidence: Option<PreparedClaudeLocalEvidence>,
     terminal_native_traversal:
         Option<Box<crate::snapshots::claude_native_comparison::TerminalTraversal>>,
-    native_comparison_qualification:
-        Option<crate::snapshots::claude_native_comparison::Qualification>,
+    native_comparison_controller: Option<crate::snapshots::claude_native_comparison::Controller>,
     retry_authority: Option<live_snapshot_retry::LiveAuthority>,
     source: SnapshotSource,
     claude_scan_roots: Option<Vec<PathBuf>>,
@@ -3464,24 +3463,53 @@ impl SourcePreparation {
     fn step(mut self) -> SourcePreparationStep {
         let mut state = self.scan.take().expect("active source preparation");
         if state.native_comparison_ready() {
-            if let Some(support_dir) = state.native_comparison_support_dir() {
-                let (index, native) = state.native_comparison_inputs();
-                let evidence = PreparedClaudeLocalEvidence::load(support_dir, native, index);
-                let qualification = if self
-                    .native_comparison_lease
-                    .as_ref()
-                    .is_some_and(|lease| lease.allowed())
-                {
-                    state.prepare_native_comparison(evidence.rows())
+            if let Some(support_dir) = state.native_comparison_support_dir().map(Path::to_path_buf)
+            {
+                if self.prepared_claude_evidence.is_none() {
+                    let (index, native) = state.native_comparison_inputs();
+                    self.prepared_claude_evidence = Some(PreparedClaudeLocalEvidence::load(
+                        &support_dir,
+                        native,
+                        index,
+                    ));
+                    if self
+                        .native_comparison_lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.allowed())
+                    {
+                        let qualification = state.prepare_native_comparison(
+                            self.prepared_claude_evidence.as_ref().unwrap().rows(),
+                        );
+                        self.native_comparison_controller =
+                            Some(crate::snapshots::claude_native_comparison::Controller::new(
+                                qualification,
+                            ));
+                    }
+                }
+                if let Some(controller) = self.native_comparison_controller.as_mut() {
+                    // The prepared owner and PRE-MUTATION proof survive every
+                    // target yield. No second load/requalification from P_new.
+                    let current = self
+                        .native_comparison_lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.allowed())
+                        && self
+                            .prepared_claude_evidence
+                            .as_ref()
+                            .is_some_and(|evidence| {
+                                evidence.frozen_roots_are_current(
+                                    &support_dir,
+                                    controller.required_roots(),
+                                )
+                            });
+                    if !controller.advance(&mut state, current) {
+                        if let Some(lease) = self.native_comparison_lease.as_mut() {
+                            lease.revoke();
+                        }
+                    }
                 } else {
                     state.resume_native_comparison_base();
-                    crate::snapshots::claude_native_comparison::Qualification::default()
-                };
-                // Preparation is not an ownership/bootstrap/reuse decision.
-                // Keep the original scanner alive until continuation finishes.
-                let _certified_members = qualification.certified_member_count();
-                self.prepared_claude_evidence = Some(evidence);
-                self.native_comparison_qualification = Some(qualification);
+                }
             } else {
                 state.disable_native_comparison();
                 if let Some(lease) = self.native_comparison_lease.as_mut() {
@@ -3948,7 +3976,7 @@ fn prepare_sync_source(
         native_comparison_lease,
         prepared_claude_evidence: None,
         terminal_native_traversal: None,
-        native_comparison_qualification: None,
+        native_comparison_controller: None,
         retry_authority,
         source,
         claude_scan_roots: (source == SnapshotSource::ClaudeCode).then_some(roots),
@@ -4043,7 +4071,7 @@ fn finish_sync_source(
         mut native_comparison_lease,
         prepared_claude_evidence,
         terminal_native_traversal,
-        native_comparison_qualification,
+        native_comparison_controller,
         retry_authority,
         source,
         claude_scan_roots,
@@ -4069,9 +4097,20 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
-    // The initial checkpoint deliberately cannot activate envelope reuse.
-    // Target acquisition and final selected-state settlement come next.
-    drop(native_comparison_qualification);
+    // Recheck after native finalization, before the sole authoritative fold.
+    // This checkpoint still emits through the base fold: selected-state
+    // deferral and rearm suppression remain inactive.
+    if let Some(controller) = native_comparison_controller.as_ref() {
+        let current = prepared_claude_evidence.as_ref().is_some_and(|evidence| {
+            evidence.frozen_roots_are_current(support_dir, controller.required_roots())
+        });
+        if !current {
+            if let Some(lease) = native_comparison_lease.as_mut() {
+                lease.revoke();
+            }
+        }
+    }
+    drop(native_comparison_controller);
     // The terminal graph moves separately from Clone-able results. Selected
     // fallback is not wired yet, so do not retain an unused graph during upload.
     drop(terminal_native_traversal);
@@ -5296,7 +5335,6 @@ impl PreparedClaudeLocalEvidence {
     /// or replacing P. It returns no new paired view or proof. A controller must
     /// revoke and take the base path on false; unrelated ineligible roots do
     /// not expand the qualified population or poison healthy-family evidence.
-    #[allow(dead_code)] // Full controller/selected-settlement integration pending.
     fn frozen_roots_are_current(
         &self,
         support_dir: &Path,
@@ -18540,7 +18578,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_qualification, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries);
 

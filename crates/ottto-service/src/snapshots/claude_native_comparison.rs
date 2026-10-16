@@ -348,6 +348,11 @@ impl NativePhase {
                 })
                 .collect::<BTreeMap<_, _>>();
             if !certified.is_empty() || !prior_native_revisions.is_empty() {
+                let paired_roots = std::iter::once(root.clone())
+                    // The shared reconstruction above verified these exact
+                    // predecessor roots against the excluded-request owners.
+                    .chain(retained.legacy_owner_roots.iter().cloned())
+                    .collect();
                 families.insert(
                     root.clone(),
                     FrozenFamily {
@@ -355,6 +360,7 @@ impl NativePhase {
                         assigned: ledger.assigned_request_id_hashes,
                         certified,
                         prior_native_revisions,
+                        paired_roots,
                     },
                 );
             }
@@ -369,6 +375,88 @@ struct FrozenFamily {
     assigned: BTreeMap<String, BTreeSet<String>>,
     certified: BTreeMap<String, NormalSkip>,
     prior_native_revisions: BTreeMap<String, String>,
+    paired_roots: BTreeSet<String>,
+}
+
+/// Moves the one frozen qualification through native continuation. A target
+/// is attempted once; only newly acquired native bodies extend the frontier.
+/// This controller does not filter emission, restore selected state, or
+/// suppress any rearm. An unavailable comparison stays on the base path.
+pub(crate) struct Controller {
+    qualification: Qualification,
+    required_roots: BTreeSet<String>,
+    native_frontier: usize,
+    awaiting_targets: bool,
+    failed: bool,
+    acquisition: TargetAcquisition,
+}
+
+impl Controller {
+    pub(crate) fn new(qualification: Qualification) -> Self {
+        let required_roots = qualification
+            .families
+            .values()
+            .flat_map(|family| family.paired_roots.iter().cloned())
+            .collect();
+        Self {
+            qualification,
+            required_roots,
+            native_frontier: 0,
+            awaiting_targets: false,
+            failed: false,
+            acquisition: TargetAcquisition::default(),
+        }
+    }
+
+    pub(crate) fn required_roots(&self) -> &BTreeSet<String> {
+        &self.required_roots
+    }
+
+    /// Called at the initial preparation pause and each subsequent target
+    /// pause. False requires revoking the process lease; all actual native
+    /// bodies remain available to the unchanged authoritative base fold.
+    pub(crate) fn advance(&mut self, scan: &mut OwnedSourceScan, current: bool) -> bool {
+        if self.failed
+            || !current
+            || !scan.native_comparison_is_healthy()
+            || self.native_frontier > scan.snapshots.len()
+        {
+            self.failed = true;
+            scan.disable_native_comparison();
+            return false;
+        }
+        if self.awaiting_targets {
+            let acquired = scan.take_native_comparison_acquisition(&mut self.qualification);
+            self.awaiting_targets = false;
+            let unresolved = !acquired.unresolved_sources.is_empty();
+            self.acquisition.merge(acquired);
+            if unresolved {
+                self.failed = true;
+                scan.disable_native_comparison();
+                return false;
+            }
+        }
+        scan.resume_native_comparison_base();
+        let next_frontier = scan.snapshots.len();
+        let selection = scan
+            .acquire_native_comparison_targets_after(&mut self.qualification, self.native_frontier);
+        self.native_frontier = next_frontier;
+        self.awaiting_targets = selection.queued > 0;
+        if !selection.unresolved_sources.is_empty() {
+            self.failed = true;
+            self.acquisition
+                .unresolved_sources
+                .extend(selection.unresolved_sources);
+            scan.disable_native_comparison();
+            return false;
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn receipt_for_test(&self) -> (&TargetAcquisition, usize) {
+        (&self.acquisition, self.native_frontier)
+    }
 }
 
 #[derive(Default)]
@@ -453,15 +541,24 @@ impl Qualification {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn take_target_candidates(
         &mut self,
         native: &[SnapshotItem],
         remaining_files: usize,
     ) -> (Vec<CandidateFile>, TargetSelection) {
-        let native_by_root = group_native_by_root(native);
+        self.take_target_candidates_after(native, 0, remaining_files)
+    }
+
+    pub(super) fn take_target_candidates_after(
+        &mut self,
+        native: &[SnapshotItem],
+        frontier: usize,
+        remaining_files: usize,
+    ) -> (Vec<CandidateFile>, TargetSelection) {
         let mut sources_by_root = BTreeMap::<String, BTreeSet<String>>::new();
         let mut result = TargetSelection::default();
-        for item in native {
+        for item in &native[frontier..] {
             match self.possible_targets(item) {
                 Some(roots) => {
                     for root in roots {
@@ -477,6 +574,17 @@ impl Qualification {
                     result
                         .unresolved_sources
                         .insert(item.source_session_id.clone());
+                }
+            }
+        }
+        // No hit, no repeated whole-page grouping. Only actual target roots
+        // need current native siblings to establish acquisition completeness.
+        let mut native_by_root = BTreeMap::<String, Vec<&SnapshotItem>>::new();
+        if !sources_by_root.is_empty() {
+            for item in native {
+                let root = claude_snapshot_family_root(item);
+                if sources_by_root.contains_key(&root) {
+                    native_by_root.entry(root).or_default().push(item);
                 }
             }
         }
@@ -674,6 +782,7 @@ impl Qualification {
     }
 
     /// Count-only preparation receipt; not a bootstrap or reuse permit.
+    #[cfg(test)]
     pub(crate) fn certified_member_count(&self) -> usize {
         self.families
             .values()
@@ -692,6 +801,23 @@ impl Qualification {
                     .count()
             })
             .sum()
+    }
+}
+
+impl TargetAcquisition {
+    fn merge(&mut self, next: Self) {
+        self.completed_target_files = self
+            .completed_target_files
+            .saturating_add(next.completed_target_files);
+        self.acquired_roots.extend(next.acquired_roots);
+        self.ready_for_fold_sources
+            .extend(next.ready_for_fold_sources);
+        self.unresolved_sources.extend(next.unresolved_sources);
+        self.rearm_roots.extend(next.rearm_roots);
+        self.known_rearm_candidates
+            .extend(next.known_rearm_candidates);
+        self.ready_for_fold_sources
+            .retain(|source| !self.unresolved_sources.contains(source));
     }
 }
 
@@ -725,7 +851,8 @@ impl Drop for TestScope {
 
 crate::heap_layout_bound::fields!(NormalSkip; root, member, revision, census_window_end, upload_context, candidate);
 crate::heap_layout_bound::fields!(NativePhase; paused, prepared, skips, target_revisions, attempted_targets);
-crate::heap_layout_bound::fields!(FrozenFamily; witness, assigned, certified, prior_native_revisions);
+crate::heap_layout_bound::fields!(FrozenFamily; witness, assigned, certified, prior_native_revisions, paired_roots);
+crate::heap_layout_bound::fields!(Controller; qualification, required_roots, native_frontier, awaiting_targets, failed, acquisition);
 crate::heap_layout_bound::fields!(Qualification; families, envelope_roots, envelope_by_hash, pending, unknown_native_sources);
 
 crate::heap_layout_bound::fields!(TargetSelection; queued, matched_roots, unresolved_sources);

@@ -2048,6 +2048,95 @@ fn native_comparison_acquisition_requires_actual_completed_target_reads() {
 }
 
 #[test]
+fn native_comparison_controller_moves_frozen_plan_across_native_target_yields() {
+    let (fixture, mut state, qualification) = native_comparison_positive_hit_fixture();
+    let mut controller = claude_native_comparison::Controller::new(qualification);
+    assert_eq!(
+        controller.required_roots(),
+        &BTreeSet::from([fixture.parent.clone()])
+    );
+    let context = state.native_comparison_context().unwrap().to_owned();
+    assert!(controller.advance(&mut state, true));
+    assert_eq!(state.scanned_file_count, 1, "queueing is not acquisition");
+    let mut state = pause_native_comparison(state);
+    assert_eq!(state.scanned_file_count, 3);
+    assert_eq!(state.native_comparison_context(), Some(context.as_str()));
+    assert!(controller.advance(&mut state, true));
+    let (receipt, frontier) = controller.receipt_for_test();
+    assert_eq!(frontier, 3, "only the two newly acquired bodies extend H");
+    assert_eq!(receipt.completed_target_files, 2);
+    assert_eq!(
+        receipt.acquired_roots,
+        BTreeSet::from([fixture.parent.clone()])
+    );
+    assert_eq!(receipt.ready_for_fold_sources.len(), 1);
+    assert!(receipt.unresolved_sources.is_empty());
+    assert!(state.identified_candidates.is_empty());
+    assert!(!state.native_comparison_ready());
+    assert!(state
+        .snapshots
+        .iter()
+        .all(|item| item.usage_accounting_contract.is_none()));
+    let (_, scan) = SelectionFixture::run(state);
+    assert_eq!(scan.scanned_file_count, 3);
+    assert_eq!(
+        scan.snapshots.len(),
+        3,
+        "no emission filtering is activated"
+    );
+    writeln!(std::io::stderr().lock(), "native_comparison_controller: initial_native=1 completed_targets=2 frontier=3 same_owner_context=true repeated_targets=0 pre_fold_bodies=3 selected_deferral_and_rearm_suppression=false").unwrap();
+}
+
+#[test]
+fn native_comparison_controller_generation_loss_or_insufficient_budget_uses_base() {
+    for changed_pair in [true, false] {
+        let (_fixture, mut state, qualification) = native_comparison_positive_hit_fixture();
+        if !changed_pair {
+            state.file_limit = state.scanned_file_count + 1;
+        }
+        let mut controller = claude_native_comparison::Controller::new(qualification);
+        assert!(!controller.advance(&mut state, !changed_pair));
+        assert!(state.native_comparison.is_none());
+        assert!(
+            !controller.advance(&mut state, true),
+            "generation rollback or a later positive boolean cannot revive the controller"
+        );
+        assert!(state.identified_candidates.is_empty());
+        let (_, scan) = SelectionFixture::run(state);
+        assert_eq!(scan.scanned_file_count, 1);
+        assert_eq!(
+            scan.snapshots.len(),
+            1,
+            "base native body remains available"
+        );
+        assert!(scan.snapshots[0].usage_accounting_contract.is_none());
+    }
+    writeln!(std::io::stderr().lock(), "native_comparison_controller: changed_generation_base=true insufficient_remaining_budget_base=true no_extra_target_reads=true no_body_suppression=true actual_process_bootstrap_unproved=true").unwrap();
+}
+
+#[test]
+fn native_comparison_controller_replaced_target_cannot_complete_comparison() {
+    let (fixture, mut state, qualification) = native_comparison_positive_hit_fixture();
+    let mut controller = claude_native_comparison::Controller::new(qualification);
+    assert!(controller.advance(&mut state, true));
+    let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
+    let replacement = fixture.dir.join("controller-replacement.tmp");
+    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+    fs::rename(replacement, path).unwrap();
+    let mut state = pause_native_comparison(state);
+    assert!(!controller.advance(&mut state, true));
+    assert!(state.native_comparison.is_none());
+    assert!(controller.receipt_for_test().0.acquired_roots.is_empty());
+    let (_, scan) = SelectionFixture::run(state);
+    assert!(!scan.census_complete);
+    assert!(scan
+        .snapshots
+        .iter()
+        .all(|item| item.usage_accounting_contract.is_none()));
+    writeln!(std::io::stderr().lock(), "native_comparison_controller: actual_target_replacement_base=true current_native_census_incomplete=true no_acquired_owner_posture=true").unwrap();
+}
+
+#[test]
 fn native_comparison_failed_target_keeps_dependent_source_unresolved() {
     let (fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
     assert_eq!(
