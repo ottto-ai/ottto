@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 666,
-  "content_sha256": "935f04bde7ce4c7f72ef576312ca6ac725307f96a6ecd217b801597355d83b4f",
+  "content_sha256": "3f7b7eac294859cf9708bd00ff4f450f0ac4908f3129950f8aa5be691be6b112",
   "files": [
     {
       "executable": false,
@@ -531,8 +531,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/claude_config_slots.rs",
-      "sha256": "89cce1601fc8ed57edcbfdc5b435e75b5b141eb863ea769009e246eb6336a214",
-      "size_bytes": 196700
+      "sha256": "49d2a9902168ec61becaac374f60c06b99195748b4d985a147463a148793bc5d",
+      "size_bytes": 196702
     },
     {
       "executable": false,
@@ -4665,7 +4665,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-16T22:37:05+00:00",
+  "generated_at": "2026-10-16T22:42:50.567183Z",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 667,
   "public_roots": [
@@ -4704,5 +4704,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ce146c70a57853f5e151cf1680440a5570a6523f"
+  "source_commit": "50a05a6f57a0f1ce930b1107cb95bf58a901bbbe"
 }

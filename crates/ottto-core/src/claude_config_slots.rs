@@ -2859,7 +2859,7 @@ mod tests {
         assert!(store.transcript_binding_fingerprint().is_err());
         fs::remove_file(&path).unwrap();
         copy_binding_write(&path, &copy_binding_settings());
-        fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
         let denied = fs::read(&path).is_err();
         if denied {
             assert!(store.transcript_binding_fingerprint().is_err());
