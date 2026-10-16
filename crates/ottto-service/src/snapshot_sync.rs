@@ -5279,6 +5279,33 @@ impl PreparedClaudeLocalEvidence {
         }
     }
 
+    /// Check every root used by a frozen negative, including retained legacy
+    /// predecessors. This validates opened generations without reloading rows
+    /// or replacing P. It returns no new paired view or proof. A controller must
+    /// revoke and take the base path on false; unrelated ineligible roots do
+    /// not expand the qualified population or poison healthy-family evidence.
+    #[allow(dead_code)] // Full controller/selected-settlement integration pending.
+    fn frozen_roots_are_current(
+        &self,
+        support_dir: &Path,
+        required_roots: &BTreeSet<String>,
+    ) -> bool {
+        !self.api_failed
+            && required_roots.iter().all(|root| {
+                self.healthy_roots.contains(root)
+                    && self.api.strict_generation_matches(support_dir, root)
+                    && self.traces.get(root).is_some_and(|read| {
+                        read.report.is_complete()
+                            && read.generation.is_some()
+                            && read.generation
+                                == crate::claude_local_otel::claude_trace_read_generation(
+                                    support_dir,
+                                    root,
+                                )
+                    })
+            })
+    }
+
     fn take_api(
         &mut self,
         support_dir: &Path,
@@ -5316,6 +5343,20 @@ impl PreparedClaudeLocalEvidence {
             [root.to_owned()],
         )
     }
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_claude_negative_rows_for_test(
+    support_dir: &Path,
+    index: &ScanIndex,
+    required_roots: &BTreeSet<String>,
+    after_load: impl FnOnce(),
+) -> (bool, bool) {
+    let prepared = PreparedClaudeLocalEvidence::load(support_dir, &[], index);
+    let before = prepared.frozen_roots_are_current(support_dir, required_roots);
+    after_load();
+    let after = prepared.frozen_roots_are_current(support_dir, required_roots);
+    (before, after)
 }
 
 #[cfg(test)]

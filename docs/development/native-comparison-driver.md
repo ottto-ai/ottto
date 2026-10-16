@@ -173,3 +173,17 @@ were zero. Requested layout remained unavailable on Rust1.98.1, as required.
 The nine base-exit receipts and four blocked controls passed; two original
 optimized-prelude bodies remain compiled and ignored. No installed or CPU/RSS
 benefit follows from this source checkpoint.
+
+## Revalidating frozen evidence across yields
+
+An additional read-only seam checks the current opened API and trace generations
+before a frozen view can support another negative comparison. It must include
+all required roots, including retained legacy predecessors. Unknown or changed
+pairs return false without issuing a new paired view; checking them never reloads rows or substitutes a new
+proof for the frozen proof. Normal final enrichment retains its existing fresh
+load fallback. The moving controller has not invoked this seam yet.
+
+Scoped tests cover unchanged pairs, independent same-byte API and trace object
+replacement, and an unloaded predecessor. They also count actual evidence opens
+to distinguish metadata validation from another decode. This candidate needs its
+own hosted validation and establishes neither full-driver nor resource savings.

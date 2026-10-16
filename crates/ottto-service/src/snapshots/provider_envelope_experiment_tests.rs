@@ -1196,6 +1196,65 @@ fn native_comparison_paired_rows_replaced_after_preflight_use_fresh_strict_load(
 }
 
 #[test]
+fn native_comparison_negative_rows_recheck_each_opened_pair_without_decoding() {
+    let fixture = NativePreparationFixture::new();
+    let required = BTreeSet::from([fixture.parent.clone()]);
+    // Same-byte object replacement must still withdraw a frozen negative;
+    // neither API nor trace generation can be inferred from the other.
+    for changed in [
+        None,
+        Some("claude-code-effort"),
+        Some("claude-code-trace-ownership"),
+    ] {
+        let support = crate::test_scratch::ScratchDir::new("native-negative-generation");
+        write_native_preparation_pair(&support, &fixture.parent, &fixture.api, &fixture.trace);
+        crate::claude_local_otel::reset_evidence_read_counts_for_test();
+        let (before, after) = crate::snapshot_sync::prepared_claude_negative_rows_for_test(
+            &support,
+            &fixture.index,
+            &required,
+            || {
+                if let Some(folder) = changed {
+                    let path = support.join("local-otel").join(folder).join(format!(
+                        "{:x}.jsonl",
+                        Sha256::digest(fixture.parent.as_bytes())
+                    ));
+                    let replacement = path.with_extension("replacement");
+                    fs::write(&replacement, fs::read(&path).unwrap()).unwrap();
+                    fs::rename(replacement, path).unwrap();
+                }
+            },
+        );
+        assert!(before);
+        assert_eq!(after, changed.is_none());
+        assert_eq!(
+            crate::claude_local_otel::evidence_read_counts_for_test(),
+            (1, 1),
+            "negative validation must not silently reload P or decode another graph"
+        );
+    }
+    writeln!(std::io::stderr().lock(), "native_comparison_generation: unchanged_pair_reusable=true same_bytes_api_or_trace_replacement_withdraws=true validation_decodes=0 controller_unproved=true").unwrap();
+}
+
+#[test]
+fn native_comparison_negative_rows_cannot_qualify_an_unloaded_predecessor() {
+    let fixture = NativePreparationFixture::new();
+    let support = crate::test_scratch::ScratchDir::new("native-negative-missing-root");
+    write_native_preparation_pair(&support, &fixture.parent, &fixture.api, &fixture.trace);
+    let required = BTreeSet::from([fixture.parent.clone(), "unknown-predecessor".to_owned()]);
+    let (before, after) = crate::snapshot_sync::prepared_claude_negative_rows_for_test(
+        &support,
+        &fixture.index,
+        &required,
+        || {},
+    );
+    assert!(
+        !before && !after,
+        "one healthy root cannot certify missing predecessor rows"
+    );
+}
+
+#[test]
 fn native_comparison_lifecycle_requires_native_save_and_revokes_after_drop_context_or_restart() {
     let mut fixture = NativePreparationFixture::new();
     let scratch = crate::test_scratch::ScratchDir::new("native-comparison-lifecycle");
