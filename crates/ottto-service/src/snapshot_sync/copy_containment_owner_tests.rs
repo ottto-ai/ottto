@@ -490,15 +490,15 @@ fn copy_containment_local_status_is_bounded_deduplicated_and_absent_from_backend
     let original_bytes = serde_json::to_vec(&original_ref).unwrap();
     daemon.transcript_cache.require_copy_containment_for_test();
     record_copy_containment_status(&daemon, &index, "uncommitted_scan_observation").unwrap();
-    let first_id = daemon
-        .state()
-        .unwrap()
-        .local_health_events
-        .iter()
-        .find(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE)
-        .unwrap()
-        .event_id
-        .clone();
+    let (first_id, first_sequence) = {
+        let state = daemon.state().unwrap();
+        let event = state
+            .local_health_events
+            .iter()
+            .find(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE)
+            .unwrap();
+        (event.event_id.clone(), event.sequence)
+    };
     for _ in 0..200 {
         record_copy_containment_status(&daemon, &index, "uncommitted_scan_observation").unwrap();
     }
@@ -528,7 +528,32 @@ fn copy_containment_local_status_is_bounded_deduplicated_and_absent_from_backend
             .unwrap()
             .contains(IDENTITY_PIPELINE_ROOT));
     }
-    record_copy_containment_status(&daemon, &index, "durable_selected_index").unwrap();
+    let mut previous_id = first_id;
+    let mut previous_sequence = first_sequence;
+    for basis in [
+        "durable_partial_selection",
+        "uncommitted_scan_observation",
+        "durable_selected_index",
+    ] {
+        record_copy_containment_status(&daemon, &index, basis).unwrap();
+        let state = daemon.state().unwrap();
+        let event = state
+            .local_health_events
+            .iter()
+            .find(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE)
+            .unwrap();
+        assert_ne!(
+            event.event_id, previous_id,
+            "changed payload cannot reuse an event id"
+        );
+        assert_eq!(
+            event.sequence,
+            previous_sequence + 1,
+            "bounded replacement still advances sequence"
+        );
+        previous_id = event.event_id.clone();
+        previous_sequence = event.sequence;
+    }
     let state = daemon.state().unwrap();
     assert_eq!(
         state.local_health_events.len(),
@@ -572,5 +597,5 @@ fn copy_containment_local_status_is_bounded_deduplicated_and_absent_from_backend
             .any(|event| event.event_id == local_event.event_id));
         crate::refresh_canonical_local_health(&mut status);
     }
-    writeln!(std::io::stderr().lock(), "copy_containment_status_envelope: default_disabled_no_event=true repeated_observations=200 own_retained_events=1 unchanged_payload_dedup=true changed_basis_replaces=true local_event_retained=true canonical_backend_type_and_id_absent=true unrelated_evidence_bytes_unchanged=true no_content=true").unwrap();
+    writeln!(std::io::stderr().lock(), "copy_containment_status_envelope: default_disabled_no_event=true repeated_observations=200 own_retained_events=1 unchanged_payload_dedup=true changed_basis_replaces=true changed_payload_sequence_and_id_advance=true local_event_retained=true canonical_backend_type_and_id_absent=true unrelated_evidence_bytes_unchanged=true no_content=true").unwrap();
 }

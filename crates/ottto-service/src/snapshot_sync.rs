@@ -75,9 +75,8 @@ fn record_copy_containment_status(
     {
         return Ok(());
     }
-    state
-        .local_health_events
-        .retain(|event| event.event_type != COPY_CONTAINMENT_EVENT_TYPE);
+    // Keep the old sequence visible while constructing the new event. The
+    // same mutex makes replacement atomic to every local status reader.
     crate::push_local_health_event(
         &mut state,
         COPY_CONTAINMENT_EVENT_TYPE,
@@ -85,6 +84,11 @@ fn record_copy_containment_status(
         ottto_protocol::LocalHealthAuthority::Runtime,
         payload,
     );
+    if let Some(sequence) = state.local_health_events.last().map(|event| event.sequence) {
+        state.local_health_events.retain(|event| {
+            event.event_type != COPY_CONTAINMENT_EVENT_TYPE || event.sequence == sequence
+        });
+    }
     Ok(())
 }
 

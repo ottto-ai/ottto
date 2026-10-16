@@ -45,7 +45,9 @@ qualified disclosed residual, not a reason to add automatic retry work.
 The inactive required-policy path projects a content-free aggregate through the
 existing local health-event envelope. It retains one current observation, replacing
 its previous observation rather than growing a per-pass history. Identical payloads
-do not create a new event. The event stays in local status; its exact type is omitted
+do not create a new event. Changed payloads advance event sequence and ID before
+atomically replacing the old observation under the same state lock. The event stays
+in local status; its exact type is omitted
 from canonical backend health evidence, while unrelated evidence remains unchanged.
 No protocol field, server upload, endpoint or new state file is added.
 
