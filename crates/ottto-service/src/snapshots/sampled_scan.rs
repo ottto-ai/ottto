@@ -27,13 +27,66 @@ pub(crate) struct SharedCache {
 struct SharedState {
     reductions: TranscriptCache<sampled_jsonl::CachedJsonlReduction>,
     copy_membership: MembershipIndex,
+    // Required negative attempt memory is not an optional parser cache. Never
+    // evict it on clear/pressure and then grant the same event another read.
+    copy_attempts: BTreeSet<CopyAttempt>,
+    copy_attempt_charge: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct CopyAttempt {
+    scope: [u8; 32],
+    location: [u8; 32],
+    revision: [u8; 32],
+    event: [u8; 32],
+}
+impl CopyAttempt {
+    pub(super) fn new(scope: &str, candidate: &CandidateFile, event: &str) -> Option<Self> {
+        let hash = |domain: &str, parts: &[&str]| -> [u8; 32] {
+            let mut digest = Sha256::new();
+            update_length_prefixed(&mut digest, domain.as_bytes());
+            for part in parts {
+                update_length_prefixed(&mut digest, part.as_bytes());
+            }
+            digest.finalize().into()
+        };
+        Some(Self {
+            scope: hash("copy_attempt_scope:v1", &[scope]),
+            location: hash(
+                "copy_attempt_location:v1",
+                &[candidate.scan_root.to_str()?, candidate.path.to_str()?],
+            ),
+            revision: hash(
+                "copy_attempt_revision:v1",
+                &[&candidate.source_file_fingerprint],
+            ),
+            event: hash("copy_attempt_event:v1", &[event]),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CopyAttemptResult {
+    Claimed,
+    Repeated,
+    Unavailable,
 }
 impl SharedState {
     fn with_byte_limit(bytes: usize) -> Self {
         Self {
             reductions: TranscriptCache::with_byte_limit(bytes),
             copy_membership: MembershipIndex::default(),
+            copy_attempts: BTreeSet::new(),
+            copy_attempt_charge: 0,
         }
+    }
+    fn attempt_charge(&self) -> Option<usize> {
+        if self.copy_attempt_charge != 0 {
+            return Some(self.copy_attempt_charge);
+        }
+        // No mutator removes markers: empty + never charged is precisely the
+        // never-allocated state. Keep the disabled ordinary cache unchanged.
+        self.copy_attempts.is_empty().then_some(0)
     }
 }
 impl HeapLayoutBound for SharedState {
@@ -41,11 +94,14 @@ impl HeapLayoutBound for SharedState {
         let Self {
             reductions,
             copy_membership,
+            copy_attempts: _,
+            copy_attempt_charge: _,
         } = self;
         reductions.heap_bound(counter)?;
         // Includes conservative inline/root overhead twice if necessary. Never
         // replace this with a complete ID graph walk on every parser check.
-        counter.add(copy_membership.current_charge(STATE_BYTES)?)
+        counter.add(copy_membership.current_charge(STATE_BYTES)?)?;
+        counter.add(self.attempt_charge()?)
     }
 }
 impl Default for SharedCache {
@@ -86,7 +142,78 @@ impl SharedCache {
         if let Ok(mut cache) = self.inner.lock() {
             cache.reductions.clear();
             cache.copy_membership = MembershipIndex::default();
+            // Attempt markers deliberately survive optional-cache eviction.
         }
+    }
+    /// Atomic claim BEFORE native parser construction, never an upload permit.
+    /// The current parser owner supplies its existing remaining copy budget.
+    /// Keeping a bounded exact event history is conservative: once the shared
+    /// existing hold allowance is spent, new events park rather than evicting
+    /// a marker and rereading an old event. No clock/reset/restart allowance.
+    pub(super) fn claim_copy_attempt(
+        &self,
+        attempt: CopyAttempt,
+        remaining: usize,
+    ) -> CopyAttemptResult {
+        if !self.copy_containment_required() {
+            return CopyAttemptResult::Unavailable;
+        }
+        let Ok(mut cache) = self.inner.try_lock() else {
+            return CopyAttemptResult::Unavailable;
+        };
+        if cache.copy_attempts.contains(&attempt) {
+            return CopyAttemptResult::Repeated;
+        }
+        if !crate::heap_layout_bound::layout_supported()
+            || cache
+                .copy_attempts
+                .len()
+                .saturating_add(cache.copy_membership.held_slots_used())
+                >= MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS
+            || cache
+                .copy_attempts
+                .len()
+                .saturating_add(cache.copy_membership.owner_slots_used())
+                >= MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS
+        {
+            return CopyAttemptResult::Unavailable;
+        }
+        let Some(resident) = crate::heap_layout_bound::bound(&*cache, STATE_BYTES) else {
+            return CopyAttemptResult::Unavailable;
+        };
+        let Some(room) = STATE_BYTES
+            .checked_sub(resident)
+            .and_then(|room| room.checked_sub(std::mem::size_of::<Self>()))
+        else {
+            return CopyAttemptResult::Unavailable;
+        };
+        let mut extra = Counter::new(remaining.min(room));
+        // Charge a full prospective tree beside all old resident nodes and
+        // the fixed incoming key. No insertion/clone precedes this check.
+        if extra.add(std::mem::size_of::<CopyAttempt>()).is_none()
+            || crate::heap_layout_bound::tree_nodes::<CopyAttempt, ()>(
+                cache.copy_attempts.len() + 1,
+                &mut extra,
+            )
+            .is_none()
+        {
+            return CopyAttemptResult::Unavailable;
+        }
+        let mut retained = Counter::new(STATE_BYTES);
+        if retained
+            .add(std::mem::size_of_val(&cache.copy_attempts))
+            .is_none()
+            || crate::heap_layout_bound::tree_nodes::<CopyAttempt, ()>(
+                cache.copy_attempts.len() + 1,
+                &mut retained,
+            )
+            .is_none()
+        {
+            return CopyAttemptResult::Unavailable;
+        }
+        cache.copy_attempts.insert(attempt);
+        cache.copy_attempt_charge = retained.bytes;
+        CopyAttemptResult::Claimed
     }
     /// Exercise custody on the actual process cache before native completion
     /// supplies the production admission call. The caller must move an already
@@ -114,13 +241,20 @@ impl SharedCache {
             .checked_sub(std::mem::size_of::<Self>())
             .and_then(|bytes| bytes.checked_sub(resident))
             .and_then(|bytes| bytes.checked_sub(live_bytes))
+            .and_then(|bytes| bytes.checked_sub(cache.attempt_charge()?))
             .ok_or(Refused::HeapBudget)?;
+        let held_slots = remaining
+            .held_slots
+            .saturating_sub(cache.copy_attempts.len());
+        let owner_slots = remaining
+            .owner_slots
+            .saturating_sub(cache.copy_attempts.len());
         cache.copy_membership.insert(
             held,
             ids,
             &Allowance {
-                owner_slots: remaining.owner_slots,
-                held_slots: remaining.held_slots,
+                owner_slots,
+                held_slots,
                 heap_bytes,
             },
         )
@@ -143,6 +277,7 @@ impl SharedCache {
                     .copy_membership
                     .current_charge(STATE_BYTES)
                     .and_then(|membership| membership.checked_add(live_bytes))
+                    .and_then(|live| live.checked_add(cache.attempt_charge()?))
                     .and_then(|live| live.checked_add(std::mem::size_of::<Self>()))
                     .filter(|all_live| *all_live <= STATE_BYTES)
                 else {
@@ -152,7 +287,7 @@ impl SharedCache {
                     checkpoint: completed.checkpoint,
                     state,
                 };
-                if cache.copy_membership.is_empty() {
+                if cache.copy_membership.is_empty() && cache.copy_attempts.is_empty() {
                     cache.reductions.insert_reserving(key, retained, live_bytes);
                 } else {
                     cache

@@ -829,6 +829,74 @@ fn copy_shared_allowance() -> Allowance {
 }
 
 #[test]
+fn copy_containment_actual_attempt_owner_refuses_before_allocating_and_never_evicts_seen_events() {
+    let cache = SharedCache::default();
+    let event = CopyAttempt {
+        scope: [1; 32],
+        location: [2; 32],
+        revision: [3; 32],
+        event: [4; 32],
+    };
+    assert_eq!(
+        cache.claim_copy_attempt(event, STATE_BYTES),
+        CopyAttemptResult::Unavailable
+    );
+    cache.require_copy_containment_for_test();
+    let guard = cache.inner.lock().unwrap();
+    let (busy, measured) =
+        crate::retry_allocation_probe::measure(|| cache.claim_copy_attempt(event, STATE_BYTES));
+    assert_eq!(busy, CopyAttemptResult::Unavailable);
+    assert_eq!(measured.allocations, 0);
+    drop(guard);
+    let (refused, measured) =
+        crate::retry_allocation_probe::measure(|| cache.claim_copy_attempt(event, 0));
+    assert_eq!(refused, CopyAttemptResult::Unavailable);
+    assert_eq!(measured.allocations, 0);
+    assert!(cache.inner.lock().unwrap().copy_attempts.is_empty());
+    let admitted = cache.claim_copy_attempt(event, STATE_BYTES);
+    if !crate::heap_layout_bound::layout_supported() {
+        assert_eq!(admitted, CopyAttemptResult::Unavailable);
+        writeln!(std::io::stderr().lock(), "copy_containment_attempt_owner: disabled_busy_budget_refused=true refusal_allocations=0 layout_unavailable=true positive_claim_clear_pressure_history_executed=false").unwrap();
+        return;
+    }
+    assert_eq!(admitted, CopyAttemptResult::Claimed);
+    assert_eq!(
+        cache.claim_copy_attempt(event, 0),
+        CopyAttemptResult::Repeated
+    );
+    cache.clear();
+    assert_eq!(
+        cache.claim_copy_attempt(event, 0),
+        CopyAttemptResult::Repeated
+    );
+    let changed = CopyAttempt {
+        event: [5; 32],
+        ..event
+    };
+    assert_eq!(
+        cache.claim_copy_attempt(changed, 0),
+        CopyAttemptResult::Unavailable
+    );
+    assert_eq!(
+        cache.claim_copy_attempt(event, 0),
+        CopyAttemptResult::Repeated
+    );
+    assert_eq!(
+        cache.claim_copy_attempt(changed, STATE_BYTES),
+        CopyAttemptResult::Claimed
+    );
+    cache.clear();
+    assert_eq!(
+        cache.claim_copy_attempt(event, 0),
+        CopyAttemptResult::Repeated,
+        "old event reappearance is not another grant"
+    );
+    assert_eq!(cache.inner.lock().unwrap().copy_attempts.len(), 2);
+    assert!(crate::heap_layout_bound::bound(&cache, STATE_BYTES).is_some());
+    writeln!(std::io::stderr().lock(), "copy_containment_attempt_owner: atomic_before_read=true same_allowance_bytes={STATE_BYTES} seen_events=2 optional_clear_preserves=true pressure_never_evicts=true old_event_reappearance_refused=true positive_claim_executed=true crash_guarantee=false").unwrap();
+}
+
+#[test]
 fn copy_containment_shared_cache_disabled_busy_and_live_overlap_refuse_before_membership_allocation(
 ) {
     let cache = SharedCache::default();

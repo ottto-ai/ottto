@@ -77,6 +77,12 @@ impl MembershipIndex {
     pub(in crate::snapshots) fn is_empty(&self) -> bool {
         self.by_held.is_empty()
     }
+    pub(in crate::snapshots) fn held_slots_used(&self) -> usize {
+        self.by_held.len()
+    }
+    pub(in crate::snapshots) fn owner_slots_used(&self) -> usize {
+        self.memberships.saturating_add(self.peer_witnesses)
+    }
     /// A borrowed negative lookup only. Empty output is NOT proof of absence
     /// and callbacks may repeat a held key for multiple matching native IDs.
     pub(super) fn for_each_cached_native_link(

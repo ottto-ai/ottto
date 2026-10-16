@@ -13832,20 +13832,40 @@ impl OwnedSourceScan {
             }
             // A parked copy is not an unchanged Skip/current census certificate.
             // Actual opened-object/sidecar identity has already been computed.
-            if source == SnapshotSource::ClaudeCode && index.copy_hold_should_park(&candidate) {
+            let copy_held_candidate = source == SnapshotSource::ClaudeCode
+                && !index.claude_copy_holds.is_empty()
+                && index
+                    .claude_copy_holds
+                    .contains_key(&local_index_key(&candidate.path));
+            if copy_held_candidate
+                && index.copy_hold_should_park(
+                    &candidate,
+                    sampling.as_ref().map(|context| context.cache.as_ref()),
+                    copy_budget,
+                )
+            {
                 pending!();
             }
-            let (mut decision, parse_reason) = claude_index_path_family_member(&candidate.path)
-                .filter(|(root_session_id, _)| {
-                    forced_claude_family_reparses.contains(root_session_id)
-                })
-                .map(|_| {
+            let (mut decision, parse_reason) =
+                if copy_held_candidate && index.active_copy_scan.is_some() {
+                    // Claimed events require native comparison, never a normal Skip.
                     (
                         CandidateDecision::Parse,
-                        Some(CandidateParseReason::ForcedFamily),
+                        Some(CandidateParseReason::SourceChanged),
                     )
-                })
-                .unwrap_or_else(|| index.candidate_decision_with_reason(&candidate));
+                } else {
+                    claude_index_path_family_member(&candidate.path)
+                        .filter(|(root_session_id, _)| {
+                            forced_claude_family_reparses.contains(root_session_id)
+                        })
+                        .map(|_| {
+                            (
+                                CandidateDecision::Parse,
+                                Some(CandidateParseReason::ForcedFamily),
+                            )
+                        })
+                        .unwrap_or_else(|| index.candidate_decision_with_reason(&candidate))
+                };
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
                     let count = &mut census.claude_parse_reasons[reason as usize];

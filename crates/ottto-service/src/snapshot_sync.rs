@@ -3854,6 +3854,15 @@ fn prepare_sync_source(
             ),
             registered_slots,
         )?;
+        // A reconnect/lease/cycle change must not reset physical attempt memory.
+        index.attach_copy_attempt_scope(format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "copy_attempt_destination:v1:{upload_destination_namespace}:{}:{}",
+                source.api_slug(),
+                index_path.display()
+            ))
+        ))?;
     }
     let scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
         source,

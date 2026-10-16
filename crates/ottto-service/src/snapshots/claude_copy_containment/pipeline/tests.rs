@@ -75,6 +75,38 @@ impl Fixture {
         )
         .unwrap()
     }
+    fn scan_with_owner(
+        &self,
+        index: &mut ScanIndex,
+        cache: Arc<sampled_scan::SharedCache>,
+    ) -> SourceScanResult {
+        let mut state = OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            &self.roots,
+            std::mem::take(index),
+            &self.now,
+            730,
+            32,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(
+            cache,
+            crate::transcript_acquisition::Scope("copy-fixture".into()),
+        );
+        loop {
+            match state.step(None) {
+                OwnedSourceScanStep::Pending(next) => state = next,
+                OwnedSourceScanStep::Complete { index: next, scan } => {
+                    *index = next;
+                    return scan;
+                }
+            }
+        }
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -82,11 +114,13 @@ impl Drop for Fixture {
     }
 }
 fn context(key: &str, value: Option<&str>) -> ScanContext {
-    ScanContext::new(
+    let mut context = ScanContext::new(
         "a".repeat(64),
         BTreeMap::from([(key.to_string(), value.map(str::to_string))]),
     )
-    .unwrap()
+    .unwrap();
+    context.attempt_scope = Some("a".repeat(64));
+    context
 }
 fn install_hold(index: &mut ScanIndex, path: &Path, source: &str, evidence: &str) {
     index.claude_copy_holds.entries.insert(
@@ -156,7 +190,7 @@ fn copy_containment_native_scanner_parks_actual_heavy_file_under_repeated_finger
 }
 
 #[test]
-fn copy_containment_native_scanner_unknown_wake_stays_parked_known_revision_change_reads() {
+fn copy_containment_native_scanner_proven_own_change_reads_once_with_other_wakes_unknown() {
     let f = Fixture::new();
     f.write(A, &["req_shared"], false);
     let mut index = ScanIndex::default();
@@ -167,12 +201,67 @@ fn copy_containment_native_scanner_unknown_wake_stays_parked_known_revision_chan
     let evidence = "b".repeat(64);
     install_hold(&mut index, &f.path(A), &revision, &evidence);
     index.attach_copy_scan_context(context(&key, None));
-    f.write(A, &["req_shared", "req_new"], false);
     assert_eq!(f.scan(&mut index).scanned_file_count, 0);
-    index.attach_copy_scan_context(context(&key, Some(&evidence)));
-    let changed = f.scan(&mut index);
+    let previous = index.clone();
+    f.write(A, &["req_shared", "req_new"], false);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    cache.require_copy_containment_for_test();
+    let mut changed = f.scan_with_owner(&mut index, cache.clone());
+    if !crate::heap_layout_bound::layout_supported() {
+        assert_eq!(changed.scanned_file_count, 0);
+        assert_eq!(index.copy_hold_count(), 1);
+        writeln!(std::io::stderr().lock(), "copy_containment_own_change: layout_unavailable=true actual_attempt_refused=true positive_own_change_save_reload_executed=false original_positive_oracle_unaccepted=true").unwrap();
+        return;
+    }
     assert_eq!(changed.scanned_file_count, 1);
-    assert_eq!(index.copy_hold_count(), 1); // Parse is not ACK/debt settlement.
+    assert!(changed
+        .pending_finalization
+        .iter()
+        .all(|pending| pending.parse_complete));
+    let authority = apply_claude_reported_usage_to_scan_with_identity(
+        &mut changed,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+        &mut index,
+        None,
+    );
+    assert!(authority.copied_source_session_ids.contains(A));
+    authority.retain_copy_uploadable(&mut changed.snapshots);
+    assert!(
+        changed.snapshots.is_empty(),
+        "a wake never releases a held body"
+    );
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut changed, &mut index);
+    let mut selected = index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    assert_eq!(selected.copy_hold_count(), 1);
+    assert_eq!(
+        selected.claude_copy_holds.entries[&key]
+            .revision
+            .first_observed_unix_seconds,
+        Some(100)
+    );
+    let path = f.base.join("own-change-index.json");
+    selected.save(&path).unwrap();
+    let mut reloaded = ScanIndex::load_for_copy_containment(&path).unwrap();
+    reloaded.attach_copy_scan_context(context(&key, None));
+    for _ in 0..3 {
+        assert_eq!(
+            f.scan_with_owner(&mut reloaded, cache.clone())
+                .scanned_file_count,
+            0,
+            "remember native evaluation independently from ACK/hold resolution"
+        );
+    }
+    assert_eq!(reloaded.copy_hold_count(), 1);
+    // An unavailable opened own revision is not a positive event.
+    fs::remove_file(f.path(A)).unwrap();
+    assert_eq!(f.scan(&mut reloaded).scanned_file_count, 0);
+    assert_eq!(
+        reloaded.copy_hold_count(),
+        1,
+        "a traversal miss is not absence proof"
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_own_change: actual_guarded_native_read=1 unrelated_wakes_unknown=true withheld_bodies=1 offered_bodies=0 selected_save_reload=true unchanged_followup_reads=0 debt_and_age_preserved=true missing_own_revision_no_wake=true failed_save_process_attempt_lifetime_unproved=true").unwrap();
 }
 
 #[test]

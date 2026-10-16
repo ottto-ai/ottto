@@ -40,6 +40,37 @@ held revision. Real process-owner context acquisition and all W1–W5 bindings
 remain unfinished. Restart alone need not grant a read: a lost W4 cache is a
 qualified disclosed residual, not a reason to add automatic retry work.
 
+## Inactive process-attempt integration
+
+A positively observed own-file or sidecar revision change can request native
+comparison independently of unrelated unknown peer or approval inputs. Unknown
+evidence alone cannot request work. Re-evaluation never grants an upload, identity,
+coverage, ACK or hold settlement. The selected durable hold revision can remember
+an evaluated input while retaining the entire unresolved obligation.
+
+Before constructing the heavy parser, the actual shared process owner atomically
+claims the full semantic destination/source/index, root/path, opened revision and
+meaningful event. Connection, lease and cycle churn are excluded from that key.
+The bounded exact attempt history competes with parser reductions and membership
+under the same existing retained-memory and owner/hold allowances. Preflight
+includes old resident nodes, prospective nodes and the fixed input. Optional cache
+clearing or pressure cannot evict an attempt and make its old event readable again.
+Unavailable owner, lock, layout or budget parks the revision; a claimed event
+forces native comparison instead of falling through an unchanged-file Skip.
+
+The new synthetic owner tests cover malformed input without a snapshot and actual
+generation-CAS losing selected saves across repeated preparations. Their positive
+branches require supported layout admission. An unavailable layout must report
+those branches as unexecuted; refused reads and passing test names do not establish
+successful event handling or peak-memory acceptance. This integration remains
+unvalidated until exact-head CI executes its tests. It remains inactive afterward
+until settlement, status and resource gates are complete.
+
+Process attempt memory does not guarantee no repeated attempt across a crash when
+the durable input witness was never saved. No automatic restart read, retry timer
+or persistent attempt journal is introduced. Crash behavior and full frame/index
+clone/decoder peak remain explicit acceptance gaps.
+
 The first ten component tests passed on exact head `2b162a96`, automatic CI
 `38958674335`, with all four checks successful. They parse synthetic native transcripts,
 exercise copied IDs despite rewritten session IDs, preserve the original usage

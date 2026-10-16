@@ -45,9 +45,14 @@ pub(crate) struct ScanContext {
     contexts: BTreeMap<String, Option<String>>,
     // One required semantic input, never a complete W5 or read permission.
     registered_slot_fingerprint: Option<String>,
+    // Semantic namespace excludes connection/lease churn.
+    attempt_scope: Option<String>,
     parked: usize,
+    attempt_unavailable: usize,
+    attempt_repeated: usize,
 }
-crate::heap_layout_bound::fields!(ScanContext; scope, contexts, registered_slot_fingerprint, parked);
+crate::heap_layout_bound::fields!(ScanContext; scope, contexts, registered_slot_fingerprint,
+    attempt_scope, parked, attempt_unavailable, attempt_repeated);
 
 impl ScanContext {
     pub(crate) fn new(scope: String, contexts: BTreeMap<String, Option<String>>) -> Option<Self> {
@@ -56,7 +61,10 @@ impl ScanContext {
                 scope,
                 contexts,
                 registered_slot_fingerprint: None,
+                attempt_scope: None,
                 parked: 0,
+                attempt_unavailable: 0,
+                attempt_repeated: 0,
             })
     }
 }
@@ -124,6 +132,15 @@ impl ScanIndex {
     pub(crate) fn attach_copy_scan_context(&mut self, context: ScanContext) {
         self.active_copy_scan = Some(context);
     }
+    pub(crate) fn attach_copy_attempt_scope(&mut self, scope: String) -> anyhow::Result<()> {
+        anyhow::ensure!(digest_valid(&scope), "invalid copied-request attempt scope");
+        let context = self
+            .active_copy_scan
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("missing copied-request process context"))?;
+        context.attempt_scope = Some(scope);
+        Ok(())
+    }
     pub(crate) fn copy_hold_count(&self) -> usize {
         self.claude_copy_holds.entries.len()
     }
@@ -135,6 +152,8 @@ impl ScanIndex {
     pub(in crate::snapshots) fn copy_hold_should_park(
         &mut self,
         candidate: &CandidateFile,
+        owner: Option<&crate::snapshots::sampled_scan::SharedCache>,
+        remaining: usize,
     ) -> bool {
         let Some(context) = self.active_copy_scan.as_mut() else {
             return false;
@@ -143,15 +162,56 @@ impl ScanIndex {
         let Some(held) = self.claude_copy_holds.entries.get(&key) else {
             return false;
         };
-        let park = context
-            .contexts
-            .get(&key)
-            .and_then(Option::as_deref)
-            .map_or(true, |evidence| {
-                held.revision
-                    .read_disposition(&candidate.source_file_fingerprint, evidence)
-                    == ReadDisposition::ParkUnchangedHeldRevision
-            });
+        // W1/W2 are independent positive events. This seam follows the
+        // scanner's guarded open and exact physical/sidecar fingerprinting;
+        // a proved own change may request native comparison even while a peer
+        // or approval witness is UNKNOWN. It grants no body/ACK/coverage.
+        // Unknown/invalid own evidence itself is never a change signal.
+        let own_known = digest_valid(&candidate.source_file_fingerprint);
+        let own_changed =
+            own_known && candidate.source_file_fingerprint != held.revision.source_revision;
+        let mut park = !own_known
+            || !own_changed
+                && context
+                    .contexts
+                    .get(&key)
+                    .and_then(Option::as_deref)
+                    .map_or(true, |evidence| {
+                        held.revision
+                            .read_disposition(&candidate.source_file_fingerprint, evidence)
+                            == ReadDisposition::ParkUnchangedHeldRevision
+                    });
+        if !park {
+            // Claim before the heavy parser, even when parse or durable save
+            // fails later. No owner/budget/event means park, never BASE.
+            let event = if own_changed {
+                Some(candidate.source_file_fingerprint.as_str())
+            } else {
+                context.contexts.get(&key).and_then(Option::as_deref)
+            };
+            let attempt = context
+                .attempt_scope
+                .as_deref()
+                .zip(event)
+                .and_then(|(scope, event)| {
+                    crate::snapshots::sampled_scan::CopyAttempt::new(scope, candidate, event)
+                });
+            let result = owner.zip(attempt).map_or(
+                crate::snapshots::sampled_scan::CopyAttemptResult::Unavailable,
+                |(owner, attempt)| owner.claim_copy_attempt(attempt, remaining),
+            );
+            match result {
+                crate::snapshots::sampled_scan::CopyAttemptResult::Claimed => {}
+                crate::snapshots::sampled_scan::CopyAttemptResult::Repeated => {
+                    context.attempt_repeated = context.attempt_repeated.saturating_add(1);
+                    park = true;
+                }
+                crate::snapshots::sampled_scan::CopyAttemptResult::Unavailable => {
+                    context.attempt_unavailable = context.attempt_unavailable.saturating_add(1);
+                    park = true;
+                }
+            }
+        }
         if park {
             context.parked = context.parked.saturating_add(1);
         }
