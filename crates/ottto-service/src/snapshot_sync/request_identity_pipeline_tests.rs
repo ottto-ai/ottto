@@ -142,7 +142,9 @@ fn identity_pipeline_cycle(
     let (mut oracle_index, mut oracle_scan) = loop {
         match oracle.step(None) {
             crate::snapshots::OwnedSourceScanStep::Pending(next) => oracle = next,
-            crate::snapshots::OwnedSourceScanStep::Complete { index, scan } => break (index, scan),
+            crate::snapshots::OwnedSourceScanStep::Complete { index, scan, .. } => {
+                break (index, scan)
+            }
         }
     };
     apply_claude_local_evidence_to_scan_with_permit(

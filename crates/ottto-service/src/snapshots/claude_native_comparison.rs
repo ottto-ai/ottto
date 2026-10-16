@@ -21,6 +21,54 @@ pub(crate) struct PairedRows<'a> {
     pub(crate) healthy_roots: &'a BTreeSet<String>,
 }
 
+/// A single moving owner for the actual completed native traversal. It never
+/// enters SourceScanResult (which is Clone), a disk record, or a proof/permit.
+/// The future selected-state fallback must validate context before restoring it.
+/// Until that callback exists, finish simply drops this unused owner.
+pub(crate) struct TerminalTraversal {
+    traversal: ScanTraversalCheckpoint,
+}
+impl TerminalTraversal {
+    pub(super) fn take(
+        index: &mut ScanIndex,
+        source: SnapshotSource,
+        comparison_active: bool,
+        census_complete: bool,
+        census_window_end: &str,
+    ) -> Option<Box<Self>> {
+        if source != SnapshotSource::ClaudeCode
+            || !comparison_active
+            || !census_complete
+            || !index.traversal.as_ref().is_some_and(|traversal| {
+                traversal.census_window_end == census_window_end
+                    && !traversal.context_fingerprint.is_empty()
+                    && traversal.pending_directories.is_empty()
+                    && traversal.pending_candidates.is_empty()
+                    && !traversal.counts.has_errors()
+                    && !traversal.watcher_hint_seen
+                    && !traversal.codex_parent_resolution_retry_required
+            })
+        {
+            return None;
+        }
+        // Move the original object, not the diagnostic traversal_snapshot clone.
+        index
+            .traversal
+            .take()
+            .map(|traversal| Box::new(Self { traversal }))
+    }
+
+    #[cfg(test)]
+    pub(super) fn context_pointer_for_test(&self) -> usize {
+        self.traversal.context_fingerprint.as_ptr() as usize
+    }
+    #[cfg(test)]
+    pub(super) fn contains_observed_for_test(&self, key: &str) -> bool {
+        self.traversal.observed_index_keys.contains(key)
+    }
+}
+crate::heap_layout_bound::fields!(TerminalTraversal; traversal);
+
 /// Select only caller-known recovery paths already in this traversal queue and
 /// still carrying durable rearm debt. The queue retains its allocation and all
 /// unselected entries in their prior order. Clone only selected path records;

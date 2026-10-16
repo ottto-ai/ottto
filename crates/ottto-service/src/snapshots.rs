@@ -11729,6 +11729,7 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
             OwnedSourceScanStep::Complete {
                 index: complete_index,
                 scan,
+                ..
             } => {
                 *index = complete_index;
                 return Ok(scan);
@@ -11886,6 +11887,7 @@ pub(crate) enum OwnedSourceScanStep {
     Complete {
         index: ScanIndex,
         scan: SourceScanResult,
+        terminal_native_traversal: Option<Box<claude_native_comparison::TerminalTraversal>>,
     },
 }
 impl OwnedSourceScan {
@@ -13868,6 +13870,7 @@ impl OwnedSourceScan {
                         &traversal_snapshot.observed_index_keys,
                     );
                 }
+                let mut terminal_native_traversal = None;
                 if (raw_census_complete
                     && codex_legacy_join_baselines.is_empty()
                     && !pending_finalization.iter().any(|pending| {
@@ -13879,6 +13882,13 @@ impl OwnedSourceScan {
                     || restart_after_hints
                     || parent_resolution_restart
                 {
+                    terminal_native_traversal = claude_native_comparison::TerminalTraversal::take(
+                        index,
+                        source,
+                        native_comparison.is_some(),
+                        census_complete,
+                        &census_window_end,
+                    );
                     index.traversal = None;
                     index.resume_after_path = None;
                     index.resume_upper_bound_path = None;
@@ -14036,6 +14046,7 @@ impl OwnedSourceScan {
                 return OwnedSourceScanStep::Complete {
                     index: index_storage,
                     scan,
+                    terminal_native_traversal,
                 };
             };
             let preflight_source_file_fingerprint =

@@ -621,7 +621,7 @@ impl SelectionFixture {
         for _ in 0..1024 {
             match native.step(None) {
                 OwnedSourceScanStep::Pending(next) => native = next,
-                OwnedSourceScanStep::Complete { index, scan } => return (index, scan),
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
             }
         }
         panic!("bounded fixture native scan did not complete");
@@ -1344,6 +1344,119 @@ fn native_comparison_recovery_priority_requires_scope_queued_debt_and_remaining_
     );
     let zero = native_recovery_priority_scan(&fixture, rearmed, 0, &fixture.paths[..1]);
     assert!(zero.identified_candidates.is_empty());
+}
+
+fn complete_native_with_terminal_owner(
+    mut state: OwnedSourceScan,
+) -> (
+    ScanIndex,
+    SourceScanResult,
+    Option<Box<claude_native_comparison::TerminalTraversal>>,
+) {
+    for _ in 0..1024 {
+        if state.native_comparison_ready() {
+            state.resume_native_comparison_base();
+        }
+        match state.step(None) {
+            OwnedSourceScanStep::Pending(next) => state = next,
+            OwnedSourceScanStep::Complete {
+                index,
+                scan,
+                terminal_native_traversal,
+            } => {
+                return (index, scan, terminal_native_traversal);
+            }
+        }
+    }
+    panic!("bounded native scan did not complete");
+}
+
+#[test]
+fn native_comparison_terminal_checkpoint_moves_outside_cloneable_scan_result() {
+    let fixture = NativePreparationFixture::new();
+    let base = OwnedSourceScan::new_with_identity_capture(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&fixture.dir),
+        fixture.index.clone(),
+        WINDOW,
+        30,
+        8,
+        false,
+        None,
+        &[],
+        false,
+        false,
+        false,
+    );
+    let (base_index, base_scan, base_terminal) = complete_native_with_terminal_owner(base);
+    assert!(base_terminal.is_none());
+    let state = fixture.paused();
+    let original_context = state
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .context_fingerprint
+        .as_ptr() as usize;
+    let (index, scan, terminal) = complete_native_with_terminal_owner(state);
+    let terminal = terminal.expect("complete opted-in native traversal moves separately");
+    assert!(scan.census_complete && base_scan.census_complete);
+    assert!(index.traversal.is_none() && base_index.traversal.is_none());
+    assert_eq!(
+        terminal.context_pointer_for_test(),
+        original_context,
+        "move the original allocation, never the diagnostic traversal clone"
+    );
+    assert!(terminal.contains_observed_for_test(&local_index_key(
+        &fixture.dir.join(format!("{}.jsonl", fixture.parent))
+    )));
+    assert_eq!(
+        serde_json::to_value(&index).unwrap(),
+        serde_json::to_value(&base_index).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&scan.snapshots).unwrap(),
+        serde_json::to_value(&base_scan.snapshots).unwrap()
+    );
+    let result_clone = scan.clone();
+    drop(scan);
+    assert!(result_clone.census_complete);
+    assert_eq!(terminal.context_pointer_for_test(), original_context);
+    writeln!(std::io::stderr().lock(), "native_comparison_terminal_owner: original_context_allocation_moved=true result_clone_separate=true base_index_body_parity=true actual_census_complete=true selected_restore_unproved=true").unwrap();
+}
+
+#[test]
+fn native_comparison_terminal_owner_requires_complete_current_claude_census() {
+    let fixture = SelectionFixture::new();
+    let mut incomplete = fixture.prepare(fixture.previous.clone(), 1);
+    incomplete.enable_native_comparison();
+    let (index, scan, terminal) = complete_native_with_terminal_owner(incomplete);
+    assert!(!scan.census_complete);
+    assert!(index.traversal.is_some());
+    assert!(
+        terminal.is_none(),
+        "incomplete traversal stays under its existing index owner"
+    );
+    let fixture = NativePreparationFixture::new();
+    let state = fixture.paused();
+    for (source, active, complete, window) in [
+        (SnapshotSource::Codex, true, true, WINDOW),
+        (SnapshotSource::ClaudeCode, false, true, WINDOW),
+        (SnapshotSource::ClaudeCode, true, false, WINDOW),
+        (SnapshotSource::ClaudeCode, true, true, "different-census"),
+    ] {
+        let mut index = state.index.clone();
+        let before = serde_json::to_value(&index).unwrap();
+        assert!(claude_native_comparison::TerminalTraversal::take(
+            &mut index, source, active, complete, window
+        )
+        .is_none());
+        assert_eq!(
+            serde_json::to_value(&index).unwrap(),
+            before,
+            "failed capture guard must not consume or alter the existing traversal"
+        );
+    }
 }
 
 #[test]

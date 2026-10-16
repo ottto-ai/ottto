@@ -3422,6 +3422,8 @@ fn persist_machine_icon_at(path: &Path, response: &AgentStatusSnapshotUploadResp
 struct SourcePreparation {
     native_comparison_lease: Option<crate::snapshots::claude_native_comparison::lifecycle::Lease>,
     prepared_claude_evidence: Option<PreparedClaudeLocalEvidence>,
+    terminal_native_traversal:
+        Option<Box<crate::snapshots::claude_native_comparison::TerminalTraversal>>,
     native_comparison_qualification:
         Option<crate::snapshots::claude_native_comparison::Qualification>,
     retry_authority: Option<live_snapshot_retry::LiveAuthority>,
@@ -3494,7 +3496,12 @@ impl SourcePreparation {
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
-            crate::snapshots::OwnedSourceScanStep::Complete { index, scan } => {
+            crate::snapshots::OwnedSourceScanStep::Complete {
+                index,
+                scan,
+                terminal_native_traversal,
+            } => {
+                self.terminal_native_traversal = terminal_native_traversal;
                 SourcePreparationStep::Complete {
                     preparation: self,
                     index,
@@ -3940,6 +3947,7 @@ fn prepare_sync_source(
     Ok(Some(SourcePreparation {
         native_comparison_lease,
         prepared_claude_evidence: None,
+        terminal_native_traversal: None,
         native_comparison_qualification: None,
         retry_authority,
         source,
@@ -4034,6 +4042,7 @@ fn finish_sync_source(
     let SourcePreparation {
         mut native_comparison_lease,
         prepared_claude_evidence,
+        terminal_native_traversal,
         native_comparison_qualification,
         retry_authority,
         source,
@@ -4063,6 +4072,9 @@ fn finish_sync_source(
     // The initial checkpoint deliberately cannot activate envelope reuse.
     // Target acquisition and final selected-state settlement come next.
     drop(native_comparison_qualification);
+    // The terminal graph moves separately from Clone-able results. Selected
+    // fallback is not wired yet, so do not retain an unused graph during upload.
+    drop(terminal_native_traversal);
     let client = &receipt_client;
     let codex_join_validator = scan_result.codex_joining_validator();
     let validate_joined = |snapshots: &[SnapshotItem]| -> Result<()> {
@@ -18528,7 +18540,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_lease, prepared_claude_evidence, native_comparison_qualification, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_qualification, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries);
 

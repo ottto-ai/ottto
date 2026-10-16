@@ -205,3 +205,23 @@ These tests need hosted validation. They do not establish the controller's
 process/context binding, selected-state fallback settlement, missing-path recovery
 or cross-generation liveness. The full controller must supply those proofs before
 using this seam; no source fingerprint, deadline or census flag is changed here.
+
+## Moving the terminal traversal separately
+
+An additional inactive component moves the original completed Claude traversal
+through native completion into source preparation. Its opaque owner has no Clone
+or serialization implementation. It remains outside the cloneable scan result;
+ordinary callers discard it, and current finish drops it before upload because
+selected-state fallback is not wired yet. The optional owner is boxed, avoiding
+an inline traversal graph in every preparation. Its fields remain covered by
+exhaustive requested-layout accounting.
+
+Capture requires the active comparison phase, the same completed census window,
+and a healthy terminal traversal. Incomplete traversal stays in its existing
+index owner. The current index/result keep their original census flags and
+serialized shape. Tests compare base index/body output, check that the context
+allocation moved from the original traversal, clone the result independently,
+and exercise inactive/wrong-source/incomplete/wrong-window guards. These tests
+need hosted validation; they establish neither selected restoration nor process
+memory savings. No checkpoint is restored, persisted or treated as a permit by
+this component.
