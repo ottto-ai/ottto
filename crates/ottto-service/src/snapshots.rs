@@ -4709,8 +4709,22 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
                 });
             if full_rearm
-                || (proven.contains_key(&root_session_id)
-                    && !current_ids.contains(source_session_id.as_str()))
+                || {
+                    let proof_rearm = proven.contains_key(&root_session_id)
+                        && !current_ids.contains(source_session_id.as_str());
+                    #[cfg(test)]
+                    {
+                        proof_rearm
+                            && !envelope_selection_experiment::suppress_certified_negative_rearm(
+                                &root_session_id,
+                                index_key,
+                            )
+                    }
+                    #[cfg(not(test))]
+                    {
+                        proof_rearm
+                    }
+                }
                 || invalidated_witness_roots.contains(&root_session_id)
                 || changed_duplicate_owners.contains(&duplicate_owner)
                 || current_member_owns_changed_request

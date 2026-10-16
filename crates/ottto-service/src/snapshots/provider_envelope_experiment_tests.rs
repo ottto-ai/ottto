@@ -810,3 +810,142 @@ fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_
     assert_eq!(restarted.counts().unknown_age, 1);
     writeln!(std::io::stderr().lock(), "envelope_experiment_unavailable: reason=comparison_deferred_unavailable failed_open=1 successful_deferrals=0 durable_rearm=true restart_retry=true age_unknown_count=1").unwrap();
 }
+
+fn comparison_owner_epoch(
+    index: &mut ScanIndex,
+    root: &SnapshotItem,
+    child: &SnapshotItem,
+    api: &Api,
+    trace: &Trace,
+) {
+    apply_claude_reported_usage_with_index(
+        &mut [root.clone()],
+        api,
+        trace,
+        index,
+        false,
+        "2026-08-02T07:11:00Z",
+    );
+    apply_claude_reported_usage_with_index(
+        &mut [child.clone()],
+        api,
+        trace,
+        index,
+        true,
+        "2026-08-02T07:11:00Z",
+    );
+}
+
+#[test]
+fn envelope_experiment_disabled_family_bypasses_actual_rearm_suppression_gate() {
+    let (dir, parent, _) = claude_account_family_fixture();
+    let roots = [dir.clone()];
+    let initial = OwnedSourceScan::new_with_identity_capture(
+        SnapshotSource::ClaudeCode,
+        &roots,
+        ScanIndex::default(),
+        WINDOW,
+        30,
+        8,
+        false,
+        None,
+        &[],
+        false,
+        false,
+        false,
+    );
+    let (mut baseline, mut scan) = SelectionFixture::run(initial);
+    assert!(scan.census_complete);
+    let raw_root = scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id == parent)
+        .unwrap()
+        .clone();
+    let raw_child = scan
+        .snapshots
+        .iter()
+        .find(|item| item.source_session_id != parent)
+        .unwrap()
+        .clone();
+    let (api, trace) = reports(&parent, false);
+    apply_claude_reported_usage_with_index(
+        &mut scan.snapshots,
+        &api,
+        &trace,
+        &mut baseline,
+        true,
+        WINDOW,
+    );
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut baseline);
+    let key = local_index_key(&dir.join(format!("{parent}.jsonl")));
+    let candidate = matching_candidate(&baseline, &key);
+    assert_eq!(decision(&baseline, &candidate).0, CandidateDecision::Skip);
+    let frozen = baseline.claude_usage_family_witnesses[&parent].clone();
+    let prior = qualified_prior(&frozen, &raw_child, &api, &trace, true).unwrap();
+    assert!(raw_hashes(&raw_child).difference(&prior).next().is_none());
+    assert!(!baseline
+        .claude_usage_authority_quarantine
+        .contains_key(&parent));
+    let scope = envelope_selection_experiment::Scope::controlled();
+    let targets = BTreeSet::from([PathBuf::from(&key)]);
+    scope.register(&parent, targets.clone());
+    scope.certify_negative(key.clone());
+    let mut enabled = baseline.clone();
+    comparison_owner_epoch(&mut enabled, &raw_root, &raw_child, &api, &trace);
+    assert_eq!(decision(&enabled, &candidate).0, CandidateDecision::Skip);
+    assert_eq!(scope.counts().rearm_suppressed, 1);
+
+    // Real successful native target reads, not an invented scan result, earn
+    // the two controlled eligible attempts. Other cases cover atomic partial
+    // saves; this case specifically connects disable to the actual fold gate.
+    let mut native_index = baseline.clone();
+    native_index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    for _ in 0..2 {
+        let native = OwnedSourceScan::new_with_identity_capture(
+            SnapshotSource::ClaudeCode,
+            &roots,
+            native_index,
+            WINDOW,
+            30,
+            1,
+            false,
+            None,
+            &[],
+            false,
+            false,
+            false,
+        );
+        let (mut index, scan) = SelectionFixture::run(native);
+        assert_eq!(scan.scanned_file_count, 1);
+        scope.defer_after_native(&parent, &scan);
+        envelope_selection_experiment::after_selected_restore(&mut index, &baseline);
+        native_index = index;
+    }
+    assert_eq!(scope.counts().successful_deferrals, 2);
+    assert!(!scope.allowed(&parent));
+    scope.register(&parent, targets);
+    scope.certify_negative(key.clone()); // even a renewed negative cannot reset disable
+    let mut disabled = baseline.clone();
+    comparison_owner_epoch(&mut disabled, &raw_root, &raw_child, &api, &trace);
+    assert_eq!(
+        decision(&disabled, &candidate),
+        (
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::Rearmed)
+        )
+    );
+    assert_eq!(scope.counts().rearm_base_bypasses, 1);
+    assert_eq!(scope.counts().rearm_suppressed, 1);
+    assert_eq!(
+        enabled.claude_duplicate_request_owners,
+        disabled.claude_duplicate_request_owners
+    );
+    writeln!(std::io::stderr().lock(), "envelope_experiment_gate: actual_rearm_suppressed=1 successful_deferrals=2 actual_base_bypasses=1 register_and_negative_cannot_renew=true").unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}

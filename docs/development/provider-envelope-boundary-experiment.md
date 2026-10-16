@@ -66,3 +66,13 @@ other pages. Only already-observed paths inside the frozen roots may be queued.
 Per-request tagging, complete two-phase proof classification, full P1–P12 and
 original regression parity, and net per-class read/CPU/allocation benefit still
 need separate proof before the optimization is considered for shipping.
+
+A final direct gate case also exercises the actual earlier-page proof-rearm
+condition. It collects the native family, proves and finalizes it, checks the
+normal Skip and frozen-proof negative, then permits one test-only suppression.
+Two actual successful native attempts disable reuse; re-registering the family
+and negative must then leave the real base rearm intact (`Parse/Rearmed`). This
+connects the policy flag to a real rearm-suppression decision. The gate is absent
+in production and does not suppress global-fence, changed-owner or invalidated
+witness rearm reasons. It still does not establish the full envelope engine or
+per-class performance benefit.

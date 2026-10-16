@@ -15,6 +15,8 @@ pub(crate) struct Counts {
     pub unavailable: usize,
     pub base_exits: usize,
     pub unknown_age: usize,
+    pub rearm_suppressed: usize,
+    pub rearm_base_bypasses: usize,
 }
 #[derive(Default)]
 struct State {
@@ -22,6 +24,7 @@ struct State {
     unknown_age_seen: bool,
     families: BTreeMap<String, Family>,
     withheld: BTreeSet<String>,
+    certified_negative_keys: BTreeSet<String>,
     counts: Counts,
 }
 thread_local! {
@@ -54,6 +57,18 @@ impl Scope {
                 .or_default()
                 .paths
                 .extend(paths);
+        });
+    }
+    // Tests mint this only from frozen retained-P reconstruction, exact native
+    // digests, normal Skip and a negative comparison. No production caller.
+    pub(crate) fn certify_negative(&self, key: String) {
+        STATE.with(|state| {
+            state
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .certified_negative_keys
+                .insert(key);
         });
     }
     pub(crate) fn withhold(&self, paths: BTreeSet<String>) {
@@ -113,6 +128,33 @@ impl Drop for Scope {
             state.replace(self.0.take());
         });
     }
+}
+
+// Used at the real proof-rearm branch, not just a policy assertion. Other
+// rearm reasons (changed owner, invalid witness, global fence) remain intact.
+pub(super) fn suppress_certified_negative_rearm(root: &str, key: &str) -> bool {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(state) = state.as_mut() else {
+            return false;
+        };
+        if !state.certified_negative_keys.contains(key) {
+            return false;
+        }
+        let Some(family) = state.families.get(root) else {
+            return false;
+        };
+        if !family.paths.contains(Path::new(key)) {
+            return false;
+        }
+        if state.permit && !family.disabled {
+            state.counts.rearm_suppressed += 1;
+            true
+        } else {
+            state.counts.rearm_base_bypasses += 1;
+            false
+        }
+    })
 }
 
 pub(super) fn before_audit_selection(
