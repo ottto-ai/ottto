@@ -527,13 +527,14 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
     let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     let mut completed = 0;
     let mut bootstrap_observed = false;
+    let mut previous_context = None;
     let collection = || AgentStatusCollection {
         snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
     };
-    for _ in 0..6 {
+    for cycle in 0..=2 {
         cadence.next_due_cycle();
         let mut frame = crate::agent_status_refresh::with_test_collection(collection(), || {
             prepare_sync_source(
@@ -552,16 +553,39 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
         })
         .unwrap()
         .expect("ordinary full source cycle");
+        let context = frame
+            .scan
+            .as_ref()
+            .unwrap()
+            .native_comparison_context()
+            .unwrap()
+            .to_owned();
+        assert_eq!(frame.backfill_pending, cycle == 0);
         let allowed = frame.native_comparison_lease.as_ref().unwrap().allowed();
-        if completed == 0 {
-            assert!(!allowed, "disk rows alone cannot bootstrap");
+        match cycle {
+            0 => assert!(!allowed, "disk rows alone cannot bootstrap"),
+            1 => {
+                assert_ne!(
+                    previous_context.as_ref(),
+                    Some(&context),
+                    "the full-backfill to negotiated-window transition changes actual scan context"
+                );
+                assert!(
+                    !allowed,
+                    "a backfill-scope grant cannot cross into the normal window"
+                );
+            }
+            _ => {
+                assert_eq!(previous_context.as_ref(), Some(&context));
+                assert!(allowed,
+                    "real normal-scope native conjunction plus exact ACK/save must bootstrap the next real preparation");
+                assert_eq!(completed, 2);
+                bootstrap_observed = true;
+                drop(frame); // Abandoning a new preparation must revoke again.
+                break;
+            }
         }
-        if allowed {
-            assert!(completed > 0);
-            bootstrap_observed = true;
-            drop(frame); // Abandoning a new preparation must revoke again.
-            break;
-        }
+        previous_context = Some(context);
         let (preparation, index, scan) = loop {
             match frame.step() {
                 SourcePreparationStep::Pending(next) => frame = next,
@@ -574,6 +598,15 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
         };
         assert!(preparation.prepared_claude_evidence.is_some());
         assert!(scan.census_complete);
+        assert_eq!(
+            scan.scanned_file_count, 1,
+            "both bootstrap opportunities require a real native read"
+        );
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(
+            scan.snapshots[0].request_count,
+            if cycle == 0 { 2 } else { 3 }
+        );
         let index_path = preparation.index_path.clone();
         crate::agent_status_refresh::with_test_collection(collection(), || {
             finish_sync_source(
@@ -596,10 +629,38 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
         let saved = ScanIndex::load(&index_path).unwrap();
         assert!(saved.generation > 0);
         assert!(
+            daemon.native_comparison.retained_valid_for_test(),
+            "actual finish must retain its own native saved grant before any next-context check"
+        );
+        assert!(
             source_cadence_wait(SnapshotSource::ClaudeCode).is_some(),
             "successful real finish must still enforce ordinary cadence"
         );
         completed += 1;
+        if cycle == 0 {
+            // An ordinary new request, not a forced rearm or fake lease, gives
+            // the new normal scope its own complete native conjunction.
+            let transcript = fixture
+                .home
+                .join(".claude/projects/-synthetic-repo")
+                .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+            let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(177))
+                .replace_nanosecond(0)
+                .unwrap()
+                .format(&Rfc3339)
+                .unwrap();
+            let row = serde_json::json!({"timestamp":at,"type":"assistant",
+                "sessionId":IDENTITY_PIPELINE_ROOT,"requestId":"req_3",
+                "message":{"id":"m3","model":"claude-haiku-4-5",
+                    "usage":{"input_tokens":30,"output_tokens":3}}});
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(transcript)
+                .unwrap()
+                .write_all((row.to_string() + "\n").as_bytes())
+                .unwrap();
+            write_native_bootstrap_sidecars(&fixture, &support);
+        }
     }
     assert!(
         bootstrap_observed,
@@ -637,5 +698,5 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
         .unwrap()
         .allowed());
     drop(abandoned);
-    writeln!(std::io::stderr().lock(), "native_comparison_source_bootstrap: actual_prepare_step_finish=true completed_saved_cycles={completed} actual_wire_ack=true next_real_preparation_allowed=true abandoned_preparation_revokes=true test_only_due_cadence_slot=true ordinary_post_finish_wait_verified=true actual_positive_retained_layout_unproved=true").unwrap();
+    writeln!(std::io::stderr().lock(), "native_comparison_source_bootstrap: actual_prepare_step_finish=true completed_saved_cycles={completed} actual_wire_ack=true next_real_preparation_allowed=true abandoned_preparation_revokes=true test_only_due_cadence_slot=true ordinary_post_finish_wait_verified=true backfill_to_normal_scope_revokes=true new_request_native_conjunction=true actual_positive_retained_layout_unproved=true").unwrap();
 }

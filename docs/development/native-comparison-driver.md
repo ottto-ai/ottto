@@ -430,3 +430,22 @@ finish to impose its ordinary wait before that test-only reset. The loopback
 agent-status response also uses its proper numeric accepted count and source
 list. No production cadence, lifecycle, permission, format or budget changes.
 The corrected head requires its own hosted validation.
+
+
+The cadence-isolated candidate `53909ba0` (CI `38953076748`) passed
+compilation and Clippy: 2,935 service tests passed, one failed, 24 ignored.
+All 40 other native-comparison and five budget tests passed. The missing-pair
+control now passes. Bootstrap remains unaccepted: the first actual native
+conjunction/ACK/save completed, but five later quiet scans did not authorize.
+
+The fixture crossed the initial 730-day backfill scope into the negotiated
+183-day normal scope. That changes the actual traversal context, which must
+revoke the previous grant. The corrected fixture explicitly checks that
+rejection, appends an ordinary synthetic request with matching paired rows,
+and requires a second native conjunction/ACK/save in the stable normal scope.
+Only its next real preparation may authorize; abandonment must revoke again.
+A read-only test accessor checks that each actual finish retained its own
+grant before any subsequent context check. This exposes a separate bootstrap
+failure if one remains. No production context guard, cadence, permission,
+layout or budget changes. These revised assertions require hosted validation;
+they establish no resource savings or installed performance acceptance.

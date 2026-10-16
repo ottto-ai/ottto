@@ -67,6 +67,11 @@ impl Lifecycle {
     }
 
     #[cfg(test)]
+    pub(crate) fn retained_valid_for_test(&self) -> bool {
+        self.state.lock().is_ok_and(|state| state.valid)
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_state_locked_for_test(&self, check: impl FnOnce()) {
         let _state = self.state.lock().expect("synthetic lifecycle lock");
         check();
