@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 666,
-  "content_sha256": "f18e4355e76eb624c7d200b4085cdca05778eb241817a4be84d4dd4a88de1ffb",
+  "content_sha256": "2c4a89e4a3bd8a81ccbab4e66674a9b3e1b92acb455ea73b35603ccb5cafa8d2",
   "files": [
     {
       "executable": false,
@@ -1217,8 +1217,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/p12_pipeline_original_tests.rs",
-      "sha256": "1227c8812b4f1a446adae878188a35443ade823a5423947b8a41b6e15de6f6ad",
-      "size_bytes": 32372
+      "sha256": "e57bd19afd44e6a6aeb27d02fcaaa13be773a72a5de07301d0e6b4fa7501b0bd",
+      "size_bytes": 32543
     },
     {
       "executable": false,
@@ -1560,8 +1560,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/provider-envelope-p12-oracles.md",
-      "sha256": "a70e46914c07dbb4578b47307437bc1b6b072a584081a63c883287e1a62d56f7",
-      "size_bytes": 5127
+      "sha256": "889d5c12e2435a955f6453dbb62bdf66bb0e83714a9d6dd506ec2d337108e33b",
+      "size_bytes": 5160
     },
     {
       "executable": false,
@@ -4665,7 +4665,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-16T13:16:24+00:00",
+  "generated_at": "2026-10-16T13:20:24+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 667,
   "public_roots": [

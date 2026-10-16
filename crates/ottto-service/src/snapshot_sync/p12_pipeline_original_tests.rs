@@ -527,7 +527,8 @@ impl RearmFixture {
                 .claude_usage_family_witness_digest_for_test(REARM_ROOT),
             "family_retry_pending_bound": last
                 .index
-                .bound_retry_pending_claude_authority_for_test(REARM_ROOT),
+                .claude_authority_record_for_test(REARM_ROOT)
+                .is_some_and(|record| !record.terminal && record.bound_to_retained_witness),
             "census_complete": last.scan.census_complete,
             "fully_settled": last.fully_settled,
         });
@@ -791,7 +792,6 @@ fn assert_late_import_checks_settled_request_owners(copied: bool) {
     }
 }
 
-
 #[test]
 #[ignore = "P12: needs full qualified two-phase driver; original expectations preserved"]
 #[serial(source_manifests)]
@@ -801,19 +801,35 @@ fn novel_import_recovers_after_owner_coverage_then_stops_reading() {
 }
 
 fn observe_base_prelude(experimental_base_exit: bool) {
-    let _scope = experimental_base_exit.then(crate::snapshots::envelope_selection_experiment::Scope::restart);
+    let _scope = experimental_base_exit
+        .then(crate::snapshots::envelope_selection_experiment::Scope::restart);
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = RearmFixture::new("p12-novel-import-prelude");
     let established = fixture.establish();
     let quiet = fixture.generation(10);
-    assert_eq!(rearm_reads(&quiet), rearm_family_sessions().len(), "base re-reads all three members, not the original optimized zero-read requirement");
-    assert_eq!(RearmFixture::family_heads(&quiet.last().unwrap().index), established.heads);
-    let mode = if experimental_base_exit { "experimental_base_exit_no_reuse" } else { "base_control" };
+    assert_eq!(
+        rearm_reads(&quiet),
+        rearm_family_sessions().len(),
+        "base re-reads all three members, not the original optimized zero-read requirement"
+    );
+    assert_eq!(
+        RearmFixture::family_heads(&quiet.last().unwrap().index),
+        established.heads
+    );
+    let mode = if experimental_base_exit {
+        "experimental_base_exit_no_reuse"
+    } else {
+        "base_control"
+    };
     writeln!(std::io::stderr().lock(), "p12_oracle: name=novel_import_recovers_after_owner_coverage_then_stops_reading mode={mode} status=BLOCKED_OPTIMIZED_PRELUDE original_expected_reads=0 observed_reads={} original_oracle_passed=false downstream_assertions_executed=false", rearm_reads(&quiet)).unwrap();
 }
 #[test]
 #[serial(source_manifests)]
-fn p12_novel_import_base_control_reveals_unmet_original_prelude() { observe_base_prelude(false); }
+fn p12_novel_import_base_control_reveals_unmet_original_prelude() {
+    observe_base_prelude(false);
+}
 #[test]
 #[serial(source_manifests)]
-fn p12_novel_import_experiment_base_exit_reveals_unmet_original_prelude() { observe_base_prelude(true); }
+fn p12_novel_import_experiment_base_exit_reveals_unmet_original_prelude() {
+    observe_base_prelude(true);
+}

@@ -24,7 +24,7 @@ The complete original bodies of `member_change_after_unchanged_proof_fails_close
 
 Separate characterization controls observe the real opposite base behavior: the stable terminal proof clears the parent revision, and the stable family still reads its three members. These controls do **not** count as the original oracles passing; their receipts say `BLOCKED_OPTIMIZED_PRELUDE`, `original_oracle_passed=false`, and `downstream_assertions_executed=false`. If an earlier or different invariant fails, the characterization fails normally.
 
-The novel-import helper includes one independently evidenced fixture repair: an omitted empty duplicate map is only unwrapped in the copied-request branch; the novel branch still requires the map to be absent. Original oracle bodies and semantic assertions are unchanged. The port adapts the current optional correction-scan checkpoint argument and removes unused fixture fields/methods; it introduces no production behavior.
+The novel-import helper includes one independently evidenced fixture repair: an omitted empty duplicate map is only unwrapped in the copied-request branch; the novel branch still requires the map to be absent. Original oracle bodies and semantic assertions are unchanged. The port adapts the current optional correction-scan checkpoint argument and retry-record inspection API, and removes unused fixture fields/methods; it introduces no production behavior.
 
 ## Missing integration, not a weakened assertion
 
