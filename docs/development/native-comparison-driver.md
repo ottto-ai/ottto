@@ -310,3 +310,28 @@ Q5 test now expects zero sibling negative certificates after the actual parse,
 while still requiring its exact prior to work. The two original optimized
 oracles are unchanged. Cross-page event retention and the rest of the window
 revocations remain unwired; this component does not establish their acceptance.
+
+## Shared allowance for future retained certificates
+
+The rotation now has optional owner hooks for graphs retained outside every
+moving or parked frame. Owners without a carry graph report zero. Rotation
+deducts queue capacity, parked frames and external retention from its existing
+single allowance before parking; it also checks retention after finish and on
+entry to the next cycle. A graph moved into a frame must be charged by the
+frame alone. Moving it back to process retention does not create another
+allowance, and a finish must account for siblings already parked.
+
+An unknown or refused charge invokes whole-window and permit discard, including
+revocation tombstones. Rotation rechecks once; persistent unknown continues the
+same frame serially, without restarting a source. Queue charge overflow or an
+insufficient total allowance refuses optional retention/parking. No budget,
+compiler allowlist, requested-layout estimator or mutable shared-graph sizing
+rule is changed. Concrete owners must use the existing measurement gate.
+
+Five synthetic tests of the actual rotation exercise budget equality/overflow,
+already parked siblings, a single moved allocation through frame/finish/next
+cycle, refused/unknown accounting without loops, and failed-finish cleanup.
+Their declared costs test arithmetic and ownership transfer, not compiler
+layout or RSS. They require hosted CI. The concrete lifecycle certificate graph
+and its owner hooks remain unwired; these tests do not prove actual certificate
+carry, complete root revocation, original optimized oracles or resource savings.
