@@ -25,6 +25,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
 pub(crate) mod cache_observations;
+#[allow(dead_code)] // Containment selection/checkpoint wiring is not active yet.
+mod claude_copy_containment;
 pub(crate) mod claude_request_accounts;
 pub(crate) mod claude_request_identity;
 #[cfg(test)]
