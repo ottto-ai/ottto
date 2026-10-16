@@ -223,3 +223,8 @@ impl Drop for TestScope {
         ENABLED.with(|enabled| enabled.set(self.0));
     }
 }
+
+crate::heap_layout_bound::fields!(NormalSkip; root, member, revision, census_window_end, upload_context);
+crate::heap_layout_bound::fields!(NativePhase; paused, prepared, skips);
+crate::heap_layout_bound::fields!(FrozenFamily; family, certified);
+crate::heap_layout_bound::fields!(Qualification; families);

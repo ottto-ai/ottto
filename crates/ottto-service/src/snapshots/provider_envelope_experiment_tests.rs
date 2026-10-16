@@ -1147,7 +1147,7 @@ fn native_preparation_pair_roundtrip(replace: bool) {
     let support = crate::test_scratch::ScratchDir::new("native-preparation-pairs");
     write_native_preparation_pair(&support, &fixture.parent, &fixture.api, &fixture.trace);
     crate::claude_local_otel::reset_evidence_read_counts_for_test();
-    let (api, trace, healthy) = crate::snapshot_sync::prepared_claude_pair_for_test(
+    let (api, trace, healthy, permissive_rows) = crate::snapshot_sync::prepared_claude_pair_for_test(
         &support,
         &[],
         &fixture.index,
@@ -1166,6 +1166,7 @@ fn native_preparation_pair_roundtrip(replace: bool) {
     assert!(healthy);
     assert!(api.health.is_complete() && trace.is_complete());
     let rows = if replace { 6 } else { 5 };
+    assert_eq!(permissive_rows, rows, "effort fold must also receive current rows after the pause");
     assert_eq!(api.evidence[&fixture.parent].len(), rows);
     assert_eq!(trace.evidence[&fixture.parent].len(), rows);
     let reads = if replace { 2 } else { 1 };

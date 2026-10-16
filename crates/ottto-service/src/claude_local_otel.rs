@@ -634,6 +634,19 @@ fn api_file_generation(metadata: &fs::Metadata) -> Option<ApiFileGeneration> {
 }
 
 impl ClaudeApiEvidenceRead {
+    pub(crate) fn permissive_readset_is_current(&self, support_dir: &Path) -> bool {
+        self.reads.iter().all(|(root, witness)| {
+            if witness.generation.is_some() {
+                return self.strict_generation_matches(support_dir, root);
+            }
+            // A witnessed absence contributes no effort rows. Reappearance,
+            // unreadability or an incomplete nonempty read requires base load.
+            witness.health.missing_files == 1
+                && fs::metadata(evidence_path(support_dir, root))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        })
+    }
+
     pub(crate) fn load(
         support_dir: &Path,
         session_ids: impl IntoIterator<Item = String>,
@@ -702,7 +715,9 @@ impl ClaudeApiEvidenceRead {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ClaudeTraceReadGeneration(ApiFileGeneration);
+pub(crate) struct ClaudeTraceReadGeneration {
+    opened: ApiFileGeneration,
+}
 
 pub(crate) fn claude_trace_read_generation(
     support_dir: &Path,
@@ -711,7 +726,7 @@ pub(crate) fn claude_trace_read_generation(
     fs::metadata(trace_evidence_path(support_dir, session_id))
         .ok()
         .and_then(|metadata| api_file_generation(&metadata))
-        .map(ClaudeTraceReadGeneration)
+        .map(|opened| ClaudeTraceReadGeneration { opened })
 }
 
 pub fn load_claude_effort_evidence(
@@ -3258,5 +3273,37 @@ mod tests {
         assert_eq!(first_report.evidence["sess-mixed"], rows);
         fs::remove_dir_all(first).unwrap();
         fs::remove_dir_all(second).unwrap();
+    }
+}
+
+crate::heap_layout_bound::fields!(ClaudeApiEvidenceRead; evidence, reads);
+crate::heap_layout_bound::fields!(ApiReadWitness; health, generation);
+crate::heap_layout_bound::fields!(ApiFileGeneration; device, inode, bytes, modified, changed);
+crate::heap_layout_bound::fields!(ClaudeTraceReadGeneration; opened);
+crate::heap_layout_bound::fields!(ClaudeLocalOtelLoadHealth; missing_files, malformed_lines, unreadable_lines, oversized_files, invalid_session_rows, missing_request_ids, conflicting_request_ids);
+crate::heap_layout_bound::fields!(ClaudeLocalOtelEvidence; capture_revision, fingerprint, session_id, request_id, client_request_id, observed_at, model, effort, query_source, speed, cost_usd_micros, event_sequence, app_version, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, request_count, account_identity_checked, account_identifier_hash, request_identity);
+crate::heap_layout_bound::fields!(ClaudeRequestIdentityEvidence; identity_hash_scheme, account, organization, disposition);
+crate::heap_layout_bound::fields!(ClaudeIdentityAttributeEvidence; origin, disposition, resource_hash, log_record_hash);
+crate::heap_layout_bound::fields!(ClaudeTraceOwnershipEvidence; capture_revision, fingerprint, session_id, request_id, client_request_id, agent_id, parent_agent_id, workflow_run_id, observed_at);
+crate::heap_layout_bound::fields!(ClaudeTraceOwnershipLoadReport; evidence, missing_files, malformed_lines, unreadable_lines, oversized_files, invalid_session_rows, missing_request_ids, conflicting_request_ids);
+
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeIdentityDisposition {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Missing | Self::Invalid | Self::Conflict | Self::Complete => counter.add(0),
+        }
+    }
+}
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeIdentityAttributeOrigin {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        match self {
+            Self::Missing | Self::Resource | Self::LogRecord | Self::ResourceAndLogRecord => {
+                counter.add(0)
+            }
+        }
     }
 }

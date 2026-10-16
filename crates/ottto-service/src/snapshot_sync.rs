@@ -5157,6 +5157,7 @@ struct PreparedTraceRead {
 /// Preflight borrows rows; finish consumes them after the original effort fold.
 /// A changed/unknown opened generation always falls back to the existing load.
 struct PreparedClaudeLocalEvidence {
+    sessions: BTreeSet<String>,
     api: crate::claude_local_otel::ClaudeApiEvidenceRead,
     api_failed: bool,
     trace_rows: BTreeMap<String, Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>>,
@@ -5170,7 +5171,8 @@ impl PreparedClaudeLocalEvidence {
             .into_iter()
             .chain(crate::snapshots::claude_pending_family_session_ids(index))
             .collect::<BTreeSet<_>>();
-        let loaded = crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, sessions);
+        let loaded =
+            crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, sessions.clone());
         let api_failed = loaded.is_err();
         let api = loaded.unwrap_or_default();
         let roots = claude_evidence_root_session_ids(native)
@@ -5214,6 +5216,7 @@ impl PreparedClaudeLocalEvidence {
             traces.insert(root, PreparedTraceRead { generation, report });
         }
         Self {
+            sessions,
             api,
             api_failed,
             trace_rows,
@@ -5230,9 +5233,17 @@ impl PreparedClaudeLocalEvidence {
         }
     }
 
-    fn take_api(&mut self) -> Result<crate::claude_local_otel::ClaudeApiEvidenceRead> {
-        if self.api_failed {
-            return Err(anyhow!("prepared API evidence unavailable"));
+    fn take_api(
+        &mut self,
+        support_dir: &Path,
+    ) -> Result<crate::claude_local_otel::ClaudeApiEvidenceRead> {
+        if self.api_failed || !self.api.permissive_readset_is_current(support_dir) {
+            // Even permissive effort enrichment must not consume a stale
+            // preflight view after a moving native continuation yields.
+            return crate::claude_local_otel::ClaudeApiEvidenceRead::load(
+                support_dir,
+                self.sessions.clone(),
+            );
         }
         Ok(std::mem::take(&mut self.api))
     }
@@ -5272,15 +5283,18 @@ pub(crate) fn prepared_claude_pair_for_test(
     crate::claude_local_otel::ClaudeLocalOtelLoadReport,
     crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
     bool,
+    usize,
 ) {
     let mut prepared = PreparedClaudeLocalEvidence::load(support_dir, native, index);
     let healthy = prepared.rows().healthy_roots.contains(root);
     after_load();
-    let mut api = prepared.take_api().expect("synthetic API read");
+    let mut api = prepared.take_api(support_dir).expect("synthetic API read");
+    let permissive_rows = api.evidence.get(root).map_or(0, Vec::len);
     (
         api.take_strict_report(support_dir, root),
         prepared.take_trace(support_dir, root),
         healthy,
+        permissive_rows,
     )
 }
 
@@ -5347,7 +5361,7 @@ fn apply_claude_local_evidence_to_scan_with_prepared(
     };
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
     let api_load = match prepared.as_mut() {
-        Some(read) => read.take_api(),
+        Some(read) => read.take_api(support_dir),
         None => crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, session_ids),
     };
     match api_load {
@@ -18427,7 +18441,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; prepared_claude_evidence, native_comparison_qualification, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries);
 
@@ -18438,3 +18452,6 @@ crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint,
 mod h357_ack_tests;
 
 crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason);
+
+crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
+crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
