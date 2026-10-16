@@ -4709,8 +4709,22 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                     !request_hashes.is_disjoint(&changed_duplicate_request_hashes)
                 });
             if full_rearm
-                || (proven.contains_key(&root_session_id)
-                    && !current_ids.contains(source_session_id.as_str()))
+                || {
+                    let proof_rearm = proven.contains_key(&root_session_id)
+                        && !current_ids.contains(source_session_id.as_str());
+                    #[cfg(test)]
+                    {
+                        proof_rearm
+                            && !envelope_selection_experiment::suppress_certified_negative_rearm(
+                                &root_session_id,
+                                index_key,
+                            )
+                    }
+                    #[cfg(not(test))]
+                    {
+                        proof_rearm
+                    }
+                }
                 || invalidated_witness_roots.contains(&root_session_id)
                 || changed_duplicate_owners.contains(&duplicate_owner)
                 || current_member_owns_changed_request
@@ -11905,6 +11919,16 @@ impl OwnedSourceScan {
         let hinted_budget = selection_limit
             .min(MAX_WATCHER_HINTED_FILES_PER_TICK)
             .saturating_sub(usize::from(ordinary_census_pending && file_limit > 0));
+        // Nonshipping candidate: exercise target priority at the actual
+        // selection boundary, before audits, with the unchanged page cap.
+        #[cfg(test)]
+        envelope_selection_experiment::before_audit_selection(
+            source,
+            &mut traversal.pending_candidates,
+            &mut pending_paths,
+            &mut index.files,
+            selection_limit,
+        );
         let audit_now = sampled_scan::now_seconds();
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal.pending_candidates.iter().position(|candidate| {
@@ -25287,6 +25311,11 @@ pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<P
 }
 
 #[cfg(test)]
+pub(crate) mod envelope_selection_experiment {
+    include!("snapshots/envelope_selection_experiment.rs");
+}
+
+#[cfg(test)]
 mod tests {
     include!("snapshots/claude_request_account_tests.rs");
     mod claude_request_identity_tests {
@@ -25295,6 +25324,13 @@ mod tests {
     mod census_convergence_tests {
         include!("snapshots/census_convergence_tests.rs");
     }
+    mod p12_base_exit_tests {
+        include!("snapshots/p12_base_exit_tests.rs");
+    }
+    mod p12_usage_original_tests {
+        include!("snapshots/p12_usage_original_tests.rs");
+    }
+
     mod giant_row_measurement_tests {
         include!("snapshots/giant_row_measurement_tests.rs");
     }
