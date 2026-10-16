@@ -45904,8 +45904,7 @@ mod tests {
             .insert(local_index_key(&path), entry);
         let restored: ScanIndex =
             serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
-        let metadata = ClaudeTitleMetadata::from_durable_index(&restored, false);
-        metadata
+        ClaudeTitleMetadata::from_durable_index(&restored, false)
     }
 
     fn claude_original_carrier_missing_metadata() -> ClaudeTitleMetadata {
