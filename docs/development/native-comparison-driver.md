@@ -35,10 +35,10 @@ coverage, settled body, or authorization to skip a later read.
 
 ## Remaining integration
 
-The initial qualification is deliberately discarded before finish. The candidate
-still needs actual same-census targeted acquisition under the existing budgets,
-bootstrap from a complete native conjunction plus durable save, negative-only
-target intersection, pre-offer B/C withholding when comparison cannot finish,
+The initial qualification is deliberately discarded before finish. The lifecycle
+bootstrap component below is implemented but requires its own hosted acceptance.
+The candidate still needs actual same-census targeted acquisition under the
+existing budgets, negative-only target intersection, pre-offer B/C withholding when comparison cannot finish,
 atomic selected-state restore/rearm/save, and one authoritative final fold.
 Revision/context/row changes during that continuation must revoke eligibility.
 No target selection or performance benefit is claimed by this checkpoint.
@@ -54,3 +54,21 @@ No schema, wire/ACK contract, persisted metadata, cache cap, retry cap, account
 binding or hold policy is changed. Strict review and installed resource and
 interaction acceptance remain separate, unperformed gates. This draft is not
 ready for intake, merge or release.
+
+## Lifecycle continuation
+
+The next inactive source component stores bootstrap in the daemon lifecycle,
+shared by its clones. It is absent from disk and from the transcript cache.
+Preparation captures an error-revoking lease before fallible work, then binds a
+hash of destination, account witness, frozen root/upload context, replay and
+capture mode. Restart, unknown/context change, concurrent generation change or
+unfinished drop leaves the next cycle on base. An index loaded from disk does
+not mint permission.
+
+Only the actual complete native conjunction receipt can be noted after the
+normal selected-index save; any later finish failure revokes it. A clean complete
+finish may retain an already valid lease. These internal gates do not themselves
+activate envelopes or suppress rearming. New lifecycle tests exercise real native
+collection/fold and an actual index save, then context/restart/drop and a real
+failed index CAS. Their current head needs its own hosted validation; the prior
+first-checkpoint CI is not lifecycle-test acceptance.

@@ -11825,6 +11825,19 @@ impl OwnedSourceScan {
         self.claude_effort_support_dir.as_deref()
     }
 
+    pub(crate) fn native_comparison_context(&self) -> Option<&str> {
+        self.index
+            .traversal
+            .as_ref()
+            .map(|traversal| traversal.context_fingerprint.as_str())
+    }
+
+    pub(crate) fn resume_native_comparison_base(&mut self) {
+        if let Some(phase) = self.native_comparison.as_mut() {
+            phase.resume();
+        }
+    }
+
     pub(crate) fn disable_native_comparison(&mut self) {
         self.native_comparison = None;
     }

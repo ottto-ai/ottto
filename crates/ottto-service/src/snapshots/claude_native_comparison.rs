@@ -1,6 +1,17 @@
 //! Private, default-inactive native comparison preparation. Nothing here is
 //! ownership, coverage, a settled body, or permission to suppress a rearm.
 use super::*;
+pub(crate) mod lifecycle;
+
+pub(crate) fn actual_native_conjunction(disposition: &ClaudeUsageAuthorityDisposition) -> bool {
+    let census = &disposition.duplicate_census;
+    census.census_complete
+        && census.coverage_complete
+        && !census.census_invalid
+        && !census.fence_after
+        && census.pending_occurrence_count > 0
+        && disposition.transcript_ownership_complete
+}
 
 pub(crate) struct PairedRows<'a> {
     pub(crate) api: &'a BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,

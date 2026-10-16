@@ -3420,6 +3420,7 @@ fn persist_machine_icon_at(path: &Path, response: &AgentStatusSnapshotUploadResp
 // Preparation stays owned by the existing cycle. No token/report lease or
 // partially finalized body crosses a collection step.
 struct SourcePreparation {
+    native_comparison_lease: Option<crate::snapshots::claude_native_comparison::lifecycle::Lease>,
     prepared_claude_evidence: Option<PreparedClaudeLocalEvidence>,
     native_comparison_qualification:
         Option<crate::snapshots::claude_native_comparison::Qualification>,
@@ -3464,7 +3465,16 @@ impl SourcePreparation {
             if let Some(support_dir) = state.native_comparison_support_dir() {
                 let (index, native) = state.native_comparison_inputs();
                 let evidence = PreparedClaudeLocalEvidence::load(support_dir, native, index);
-                let qualification = state.prepare_native_comparison(evidence.rows());
+                let qualification = if self
+                    .native_comparison_lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.allowed())
+                {
+                    state.prepare_native_comparison(evidence.rows())
+                } else {
+                    state.resume_native_comparison_base();
+                    crate::snapshots::claude_native_comparison::Qualification::default()
+                };
                 // Preparation is not an ownership/bootstrap/reuse decision.
                 // Keep the original scanner alive until continuation finishes.
                 let _certified_members = qualification.certified_member_count();
@@ -3472,6 +3482,9 @@ impl SourcePreparation {
                 self.native_comparison_qualification = Some(qualification);
             } else {
                 state.disable_native_comparison();
+                if let Some(lease) = self.native_comparison_lease.as_mut() {
+                    lease.revoke();
+                }
             }
             self.scan = Some(state);
             return SourcePreparationStep::Pending(self);
@@ -3519,6 +3532,11 @@ fn prepare_sync_source(
     account_witness: [u8; 32],
     retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
+    // Capture before any fallible provider/destination/root work. Dropping an
+    // unfinished frame or returning early revokes reuse for the next cycle.
+    let mut native_comparison_lease = (source == SnapshotSource::ClaudeCode
+        && crate::snapshots::claude_native_comparison::enabled())
+    .then(|| daemon.native_comparison.begin());
     if let Some(remaining) = source_upload_backoff_remaining(source) {
         // The server asked for room and we said yes. Re-running the cycle now
         // would scan, re-derive and re-POST the same pages it just shed, which is
@@ -3911,7 +3929,16 @@ fn prepare_sync_source(
     if crate::snapshots::claude_native_comparison::enabled() {
         scan.enable_native_comparison();
     }
+    if let Some(lease) = native_comparison_lease.as_mut() {
+        if let Some(native_context) = scan.native_comparison_context() {
+            let scope = format!("native_comparison:v1:{account_witness:?}:{upload_destination_namespace}:{native_context}:{replay_generation}:{request_identity_capture}:{context_curve_enabled}");
+            lease.bind(format!("{:x}", Sha256::digest(scope.as_bytes())));
+        } else {
+            lease.revoke();
+        }
+    }
     Ok(Some(SourcePreparation {
+        native_comparison_lease,
         prepared_claude_evidence: None,
         native_comparison_qualification: None,
         retry_authority,
@@ -4005,6 +4032,7 @@ fn finish_sync_source(
     retry: &mut live_snapshot_retry::LiveRetryOwner,
 ) -> Result<()> {
     let SourcePreparation {
+        mut native_comparison_lease,
         prepared_claude_evidence,
         native_comparison_qualification,
         retry_authority,
@@ -4077,6 +4105,7 @@ fn finish_sync_source(
     // labels on the wire.
     let mut claude_authority_disposition =
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+    let mut actual_native_conjunction = false;
     if source == SnapshotSource::ClaudeCode {
         let evidence_started = Instant::now();
         let (disposition, census_withheld, stats) =
@@ -4093,6 +4122,10 @@ fn finish_sync_source(
                 evidence_started.elapsed().as_millis()
             );
         }
+        actual_native_conjunction =
+            crate::snapshots::claude_native_comparison::actual_native_conjunction(&disposition)
+                && !census_withheld
+                && scan_result.census_complete;
         claude_authority_disposition = disposition;
         if census_withheld {
             backfill_succeeded = false;
@@ -4903,6 +4936,11 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    if let Some(lease) = native_comparison_lease.as_mut() {
+        lease.note_native_save(
+            actual_native_conjunction && scan_result.census_complete && upload_fully_settled,
+        );
+    }
     // A completed cycle is what moves the tier: uploads keep a source warm, a
     // quiet cycle lets it fall to idle and then cold. A conflict pass has still
     // durably committed its accepted siblings, but remains a source failure so
@@ -5022,6 +5060,14 @@ fn finish_sync_source(
             state: CollectorState::Success,
         },
     )?;
+    if let Some(lease) = native_comparison_lease {
+        lease.finish(
+            scan_result.census_complete
+                && upload_fully_settled
+                && !claude_authority_disposition.duplicate_census.census_invalid
+                && !claude_authority_disposition.duplicate_census.fence_after,
+        );
+    }
     Ok(())
 }
 
@@ -18441,7 +18487,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; prepared_claude_evidence, native_comparison_qualification, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_lease, prepared_claude_evidence, native_comparison_qualification, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries);
 

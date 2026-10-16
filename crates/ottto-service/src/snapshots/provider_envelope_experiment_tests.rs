@@ -953,6 +953,7 @@ fn envelope_experiment_disabled_family_bypasses_actual_rearm_suppression_gate() 
 // Carried from #587; the tests below exercise the new moving preparation seam,
 // not the synthetic permit/rearm controls above. No reuse is activated.
 struct NativePreparationFixture {
+    native_conjunction: bool,
     dir: PathBuf,
     parent: String,
     index: ScanIndex,
@@ -979,7 +980,7 @@ impl NativePreparationFixture {
         let (mut index, mut scan) = SelectionFixture::run(native);
         assert!(scan.census_complete);
         let (api, trace) = reports(&parent, false);
-        apply_claude_reported_usage_with_index(
+        let disposition = apply_claude_reported_usage_with_index(
             &mut scan.snapshots,
             &api,
             &trace,
@@ -987,11 +988,14 @@ impl NativePreparationFixture {
             true,
             WINDOW,
         );
+        let native_conjunction = claude_native_comparison::actual_native_conjunction(&disposition);
+        assert!(native_conjunction);
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
         index.upload_context_fingerprint = Some("native-preparation-test".into());
         index.active_upload_context_fingerprint = index.upload_context_fingerprint.clone();
         assert!(index.claude_usage_family_witnesses.contains_key(&parent));
         Self {
+            native_conjunction,
             dir,
             parent,
             index,
@@ -1147,26 +1151,30 @@ fn native_preparation_pair_roundtrip(replace: bool) {
     let support = crate::test_scratch::ScratchDir::new("native-preparation-pairs");
     write_native_preparation_pair(&support, &fixture.parent, &fixture.api, &fixture.trace);
     crate::claude_local_otel::reset_evidence_read_counts_for_test();
-    let (api, trace, healthy, permissive_rows) = crate::snapshot_sync::prepared_claude_pair_for_test(
-        &support,
-        &[],
-        &fixture.index,
-        &fixture.parent,
-        || {
-            assert_eq!(
-                crate::claude_local_otel::evidence_read_counts_for_test(),
-                (1, 1)
-            );
-            if replace {
-                let (api, trace) = reports(&fixture.parent, true);
-                write_native_preparation_pair(&support, &fixture.parent, &api, &trace);
-            }
-        },
-    );
+    let (api, trace, healthy, permissive_rows) =
+        crate::snapshot_sync::prepared_claude_pair_for_test(
+            &support,
+            &[],
+            &fixture.index,
+            &fixture.parent,
+            || {
+                assert_eq!(
+                    crate::claude_local_otel::evidence_read_counts_for_test(),
+                    (1, 1)
+                );
+                if replace {
+                    let (api, trace) = reports(&fixture.parent, true);
+                    write_native_preparation_pair(&support, &fixture.parent, &api, &trace);
+                }
+            },
+        );
     assert!(healthy);
     assert!(api.health.is_complete() && trace.is_complete());
     let rows = if replace { 6 } else { 5 };
-    assert_eq!(permissive_rows, rows, "effort fold must also receive current rows after the pause");
+    assert_eq!(
+        permissive_rows, rows,
+        "effort fold must also receive current rows after the pause"
+    );
     assert_eq!(api.evidence[&fixture.parent].len(), rows);
     assert_eq!(trace.evidence[&fixture.parent].len(), rows);
     let reads = if replace { 2 } else { 1 };
@@ -1185,4 +1193,67 @@ fn native_comparison_paired_rows_move_once_without_reloading_unchanged_files() {
 #[test]
 fn native_comparison_paired_rows_replaced_after_preflight_use_fresh_strict_load() {
     native_preparation_pair_roundtrip(true);
+}
+
+#[test]
+fn native_comparison_lifecycle_requires_native_save_and_revokes_after_drop_context_or_restart() {
+    let mut fixture = NativePreparationFixture::new();
+    let scratch = crate::test_scratch::ScratchDir::new("native-comparison-lifecycle");
+    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut first = owner.begin();
+    first.bind("synthetic-source-destination-context".into());
+    assert!(!first.allowed());
+    fixture.index.save(&scratch.join("index.json")).unwrap();
+    first.note_native_save(fixture.native_conjunction);
+    first.finish(true);
+    let mut next = owner.begin();
+    next.bind("synthetic-source-destination-context".into());
+    assert!(next.allowed());
+    next.finish(true);
+    let restarted = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let reloaded = ScanIndex::load(&scratch.join("index.json")).unwrap();
+    assert_eq!(reloaded.generation, fixture.index.generation);
+    let mut restart_lease = restarted.begin();
+    restart_lease.bind("synthetic-source-destination-context".into());
+    assert!(
+        !restart_lease.allowed(),
+        "retained index is not process bootstrap"
+    );
+    drop(restart_lease);
+    let mut changed = owner.begin();
+    changed.bind("different-source-destination-context".into());
+    assert!(!changed.allowed());
+    drop(changed);
+    let mut original = owner.begin();
+    original.bind("synthetic-source-destination-context".into());
+    assert!(
+        !original.allowed(),
+        "context rollback cannot revive a process grant"
+    );
+    writeln!(std::io::stderr().lock(), "native_comparison_lifecycle: actual_native_conjunction=true actual_index_save=true next_cycle_allowed=true retained_index_restart_base=true context_change_and_drop_revoke=true").unwrap();
+}
+
+#[test]
+fn native_comparison_lifecycle_failed_cas_never_mints_a_grant() {
+    let mut fixture = NativePreparationFixture::new();
+    let scratch = crate::test_scratch::ScratchDir::new("native-comparison-cas");
+    let path = scratch.join("index.json");
+    let mut stale = fixture.index.clone();
+    fixture.index.save(&path).unwrap();
+    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut failed = owner.begin();
+    failed.bind("synthetic-source-destination-context".into());
+    assert!(!failed.allowed());
+    let result = stale.save(&path);
+    assert!(result.is_err());
+    // Same ordering as finish: save failure exits before note_native_save.
+    drop(failed);
+    let mut next = owner.begin();
+    next.bind("synthetic-source-destination-context".into());
+    assert!(!next.allowed());
+    writeln!(
+        std::io::stderr().lock(),
+        "native_comparison_lifecycle: actual_failed_index_cas=true process_grant=false"
+    )
+    .unwrap();
 }
