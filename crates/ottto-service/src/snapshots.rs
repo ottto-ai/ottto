@@ -14208,6 +14208,11 @@ impl OwnedSourceScan {
                 }
                 CandidateDecision::ReconcileLegacy | CandidateDecision::Parse => {}
             }
+            if let Some(phase) = native_comparison.as_mut() {
+                // This is an actual native acquisition attempt, before parser
+                // construction can fail or complete with no emitted entity.
+                phase.record_parse_attempt(&candidate);
+            }
             scanned_file_count += 1;
             let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
             let previous_upload_body_witness = index.last_upload_body_witness(&candidate);

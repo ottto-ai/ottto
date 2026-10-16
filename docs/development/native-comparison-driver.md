@@ -266,8 +266,9 @@ The same census can span several source cycles. Its previously bootstrapped
 process permit may survive a known, fully settled bounded page only after that
 page's actual selected-index save and successful finish. An explicit ephemeral
 save marker is now required for both retention and bootstrap. The terminal
-native conjunction remains the only way to mint permission; a saved partial
-page or a clean boolean alone cannot mint or retain it.
+native conjunction remains the only way to mint permission. A saved partial
+page cannot mint permission; a clean boolean without a selected save cannot
+retain it.
 
 Read/parser/sidecar loss, an absent or mismatched partial traversal, unsettled
 upload history, an invalid census or a closed/overflowed fence rejects retention.
@@ -290,3 +291,22 @@ CI `38937669191`, passed all four checks: 2,917 service tests passed, zero faile
 target reads, one delta frontier, no repeated targets, generation/budget fallback
 and actual replacement rejection. This proof does not validate the new saved-page
 continuation or establish certificate carry, selected recovery or resource gains.
+
+## Actual parse revocation
+
+A family loses its negative Skip eligibility as soon as the scanner actually
+attempts a native parse of any member, before parser construction can fail or
+finish without a body. Certificates already recorded for siblings are removed;
+later sibling Skips on that page cannot revive them. This event is independent
+of the emitted native-body list. Exact pre-mutation Q5 validation for the parsed
+member remains separate and unchanged. Acquisition, folds, body bytes and the
+retained proof are untouched. The new event inventory is process-only and has
+exhaustive requested-layout accounting.
+
+Two new real-scanner regressions cover unchanged native reparses of either
+member, with sibling Skip visits on either side of the attempt, and a successful
+empty parse emitting no body. These tests require hosted validation. The older
+Q5 test now expects zero sibling negative certificates after the actual parse,
+while still requiring its exact prior to work. The two original optimized
+oracles are unchanged. Cross-page event retention and the rest of the window
+revocations remain unwired; this component does not establish their acceptance.

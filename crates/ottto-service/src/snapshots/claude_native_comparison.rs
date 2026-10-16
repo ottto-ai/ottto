@@ -151,11 +151,21 @@ pub(crate) struct NativePhase {
     prepared: bool,
     // At most the candidates selected under the existing native page limit.
     skips: BTreeMap<String, NormalSkip>,
+    // Eligibility is revoked by the actual parse attempt, including a parse
+    // that later fails or produces no body. Body lists cannot recover this.
+    parsed_roots: BTreeSet<String>,
     target_revisions: BTreeMap<String, String>,
     attempted_targets: BTreeSet<String>,
 }
 
 impl NativePhase {
+    pub(super) fn record_parse_attempt(&mut self, candidate: &CandidateFile) {
+        if let Some((root, _)) = claude_index_path_family_member(&candidate.path) {
+            self.skips.retain(|_, skip| skip.root != root);
+            self.parsed_roots.insert(root);
+        }
+    }
+
     pub(super) fn record_actual_skip(
         &mut self,
         index: &ScanIndex,
@@ -173,6 +183,7 @@ impl NativePhase {
         // canonical identity, sidecars and launcher context were prepared.
         // Held/empty/policy/legacy/terminal skips are not normal Skip evidence.
         if index.claude_usage_authority_quarantine.contains_key(&root)
+            || self.parsed_roots.contains(&root)
             || index.claude_account_deferred_holds.contains_key(&key)
             || index.confirmed_empty_files.contains(&key)
             || index.terminal_jsonl_dispositions.contains_key(&key)
@@ -333,6 +344,7 @@ impl NativePhase {
                 .iter()
                 .filter(|(key, skip)| {
                     skip.root == *root
+                        && !self.parsed_roots.contains(root)
                         && skip.census_window_end == census_window_end
                         && index.files.get(*key).is_some_and(|entry| {
                             entry.source_file_fingerprint == skip.revision
@@ -885,7 +897,7 @@ impl Drop for TestScope {
 }
 
 crate::heap_layout_bound::fields!(NormalSkip; root, member, revision, census_window_end, upload_context, candidate);
-crate::heap_layout_bound::fields!(NativePhase; paused, prepared, skips, target_revisions, attempted_targets);
+crate::heap_layout_bound::fields!(NativePhase; paused, prepared, skips, parsed_roots, target_revisions, attempted_targets);
 crate::heap_layout_bound::fields!(FrozenFamily; witness, assigned, certified, prior_native_revisions, paired_roots);
 crate::heap_layout_bound::fields!(Controller; qualification, required_roots, native_frontier, awaiting_targets, failed, acquisition);
 crate::heap_layout_bound::fields!(Qualification; families, envelope_roots, envelope_by_hash, pending, unknown_native_sources);

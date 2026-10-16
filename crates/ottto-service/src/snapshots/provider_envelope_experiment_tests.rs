@@ -1714,7 +1714,11 @@ fn native_comparison_q5_keeps_old_proof_and_checks_revision_and_occurrences() {
         trace: &fixture.trace.evidence,
         healthy_roots: &healthy,
     });
-    assert_eq!(qualification.certified_member_count(), 1);
+    assert_eq!(
+        qualification.certified_member_count(),
+        0,
+        "an actual family parse withdraws sibling negatives, not the exact Q5 native prior"
+    );
     assert!(qualification.new_native_hashes(&native).unwrap().is_empty());
     // Changing the live index proof after qualification cannot turn P_new into
     // the old prior. This immutable plan never consults the live proof map.
@@ -2353,4 +2357,85 @@ fn native_comparison_ambiguous_index_member_withdraws_frozen_family() {
     });
     assert_eq!(qualified.certified_member_count(), 0);
     assert!(state.snapshots.is_empty());
+}
+
+#[test]
+fn native_comparison_family_parse_withdraws_skips_before_and_after_attempt() {
+    for parse_child in [false, true] {
+        let mut fixture = NativePreparationFixture::new();
+        let path = if parse_child {
+            fixture
+                .dir
+                .join(&fixture.parent)
+                .join("subagents/agent-a4d1585d310070d0f.jsonl")
+        } else {
+            fixture.dir.join(format!("{}.jsonl", fixture.parent))
+        };
+        // Existing durable rearm debt forces a real unchanged native parse.
+        // No revision, request, occurrence or retained proof is fabricated.
+        fixture
+            .index
+            .files
+            .get_mut(&local_index_key(&path))
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        let mut state = fixture.paused();
+        assert_eq!(state.scanned_file_count, 1);
+        assert_eq!(state.snapshots.len(), 1);
+        let native_before = serde_json::to_vec(&state.snapshots).unwrap();
+        let proof_before = serde_json::to_vec(&state.index.claude_usage_family_witnesses).unwrap();
+        let healthy = BTreeSet::from([fixture.parent.clone()]);
+        let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+            api: &fixture.api.evidence,
+            trace: &fixture.trace.evidence,
+            healthy_roots: &healthy,
+        });
+        assert_eq!(qualification.certified_member_count(), 0);
+        assert!(
+            qualification
+                .new_native_hashes(&state.snapshots[0])
+                .unwrap()
+                .is_empty(),
+            "revoking negatives must preserve the independently verified pre-mutation Q5 prior"
+        );
+        assert_eq!(serde_json::to_vec(&state.snapshots).unwrap(), native_before);
+        assert_eq!(
+            serde_json::to_vec(&state.index.claude_usage_family_witnesses).unwrap(),
+            proof_before
+        );
+        writeln!(std::io::stderr().lock(), "native_comparison_parse_revocation: actual_unchanged_parse=1 parse_child={parse_child} sibling_negative_members=0 exact_q5_prior_retained=true native_and_proof_unchanged=true crosspage_carry_unwired=true").unwrap();
+    }
+}
+
+#[test]
+fn native_comparison_empty_parse_withdraws_sibling_without_native_body() {
+    let fixture = NativePreparationFixture::new();
+    let path = fixture.dir.join(format!("{}.jsonl", fixture.parent));
+    fs::write(&path, "").unwrap();
+    let mut state = fixture.paused();
+    assert_eq!(state.scanned_file_count, 1);
+    assert!(
+        state.snapshots.is_empty(),
+        "the actual parse emitted no body"
+    );
+    assert_eq!(state.pending_finalization.len(), 1);
+    assert!(state.pending_finalization[0].parse_complete);
+    let proof_before = serde_json::to_vec(&state.index.claude_usage_family_witnesses).unwrap();
+    let healthy = BTreeSet::from([fixture.parent.clone()]);
+    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+        api: &fixture.api.evidence,
+        trace: &fixture.trace.evidence,
+        healthy_roots: &healthy,
+    });
+    assert_eq!(
+        qualification.certified_member_count(),
+        0,
+        "absence of a native body cannot hide the family's actual parse"
+    );
+    assert_eq!(
+        serde_json::to_vec(&state.index.claude_usage_family_witnesses).unwrap(),
+        proof_before
+    );
+    writeln!(std::io::stderr().lock(), "native_comparison_parse_revocation: actual_empty_parse=1 native_bodies=0 sibling_negative_members=0 retained_proof_unchanged=true crosspage_carry_unwired=true").unwrap();
 }
