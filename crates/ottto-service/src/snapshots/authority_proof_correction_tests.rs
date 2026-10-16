@@ -1615,7 +1615,7 @@ fn terminal_refusal_requires_current_proof_revision_body_and_nonpartial_outcome(
         body_witness: body.clone(),
     };
     let scratch = crate::test_scratch::ScratchDir::new("apc-terminal-refusal");
-    let path = scratch.join("index.json");
+    let path = scratch.join("before-settlement.json");
     let mut before = base.clone();
     let before = apc_save_reload(&mut before, &path);
     assert_eq!(
@@ -1683,7 +1683,7 @@ fn terminal_refusal_requires_current_proof_revision_body_and_nonpartial_outcome(
             outside,
             "{case}: accepted/refusal/debt state unchanged"
         );
-        let loaded = apc_save_reload(&mut index, &path);
+        let loaded = apc_save_reload(&mut index, &scratch.join(format!("{case}.json")));
         assert_eq!(
             apc_owed(&loaded),
             Some(if case == "permanent" {
@@ -1719,7 +1719,14 @@ fn cutoff_only_completion_carries_its_selected_empty_facts_or_stays_owed() {
     };
     let cutoff_bytes = serde_json::to_vec(&cutoff).unwrap();
     for rollback in [false, true] {
-        let before = apc_granted();
+        let scratch = crate::test_scratch::ScratchDir::new("apc-cutoff-restart");
+        let path = scratch.join("index.json");
+        let mut durable_before = apc_granted();
+        let before = apc_save_reload(&mut durable_before, &path);
+        assert_eq!(
+            apc_owed(&before),
+            Some(BTreeSet::from([root.clone(), agent.clone()]))
+        );
         let mut index = before.clone();
         index.files.get_mut(&key).unwrap().source_file_fingerprint = revision.clone();
         let mut scan = apc_scan(true, vec![apc_pending(0, &revision, true, 1)]);
@@ -1757,14 +1764,6 @@ fn cutoff_only_completion_carries_its_selected_empty_facts_or_stays_owed() {
         index.settle_cutoff_claude_proof_corrections(&candidates);
         assert_eq!(apc_outside(&index), outside);
         assert_eq!(apc_frame(&index), frame);
-        let scratch = crate::test_scratch::ScratchDir::new("apc-cutoff-restart");
-        let path = scratch.join("index.json");
-        let mut durable_before = before;
-        let restarted_before = apc_save_reload(&mut durable_before, &path);
-        assert_eq!(
-            apc_owed(&restarted_before),
-            Some(BTreeSet::from([root.clone(), agent.clone()]))
-        );
         let loaded = apc_save_reload(&mut index, &path);
         assert_eq!(
             apc_owed(&loaded),

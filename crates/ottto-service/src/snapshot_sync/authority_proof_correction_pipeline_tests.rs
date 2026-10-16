@@ -614,7 +614,7 @@ impl ApcFixture {
                         retry_after: Some(Duration::from_secs(60)),
                     })),
                     ApcUpload::PermanentRejection | ApcUpload::RetryableRejection => {
-                        Ok(crate::snapshot_client::SnapshotBatchResponse {
+                        let response = crate::snapshot_client::SnapshotBatchResponse {
                             accepted: 0,
                             sessions_reconciled: 0,
                             session_ids: Vec::new(),
@@ -627,17 +627,39 @@ impl ApcFixture {
                             unchanged_entities: Vec::new(),
                             rejected_entities: items
                                 .iter()
+                                .filter(|_| upload == ApcUpload::PermanentRejection)
                                 .map(|item| crate::snapshot_client::SnapshotEntityRejection {
                                     source_session_id: item.source_session_id.clone(),
                                     snapshot_fingerprint: item.snapshot_fingerprint.clone(),
                                     reason: "invalid".to_string(),
                                     detail: "synthetic refusal".to_string(),
-                                    permanent: upload == ApcUpload::PermanentRejection,
+                                    permanent: true,
                                     occurrence_count: 1,
                                 })
                                 .collect(),
-                            conflict_entities: Vec::new(),
-                        })
+                            // Retryable outcomes use the canonical conflict contract;
+                            // permanent:false rejections fail the real ACK validator.
+                            conflict_entities: items
+                                .iter()
+                                .filter(|_| upload == ApcUpload::RetryableRejection)
+                                .map(|item| crate::snapshot_client::SnapshotEntityRef {
+                                    source_session_id: item.source_session_id.clone(),
+                                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                                    occurrence_count: 1,
+                                    body_witness_version: None,
+                                    body_witness_digest: None,
+                                    head_etag: None,
+                                    head_challenge: None,
+                                })
+                                .collect(),
+                        };
+                        response.validate_entity_ack_identities(items.iter().map(|item| {
+                            (
+                                item.source_session_id.as_str(),
+                                item.snapshot_fingerprint.as_str(),
+                            )
+                        }))?;
+                        Ok(response)
                     }
                 }
             },
