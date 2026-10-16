@@ -531,3 +531,282 @@ fn envelope_experiment_selected_restore_rearm_survives_reload_without_age_proof(
     // This receipt proves explicit queue priority and retry eligibility, not wall time.
     writeln!(std::io::stderr().lock(), "envelope_experiment_deferral: selected_old_b=true new_c_uncommitted=true durable_target_rearm=true explicit_durable_queue_priority=true deferral_age=unknown wall_completion=unknown").unwrap();
 }
+
+// Phase 2 uses actual constructor priority and the real locked partial-save
+// seam. Controls remain scoped/cfg(test); no shipping eligibility is added.
+struct SelectionFixture {
+    _scratch: crate::test_scratch::ScratchDir,
+    roots: [PathBuf; 1],
+    paths: [PathBuf; 4], // A, audit B, uncommitted C, A's subagent
+    index_path: PathBuf,
+    progress_path: PathBuf,
+    previous: ScanIndex,
+}
+impl SelectionFixture {
+    fn new() -> Self {
+        let scratch = crate::test_scratch::ScratchDir::new("envelope-selection-matrix");
+        let root = scratch.join("native");
+        fs::create_dir_all(&root).unwrap();
+        let a = "a1111111-1111-4111-8111-111111111111";
+        let sessions = [
+            a,
+            "b2222222-2222-4222-8222-222222222222",
+            "c3333333-3333-4333-8333-333333333333",
+            a,
+        ];
+        let paths = [
+            root.join(format!("{a}.jsonl")),
+            root.join(format!("{}.jsonl", sessions[1])),
+            root.join(format!("{}.jsonl", sessions[2])),
+            root.join(a).join("subagents/agent-comparison.jsonl"),
+        ];
+        let mut previous = ScanIndex {
+            accepted_snapshot_fingerprint_ledger_version: SNAPSHOT_ACCEPTED_LEDGER_VERSION,
+            ..Default::default()
+        };
+        for (slot, path) in paths.iter().enumerate() {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let agent = if slot == 3 {
+                "\"agentId\":\"comparison\",\"isSidechain\":true,"
+            } else {
+                ""
+            };
+            fs::write(path, format!("{{\"timestamp\":\"2026-08-02T07:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"{}\",{agent}\"requestId\":\"req_matrix_{slot}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n", sessions[slot])).unwrap();
+            if slot != 2 {
+                let body = format!("{slot:064x}");
+                index_file(
+                    &mut previous,
+                    &local_index_key(path),
+                    &hex64('a'),
+                    &body,
+                    WINDOW,
+                );
+                previous.accepted_snapshot_fingerprints.insert(body);
+            }
+        }
+        previous
+            .files
+            .get_mut(&local_index_key(&paths[1]))
+            .unwrap()
+            .set_unverified_deadline(1);
+        let index_path = scratch.join("index.json");
+        let progress_path = scratch.join("progress.json");
+        previous.save(&index_path).unwrap();
+        Self {
+            _scratch: scratch,
+            roots: [root],
+            paths,
+            index_path,
+            progress_path,
+            previous,
+        }
+    }
+    fn prepare(&self, index: ScanIndex, limit: usize) -> OwnedSourceScan {
+        OwnedSourceScan::new_with_identity_capture(
+            SnapshotSource::ClaudeCode,
+            &self.roots,
+            index,
+            WINDOW,
+            30,
+            limit,
+            false,
+            None,
+            &[],
+            false,
+            false,
+            false,
+        )
+    }
+    fn run(mut native: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
+        for _ in 0..1024 {
+            match native.step(None) {
+                OwnedSourceScanStep::Pending(next) => native = next,
+                OwnedSourceScanStep::Complete { index, scan } => return (index, scan),
+            }
+        }
+        panic!("bounded fixture native scan did not complete");
+    }
+    fn checkpoint(&self, index: &ScanIndex, scan: &SourceScanResult) -> ScanIndex {
+        crate::snapshot_sync::comparison_partial_checkpoint_for_test(
+            index,
+            &self.previous,
+            &scan.snapshots,
+            &self.index_path,
+            &self.progress_path,
+        )
+        .unwrap()
+    }
+}
+
+#[test]
+fn envelope_experiment_target_priority_precedes_actual_audit_selection() {
+    let fixture = SelectionFixture::new();
+    let base = fixture.prepare(fixture.previous.clone(), 1);
+    assert_eq!(base.identified_candidates[0].path, fixture.paths[1]);
+    let scope = envelope_selection_experiment::Scope::controlled();
+    scope.register("family", BTreeSet::from([fixture.paths[0].clone()]));
+    let candidate = fixture.prepare(fixture.previous.clone(), 1);
+    assert_eq!(candidate.identified_candidates.len(), 1);
+    assert_eq!(candidate.identified_candidates[0].path, fixture.paths[0]);
+    let (index, scan) = SelectionFixture::run(candidate);
+    assert_eq!(scan.scanned_file_count, 1);
+    assert_eq!(scan.snapshots.len(), 1);
+    assert!(
+        index.files[&local_index_key(&fixture.paths[1])]
+            .audit_requires_full(sampled_scan::now_seconds()),
+        "priority does not clear unrelated audit debt"
+    );
+    writeln!(std::io::stderr().lock(), "envelope_experiment_audit: base_selects_audit=true candidate_selects_target=true page_limit=1 audit_debt_preserved=true").unwrap();
+}
+
+#[test]
+fn envelope_experiment_oversized_family_exits_immediately_without_cap_increase() {
+    let fixture = SelectionFixture::new();
+    let scope = envelope_selection_experiment::Scope::controlled();
+    let paths = BTreeSet::from([fixture.paths[0].clone(), fixture.paths[3].clone()]);
+    scope.register("family", paths.clone());
+    let first = fixture.prepare(fixture.previous.clone(), 1);
+    assert!(!scope.allowed("family"));
+    assert_eq!(scope.counts().base_exits, 1);
+    assert_eq!(first.identified_candidates.len(), 1);
+    let (index, first_scan) = SelectionFixture::run(first);
+    let second = fixture.prepare(index, 1);
+    assert_eq!(second.identified_candidates.len(), 1);
+    let (_, second_scan) = SelectionFixture::run(second);
+    let members = first_scan
+        .snapshots
+        .iter()
+        .chain(&second_scan.snapshots)
+        .map(|item| item.source_session_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        members.len(),
+        2,
+        "native base spans pages under the unchanged file limit"
+    );
+    scope.register("family", paths);
+    assert!(
+        !scope.allowed("family"),
+        "new registration/proof cannot renew the disabled process family"
+    );
+    assert_eq!(scope.counts().base_exits, 1);
+    assert_eq!(scope.counts().successful_deferrals, 0);
+    writeln!(std::io::stderr().lock(), "envelope_experiment_oversized: family_members=2 page_limit=1 base_exits=1 native_pages=2 no_renewal=true").unwrap();
+}
+
+#[test]
+fn envelope_experiment_two_successful_deferrals_use_locked_shed_restore_then_disable() {
+    let fixture = SelectionFixture::new();
+    let scope = envelope_selection_experiment::Scope::controlled();
+    let target = BTreeSet::from([fixture.paths[0].clone()]);
+    scope.register("family", target.clone());
+    scope.withhold(BTreeSet::from([
+        local_index_key(&fixture.paths[1]),
+        local_index_key(&fixture.paths[2]),
+    ]));
+    let mut previous = fixture.previous.clone();
+    for attempt in 1..=2 {
+        let native = fixture.prepare(previous.clone(), 1);
+        assert_eq!(native.identified_candidates[0].path, fixture.paths[0]);
+        let (mut index, scan) = SelectionFixture::run(native);
+        assert_eq!(scan.scanned_file_count, 1);
+        scope.defer_after_native("family", &scan);
+        // Unaccepted current B/C replacements: no fake ACK/refusal/hold.
+        index_file(
+            &mut index,
+            &local_index_key(&fixture.paths[1]),
+            &hex64('d'),
+            &hex64('3'),
+            WINDOW,
+        );
+        index_file(
+            &mut index,
+            &local_index_key(&fixture.paths[2]),
+            &hex64('e'),
+            &hex64('4'),
+            WINDOW,
+        );
+        let saved = crate::snapshot_sync::comparison_partial_checkpoint_for_test(
+            &index,
+            &previous,
+            &scan.snapshots,
+            &fixture.index_path,
+            &fixture.progress_path,
+        )
+        .unwrap();
+        let loaded = ScanIndex::load(&fixture.index_path).unwrap();
+        let a = local_index_key(&fixture.paths[0]);
+        let b = local_index_key(&fixture.paths[1]);
+        let c = local_index_key(&fixture.paths[2]);
+        assert!(saved.files[&a].source_file_fingerprint.is_empty());
+        assert_eq!(
+            serde_json::to_vec(&loaded.files[&b]).unwrap(),
+            serde_json::to_vec(&previous.files[&b]).unwrap()
+        );
+        assert!(!loaded.files.contains_key(&c));
+        assert!(!loaded.confirmed_empty_files.contains(&c));
+        assert_eq!(
+            loaded.accepted_snapshot_fingerprints,
+            fixture.previous.accepted_snapshot_fingerprints
+        );
+        assert_eq!(scope.counts().successful_deferrals, attempt);
+        previous = loaded;
+    }
+    assert!(!scope.allowed("family"));
+    scope.register("family", target);
+    assert!(
+        !scope.allowed("family"),
+        "cannot reset the attempt bound with new proof/census registration"
+    );
+    assert_eq!(scope.counts().base_exits, 1);
+    drop(scope);
+    let restarted = envelope_selection_experiment::Scope::restart();
+    assert!(!restarted.allowed("family"));
+    let first_after_restart = fixture.prepare(previous, 1);
+    assert_eq!(
+        first_after_restart.identified_candidates[0].path,
+        fixture.paths[0]
+    );
+    let (_, scan) = SelectionFixture::run(first_after_restart);
+    assert_eq!(scan.scanned_file_count, 1);
+    assert_eq!(restarted.counts().unknown_age, 1);
+    writeln!(std::io::stderr().lock(), "envelope_experiment_attempts: successful_deferrals=2 base_exits=1 no_renewal=true locked_shed_restore=true restart_native_priority=true age_unknown_count=1").unwrap();
+}
+
+#[test]
+fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_rearm() {
+    let fixture = SelectionFixture::new();
+    let scope = envelope_selection_experiment::Scope::controlled();
+    scope.register("family", BTreeSet::from([fixture.paths[0].clone()]));
+    let native = fixture.prepare(fixture.previous.clone(), 1);
+    assert_eq!(native.identified_candidates[0].path, fixture.paths[0]);
+    let bytes = fs::read(&fixture.paths[0]).unwrap();
+    fs::remove_file(&fixture.paths[0]).unwrap(); // after frozen selection, before safe open
+    let (index, scan) = SelectionFixture::run(native);
+    assert!(scan.disappeared_file_count + scan.unreadable_path_count > 0);
+    scope.defer_after_native("family", &scan);
+    assert_eq!(scope.counts().unavailable, 1);
+    assert_eq!(scope.counts().successful_deferrals, 0);
+    assert!(
+        !scope.allowed("family"),
+        "fallback revokes reuse, never converts failed read to success"
+    );
+    let saved = fixture.checkpoint(&index, &scan);
+    assert!(saved.files[&local_index_key(&fixture.paths[0])]
+        .source_file_fingerprint
+        .is_empty());
+    assert_eq!(
+        saved.accepted_snapshot_fingerprints,
+        fixture.previous.accepted_snapshot_fingerprints
+    );
+    fs::write(&fixture.paths[0], bytes).unwrap();
+    drop(scope);
+    let restarted = envelope_selection_experiment::Scope::restart();
+    let reloaded = ScanIndex::load(&fixture.index_path).unwrap();
+    let retry = fixture.prepare(reloaded, 1);
+    assert_eq!(retry.identified_candidates[0].path, fixture.paths[0]);
+    let (_, scan) = SelectionFixture::run(retry);
+    assert_eq!(scan.scanned_file_count, 1);
+    assert_eq!(restarted.counts().unknown_age, 1);
+    writeln!(std::io::stderr().lock(), "envelope_experiment_unavailable: reason=comparison_deferred_unavailable failed_open=1 successful_deferrals=0 durable_rearm=true restart_retry=true age_unknown_count=1").unwrap();
+}

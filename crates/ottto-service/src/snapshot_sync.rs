@@ -1652,6 +1652,34 @@ fn save_index_and_publish_manifest(
     Ok(())
 }
 
+// Test-only empty-ACK/shed boundary; invokes the real locked partial save.
+#[cfg(test)]
+pub(crate) fn comparison_partial_checkpoint_for_test(
+    index: &ScanIndex,
+    committed: &ScanIndex,
+    snapshots: &[SnapshotItem],
+    index_path: &Path,
+    progress_path: &Path,
+) -> Result<ScanIndex> {
+    let mut progress = SnapshotUploadProgress::load(
+        progress_path,
+        &format!("{:064x}", 587),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )?;
+    progress.save(progress_path)?;
+    checkpoint_partial_snapshot_index(
+        index,
+        committed,
+        &progress,
+        snapshots,
+        None,
+        &BTreeSet::new(),
+        index_path,
+        progress_path,
+        || Ok(()),
+    )
+}
+
 /// Preserve only delivery-owned file checkpoints on an unfinished upload.
 /// Hold the progress lock through index CAS: neither an unsaved ACK nor a
 /// racing ledger generation may certify the scan's new file/body witnesses.
@@ -1763,6 +1791,11 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
         // actually selected for this save, after any old-entry restoration.
         committable.settle_empty_claude_proof_corrections(scan);
     }
+    #[cfg(test)]
+    crate::snapshots::envelope_selection_experiment::after_selected_restore(
+        &mut committable,
+        committed_index,
+    );
     committable.mark_bounded_sweep_unsettled();
     validate_destination()?;
     if let Some(cap) = read_limit {

@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 660,
-  "content_sha256": "0fdf375b25c13beb5b502bd10dc92106fc020714d1538903a297f8dd8e54f62c",
+  "candidate_file_count": 661,
+  "content_sha256": "64905cb60e73b261ffb70c469aa423f866cab23ed82b95c8427d3f29f639fdc7",
   "files": [
     {
       "executable": false,
@@ -1182,8 +1182,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "16097baa811f5547831ae2a39c631267216cd6c7d35e80bc8e483d656a3950a9",
-      "size_bytes": 766311
+      "sha256": "c7d45de7a22f466f1010474d75bd67b588822d30afcb4df4c61845357a6d0d66",
+      "size_bytes": 767202
     },
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "df037fc57cd5863fff789d0c3b7b9752fe75614ff05be84e7f5ce30725d9e362",
-      "size_bytes": 2463548
+      "sha256": "e0570bca2fe7d7ead95896b9d39d592766f2b9f4a0e65d0e783308f6bdfda7a1",
+      "size_bytes": 2464072
     },
     {
       "executable": false,
@@ -1328,6 +1328,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/envelope_selection_experiment.rs",
+      "sha256": "7428dbaf0adffad55fe56ff9e6528d60ec3c7c9da6401fc2704ae962cdf36689",
+      "size_bytes": 8913
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/giant_row_measurement_tests.rs",
       "sha256": "4901febe540660dd3dd34a81f1ff599615f59dc4733afc2294b8cbfd5dced220",
       "size_bytes": 17307
@@ -1357,8 +1364,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/provider_envelope_experiment_tests.rs",
-      "sha256": "b288470d062a6544db701370f69ed240ea875c2d2e5fe83e3facb2b20812b57d",
-      "size_bytes": 19783
+      "sha256": "a90bc5c1044d982edc9a96091f72bb805a8d1898b4b7f178057af07cff796358",
+      "size_bytes": 31393
     },
     {
       "executable": false,
@@ -1518,8 +1525,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/provider-envelope-boundary-experiment.md",
-      "sha256": "9b9ae7b9e4d371f702f7e9051ef3e0a43d1e618bb68c64203523624dfc25c924",
-      "size_bytes": 2552
+      "sha256": "fe3755e0756b9c66d15e7f99b331a12e2893fcb41f8f2184440073f32e831b52",
+      "size_bytes": 4320
     },
     {
       "executable": false,
@@ -4623,9 +4630,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-16T11:46:28+00:00",
+  "generated_at": "2026-10-16T12:12:28+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 661,
+  "output_file_count": 662,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4662,5 +4669,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "bdd504a11fa5e919e29b5ae228bf34ca65bec344"
+  "source_commit": "cf32dc2a04ef92ec69f9f4bb5244ca8582c5482d"
 }

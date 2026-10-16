@@ -11905,6 +11905,16 @@ impl OwnedSourceScan {
         let hinted_budget = selection_limit
             .min(MAX_WATCHER_HINTED_FILES_PER_TICK)
             .saturating_sub(usize::from(ordinary_census_pending && file_limit > 0));
+        // Nonshipping candidate: exercise target priority at the actual
+        // selection boundary, before audits, with the unchanged page cap.
+        #[cfg(test)]
+        envelope_selection_experiment::before_audit_selection(
+            source,
+            &mut traversal.pending_candidates,
+            &mut pending_paths,
+            &mut index.files,
+            selection_limit,
+        );
         let audit_now = sampled_scan::now_seconds();
         while pending_paths.len() < selection_limit {
             let Some(position) = traversal.pending_candidates.iter().position(|candidate| {
@@ -25284,6 +25294,11 @@ pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<P
         .into_iter()
         .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) mod envelope_selection_experiment {
+    include!("snapshots/envelope_selection_experiment.rs");
 }
 
 #[cfg(test)]
