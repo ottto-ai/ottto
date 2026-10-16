@@ -69,7 +69,8 @@ not mint permission.
 
 Only the actual complete native conjunction receipt can be noted after the
 normal selected-index save; any later finish failure revokes it. A clean complete
-finish may retain an already valid lease. These internal gates do not themselves
+finish may retain an already valid lease. The bounded-page continuation below
+also requires its own actual selected-save marker. These internal gates do not themselves
 activate envelopes or suppress rearming. New lifecycle tests exercise real native
 collection/fold and an actual index save, then context/restart/drop and a real
 failed index CAS. Hosted CI `38917089098` at
@@ -258,3 +259,34 @@ CI `38935288344`, passed all four checks: 2,914 service tests passed, zero faile
 outside the cloned result and base index/body parity held. This validates that
 carrier, not selected restoration. The controller continuation above needs its
 own hosted CI; this prior result is not its acceptance.
+
+## Saved bounded-page lease continuation
+
+The same census can span several source cycles. Its previously bootstrapped
+process permit may survive a known, fully settled bounded page only after that
+page's actual selected-index save and successful finish. An explicit ephemeral
+save marker is now required for both retention and bootstrap. The terminal
+native conjunction remains the only way to mint permission; a saved partial
+page or a clean boolean alone cannot mint or retain it.
+
+Read/parser/sidecar loss, an absent or mismatched partial traversal, unsettled
+upload history, an invalid census or a closed/overflowed fence rejects retention.
+Shed/error/disabled paths still exit before the normal selected-save/finish
+sequence and revoke through the existing lease drop. No upload/ACK outcome,
+account hold, persisted metadata or census flag is changed. Certificate storage
+and transfer across pages are not wired by this change.
+
+Two new tests require hosted validation: an actual quiet bounded scan/fold/save
+retains a previously native-bootstrapped grant while a restarted lifecycle cannot
+mint one from that partial save; no selected-save marker and the loss/unknown/
+unsettled/invalid/fence controls reject retention. Full source bootstrap, every
+root/global certificate revocation and the original multi-page quiet oracle
+remain separate, unaccepted gates. Existing requested-layout refusal on an
+unsupported compiler must remain closed; zero carry coverage is honest.
+
+Prior controller checkpoint `48ba9828a7993224dfb341bd27f3ee33f00f7d64`, hosted
+CI `38937669191`, passed all four checks: 2,917 service tests passed, zero failed,
+24 ignored, including all 27 new tests. Actual receipts show two same-owner
+target reads, one delta frontier, no repeated targets, generation/budget fallback
+and actual replacement rejection. This proof does not validate the new saved-page
+continuation or establish certificate carry, selected recovery or resource gains.

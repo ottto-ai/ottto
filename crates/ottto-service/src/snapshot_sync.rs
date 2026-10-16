@@ -4988,7 +4988,7 @@ fn finish_sync_source(
         &manifest_window_end,
     )?;
     if let Some(lease) = native_comparison_lease.as_mut() {
-        lease.note_native_save(
+        lease.note_selected_save(
             actual_native_conjunction && scan_result.census_complete && upload_fully_settled,
         );
     }
@@ -5112,11 +5112,15 @@ fn finish_sync_source(
         },
     )?;
     if let Some(lease) = native_comparison_lease {
+        // Only an existing permit may survive a known, saved bounded page.
+        // The actual terminal native conjunction remains the sole bootstrap.
         lease.finish(
-            scan_result.census_complete
-                && upload_fully_settled
-                && !claude_authority_disposition.duplicate_census.census_invalid
-                && !claude_authority_disposition.duplicate_census.fence_after,
+            upload_fully_settled
+                && crate::snapshots::claude_native_comparison::selected_page_is_clean(
+                    &scan_result,
+                    &index,
+                    &claude_authority_disposition,
+                ),
         );
     }
     Ok(())

@@ -21,6 +21,7 @@ pub(crate) struct Lease {
     previous_valid: bool,
     scope: Option<String>,
     allowed: bool,
+    selected_save: bool,
     native_save: bool,
     finished: bool,
 }
@@ -34,6 +35,7 @@ impl Lifecycle {
             previous_valid: false,
             scope: None,
             allowed: false,
+            selected_save: false,
             native_save: false,
             finished: false,
         };
@@ -73,19 +75,25 @@ impl Lease {
 
     pub(crate) fn revoke(&mut self) {
         self.allowed = false;
+        self.selected_save = false;
         self.native_save = false;
     }
 
     /// Call only AFTER the actual selected-index save, from the actual native
-    /// conjunction receipt. Envelopes/possible hits never produce this input.
-    pub(crate) fn note_native_save(&mut self, native_conjunction: bool) {
+    /// conjunction receipt. A known saved bounded page may retain an existing
+    /// permit, but cannot mint one. Envelopes/possible hits never mint one.
+    pub(crate) fn note_selected_save(&mut self, native_conjunction: bool) {
+        self.selected_save = true;
         self.native_save = native_conjunction;
     }
 
     pub(crate) fn finish(mut self, clean: bool) {
         if let Ok(mut state) = self.owner.state.lock() {
             if self.generation == Some(state.generation) && self.scope == state.scope {
-                state.valid = clean && self.scope.is_some() && (self.native_save || self.allowed);
+                state.valid = clean
+                    && self.scope.is_some()
+                    && self.selected_save
+                    && (self.native_save || self.allowed);
             }
         }
         self.finished = true;
@@ -106,4 +114,4 @@ impl Drop for Lease {
 
 crate::heap_layout_bound::fields!(Lifecycle; state);
 crate::heap_layout_bound::fields!(State; generation, scope, valid);
-crate::heap_layout_bound::fields!(Lease; owner, generation, previous_scope, previous_valid, scope, allowed, native_save, finished);
+crate::heap_layout_bound::fields!(Lease; owner, generation, previous_scope, previous_valid, scope, allowed, selected_save, native_save, finished);

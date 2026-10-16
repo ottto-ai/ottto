@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 668,
-  "content_sha256": "d21e1b65f97d479edb2dd403bb39d6649cb30f31d8d6a8003d26f551e1abc197",
+  "content_sha256": "293e335de50de612586710a240f0d905fc86b630e2b7f351c41e6478f6165162",
   "files": [
     {
       "executable": false,
@@ -1182,8 +1182,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "ef79430f87c829e18c4f33fd1644e94407d2580e94d5079567b8b6d86d2e1c3a",
-      "size_bytes": 781995
+      "sha256": "2c4365277ff105fb1a14cc594798e1e7e0e759af806c9528676d90c342fd3085",
+      "size_bytes": 782163
     },
     {
       "executable": false,
@@ -1287,15 +1287,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison.rs",
-      "sha256": "a4bccee70fa9cd0b3694639cc5839d194ef47efeae7604eeadcc8d8f01ace1f4",
-      "size_bytes": 34420
+      "sha256": "ce97cd7877976ad2dc61f4904ebe9d409a80c0048e78bab563b14394cac5ba03",
+      "size_bytes": 36010
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison/lifecycle.rs",
-      "sha256": "cb1219ed997cea0d1d2dc311a3379273cec3d356ab8bf4a03e5989a7c15f7d62",
-      "size_bytes": 3446
+      "sha256": "0c82d3b9d20fb7ba32ffaabf36eccac77bc8be269268a5b188ab39d8d035e04c",
+      "size_bytes": 3752
     },
     {
       "executable": false,
@@ -1406,8 +1406,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/provider_envelope_experiment_tests.rs",
-      "sha256": "281792f976760ec8dc73a1334d10a8f05154d68a52c11cb56a86302c4133dc92",
-      "size_bytes": 86214
+      "sha256": "1a0c22ecad24e6b846a305763f23f9ef759a040948e30ef0e47025f96b7dbcee",
+      "size_bytes": 91864
     },
     {
       "executable": false,
@@ -1567,8 +1567,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/native-comparison-driver.md",
-      "sha256": "25fdc089539ac375557c0e6e9d11dde14c2fdbd25a2e184b22d813dbe0397806",
-      "size_bytes": 16034
+      "sha256": "98e156fcefe788c0da4360ea15e88982931cad9b70d927426bcfc7ccfd34e929",
+      "size_bytes": 18085
     },
     {
       "executable": false,
@@ -4718,5 +4718,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "36dcfbc18b6a168dd400d656c1cfa79dad50d915"
+  "source_commit": "48ba9828a7993224dfb341bd27f3ee33f00f7d64"
 }

@@ -1468,7 +1468,7 @@ fn native_comparison_lifecycle_requires_native_save_and_revokes_after_drop_conte
     first.bind("synthetic-source-destination-context".into());
     assert!(!first.allowed());
     fixture.index.save(&scratch.join("index.json")).unwrap();
-    first.note_native_save(fixture.native_conjunction);
+    first.note_selected_save(fixture.native_conjunction);
     first.finish(true);
     let mut next = owner.begin();
     next.bind("synthetic-source-destination-context".into());
@@ -1510,7 +1510,7 @@ fn native_comparison_lifecycle_failed_cas_never_mints_a_grant() {
     assert!(!failed.allowed());
     let result = stale.save(&path);
     assert!(result.is_err());
-    // Same ordering as finish: save failure exits before note_native_save.
+    // Same ordering as finish: save failure exits before note_selected_save.
     drop(failed);
     let mut next = owner.begin();
     next.bind("synthetic-source-destination-context".into());
@@ -1520,6 +1520,158 @@ fn native_comparison_lifecycle_failed_cas_never_mints_a_grant() {
         "native_comparison_lifecycle: actual_failed_index_cas=true process_grant=false"
     )
     .unwrap();
+}
+
+fn native_comparison_quiet_bounded_page(
+    fixture: &NativePreparationFixture,
+) -> (ScanIndex, SourceScanResult, ClaudeUsageAuthorityDisposition) {
+    let native = OwnedSourceScan::new_with_identity_capture(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&fixture.dir),
+        fixture.index.clone(),
+        WINDOW,
+        30,
+        1,
+        false,
+        None,
+        &[],
+        false,
+        false,
+        false,
+    );
+    let (mut index, mut scan) = SelectionFixture::run(native);
+    assert!(!scan.census_complete);
+    assert_eq!(scan.scanned_file_count, 0);
+    assert!(scan.snapshots.is_empty(), "no new body needs an ACK");
+    let disposition = apply_claude_reported_usage_with_index(
+        &mut scan.snapshots,
+        &fixture.api,
+        &fixture.trace,
+        &mut index,
+        scan.census_complete,
+        &scan.census_window_end,
+    );
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+    (index, scan, disposition)
+}
+
+#[test]
+fn native_comparison_lifecycle_saved_bounded_page_retains_only_existing_grant() {
+    let mut fixture = NativePreparationFixture::new();
+    let scratch = crate::test_scratch::ScratchDir::new("native-comparison-page-save");
+    let path = scratch.join("index.json");
+    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut bootstrap = owner.begin();
+    bootstrap.bind("page-source-destination-context".into());
+    fixture.index.save(&path).unwrap();
+    bootstrap.note_selected_save(fixture.native_conjunction);
+    bootstrap.finish(true);
+
+    let mut page = owner.begin();
+    page.bind("page-source-destination-context".into());
+    assert!(page.allowed());
+    let (mut index, scan, disposition) = native_comparison_quiet_bounded_page(&fixture);
+    assert!(claude_native_comparison::selected_page_is_clean(
+        &scan,
+        &index,
+        &disposition
+    ));
+    index.save(&path).unwrap();
+    page.note_selected_save(false); // A partial census cannot bootstrap.
+    page.finish(claude_native_comparison::selected_page_is_clean(
+        &scan,
+        &index,
+        &disposition,
+    ));
+    let mut next = owner.begin();
+    next.bind("page-source-destination-context".into());
+    assert!(next.allowed());
+    drop(next);
+
+    let restarted = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut fresh = restarted.begin();
+    fresh.bind("page-source-destination-context".into());
+    assert!(!fresh.allowed());
+    index.save(&path).unwrap();
+    fresh.note_selected_save(false);
+    fresh.finish(true);
+    let mut after_restart = restarted.begin();
+    after_restart.bind("page-source-destination-context".into());
+    assert!(
+        !after_restart.allowed(),
+        "saved partial page is not bootstrap"
+    );
+    writeln!(std::io::stderr().lock(), "native_comparison_page_lease: actual_native_bootstrap_save=true actual_quiet_bounded_page_save=true prior_grant_retained=true partial_page_cannot_mint=true certificate_carry_unwired=true").unwrap();
+}
+
+#[test]
+fn native_comparison_lifecycle_page_loss_or_missing_selected_save_revokes() {
+    let mut fixture = NativePreparationFixture::new();
+    let scratch = crate::test_scratch::ScratchDir::new("native-comparison-page-loss");
+    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut bootstrap = owner.begin();
+    bootstrap.bind("page-source-destination-context".into());
+    fixture.index.save(&scratch.join("index.json")).unwrap();
+    bootstrap.note_selected_save(fixture.native_conjunction);
+    bootstrap.finish(true);
+    let mut no_save = owner.begin();
+    no_save.bind("page-source-destination-context".into());
+    assert!(no_save.allowed());
+    no_save.finish(true);
+    let mut next = owner.begin();
+    next.bind("page-source-destination-context".into());
+    assert!(
+        !next.allowed(),
+        "clean boolean cannot replace selected save"
+    );
+
+    let (index, scan, disposition) = native_comparison_quiet_bounded_page(&fixture);
+    assert!(claude_native_comparison::selected_page_is_clean(
+        &scan,
+        &index,
+        &disposition
+    ));
+    let mut loss = scan.clone();
+    loss.unreadable_path_count = 1;
+    assert!(!claude_native_comparison::selected_page_is_clean(
+        &loss,
+        &index,
+        &disposition
+    ));
+    let mut sidecar = scan.clone();
+    sidecar.sidecar_census_complete = false;
+    assert!(!claude_native_comparison::selected_page_is_clean(
+        &sidecar,
+        &index,
+        &disposition
+    ));
+    let mut unknown = index.clone();
+    unknown.traversal = None;
+    assert!(!claude_native_comparison::selected_page_is_clean(
+        &scan,
+        &unknown,
+        &disposition
+    ));
+    let mut unsettled = index.clone();
+    unsettled.mark_bounded_sweep_unsettled();
+    assert!(!claude_native_comparison::selected_page_is_clean(
+        &scan,
+        &unsettled,
+        &disposition
+    ));
+    let mut invalid = ClaudeUsageAuthorityDisposition::default();
+    invalid.duplicate_census.census_invalid = true;
+    assert!(!claude_native_comparison::selected_page_is_clean(
+        &scan, &index, &invalid
+    ));
+    let mut closed = index.clone();
+    closed.claude_duplicate_request_witness_overflowed = true;
+    assert!(!claude_native_comparison::selected_page_is_clean(
+        &scan,
+        &closed,
+        &disposition
+    ));
+    writeln!(std::io::stderr().lock(), "native_comparison_page_lease: no_selected_save_revokes=true unreadable_sidecar_unknown_unsettled_invalid_closed_rejected=true certificate_carry_unwired=true").unwrap();
 }
 
 fn pause_native_comparison(mut state: OwnedSourceScan) -> OwnedSourceScan {

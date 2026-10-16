@@ -13,6 +13,41 @@ pub(crate) fn actual_native_conjunction(disposition: &ClaudeUsageAuthorityDispos
         && disposition.transcript_ownership_complete
 }
 
+/// Retaining a previously bootstrapped permit across a bounded page requires
+/// known clean native history and the actual selected-save marker in Lease.
+/// This predicate cannot mint a permit or certify an unchanged member.
+pub(crate) fn selected_page_is_clean(
+    scan: &SourceScanResult,
+    index: &ScanIndex,
+    disposition: &ClaudeUsageAuthorityDisposition,
+) -> bool {
+    scan.source == SnapshotSource::ClaudeCode
+        && scan.state_census_complete
+        && scan.sidecar_census_complete
+        && scan.directory_entry_cap_exceeded_count == 0
+        && scan.symlink_rejected_count == 0
+        && scan.unreadable_path_count == 0
+        && scan.oversized_file_count == 0
+        && scan.disappeared_file_count == 0
+        && scan.malformed_json_line_count == 0
+        && scan.invalid_utf8_line_count == 0
+        && scan.over_line_cap_count == 0
+        && scan.recognized_usage_drop_count == 0
+        && scan.ownership_incomplete_file_count == 0
+        && scan.zero_snapshot_usage_evidence_count == 0
+        && scan.dropped_usage_record_count == 0
+        && !index.bounded_sweep_had_unsettled_upload
+        && !index.claude_duplicate_request_witness_overflowed
+        && !disposition.duplicate_census.census_invalid
+        && !disposition.duplicate_census.fence_after
+        && (scan.census_complete
+            || index.traversal.as_ref().is_some_and(|traversal| {
+                traversal.census_window_end == scan.census_window_end
+                    && !traversal.counts.has_errors()
+                    && !traversal.watcher_hint_seen
+            }))
+}
+
 pub(crate) struct PairedRows<'a> {
     pub(crate) api: &'a BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
     pub(crate) trace:
