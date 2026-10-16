@@ -356,9 +356,8 @@ impl LocalHoldSettlement {
     }
 }
 
-/// The index an upload outcome commits, and whether that outcome leaves the
-/// upload fully settled. An unsettled outcome keeps backfill and context-curve
-/// replay completion pending.
+/// The index selected by an upload outcome, and its transport/local-hold
+/// settlement. Authority corrections are finalized on that selected index.
 struct UploadIndexSettlement {
     index: ScanIndex,
     fully_settled: bool,
@@ -367,9 +366,7 @@ struct UploadIndexSettlement {
 /// A persisted account hold was never uploaded, so the backfill and replay it
 /// belongs to stay pending even on a page that did not revisit it.
 fn upload_settled_without_account_holds(index: &ScanIndex, settled: bool) -> bool {
-    settled
-        && index.claude_account_deferred_hold_count() == 0
-        && !index.claude_authority_proof_correction_pending()
+    settled && index.claude_account_deferred_hold_count() == 0
 }
 
 /// Settle a `Completed` upload: every uploaded entity was accepted or
@@ -451,6 +448,60 @@ fn settle_index_after_upload(
     );
     index.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
     index.record_accepted_snapshot_fingerprints(&upload_progress.accepted_fingerprints);
+}
+
+/// Correction completion depends on the final selected file/empty facts. In
+/// particular, the last M2 no-body drain must precede the completion decision.
+fn settle_upload_corrections_after_selection(
+    index: &mut ScanIndex,
+    scan: &SourceScanResult,
+    committed_index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    candidates: &[crate::snapshots::ClaudeProofCorrectionCandidate],
+    cutoff_candidates: &[crate::snapshots::ClaudeCutoffCorrectionCandidate],
+    transport_fully_settled: bool,
+) -> bool {
+    // D1 is deliberately unavailable to partial/deferred/shed/error outcomes.
+    // Both existing durable refusal carriers must bind the exact current body.
+    if transport_fully_settled {
+        index.settle_claude_proof_corrections_with_permanent(
+            committed_index,
+            candidates,
+            &progress.accepted_fingerprints,
+            &progress.accepted_body_witnesses,
+            |fingerprint, body| {
+                progress
+                    .permanent_rejections
+                    .get(fingerprint)
+                    .is_some_and(|rejection| rejection.body_witness == body)
+                    && progress
+                        .quarantined_fingerprints
+                        .get(fingerprint)
+                        .is_some_and(|record| {
+                            record.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
+                                && record.upload_body_witness.as_deref() == Some(body)
+                        })
+            },
+        );
+    }
+    index.settle_cutoff_claude_proof_corrections(cutoff_candidates);
+    index.settle_empty_claude_proof_corrections(scan);
+    transport_fully_settled && !index.claude_authority_proof_correction_pending()
+}
+
+fn apply_backfill_cutoff_with_claude_corrections(
+    scan: &mut SourceScanResult,
+    index: &ScanIndex,
+    disposition: &crate::snapshots::ClaudeUsageAuthorityDisposition,
+    state: &crate::backfill::BackfillState,
+) -> (
+    usize,
+    Vec<crate::snapshots::ClaudeCutoffCorrectionCandidate>,
+) {
+    let mut candidates = index.capture_claude_cutoff_corrections(scan, disposition);
+    let removed = apply_backfill_cutoff(&mut scan.snapshots, state);
+    ScanIndex::retain_fully_cutoff_corrections(&mut candidates, &scan.snapshots);
+    (removed, candidates)
 }
 
 #[derive(Debug)]
@@ -4007,7 +4058,20 @@ fn finish_sync_source(
     // upstream this cycle — sessions whose activity ended strictly before the
     // cutoff are historical by definition, whichever scan produced them; live
     // sessions always have activity at/after the cutoff and pass untouched.
-    let skipped_before_cutoff = apply_backfill_cutoff(&mut scan_result.snapshots, &backfill_state);
+    let (skipped_before_cutoff, claude_cutoff_corrections) = if source == SnapshotSource::ClaudeCode
+    {
+        apply_backfill_cutoff_with_claude_corrections(
+            &mut scan_result,
+            &index,
+            &claude_authority_disposition,
+            &backfill_state,
+        )
+    } else {
+        (
+            apply_backfill_cutoff(&mut scan_result.snapshots, &backfill_state),
+            Vec::new(),
+        )
+    };
     if skipped_before_cutoff > 0 {
         eprintln!(
             "ottto-service: skipped {} historical {} snapshot(s) that ended before the account-switch backfill cutoff",
@@ -4735,7 +4799,16 @@ fn finish_sync_source(
     settle_index_after_upload(&mut index, &committed_index, &upload_progress);
     // Completed/checkpointed outcomes have now selected their retained file
     // facts. No-body completion must share that exact durable checkpoint.
-    index.settle_empty_claude_proof_corrections(&scan_result);
+    upload_fully_settled = settle_upload_corrections_after_selection(
+        &mut index,
+        &scan_result,
+        &committed_index,
+        &upload_progress,
+        &claude_proof_correction_candidates,
+        &claude_cutoff_corrections,
+        upload_fully_settled,
+    );
+    backfill_succeeded &= upload_fully_settled;
     // A quiet/delta-only scan still discloses current permanent refusals even
     // though no body needed another upload. The committed census owns scope.
     let current_entities = index.current_snapshot_fingerprints();

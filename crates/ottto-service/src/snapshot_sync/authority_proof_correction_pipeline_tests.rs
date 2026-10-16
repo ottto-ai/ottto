@@ -128,6 +128,8 @@ fn apc_evidence_lines(agent: Option<&str>, request: &str, sequence: u64) -> (Str
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApcUpload {
     Accept,
+    PermanentRejection,
+    RetryableRejection,
     /// The server sheds the page's first batch; the page then checkpoints
     /// only what the durable progress ledger accepted. A page with nothing to
     /// offer completes normally.
@@ -159,6 +161,7 @@ struct ApcPage {
     shed: bool,
     /// Correction candidates captured before the finalizer.
     candidates: Vec<crate::snapshots::ClaudeProofCorrectionCandidate>,
+    progress: SnapshotUploadProgress,
 }
 
 impl ApcPage {
@@ -223,6 +226,7 @@ struct ApcFixture {
     withheld_owners: std::cell::RefCell<BTreeSet<String>>,
     next_sequence: std::cell::Cell<u64>,
     page_files: std::cell::Cell<usize>,
+    cutoff: std::cell::Cell<Option<&'static str>>,
 }
 
 impl ApcFixture {
@@ -248,6 +252,7 @@ impl ApcFixture {
             withheld_owners: std::cell::RefCell::new(BTreeSet::new()),
             next_sequence: std::cell::Cell::new(1),
             page_files: std::cell::Cell::new(APC_PAGE_FILES),
+            cutoff: std::cell::Cell::new(None),
         };
         for (session, path) in [
             (
@@ -478,7 +483,25 @@ impl ApcFixture {
             &mut scan.snapshots,
             SnapshotUploadPolicy::default(),
         );
-        let mut progress = test_upload_progress();
+        let cutoff_state = crate::backfill::BackfillState {
+            backfill_cutoff_at: self.cutoff.get().map(str::to_string),
+            ..Default::default()
+        };
+        let cutoff_bytes = serde_json::to_vec(&cutoff_state).unwrap();
+        let (_, cutoff_candidates) = apply_backfill_cutoff_with_claude_corrections(
+            &mut scan,
+            &index,
+            &disposition,
+            &cutoff_state,
+        );
+        assert_eq!(serde_json::to_vec(&cutoff_state).unwrap(), cutoff_bytes);
+        let empty_progress = test_upload_progress();
+        let mut progress = SnapshotUploadProgress::load(
+            &self.progress_path,
+            &empty_progress.destination_namespace_hash,
+            empty_progress.active_quarantine_witness.clone().unwrap(),
+        )
+        .expect("reload exact synthetic upload progress");
         exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
         let candidates =
             index.capture_claude_proof_corrections(&mut scan, &disposition, |snapshot| {
@@ -545,6 +568,7 @@ impl ApcFixture {
                 uploaded: BTreeSet::new(),
                 shed: false,
                 candidates,
+                progress,
             };
         }
         for snapshot in &mut scan.snapshots {
@@ -566,6 +590,11 @@ impl ApcFixture {
         let mut offered = BTreeSet::new();
         let mut uploaded = BTreeSet::new();
         let mut accepted = 0;
+        let persist_refusal = self.progress_path.exists()
+            || matches!(
+                upload,
+                ApcUpload::PermanentRejection | ApcUpload::RetryableRejection
+            );
         let result = upload_resumable_batches_with_body_witness(
             &scan.snapshots,
             &unique_poison_scope(),
@@ -584,9 +613,41 @@ impl ApcFixture {
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
                     })),
+                    ApcUpload::PermanentRejection | ApcUpload::RetryableRejection => {
+                        Ok(crate::snapshot_client::SnapshotBatchResponse {
+                            accepted: 0,
+                            sessions_reconciled: 0,
+                            session_ids: Vec::new(),
+                            disabled: false,
+                            disabled_reason: None,
+                            entity_ack_contract: Some(
+                                crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string(),
+                            ),
+                            accepted_entities: Vec::new(),
+                            unchanged_entities: Vec::new(),
+                            rejected_entities: items
+                                .iter()
+                                .map(|item| crate::snapshot_client::SnapshotEntityRejection {
+                                    source_session_id: item.source_session_id.clone(),
+                                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                                    reason: "invalid".to_string(),
+                                    detail: "synthetic refusal".to_string(),
+                                    permanent: upload == ApcUpload::PermanentRejection,
+                                    occurrence_count: 1,
+                                })
+                                .collect(),
+                            conflict_entities: Vec::new(),
+                        })
+                    }
                 }
             },
-            |_| Ok(()),
+            |progress| {
+                if persist_refusal {
+                    progress.save(&self.progress_path)
+                } else {
+                    Ok(())
+                }
+            },
         )
         .expect("in-process upload");
         let shed = matches!(result, ResumableUploadResult::Shed { .. });
@@ -601,7 +662,6 @@ impl ApcFixture {
         );
         index.log_claude_proof_correction_debt();
         if shed {
-            let _ = std::fs::remove_file(&self.progress_path);
             progress
                 .save(&self.progress_path)
                 .expect("persist upload progress");
@@ -617,7 +677,9 @@ impl ApcFixture {
                 || Ok(()),
             )
             .expect("checkpoint shed page");
-            let _ = std::fs::remove_file(&self.progress_path);
+            if !persist_refusal {
+                let _ = std::fs::remove_file(&self.progress_path);
+            }
             return ApcPage {
                 upload,
                 scan,
@@ -633,14 +695,32 @@ impl ApcFixture {
                 uploaded,
                 shed,
                 candidates,
+                progress,
             };
         }
-        assert_eq!(result, ResumableUploadResult::Completed);
-        let settlement = settle_completed_upload(index, &committed_index, &progress, &holds);
-        let fully_settled = settlement.fully_settled;
+        let settlement = match result {
+            ResumableUploadResult::Completed => {
+                settle_completed_upload(index, &committed_index, &progress, &holds)
+            }
+            ResumableUploadResult::Rejected { .. } => {
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
+            }
+            ResumableUploadResult::Deferred { .. } => {
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
+            }
+            other => panic!("unexpected synthetic upload {other:?}"),
+        };
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
-        index.settle_empty_claude_proof_corrections(&scan);
+        let fully_settled = settle_upload_corrections_after_selection(
+            &mut index,
+            &scan,
+            &committed_index,
+            &progress,
+            &candidates,
+            &cutoff_candidates,
+            settlement.fully_settled,
+        );
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
             &mut index,
@@ -675,6 +755,7 @@ impl ApcFixture {
             uploaded,
             shed,
             candidates,
+            progress,
         }
     }
 
@@ -1672,7 +1753,7 @@ fn natural_owed_members_drain_on_separate_bounded_pages() {
             .collect::<Vec<_>>()
     );
     // Preserve the original hour-12 causal fixture, then tighten its drain
-    // page size. One parsed file per page forces the two naturally owed
+    // page size. One parsed file per page forces the naturally owed
     // members to settle on separate real bounded pages without seeding debt.
     fixture.page_files.set(1);
     ApcFixture::append(&fixture.sibling_path(), &apc_note_line(APC_SIBLING, 2));
@@ -1758,8 +1839,7 @@ fn natural_owed_members_drain_on_separate_bounded_pages() {
 }
 
 /// R2, CONTROLLED: the owed set is seeded (through the persisted index) to all
-/// three family members after the natural grant, because the natural grant
-/// owes only the members of its last demoting page. With the sibling working,
+/// three family members after the natural grant, to make this control independent of the natural grant distribution. With the sibling working,
 /// the root and one agent settle on their own separate pages by exact ACK or
 /// no-op while the other agent's withheld owner proof keeps it account-held
 /// and owed; the record is kept until that member's own settlement.
@@ -2114,6 +2194,169 @@ fn controlled_last_owed_empty_member_with_a_prior_entity_rolls_back_on_a_partial
 fn controlled_last_owed_empty_member_without_a_prior_entity_carries_its_pair_and_drains() {
     apc_checkpoint_last_owed_empty_agent(false, false);
     apc_checkpoint_last_owed_empty_agent(false, true);
+}
+
+#[test]
+fn last_empty_correction_completes_replay_in_its_drain_cycle() {
+    for complete in [false, true] {
+        for (outcome, held, expected_transport) in [
+            ("completed", false, true),
+            ("permanent", false, true),
+            ("deferred", false, false),
+            ("completed", true, false),
+        ] {
+            let committed = apc_m2_index(1, 1, false, false);
+            let current = apc_m2_index(1, 1, true, false);
+            let scan = apc_m2_scan(complete);
+            let progress = test_upload_progress();
+            let holds = LocalHoldSettlement {
+                held_entity_count: usize::from(held),
+                retry_pending_family_count: 0,
+                held_fingerprints: BTreeSet::new(),
+                account_deferred_fingerprints: BTreeSet::new(),
+                progress_blocking: false,
+            };
+            let selected = if outcome == "completed" {
+                settle_completed_upload(current, &committed, &progress, &holds)
+            } else {
+                settle_checkpointed_upload(
+                    current,
+                    &committed,
+                    &progress,
+                    &holds,
+                    outcome == "permanent",
+                )
+            };
+            assert_eq!(selected.fully_settled, expected_transport);
+            let mut index = selected.index;
+            settle_index_after_upload(&mut index, &committed, &progress);
+            let settled = settle_upload_corrections_after_selection(
+                &mut index,
+                &scan,
+                &committed,
+                &progress,
+                &[],
+                &[],
+                selected.fully_settled,
+            );
+            assert_eq!(
+                settled,
+                complete && expected_transport,
+                "{outcome}, held={held}, complete={complete}"
+            );
+            settle_context_curve_replay_state(
+                &mut index,
+                true,
+                complete && settled,
+                "last-empty-cycle",
+            );
+            let scratch = crate::test_scratch::ScratchDir::new("apc-last-empty-cycle");
+            let path = scratch.join("index.json");
+            index.save(&path).unwrap();
+            let loaded = ScanIndex::load(&path).unwrap();
+            assert_eq!(
+                loaded.claude_authority_proof_correction_pending(),
+                !complete
+            );
+            assert_eq!(
+                serde_json::to_value(loaded).unwrap()["completed_context_curve_replay_generation"]
+                    .as_str(),
+                (complete && expected_transport).then_some("last-empty-cycle")
+            );
+        }
+    }
+}
+
+#[test]
+#[serial(source_manifests)]
+fn exact_permanent_refusal_drains_correction_and_keeps_refusal_witness() {
+    let _manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("apc-permanent-drain", true);
+    let (_, grant) = fixture.reach_grant();
+    let pages = fixture.generation(grant.hour + 1, |_| ApcUpload::PermanentRejection);
+    let mut refused = 0;
+    for page in &pages {
+        for (fp, rejection) in &page.progress.permanent_rejections {
+            let record = page
+                .index
+                .quarantined_snapshot_fingerprints
+                .get(fp)
+                .expect("durable index refusal");
+            assert_eq!(
+                record.upload_body_witness.as_ref(),
+                Some(&rejection.body_witness)
+            );
+            assert_eq!(
+                record.disposition,
+                SnapshotQuarantineDisposition::UnprovenTerminal
+            );
+            assert!(!page.index.accepted_snapshot_fingerprint_recorded(fp));
+            refused += 1;
+        }
+    }
+    assert!(
+        refused > 0,
+        "a real validated permanent response was exercised"
+    );
+    let last = pages.last().unwrap();
+    assert!(last.record().is_none());
+    assert!(last.fully_settled);
+    let quiet = fixture.generation(grant.hour + 2, |_| ApcUpload::Accept);
+    assert!(
+        quiet
+            .iter()
+            .all(|page| page.parsed.is_disjoint(&apc_family_sessions())),
+        "settled grants do not force per-pass parses"
+    );
+    let last = quiet.last().unwrap();
+    assert!(!last.progress.permanent_rejections.is_empty());
+    for (fp, refusal) in &last.progress.permanent_rejections {
+        assert_eq!(
+            last.index.quarantined_snapshot_fingerprints[fp]
+                .upload_body_witness
+                .as_ref(),
+            Some(&refusal.body_witness)
+        );
+    }
+}
+
+#[test]
+#[serial(source_manifests)]
+fn retryable_refusal_keeps_its_member_owed_across_restart() {
+    let _manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("apc-retryable-owed", true);
+    let (_, grant) = fixture.reach_grant();
+    let pages = fixture.generation(grant.hour + 1, |_| ApcUpload::RetryableRejection);
+    assert!(pages.iter().any(|page| !page.offered.is_empty()));
+    assert!(pages
+        .iter()
+        .all(|page| page.progress.permanent_rejections.is_empty()));
+    let last = pages.last().unwrap();
+    assert!(last.record().and_then(|record| record.correction).is_some());
+    assert!(!last.fully_settled);
+    assert!(ScanIndex::load(&fixture.index_path)
+        .unwrap()
+        .claude_authority_proof_correction_pending());
+}
+
+#[test]
+#[serial(source_manifests)]
+fn complete_cutoff_drains_without_upload_or_repeated_grant_parse() {
+    let _manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("apc-cutoff-drain", true);
+    let (_, grant) = fixture.reach_grant();
+    fixture.cutoff.set(Some("2026-08-02T08:00:00Z"));
+    let pages = fixture.generation(grant.hour + 1, |_| ApcUpload::Accept);
+    assert!(pages
+        .iter()
+        .all(|page| page.offered.is_empty() && page.uploaded.is_empty()));
+    assert!(pages.last().unwrap().record().is_none());
+    assert!(pages.last().unwrap().fully_settled);
+    assert_eq!(fixture.cutoff.get(), Some("2026-08-02T08:00:00Z"));
+    let quiet = fixture.generation(grant.hour + 2, |_| ApcUpload::Accept);
+    assert!(quiet
+        .iter()
+        .all(|page| page.parsed.is_disjoint(&apc_family_sessions())));
 }
 
 /// R8/A2: requested bytes of the actual locked partial checkpoint on the small

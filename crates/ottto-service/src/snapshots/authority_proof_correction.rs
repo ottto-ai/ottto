@@ -28,6 +28,15 @@ pub(crate) struct ClaudeProofCorrectionCandidate {
     body_witness: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct ClaudeCutoffCorrectionCandidate {
+    index_key: String,
+    root: String,
+    member: String,
+    proof: String,
+    revision: String,
+}
+
 #[cfg(test)]
 impl ClaudeProofCorrectionCandidate {
     pub(crate) fn member_for_test(&self) -> &str {
@@ -363,6 +372,7 @@ impl ScanIndex {
                 || result.pending_finalization.iter().any(|pending| {
                     pending.index_key == *key
                         && (!pending.parse_complete
+                            || pending.parsed_snapshot_count != 0
                             || pending.source_file_fingerprint != entry.source_file_fingerprint)
                 })
             {
@@ -471,6 +481,126 @@ impl ScanIndex {
         candidates
     }
 
+    // Capture before the cutoff alone removes snapshots. Every item produced
+    // by the completed parse must still be present, reported and unheld.
+    pub(crate) fn capture_claude_cutoff_corrections(
+        &self,
+        result: &SourceScanResult,
+        disposition: &ClaudeUsageAuthorityDisposition,
+    ) -> Vec<ClaudeCutoffCorrectionCandidate> {
+        if !self.claude_authority_proof_correction_pending() {
+            return Vec::new();
+        }
+        let mut candidates = Vec::new();
+        for pending in &result.pending_finalization {
+            if !pending.parse_complete || pending.parsed_snapshot_count == 0 {
+                continue;
+            }
+            let Some((root, member)) =
+                claude_index_path_family_member(Path::new(&pending.index_key))
+            else {
+                continue;
+            };
+            let Some(record) = self.claude_usage_authority_quarantine.get(&root) else {
+                continue;
+            };
+            let Some(correction) = &record.proof_correction else {
+                continue;
+            };
+            if !correction.owed_member_ids.contains(&member)
+                || !self
+                    .claude_usage_family_witnesses
+                    .get(&root)
+                    .is_some_and(|witness| {
+                        claude_usage_authority_preserves_pending(record, witness)
+                    })
+            {
+                continue;
+            }
+            let mut items = result.snapshots.iter().filter(|snapshot| {
+                snapshot.source_file_fingerprint.as_deref()
+                    == Some(pending.source_file_fingerprint.as_str())
+            });
+            if items.clone().count() != pending.parsed_snapshot_count
+                || !items.all(|snapshot| {
+                    snapshot.source_session_id == member
+                        && claude_snapshot_family_root(snapshot) == root
+                        && snapshot.usage_accounting_contract.as_deref()
+                            == Some("session_exclusive_reported_usage:v1")
+                        && !disposition.quarantined_source_session_ids.contains(&member)
+                })
+            {
+                continue;
+            }
+            candidates.push(ClaudeCutoffCorrectionCandidate {
+                index_key: pending.index_key.clone(),
+                root,
+                member,
+                proof: correction.proof_witness_fingerprint.clone(),
+                revision: pending.source_file_fingerprint.clone(),
+            });
+        }
+        candidates
+    }
+
+    pub(crate) fn retain_fully_cutoff_corrections(
+        candidates: &mut Vec<ClaudeCutoffCorrectionCandidate>,
+        remaining: &[SnapshotItem],
+    ) {
+        candidates.retain(|candidate| {
+            !remaining.iter().any(|snapshot| {
+                snapshot.source_file_fingerprint.as_deref() == Some(candidate.revision.as_str())
+            })
+        });
+    }
+
+    // D2: apply only after final file selection. Restoring a prior entity or
+    // revision invalidates the current-page no-body evidence and keeps debt.
+    pub(crate) fn settle_cutoff_claude_proof_corrections(
+        &mut self,
+        candidates: &[ClaudeCutoffCorrectionCandidate],
+    ) {
+        for candidate in candidates {
+            let Some(record) = self.claude_usage_authority_quarantine.get(&candidate.root) else {
+                continue;
+            };
+            if !record.proof_correction.as_ref().is_some_and(|correction| {
+                correction.proof_witness_fingerprint == candidate.proof
+                    && correction.owed_member_ids.contains(&candidate.member)
+            }) || !self
+                .claude_usage_family_witnesses
+                .get(&candidate.root)
+                .is_some_and(|witness| claude_usage_authority_preserves_pending(record, witness))
+                || !self.files.get(&candidate.index_key).is_some_and(|entry| {
+                    entry.source_file_fingerprint == candidate.revision
+                        && entry.last_snapshot_fingerprint.is_none()
+                })
+                || !self.confirmed_empty_files.contains(&candidate.index_key)
+                || self
+                    .file_snapshot_fingerprints
+                    .get(&candidate.index_key)
+                    .is_some_and(|items| !items.is_empty())
+            {
+                continue;
+            }
+            let record = self
+                .claude_usage_authority_quarantine
+                .get_mut(&candidate.root)
+                .unwrap();
+            record
+                .member_source_file_fingerprints
+                .insert(candidate.member.clone(), candidate.revision.clone());
+            let correction = record.proof_correction.as_mut().unwrap();
+            correction.owed_member_ids.remove(&candidate.member);
+            if correction.owed_member_ids.is_empty() {
+                self.claude_usage_authority_quarantine
+                    .remove(&candidate.root);
+                self.claude_usage_family_pending.remove(&candidate.root);
+            }
+            eprintln!("local snapshot sync: claude proof correction reason=backfill_cutoff drained_members=1");
+        }
+    }
+
     /// Called only at an index settlement boundary. A following save either
     /// commits both exact body state and owed progress, or commits neither.
     pub(crate) fn settle_claude_proof_corrections(
@@ -480,6 +610,26 @@ impl ScanIndex {
         accepted: &BTreeSet<String>,
         accepted_bodies: &BTreeMap<String, String>,
     ) {
+        self.settle_claude_proof_corrections_with_permanent(
+            previous,
+            candidates,
+            accepted,
+            accepted_bodies,
+            |_, _| false,
+        );
+    }
+
+    pub(crate) fn settle_claude_proof_corrections_with_permanent(
+        &mut self,
+        previous: &ScanIndex,
+        candidates: &[ClaudeProofCorrectionCandidate],
+        accepted: &BTreeSet<String>,
+        accepted_bodies: &BTreeMap<String, String>,
+        permanent: impl Fn(&str, &str) -> bool,
+    ) {
+        if !self.claude_authority_proof_correction_pending() {
+            return;
+        }
         let mut by_file = BTreeMap::<&str, Vec<&ClaudeProofCorrectionCandidate>>::new();
         for candidate in candidates {
             by_file
@@ -541,9 +691,20 @@ impl ScanIndex {
             {
                 continue;
             }
-            let acked = group.iter().all(|item| {
-                accepted.contains(&item.fingerprint)
-                    && accepted_bodies.get(&item.fingerprint) == Some(&item.body_witness)
+            let rejected = |item: &ClaudeProofCorrectionCandidate| {
+                permanent(&item.fingerprint, &item.body_witness)
+                    && self
+                        .quarantined_snapshot_fingerprints
+                        .get(&item.fingerprint)
+                        .is_some_and(|record| {
+                            record.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
+                                && record.upload_body_witness.as_ref() == Some(&item.body_witness)
+                        })
+            };
+            let acked_or_rejected = group.iter().all(|item| {
+                (accepted.contains(&item.fingerprint)
+                    && accepted_bodies.get(&item.fingerprint) == Some(&item.body_witness))
+                    || rejected(item)
             });
             let noop = previous.accepted_snapshot_fingerprint_ledger_version
                 == SNAPSHOT_ACCEPTED_LEDGER_VERSION
@@ -557,8 +718,11 @@ impl ScanIndex {
                     previous.accepted_snapshot_fingerprints.contains(fp)
                         && !previous.quarantined_snapshot_fingerprints.contains_key(fp)
                 });
-            if !acked && !noop {
+            if !acked_or_rejected && !noop {
                 continue;
+            }
+            for item in group.iter().filter(|item| rejected(item)) {
+                eprintln!("local snapshot sync: claude proof correction reason=permanent_rejection drained_members=1 body_witness={}", item.body_witness);
             }
             let record = self
                 .claude_usage_authority_quarantine

@@ -517,7 +517,7 @@ fn new_reader_keeps_old_contract_records_byte_identical() {
     );
     assert_eq!(serde_json::to_string(&record).unwrap(), expected);
     assert_eq!(
-        pre_change_cfbf6d10::reencode(&expected),
+        previous_release_0_1_173::reencode(&expected),
         expected,
         "the pre-change decoder reads and writes the same record"
     );
@@ -551,7 +551,7 @@ fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
     let saved = serde_json::to_value(&index).unwrap();
     let records = &saved["claude_usage_authority_quarantine"];
     assert!(records[APC_ROOT].get("proof_correction").is_some());
-    let accepted = pre_change_cfbf6d10::loader_accepts_authority_records(
+    let accepted = previous_release_0_1_173::loader_accepts_authority_records(
         records,
         &index.claude_usage_family_witnesses,
     )
@@ -561,14 +561,14 @@ fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
     let mut stranded = records.clone();
     stranded[APC_ROOT]["contract"] = json!(CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION);
     assert!(
-        pre_change_cfbf6d10::loader_accepts_authority_records(
+        previous_release_0_1_173::loader_accepts_authority_records(
             &stranded,
             &index.claude_usage_family_witnesses,
         )
         .unwrap(),
         "an undeclared field would be silently dropped by the old reader"
     );
-    let dropped: Value = serde_json::from_str(&pre_change_cfbf6d10::reencode(
+    let dropped: Value = serde_json::from_str(&previous_release_0_1_173::reencode(
         &stranded[APC_ROOT].to_string(),
     ))
     .unwrap();
@@ -578,6 +578,7 @@ fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-old-reader");
     let path = scratch.join("index.json");
     index.save(&path).unwrap();
+    let encoded_index_bytes = fs::metadata(&path).unwrap().len();
     let files = index.files.len();
     let accepted_entities = index.accepted_snapshot_fingerprints.len();
     let rebuilt = quarantine_invalid_scan_index(&path).unwrap();
@@ -595,8 +596,11 @@ fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
     }
     apc_emit(json!({
         "receipt": "claude_authority_correction_old_reader:v1",
-        "decoder": "source_pinned_cfbf6d10_record_and_predicate",
+        "decoder": "source_pinned_0_1_173_896b98f6_record_and_predicate",
+        "release_version": "0.1.173",
+        "release_source_commit": "896b98f6b7347251b35c2d13cd462b132cd99d84",
         "old_binary_executed": false,
+        "synthetic_encoded_index_bytes": encoded_index_bytes,
         "v2_record_serde_decode_ok": true,
         "v2_record_old_predicate_accepts": accepted,
         "rebuild_reparsed_file_count": files,
@@ -1578,6 +1582,288 @@ fn an_accepted_unchanged_body_drains_as_a_no_op_without_an_upload() {
     );
 }
 
+#[test]
+fn terminal_refusal_requires_current_proof_revision_body_and_nonpartial_outcome() {
+    let [root, agent] = apc_members();
+    let key = apc_keys()[0].clone();
+    let fp = apc_hex('c');
+    let body = apc_hex('7');
+    let mut base = apc_granted();
+    base.accepted_snapshot_fingerprints.remove(&fp);
+    let mut digest = Sha256::new();
+    update_length_prefixed(&mut digest, b"snapshot_file_upload_body_set:v1");
+    update_length_prefixed(&mut digest, body.as_bytes());
+    base.files.get_mut(&key).unwrap().last_upload_body_witness =
+        Some(format!("{:x}", digest.finalize()));
+    base.quarantined_snapshot_fingerprints.insert(
+        fp.clone(),
+        SnapshotQuarantineRecord {
+            witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            retry_after_unix_seconds: 0,
+            upload_body_witness: Some(body.clone()),
+            failed_reconstruction_count: MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+            disposition: SnapshotQuarantineDisposition::UnprovenTerminal,
+        },
+    );
+    let candidate = ClaudeProofCorrectionCandidate {
+        index_key: key.clone(),
+        root: APC_ROOT.to_string(),
+        member: root.clone(),
+        proof: apc_record(&base).proven_witness_fingerprint.clone(),
+        revision: apc_revisions()[0].clone(),
+        fingerprint: fp.clone(),
+        body_witness: body.clone(),
+    };
+    let scratch = crate::test_scratch::ScratchDir::new("apc-terminal-refusal");
+    let path = scratch.join("index.json");
+    let mut before = base.clone();
+    let before = apc_save_reload(&mut before, &path);
+    assert_eq!(
+        apc_owed(&before),
+        Some(BTreeSet::from([root.clone(), agent.clone()])),
+        "restart before settlement keeps debt"
+    );
+    for case in [
+        "permanent",
+        "retryable",
+        "superseded",
+        "other-proof",
+        "other-body",
+        "partial",
+    ] {
+        let mut index = base.clone();
+        let frame = apc_frame(&index);
+        let mut item = candidate.clone();
+        match case {
+            "retryable" => {
+                let quarantine = index
+                    .quarantined_snapshot_fingerprints
+                    .get_mut(&fp)
+                    .unwrap();
+                quarantine.disposition = SnapshotQuarantineDisposition::RetryPending;
+                quarantine.failed_reconstruction_count = 1;
+            }
+            "superseded" => {
+                index.files.get_mut(&key).unwrap().source_file_fingerprint = apc_hex('8')
+            }
+            "other-proof" => item.proof = apc_hex('9'),
+            "other-body" => {
+                index
+                    .quarantined_snapshot_fingerprints
+                    .get_mut(&fp)
+                    .unwrap()
+                    .upload_body_witness = Some(apc_hex('a'))
+            }
+            _ => {}
+        }
+        let outside = apc_outside(&index);
+        if case == "partial" {
+            index.settle_claude_proof_corrections(
+                &base,
+                &[item],
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+            );
+        } else {
+            index.settle_claude_proof_corrections_with_permanent(
+                &base,
+                &[item],
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+                |fingerprint, witness| fingerprint == fp && witness == body,
+            );
+        }
+        assert_eq!(
+            apc_frame(&index),
+            frame,
+            "{case}: counters/deadline unchanged"
+        );
+        assert_eq!(
+            apc_outside(&index),
+            outside,
+            "{case}: accepted/refusal/debt state unchanged"
+        );
+        let loaded = apc_save_reload(&mut index, &path);
+        assert_eq!(
+            apc_owed(&loaded),
+            Some(if case == "permanent" {
+                BTreeSet::from([agent.clone()])
+            } else {
+                BTreeSet::from([root.clone(), agent.clone()])
+            }),
+            "{case}"
+        );
+    }
+}
+
+fn apc_cutoff_item(revision: &str, activity: &str) -> SnapshotItem {
+    let mut item = cache_fixture_item();
+    item.source_session_id = APC_ROOT.to_string();
+    item.source_file_fingerprint = Some(revision.to_string());
+    item.attribution_facts.clear();
+    item.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".to_string());
+    item.source_started_at = Some(activity.to_string());
+    item.source_ended_at = Some(activity.to_string());
+    item.source_last_activity_at = Some(activity.to_string());
+    item
+}
+
+#[test]
+fn cutoff_only_completion_carries_its_selected_empty_facts_or_stays_owed() {
+    let [root, agent] = apc_members();
+    let key = apc_keys()[0].clone();
+    let revision = apc_hex('6');
+    let cutoff = crate::backfill::BackfillState {
+        backfill_cutoff_at: Some("2026-09-30T08:00:00Z".to_string()),
+        ..Default::default()
+    };
+    let cutoff_bytes = serde_json::to_vec(&cutoff).unwrap();
+    for rollback in [false, true] {
+        let before = apc_granted();
+        let mut index = before.clone();
+        index.files.get_mut(&key).unwrap().source_file_fingerprint = revision.clone();
+        let mut scan = apc_scan(true, vec![apc_pending(0, &revision, true, 1)]);
+        scan.snapshots
+            .push(apc_cutoff_item(&revision, "2026-09-30T07:00:00Z"));
+        let mut candidates = index
+            .capture_claude_cutoff_corrections(&scan, &ClaudeUsageAuthorityDisposition::default());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            crate::backfill::apply_backfill_cutoff(&mut scan.snapshots, &cutoff),
+            1
+        );
+        ScanIndex::retain_fully_cutoff_corrections(&mut candidates, &scan.snapshots);
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::ClaudeCode,
+            &mut scan,
+            &mut index,
+            snapshot_upload_body_witness,
+        );
+        if rollback {
+            index.files.insert(key.clone(), before.files[&key].clone());
+            index
+                .file_snapshot_fingerprints
+                .insert(key.clone(), before.file_snapshot_fingerprints[&key].clone());
+            index.confirmed_empty_files.remove(&key);
+        }
+        let frame = apc_frame(&index);
+        let outside = apc_outside(&index);
+        // Current-page non-empty parses cannot borrow the M2 empty path.
+        index.settle_empty_claude_proof_corrections(&scan);
+        assert_eq!(
+            apc_owed(&index),
+            Some(BTreeSet::from([root.clone(), agent.clone()]))
+        );
+        index.settle_cutoff_claude_proof_corrections(&candidates);
+        assert_eq!(apc_outside(&index), outside);
+        assert_eq!(apc_frame(&index), frame);
+        let scratch = crate::test_scratch::ScratchDir::new("apc-cutoff-restart");
+        let path = scratch.join("index.json");
+        let mut durable_before = before;
+        let restarted_before = apc_save_reload(&mut durable_before, &path);
+        assert_eq!(
+            apc_owed(&restarted_before),
+            Some(BTreeSet::from([root.clone(), agent.clone()]))
+        );
+        let loaded = apc_save_reload(&mut index, &path);
+        assert_eq!(
+            apc_owed(&loaded),
+            Some(if rollback {
+                BTreeSet::from([root.clone(), agent.clone()])
+            } else {
+                BTreeSet::from([agent.clone()])
+            })
+        );
+        if !rollback {
+            assert_eq!(apc_map(&loaded)[&root], revision);
+        }
+    }
+    assert_eq!(serde_json::to_vec(&cutoff).unwrap(), cutoff_bytes);
+}
+
+#[test]
+fn partial_cutoff_keeps_the_remaining_body_on_the_exact_ack_path() {
+    let revision = apc_revisions()[0].clone();
+    let before = apc_granted();
+    for (complete, held, parsed_count) in [
+        (true, false, 2),
+        (false, false, 2),
+        (true, true, 2),
+        (true, false, 3),
+    ] {
+        let mut index = before.clone();
+        let mut scan = apc_scan(
+            true,
+            vec![apc_pending(0, &revision, complete, parsed_count)],
+        );
+        scan.snapshots = vec![
+            apc_cutoff_item(&revision, "2026-09-30T07:00:00Z"),
+            apc_cutoff_item(&revision, "2026-09-30T09:00:00Z"),
+        ];
+        let mut disposition = ClaudeUsageAuthorityDisposition::default();
+        if held {
+            disposition
+                .quarantined_source_session_ids
+                .insert(APC_ROOT.to_string());
+        }
+        let mut cutoff_candidates = index.capture_claude_cutoff_corrections(&scan, &disposition);
+        assert_eq!(
+            cutoff_candidates.len(),
+            usize::from(complete && !held && parsed_count == 2)
+        );
+        let cutoff = crate::backfill::BackfillState {
+            backfill_cutoff_at: Some("2026-09-30T08:00:00Z".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::backfill::apply_backfill_cutoff(&mut scan.snapshots, &cutoff),
+            1
+        );
+        ScanIndex::retain_fully_cutoff_corrections(&mut cutoff_candidates, &scan.snapshots);
+        assert!(
+            cutoff_candidates.is_empty(),
+            "one capturable item forbids a policy drain"
+        );
+        if !complete || held || parsed_count != 2 {
+            continue;
+        }
+        let candidates = index.capture_claude_proof_corrections(
+            &mut scan,
+            &disposition,
+            snapshot_upload_body_witness,
+        );
+        assert_eq!(candidates.len(), 1);
+        finalize_scan_after_policy_with_body_witness(
+            SnapshotSource::ClaudeCode,
+            &mut scan,
+            &mut index,
+            snapshot_upload_body_witness,
+        );
+        index.settle_cutoff_claude_proof_corrections(&cutoff_candidates);
+        index.settle_claude_proof_corrections(
+            &before,
+            &candidates,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(apc_owed(&index), apc_owed(&before));
+        let candidate = &candidates[0];
+        index.settle_claude_proof_corrections(
+            &before,
+            &candidates,
+            &BTreeSet::from([candidate.fingerprint.clone()]),
+            &BTreeMap::from([(
+                candidate.fingerprint.clone(),
+                candidate.body_witness.clone(),
+            )]),
+        );
+        assert_eq!(
+            apc_owed(&index),
+            Some(BTreeSet::from([apc_members()[1].clone()]))
+        );
+    }
+}
+
 /// OBS: correction state persists only the proof and the owed member ids; owed
 /// counts and reasons go only to the existing local diagnostic line.
 #[test]
@@ -1961,16 +2247,16 @@ fn proof_correction_encoded_and_owned_bytes_receipt() {
 }
 
 /// Source-pinned pre-change decoder. The record type and its predicate are
-/// copied verbatim from `crates/ottto-service/src/snapshots.rs` at base
-/// cfbf6d100abd12c80d7b1b446ff5159a66c69116 (blob a993d908e79b), lines
+/// copied (with rustfmt line wrapping) from `crates/ottto-service/src/snapshots.rs` at release source
+/// 896b98f6b7347251b35c2d13cd462b132cd99d84 (release 0.1.173; blob 00ffefd4574e), lines
 /// 2350-2370 and 2570-2595; they use the unchanged shared helpers, constants
 /// and disposition enum. Only the authority conjuncts of that base's
 /// `ScanIndex::load` guard (lines 22481-22495) are restated as a function.
 /// This is source characterization, not an older binary.
-mod pre_change_cfbf6d10 {
+mod previous_release_0_1_173 {
     use super::*;
 
-    // BEGIN VERBATIM cfbf6d10 snapshots.rs 2350-2370
+    // BEGIN SOURCE-PINNED 0.1.173 896b98f6 snapshots.rs 2350-2370
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct ClaudeUsageAuthorityQuarantineRecord {
         contract: String,
@@ -1992,9 +2278,9 @@ mod pre_change_cfbf6d10 {
         disposition: ClaudeUsageAuthorityQuarantineDisposition,
         retry_after_unix_seconds: u64,
     }
-    // END VERBATIM
+    // END SOURCE-PINNED
 
-    // BEGIN VERBATIM cfbf6d10 snapshots.rs 2570-2595
+    // BEGIN SOURCE-PINNED 0.1.173 896b98f6 snapshots.rs 2570-2595
     fn claude_usage_authority_deadline_is_bounded(
         record: &ClaudeUsageAuthorityQuarantineRecord,
     ) -> bool {
@@ -2022,7 +2308,7 @@ mod pre_change_cfbf6d10 {
             && record.retry_after_unix_seconds
                 <= now.saturating_add(CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS.saturating_mul(2))
     }
-    // END VERBATIM
+    // END SOURCE-PINNED
 
     /// The base loader's authority conjuncts over the saved
     /// `claude_usage_authority_quarantine` map, decoded with the base record

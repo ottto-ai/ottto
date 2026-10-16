@@ -61,9 +61,32 @@ empty or out-of-family owed sets fail closed. An older reader rejects v2 through
 its existing contract validator and can quarantine/rebuild the whole index on
 rollback. A live downgrade and installed rebuild cost are not established here.
 
-Validation is pending for the production repair. The earlier green
-characterization tests prove the rejected transitions only. Natural multipage
-replay/save/reload, mixed ACK/hold, empty/absence, invalid-load and allocation
-regressions must pass on the exact implementation head before landing. Requested
-allocation bytes are distinct from installed RSS, CPU and reread acceptance;
-this source change alone establishes none of those installed outcomes.
+Two additional terminal outcomes complete a correction without an ACK. An exact
+permanent refusal of the current corrected body drains only alongside its existing
+permanent-rejection and terminal-quarantine witnesses, on a clean terminal upload
+outcome. Retryable, stale-revision, other-proof and partial outcomes do not qualify.
+The refusal remains observable. A completed unheld parse whose corrected items are
+all removed solely by the account-switch cutoff drains as a policy no-op. If any
+item survives the cutoff, the ordinary ACK/no-op path applies. Both drains use the
+final selected file revision; a restored prior entity invalidates the cutoff drain.
+No extra persisted metadata is added. Completion flags are computed after these
+and confirmed-empty drains, so settling the last empty member needs no extra sweep.
+
+A daemon older than this release that reads an index written by it discards the
+index and rescans from scratch. Usage is not lost; the rescan costs a full first
+scan's time and upload volume. The decoder is pinned to previous stable 0.1.173,
+release source `896b98f6b7347251b35c2d13cd462b132cd99d84`. Its record, authority
+validator, index-load guard and quarantine/rebuild helper were source-compared
+against the characterization base. The synthetic fixture reparses two files and
+discards two local accepted-ledger entries. This is a cost estimate, not a measured
+downgrade. An actual old binary was not run, and no valid saved first-scan/backfill
+wall-time receipt was available; real rebuild wall time and bytes remain unmeasured.
+The qualified compatibility gate accepts this disclosed source characterization.
+
+The earlier implementation passed all 33 new correction regressions and the
+containing hosted service suite (2,858 passed, zero failed, 22 ignored). Independent
+strict review then found the terminal-outcome and completion-order defects above.
+Seven additional regressions and their corrections await exact-head hosted CI and
+focused verification. Requested allocation bytes remain distinct from installed
+RSS, CPU and reread acceptance; this source change establishes none of those
+installed outcomes.

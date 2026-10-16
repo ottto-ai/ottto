@@ -56037,6 +56037,7 @@ crate::heap_layout_bound::fields!(ClaudeUsageAuthorityQuarantineRecord; contract
 crate::heap_layout_bound::fields!(ClaudeEmptyMapAdvance; root, member, key, revision, previous);
 crate::heap_layout_bound::fields!(ClaudeAuthorityProofCorrection; proof_witness_fingerprint, owed_member_ids);
 crate::heap_layout_bound::fields!(ClaudeProofCorrectionCandidate; index_key, root, member, proof, revision, fingerprint, body_witness);
+crate::heap_layout_bound::fields!(ClaudeCutoffCorrectionCandidate; index_key, root, member, proof, revision);
 crate::heap_layout_bound::fields!(ClaudeUsageFamilyPending; census_window_end, member_request_id_hashes, member_occurrences, invalid);
 crate::heap_layout_bound::fields!(ClaudeUsageFamilyWitness; evidence_fingerprint, member_request_id_fingerprints, member_occurrence_fingerprints, assigned_request_id_fingerprints, legacy_excluded_request_id_hashes, legacy_exclusion_evidence_fingerprint, legacy_owner_roots);
 crate::heap_layout_bound::fields!(CodexParentOwnershipLedger; signatures, scan_complete, opened_object_identity);
