@@ -1,10 +1,12 @@
-//! Interim copy containment components. Not wired into scan/upload decisions.
+//! Interim copy containment components and inactive native integration seams.
+//! The ordinary daemon owner does not attach a comparison context yet.
 //! Pair observations are negative evidence only, never a uniqueness certificate,
 //! accepted-request membership, account identity or provider ownership proof.
 use super::{SnapshotItem, MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS};
 use serde::{Deserialize, Serialize};
 
 mod membership;
+pub(crate) mod pipeline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NativePairObservation {
@@ -64,8 +66,8 @@ pub(super) enum ReadDisposition {
     ParkUnchangedHeldRevision,
 }
 
-/// Proposed local held-revision value, not yet a ScanIndex field or wire data.
-/// A typed value cannot itself establish the durable save or comparison scope.
+/// Local held-revision value in a separately validated ScanIndex ledger.
+/// It is not wire data and cannot itself establish comparison scope or custody.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "UncheckedHoldRevision")]
 pub(super) struct HoldRevision {

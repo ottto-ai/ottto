@@ -3644,6 +3644,121 @@ fn transcript_markers_tag_only_requests_a_settled_census_shows_unduplicated() {
 
 // --- Zero-usage responses -----------------------------------------------------
 
+/// A parked transcript is still uncompared. Matching the base's uncompared
+/// census must preserve healthy telemetry tags byte-for-byte while neither a
+/// healthy marker nor a copied prefix can borrow uniqueness from the hold.
+#[test]
+fn copy_containment_parked_debt_preserves_matched_unsettled_identity_and_own_telemetry() {
+    let dir = temp_dir("claude-copy-held-identity");
+    let mut lines = email_session(false, false);
+    lines.push(owned_response("req_2", "2026-08-02T07:00:02Z", 20, 2));
+    let org = org_hash(ORG_1);
+    let mut member = complete_api_row(ROOT, "req_member", 9, 10, 1, 0);
+    member.request_identity = Some(org_identity(&org));
+    let (api, trace) = reports(
+        vec![
+            signed(member),
+            signed(complete_api_row(ROOT, "req_2", 2, 20, 2, 0)),
+        ],
+        vec![
+            complete_trace_row(ROOT, "req_member", ""),
+            complete_trace_row(ROOT, "req_2", ""),
+        ],
+    );
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let clean = ScanIndex::default();
+    let mut encoded = serde_json::to_value(&clean).unwrap();
+    encoded["claude_copy_holds"] = json!({"synthetic-parked-copy": {
+        "revision": {"version": 1, "reason": "copied_overlap_unproven",
+            "source_revision": "c".repeat(64), "comparison_context": "d".repeat(64),
+            "first_observed_unix_seconds": null},
+        "peers": ["e".repeat(64)]
+    }});
+    let held: ScanIndex = serde_json::from_value(encoded).unwrap();
+    assert_eq!(held.copy_hold_count(), 1);
+    let run = |index: &ScanIndex, compared: bool| {
+        let mut items = parse_session(&dir, &lines);
+        let disposition = ClaudeUsageAuthorityDisposition {
+            duplicate_census: ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                coverage_complete: true,
+                ..Default::default()
+            },
+            transcript_ownership_complete: compared,
+            ..Default::default()
+        };
+        let ownership = identity::TranscriptOwnership::after_census(index, &disposition);
+        identity::apply_scan_with_ownership(&mut items, &evidence, BTreeMap::new(), &ownership);
+        items.remove(0)
+    };
+    let baseline = run(&clean, false);
+    let parked = run(&held, true); // Even optimistic census flags cannot bless parked debt.
+    assert_eq!(
+        serde_json::to_vec(&parked).unwrap(),
+        serde_json::to_vec(&baseline).unwrap()
+    );
+    let bases = |item: &SnapshotItem| {
+        item.request_evidence
+            .iter()
+            .map(|part| {
+                (
+                    part.identity_basis.clone(),
+                    part.provider_workspace_hash.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        bases(&parked),
+        BTreeSet::from([(identity::TELEMETRY_LOGIN.to_string(), None)])
+    );
+    assert_eq!(parked.request_identity_refusals, 0);
+    let settled_control = run(&clean, true);
+    assert!(bases(&settled_control)
+        .iter()
+        .any(|(basis, _)| basis == identity::TRANSCRIPT_ORG));
+    assert_eq!(parked.input_tokens, settled_control.input_tokens);
+    assert_eq!(parked.output_tokens, settled_control.output_tokens);
+    assert_eq!(parked.cost, settled_control.cost);
+
+    // A root with copied markers and no own telemetry gets no tag from the
+    // original's rows, even with optimistic census flags and a complete parse.
+    let mut fork_lines = lines.clone();
+    for line in &mut fork_lines {
+        if line.get("sessionId").is_some() {
+            line["sessionId"] = json!(OTHER_ROOT);
+        }
+    }
+    let fork_path = dir.join(format!("{OTHER_ROOT}.jsonl"));
+    fs::write(
+        &fork_path,
+        fork_lines
+            .iter()
+            .map(|line| line.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    let mut fork =
+        parse_claude_code_jsonl_file(&fork_path, "2026-08-02T07:01:00Z", "f".repeat(64)).unwrap();
+    let disposition = ClaudeUsageAuthorityDisposition {
+        duplicate_census: ClaudeDuplicateCensusCounts {
+            census_complete: true,
+            coverage_complete: true,
+            ..Default::default()
+        },
+        transcript_ownership_complete: true,
+        ..Default::default()
+    };
+    identity::apply_scan_with_ownership(
+        &mut fork,
+        &evidence,
+        BTreeMap::new(),
+        &identity::TranscriptOwnership::after_census(&held, &disposition),
+    );
+    assert!(fork.iter().all(|item| item.request_evidence.is_empty()));
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// One owned response of `ROOT` with its own request id.
 fn owned_response(request_id: &str, timestamp: &str, input: u64, output: u64) -> Value {
     json!({"timestamp": timestamp, "type": "assistant", "sessionId": ROOT,

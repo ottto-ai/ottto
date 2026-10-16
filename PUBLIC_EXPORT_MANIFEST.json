@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 663,
-  "content_sha256": "364b43f47e56f4873c5437781ca870afcc22e9fa29d10b2172bf38df611b03fc",
+  "candidate_file_count": 665,
+  "content_sha256": "51c538a12e05e7ba8c24901beebcb02cd5bea2711d52115205ca263ddfce67df",
   "files": [
     {
       "executable": false,
@@ -1182,8 +1182,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "16097baa811f5547831ae2a39c631267216cd6c7d35e80bc8e483d656a3950a9",
-      "size_bytes": 766311
+      "sha256": "ea92cd652655ff56149156a161b5002d3355c31f77de3ac7236eca61b5a4554f",
+      "size_bytes": 766688
     },
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "54d829287b9cc1f5da715c5ff2e0a1c1af54aa308d20a584f2ab34469c99b12a",
-      "size_bytes": 2463659
+      "sha256": "42f4951e772fb29d2788dab13bb031576350871cbc0d37f79332d9a65b5dbee1",
+      "size_bytes": 2467076
     },
     {
       "executable": false,
@@ -1273,8 +1273,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_copy_containment.rs",
-      "sha256": "82e617d407fdcb535715f962b40a7c28d1276ea3d2b981b3e4374d151c05401f",
-      "size_bytes": 6440
+      "sha256": "c37b5607a8b997febb71d331636d424e527d96756885a6a94de93feaaa3b99b1",
+      "size_bytes": 6532
     },
     {
       "executable": false,
@@ -1289,6 +1289,20 @@
       "path": "crates/ottto-service/src/snapshots/claude_copy_containment/membership/tests.rs",
       "sha256": "e829f2ba4aacc0c6eb7e3863480b8e920150e136121c42198648b96aba7503ea",
       "size_bytes": 7705
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_copy_containment/pipeline.rs",
+      "sha256": "f7bed22caae411f44973a8b6b001dc931e4d34e9c16462fbe77d5ba6d633d52b",
+      "size_bytes": 12514
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_copy_containment/pipeline/tests.rs",
+      "sha256": "7489c2ec93ff91e8737a52e795f8687b8915eb44f2d24f14439bddf8ab5b1aa0",
+      "size_bytes": 13661
     },
     {
       "executable": false,
@@ -1315,15 +1329,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_identity.rs",
-      "sha256": "e9821f1165c4161e50aa843637eaff59fb9fe596d6529fb0c5337bad2cf40c49",
-      "size_bytes": 83976
+      "sha256": "70a2610c7c3c456af89f92ed76672e15e42372f663e15e0e7c270a008eed1663",
+      "size_bytes": 84024
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_identity_tests.rs",
-      "sha256": "0bedda7c9cb245f7976f93cdf30b06b5eb0f779cbca87deb68cb6d63956821e7",
-      "size_bytes": 162332
+      "sha256": "c0a12e0a00fad6bfe2d260d66f98c77b7ec5b62f74569d4bf3a1946197b8c520",
+      "size_bytes": 166952
     },
     {
       "executable": false,
@@ -1539,8 +1553,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/claude-copy-containment.md",
-      "sha256": "3df3df64643df628f35a8c060f471f17693d6df6e04045d0faaa6bd62089b64f",
-      "size_bytes": 7879
+      "sha256": "5ed2a1d9e3d339f150596e518bcfa7761f3e6227d9545ba726fb3b2aa929230b",
+      "size_bytes": 11247
     },
     {
       "executable": false,
@@ -4644,9 +4658,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-16T02:37:36+00:00",
+  "generated_at": "2026-10-16T20:53:10+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 664,
+  "output_file_count": 666,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -4683,5 +4697,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "da92e73dc4b467650350d07490fd018bbb394184"
+  "source_commit": "40690ef9c3c98188ceb64fb4590dfd43b03a5534"
 }

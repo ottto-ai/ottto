@@ -366,7 +366,7 @@ struct UploadIndexSettlement {
 /// A persisted account hold was never uploaded, so the backfill and replay it
 /// belongs to stay pending even on a page that did not revisit it.
 fn upload_settled_without_account_holds(index: &ScanIndex, settled: bool) -> bool {
-    settled && index.claude_account_deferred_hold_count() == 0
+    settled && index.claude_account_deferred_hold_count() == 0 && index.copy_hold_count() == 0
 }
 
 /// Settle a `Completed` upload: every uploaded entity was accepted or
@@ -461,6 +461,7 @@ fn settle_upload_corrections_after_selection(
     cutoff_candidates: &[crate::snapshots::ClaudeCutoffCorrectionCandidate],
     transport_fully_settled: bool,
 ) -> bool {
+    index.restore_copy_held_checkpoint(committed_index);
     // D1 is deliberately unavailable to partial/deferred/shed/error outcomes.
     // Both existing durable refusal carriers must bind the exact current body.
     if transport_fully_settled {
@@ -1758,6 +1759,7 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
         .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
         .collect();
     let mut committable = index.committable_subset(committed_index, &accepted, &quarantined);
+    committable.restore_copy_held_checkpoint(committed_index);
     if let Some(scan) = correction_scan {
         // A2: settle no-body grants only against the file/empty/map facts
         // actually selected for this save, after any old-entry restoration.
@@ -5253,6 +5255,9 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
         index,
         identity_evidence.as_ref(),
     );
+    // Keep all actual native observations through the authoritative fold;
+    // withheld copies never reach C5 construction, name/account binding or POST.
+    disposition.retain_copy_uploadable(&mut scan_result.snapshots);
     if let Some(evidence) = &identity_evidence {
         // Contract 5 first: D1 below leaves new-collector items untouched. The
         // rebuild above has just settled this pass's duplicate census.

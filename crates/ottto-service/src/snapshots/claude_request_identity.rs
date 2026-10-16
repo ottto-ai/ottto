@@ -2048,7 +2048,8 @@ impl<'i> TranscriptOwnership<'i> {
         let census = &disposition.duplicate_census;
         Self {
             duplicates: &index.claude_duplicate_request_owners,
-            settled: census.census_complete
+            settled: index.copy_hold_count() == 0
+                && census.census_complete
                 && census.coverage_complete
                 && disposition.transcript_ownership_complete
                 && !census.census_invalid
