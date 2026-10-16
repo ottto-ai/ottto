@@ -1631,45 +1631,63 @@ fn native_comparison_legacy_exclusion_is_target_evidence_never_a_q5_prior() {
         .trace
         .evidence
         .insert(c.to_owned(), vec![complete_trace_row(c, "req_extra", "")]);
-    for entry in fixture.index.files.values_mut() {
-        entry.source_file_fingerprint.clear();
+    // Introducing C changes the duplicate-owner witness and legitimately
+    // rearms existing members. This is a qualification fixture, not a quiet
+    // convergence oracle: establish a second complete native conjunction before
+    // asking which unchanged members the ordinary scanner can actually skip.
+    // Never restore fingerprints by hand or suppress that production rearm.
+    for establishing_pass in 0..2 {
+        for entry in fixture.index.files.values_mut() {
+            entry.source_file_fingerprint.clear();
+        }
+        let native = OwnedSourceScan::new_with_identity_capture(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&fixture.dir),
+            fixture.index.clone(),
+            WINDOW,
+            30,
+            8,
+            false,
+            None,
+            &[],
+            false,
+            false,
+            false,
+        );
+        let (mut index, mut scan) = SelectionFixture::run(native);
+        assert_eq!(scan.scanned_file_count, 3);
+        assert!(scan.census_complete);
+        apply_claude_reported_usage_with_index(
+            &mut scan.snapshots,
+            &fixture.api,
+            &fixture.trace,
+            &mut index,
+            true,
+            WINDOW,
+        );
+        let excluded =
+            index.claude_usage_family_witnesses[c].legacy_excluded_request_id_hashes[c].clone();
+        assert_eq!(
+            excluded,
+            ["req_1", "req_2"]
+                .into_iter()
+                .map(|id| format!("{:x}", Sha256::digest(id.as_bytes())))
+                .collect::<BTreeSet<_>>()
+        );
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+        if establishing_pass == 0 {
+            assert!(index
+                .files
+                .values()
+                .any(|entry| entry.source_file_fingerprint.is_empty()));
+        } else {
+            assert!(index
+                .files
+                .values()
+                .all(|entry| !entry.source_file_fingerprint.is_empty()));
+        }
+        fixture.index = index;
     }
-    let native = OwnedSourceScan::new_with_identity_capture(
-        SnapshotSource::ClaudeCode,
-        std::slice::from_ref(&fixture.dir),
-        fixture.index.clone(),
-        WINDOW,
-        30,
-        8,
-        false,
-        None,
-        &[],
-        false,
-        false,
-        false,
-    );
-    let (mut index, mut scan) = SelectionFixture::run(native);
-    assert_eq!(scan.scanned_file_count, 3);
-    assert!(scan.census_complete);
-    apply_claude_reported_usage_with_index(
-        &mut scan.snapshots,
-        &fixture.api,
-        &fixture.trace,
-        &mut index,
-        true,
-        WINDOW,
-    );
-    let excluded =
-        index.claude_usage_family_witnesses[c].legacy_excluded_request_id_hashes[c].clone();
-    assert_eq!(
-        excluded,
-        ["req_1", "req_2"]
-            .into_iter()
-            .map(|id| format!("{:x}", Sha256::digest(id.as_bytes())))
-            .collect::<BTreeSet<_>>()
-    );
-    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-    fixture.index = index;
     let stable_index = fixture.index.clone();
     fixture
         .index

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 668,
-  "content_sha256": "802a1981cd35c62da90dcbd3183702d882042f2dde8d4c14556b5ec482d5f667",
+  "content_sha256": "6fda8eeace2bc73d5a32904901a802fc27726cf3bc669309dc7e742c53a9dae8",
   "files": [
     {
       "executable": false,
@@ -1406,8 +1406,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/provider_envelope_experiment_tests.rs",
-      "sha256": "f53c96a306f0621efbcd022f6a1eb626166ce6aa5421ae244a0d0ff649e2a3d6",
-      "size_bytes": 70581
+      "sha256": "56e10152b3c064f35492f592f3ea473ce5578c8c36ed834a974c8368f30b45f4",
+      "size_bytes": 71526
     },
     {
       "executable": false,
@@ -4718,5 +4718,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "7e175a184219494f563437276042c7f48fb6a9e6"
+  "source_commit": "10f2507894f9a540c43b05dc0df6b69db1ebf7d8"
 }
