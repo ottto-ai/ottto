@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 658,
-  "content_sha256": "13e6d6b638bd9a69c2870cd155696261079802852bb3cd13accf7dc1a503aad7",
+  "content_sha256": "a22d27e728f2aeeae470eae49941251236b8bac054e7b0401d51b47a5d8a2249",
   "files": [
     {
       "executable": false,
@@ -1294,8 +1294,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_identity_tests.rs",
-      "sha256": "3a6205ae43e88c794d18b629cf72fafd8c35bf01d31d822cce0e991ab8670ded",
-      "size_bytes": 149712
+      "sha256": "0bedda7c9cb245f7976f93cdf30b06b5eb0f779cbca87deb68cb6d63956821e7",
+      "size_bytes": 162332
     },
     {
       "executable": false,
@@ -4609,7 +4609,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-16T01:13:31+00:00",
+  "generated_at": "2026-10-16T02:22:56+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 659,
   "public_roots": [
@@ -4648,5 +4648,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f8ba39637e76bea6e463777772da87903e42c6af"
+  "source_commit": "3b76e5f214c4a36587b151b805d081ecfd2a9ed5"
 }
