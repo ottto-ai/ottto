@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 668,
-  "content_sha256": "c3475ee7080ba5c26ece72320cfef5df6332ec434aca7dea6a929ec926324f7c",
+  "content_sha256": "da4147f9a884959eef7f930be5d92e55dfd278ae58c516535b0f7efb0ae8f852",
   "files": [
     {
       "executable": false,
@@ -1406,8 +1406,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/provider_envelope_experiment_tests.rs",
-      "sha256": "8f098b1c0390469b0c7b229ac5ec465f0ae8f97b6aeb3c6dfd42c61854c3191d",
-      "size_bytes": 56105
+      "sha256": "1eb69d4c6c7b029c736831311f3786139f96d93356e901cbb64bbf581ff16eb1",
+      "size_bytes": 56275
     },
     {
       "executable": false,
@@ -1567,8 +1567,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/native-comparison-driver.md",
-      "sha256": "6c2c444fea0d3dca2b666d4e7b81b658b70fb98ff11e40374b326297c0e3ce66",
-      "size_bytes": 6770
+      "sha256": "8fef48249ae7405d3aa49b19768f3c40e5cfb1a15b5bf13f6da73570a1ccbbed",
+      "size_bytes": 7407
     },
     {
       "executable": false,
@@ -4718,5 +4718,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "0e98ea45785726b3e3cbbb5ad495683946c4ceb0"
+  "source_commit": "a3acb45ba871720b417e5eb9f25614b76fe4b5fa"
 }

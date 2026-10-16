@@ -1364,9 +1364,15 @@ fn native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold()
     let (_fixture, mut state, mut qualification) = native_comparison_positive_hit_fixture();
     let scope_before = state.native_comparison_context().unwrap().to_owned();
     let requested_layout_bytes =
-        crate::heap_layout_bound::completed_bound(&qualification, usize::MAX)
-            .expect("frozen plan has an exhaustively accounted owned graph");
-    assert!(requested_layout_bytes > 0);
+        crate::heap_layout_bound::completed_bound(&qualification, usize::MAX);
+    if crate::heap_layout_bound::layout_supported() {
+        assert!(requested_layout_bytes.is_some_and(|bytes| bytes > 0));
+    } else {
+        assert!(
+            requested_layout_bytes.is_none(),
+            "unvalidated compiler layouts must remain unavailable"
+        );
+    }
     let limit = state.file_limit;
     let selection = state.acquire_native_comparison_targets(&mut qualification);
     assert_eq!(selection.matched_roots, 1);
@@ -1407,7 +1413,7 @@ fn native_comparison_positive_hit_reads_targets_in_same_owner_before_body_fold()
     state.resume_native_comparison_base();
     let (_, scan) = SelectionFixture::run(state);
     assert_eq!(scan.scanned_file_count, 3);
-    writeln!(std::io::stderr().lock(), "native_comparison_target: initial_native=1 matched_roots=1 queued=2 actual_target_reads=2 same_scanner_context=true existing_file_budget=true before_body_fold=true repeated_targets=0 requested_layout_bytes={requested_layout_bytes} rss_measured=false").unwrap();
+    writeln!(std::io::stderr().lock(), "native_comparison_target: initial_native=1 matched_roots=1 queued=2 actual_target_reads=2 same_scanner_context=true existing_file_budget=true before_body_fold=true repeated_targets=0 requested_layout_bytes={requested_layout_bytes:?} rss_measured=false").unwrap();
 }
 
 #[test]

@@ -109,3 +109,13 @@ must be complete first. A component test manually drives the same moving owner;
 that is not a shipping optimization or a positive lifecycle bootstrap proof.
 No reread, CPU, RSS or interaction improvement is claimed. Requested layout
 accounting in a synthetic test describes the retained plan, not process memory.
+
+
+The first Q5/target run, CI `38920853932` at `a3acb45b`, compiled and
+passed Clippy, then failed the target test before its native-acquisition assertions:
+the test incorrectly required a layout bound on Rust 1.98.1. The existing layout
+guard correctly returns unavailable for that unvalidated compiler. The corrected
+test keeps the guard closed, reports the optional bound as unavailable and still
+executes the target acquisition assertions. No compiler allowlist or heap policy
+was changed. That failed run passed 2,901 service tests and failed one; it is not
+target-read or resource-cost acceptance. The correction needs its own CI.
