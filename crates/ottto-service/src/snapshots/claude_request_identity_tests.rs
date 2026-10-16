@@ -3641,3 +3641,301 @@ fn transcript_markers_tag_only_requests_a_settled_census_shows_unduplicated() {
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+// --- Zero-usage responses -----------------------------------------------------
+
+/// One owned response of `ROOT` with its own request id.
+fn owned_response(request_id: &str, timestamp: &str, input: u64, output: u64) -> Value {
+    json!({"timestamp": timestamp, "type": "assistant", "sessionId": ROOT,
+        "requestId": request_id, "message": {"id": format!("msg_{request_id}"),
+        "model": "claude-haiku-4-5", "usage": {"input_tokens": input, "output_tokens": output}}})
+}
+
+/// An API-error record as Claude Code writes it: a synthetic assistant message
+/// whose every usage field, cache included, is zero.
+fn api_error_response(request_id: Option<&str>, timestamp: &str) -> Value {
+    let mut line = json!({"timestamp": timestamp, "type": "assistant", "sessionId": ROOT,
+        "isApiErrorMessage": true, "message": {"id": format!("msg_error_{timestamp}"),
+        "model": "<synthetic>", "usage": {"input_tokens": 0, "output_tokens": 0,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0}}}});
+    if let Some(request_id) = request_id {
+        line["requestId"] = json!(request_id);
+    }
+    line
+}
+
+fn second(n: u64) -> String {
+    format!("2026-08-02T07:00:{n:02}Z")
+}
+
+/// Three owned responses, each with telemetry under the default login.
+fn owned_session() -> Vec<Value> {
+    (1..=3)
+        .map(|n| owned_response(&format!("req_{n}"), &second(n), 10, 10))
+        .collect()
+}
+
+fn owned_session_reports() -> (
+    crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+) {
+    reports(
+        (1..=3)
+            .map(|n| complete_api_row(ROOT, &format!("req_{n}"), n, 10, 10, 0))
+            .collect(),
+        (1..=3)
+            .map(|n| complete_trace_row(ROOT, &format!("req_{n}"), ""))
+            .collect(),
+    )
+}
+
+fn tag_one(
+    raw: &SnapshotItem,
+    api: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+) -> (identity::ScanOutcome, SnapshotItem) {
+    let evidence = ScanEvidence::new(api, trace, BTreeSet::new(), None);
+    let mut items = vec![raw.clone()];
+    let outcome = identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+    (outcome, items.remove(0))
+}
+
+/// The tagged usage and identity a contract-5 body carries.
+fn tagged_body(item: &SnapshotItem) -> (Value, Value, Value, u64) {
+    (
+        serde_json::to_value(&item.usage_buckets).unwrap(),
+        serde_json::to_value(&item.model_usage).unwrap(),
+        serde_json::to_value(&item.request_evidence).unwrap(),
+        item.request_identity_refusals,
+    )
+}
+
+/// A response whose usage is zero in every field, cache included, but which
+/// carries a request id (an API error) adds no row, token or money. Appending
+/// one keeps the session contract 5 with exactly the tagged usage it had: the
+/// error is never counted, placed or classified, so even telemetry of its own
+/// under another login claims nothing. Non-permit D1 and the parser's
+/// request-id set keep today's behavior.
+#[test]
+fn zero_usage_api_error_with_request_id_keeps_contract5_and_claims_nothing() {
+    let dir = temp_dir("claude-request-identity-zero-usage");
+    let other_login = "b".repeat(64);
+    let base = owned_session();
+    let mut appended = base.clone();
+    appended.push(api_error_response(Some("req_error"), &second(4)));
+    let raw_before = parse_session(&dir, &base).remove(0);
+    let raw_after = parse_session(&dir, &appended).remove(0);
+    // The trigger: the parser keeps the error's id but counts no request.
+    assert_eq!(raw_before.request_count, 3);
+    assert_eq!(raw_after.request_count, 3);
+    assert_eq!(raw_after.claude_usage_request_ids.len(), 4);
+    assert!(raw_after.claude_usage_occurrences["req_error"]
+        .usage
+        .is_zero());
+    assert!(claude_snapshot_request_id_hashes(&raw_before).is_some());
+    assert!(claude_snapshot_request_id_hashes(&raw_after).is_none());
+    assert_usage_conserved(&raw_after, &raw_before);
+
+    let (api, trace) = owned_session_reports();
+    let (mut claimed_api, mut claimed_trace) = owned_session_reports();
+    let mut error_row = complete_api_row(ROOT, "req_error", 4, 0, 0, 0);
+    error_row.account_identifier_hash = Some(other_login.clone());
+    claimed_api
+        .evidence
+        .get_mut(ROOT)
+        .unwrap()
+        .push(signed(error_row));
+    claimed_trace
+        .evidence
+        .get_mut(ROOT)
+        .unwrap()
+        .push(complete_trace_row(ROOT, "req_error", ""));
+
+    let sent = identity::ScanOutcome {
+        sent: 1,
+        ..Default::default()
+    };
+    let (outcome, before) = tag_one(&raw_before, &api, &trace);
+    assert_eq!(outcome, sent);
+    assert_eq!(
+        identity_shares(&before),
+        (BTreeMap::from([(OWNER_A.to_string(), (3, 0))]), (0, 0))
+    );
+    for (api, trace) in [(&api, &trace), (&claimed_api, &claimed_trace)] {
+        let (outcome, after) = tag_one(&raw_after, api, trace);
+        assert_eq!(outcome, sent);
+        assert_eq!(after.provenance.collector, identity::COLLECTOR);
+        assert_usage_conserved(&after, &raw_after);
+        assert_eq!(tagged_body(&after), tagged_body(&before));
+        assert_eq!(after.request_identity_refusals, 0);
+        assert!(!serde_json::to_string(&after)
+            .unwrap()
+            .contains(&other_login));
+    }
+
+    // Non-permit D1 keeps the plain request-id count guard.
+    let d1 = |raw: &SnapshotItem| {
+        let mut items = vec![raw.clone()];
+        let coverage = claude_request_accounts::apply(&mut items, &api, &trace).coverage;
+        (coverage, items.remove(0).provenance.collector)
+    };
+    assert_eq!(
+        d1(&raw_before),
+        (
+            vec![claude_request_accounts::Coverage::Complete],
+            claude_request_accounts::COMPLETE.to_string()
+        )
+    );
+    assert_eq!(
+        d1(&raw_after),
+        (
+            vec![claude_request_accounts::Coverage::MissingRequests],
+            claude_request_accounts::UNKNOWN.to_string()
+        )
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Zero-usage records the parser never counts as a request id keep today's
+/// contract 5 unchanged: an error without a request id, and a response whose
+/// early progressive record is all zero before its final usage.
+#[test]
+fn zero_usage_without_an_id_or_before_final_usage_keeps_todays_contract5() {
+    let dir = temp_dir("claude-request-identity-zero-usage-unchanged");
+    let (api, trace) = owned_session_reports();
+    let base = owned_session();
+    let (outcome, expected) = tag_one(&parse_session(&dir, &base).remove(0), &api, &trace);
+    assert_eq!(outcome.sent, 1, "{outcome:?}");
+
+    let mut without_id = base.clone();
+    without_id.push(api_error_response(None, &second(4)));
+    let mut progressive = base.clone();
+    progressive.insert(2, owned_response("req_3", "2026-08-02T07:00:02.500Z", 0, 0));
+    for (case, lines) in [("without id", without_id), ("progressive", progressive)] {
+        let raw = parse_session(&dir, &lines).remove(0);
+        assert_eq!(raw.request_count, 3, "{case}");
+        assert_eq!(raw.claude_usage_request_ids.len(), 3, "{case}");
+        assert!(
+            raw.claude_usage_occurrences
+                .values()
+                .all(|occurrence| !occurrence.usage.is_zero()),
+            "{case}"
+        );
+        assert!(claude_snapshot_request_id_hashes(&raw).is_some(), "{case}");
+        let (outcome, tagged) = tag_one(&raw, &api, &trace);
+        assert_eq!(outcome.sent, 1, "{case}: {outcome:?}");
+        assert_usage_conserved(&tagged, &raw);
+        assert_eq!(tagged_body(&tagged), tagged_body(&expected), "{case}");
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// A zero-usage record admits nothing else: with one present, nonzero usage
+/// without its own request id, a nonzero request id held by two responses, a
+/// multi-iteration response and a row the requests cannot reproduce each keep
+/// the item on today's path with its bytes unchanged. The first two make the
+/// plain request-id count coincide, which never admitted them either.
+#[test]
+fn zero_usage_record_never_admits_unowned_or_uncounted_usage() {
+    let dir = temp_dir("claude-request-identity-zero-usage-negatives");
+    let (api, trace) = owned_session_reports();
+    let with_error = |extra: Option<Value>| {
+        let mut lines = owned_session();
+        lines.push(api_error_response(Some("req_error"), &second(4)));
+        lines.extend(extra);
+        parse_session(&dir, &lines).remove(0)
+    };
+    let without_id = json!({"timestamp": second(5), "type": "assistant", "sessionId": ROOT,
+        "message": {"id": "msg_without_id", "model": "claude-haiku-4-5",
+        "usage": {"input_tokens": 10, "output_tokens": 10}}});
+    let mut duplicate = owned_response("req_2", &second(5), 10, 10);
+    duplicate["message"]["id"] = json!("msg_duplicate");
+    let mut iterations = owned_response("req_4", &second(5), 10, 10);
+    iterations["message"]["usage"]["iterations"] =
+        json!([{"input_tokens": 5, "output_tokens": 5}, {"input_tokens": 5, "output_tokens": 5}]);
+    let mut unreproduced = with_error(None);
+    unreproduced.usage_buckets[0].model_usage[0].request_count += 1;
+
+    let coincident = [
+        ("nonzero without id", with_error(Some(without_id))),
+        ("nonzero duplicate id", with_error(Some(duplicate))),
+    ];
+    for (case, raw) in &coincident {
+        assert_eq!(raw.request_count, 4, "{case}");
+        assert!(claude_snapshot_request_id_hashes(raw).is_some(), "{case}");
+    }
+    let iterated = with_error(Some(iterations));
+    assert!(!iterated.claude_context_curve_request_index_complete);
+    for (case, raw) in coincident.into_iter().chain([
+        ("multi-iteration response", iterated),
+        ("row not reproduced", unreproduced),
+    ]) {
+        let untouched = serde_json::to_vec(&raw).unwrap();
+        let (outcome, item) = tag_one(&raw, &api, &trace);
+        assert_eq!(
+            outcome,
+            identity::ScanOutcome {
+                ineligible: 1,
+                ..Default::default()
+            },
+            "{case}"
+        );
+        assert_eq!(serde_json::to_vec(&item).unwrap(), untouched, "{case}");
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// A copied response whose telemetry sits under another root stays refused
+/// and never lends that root's login, with or without a zero-usage record.
+#[test]
+fn zero_usage_record_keeps_a_foreign_owned_request_refused() {
+    let dir = temp_dir("claude-request-identity-zero-usage-foreign");
+    let foreign_login = "b".repeat(64);
+    let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+    let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+    let mut copied = complete_api_row(OTHER_ROOT, "req_copied", 1, 10, 10, 0);
+    copied.account_identifier_hash = Some(foreign_login.clone());
+    api_report
+        .evidence
+        .insert(OTHER_ROOT.to_string(), vec![signed(copied)]);
+    trace_report.evidence.insert(
+        OTHER_ROOT.to_string(),
+        vec![complete_trace_row(OTHER_ROOT, "req_copied", "")],
+    );
+    api_report.evidence.insert(
+        ROOT.to_string(),
+        (2..=3)
+            .map(|n| complete_api_row(ROOT, &format!("req_{n}"), n, 10, 10, 0))
+            .collect(),
+    );
+    trace_report.evidence.insert(
+        ROOT.to_string(),
+        (2..=3)
+            .map(|n| complete_trace_row(ROOT, &format!("req_{n}"), ""))
+            .collect(),
+    );
+    let mut base = vec![owned_response("req_copied", &second(1), 10, 10)];
+    base.extend((2..=3).map(|n| owned_response(&format!("req_{n}"), &second(n), 10, 10)));
+    let mut appended = base.clone();
+    appended.push(api_error_response(Some("req_error"), &second(4)));
+
+    let mut bodies = Vec::new();
+    for lines in [base, appended] {
+        let raw = parse_session(&dir, &lines).remove(0);
+        let (outcome, tagged) = tag_one(&raw, &api_report, &trace_report);
+        assert_eq!(outcome.sent, 1, "{outcome:?}");
+        assert_usage_conserved(&tagged, &raw);
+        assert_eq!(
+            identity_shares(&tagged),
+            (BTreeMap::from([(OWNER_A.to_string(), (2, 0))]), (1, 0))
+        );
+        assert!(tagged.request_identity_refusals >= 1);
+        assert!(!serde_json::to_string(&tagged)
+            .unwrap()
+            .contains(&foreign_login));
+        bodies.push(tagged_body(&tagged));
+    }
+    assert_eq!(bodies[0], bodies[1]);
+    let _ = fs::remove_dir_all(dir);
+}
