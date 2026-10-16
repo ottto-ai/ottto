@@ -6329,10 +6329,7 @@ fn prepare_claude_reported_usage(
             .map(u128::from)
             .and_then(|value| value.checked_mul(1_000_000));
         if let Some(cost_picos) = cost_picos {
-            total_cost_picos = match total_cost_picos.checked_add(cost_picos) {
-                Some(value) => value,
-                None => return None,
-            };
+            total_cost_picos = total_cost_picos.checked_add(cost_picos)?;
         } else {
             cost_complete = false;
         }
@@ -6436,10 +6433,7 @@ fn prepare_claude_reported_usage(
         if !totals.add(&usage) {
             return None;
         }
-        let Some((bucket_start, normalized_timestamp)) = activity_bucket_from_timestamp(&timestamp)
-        else {
-            return None;
-        };
+        let (bucket_start, normalized_timestamp) = activity_bucket_from_timestamp(&timestamp)?;
         let (row_key, selector_context, selector_sources) =
             build_row_identity(&model, &selector, effort.as_deref());
         if let Some(sink) = sink.as_deref_mut() {
