@@ -379,3 +379,35 @@ new graph integration. Exhaustive revocation, real parked-sibling/lease graph
 admission, positive end-to-end source bootstrap, both selected-state recovery
 callbacks, the final rearm gate, the unchanged original oracles and measured
 resource benefit remain unfinished. No installed performance acceptance exists.
+
+
+## Source bootstrap and independent revocation candidate
+
+Concrete-window checkpoint `b5588bef22909f06cec5c4a38300e4ee86cedb5c`,
+hosted CI `38946115656`, passed all four checks: 2,931 service tests passed,
+zero failed, 24 ignored. All 36 native-comparison and five retained-budget
+tests passed. The actual layout gate returned unavailable and correctly
+revoked the whole window/permit on Rust 1.98.1. Its supported-layout move
+branch was not executed. Direct two-page import remains component evidence,
+not lifecycle admission or an original optimized-oracle pass.
+
+The next candidate adds isolated revocation controls that start with an
+independently valid saved grant, then change scope or invalidate an outstanding
+lease generation after a refused lock query. Current API/trace loss or an
+unhealthy pair withdraws the root for the rest of its window, even if later
+rows recover. Any authority quarantine, including pending proof correction,
+withdraws existing certificates without changing its debt or accepted bodies.
+The lock fixture exposes only a test-only bounded callback under the real
+mutex; it supplies no alternate accounting result or graph admission.
+
+A synthetic source-lifecycle test uses the real prepare/step/finish functions,
+paired local sidecars, file device/secret fixtures and a loopback transport.
+The transport returns exact entity ACKs bound to the actual wire bodies. It
+requires an ordinary clean native conjunction, durable selected index save,
+and a subsequent real preparation with permission; abandoning that preparation
+must revoke permission for another real preparation in the same context.
+No lease save marker or native-conjunction boolean is supplied by this fixture.
+These five new tests are unexecuted until the candidate's hosted CI passes.
+They do not activate reuse or establish supported-layout retention, selected
+fallback, either original optimized oracle, measured savings or installed
+acceptance.

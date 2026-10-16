@@ -293,3 +293,310 @@ fn master_on_emits_contract5_only_under_the_cycles_exact_hint_token() {
         "an aborted cycle writes no scan state"
     );
 }
+
+/// Offline transport for the real source lifecycle. It ACKs exactly the wire
+/// entities it receives, including creator evidence, rather than marking index
+/// entries accepted or manufacturing a process lease in the fixture.
+struct NativeBootstrapServer {
+    url: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl NativeBootstrapServer {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let captured = bodies.clone();
+        let worker = std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("synthetic accept: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let request = read_complete_http_request(&mut stream);
+                assert!(http_request_complete(request.as_bytes()));
+                let raw_body = request.split_once("\r\n\r\n").unwrap().1;
+                let value: serde_json::Value = if raw_body.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str(raw_body).unwrap()
+                };
+                let response = if request.contains("/relay-token") {
+                    serde_json::json!({"token":"synthetic-native-token", "expires_at":"2099-01-01T00:00:00Z"})
+                } else if request.contains("/activity-hints") {
+                    serde_json::json!({"source":"claude_code", "server_time":current_rfc3339(),
+                        "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
+                        "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
+                        "recommended_scan_after":"2099-01-01T00:00:00Z"})
+                } else if let Some(items) =
+                    value.get("snapshots").and_then(|items| items.as_array())
+                {
+                    let entities = items.iter().map(|item| {
+                        // These fixtures declare no cache/curve evidence. Hash
+                        // the actual wire creator/tool leaves independently.
+                        assert!(item.get("cache_observations").is_none());
+                        assert!(item.get("context_curve").is_none());
+                        let mut payload = serde_json::Map::new();
+                        for key in ["session_account_evidence", "tool_usage", "tool_usage_truncated"] {
+                            if let Some(value) = item.get(key) { payload.insert(key.into(), value.clone()); }
+                        }
+                        let exclusive = item.get("usage_accounting_contract").and_then(|v|v.as_str())
+                            == Some("session_exclusive_reported_usage:v1");
+                        let creator = item.get("session_account_evidence").is_some();
+                        let version = creator.then_some(if exclusive { 8u64 } else { 7u64 });
+                        let digest = format!("{:x}", Sha256::digest(
+                            crate::canonical_json::canonicalize(&serde_json::Value::Object(payload)).unwrap()));
+                        serde_json::json!({"source_session_id":item["source_session_id"],
+                            "snapshot_fingerprint":item["snapshot_fingerprint"],"occurrence_count":1,
+                            "body_witness_version":version,"body_witness_digest":version.map(|_|digest)})
+                    }).collect::<Vec<_>>();
+                    captured.lock().unwrap().extend(items.iter().cloned());
+                    serde_json::json!({"accepted":items.len(),"sessions_reconciled":items.len(),
+                        "session_ids":[],"disabled":false,"disabled_reason":null,
+                        "entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":entities,
+                        "unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]})
+                } else {
+                    serde_json::json!({"accepted":true,"source":"claude_code", "machine_id":"otm_test", "disabled":false})
+                };
+                bounded_native_response(&mut stream, "200 OK", &response.to_string());
+            }
+        });
+        Self {
+            url,
+            stop,
+            worker: Some(worker),
+            bodies,
+        }
+    }
+}
+
+impl Drop for NativeBootstrapServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let outcome = self.worker.take().unwrap().join();
+        if !std::thread::panicking() {
+            outcome.unwrap();
+        }
+    }
+}
+
+fn write_native_bootstrap_sidecars(fixture: &IdentityPipelineHome, support: &Path) {
+    let transcript = fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+    let rows = std::fs::read_to_string(transcript)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["type"] == "assistant")
+        .collect::<Vec<_>>();
+    let mut api_lines = String::new();
+    let mut trace_lines = String::new();
+    for (sequence, row) in rows.iter().enumerate() {
+        let request = row["requestId"].as_str().unwrap();
+        let mut api = crate::claude_local_otel::ClaudeLocalOtelEvidence {
+            capture_revision: "claude_api_request:v2".into(),
+            session_id: IDENTITY_PIPELINE_ROOT.into(),
+            request_id: request.into(),
+            client_request_id: format!("client-{request}"),
+            observed_at: row["timestamp"].as_str().unwrap().into(),
+            model: "claude-haiku-4-5".into(),
+            effort: "high".into(),
+            query_source: "user".into(),
+            speed: "fast".into(),
+            app_version: "2.1.226".into(),
+            event_sequence: Some(sequence as u64 + 1),
+            cost_usd_micros: Some(100),
+            input_tokens: row["message"]["usage"]["input_tokens"].as_u64().unwrap(),
+            output_tokens: row["message"]["usage"]["output_tokens"].as_u64().unwrap(),
+            request_count: 1,
+            ..Default::default()
+        };
+        api.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&api).unwrap())
+        );
+        let mut trace = crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
+            capture_revision: "claude_llm_request_ownership:v1".into(),
+            session_id: IDENTITY_PIPELINE_ROOT.into(),
+            request_id: request.into(),
+            client_request_id: format!("client-{request}"),
+            observed_at: api.observed_at.clone(),
+            ..Default::default()
+        };
+        trace.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&trace).unwrap())
+        );
+        api_lines.push_str(&(serde_json::to_string(&api).unwrap() + "\n"));
+        trace_lines.push_str(&(serde_json::to_string(&trace).unwrap() + "\n"));
+    }
+    for (kind, lines) in [
+        ("claude-code-effort", api_lines),
+        ("claude-code-trace-ownership", trace_lines),
+    ] {
+        let directory = support.join("local-otel").join(kind);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(format!(
+                "{:x}.jsonl",
+                Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())
+            )),
+            lines,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+#[serial]
+fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save() {
+    let fixture = IdentityPipelineHome::new();
+    let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
+    let support = fixture.base.join("native-bootstrap-support");
+    let secrets = fixture.base.join("native-bootstrap-secrets");
+    std::fs::create_dir_all(&support).unwrap();
+    std::fs::create_dir_all(&secrets).unwrap();
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+    let server = NativeBootstrapServer::new();
+    let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
+    let device = LocalDeviceBinding {
+        device_id: "native-bootstrap-device".into(),
+        machine_id: Some("otm_test".into()),
+        sources: vec!["claude_code".into()],
+    };
+    FileDeviceStore::default().save(&device).unwrap();
+    std::fs::write(
+        secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        "device-secret",
+    )
+    .unwrap();
+    write_native_bootstrap_sidecars(&fixture, &support);
+    let client = SnapshotApiClient::new(server.url.clone());
+    let daemon = test_daemon("otm_test");
+    let witness = daemon.snapshot_scan_account_witness().unwrap();
+    let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+    let mut completed = 0;
+    let mut bootstrap_observed = false;
+    let collection = || AgentStatusCollection {
+        snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+        source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+        codex_scan_homes: Vec::new(),
+        codex_home_bindings: Vec::new(),
+    };
+    for _ in 0..6 {
+        let mut frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+            prepare_sync_source(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                witness,
+                false,
+            )
+        })
+        .unwrap()
+        .expect("ordinary full source cycle");
+        let allowed = frame.native_comparison_lease.as_ref().unwrap().allowed();
+        if completed == 0 {
+            assert!(!allowed, "disk rows alone cannot bootstrap");
+        }
+        if allowed {
+            assert!(completed > 0);
+            bootstrap_observed = true;
+            drop(frame); // Abandoning a new preparation must revoke again.
+            break;
+        }
+        let (preparation, index, scan) = loop {
+            match frame.step() {
+                SourcePreparationStep::Pending(next) => frame = next,
+                SourcePreparationStep::Complete {
+                    preparation,
+                    index,
+                    scan,
+                } => break (preparation, index, scan),
+            }
+        };
+        assert!(preparation.prepared_claude_evidence.is_some());
+        assert!(scan.census_complete);
+        let index_path = preparation.index_path.clone();
+        crate::agent_status_refresh::with_test_collection(collection(), || {
+            finish_sync_source(
+                preparation,
+                index,
+                scan,
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                &mut retry,
+            )
+        })
+        .unwrap();
+        let saved = ScanIndex::load(&index_path).unwrap();
+        assert!(saved.generation > 0);
+        completed += 1;
+    }
+    assert!(
+        bootstrap_observed,
+        "real finish must mint after a clean native conjunction and durable exact settlement"
+    );
+    let bodies = server.bodies.lock().unwrap();
+    assert!(
+        !bodies.is_empty(),
+        "the real uploader must perform an exact wire ACK"
+    );
+    assert!(bodies
+        .iter()
+        .any(|body| body["usage_accounting_contract"] == "session_exclusive_reported_usage:v1"));
+    drop(bodies);
+    let abandoned = crate::agent_status_refresh::with_test_collection(collection(), || {
+        prepare_sync_source(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::ClaudeCode,
+            "otm_test",
+            &fixture.home,
+            &support,
+            &daemon,
+            &mut transport,
+            witness,
+            false,
+        )
+    })
+    .unwrap()
+    .expect("same-scope preparation after abandonment");
+    assert!(!abandoned
+        .native_comparison_lease
+        .as_ref()
+        .unwrap()
+        .allowed());
+    drop(abandoned);
+    writeln!(std::io::stderr().lock(), "native_comparison_source_bootstrap: actual_prepare_step_finish=true completed_saved_cycles={completed} actual_wire_ack=true next_real_preparation_allowed=true abandoned_preparation_revokes=true actual_positive_retained_layout_unproved=true").unwrap();
+}

@@ -66,6 +66,12 @@ impl Lifecycle {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_state_locked_for_test(&self, check: impl FnOnce()) {
+        let _state = self.state.lock().expect("synthetic lifecycle lock");
+        check();
+    }
+
     pub(crate) fn discard_retained(&self) {
         // Poison may be recovered ONLY to destroy the graph and permission.
         // All lock holders perform bounded state moves, never I/O/callbacks.

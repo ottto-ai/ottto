@@ -2665,3 +2665,181 @@ fn native_comparison_window_wrong_window_scope_restart_or_missing_save_is_base()
     assert!(!fresh.allowed());
     assert!(fresh.take_window().is_none());
 }
+
+#[test]
+fn native_comparison_window_scope_change_revokes_a_valid_saved_grant() {
+    let mut fixture = NativePreparationFixture::new();
+    let scratch = crate::test_scratch::ScratchDir::new("native-window-valid-scope");
+    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut bootstrap = owner.begin();
+    bootstrap.bind("original-scope".into());
+    fixture.index.save(&scratch.join("index.json")).unwrap();
+    bootstrap.note_selected_save(fixture.native_conjunction);
+    bootstrap.finish(true);
+    let mut valid = owner.begin();
+    valid.bind("original-scope".into());
+    assert!(valid.allowed(), "control starts with a valid saved grant");
+    valid.note_selected_save(false);
+    valid.finish(true);
+    let mut changed = owner.begin();
+    changed.bind("other-scope".into());
+    assert!(!changed.allowed());
+    assert!(changed.take_window().is_none());
+    changed.note_selected_save(false);
+    changed.finish(true);
+    let mut rolled_back = owner.begin();
+    rolled_back.bind("original-scope".into());
+    assert!(
+        !rolled_back.allowed(),
+        "scope rollback cannot revive permission"
+    );
+    writeln!(std::io::stderr().lock(), "native_comparison_window_revocation: independently_valid_scope_control=true changed_scope_base=true rolled_back_scope_base=true").unwrap();
+}
+
+#[test]
+fn native_comparison_window_unknown_lock_and_stale_generation_revoke() {
+    let mut fixture = NativePreparationFixture::new();
+    let scratch = crate::test_scratch::ScratchDir::new("native-window-lock-generation");
+    let owner = Arc::new(claude_native_comparison::lifecycle::Lifecycle::default());
+    let mut bootstrap = owner.begin();
+    bootstrap.bind("scope".into());
+    fixture.index.save(&scratch.join("index.json")).unwrap();
+    bootstrap.note_selected_save(fixture.native_conjunction);
+    bootstrap.finish(true);
+    let mut outstanding = owner.begin();
+    outstanding.bind("scope".into());
+    assert!(outstanding.allowed());
+    let page = native_window_page(&fixture);
+    outstanding.note_selected_save(false);
+    outstanding.stage_window_after_save(Some(page.window), &page.index, false);
+    owner.with_state_locked_for_test(|| {
+        assert_eq!(
+            owner.retained_bound(crate::source_rotation::PARKED_BUDGET),
+            None
+        );
+    });
+    // Exactly the rotation refusal action, after the failed nonblocking query
+    // releases its lock. This also invalidates a graph already moved to a frame.
+    owner.discard_retained();
+    assert!(!outstanding.allowed());
+    assert!(outstanding.take_window().is_none());
+    outstanding.note_selected_save(fixture.native_conjunction);
+    outstanding.finish(true);
+    let mut next = owner.begin();
+    next.bind("scope".into());
+    assert!(!next.allowed(), "stale finish must not republish a grant");
+    assert!(next.take_window().is_none());
+    writeln!(std::io::stderr().lock(), "native_comparison_window_revocation: held_lock_bound=None whole_window_discard=true stale_generation_cannot_republish=true").unwrap();
+}
+
+#[test]
+fn native_comparison_window_missing_current_rows_withdraws_until_window_end() {
+    for control in 0..3 {
+        let mut fixture = NativePreparationFixture::new();
+        let page = native_window_page(&fixture);
+        fixture.index = page.index;
+        let mut next = fixture.paused_with_limit(1);
+        let healthy = if control == 2 {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([fixture.parent.clone()])
+        };
+        let mut api = fixture.api.evidence.clone();
+        let mut trace = fixture.trace.evidence.clone();
+        if control == 0 {
+            api.remove(&fixture.parent);
+        }
+        if control == 1 {
+            trace.remove(&fixture.parent);
+        }
+        let qualification = next
+            .prepare_native_comparison_with_window(
+                claude_native_comparison::PairedRows {
+                    api: &api,
+                    trace: &trace,
+                    healthy_roots: &healthy,
+                },
+                Some(page.window),
+            )
+            .unwrap();
+        assert_eq!(qualification.certified_member_count(), 0);
+        let window = claude_native_comparison::Controller::new(qualification)
+            .into_window(&next.census_window_end)
+            .unwrap();
+        assert!(window.root_revoked_for_test(&fixture.parent));
+        let mut retry = fixture.paused_with_limit(1);
+        let healthy = BTreeSet::from([fixture.parent.clone()]);
+        let recovered_rows = retry
+            .prepare_native_comparison_with_window(
+                claude_native_comparison::PairedRows {
+                    api: &fixture.api.evidence,
+                    trace: &fixture.trace.evidence,
+                    healthy_roots: &healthy,
+                },
+                Some(window),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered_rows.certified_member_count(),
+            0,
+            "a later healthy reconstruction cannot undo a same-window withdrawal"
+        );
+    }
+    writeln!(std::io::stderr().lock(), "native_comparison_window_revocation: current_api_missing_base=true current_trace_missing_base=true unhealthy_pair_base=true later_rows_cannot_revive=true").unwrap();
+}
+
+#[test]
+fn native_comparison_window_any_authority_quarantine_withdraws() {
+    for corrected in [false, true] {
+        let fixture = NativePreparationFixture::new();
+        let mut page = native_window_page(&fixture);
+        let witness = &page.index.claude_usage_family_witnesses[&fixture.parent];
+        let digest = claude_usage_family_witness_fingerprint(witness);
+        let members = witness
+            .member_request_id_fingerprints
+            .keys()
+            .map(|member| {
+                let key = page
+                    .index
+                    .files
+                    .keys()
+                    .find(|key| {
+                        claude_index_path_family_member(Path::new(key))
+                            .is_some_and(|(_, current)| current == *member)
+                    })
+                    .unwrap();
+                (
+                    member.clone(),
+                    page.index.files[key].source_file_fingerprint.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        page.index.claude_usage_authority_quarantine.insert(
+            fixture.parent.clone(),
+            ClaudeUsageAuthorityQuarantineRecord {
+                contract: if corrected {
+                    CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION
+                } else {
+                    CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION
+                }
+                .into(),
+                proven_witness_fingerprint: digest.clone(),
+                member_source_file_fingerprints: members.clone(),
+                failed_reconstruction_count: MAX_CLAUDE_USAGE_AUTHORITY_FAILURES,
+                disposition: ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+                retry_after_unix_seconds: claude_usage_authority_retry_deadline(
+                    &fixture.parent,
+                    &digest,
+                ),
+                proof_correction: corrected.then(|| ClaudeAuthorityProofCorrection {
+                    proof_witness_fingerprint: digest,
+                    owed_member_ids: members.into_keys().collect(),
+                }),
+            },
+        );
+        page.window.retain_current(&page.index);
+        assert_eq!(page.window.certified_member_count(), 0);
+        assert!(page.window.root_revoked_for_test(&fixture.parent));
+    }
+    writeln!(std::io::stderr().lock(), "native_comparison_window_revocation: terminal_quarantine_base=true proof_correction_quarantine_base=true accepted_body_or_debt_unchanged=true").unwrap();
+}
