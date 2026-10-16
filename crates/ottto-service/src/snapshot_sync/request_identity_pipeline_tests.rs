@@ -16,7 +16,10 @@ impl IdentityPipelineHome {
     fn new() -> Self {
         let base = test_dir("c5-identity-pipeline");
         let home = base.join("home");
-        let project = home.join(".claude").join("projects").join("-synthetic-repo");
+        let project = home
+            .join(".claude")
+            .join("projects")
+            .join("-synthetic-repo");
         std::fs::create_dir_all(&project).expect("create synthetic Claude project");
         // An empty Desktop store: its census completes, so only the capture
         // mode decides whether a witness is kept.
@@ -64,6 +67,7 @@ impl Drop for IdentityPipelineHome {
 }
 
 struct IdentityPipelineCycle {
+    prepared_before_body: bool,
     body: Vec<u8>,
     snapshots: Vec<SnapshotItem>,
     /// The scan index before finish's evidence stage.
@@ -159,18 +163,38 @@ fn identity_pipeline_cycle(
         }
     };
     let scanned_index = index.clone();
-    apply_claude_local_evidence_to_scan_with_permit(
+    let prepared_before_body = preparation.prepared_claude_evidence.is_some();
+    apply_claude_local_evidence_to_scan_with_prepared(
         &support,
         &mut scan,
         &mut index,
         cycle_request_identity_permit(source, &preparation.activity_hint),
+        preparation.prepared_claude_evidence,
     );
     Ok(IdentityPipelineCycle {
+        prepared_before_body,
         body: serde_json::to_vec(&scan.snapshots).expect("serialize body"),
         snapshots: scan.snapshots,
         scanned_index,
         dark_oracle: serde_json::to_vec(&oracle_scan.snapshots).expect("serialize oracle"),
     })
+}
+
+#[test]
+#[serial]
+fn native_comparison_real_source_preparation_stays_base_without_paired_evidence() {
+    let fixture = IdentityPipelineHome::new();
+    let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
+    let cycle = identity_pipeline_cycle(&fixture, "native-preparation", "").unwrap();
+    assert!(cycle.prepared_before_body);
+    assert!(!cycle.snapshots.is_empty());
+    assert!(cycle
+        .snapshots
+        .iter()
+        .all(|item| item.usage_accounting_contract.is_none()));
+    // The read-only phase is exercised by actual SourcePreparation::step;
+    // absent paired evidence yields zero coverage and the existing base path.
+    writeln!(std::io::stderr().lock(), "native_comparison_checkpoint: real_source_preparation=true missing_pairs_base=true reuse_activated=false").unwrap();
 }
 
 #[test]
@@ -206,7 +230,10 @@ fn master_on_emits_contract5_only_under_the_cycles_exact_hint_token() {
         .iter()
         .all(|evidence| evidence.identity_basis == identity::TRANSCRIPT_ORG));
     assert_eq!(item.request_identity_refusals, 0);
-    assert_eq!((item.request_count, item.input_tokens, item.output_tokens), (2, 30, 3));
+    assert_eq!(
+        (item.request_count, item.input_tokens, item.output_tokens),
+        (2, 30, 3)
+    );
     assert_ne!(permitted.body, permitted.dark_oracle);
 
     // No token, null, another version, a prefixed token, or the collector
@@ -214,8 +241,14 @@ fn master_on_emits_contract5_only_under_the_cycles_exact_hint_token() {
     for (name, extra) in [
         ("absent", ""),
         ("null", r#","session_request_identity_contract":null"#),
-        ("other", r#","session_request_identity_contract":"own_request_identity_rows:v2""#),
-        ("prefixed", r#","session_request_identity_contract":" own_request_identity_rows:v1""#),
+        (
+            "other",
+            r#","session_request_identity_contract":"own_request_identity_rows:v2""#,
+        ),
+        (
+            "prefixed",
+            r#","session_request_identity_contract":" own_request_identity_rows:v1""#,
+        ),
         (
             "collector",
             r#","session_request_identity_contract":"claude_code_jsonl:own_request_identity_rows:v1""#,
@@ -236,7 +269,10 @@ fn master_on_emits_contract5_only_under_the_cycles_exact_hint_token() {
             identity::desktop_census(&dark.scanned_index).is_none(),
             "{name}: no census witness"
         );
-        assert_eq!((item.request_count, item.input_tokens, item.output_tokens), (2, 30, 3));
+        assert_eq!(
+            (item.request_count, item.input_tokens, item.output_tokens),
+            (2, 30, 3)
+        );
     }
 
     // A hint that cannot be read aborts the cycle: no scan, no fallback body.
