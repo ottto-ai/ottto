@@ -12051,6 +12051,42 @@ impl OwnedSourceScan {
     pub(crate) fn new_with_identity_capture(
         source: SnapshotSource,
         roots: &[PathBuf],
+        owned_index: ScanIndex,
+        collected_at: &str,
+        requested_backfill_window_days: u64,
+        file_limit: usize,
+        artifacts_enabled: bool,
+        claude_effort_support_dir: Option<&Path>,
+        hinted_paths: &[PathBuf],
+        watcher_overflowed: bool,
+        context_curve_enabled: bool,
+        claude_request_identity_capture: bool,
+    ) -> Self {
+        Self::new_with_identity_capture_and_recovery_priority(
+            source,
+            roots,
+            owned_index,
+            collected_at,
+            requested_backfill_window_days,
+            file_limit,
+            artifacts_enabled,
+            claude_effort_support_dir,
+            hinted_paths,
+            watcher_overflowed,
+            context_curve_enabled,
+            claude_request_identity_capture,
+            &[],
+        )
+    }
+
+    /// Inactive source seam for already queued, durably rearmed recovery paths.
+    /// This only changes native selection order, never ownership or settlement.
+    /// The controller must still bind its process/source/destination scope and
+    /// prove selected-save/restart liveness before using it.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn new_with_identity_capture_and_recovery_priority(
+        source: SnapshotSource,
+        roots: &[PathBuf],
         mut owned_index: ScanIndex,
         collected_at: &str,
         requested_backfill_window_days: u64,
@@ -12061,6 +12097,7 @@ impl OwnedSourceScan {
         watcher_overflowed: bool,
         context_curve_enabled: bool,
         claude_request_identity_capture: bool,
+        recovery_priority: &[PathBuf],
     ) -> Self {
         let resource_probe = crate::local_resource_diagnostics::Probe::start();
         let index = &mut owned_index;
@@ -12186,6 +12223,19 @@ impl OwnedSourceScan {
         let hinted_budget = selection_limit
             .min(MAX_WATCHER_HINTED_FILES_PER_TICK)
             .saturating_sub(usize::from(ordinary_census_pending && file_limit > 0));
+        // Recovery must be selected before audits consume the page. Only
+        // existing queued paths with durable rearm debt are eligible here.
+        // Unknown/outside-page paths are not injected, and no deadline, source
+        // fingerprint, census flag or budget is changed by selection.
+        if source == SnapshotSource::ClaudeCode && claude_native_comparison::enabled() {
+            claude_native_comparison::select_recovery_before_audits(
+                &mut traversal.pending_candidates,
+                &mut pending_paths,
+                &index.files,
+                recovery_priority,
+                selection_limit,
+            );
+        }
         // Nonshipping candidate: exercise target priority at the actual
         // selection boundary, before audits, with the unchanged page cap.
         #[cfg(test)]

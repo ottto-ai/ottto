@@ -1254,6 +1254,98 @@ fn native_comparison_negative_rows_cannot_qualify_an_unloaded_predecessor() {
     );
 }
 
+fn native_recovery_priority_scan(
+    fixture: &SelectionFixture,
+    index: ScanIndex,
+    limit: usize,
+    paths: &[PathBuf],
+) -> OwnedSourceScan {
+    OwnedSourceScan::new_with_identity_capture_and_recovery_priority(
+        SnapshotSource::ClaudeCode,
+        &fixture.roots,
+        index,
+        WINDOW,
+        30,
+        limit,
+        false,
+        None,
+        &[],
+        false,
+        false,
+        false,
+        paths,
+    )
+}
+
+#[test]
+fn native_comparison_recovery_selection_precedes_real_audit_without_expanding_page() {
+    let fixture = SelectionFixture::new();
+    let mut rearmed = fixture.previous.clone();
+    rearmed
+        .files
+        .get_mut(&local_index_key(&fixture.paths[0]))
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    rearmed.save(&fixture.index_path).unwrap();
+    let rearmed = ScanIndex::load(&fixture.index_path).unwrap();
+    assert!(rearmed.files[&local_index_key(&fixture.paths[0])]
+        .source_file_fingerprint
+        .is_empty());
+    let base = fixture.prepare(rearmed.clone(), 1);
+    assert_eq!(base.identified_candidates.len(), 1);
+    assert_eq!(base.identified_candidates[0].path, fixture.paths[1]);
+    let _scope = claude_native_comparison::enable_for_test();
+    let native = native_recovery_priority_scan(&fixture, rearmed, 1, &fixture.paths[..1]);
+    assert_eq!(native.identified_candidates.len(), 1);
+    assert_eq!(native.identified_candidates[0].path, fixture.paths[0]);
+    let (index, scan) = SelectionFixture::run(native);
+    assert_eq!(scan.scanned_file_count, 1);
+    assert_eq!(scan.snapshots.len(), 1);
+    assert!(index.files[&local_index_key(&fixture.paths[1])]
+        .audit_requires_full(sampled_scan::now_seconds()));
+    assert!(
+        index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .any(|entry| entry.path == fixture.paths[1]),
+        "unselected audit remains queued"
+    );
+    writeln!(std::io::stderr().lock(), "native_comparison_recovery_priority: real_constructor=true actual_index_save_reload=true base_selects_audit=true recovery_selected_first=true native_reads=1 page_limit=1 audit_debt_and_queue_preserved=true selected_save_and_lifecycle_unproved=true").unwrap();
+}
+
+#[test]
+fn native_comparison_recovery_priority_requires_scope_queued_debt_and_remaining_budget() {
+    let fixture = SelectionFixture::new();
+    let mut rearmed = fixture.previous.clone();
+    rearmed
+        .files
+        .get_mut(&local_index_key(&fixture.paths[0]))
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    let inactive = native_recovery_priority_scan(&fixture, rearmed.clone(), 1, &fixture.paths[..1]);
+    assert_eq!(
+        inactive.identified_candidates[0].path, fixture.paths[1],
+        "ordinary construction stays on base with no process test opt-in"
+    );
+    let _scope = claude_native_comparison::enable_for_test();
+    let no_debt =
+        native_recovery_priority_scan(&fixture, fixture.previous.clone(), 1, &fixture.paths[..1]);
+    assert_eq!(no_debt.identified_candidates[0].path, fixture.paths[1]);
+    let unknown = fixture.roots[0].join("unknown-recovery.jsonl");
+    let missing = native_recovery_priority_scan(&fixture, rearmed.clone(), 1, &[unknown]);
+    assert_eq!(
+        missing.identified_candidates[0].path, fixture.paths[1],
+        "missing path cannot become a synthetic queued candidate"
+    );
+    let zero = native_recovery_priority_scan(&fixture, rearmed, 0, &fixture.paths[..1]);
+    assert!(zero.identified_candidates.is_empty());
+}
+
 #[test]
 fn native_comparison_lifecycle_requires_native_save_and_revokes_after_drop_context_or_restart() {
     let mut fixture = NativePreparationFixture::new();

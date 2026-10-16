@@ -187,3 +187,21 @@ Scoped tests cover unchanged pairs, independent same-byte API and trace object
 replacement, and an unloaded predecessor. They also count actual evidence opens
 to distinguish metadata validation from another decode. This candidate needs its
 own hosted validation and establishes neither full-driver nor resource savings.
+
+
+## Recovery selection before audit
+
+A further inactive constructor seam accepts known recovery paths already queued
+in the current traversal and carrying an empty source revision. Selection runs
+before audits, within the existing file limit. It retains every unselected queue
+entry and audit obligation. Missing or outside-page paths are not injected, and
+an ordinary constructor passes no priorities. The seam is additionally guarded
+by the same nonshipping test scope; production remains inactive.
+
+The selection test saves and reloads real rearm debt, then compares the ordinary
+constructor's audit choice with a one-file recovery choice and native read. Other
+controls cover inactive scope, absent debt, a missing path and zero budget.
+These tests need hosted validation. They do not establish the controller's
+process/context binding, selected-state fallback settlement, missing-path recovery
+or cross-generation liveness. The full controller must supply those proofs before
+using this seam; no source fingerprint, deadline or census flag is changed here.

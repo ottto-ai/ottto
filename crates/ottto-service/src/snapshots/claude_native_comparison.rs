@@ -21,6 +21,37 @@ pub(crate) struct PairedRows<'a> {
     pub(crate) healthy_roots: &'a BTreeSet<String>,
 }
 
+/// Select only caller-known recovery paths already in this traversal queue and
+/// still carrying durable rearm debt. The queue retains its allocation and all
+/// unselected entries in their prior order. Clone only selected path records;
+/// there is no index/parser/snapshot clone or separate traversal.
+///
+/// Missing paths stay missing: the controller must use base fallback rather
+/// than interpreting this narrow seam as proof of cross-generation liveness.
+pub(super) fn select_recovery_before_audits(
+    queue: &mut VecDeque<ScanTraversalPath>,
+    selected: &mut Vec<ScanTraversalPath>,
+    files: &BTreeMap<String, ScanIndexEntry>,
+    recovery_paths: &[PathBuf],
+    limit: usize,
+) {
+    if recovery_paths.is_empty() || selected.len() >= limit {
+        return;
+    }
+    let requested = recovery_paths.iter().collect::<BTreeSet<_>>();
+    queue.retain(|candidate| {
+        let eligible = selected.len() < limit
+            && requested.contains(&candidate.path)
+            && files
+                .get(&local_index_key(&candidate.path))
+                .is_some_and(|entry| entry.source_file_fingerprint.is_empty());
+        if eligible {
+            selected.push(candidate.clone());
+        }
+        !eligible
+    });
+}
+
 #[derive(Debug, Clone)]
 struct NormalSkip {
     root: String,
