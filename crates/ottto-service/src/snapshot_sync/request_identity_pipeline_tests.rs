@@ -66,6 +66,33 @@ impl Drop for IdentityPipelineHome {
     }
 }
 
+/// Own only this synthetic Claude cadence slot. The named serial key below
+/// excludes cadence tests; the default key excludes environment fixtures.
+/// Restore pre-test state on every exit, including panic.
+struct IdentityPipelineCadence(Option<SourceCadence>);
+
+impl IdentityPipelineCadence {
+    fn new() -> Self {
+        Self(source_cadences().lock().unwrap().remove("claude_code"))
+    }
+
+    fn next_due_cycle(&self) {
+        // Test-only fresh cadence represents the next already-due cycle. The
+        // real prepare gate and all index/ACK/lifecycle state remain unchanged.
+        source_cadences().lock().unwrap().remove("claude_code");
+    }
+}
+
+impl Drop for IdentityPipelineCadence {
+    fn drop(&mut self) {
+        let mut cadences = source_cadences().lock().unwrap();
+        cadences.remove("claude_code");
+        if let Some(previous) = self.0.take() {
+            cadences.insert("claude_code", previous);
+        }
+    }
+}
+
 struct IdentityPipelineCycle {
     prepared_before_body: bool,
     body: Vec<u8>,
@@ -83,6 +110,7 @@ fn identity_pipeline_cycle(
     name: &str,
     hint_extra: &'static str,
 ) -> Result<IdentityPipelineCycle> {
+    let _cadence = IdentityPipelineCadence::new();
     let source = SnapshotSource::ClaudeCode;
     let support = fixture.base.join(format!("support-{name}"));
     std::fs::create_dir_all(&support).expect("create support dir");
@@ -184,6 +212,7 @@ fn identity_pipeline_cycle(
 
 #[test]
 #[serial]
+#[serial(source_cadences)]
 fn native_comparison_real_source_preparation_stays_base_without_paired_evidence() {
     let fixture = IdentityPipelineHome::new();
     let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
@@ -201,6 +230,7 @@ fn native_comparison_real_source_preparation_stays_base_without_paired_evidence(
 
 #[test]
 #[serial]
+#[serial(source_cadences)]
 fn master_on_emits_contract5_only_under_the_cycles_exact_hint_token() {
     use crate::snapshots::claude_request_identity as identity;
     let fixture = IdentityPipelineHome::new();
@@ -340,6 +370,8 @@ impl NativeBootstrapServer {
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
                         "recommended_scan_after":"2099-01-01T00:00:00Z"})
+                } else if request.contains("/agent-status/snapshots") {
+                    serde_json::json!({"accepted":1,"machine_id":"otm_test","sources":["claude_code"]})
                 } else if let Some(items) =
                     value.get("snapshots").and_then(|items| items.as_array())
                 {
@@ -463,9 +495,11 @@ fn write_native_bootstrap_sidecars(fixture: &IdentityPipelineHome, support: &Pat
 
 #[test]
 #[serial]
+#[serial(source_cadences)]
 fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save() {
     let fixture = IdentityPipelineHome::new();
     let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
+    let cadence = IdentityPipelineCadence::new();
     let support = fixture.base.join("native-bootstrap-support");
     let secrets = fixture.base.join("native-bootstrap-secrets");
     std::fs::create_dir_all(&support).unwrap();
@@ -500,6 +534,7 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
         codex_home_bindings: Vec::new(),
     };
     for _ in 0..6 {
+        cadence.next_due_cycle();
         let mut frame = crate::agent_status_refresh::with_test_collection(collection(), || {
             prepare_sync_source(
                 &client,
@@ -560,6 +595,10 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
         .unwrap();
         let saved = ScanIndex::load(&index_path).unwrap();
         assert!(saved.generation > 0);
+        assert!(
+            source_cadence_wait(SnapshotSource::ClaudeCode).is_some(),
+            "successful real finish must still enforce ordinary cadence"
+        );
         completed += 1;
     }
     assert!(
@@ -598,5 +637,5 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
         .unwrap()
         .allowed());
     drop(abandoned);
-    writeln!(std::io::stderr().lock(), "native_comparison_source_bootstrap: actual_prepare_step_finish=true completed_saved_cycles={completed} actual_wire_ack=true next_real_preparation_allowed=true abandoned_preparation_revokes=true actual_positive_retained_layout_unproved=true").unwrap();
+    writeln!(std::io::stderr().lock(), "native_comparison_source_bootstrap: actual_prepare_step_finish=true completed_saved_cycles={completed} actual_wire_ack=true next_real_preparation_allowed=true abandoned_preparation_revokes=true test_only_due_cadence_slot=true ordinary_post_finish_wait_verified=true actual_positive_retained_layout_unproved=true").unwrap();
 }

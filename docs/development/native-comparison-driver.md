@@ -411,3 +411,22 @@ These five new tests are unexecuted until the candidate's hosted CI passes.
 They do not activate reuse or establish supported-layout retention, selected
 fallback, either original optimized oracle, measured savings or installed
 acceptance.
+
+
+The first bootstrap/revocation candidate `aaf35960` (CI `38950696218`)
+passed compilation and Clippy but failed runtime tests: 2,934 passed, two
+failed, 24 ignored. All four new revocation tests passed. The real finish
+completed with paired rows and an open, complete, covered native census,
+but the test requested another scan immediately. The normal cadence gate
+correctly delayed it; leaked fixture cadence then delayed the existing
+missing-pair test. The next real-preparation permission assertion did not
+execute, so bootstrap is not accepted from that run.
+
+The correction is test-only: retain and restore the synthetic Claude cadence
+slot with RAII, serialize against cadence tests as well as environment tests,
+and represent the next already-due cycle with a fresh synthetic cadence slot.
+The real prepare gate remains in use. A positive assertion requires the actual
+finish to impose its ordinary wait before that test-only reset. The loopback
+agent-status response also uses its proper numeric accepted count and source
+list. No production cadence, lifecycle, permission, format or budget changes.
+The corrected head requires its own hosted validation.
