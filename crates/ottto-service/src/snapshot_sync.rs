@@ -3726,6 +3726,7 @@ impl SourcePreparation {
                         if let Some(qualification) = qualification {
                             match crate::snapshots::claude_native_comparison::Controller::new_paid(
                                 qualification,
+                                state.native_ordinary_body_frontier(),
                                 &mut self.native_comparison_reservation,
                             ) {
                                 Ok(controller) => {
@@ -4580,16 +4581,27 @@ fn finish_sync_source(
     let mut actual_native_conjunction = false;
     if source == SnapshotSource::ClaudeCode {
         let evidence_started = Instant::now();
-        let (disposition, census_withheld, stats) =
-            apply_claude_local_evidence_to_scan_with_comparison(
-                support_dir,
-                &mut scan_result,
-                &mut index,
-                cycle_request_identity_permit(source, &activity_hint),
-                prepared_claude_evidence,
-                comparison_completion.as_mut(),
-                native_comparison_lease.as_ref(),
-            );
+        let applied = try_apply_claude_local_evidence_to_scan_with_comparison(
+            support_dir,
+            &mut scan_result,
+            &mut index,
+            cycle_request_identity_permit(source, &activity_hint),
+            prepared_claude_evidence,
+            comparison_completion.as_mut(),
+            native_comparison_lease.as_ref(),
+        );
+        let (disposition, census_withheld, stats) = match applied {
+            Ok(applied) => applied,
+            Err(reason) => {
+                if let Some(lease) = native_comparison_lease.as_mut() {
+                    lease.refuse_admission();
+                }
+                // No new body was offered. Do not reinterpret an allocation
+                // refusal as semantic identity ineligibility or upload stripped
+                // identities. The last selected durable checkpoint is intact.
+                return Err(reason.into());
+            }
+        };
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
                 "local snapshot sync: claude local evidence duration_ms={} counts={counts}",
@@ -6121,7 +6133,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
     scan_result: &mut SourceScanResult,
     index: &mut ScanIndex,
     permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
-    mut prepared: Option<PreparedClaudeLocalEvidence>,
+    prepared: Option<PreparedClaudeLocalEvidence>,
     comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
     lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
 ) -> (
@@ -6129,11 +6141,40 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
+    try_apply_claude_local_evidence_to_scan_with_comparison(
+        support_dir,
+        scan_result,
+        index,
+        permit,
+        prepared,
+        comparison,
+        lease,
+    )
+    .expect("ordinary or logical comparison evidence fixture has no resource refusal")
+}
+
+fn try_apply_claude_local_evidence_to_scan_with_comparison(
+    support_dir: &Path,
+    scan_result: &mut SourceScanResult,
+    index: &mut ScanIndex,
+    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
+    mut prepared: Option<PreparedClaudeLocalEvidence>,
+    mut comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
+    lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
+) -> std::result::Result<
+    (
+        crate::snapshots::ClaudeUsageAuthorityDisposition,
+        bool,
+        ClaudeLocalEvidenceStats,
+    ),
+    crate::source_rotation::LocalRefusal,
+> {
     // Actual native occurrences are recorded once BEFORE emission filtering.
     // The authoritative fold still sees the actual terminal census decision.
-    let observations = comparison
-        .as_deref()
-        .map(|_| crate::snapshots::record_claude_native_observations(scan_result, index));
+    let observations = match comparison.as_deref_mut() {
+        Some(comparison) => comparison.record_native_observations_paid(scan_result, index)?,
+        None => None,
+    };
     if let Some(fallback) = comparison
         .as_deref()
         .and_then(|comparison| comparison.fallback.as_ref())
@@ -6396,7 +6437,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
         scan_result.scan_cap_hit = true;
         index.mark_bounded_sweep_unsettled();
     }
-    (disposition, census_withheld, stats)
+    Ok((disposition, census_withheld, stats))
 }
 
 #[derive(Debug, PartialEq, Eq)]

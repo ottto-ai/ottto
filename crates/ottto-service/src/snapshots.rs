@@ -4897,6 +4897,23 @@ fn accumulate_claude_usage_family_pending_with_limit(
     census_window_end: &str,
     max_occurrences: usize,
 ) -> ClaudeDuplicateCensusCounts {
+    accumulate_claude_usage_family_pending_with_credit(
+        snapshots,
+        pending_by_root,
+        census_window_end,
+        max_occurrences,
+        None,
+    )
+    .expect("ordinary observation accumulation has no optional credit")
+}
+
+fn accumulate_claude_usage_family_pending_with_credit(
+    snapshots: &[SnapshotItem],
+    pending_by_root: &mut BTreeMap<String, ClaudeUsageFamilyPending>,
+    census_window_end: &str,
+    max_occurrences: usize,
+    mut credit: Option<&mut claude_native_comparison::NativeBodyBudget<'_>>,
+) -> Result<ClaudeDuplicateCensusCounts, crate::source_rotation::LocalRefusal> {
     let mut counts = ClaudeDuplicateCensusCounts::default();
     let mut retained_occurrence_count = pending_by_root
         .values()
@@ -4904,105 +4921,118 @@ fn accumulate_claude_usage_family_pending_with_limit(
         .map(BTreeMap::len)
         .fold(0_usize, usize::saturating_add);
     for item in snapshots {
-        let root_session_id = claude_snapshot_family_root(item);
-        let prior_family_occurrence_count = pending_by_root
-            .get(&root_session_id)
-            .map(|pending| {
-                pending
-                    .member_occurrences
-                    .values()
-                    .map(BTreeMap::len)
-                    .fold(0_usize, usize::saturating_add)
-            })
-            .unwrap_or_default();
-        let pending =
-            pending_by_root
-                .entry(root_session_id)
-                .or_insert_with(|| ClaudeUsageFamilyPending {
+        let construction = match credit.as_deref_mut() {
+            Some(credit) => {
+                credit.before_native_observation(item, pending_by_root, census_window_end)?
+            }
+            None => None,
+        };
+        (|| {
+            let root_session_id = claude_snapshot_family_root(item);
+            let prior_family_occurrence_count = pending_by_root
+                .get(&root_session_id)
+                .map(|pending| {
+                    pending
+                        .member_occurrences
+                        .values()
+                        .map(BTreeMap::len)
+                        .fold(0_usize, usize::saturating_add)
+                })
+                .unwrap_or_default();
+            let pending = pending_by_root.entry(root_session_id).or_insert_with(|| {
+                ClaudeUsageFamilyPending {
                     census_window_end: census_window_end.to_string(),
                     member_request_id_hashes: BTreeMap::new(),
                     member_occurrences: BTreeMap::new(),
                     invalid: false,
-                });
-        if pending.census_window_end != census_window_end {
-            retained_occurrence_count =
-                retained_occurrence_count.saturating_sub(prior_family_occurrence_count);
-            *pending = ClaudeUsageFamilyPending {
-                census_window_end: census_window_end.to_string(),
-                member_request_id_hashes: BTreeMap::new(),
-                member_occurrences: BTreeMap::new(),
-                invalid: false,
+                }
+            });
+            if pending.census_window_end != census_window_end {
+                retained_occurrence_count =
+                    retained_occurrence_count.saturating_sub(prior_family_occurrence_count);
+                *pending = ClaudeUsageFamilyPending {
+                    census_window_end: census_window_end.to_string(),
+                    member_request_id_hashes: BTreeMap::new(),
+                    member_occurrences: BTreeMap::new(),
+                    invalid: false,
+                };
+            }
+            if pending.invalid {
+                return;
+            }
+            let Some(hashes) = claude_snapshot_request_id_hashes(item).filter(|_| {
+                item.claude_usage_occurrences.len() == item.claude_usage_request_ids.len()
+            }) else {
+                counts.page_invalidated_identity_count =
+                    counts.page_invalidated_identity_count.saturating_add(1);
+                invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
+                return;
             };
-        }
-        if pending.invalid {
-            continue;
-        }
-        let Some(hashes) = claude_snapshot_request_id_hashes(item)
-            .filter(|_| item.claude_usage_occurrences.len() == item.claude_usage_request_ids.len())
-        else {
-            counts.page_invalidated_identity_count =
-                counts.page_invalidated_identity_count.saturating_add(1);
-            invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
-            continue;
-        };
-        let occurrences = item
-            .claude_usage_occurrences
-            .iter()
-            .map(|(request_id, occurrence)| {
-                (
-                    format!("{:x}", Sha256::digest(request_id.as_bytes())),
-                    ClaudeTranscriptUsageOccurrenceWitness::from(occurrence),
+            let occurrences = item
+                .claude_usage_occurrences
+                .iter()
+                .map(|(request_id, occurrence)| {
+                    (
+                        format!("{:x}", Sha256::digest(request_id.as_bytes())),
+                        ClaudeTranscriptUsageOccurrenceWitness::from(occurrence),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            if occurrences.keys().cloned().collect::<BTreeSet<_>>() != hashes {
+                counts.page_invalidated_occurrence_mismatch_count = counts
+                    .page_invalidated_occurrence_mismatch_count
+                    .saturating_add(1);
+                invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
+                return;
+            }
+            let replaced_occurrence_count = pending
+                .member_occurrences
+                .get(&item.source_session_id)
+                .map(BTreeMap::len)
+                .unwrap_or_default();
+            let Some(next_retained_occurrence_count) =
+                claude_pending_occurrence_count_after_replace(
+                    retained_occurrence_count,
+                    replaced_occurrence_count,
+                    occurrences.len(),
+                    max_occurrences,
                 )
-            })
-            .collect::<BTreeMap<_, _>>();
-        if occurrences.keys().cloned().collect::<BTreeSet<_>>() != hashes {
-            counts.page_invalidated_occurrence_mismatch_count = counts
-                .page_invalidated_occurrence_mismatch_count
-                .saturating_add(1);
-            invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
-            continue;
+            else {
+                counts.page_invalidated_cap_count =
+                    counts.page_invalidated_cap_count.saturating_add(1);
+                invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
+                return;
+            };
+            if pending
+                .member_request_id_hashes
+                .insert(item.source_session_id.clone(), hashes.clone())
+                .is_some_and(|previous| previous != hashes)
+            {
+                counts.page_invalidated_member_changed_count = counts
+                    .page_invalidated_member_changed_count
+                    .saturating_add(1);
+                invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
+                return;
+            }
+            if pending
+                .member_occurrences
+                .insert(item.source_session_id.clone(), occurrences.clone())
+                .is_some_and(|previous| previous != occurrences)
+            {
+                counts.page_invalidated_member_changed_count = counts
+                    .page_invalidated_member_changed_count
+                    .saturating_add(1);
+                invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
+                return;
+            }
+            retained_occurrence_count = next_retained_occurrence_count;
+        })();
+        if let Some(construction) = construction {
+            construction.finish()?;
         }
-        let replaced_occurrence_count = pending
-            .member_occurrences
-            .get(&item.source_session_id)
-            .map(BTreeMap::len)
-            .unwrap_or_default();
-        let Some(next_retained_occurrence_count) = claude_pending_occurrence_count_after_replace(
-            retained_occurrence_count,
-            replaced_occurrence_count,
-            occurrences.len(),
-            max_occurrences,
-        ) else {
-            counts.page_invalidated_cap_count = counts.page_invalidated_cap_count.saturating_add(1);
-            invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
-            continue;
-        };
-        if pending
-            .member_request_id_hashes
-            .insert(item.source_session_id.clone(), hashes.clone())
-            .is_some_and(|previous| previous != hashes)
-        {
-            counts.page_invalidated_member_changed_count = counts
-                .page_invalidated_member_changed_count
-                .saturating_add(1);
-            invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
-            continue;
-        }
-        if pending
-            .member_occurrences
-            .insert(item.source_session_id.clone(), occurrences.clone())
-            .is_some_and(|previous| previous != occurrences)
-        {
-            counts.page_invalidated_member_changed_count = counts
-                .page_invalidated_member_changed_count
-                .saturating_add(1);
-            invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
-            continue;
-        }
-        retained_occurrence_count = next_retained_occurrence_count;
     }
     counts.pending_occurrence_count = retained_occurrence_count;
-    counts
+    Ok(counts)
 }
 
 fn invalidate_claude_usage_family_pending(
@@ -12362,6 +12392,12 @@ pub(crate) enum OwnedSourceScanStep {
     },
 }
 impl OwnedSourceScan {
+    pub(crate) fn native_ordinary_body_frontier(&self) -> usize {
+        // The Claude producer only extends snapshots until it returns Complete.
+        // This index is consumed into owned receipts BEFORE the final fold.
+        self.snapshots.len()
+    }
+
     pub(crate) fn native_early_evidence_roots(&self) -> impl Iterator<Item = &str> + Clone {
         self.native_comparison
             .as_ref()

@@ -6,7 +6,7 @@ mod metadata;
 mod settlement;
 use metadata::{Map as DescriptorMap, Set as DescriptorSet};
 use settlement::NativeCorrection;
-pub(crate) use settlement::{Completion, SelectedFallback};
+pub(crate) use settlement::{Completion, NativeBodyBudget, SelectedFallback};
 
 #[cfg(test)]
 thread_local! {
@@ -1991,6 +1991,7 @@ pub(crate) struct Controller {
     qualification: Qualification,
     required_roots: BTreeSet<String>,
     native_frontier: usize,
+    ordinary_body_frontier: Option<usize>,
     awaiting_targets: bool,
     failed: bool,
     acquisition: TargetAcquisition,
@@ -2018,6 +2019,7 @@ impl Controller {
             qualification,
             required_roots,
             native_frontier: 0,
+            ordinary_body_frontier: None,
             awaiting_targets: false,
             failed: false,
             acquisition: TargetAcquisition::default(),
@@ -2028,6 +2030,7 @@ impl Controller {
     /// the qualification. Fund them before the canonical constructor clones.
     pub(crate) fn new_paid(
         qualification: Qualification,
+        ordinary_body_frontier: usize,
         credit: &mut Option<crate::source_rotation::PaidReservation>,
     ) -> Result<Self, crate::source_rotation::LocalRefusal> {
         use crate::heap_layout_bound::{self, Counter, HeapLayoutBound};
@@ -2056,7 +2059,10 @@ impl Controller {
         })()
         .filter(|peak| paid.grow_for(*peak))
         .ok_or(refusal)?;
-        let controller = Self::new(qualification);
+        let mut controller = Self::new(qualification);
+        // OwnedSourceScan only appends complete native target outputs after
+        // this pause; receipts are minted before finish filtering/reordering.
+        controller.ordinary_body_frontier = Some(ordinary_body_frontier);
         // Required roots and empty acquisition state are the only added heap.
         let mut extra = Counter::new(crate::source_rotation::PARKED_BUDGET);
         controller
@@ -2631,7 +2637,7 @@ crate::heap_layout_bound::fields!(NormalSkip; root, member, revision, census_win
 crate::heap_layout_bound::fields!(NativePhase; disabled, retained_target_bytes, parsed_keys, native_corrections, correction_revoked_keys, correction_forbidden_roots, paused, prepared, skips, parsed_roots, target_revisions, attempted_targets);
 crate::heap_layout_bound::fields!(FrozenFamily; proof, members, envelope, certified, prior_native, paired_roots);
 crate::heap_layout_bound::fields!(FrozenNativePrior; revision, request_fingerprint, occurrence_fingerprint, assigned);
-crate::heap_layout_bound::fields!(Controller; qualification, required_roots, native_frontier, awaiting_targets, failed, acquisition);
+crate::heap_layout_bound::fields!(Controller; qualification, required_roots, native_frontier, ordinary_body_frontier, awaiting_targets, failed, acquisition);
 crate::heap_layout_bound::fields!(Qualification; families, envelope_roots, envelope_by_hash, pending, unknown_native_sources, revoked_roots, native_corrections, correction_revoked_keys, correction_forbidden_roots);
 crate::heap_layout_bound::fields!(WindowEligibility; census_window_end, roots, revoked_roots, native_corrections, correction_revoked_keys, correction_forbidden_roots);
 crate::heap_layout_bound::fields!(WindowRoot; proof, certified);
