@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 674,
-  "content_sha256": "2a28822b3d742d6644fbf7a10b6b96183dc92b9ef0e41aa70605f70ed8016e98",
+  "content_sha256": "458a50f26d619820a565a94ede0dca037824f5083993e349bac213b9dc6ee229",
   "files": [
     {
       "executable": false,
@@ -1182,8 +1182,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "a0f2529205f2631c4cbf71689191fe86a5b894d7543aed4f9d710612dbbaa54a",
-      "size_bytes": 791339
+      "sha256": "10860fbc594142106079891ce9ed2ce96b278395909a4e7ce67bd7f2f9d91c63",
+      "size_bytes": 791563
     },
     {
       "executable": false,
@@ -1217,8 +1217,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/p12_pipeline_original_tests.rs",
-      "sha256": "3c8cafb53398cf6fbed0ad29384d6ddcb1524bb1e61fc57c072e9acd9008d760",
-      "size_bytes": 66994
+      "sha256": "b54a22a6f1250f3f64d884fa7785d7bebcc678ec8413b8467bdc12a6626eee2d",
+      "size_bytes": 79320
     },
     {
       "executable": false,
@@ -1315,8 +1315,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison/settlement.rs",
-      "sha256": "b588f4954206a7b9cf3cdd5368e1803469018cae2849003c8f5ee83f06a1ad24",
-      "size_bytes": 20320
+      "sha256": "194d6edc7d44b3381ba6361b7e66efa4bf9542b523d8931b513c1bd32ad639d2",
+      "size_bytes": 20786
     },
     {
       "executable": false,
@@ -4760,5 +4760,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "679fa2a81421a4f0d5c661419be796a9123b6fd6"
+  "source_commit": "14118014d3d96959437fc1bc62fff9d811d7427a"
 }
