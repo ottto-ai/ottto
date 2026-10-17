@@ -138,6 +138,18 @@ impl Lease {
                 window.retain_current(index);
                 window
             });
+            if self.window.as_ref().is_some_and(|window| {
+                crate::heap_layout_bound::bound(
+                    window.as_ref(),
+                    crate::source_rotation::PARKED_BUDGET,
+                )
+                .is_none()
+            }) {
+                // This is the existing rotation allowance, not another cache
+                // or an alternate layout result. Unknown/pressure loses ALL
+                // window history and permission, never a truncated receipt.
+                self.revoke();
+            }
         }
     }
 

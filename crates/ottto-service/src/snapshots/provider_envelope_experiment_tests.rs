@@ -2255,7 +2255,13 @@ fn native_comparison_controller_generation_loss_or_insufficient_budget_uses_base
         }
         let mut controller = claude_native_comparison::Controller::new(qualification);
         assert!(!controller.advance(&mut state, !changed_pair));
-        assert!(state.native_comparison.is_none());
+        assert!(
+            state
+                .native_comparison
+                .as_ref()
+                .is_some_and(|phase| phase.disabled_for_test()),
+            "no eligibility remains; only terminal-traversal custody survives"
+        );
         assert!(
             !controller.advance(&mut state, true),
             "generation rollback or a later positive boolean cannot revive the controller"
@@ -2284,7 +2290,13 @@ fn native_comparison_controller_replaced_target_cannot_complete_comparison() {
     fs::rename(replacement, path).unwrap();
     let mut state = pause_native_comparison(state);
     assert!(!controller.advance(&mut state, true));
-    assert!(state.native_comparison.is_none());
+    assert!(
+        state
+            .native_comparison
+            .as_ref()
+            .is_some_and(|phase| phase.disabled_for_test()),
+        "no eligibility remains; only terminal-traversal custody survives"
+    );
     assert!(controller.receipt_for_test().0.acquired_roots.is_empty());
     let (_, scan) = SelectionFixture::run(state);
     assert!(!scan.census_complete);
@@ -2523,7 +2535,12 @@ fn native_comparison_window_saved_graph_obeys_real_layout_gate() {
         assert_eq!(graph.certified_member_count(), 1);
         drop(next);
     } else {
-        assert!(bound.is_none(), "unsupported compiler must remain refused");
+        assert_eq!(
+            bound,
+            Some(0),
+            "unsupported window was dropped before retention; no alternate layout admitted"
+        );
+        assert!(!owner.retained_valid_for_test());
         owner.discard_retained();
         let mut next = owner.begin();
         next.bind("window-source-destination-context".into());
@@ -2842,4 +2859,203 @@ fn native_comparison_window_any_authority_quarantine_withdraws() {
         assert!(page.window.root_revoked_for_test(&fixture.parent));
     }
     writeln!(std::io::stderr().lock(), "native_comparison_window_revocation: terminal_quarantine_base=true proof_correction_quarantine_base=true accepted_body_or_debt_unchanged=true").unwrap();
+}
+
+// The same actual scanner/controller and selected-save seams used by finish.
+// A/D share an exact native ID; the healthy C body has independent requests.
+const FALLBACK_COPY: &str = "c3333333-3333-4333-8333-333333333333";
+const FALLBACK_PEER: &str = "d4444444-4444-4444-8444-444444444444";
+const FALLBACK_HEALTHY: &str = "e5555555-5555-4555-8555-555555555555";
+fn native_comparison_selected_fallback_fixture() -> (
+    NativePreparationFixture,
+    ScanIndex,
+    SourceScanResult,
+    claude_native_comparison::SelectedFallback,
+    ScanIndex,
+    PathBuf,
+) {
+    let mut fixture = NativePreparationFixture::new();
+    for (session, request) in [
+        (FALLBACK_COPY, "req_1"),
+        (FALLBACK_PEER, "req_1"),
+        (FALLBACK_HEALTHY, "req_healthy"),
+    ] {
+        fs::write(fixture.dir.join(format!("{session}.jsonl")), format!("{{\"timestamp\":\"2026-08-02T07:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"requestId\":\"{request}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n")).unwrap();
+    }
+    let copy_key = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
+    let mut old = fixture.index.files.values().next().unwrap().clone();
+    let old_head = format!("{:064x}", 58801);
+    old.source_file_fingerprint = format!("{:064x}", 58802);
+    old.last_snapshot_fingerprint = Some(old_head.clone());
+    old.last_upload_body_witness = Some(format!("{:064x}", 58803));
+    fixture.index.files.insert(copy_key.clone(), old);
+    fixture
+        .index
+        .file_snapshot_fingerprints
+        .insert(copy_key, BTreeSet::from([old_head.clone()]));
+    fixture
+        .index
+        .accepted_snapshot_fingerprints
+        .insert(old_head.clone());
+    fixture
+        .index
+        .snapshot_activity_at
+        .insert(old_head, Some(WINDOW.to_owned()));
+    let path = fixture.dir.join("selected-index.json");
+    fixture.index.save(&path).unwrap();
+    fixture.index = ScanIndex::load(&path).unwrap();
+    let previous = fixture.index.clone();
+    let mut state = fixture.paused();
+    assert_eq!(state.scanned_file_count, 3);
+    let healthy = BTreeSet::from([fixture.parent.clone()]);
+    let qualification = state.prepare_native_comparison(claude_native_comparison::PairedRows {
+        api: &fixture.api.evidence,
+        trace: &fixture.trace.evidence,
+        healthy_roots: &healthy,
+    });
+    assert_eq!(qualification.certified_member_count(), 2);
+    // Exhaust the existing page budget, without changing any scope or cap.
+    state.file_limit = state.scanned_file_count;
+    let mut controller = claude_native_comparison::Controller::new(qualification);
+    assert!(!controller.advance(&mut state, true));
+    let (mut index, mut scan, terminal) = loop {
+        match state.step(None) {
+            OwnedSourceScanStep::Pending(next) => state = next,
+            OwnedSourceScanStep::Complete {
+                index,
+                scan,
+                terminal_native_traversal,
+            } => break (index, scan, terminal_native_traversal),
+        }
+    };
+    assert!(scan.census_complete);
+    assert!(
+        terminal.is_some(),
+        "failed comparison still MOVES the actual terminal traversal"
+    );
+    let completion = controller.complete(&scan, terminal, false).unwrap();
+    assert!(completion.window.is_none());
+    let fallback = completion.fallback.unwrap();
+    let observed = record_claude_native_observations(&scan, &mut index);
+    fallback.withhold(&mut scan);
+    assert!(scan
+        .snapshots
+        .iter()
+        .all(|item| item.source_session_id == FALLBACK_HEALTHY));
+    let disposition = apply_claude_reported_usage_to_scan_with_observations(
+        &mut scan,
+        &fixture.api,
+        &fixture.trace,
+        &mut index,
+        None,
+        Some(observed),
+    );
+    let shared = format!("{:x}", Sha256::digest(b"req_1"));
+    let owners = index.claude_duplicate_request_owners.get(&shared).unwrap();
+    assert!(owners.contains(&claude_duplicate_request_owner(
+        FALLBACK_COPY,
+        FALLBACK_COPY
+    )));
+    assert!(owners.contains(&claude_duplicate_request_owner(
+        FALLBACK_PEER,
+        FALLBACK_PEER
+    )));
+    assert!(
+        disposition.duplicate_census.census_complete,
+        "raw-native terminal decision reaches the ONE fold"
+    );
+    fallback.after_native_fold(&mut scan, &mut index);
+    assert!(!scan.census_complete);
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+    (fixture, index, scan, fallback, previous, path)
+}
+
+#[test]
+fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_before_copies() {
+    let (fixture, mut index, scan, mut fallback, previous, path) =
+        native_comparison_selected_fallback_fixture();
+    let key = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
+    let old = serde_json::to_vec(&previous.files[&key]).unwrap();
+    fallback.restore_selected(&mut index, &previous).unwrap();
+    assert_eq!(serde_json::to_vec(&index.files[&key]).unwrap(), old);
+    assert_eq!(
+        index.file_snapshot_fingerprints[&key],
+        previous.file_snapshot_fingerprints[&key]
+    );
+    let traversal = index.traversal.as_ref().unwrap();
+    let queued = traversal
+        .pending_candidates
+        .iter()
+        .map(|p| local_index_key(&p.path))
+        .collect::<Vec<_>>();
+    assert_eq!(queued.len(), 4);
+    assert!(queued[..2]
+        .iter()
+        .all(|key| claude_index_path_family_member(Path::new(key)).unwrap().0 == fixture.parent));
+    assert!(queued[2..].iter().any(|k| k == &key));
+    assert!(index.bounded_sweep_had_unsettled_upload());
+    index.save(&path).unwrap();
+    let restored = ScanIndex::load(&path).unwrap();
+    assert_eq!(serde_json::to_vec(&restored.files[&key]).unwrap(), old);
+    assert!(scan
+        .snapshots
+        .iter()
+        .all(|item| item.source_session_id == FALLBACK_HEALTHY));
+    writeln!(std::io::stderr().lock(), "native_comparison_selected_fallback: actual_native_copy_peer_observed=true healthy_body_retained=true old_body_accepted_ledger_unchanged=true terminal_graph_moved=true native_targets_before_BC=true normal_save_reload=true parked_schema=false").unwrap();
+}
+
+#[test]
+fn native_comparison_selected_fallback_partial_locked_save_and_restart_keep_exact_debt() {
+    let (fixture, index, scan, mut fallback, previous, path) =
+        native_comparison_selected_fallback_fixture();
+    let progress = fixture.dir.join("partial-progress.json");
+    let selected = crate::snapshot_sync::comparison_partial_fallback_for_test(
+        &index,
+        &previous,
+        &scan,
+        &mut fallback,
+        &path,
+        &progress,
+    )
+    .unwrap();
+    let key = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
+    assert_eq!(
+        serde_json::to_vec(&selected.files[&key]).unwrap(),
+        serde_json::to_vec(&previous.files[&key]).unwrap()
+    );
+    let new_key = local_index_key(&fixture.dir.join(format!("{FALLBACK_PEER}.jsonl")));
+    assert!(
+        !selected.files.contains_key(&new_key),
+        "never-accepted copy has no committed entry or empty marker"
+    );
+    assert!(!selected.confirmed_empty_files.contains(&new_key));
+    assert!(selected.bounded_sweep_had_unsettled_upload());
+    let restarted = ScanIndex::load(&path).unwrap();
+    assert_eq!(
+        restarted
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .len(),
+        4
+    );
+    assert!(!claude_native_comparison::lifecycle::Lifecycle::default().retained_valid_for_test());
+    writeln!(std::io::stderr().lock(), "native_comparison_partial_fallback: actual_progress_lock_selected_restore_CAS_save=true old_accepted_body_preserved=true new_copy_uncommitted=true no_empty_or_fake_hold=true native_priority_survives_reload=true restart_base=true").unwrap();
+}
+
+#[test]
+fn native_comparison_selected_fallback_cas_loss_and_wrong_window_never_commit() {
+    let (_fixture, mut index, _scan, mut fallback, previous, path) =
+        native_comparison_selected_fallback_fixture();
+    let mut winner = previous.clone();
+    winner.save(&path).unwrap();
+    let durable = fs::read(&path).unwrap();
+    fallback.restore_selected(&mut index, &previous).unwrap();
+    assert!(index.save(&path).is_err());
+    assert_eq!(fs::read(&path).unwrap(), durable);
+    index.traversal.as_mut().unwrap().census_window_end = "different-window".into();
+    assert!(fallback.restore_selected(&mut index, &previous).is_err());
+    assert_eq!(fs::read(&path).unwrap(), durable);
+    writeln!(std::io::stderr().lock(), "native_comparison_fallback_failure: actual_index_CAS_loser_preserves_winner=true wrong_window_refused=true no_checkpoint_or_offer_success=true").unwrap();
 }

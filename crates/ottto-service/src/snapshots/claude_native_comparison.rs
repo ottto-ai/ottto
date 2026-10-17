@@ -2,6 +2,87 @@
 //! ownership, coverage, a settled body, or permission to suppress a rearm.
 use super::*;
 pub(crate) mod lifecycle;
+mod settlement;
+use settlement::NativeCorrection;
+pub(crate) use settlement::{Completion, SelectedFallback};
+
+/// Borrow the same process lease at the final rearm decision, rather than
+/// turning its earlier allowed() result into a durable permission bit.
+pub(crate) struct NegativeView<'a> {
+    window: &'a WindowEligibility,
+    lease: &'a lifecycle::Lease,
+}
+impl Completion {
+    pub(crate) fn negatives<'a>(
+        &'a self,
+        lease: Option<&'a lifecycle::Lease>,
+    ) -> Option<NegativeView<'a>> {
+        let lease = lease.filter(|lease| lease.allowed())?;
+        Some(NegativeView {
+            window: self.window.as_deref()?,
+            lease,
+        })
+    }
+}
+impl<'a> NegativeView<'a> {
+    pub(super) fn keys(
+        &self,
+        index: &ScanIndex,
+        demoting: &BTreeMap<String, BTreeSet<String>>,
+        members: &BTreeMap<String, BTreeSet<String>>,
+    ) -> BTreeSet<&'a str> {
+        if !self.lease.allowed() {
+            return BTreeSet::new();
+        }
+        let mut keys: BTreeSet<&'a str> = self
+            .window
+            .roots
+            .iter()
+            .filter(|(root, saved)| {
+                !demoting.contains_key(*root)
+                    && !self.window.revoked_roots.contains(*root)
+                    && WindowEligibility::root_is_current(root, saved, index)
+                    && index
+                        .claude_usage_family_witnesses
+                        .get(*root)
+                        .is_some_and(|witness| {
+                            members.get(*root).is_some_and(|actual| {
+                                actual
+                                    .iter()
+                                    .eq(witness.member_request_id_fingerprints.keys())
+                            })
+                        })
+            })
+            .flat_map(|(_, saved)| saved.certified.keys().map(String::as_str))
+            .collect();
+        keys.extend(
+            self.window
+                .native_corrections
+                .iter()
+                .filter(|(key, receipt)| {
+                    !demoting.contains_key(receipt.root())
+                        && !self
+                            .window
+                            .correction_forbidden_roots
+                            .contains(receipt.root())
+                        && !self.window.correction_revoked_keys.contains(*key)
+                        && receipt.current(key, index)
+                        && index
+                            .claude_usage_family_witnesses
+                            .get(receipt.root())
+                            .is_some_and(|witness| {
+                                members.get(receipt.root()).is_some_and(|actual| {
+                                    actual
+                                        .iter()
+                                        .eq(witness.member_request_id_fingerprints.keys())
+                                })
+                            })
+                })
+                .map(|(key, _)| key.as_str()),
+        );
+        keys
+    }
+}
 
 pub(crate) fn actual_native_conjunction(disposition: &ClaudeUsageAuthorityDisposition) -> bool {
     let census = &disposition.duplicate_census;
@@ -152,6 +233,9 @@ pub(crate) struct WindowEligibility {
     census_window_end: String,
     roots: BTreeMap<String, WindowRoot>,
     revoked_roots: BTreeSet<String>,
+    native_corrections: BTreeMap<String, NativeCorrection>,
+    correction_revoked_keys: BTreeSet<String>,
+    correction_forbidden_roots: BTreeSet<String>,
 }
 #[derive(Debug)]
 struct WindowRoot {
@@ -201,6 +285,11 @@ impl WindowEligibility {
             }
             current
         });
+        self.native_corrections.retain(|key, receipt| {
+            !self.correction_revoked_keys.contains(key)
+                && !self.correction_forbidden_roots.contains(receipt.root())
+                && receipt.current(key, index)
+        });
     }
 
     #[cfg(test)]
@@ -221,6 +310,11 @@ impl WindowEligibility {
 
 #[derive(Default)]
 pub(crate) struct NativePhase {
+    disabled: bool,
+    parsed_keys: BTreeSet<String>,
+    native_corrections: BTreeMap<String, NativeCorrection>,
+    correction_revoked_keys: BTreeSet<String>,
+    correction_forbidden_roots: BTreeSet<String>,
     paused: bool,
     prepared: bool,
     // Actual page Skips plus moved same-window descriptors. Retention uses the
@@ -247,6 +341,17 @@ impl NativePhase {
             return false;
         }
         previous.retain_current(index);
+        self.correction_revoked_keys
+            .extend(previous.correction_revoked_keys);
+        self.correction_forbidden_roots
+            .extend(previous.correction_forbidden_roots);
+        for (key, receipt) in previous.native_corrections {
+            if self.parsed_keys.contains(&key) {
+                self.correction_revoked_keys.insert(key);
+            } else {
+                self.native_corrections.insert(key, receipt);
+            }
+        }
         self.parsed_roots.extend(previous.revoked_roots);
         for (root, saved) in previous.roots {
             if self.parsed_roots.contains(&root) {
@@ -269,6 +374,14 @@ impl NativePhase {
         true
     }
     pub(super) fn record_parse_attempt(&mut self, candidate: &CandidateFile) {
+        if self.disabled {
+            return;
+        }
+        let key = local_index_key(&candidate.path);
+        self.parsed_keys.insert(key.clone());
+        if self.native_corrections.remove(&key).is_some() {
+            self.correction_revoked_keys.insert(key);
+        }
         if let Some((root, _)) = claude_index_path_family_member(&candidate.path) {
             self.skips.retain(|_, skip| skip.root != root);
             self.parsed_roots.insert(root);
@@ -281,6 +394,9 @@ impl NativePhase {
         candidate: &CandidateFile,
         census_window_end: &str,
     ) {
+        if self.disabled {
+            return;
+        }
         let Some((root, member)) = claude_index_path_family_member(&candidate.path) else {
             return;
         };
@@ -319,7 +435,7 @@ impl NativePhase {
     }
 
     pub(super) fn pause_before_finalization(&mut self) -> bool {
-        if self.prepared {
+        if self.disabled || self.prepared {
             return false;
         }
         self.paused = true;
@@ -335,6 +451,25 @@ impl NativePhase {
         // Qualification now owns its selected path certificates. Do not keep
         // a second copy of their path/stat graph in the moving scan phase.
         self.skips.clear();
+    }
+
+    pub(super) fn disable(&mut self) {
+        *self = Self {
+            disabled: true,
+            prepared: true,
+            ..Self::default()
+        };
+        // Keep only the fact that this owner must MOVE its terminal traversal
+        // to the selected fallback seam. No eligibility survives this state.
+    }
+
+    #[cfg(test)]
+    pub(super) fn disabled_for_test(&self) -> bool {
+        self.disabled
+            && !self.ready()
+            && self.skips.is_empty()
+            && self.native_corrections.is_empty()
+            && self.target_revisions.is_empty()
     }
 
     pub(super) fn start_targets(&mut self, candidates: &[CandidateFile]) {
@@ -358,7 +493,7 @@ impl NativePhase {
     }
 
     pub(super) fn qualify(
-        &self,
+        &mut self,
         index: &ScanIndex,
         native: &[SnapshotItem],
         census_window_end: &str,
@@ -527,6 +662,18 @@ impl NativePhase {
             // family.rows_by_member is dropped here; no retained API row graph.
         }
         let mut qualification = Qualification::from_frozen_families(families);
+        qualification.correction_revoked_keys = std::mem::take(&mut self.correction_revoked_keys);
+        qualification.correction_forbidden_roots =
+            std::mem::take(&mut self.correction_forbidden_roots);
+        qualification.native_corrections = std::mem::take(&mut self.native_corrections);
+        qualification.native_corrections.retain(|key, receipt| {
+            rows.healthy_roots.contains(receipt.root())
+                && !qualification.correction_revoked_keys.contains(key)
+                && !qualification
+                    .correction_forbidden_roots
+                    .contains(receipt.root())
+                && receipt.current(key, index)
+        });
         qualification.revoked_roots = self.parsed_roots.clone();
         qualification
             .revoked_roots
@@ -567,6 +714,12 @@ impl Controller {
             .families
             .values()
             .flat_map(|family| family.paired_roots.iter().cloned())
+            .chain(
+                qualification
+                    .native_corrections
+                    .values()
+                    .map(|receipt| receipt.root().to_owned()),
+            )
             .collect();
         Self {
             qualification,
@@ -644,6 +797,9 @@ pub(crate) struct Qualification {
     pending: BTreeMap<String, PendingComparison>,
     unknown_native_sources: BTreeSet<String>,
     revoked_roots: BTreeSet<String>,
+    native_corrections: BTreeMap<String, NativeCorrection>,
+    correction_revoked_keys: BTreeSet<String>,
+    correction_forbidden_roots: BTreeSet<String>,
 }
 
 struct PendingComparison {
@@ -698,6 +854,9 @@ impl Qualification {
             census_window_end: census_window_end.to_owned(),
             roots,
             revoked_roots: self.revoked_roots,
+            native_corrections: self.native_corrections,
+            correction_revoked_keys: self.correction_revoked_keys,
+            correction_forbidden_roots: self.correction_forbidden_roots,
         }))
     }
     fn from_frozen_families(mut families: BTreeMap<String, FrozenFamily>) -> Self {
@@ -801,6 +960,9 @@ impl Qualification {
                 continue;
             };
             self.revoked_roots.insert(root.clone());
+            self.correction_forbidden_roots.insert(root.clone());
+            self.native_corrections
+                .retain(|_, receipt| receipt.root() != root);
             result.matched_roots += 1;
             let mut required_revisions = family
                 .certified
@@ -1056,11 +1218,11 @@ impl Drop for TestScope {
 }
 
 crate::heap_layout_bound::fields!(NormalSkip; root, member, revision, census_window_end, upload_context, candidate);
-crate::heap_layout_bound::fields!(NativePhase; paused, prepared, skips, parsed_roots, target_revisions, attempted_targets);
+crate::heap_layout_bound::fields!(NativePhase; disabled, parsed_keys, native_corrections, correction_revoked_keys, correction_forbidden_roots, paused, prepared, skips, parsed_roots, target_revisions, attempted_targets);
 crate::heap_layout_bound::fields!(FrozenFamily; witness, assigned, certified, prior_native_revisions, paired_roots);
 crate::heap_layout_bound::fields!(Controller; qualification, required_roots, native_frontier, awaiting_targets, failed, acquisition);
-crate::heap_layout_bound::fields!(Qualification; families, envelope_roots, envelope_by_hash, pending, unknown_native_sources, revoked_roots);
-crate::heap_layout_bound::fields!(WindowEligibility; census_window_end, roots, revoked_roots);
+crate::heap_layout_bound::fields!(Qualification; families, envelope_roots, envelope_by_hash, pending, unknown_native_sources, revoked_roots, native_corrections, correction_revoked_keys, correction_forbidden_roots);
+crate::heap_layout_bound::fields!(WindowEligibility; census_window_end, roots, revoked_roots, native_corrections, correction_revoked_keys, correction_forbidden_roots);
 crate::heap_layout_bound::fields!(WindowRoot; proof, certified);
 
 crate::heap_layout_bound::fields!(TargetSelection; queued, matched_roots, unresolved_sources);

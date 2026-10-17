@@ -3821,6 +3821,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
         identity,
         &BTreeSet::new(),
         None,
+        None,
     )
 }
 
@@ -3878,6 +3879,26 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_observations(
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
     observations: Option<ClaudeNativeObservations>,
 ) -> ClaudeUsageAuthorityDisposition {
+    apply_claude_reported_usage_to_scan_with_comparison(
+        scan,
+        api_report,
+        trace_report,
+        index,
+        identity,
+        observations,
+        None,
+    )
+}
+
+pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
+    scan: &mut SourceScanResult,
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    index: &mut ScanIndex,
+    identity: Option<&claude_request_identity::ScanEvidence<'_>>,
+    observations: Option<ClaudeNativeObservations>,
+    negatives: Option<claude_native_comparison::NegativeView<'_>>,
+) -> ClaudeUsageAuthorityDisposition {
     let current_files = if index.claude_usage_authority_quarantine.is_empty() {
         BTreeSet::new()
     } else {
@@ -3898,6 +3919,7 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_observations(
         identity,
         &current_files,
         observations,
+        negatives,
     )
 }
 
@@ -3914,6 +3936,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     identity: Option<&claude_request_identity::ScanEvidence<'_>>,
     current_files: &BTreeSet<String>,
     observations: Option<ClaudeNativeObservations>,
+    negatives: Option<claude_native_comparison::NegativeView<'_>>,
 ) -> ClaudeUsageAuthorityDisposition {
     let mut duplicate_census = match observations {
         Some(observed) => {
@@ -4715,6 +4738,17 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .iter()
             .map(|item| item.source_session_id.as_str())
             .collect::<BTreeSet<_>>();
+        // Final proof and demotion state, not the preflight's possible owners.
+        // Every other rearm disjunct below remains authoritative.
+        let negative_keys =
+            if !duplicate_census_invalid && !index.claude_duplicate_request_witness_overflowed {
+                negatives
+                    .as_ref()
+                    .map(|view| view.keys(index, &demoting_members_by_root, &complete_families))
+                    .unwrap_or_default()
+            } else {
+                BTreeSet::new()
+            };
         for (index_key, entry) in &mut index.files {
             let Some((root_session_id, source_session_id)) =
                 claude_index_path_family_member(Path::new(index_key))
@@ -4733,7 +4767,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             if full_rearm
                 || {
                     let proof_rearm = proven.contains_key(&root_session_id)
-                        && !current_ids.contains(source_session_id.as_str());
+                        && !current_ids.contains(source_session_id.as_str())
+                        && !negative_keys.contains(index_key.as_str());
                     #[cfg(test)]
                     {
                         proof_rearm
@@ -11921,7 +11956,9 @@ impl OwnedSourceScan {
     }
 
     pub(crate) fn disable_native_comparison(&mut self) {
-        self.native_comparison = None;
+        if let Some(phase) = self.native_comparison.as_mut() {
+            phase.disable();
+        }
     }
 
     pub(crate) fn native_comparison_inputs(&self) -> (&ScanIndex, &[SnapshotItem]) {

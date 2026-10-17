@@ -449,3 +449,37 @@ grant before any subsequent context check. This exposes a separate bootstrap
 failure if one remains. No production context guard, cadence, permission,
 layout or budget changes. These revised assertions require hosted validation;
 they establish no resource savings or installed performance acceptance.
+
+
+## Selected fallback candidate
+
+The inactive finish path now consumes unresolved native-comparison dependencies
+into an ephemeral selected-save capsule. Raw native occurrences are recorded
+before current B/C bodies are filtered. The same authoritative fold sees the
+actual terminal native census; only afterwards is upload terminality marked
+unsettled. Withheld files do not acquire empty/no-op finalization or identity
+bodies. The capsule moves the real terminal traversal, restores prior selected
+file/entity/acceptance facts, and queues observed native targets ahead of the
+withheld candidates in that traversal. Both the locked partial checkpoint and
+the normal final selected save use this path before their existing CAS.
+
+The final stable-proof rearm disjunct can consult a borrowed, still-current
+lifecycle lease and frozen actual-Skip window after proof reconstruction and
+demotion. Full-fence, changed-owner/request, invalid-proof and held paths remain
+authoritative. There is no new persistence, hold record, cap, wire contract or
+production opt-in. Failure to recover an exact source key/window refuses before
+a new body can be offered.
+
+This candidate requires fresh CI. Three added tests use the actual scanner and
+controller with exhausted existing target budget, exact native cross-session
+observations, an unaffected body, normal and locked partial save/reload, a real
+CAS loser and a wrong-window refusal. They do not establish full-driver or
+installed resource acceptance. The two original optimized oracles remain
+unchanged and unaccepted. A separate process-only corrected-native receipt now
+records a loss-free parse under frozen P only after an exact body ACK/no-op and
+normal durable selected save. Its same-window terminal use requires unchanged
+proof, selected revision and body witness, no demotion/quarantine or positive
+comparison trigger, and a current process lease. Reparse/proof/context/error
+and budget refusal discard it. It never becomes Skip, S, ownership, coverage,
+tagging or wire evidence. Dedicated tests and original helper integration
+remain required; actual-Skip evidence is never fabricated for parsed members.

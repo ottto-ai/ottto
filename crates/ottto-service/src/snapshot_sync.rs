@@ -1680,6 +1680,36 @@ pub(crate) fn comparison_partial_checkpoint_for_test(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn comparison_partial_fallback_for_test(
+    index: &ScanIndex,
+    committed: &ScanIndex,
+    scan: &SourceScanResult,
+    fallback: &mut crate::snapshots::claude_native_comparison::SelectedFallback,
+    index_path: &Path,
+    progress_path: &Path,
+) -> Result<ScanIndex> {
+    let mut progress = SnapshotUploadProgress::load(
+        progress_path,
+        &format!("{:064x}", 588),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )?;
+    progress.save(progress_path)?;
+    checkpoint_partial_snapshot_index_with_comparison(
+        index,
+        committed,
+        &progress,
+        &scan.snapshots,
+        Some(scan),
+        &BTreeSet::new(),
+        index_path,
+        progress_path,
+        || Ok(()),
+        None,
+        Some(fallback),
+    )
+}
+
 /// Preserve only delivery-owned file checkpoints on an unfinished upload.
 /// Hold the progress lock through index CAS: neither an unsaved ACK nor a
 /// racing ledger generation may certify the scan's new file/body witnesses.
@@ -1721,6 +1751,35 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
     progress_path: &Path,
     validate_destination: impl FnOnce() -> Result<()>,
     read_limit: Option<usize>,
+) -> Result<ScanIndex> {
+    checkpoint_partial_snapshot_index_with_comparison(
+        index,
+        committed_index,
+        progress,
+        snapshots,
+        correction_scan,
+        locally_held,
+        index_path,
+        progress_path,
+        validate_destination,
+        read_limit,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_partial_snapshot_index_with_comparison(
+    index: &ScanIndex,
+    committed_index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    snapshots: &[SnapshotItem],
+    correction_scan: Option<&SourceScanResult>,
+    locally_held: &BTreeSet<String>,
+    index_path: &Path,
+    progress_path: &Path,
+    validate_destination: impl FnOnce() -> Result<()>,
+    read_limit: Option<usize>,
+    fallback: Option<&mut crate::snapshots::claude_native_comparison::SelectedFallback>,
 ) -> Result<ScanIndex> {
     let _lock = SnapshotProgressLock::acquire(progress_path)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
@@ -1796,6 +1855,11 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
         &mut committable,
         committed_index,
     );
+    if let Some(fallback) = fallback {
+        fallback
+            .restore_selected(&mut committable, committed_index)
+            .map_err(|reason| anyhow!(reason))?;
+    }
     committable.mark_bounded_sweep_unsettled();
     validate_destination()?;
     if let Some(cap) = read_limit {
@@ -4121,26 +4185,30 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
-    // Recheck after native finalization, before the sole authoritative fold.
-    // This checkpoint still emits through the base fold: selected-state
-    // deferral and rearm suppression remain inactive.
-    if let Some(controller) = native_comparison_controller.as_ref() {
-        let current = prepared_claude_evidence.as_ref().is_some_and(|evidence| {
-            evidence.frozen_roots_are_current(support_dir, controller.required_roots())
+    // Recheck the same owner after native continuation. A failed comparison
+    // carries its unresolved exact dependencies into selected-state fallback.
+    let comparison_current = native_comparison_controller
+        .as_ref()
+        .is_some_and(|controller| {
+            native_comparison_lease
+                .as_ref()
+                .is_some_and(|lease| lease.allowed())
+                && prepared_claude_evidence.as_ref().is_some_and(|evidence| {
+                    evidence.frozen_roots_are_current(support_dir, controller.required_roots())
+                })
         });
-        if !current {
-            if let Some(lease) = native_comparison_lease.as_mut() {
-                lease.revoke();
-            }
+    if !comparison_current {
+        if let Some(lease) = native_comparison_lease.as_mut() {
+            lease.revoke();
         }
     }
-    // Move only normal-Skip descriptors/tombstones; all provider/S graphs drop
-    // before the authoritative fold. A later page reconstructs its own rows.
-    let native_window = native_comparison_controller
-        .and_then(|controller| controller.into_window(&scan_result.census_window_end));
-    // The terminal graph moves separately from Clone-able results. Selected
-    // fallback is not wired yet, so do not retain an unused graph during upload.
-    drop(terminal_native_traversal);
+    let mut comparison_completion = native_comparison_controller
+        .map(|controller| {
+            controller
+                .complete(&scan_result, terminal_native_traversal, comparison_current)
+                .map_err(|reason| anyhow!(reason))
+        })
+        .transpose()?;
     let client = &receipt_client;
     let codex_join_validator = scan_result.codex_joining_validator();
     let validate_joined = |snapshots: &[SnapshotItem]| -> Result<()> {
@@ -4187,12 +4255,14 @@ fn finish_sync_source(
     if source == SnapshotSource::ClaudeCode {
         let evidence_started = Instant::now();
         let (disposition, census_withheld, stats) =
-            apply_claude_local_evidence_to_scan_with_prepared(
+            apply_claude_local_evidence_to_scan_with_comparison(
                 support_dir,
                 &mut scan_result,
                 &mut index,
                 cycle_request_identity_permit(source, &activity_hint),
                 prepared_claude_evidence,
+                comparison_completion.as_ref(),
+                native_comparison_lease.as_ref(),
             );
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
@@ -4305,6 +4375,23 @@ fn finish_sync_source(
     } else {
         Vec::new()
     };
+    if let Some(comparison) = comparison_completion.as_mut() {
+        comparison.capture_native_corrections(
+            &mut scan_result,
+            &committed_index,
+            &claude_authority_disposition,
+            |snapshot| {
+                effective_snapshot_upload_body_witness(
+                    snapshot,
+                    &upload_progress,
+                    cache_observations_enabled,
+                    activity_hint.snapshot_head_cas_required,
+                    &legacy_reconciliation_pending,
+                    &claude_authority_disposition,
+                )
+            },
+        );
+    }
     finalize_scan_after_policy_with_body_witness(
         source,
         &mut scan_result,
@@ -4694,7 +4781,7 @@ fn finish_sync_source(
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
             let mut checkpoint_succeeded = true;
-            let committable = match checkpoint_partial_snapshot_index(
+            let committable = match checkpoint_partial_snapshot_index_with_comparison(
                 &index,
                 &committed_index,
                 &upload_progress,
@@ -4707,6 +4794,10 @@ fn finish_sync_source(
                     ensure_authority()?;
                     scan_result.validate_codex_checkpoint()
                 },
+                None,
+                comparison_completion
+                    .as_mut()
+                    .and_then(|comparison| comparison.fallback.as_mut()),
             ) {
                 Ok(committable) => committable,
                 Err(error) => {
@@ -4803,7 +4894,7 @@ fn finish_sync_source(
             // delta can prune those ACKs. Local-state failures leave durability
             // uncertain and must not certify an in-memory mutated ledger.
             if snapshot_upload_error_class(&error) != Some(SnapshotUploadErrorClass::LocalState) {
-                match checkpoint_partial_snapshot_index(
+                match checkpoint_partial_snapshot_index_with_comparison(
                     &index,
                     &committed_index,
                     &upload_progress,
@@ -4816,6 +4907,10 @@ fn finish_sync_source(
                         ensure_authority()?;
                         scan_result.validate_codex_checkpoint()
                     },
+                    None,
+                    comparison_completion
+                        .as_mut()
+                        .and_then(|comparison| comparison.fallback.as_mut()),
                 ) {
                     Ok(committable) => index = committable,
                     Err(checkpoint_error) => eprintln!(
@@ -4983,6 +5078,15 @@ fn finish_sync_source(
         &claude_cutoff_corrections,
         upload_fully_settled,
     );
+    if let Some(fallback) = comparison_completion
+        .as_mut()
+        .and_then(|comparison| comparison.fallback.as_mut())
+    {
+        fallback
+            .restore_selected(&mut index, &committed_index)
+            .map_err(|reason| anyhow!(reason))?;
+        upload_fully_settled = false;
+    }
     backfill_succeeded &= upload_fully_settled;
     // A quiet/delta-only scan still discloses current permanent refusals even
     // though no body needed another upload. The committed census owns scope.
@@ -5014,6 +5118,34 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    if upload_fully_settled
+        && native_comparison_lease
+            .as_ref()
+            .is_some_and(|lease| lease.allowed())
+    {
+        if let Some(comparison) = comparison_completion.as_mut() {
+            comparison.note_native_corrections_after_save(
+                &index,
+                &committed_index,
+                |fp, witness| {
+                    if upload_progress.quarantined_fingerprints.contains_key(fp)
+                        || upload_progress.permanent_rejections.contains_key(fp)
+                        || upload_progress.active_quarantine_retries.contains(fp)
+                    {
+                        None
+                    } else {
+                        Some(
+                            upload_progress.accepted_fingerprints.contains(fp)
+                                && upload_progress
+                                    .accepted_body_witnesses
+                                    .get(fp)
+                                    .is_some_and(|accepted| accepted == witness),
+                        )
+                    }
+                },
+            );
+        }
+    }
     if let Some(lease) = native_comparison_lease.as_mut() {
         lease.note_selected_save(
             actual_native_conjunction && scan_result.census_complete && upload_fully_settled,
@@ -5139,7 +5271,11 @@ fn finish_sync_source(
         },
     )?;
     if let Some(mut lease) = native_comparison_lease {
-        lease.stage_window_after_save(native_window, &index, scan_result.census_complete);
+        lease.stage_window_after_save(
+            comparison_completion.and_then(|comparison| comparison.window),
+            &index,
+            scan_result.census_complete,
+        );
         // Only an existing permit may survive a known, saved bounded page.
         // The actual terminal native conjunction remains the sole bootstrap.
         lease.finish(
@@ -5499,12 +5635,43 @@ fn apply_claude_local_evidence_to_scan_with_prepared(
     scan_result: &mut crate::snapshots::SourceScanResult,
     index: &mut ScanIndex,
     permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
-    mut prepared: Option<PreparedClaudeLocalEvidence>,
+    prepared: Option<PreparedClaudeLocalEvidence>,
 ) -> (
     crate::snapshots::ClaudeUsageAuthorityDisposition,
     bool,
     ClaudeLocalEvidenceStats,
 ) {
+    apply_claude_local_evidence_to_scan_with_comparison(
+        support_dir,
+        scan_result,
+        index,
+        permit,
+        prepared,
+        None,
+        None,
+    )
+}
+
+fn apply_claude_local_evidence_to_scan_with_comparison(
+    support_dir: &Path,
+    scan_result: &mut SourceScanResult,
+    index: &mut ScanIndex,
+    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
+    mut prepared: Option<PreparedClaudeLocalEvidence>,
+    comparison: Option<&crate::snapshots::claude_native_comparison::Completion>,
+    lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
+) -> (
+    crate::snapshots::ClaudeUsageAuthorityDisposition,
+    bool,
+    ClaudeLocalEvidenceStats,
+) {
+    // Actual native occurrences are recorded once BEFORE emission filtering.
+    // The authoritative fold still sees the actual terminal census decision.
+    let observations =
+        comparison.map(|_| crate::snapshots::record_claude_native_observations(scan_result, index));
+    if let Some(fallback) = comparison.and_then(|comparison| comparison.fallback.as_ref()) {
+        fallback.withhold(scan_result);
+    }
     let emission_permitted = permit.is_some();
     let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
@@ -5650,13 +5817,19 @@ fn apply_claude_local_evidence_to_scan_with_prepared(
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
     });
-    let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_identity(
+    let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_comparison(
         scan_result,
         &api_report,
         &trace_report,
         index,
         identity_evidence.as_ref(),
+        observations,
+        comparison.and_then(|comparison| comparison.negatives(lease)),
     );
+    if let Some(fallback) = comparison.and_then(|comparison| comparison.fallback.as_ref()) {
+        fallback.after_native_fold(scan_result, index);
+        disposition.transcript_ownership_complete = false;
+    }
     if let Some(evidence) = &identity_evidence {
         // Contract 5 first: D1 below leaves new-collector items untouched. The
         // rebuild above has just settled this pass's duplicate census.
