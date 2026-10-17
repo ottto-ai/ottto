@@ -3065,6 +3065,50 @@ fn native_comparison_selected_fallback_cas_loss_and_wrong_window_never_commit() 
     writeln!(std::io::stderr().lock(), "native_comparison_fallback_failure: actual_index_CAS_loser_preserves_winner=true wrong_window_refused=true no_checkpoint_or_offer_success=true").unwrap();
 }
 
+/// Complete only the remaining physical cursor before a SECOND component
+/// parse. The first corrective page selected the parent with limit1; the child
+/// is still queued. Clearing the parent's debt does not inject it into that
+/// older queue. Use the real unchanged child traversal, never reset its fields
+/// or assert a second parent read before it can actually be selected. This
+/// data-level helper mints no proof, native receipt, ACK or lifecycle grant.
+fn finish_native_receipt_component_cursor(fixture: &mut NativePreparationFixture) {
+    for _ in 0..8 {
+        if fixture.index.traversal.is_none() {
+            return;
+        }
+        let native = OwnedSourceScan::new_with_identity_capture(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&fixture.dir),
+            fixture.index.clone(),
+            WINDOW,
+            30,
+            8,
+            false,
+            None,
+            &[],
+            false,
+            false,
+            false,
+        );
+        let (index, scan) = SelectionFixture::run(native);
+        assert_eq!(
+            scan.scanned_file_count, 0,
+            "only the existing unchanged cursor tail is consumed"
+        );
+        assert!(scan.snapshots.is_empty() && scan.pending_finalization.is_empty());
+        assert_eq!(
+            index.claude_usage_family_witnesses,
+            fixture.index.claude_usage_family_witnesses
+        );
+        assert_eq!(
+            index.accepted_snapshot_fingerprints,
+            fixture.index.accepted_snapshot_fingerprints
+        );
+        fixture.index = index;
+    }
+    panic!("native receipt component cursor did not terminate");
+}
+
 fn native_comparison_corrected_native_receipt_fixture(
     mode: &str,
 ) -> (
@@ -3076,6 +3120,7 @@ fn native_comparison_corrected_native_receipt_fixture(
         let (mut fixture, accepted, _) =
             native_comparison_corrected_native_receipt_fixture("exact_ack");
         fixture.index = accepted; // Actual prior validated ACK and durable save.
+        finish_native_receipt_component_cursor(&mut fixture);
         fixture
     } else {
         NativePreparationFixture::new()
@@ -3241,6 +3286,7 @@ fn native_comparison_native_receipt_proof_revision_reparse_and_restart_are_base(
     let (mut fixture, index, window) =
         native_comparison_corrected_native_receipt_fixture("exact_ack");
     fixture.index = index;
+    finish_native_receipt_component_cursor(&mut fixture);
     let key = local_index_key(&fixture.dir.join(format!("{}.jsonl", fixture.parent)));
     fixture
         .index

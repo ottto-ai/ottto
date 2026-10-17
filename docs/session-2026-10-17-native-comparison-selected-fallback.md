@@ -52,3 +52,17 @@ and restart loss. A real constructor control checks existing queued empty-fp
 debt before audits after save/reload, without injecting paths or new eligibility.
 Production remains disabled; review, activation and installed performance are
 separate gates. No CPU/RSS improvement or release readiness is claimed.
+
+
+CI `39020879390` on `e306516a` passed format/Clippy and the three non-Rust
+checks; service tests reported 2,949 passed / 2 failed / 24 ignored. The public
+ACK repair reached exact-body receipt minting and negative modes. Both failures
+were the second component scan: the first limit-one page still had its unchanged
+child queued, so clearing the parent's fingerprint did not select that parent.
+The test helper now consumes that real unchanged native cursor first, asserting
+zero native reads/bodies/finalizations and unchanged proof/accepted sets. It
+then starts the next ordinary scan with the same expected parent read. It does
+not reset a traversal field, force a Skip or grant permission. This remains a
+data-level reparse/no-op component, not a lifecycle or full-pipeline receipt.
+Both original wrappers on the hosted unsupported layout reported UNEXECUTED;
+no original acceptance or corrected supported run exists.
