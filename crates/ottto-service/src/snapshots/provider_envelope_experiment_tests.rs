@@ -2904,6 +2904,11 @@ fn native_comparison_selected_fallback_fixture() -> (
     let path = fixture.dir.join("selected-index.json");
     fixture.index.save(&path).unwrap();
     fixture.index = ScanIndex::load(&path).unwrap();
+    // The selected upload context is runtime-only. Real preparation activates
+    // it after load; a missing context correctly reparses both proven members.
+    fixture
+        .index
+        .activate_upload_context("native-preparation-test".to_owned());
     let previous = fixture.index.clone();
     let mut state = fixture.paused();
     assert_eq!(state.scanned_file_count, 3);
