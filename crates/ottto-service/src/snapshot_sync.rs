@@ -45,6 +45,8 @@ use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use zeroize::Zeroize;
 
+mod rejection_log;
+
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -135,6 +137,7 @@ fn bootstrap_cache_heads(
             &mut accepted,
             |item| item.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
+            |item| Some(item.source_session_id.as_str()),
             |_| false,
             |items| upload(items, enforce_head_cas),
             |progress| persist(progress),
@@ -4634,6 +4637,7 @@ fn finish_sync_source(
         &mut accepted,
         |snapshot| snapshot.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
+        |snapshot| Some(snapshot.source_session_id.as_str()),
         |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
         |snapshots| {
             // A first Codex/Claude scan can spend several minutes parsing local
@@ -6165,6 +6169,7 @@ where
         accepted,
         fingerprint,
         body_witness,
+        |_| None,
         |_| false,
         upload,
         persist,
@@ -6180,7 +6185,7 @@ enum SnapshotPageOutcome {
 // Scratch extraction only: the upload callback remains the existing canonical
 // preflight/token/ACK-validator/client-report boundary. No inventory pruning.
 #[allow(clippy::too_many_arguments)]
-fn attempt_snapshot_page<T, Fingerprint, BodyWitness, Upload, Persist>(
+fn attempt_snapshot_page<T, Fingerprint, BodyWitness, SessionId, Upload, Persist>(
     items: &[T],
     indices: &[usize],
     poison_scope: &str,
@@ -6188,6 +6193,7 @@ fn attempt_snapshot_page<T, Fingerprint, BodyWitness, Upload, Persist>(
     accepted: &mut u64,
     fingerprint: &Fingerprint,
     body_witness: &BodyWitness,
+    session_id: &SessionId,
     upload: &mut Upload,
     persist: &mut Persist,
 ) -> Result<SnapshotPageOutcome>
@@ -6195,6 +6201,7 @@ where
     T: Clone + Serialize,
     Fingerprint: Fn(&T) -> &str,
     BodyWitness: Fn(&T) -> String,
+    SessionId: Fn(&T) -> Option<&str>,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
@@ -6315,10 +6322,13 @@ where
         for entity in &response.rejected_entities {
             record_poison_loss_once(poison_scope, &entity.snapshot_fingerprint);
             eprintln!(
-                "local snapshot entity rejected for {poison_scope}: reason={} permanent={}; \
+                "local snapshot entity rejected for {poison_scope}: reason={} permanent={} session_hash={}; \
                  accepted siblings checkpointed, rejected body retained in bounded quarantine",
                 entity.safe_reason(),
                 entity.permanent,
+                rejection_log::rejected_session_hash(
+                    items, indices, &entity.snapshot_fingerprint, fingerprint, session_id,
+                ),
             );
         }
     }
@@ -6329,11 +6339,38 @@ where
     })
 }
 
+// Packing needs encoded lengths, not a retained copy of every pending body.
+// Use the same serde JSON encoding without allocating its output. There is no
+// early size cap: serializers must still finish or report their original error.
+struct SnapshotPackingLength {
+    bytes: usize,
+}
+impl std::io::Write for SnapshotPackingLength {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.checked_add(bytes.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "snapshot packing length overflow",
+            )
+        })?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn snapshot_packing_json_length<T: Serialize + ?Sized>(item: &T) -> serde_json::Result<usize> {
+    let mut length = SnapshotPackingLength { bytes: 0 };
+    serde_json::to_writer(&mut length, item)?;
+    Ok(length.bytes)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upload_resumable_batches_with_body_witness_partitioned<
     T,
     Fingerprint,
     BodyWitness,
+    SessionId,
     BatchClass,
     Upload,
     Persist,
@@ -6344,6 +6381,7 @@ fn upload_resumable_batches_with_body_witness_partitioned<
     accepted: &mut u64,
     fingerprint: Fingerprint,
     body_witness: BodyWitness,
+    session_id: SessionId,
     batch_class: BatchClass,
     mut upload: Upload,
     mut persist: Persist,
@@ -6352,6 +6390,7 @@ where
     T: Clone + Serialize,
     Fingerprint: Fn(&T) -> &str,
     BodyWitness: Fn(&T) -> String,
+    SessionId: Fn(&T) -> Option<&str>,
     BatchClass: Fn(&T) -> bool,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
@@ -6425,18 +6464,18 @@ where
         })?;
     }
 
-    let mut pending_by_fingerprint: BTreeMap<String, (usize, Vec<u8>, String)> = BTreeMap::new();
+    let mut pending_by_fingerprint: BTreeMap<String, (usize, usize, String)> = BTreeMap::new();
     for (index, item) in items.iter().enumerate() {
         let witness = body_witness(item);
         if !progress.contains_body(fingerprint(item), &witness) {
             match pending_by_fingerprint.entry(fingerprint(item).to_string()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    let body = serde_json::to_vec(item).map_err(|_| {
+                    let body_length = snapshot_packing_json_length(item).map_err(|_| {
                         anyhow::Error::new(SnapshotLocalStateRejected {
                             operation: "serialize snapshot for batch packing",
                         })
                     })?;
-                    entry.insert((index, body, witness));
+                    entry.insert((index, body_length, witness));
                 }
                 std::collections::btree_map::Entry::Occupied(_) => {
                     // The finalized fingerprint covers every post-policy
@@ -6457,8 +6496,8 @@ where
     let mut batch = Vec::new();
     let mut batch_bytes = 2usize;
     let mut current_batch_class = None;
-    for (index, body, _) in pending_by_fingerprint.into_values() {
-        let item_bytes = body.len().saturating_add(1);
+    for (index, body_length, _) in pending_by_fingerprint.into_values() {
+        let item_bytes = body_length.saturating_add(1);
         let item_batch_class = batch_class(&items[index]);
         if !batch.is_empty()
             && (batch.len() == SNAPSHOT_BATCH_LIMIT
@@ -6508,6 +6547,7 @@ where
             accepted,
             &fingerprint,
             &body_witness,
+            &session_id,
             &mut upload,
             &mut persist,
         ) {
@@ -11537,6 +11577,11 @@ mod tests {
         assert_eq!(accepted, 1);
     }
 
+    mod packing_count_tests {
+        use super::*;
+        include!("snapshot_sync/packing_count_tests.rs");
+    }
+
     #[derive(Clone, Serialize)]
     struct SizedUploadItem {
         fingerprint: String,
@@ -13343,6 +13388,7 @@ mod tests {
             &mut accepted,
             String::as_str,
             |item| item.clone(),
+            |_| None,
             |item| reconcile_class.contains(item),
             |batch| {
                 let is_reconcile = batch
@@ -18071,6 +18117,7 @@ mod tests {
                 &mut 0,
                 &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
                 &snapshot_upload_body_witness,
+                &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
                 &mut { upload },
                 &mut |p: &mut SnapshotUploadProgress| p.save(&self.progress_path),
             )
@@ -18314,6 +18361,7 @@ mod tests {
             &mut 0,
             &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
             &snapshot_upload_body_witness,
+            &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
             &mut |items| {
                 physical += 1;
                 same_source_fixture_ack(items)
