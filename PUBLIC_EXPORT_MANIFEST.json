@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 676,
-  "content_sha256": "d942c93538ebff30ae61432600a9af1faede5af3a0dbd5d9f05f80cb5b8b8988",
+  "content_sha256": "766d921261a924dd2ebe0c201bc7c99bd6a0474fa1937d580c954b86abc7411f",
   "files": [
     {
       "executable": false,
@@ -1315,8 +1315,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_native_comparison/lifecycle.rs",
-      "sha256": "e4137b1a7e2be694e52dd27ace06bab35e568fbdfc304510b821d2fa2f7e52a6",
-      "size_bytes": 30470
+      "sha256": "a77f61e004efa241f0da1f9ea40929418b9db7e568f3b743f26612bdb2ffa730",
+      "size_bytes": 30607
     },
     {
       "executable": false,
@@ -4735,7 +4735,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-17T22:07:18+00:00",
+  "generated_at": "2026-10-17T22:07:55+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 677,
   "public_roots": [
@@ -4774,5 +4774,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "05dd28596acf9303b67e02f1fbf1bdbea53f62eb"
+  "source_commit": "e02f04ae0e2ebe61a193085b572cb2a44219ed18"
 }

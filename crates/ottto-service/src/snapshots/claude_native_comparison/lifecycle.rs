@@ -644,7 +644,9 @@ fn native_comparison_deferred_policy_one_hit_then_base_until_quiet_settled() {
         )
         .as_bytes(),
     );
-    let (scope, allocated) = crate::retry_allocation_probe::measure_process(|| {
+    // Pure synchronous formatting spawns no work: thread-local accounting
+    // excludes unrelated tests' allocations in parallel hosted runs.
+    let (scope, allocated) = crate::retry_allocation_probe::measure(|| {
         Scope::from_arguments(format_args!(
             "native_comparison:v1:{:?}:destination:context:replay:false:true",
             [7u8; 32]
