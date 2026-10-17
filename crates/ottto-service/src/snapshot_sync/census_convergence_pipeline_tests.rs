@@ -214,10 +214,10 @@ impl PipelineFixture {
         });
         let settlement = match upload {
             PipelineUpload::Accept => {
-                settle_completed_upload(index, &committed_index, &progress, &holds)
+                settle_completed_upload(index, &committed_index, &progress, &holds).unwrap()
             }
             PipelineUpload::ServerDeferred => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false).unwrap()
             }
         };
         if let Some(reference) = borrowed_reference {
@@ -237,7 +237,7 @@ impl PipelineFixture {
             &[],
             &[],
             settlement.fully_settled,
-        );
+        ).unwrap();
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
             &mut index,

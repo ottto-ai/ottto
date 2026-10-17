@@ -48,13 +48,49 @@ fn copy_owner_prepare_with_account_witness(
     .ok_or_else(|| anyhow!("expected a due synthetic Claude preparation"))
 }
 
-fn copy_owner_complete(mut frame: SourcePreparation) -> (ScanIndex, SourceScanResult) {
+fn copy_owner_complete(frame: SourcePreparation) -> (ScanIndex, SourceScanResult) {
+    let (_, index, scan) = copy_owner_complete_frame(frame);
+    (index, scan)
+}
+fn copy_owner_complete_frame(
+    mut frame: SourcePreparation,
+) -> (SourcePreparation, ScanIndex, SourceScanResult) {
     loop {
         match frame.step() {
             SourcePreparationStep::Pending(next) => frame = next,
-            SourcePreparationStep::Complete { index, scan, .. } => return (index, scan),
+            SourcePreparationStep::Complete {
+                preparation,
+                index,
+                scan,
+            } => return (preparation, index, scan),
         }
     }
+}
+
+fn copy_owner_unsupported_prepare_refuses(
+    fixture: &IdentityPipelineHome,
+    support: &Path,
+    daemon: &LocalDaemon,
+    path: &Path,
+) -> bool {
+    if ScanIndex::required_copy_profile_supported_for_test() {
+        return false;
+    }
+    let before = std::fs::read(path).unwrap();
+    let error = match copy_owner_prepare(fixture, support, daemon) {
+        Err(error) => error,
+        Ok(_) => panic!("actual required preparation must not fall back on unsupported profile"),
+    };
+    assert!(error
+        .to_string()
+        .contains("required copy decoding unavailable"));
+    assert_eq!(std::fs::read(path).unwrap(), before);
+    assert_eq!(
+        daemon.transcript_cache.reserved_copy_bytes_for_test(),
+        Some(0)
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_actual_required_prepare: profile_supported=false actual_prepare_refused=true no_ordinary_fallback=true disk_debt_unchanged=true reservations=0 supported_prepare_scan_save_positive=UNEXECUTED").unwrap();
+    true
 }
 
 fn copy_owner_seed(fixture: &IdentityPipelineHome, support: &Path) -> (PathBuf, String) {
@@ -129,6 +165,9 @@ fn copy_containment_real_preparation_process_policy_survives_cache_clear_reload_
         "disabled ordinary owner remains BASE"
     );
     daemon.transcript_cache.require_copy_containment_for_test();
+    if copy_owner_unsupported_prepare_refuses(&fixture, &support, &daemon, &path) {
+        return;
+    }
     let clone = daemon.clone();
     assert!(Arc::ptr_eq(
         &daemon.transcript_cache,
@@ -201,9 +240,15 @@ fn copy_containment_real_preparation_rejects_invalid_required_index_without_rebu
         Err(error) => error,
         Ok(_) => panic!("invalid required debt must stop before an owned scan exists"),
     };
-    assert!(error
-        .to_string()
-        .contains("containment-required scan index"));
+    if ScanIndex::required_copy_profile_supported_for_test() {
+        assert!(error
+            .to_string()
+            .contains("containment-required scan index"));
+    } else {
+        assert!(error
+            .to_string()
+            .contains("required copy decoding unavailable"));
+    }
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     assert!(ScanIndex::load_for_copy_containment(&path).is_err());
 }
@@ -219,6 +264,9 @@ fn copy_containment_real_own_change_evaluates_once_without_ack_or_other_known_wa
     let old_debt = serde_json::to_value(&previous).unwrap()["claude_copy_holds"][&key].clone();
     let daemon = test_daemon("otm_test");
     daemon.transcript_cache.require_copy_containment_for_test();
+    if copy_owner_unsupported_prepare_refuses(&fixture, &support, &daemon, &path) {
+        return;
+    }
     let mut file = std::fs::OpenOptions::new().append(true).open(&key).unwrap();
     writeln!(file, "{}", serde_json::json!({"type":"assistant",
         "sessionId":IDENTITY_PIPELINE_ROOT,
@@ -227,8 +275,9 @@ fn copy_containment_real_own_change_evaluates_once_without_ack_or_other_known_wa
             "model":"claude-haiku-4-5","usage":{"input_tokens":9,"output_tokens":2}}
     })).unwrap();
     drop(file);
-    let (mut index, mut scan) =
-        copy_owner_complete(copy_owner_prepare(&fixture, &support, &daemon).unwrap());
+    let frame = copy_owner_prepare(&fixture, &support, &daemon).unwrap();
+    let previous = frame.committed_index.try_clone_for_copy().unwrap();
+    let (mut index, mut scan) = copy_owner_complete(frame);
     assert!(index.copy_registered_slot_fingerprint().is_none());
     if !crate::heap_layout_bound::layout_supported() {
         assert_eq!(scan.scanned_file_count, 1);
@@ -249,7 +298,9 @@ fn copy_containment_real_own_change_evaluates_once_without_ack_or_other_known_wa
         .iter()
         .all(|item| item.source_session_id != IDENTITY_PIPELINE_ROOT));
     crate::snapshots::finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-    let mut selected = index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    let mut selected = index
+        .try_committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new())
+        .unwrap();
     let new_debt = serde_json::to_value(&selected).unwrap()["claude_copy_holds"][&key].clone();
     assert_ne!(
         new_debt["revision"]["source_revision"],
@@ -301,6 +352,9 @@ fn copy_containment_real_preparation_reads_semantic_slot_input_without_granting_
     let (path, _) = copy_owner_seed(&fixture, &support);
     let daemon = test_daemon("otm_test");
     daemon.transcript_cache.require_copy_containment_for_test();
+    if copy_owner_unsupported_prepare_refuses(&fixture, &support, &daemon, &path) {
+        return;
+    }
     let (index, scan) =
         copy_owner_complete(copy_owner_prepare(&fixture, &support, &daemon).unwrap());
     assert!(
@@ -354,6 +408,9 @@ fn copy_containment_real_failed_parse_same_event_does_not_repeat_after_cache_or_
     std::fs::write(&key, b"malformed native JSON\n").unwrap();
     let daemon = test_daemon("otm_test");
     daemon.transcript_cache.require_copy_containment_for_test();
+    if copy_owner_unsupported_prepare_refuses(&fixture, &support, &daemon, &path) {
+        return;
+    }
     let mut attempts = 0;
     let mut malformed = 0;
     for cycle in 0..3 {
@@ -407,15 +464,18 @@ fn copy_containment_real_losing_selected_save_same_event_does_not_repeat() {
     drop(file);
     let daemon = test_daemon("otm_test");
     daemon.transcript_cache.require_copy_containment_for_test();
+    if copy_owner_unsupported_prepare_refuses(&fixture, &support, &daemon, &path) {
+        return;
+    }
     let mut attempts = 0;
     let mut losers = 0;
     for cycle in 0..3 {
         daemon.transcript_cache.clear();
-        let previous = ScanIndex::load_for_copy_containment(&path).unwrap();
-        let (mut index, mut scan) = copy_owner_complete(
+        let frame =
             copy_owner_prepare_with_account_witness(&fixture, &support, &daemon, [7 + cycle; 32])
-                .unwrap(),
-        );
+                .unwrap();
+        let previous = frame.committed_index.try_clone_for_copy().unwrap();
+        let (mut index, mut scan) = copy_owner_complete(frame);
         attempts += scan.scanned_file_count.saturating_sub(1);
         let _ = apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
         assert!(scan
@@ -431,7 +491,9 @@ fn copy_containment_real_losing_selected_save_same_event_does_not_repeat() {
             &mut scan,
             &mut index,
         );
-        let mut selected = index.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+        let mut selected = index
+            .try_committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new())
+            .unwrap();
         let mut winner = ScanIndex::load_for_copy_containment(&path).unwrap();
         winner.save(&path).unwrap(); // Real competing generation, no held event advance.
         assert!(
@@ -1042,4 +1104,320 @@ fn copy_containment_required_load_actual_partial_save_and_cas_keep_exact_debt() 
         held_before
     );
     writeln!(std::io::stderr().lock(), "copy_containment_required_actual_partial: supported_positive=EXECUTED paid_loader=true actual_progress_lock_selection_held_restore_CAS_save=true healthy_no_body_selected=true held_entry_restored=true exact_debt_preserved=true stale_CAS_and_unpaid_clone_refused=true bounded_read_limit_preserved=true no_native_capture_or_activation=true").unwrap();
+}
+
+#[test]
+fn copy_containment_prepaid_registry_refuses_before_read_and_detects_growth_truncation_replacement()
+{
+    use std::io::Write;
+    let fixture = IdentityPipelineHome::new();
+    let path = fixture.base.join("registry-prepay.json");
+    let store = ottto_core::FileClaudeConfigSlotSettingsStore::new(&path);
+    let large = format!(
+        "{{\"schema_version\":2,\"background_upkeep_consent\":false,\"unknown\":\"{}\"}}",
+        "x".repeat(256 * 1024)
+    );
+    std::fs::write(&path, large.as_bytes()).unwrap();
+    let mut requests = 0;
+    let (refused, allocation) = crate::retry_allocation_probe::measure(|| {
+        store.transcript_binding_fingerprint_prepaid(|_bytes| {
+            requests += 1;
+            false
+        })
+    });
+    assert!(refused
+        .unwrap_err()
+        .to_string()
+        .contains("allocation refused"));
+    assert_eq!(requests, 1);
+    assert!(
+        allocation.requested_peak_with_overlap < 4096,
+        "no input String/typed graph before credit"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), large.as_bytes());
+    let valid =
+        b"{\"schema_version\":2,\"background_upkeep_consent\":false,\"registered_slots\":[]}";
+    for change_at in [1, 2] {
+        for change in ["grow", "truncate", "replace"] {
+            std::fs::write(&path, valid).unwrap();
+            let mut invoked = false;
+            let mut calls = 0;
+            let result = store.transcript_binding_fingerprint_prepaid(|_| {
+                calls += 1;
+                if calls == change_at {
+                    invoked = true;
+                    match change {
+                        "grow" => std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&path)
+                            .unwrap()
+                            .write_all(b" ")
+                            .unwrap(),
+                        "truncate" => std::fs::write(&path, b"{}").unwrap(),
+                        "replace" => {
+                            let replacement = fixture.base.join("replacement.json");
+                            std::fs::write(&replacement, valid).unwrap();
+                            std::fs::rename(replacement, &path).unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                // IO negative control only: no SharedCache admission/token is
+                // minted by this callback, and every mutation must return UNKNOWN.
+                true
+            });
+            assert!(invoked);
+            assert!(
+                result.is_err(),
+                "{change}, phase{change_at} is never metadata permission"
+            );
+        }
+    }
+    // Refusing the second phase leaves validation/fingerprint unavailable too.
+    std::fs::write(&path, valid).unwrap();
+    let mut stages = 0;
+    assert!(store
+        .transcript_binding_fingerprint_prepaid(|_| {
+            stages += 1;
+            stages == 1
+        })
+        .is_err());
+    assert_eq!(stages, 2);
+    writeln!(std::io::stderr().lock(), "copy_containment_registry_prepay: input_bytes={} refusal_requested_peak={} first_callback_before_input_allocation=true second_phase_refusal=true grow_truncate_replacement_unknown=true no_shared_admission_or_identity_permission=true",large.len(),allocation.requested_peak_with_overlap).unwrap();
+}
+
+#[test]
+#[serial]
+fn copy_containment_real_required_preparation_partial_terminal_deferred_and_cas_use_paid_owner() {
+    let fixture = IdentityPipelineHome::new();
+    for outcome in ["partial", "completed", "deferred", "cas"] {
+        let support = fixture.base.join(format!("paid-required-{outcome}"));
+        let (path, _) = copy_owner_seed(&fixture, &support);
+        let before = std::fs::read(&path).unwrap();
+        let old_debt = serde_json::from_slice::<serde_json::Value>(&before).unwrap()
+            ["claude_copy_holds"]
+            .clone();
+        let daemon = test_daemon("otm_paid_prepare");
+        daemon.transcript_cache.require_copy_containment_for_test();
+        if copy_owner_unsupported_prepare_refuses(&fixture, &support, &daemon, &path) {
+            writeln!(std::io::stderr().lock(), "copy_containment_actual_paid_carriers: outcome={outcome} unsupported_actual_prepare_refused=true paid_partial_terminal_deferred_CAS_positive=UNEXECUTED").unwrap();
+            continue;
+        }
+        let frame = copy_owner_prepare(&fixture, &support, &daemon).unwrap();
+        assert!(frame
+            .committed_index
+            .required_copy_owner_matches_for_test(&daemon.transcript_cache));
+        let (frame, mut index, mut scan) = copy_owner_complete_frame(frame);
+        assert!(index.required_copy_owner_matches_for_test(&daemon.transcript_cache));
+        assert_eq!(
+            scan.scanned_file_count, 1,
+            "held root remains parked, healthy native sibling progresses"
+        );
+        assert_eq!(index.copy_parked_count(), 1);
+        let (authority, _, _) =
+            apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
+        authority.ensure_copy_preparation_available().unwrap();
+        assert!(scan
+            .snapshots
+            .iter()
+            .all(|s| s.source_session_id == COPY_OWNER_HEALTHY));
+        assert!(!scan.snapshots.is_empty());
+        let healthy_body = serde_json::to_vec(&scan.snapshots).unwrap();
+        crate::snapshots::finalize_scan_after_policy(
+            SnapshotSource::ClaudeCode,
+            &mut scan,
+            &mut index,
+        );
+        let committed = &frame.committed_index;
+        let mut progress = frame.upload_progress.clone();
+        // Validate a synthetic exact response against these actual prepared
+        // bodies. Move the vector into/out of the request; no ID-set clone.
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "claude_code".into(),
+            machine_id: "otm_paid_prepare".into(),
+            collector_version: None,
+            snapshots: std::mem::take(&mut scan.snapshots),
+            upload_policy: SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let mut response = accepted_batch(request.snapshots.len());
+        response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+        for item in &request.snapshots {
+            assert!(
+                item.context_curve.is_none() && item.cache_observations.is_none(),
+                "fixture has no curve/cache grant"
+            );
+            let public_version = if item.usage_accounting_contract.as_deref()
+                == Some("session_exclusive_reported_usage:v1")
+            {
+                8
+            } else {
+                7
+            };
+            response.session_ids.push(item.source_session_id.clone());
+            response
+                .accepted_entities
+                .push(crate::snapshot_client::SnapshotEntityRef {
+                    source_session_id: item.source_session_id.clone(),
+                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                    occurrence_count: 1,
+                    body_witness_version: Some(public_version),
+                    body_witness_digest: Some(snapshot_upload_body_witness(item)),
+                    head_etag: None,
+                    head_challenge: None,
+                });
+        }
+        response.validate_entity_ack(&request).unwrap();
+        for accepted in response.accepted_entities {
+            progress
+                .accepted_fingerprints
+                .insert(accepted.snapshot_fingerprint.clone());
+            progress.accepted_body_witnesses.insert(
+                accepted.snapshot_fingerprint,
+                accepted.body_witness_digest.unwrap(),
+            );
+        }
+        scan.snapshots = request.snapshots;
+        progress.save(&frame.upload_progress_path).unwrap();
+        if outcome == "partial" {
+            let partial = checkpoint_partial_snapshot_index(
+                &index,
+                committed,
+                &progress,
+                &scan.snapshots,
+                Some(&scan),
+                &BTreeSet::new(),
+                &path,
+                &frame.upload_progress_path,
+                || Ok(()),
+            )
+            .unwrap();
+            assert!(partial.required_copy_owner_matches_for_test(&daemon.transcript_cache));
+            drop(partial);
+        } else {
+            let holds = LocalHoldSettlement {
+                held_entity_count: usize::from(outcome == "deferred"),
+                retry_pending_family_count: 0,
+                held_fingerprints: BTreeSet::new(),
+                account_deferred_fingerprints: BTreeSet::new(),
+                progress_blocking: false,
+            };
+            let settled = if outcome == "deferred" {
+                settle_checkpointed_upload(index, committed, &progress, &holds, false)
+            } else {
+                settle_completed_upload(index, committed, &progress, &holds)
+            }
+            .unwrap();
+            index = settled.index;
+            assert!(index.required_copy_owner_matches_for_test(&daemon.transcript_cache));
+            settle_index_after_upload(&mut index, committed, &progress);
+            let _settled = settle_upload_corrections_after_selection(
+                &mut index,
+                &scan,
+                committed,
+                &progress,
+                &[],
+                &[],
+                settled.fully_settled,
+            )
+            .unwrap();
+            if outcome == "cas" {
+                let mut winner =
+                    ScanIndex::load_required_copy_index(&path, &daemon.transcript_cache).unwrap();
+                winner.save(&path).unwrap();
+                let won = std::fs::read(&path).unwrap();
+                assert!(index
+                    .save(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("changed concurrently"));
+                assert_eq!(std::fs::read(&path).unwrap(), won);
+            } else {
+                index.save(&path).unwrap();
+            }
+        }
+        let durable = ScanIndex::load_required_copy_index(&path, &daemon.transcript_cache).unwrap();
+        assert_eq!(
+            serde_json::to_value(&durable).unwrap()["claude_copy_holds"],
+            old_debt
+        );
+        assert_eq!(serde_json::to_vec(&scan.snapshots).unwrap(), healthy_body);
+        assert_eq!(durable.copy_hold_count(), 1);
+        daemon.transcript_cache.clear();
+        assert!(
+            daemon
+                .transcript_cache
+                .reserved_copy_bytes_for_test()
+                .unwrap()
+                > 0
+        );
+        // Drop all actual preparation/index/selected/observation owners before
+        // requiring exact credit retirement. No manually seeded paid index.
+        drop(durable);
+        drop(authority);
+        drop(index);
+        drop(frame);
+        assert_eq!(
+            daemon.transcript_cache.reserved_copy_bytes_for_test(),
+            Some(0)
+        );
+        writeln!(std::io::stderr().lock(), "copy_containment_actual_paid_carriers: outcome={outcome} actual_prepare_step_fold=true committed_and_working_real_owner=true healthy_body_stable=true exact_debt_preserved=true cache_clear_keeps_live_credit=true final_credit0=true native_cache_activation=false").unwrap();
+    }
+}
+
+#[test]
+#[serial]
+fn copy_containment_real_required_preparation_funding_refusal_preserves_debt_and_credit() {
+    let fixture = IdentityPipelineHome::new();
+    let support = fixture.base.join("paid-required-refusal");
+    let (path, _) = copy_owner_seed(&fixture, &support);
+    let before = std::fs::read(&path).unwrap();
+    let daemon = test_daemon("otm_paid_refusal");
+    daemon.transcript_cache.require_copy_containment_for_test();
+    if copy_owner_unsupported_prepare_refuses(&fixture, &support, &daemon, &path) {
+        writeln!(std::io::stderr().lock(), "copy_containment_actual_paid_refusal: actual_prepare_layout_refused=true disk_unchanged=true credit0=true pressure_clone_selection_positive=UNEXECUTED").unwrap();
+        return;
+    }
+    daemon
+        .transcript_cache
+        .with_copy_credit_pressure_for_test(|| {
+            assert!(copy_owner_prepare(&fixture, &support, &daemon).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        });
+    assert_eq!(
+        daemon.transcript_cache.reserved_copy_bytes_for_test(),
+        Some(0)
+    );
+    let frame = copy_owner_prepare(&fixture, &support, &daemon).unwrap();
+    let (frame, mut index, _) = copy_owner_complete_frame(frame);
+    let held_before = serde_json::to_vec(&index).unwrap();
+    daemon
+        .transcript_cache
+        .with_copy_credit_pressure_for_test(|| {
+            assert!(index.try_clone_for_copy().is_err());
+            assert!(index
+                .try_committable_subset(&frame.committed_index, &BTreeSet::new(), &BTreeMap::new())
+                .is_err());
+            assert!(index
+                .try_restore_copy_held_checkpoint(&frame.committed_index)
+                .is_err());
+            assert_eq!(serde_json::to_vec(&index).unwrap(), held_before);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        });
+    drop(index);
+    drop(frame);
+    assert_eq!(
+        daemon.transcript_cache.reserved_copy_bytes_for_test(),
+        Some(0)
+    );
+    // A fresh real preparation succeeding after refusal proves no stale lock
+    // or permanently consumed memory permission, not a read/restart grant.
+    drop(copy_owner_prepare(&fixture, &support, &daemon).unwrap());
+    assert_eq!(
+        daemon.transcript_cache.reserved_copy_bytes_for_test(),
+        Some(0)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    writeln!(std::io::stderr().lock(), "copy_containment_actual_paid_refusal: real_prepare_pressure_refused=true clone_selection_restore_refused=true debt_and_disk_unchanged=true all_credit_retired=true subsequent_real_prepare_succeeds=true no_ordinary_or_empty_fallback=true").unwrap();
 }

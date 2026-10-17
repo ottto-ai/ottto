@@ -172,3 +172,49 @@ cloning; and supported-profile producer growth, pressure refusal plus escaped
 clone/credit lifetime. The last positive branch remains UNEXECUTED if the real
 profile refuses. Source and tests await their own hosted CI; no local Cargo or
 model review ran. Installed CPU, RSS and rereads remain unproved.
+
+
+## Actual required preparation and terminal carrier wiring
+
+The inactive test-opt-in required path now loads with the real shared owner,
+uses the fallible committed-index clone, and reserves context inputs before
+constructing the registry path, scope, registered-slot digest or attempt string.
+It uses the already-borrowed source support root and existing settings filename;
+ordinary callers retain their prior default-path and decoder behavior. Scope
+and attempt hashes retain their exact byte domains. Missing or changed settings
+remain unknown; funding refusal explicitly aborts required preparation.
+
+An additive prepaid registry getter reuses the existing strict regular-file,
+no-follow, 1 MiB read, typed serde decoder and validator. It asks for credit
+before input allocation using the opened length plus sentinel. That length is
+only a size preflight. The new entry rejects growth, truncation or observed
+path replacement, never treating metadata as identity or revision permission.
+A second preflight covers validation/NFC and the retained decoded graph before
+validation allocates. Existing callers do not use these new hooks.
+
+The closed serde bound charges vector doubling/old-new overlap using actual
+slot/operation layouts and an input-byte element upper bound; it also charges
+raw/owned strings, parser scratch and escaped errors. The validation bound
+uses nonallocating canonical decomposition counts for NFC buffers and output,
+and existing9/18 limits for validation trees, service strings and reference
+sorting. Decode data stays funded through validation and digest transfer.
+The bound is deliberately conservative: large valid registries can refuse
+required preparation before allocation. This is not a new data-policy cap,
+a measured peak, or activation/performance acceptance.
+
+Terminal/deferred selection and final held restoration now propagate their
+existing fallible API errors. All restore operations remain. Final restoration
+also pays its existing induced current-entity/manifest collectors. Ordinary
+source operations, ACK/body rules and correction decisions stay unchanged;
+there is no ordinary/unpaid fallback for a required owner. Failures preserve
+the last durable index/debt and do not synthesize an eligible empty state.
+
+Three additional tests are authored for registry refusal-before-input and
+file-growth/truncation/replacement, real required preparation through partial,
+terminal/deferred/CAS cases, and actual owner pressure/clone/selection/restore
+refusal with credit retirement. All positive preparation assertions use tokens
+from real preparation. Existing required-owner tests now explicitly distinguish
+unsupported preparation refusal from supported execution; original positive
+assertions remain. The real profile guard is not broadened or bypassed.
+Source/tests await their own hosted CI. No local Cargo/model/review ran.
+Native moved-ID escrow/cache capture remains unimplemented and inactive.

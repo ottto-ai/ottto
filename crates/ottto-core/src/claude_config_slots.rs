@@ -382,6 +382,21 @@ impl FileClaudeConfigSlotSettingsStore {
         Ok(transcript_binding_fingerprint(&persisted))
     }
 
+    /// Additive required-owner entry: caller credit stays alive through this
+    /// call and the returned digest's transfer into its paid context. Size is
+    /// only allocation preflight, never revision/identity or wake permission.
+    /// Caller also prepays path/input-free errors before entry. Callback sizes
+    /// include decoded graph/scratch/errors, not just input bytes. Existing
+    /// readers keep their original policy and decoder/validator.
+    pub fn transcript_binding_fingerprint_prepaid(
+        &self,
+        mut prepay: impl FnMut(usize) -> bool,
+    ) -> Result<String, ClaudeConfigSlotSettingsError> {
+        let persisted =
+            self.load_persisted_with_preflight(Some(1024 * 1024), false, false, Some(&mut prepay))?;
+        Ok(transcript_binding_fingerprint(&persisted))
+    }
+
     /// Inspect the current registry while holding the same process and
     /// cross-process transaction lock used by consent/registration mutations.
     /// This lets a caller serialize a final consent check with a bounded
@@ -1463,6 +1478,23 @@ impl FileClaudeConfigSlotSettingsStore {
         include_retired_reconnect_filter: bool,
         allow_missing: bool,
     ) -> Result<PersistedClaudeConfigSlotSettingsV1, ClaudeConfigSlotSettingsError> {
+        self.load_persisted_with_preflight(
+            limit,
+            include_retired_reconnect_filter,
+            allow_missing,
+            None,
+        )
+    }
+
+    fn load_persisted_with_preflight(
+        &self,
+        limit: Option<usize>,
+        include_retired_reconnect_filter: bool,
+        allow_missing: bool,
+        mut prepay: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<PersistedClaudeConfigSlotSettingsV1, ClaudeConfigSlotSettingsError> {
+        let mut decode_charge = 0usize;
+        let mut opened_read = None;
         let present = if limit.is_some() {
             match fs::symlink_metadata(&self.path) {
                 Ok(metadata) => {
@@ -1508,16 +1540,47 @@ impl FileClaudeConfigSlotSettingsStore {
                         "registration settings exceed regular-file read limit".into(),
                     ));
                 }
+                let read_limit = if let Some(prepay) = prepay.as_mut() {
+                    let opened =
+                        usize::try_from(metadata.len()).map_err(|_| registry_credit_refused())?;
+                    // Include the sentinel BEFORE read_to_string can allocate.
+                    decode_charge = transcript_decode_charge(
+                        opened.checked_add(1).ok_or_else(registry_credit_refused)?,
+                    )
+                    .ok_or_else(registry_credit_refused)?;
+                    if !prepay(decode_charge) {
+                        return Err(registry_credit_refused());
+                    }
+                    opened
+                } else {
+                    limit
+                };
                 let mut body = String::new();
-                file.take(limit as u64 + 1)
+                (&file)
+                    .take(read_limit as u64 + 1)
                     .read_to_string(&mut body)
                     .map_err(|error| {
                         ClaudeConfigSlotSettingsError::State(format!("read settings: {error}"))
                     })?;
-                if body.len() > limit {
+                if body.len() > read_limit {
                     return Err(ClaudeConfigSlotSettingsError::State(
                         "registration settings grew beyond read limit".into(),
                     ));
+                }
+                if prepay.is_some() {
+                    let same_open = file
+                        .metadata()
+                        .ok()
+                        .is_some_and(|now| same_registry_read(&metadata, &now));
+                    let same_path = fs::symlink_metadata(&self.path)
+                        .ok()
+                        .is_some_and(|now| same_registry_read(&metadata, &now));
+                    if body.len() != read_limit || !same_open || !same_path {
+                        return Err(ClaudeConfigSlotSettingsError::State(
+                            "registration settings changed during read".into(),
+                        ));
+                    }
+                    opened_read = Some((file, metadata));
                 }
                 body
             } else {
@@ -1557,7 +1620,29 @@ impl FileClaudeConfigSlotSettingsStore {
                 }
             }
         }
+        if let Some(prepay) = prepay.as_mut() {
+            let bytes = transcript_validation_charge(&persisted)
+                .and_then(|validation| decode_charge.checked_add(validation))
+                .ok_or_else(registry_credit_refused)?;
+            if !prepay(bytes) {
+                return Err(registry_credit_refused());
+            }
+        }
         validate_persisted(&persisted)?;
+        if let Some((file, metadata)) = opened_read {
+            let same_open = file
+                .metadata()
+                .ok()
+                .is_some_and(|now| same_registry_read(&metadata, &now));
+            let same_path = fs::symlink_metadata(&self.path)
+                .ok()
+                .is_some_and(|now| same_registry_read(&metadata, &now));
+            if !same_open || !same_path {
+                return Err(ClaudeConfigSlotSettingsError::State(
+                    "registration settings changed during read".into(),
+                ));
+            }
+        }
         Ok(persisted)
     }
 
@@ -2383,6 +2468,143 @@ fn slot_operations<'a>(
         .filter(move |operation| {
             operation.slot_id == slot.slot_id && operation.config_dir == slot.config_dir
         })
+}
+
+fn registry_credit_refused() -> ClaudeConfigSlotSettingsError {
+    ClaudeConfigSlotSettingsError::State("required registry allocation refused".into())
+}
+
+fn same_registry_read(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    if !after.is_file() || after.file_type().is_symlink() || before.len() != after.len() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        matches!((before.modified().ok(), after.modified().ok()), (Some(a),Some(b)) if a == b)
+    }
+}
+
+fn transcript_decode_charge(bytes: usize) -> Option<usize> {
+    // JSON SeqAccess supplies no attacker capacity hint. At most one completed
+    // value per input byte, plus the four initial Vec allocations. 8 covers
+    // doubling with old+new simultaneous capacity, not just final len. String
+    // payloads total <=input bytes; raw/scratch each4n, owned strings2n, and
+    // canonical+outer error construction40n (10n escaped Debug, old/new peak).
+    // No allocation or canonical-validity decision occurs in this model.
+    let element = std::mem::size_of::<PersistedClaudeConfigSlotV1>()
+        .max(std::mem::size_of::<PersistedClaudeAccountSetupOperationV1>())
+        .max(std::mem::size_of::<u64>());
+    let vectors = bytes
+        .checked_add(16)?
+        .checked_mul(8)?
+        .checked_mul(element)?;
+    vectors
+        .checked_add(bytes.max(32).checked_mul(50)?)?
+        .checked_add(8 * 146)
+}
+
+fn transcript_validation_charge(settings: &PersistedClaudeConfigSlotSettingsV1) -> Option<usize> {
+    // Exhaustive ownership inventory: additions cannot silently inherit this
+    // preflight. Decoder graph is already prepaid and stays live throughout.
+    let PersistedClaudeConfigSlotSettingsV1 {
+        schema_version: _,
+        background_upkeep_consent: _,
+        background_upkeep_consent_chosen: _,
+        registered_slots,
+        setup_operations,
+        reconnect_operations,
+        retired_reconnect_operation_filter: _,
+    } = settings;
+    let mut normalization = 0usize;
+    if registered_slots.len() <= MAX_REGISTERED_CLAUDE_CONFIG_SLOTS {
+        for slot in registered_slots {
+            let PersistedClaudeConfigSlotV1 {
+                slot_id: _,
+                ownership: _,
+                config_dir,
+                approved_account_identifier_hash: _,
+                approved_organization_identifier_hash: _,
+                approved_from: _,
+            } = slot;
+            // The validator rejects longer dirs before normalization. Canonical
+            // decomposition emits static-table chars without allocating. Count
+            // a full decomposition upper bound for NFC (composition cannot add).
+            if config_dir.len() > MAX_CLAUDE_CONFIG_DIR_BYTES {
+                continue;
+            }
+            let mut chars = Some(0usize);
+            let mut utf8 = Some(0usize);
+            for ch in config_dir.chars() {
+                unicode_normalization::char::decompose_canonical(ch, |c| {
+                    chars = chars.and_then(|n| n.checked_add(1));
+                    utf8 = utf8.and_then(|n| n.checked_add(c.len_utf8()));
+                });
+            }
+            let slots = chars?.checked_add(4)?.checked_mul(8)?;
+            // unicode-normalization0.1.25 has decomposition (u8,char) and
+            // recomposition char TinyVec buffers. Include growth overlap and
+            // owned normalized String, plus the input slot clone.
+            let buffers = slots.checked_mul(
+                std::mem::size_of::<(u8, char)>().checked_add(std::mem::size_of::<char>())?,
+            )?;
+            normalization = normalization
+                .checked_add(buffers)?
+                .checked_add(utf8?.max(8).checked_mul(4)?)?
+                .checked_add(config_dir.len())?;
+        }
+    }
+    for operation in setup_operations.iter().chain(reconnect_operations.iter()) {
+        let PersistedClaudeAccountSetupOperationV1 {
+            kind: _,
+            created_sequence: _,
+            operation_id: _,
+            slot_id: _,
+            config_dir: _,
+            state: _,
+            target_id: _,
+            requested_expected_account_identifier_hash: _,
+            requested_expected_organization_identifier_hash: _,
+            expected_account_identifier_hash: _,
+            expected_organization_identifier_hash: _,
+            account_identifier_hash: _,
+            organization_identifier_hash: _,
+            message: _,
+        } = operation;
+    }
+    // Validation never allocates these sets beyond the pre-existing9/18 caps;
+    // excess rows fail before their loops. Charge full old/new tree nodes and
+    // borrowed sorted-reference staging, plus every retained service String.
+    let n = MAX_REGISTERED_CLAUDE_CONFIG_SLOTS;
+    let node = 256usize
+        .checked_add(12 * std::mem::size_of::<usize>())?
+        .checked_add(11 * std::mem::size_of::<String>())?;
+    let trees = n
+        .checked_mul(7)?
+        .checked_add(6)?
+        .checked_mul(2)?
+        .checked_mul(node)?;
+    let staging = n
+        .max(48)
+        .checked_mul(4)?
+        .checked_mul(std::mem::size_of::<&str>())?;
+    let services = n
+        .checked_mul(CLAUDE_OAUTH_KEYCHAIN_SERVICE.len().checked_add(65)?)?
+        .checked_mul(4)?;
+    normalization
+        .checked_add(trees)?
+        .checked_add(staging)?
+        .checked_add(services)?
+        .checked_add(8 * 146)
 }
 
 /// Validation bounds this to nine registered slots/eighteen operations. Sort

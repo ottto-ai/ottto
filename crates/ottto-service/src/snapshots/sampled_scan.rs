@@ -157,8 +157,22 @@ impl SharedCache {
     }
 
     #[cfg(test)]
-    pub(in crate::snapshots) fn reserved_copy_bytes_for_test(&self) -> Option<usize> {
+    pub(crate) fn reserved_copy_bytes_for_test(&self) -> Option<usize> {
         Some(self.inner.try_lock().ok()?.copy_reserved)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_copy_credit_pressure_for_test<R>(
+        self: &Arc<Self>,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        let mut pressure = Vec::new();
+        while let Some(credit) = self.reserve_copy_bytes(1024) {
+            pressure.push(credit);
+        }
+        let result = run();
+        drop(pressure);
+        result
     }
 
     pub(crate) fn copy_containment_required(&self) -> bool {

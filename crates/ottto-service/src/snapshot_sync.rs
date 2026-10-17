@@ -327,7 +327,7 @@ fn commit_completed_with_local_holds(
     locally_held_fingerprints: &BTreeSet<String>,
     account_deferred_held_fingerprints: &BTreeSet<String>,
     progress_blocking: bool,
-) -> ScanIndex {
+) -> Result<ScanIndex> {
     if !progress_blocking
         && index.locally_held_keys_restorable(
             committed_index,
@@ -335,20 +335,23 @@ fn commit_completed_with_local_holds(
             account_deferred_held_fingerprints,
         )
     {
-        return index.into_locally_held_keys_reverted(
+        return Ok(index.into_locally_held_keys_reverted(
             committed_index,
             locally_held_fingerprints,
             account_deferred_held_fingerprints,
-        );
+        ));
     }
     let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
     accepted_fingerprints.retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
     let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
     server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
-    let mut index =
-        index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine);
+    let mut index = index.try_committable_subset(
+        committed_index,
+        &accepted_fingerprints,
+        &server_quarantine,
+    )?;
     index.mark_bounded_sweep_unsettled();
-    index
+    Ok(index)
 }
 
 /// Local holds classified once per page, after finalization and before upload.
@@ -426,13 +429,13 @@ fn settle_completed_upload(
     committed_index: &ScanIndex,
     upload_progress: &SnapshotUploadProgress,
     holds: &LocalHoldSettlement,
-) -> UploadIndexSettlement {
+) -> Result<UploadIndexSettlement> {
     if !holds.any() {
         let fully_settled = upload_settled_without_account_holds(&index, true);
-        return UploadIndexSettlement {
+        return Ok(UploadIndexSettlement {
             index,
             fully_settled,
-        };
+        });
     }
     let index = commit_completed_with_local_holds(
         index,
@@ -441,17 +444,17 @@ fn settle_completed_upload(
         &holds.held_fingerprints,
         &holds.account_deferred_fingerprints,
         holds.progress_blocking,
-    );
+    )?;
     eprintln!(
         "local snapshot sync retained {} Claude usage family/families and {} revised \
          entity/entities with unproven authority or session ownership; healthy siblings settled \
          and the retained revisions remain pending for bounded retry",
         holds.retry_pending_family_count, holds.held_entity_count
     );
-    UploadIndexSettlement {
+    Ok(UploadIndexSettlement {
         index,
         fully_settled: false,
-    }
+    })
 }
 
 /// Settle a `Deferred` or `Rejected` upload. Retryable or locally unproven
@@ -464,13 +467,13 @@ fn settle_checkpointed_upload(
     upload_progress: &SnapshotUploadProgress,
     holds: &LocalHoldSettlement,
     resolved_permanent_rejections: bool,
-) -> UploadIndexSettlement {
+) -> Result<UploadIndexSettlement> {
     let mut index = if holds.any() {
         let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
         accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
         let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
         server_quarantine.retain(|fingerprint, _| !holds.held_fingerprints.contains(fingerprint));
-        index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine)
+        index.try_committable_subset(committed_index, &accepted_fingerprints, &server_quarantine)?
     } else {
         index
     };
@@ -479,10 +482,10 @@ fn settle_checkpointed_upload(
         index.mark_bounded_sweep_unsettled();
     }
     let fully_settled = upload_settled_without_account_holds(&index, settled);
-    UploadIndexSettlement {
+    Ok(UploadIndexSettlement {
         index,
         fully_settled,
-    }
+    })
 }
 
 /// Fold the upload ledger into the index after any outcome that reaches the
@@ -510,8 +513,8 @@ fn settle_upload_corrections_after_selection(
     candidates: &[crate::snapshots::ClaudeProofCorrectionCandidate],
     cutoff_candidates: &[crate::snapshots::ClaudeCutoffCorrectionCandidate],
     transport_fully_settled: bool,
-) -> bool {
-    index.restore_copy_held_checkpoint(committed_index);
+) -> Result<bool> {
+    index.try_restore_copy_held_checkpoint(committed_index)?;
     // D1 is deliberately unavailable to partial/deferred/shed/error outcomes.
     // Both existing durable refusal carriers must bind the exact current body.
     if transport_fully_settled {
@@ -537,7 +540,7 @@ fn settle_upload_corrections_after_selection(
     }
     index.settle_cutoff_claude_proof_corrections(cutoff_candidates);
     index.settle_empty_claude_proof_corrections(scan);
-    transport_fully_settled && !index.claude_authority_proof_correction_pending()
+    Ok(transport_fully_settled && !index.claude_authority_proof_correction_pending())
 }
 
 fn apply_backfill_cutoff_with_claude_corrections(
@@ -3745,7 +3748,7 @@ fn prepare_sync_source(
     let copy_containment_required =
         source == SnapshotSource::ClaudeCode && daemon.transcript_cache.copy_containment_required();
     let mut index = if copy_containment_required {
-        ScanIndex::load_for_copy_containment(&index_path)?
+        ScanIndex::load_required_copy_index(&index_path, &daemon.transcript_cache)?
     } else {
         ScanIndex::load(&index_path)?
     };
@@ -3852,7 +3855,7 @@ fn prepare_sync_source(
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
     index.activate_effective_upload_body_witness_revision(EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION);
-    let committed_index = index.clone();
+    let committed_index = index.try_clone_for_copy()?;
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
     let watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     if watcher_hints.overflowed {
@@ -3894,25 +3897,13 @@ fn prepare_sync_source(
         // persisted/accepted evidence. Source/destination/account/capture bind
         // the owner, but are NOT complete Claude slot/peer/W1-W5 witnesses.
         // Missing witnesses stay UNKNOWN; no per-cycle/restart read allowance.
-        let registered_slots = ottto_core::FileClaudeConfigSlotSettingsStore::default()
-            .transcript_binding_fingerprint()
-            .ok(); // Missing/unreadable required storage remains UNKNOWN.
-        index.attach_unknown_copy_owner_with_registered_slots(
-            format!(
-                "{:x}",
-                Sha256::digest(format!("copy_containment_owner:v1:{sampled_scope}"))
-            ),
-            registered_slots,
+        index.attach_prepaid_copy_owner(
+            support_dir,
+            &sampled_scope,
+            &upload_destination_namespace,
+            source.api_slug(),
+            &index_path,
         )?;
-        // A reconnect/lease/cycle change must not reset physical attempt memory.
-        index.attach_copy_attempt_scope(format!(
-            "{:x}",
-            Sha256::digest(format!(
-                "copy_attempt_destination:v1:{upload_destination_namespace}:{}:{}",
-                source.api_slug(),
-                index_path.display()
-            ))
-        ))?;
     }
     let scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
         source,
@@ -4560,7 +4551,7 @@ fn finish_sync_source(
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
             let settlement =
-                settle_completed_upload(index, &committed_index, &upload_progress, &local_holds);
+                settle_completed_upload(index, &committed_index, &upload_progress, &local_holds)?;
             index = settlement.index;
             if !settlement.fully_settled {
                 backfill_succeeded = false;
@@ -4586,7 +4577,7 @@ fn finish_sync_source(
                 &upload_progress,
                 &local_holds,
                 resolved_permanent_rejections,
-            );
+            )?;
             index = settlement.index;
             if !settlement.fully_settled {
                 backfill_succeeded = false;
@@ -4906,7 +4897,7 @@ fn finish_sync_source(
         &claude_proof_correction_candidates,
         &claude_cutoff_corrections,
         upload_fully_settled,
-    );
+    )?;
     backfill_succeeded &= upload_fully_settled;
     // A quiet/delta-only scan still discloses current permanent refusals even
     // though no body needed another upload. The committed census owns scope.
@@ -14904,7 +14895,8 @@ mod tests {
             &held,
             &BTreeSet::new(),
             false,
-        );
+        )
+        .unwrap();
         assert!(!settled.bounded_sweep_had_unsettled_upload());
         assert_eq!(
             settled.files["/opaque/held.jsonl"]
@@ -14933,7 +14925,8 @@ mod tests {
             &held,
             &held,
             false,
-        );
+        )
+        .unwrap();
         assert!(!deferred.bounded_sweep_had_unsettled_upload());
         assert!(deferred.files["/opaque/held.jsonl"]
             .source_file_fingerprint
@@ -14946,7 +14939,8 @@ mod tests {
             &held,
             &BTreeSet::new(),
             true,
-        );
+        )
+        .unwrap();
         assert!(blocked.bounded_sweep_had_unsettled_upload());
         assert_eq!(
             blocked.files["/opaque/held.jsonl"]

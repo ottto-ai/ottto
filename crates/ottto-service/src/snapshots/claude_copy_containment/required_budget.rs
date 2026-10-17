@@ -446,6 +446,17 @@ fn selection_bound(
 }
 
 impl ScanIndex {
+    #[cfg(test)]
+    pub(crate) fn required_copy_profile_supported_for_test() -> bool {
+        super::required_decode::profile_supported()
+    }
+    #[cfg(test)]
+    pub(crate) fn required_copy_owner_matches_for_test(&self, owner: &Arc<SharedCache>) -> bool {
+        self.required_copy_owner()
+            .ok()
+            .flatten()
+            .is_some_and(|actual| Arc::ptr_eq(actual, owner))
+    }
     fn checked_copy_credit(&self) -> Result<&Credit, Unavailable> {
         let credit = self.copy_debt_budget.paid().ok_or(Unavailable)?;
         // A later measurement cannot bless earlier unpaid producer growth.
@@ -544,7 +555,13 @@ impl ScanIndex {
             if previous.copy_debt_budget.required() {
                 previous.checked_copy_credit()?;
             }
-            let bytes = restore_bound(self, previous, 0).ok_or(Unavailable)?;
+            // Terminal restoration can enlarge the same current-entity and
+            // manifest collectors as partial selection. Their lifetime must
+            // be funded before restoring new retained facts, not after save.
+            let consumers = consumer_costs(self, previous).ok_or(Unavailable)?;
+            let bytes = restore_bound(self, previous, 0)
+                .and_then(|n| n.checked_add(consumers.total))
+                .ok_or(Unavailable)?;
             self.copy_debt_budget.append(0, bytes)?;
         } else if previous.copy_debt_budget.required() {
             return Err(Unavailable);
