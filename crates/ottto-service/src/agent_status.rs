@@ -4845,6 +4845,8 @@ fn collect_claude_status_snapshots(
         }
     }
     let mut snapshots = Vec::with_capacity(selection.winning_by_binding.len());
+    // Slot id and binding of each candidate upload, in `snapshots` order.
+    let mut uploaded_slots = Vec::with_capacity(selection.winning_by_binding.len());
     for (index, candidate) in candidates.into_iter().enumerate() {
         match dispositions[index] {
             ClaudeSnapshotDisposition::Upload => {
@@ -4859,6 +4861,7 @@ fn collect_claude_status_snapshots(
                     );
                     continue;
                 }
+                uploaded_slots.push((candidate.slot_id.clone(), candidate.binding.clone()));
                 snapshots.push(claude_uploaded_candidate_snapshot(
                     candidate,
                     &anchor_health_by_binding,
@@ -4886,6 +4889,20 @@ fn collect_claude_status_snapshots(
                 // upkeep, and reconnect state intact for continuity.
             }
         }
+    }
+    let default_binding = default_snapshot.account.as_ref().and_then(|account| {
+        ClaudeStrongBinding::new(
+            account.account_identifier_hash.as_deref()?,
+            account.organization_identifier_hash.as_deref()?,
+        )
+    });
+    if let Some(index) = claude_runtime_defaults_carrier(
+        &snapshots,
+        &uploaded_slots,
+        default_snapshot.runtime_defaults.is_some(),
+        default_binding.as_ref(),
+    ) {
+        snapshots[index].runtime_defaults = default_snapshot.runtime_defaults.clone();
     }
     snapshots.extend(degraded_claude_slot_snapshots(
         &slot_states,
@@ -5353,6 +5370,38 @@ fn claude_stale_saved_slot_states(
             (slot_id.clone(), status)
         })
         .collect()
+}
+
+/// Which uploaded candidate snapshot should carry this Mac's Claude Code
+/// settings (`runtime_defaults`), if any.
+///
+/// Only the default login's snapshot is built with them, and when the Claude
+/// accounts are registered slots the default login is usually not uploaded,
+/// so its settings would never reach the server. They are machine-level and
+/// the server keeps one log per machine and install, so exactly one upload
+/// carries a copy, and none when one already does (the default login itself
+/// uploaded) or this pass built none. The carrier is the upload for the
+/// default login's account, otherwise the lowest slot id, so every pass with
+/// the same uploads picks the same one. `uploaded_slots[i]` is the slot id and
+/// binding of `snapshots[i]`.
+fn claude_runtime_defaults_carrier(
+    snapshots: &[AgentStatusSnapshot],
+    uploaded_slots: &[(String, ClaudeStrongBinding)],
+    defaults_built: bool,
+    default_binding: Option<&ClaudeStrongBinding>,
+) -> Option<usize> {
+    if !defaults_built
+        || snapshots
+            .iter()
+            .any(|snapshot| snapshot.runtime_defaults.is_some())
+    {
+        return None;
+    }
+    uploaded_slots
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (slot_id, binding))| (Some(binding) != default_binding, slot_id))
+        .map(|(index, _)| index)
 }
 
 /// A default-login candidate for an account a registered slot owns uploads
@@ -37938,6 +37987,158 @@ exit 44
         assert_eq!(
             claude_registered_owned_bindings(true, &["slot-a".to_string()], &current, &previous),
             BTreeSet::from([binding("acct-slot", "org-slot")])
+        );
+    }
+
+    /// Exactly one upload carries this Mac's Claude Code settings: the upload
+    /// for the default login's account, otherwise the lowest slot id. None
+    /// when an upload already carries them or this pass built none.
+    #[test]
+    fn one_upload_carries_the_machine_claude_settings() {
+        let binding = |account: &str| ClaudeStrongBinding::new(account, "org").expect("binding");
+        let snapshot = |carries: bool| {
+            let mut snapshot = base_snapshot(
+                SourceKind::ClaudeCode,
+                AgentStatusState::Available,
+                AgentStatusCollectionMethod::CliJson,
+                "2026-10-17T12:00:00Z".to_string(),
+                "2026-10-17T12:15:00Z".to_string(),
+            );
+            snapshot.runtime_defaults = carries.then(AgentRuntimeDefaults::default);
+            snapshot
+        };
+        let slots = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| (id.to_string(), binding(&format!("account-{id}"))))
+                .collect::<Vec<_>>()
+        };
+        let uploads = slots(&["slot-c", "slot-a", "slot-b"]);
+        let plain = vec![snapshot(false), snapshot(false), snapshot(false)];
+        let carrier = |snapshots: &[AgentStatusSnapshot],
+                       uploads: &[(String, ClaudeStrongBinding)],
+                       built: bool,
+                       default: Option<&ClaudeStrongBinding>| {
+            claude_runtime_defaults_carrier(snapshots, uploads, built, default)
+                .map(|index| uploads[index].0.clone())
+        };
+
+        // The default login's account is uploaded by a slot: that slot.
+        let default_login = binding("account-slot-b");
+        assert_eq!(
+            carrier(&plain, &uploads, true, Some(&default_login)),
+            Some("slot-b".to_string())
+        );
+        // Otherwise the lowest slot id, whatever the upload order.
+        let elsewhere = binding("account-elsewhere");
+        assert_eq!(
+            carrier(&plain, &uploads, true, Some(&elsewhere)),
+            Some("slot-a".to_string())
+        );
+        assert_eq!(
+            carrier(&plain, &uploads, true, None),
+            Some("slot-a".to_string())
+        );
+        let reordered = slots(&["slot-b", "slot-a", "slot-c"]);
+        assert_eq!(
+            carrier(&plain, &reordered, true, None),
+            Some("slot-a".to_string())
+        );
+        // Same inputs, same carrier on every pass.
+        assert_eq!(
+            carrier(&plain, &uploads, true, Some(&default_login)),
+            carrier(&plain, &uploads, true, Some(&default_login))
+        );
+        // The default login uploaded its own snapshot (with the settings): no
+        // second copy.
+        let with_default = vec![snapshot(true), snapshot(false)];
+        let default_uploads = slots(&["default", "slot-a"]);
+        assert_eq!(carrier(&with_default, &default_uploads, true, None), None);
+        // No settings built this pass, or nothing uploaded: nothing to carry.
+        assert_eq!(carrier(&plain, &uploads, false, Some(&default_login)), None);
+        assert_eq!(carrier(&[], &[], true, Some(&default_login)), None);
+    }
+
+    /// The registered slots upload and the default login does not: one slot
+    /// upload, the one for the default login's account, carries the Mac's
+    /// Claude Code settings exactly as built, on every pass. Slot snapshots
+    /// are otherwise unchanged (no settings capability is added).
+    #[test]
+    #[serial]
+    fn the_default_login_settings_ride_on_one_slot_upload() {
+        let fixture = Phase0Fixture::new("runtime-defaults-carrier", true);
+        let home = fixture.root.join("home");
+        fixture.write_identity(&home, SLOT_ACCOUNTS[2]);
+        fs::write(
+            home.join(".claude").join("settings.json"),
+            br#"{"model": "claude-opus-5-5", "effortLevel": "high"}"#,
+        )
+        .expect("settings");
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        let (default_account, _) = Phase0Fixture::hashes(SLOT_ACCOUNTS[2]);
+        for pass in 0..2 {
+            let collection = fixture.collect();
+            let built = collection
+                .source_health_snapshot
+                .runtime_defaults
+                .clone()
+                .expect("the default login built settings");
+            assert_eq!(built.model.as_deref(), Some("claude-opus-5-5"));
+            let carriers = collection
+                .snapshots
+                .iter()
+                .filter(|snapshot| snapshot.runtime_defaults.is_some())
+                .collect::<Vec<_>>();
+            assert_eq!(carriers.len(), 1, "pass {pass}: exactly one carrier");
+            let carrier = carriers[0];
+            assert_eq!(
+                carrier
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.account_identifier_hash.as_deref()),
+                Some(default_account.as_str()),
+                "pass {pass}: the upload for the default login's account"
+            );
+            assert_eq!(carrier.runtime_defaults.as_ref(), Some(&built));
+            assert!(
+                carrier
+                    .capabilities
+                    .iter()
+                    .all(|capability| capability.capability != "runtime_defaults"),
+                "pass {pass}: a registered slot's upload, not the default login's"
+            );
+        }
+    }
+
+    /// The default login uploads its own account with meters: its snapshot
+    /// already carries the settings and no slot upload gets a second copy.
+    #[test]
+    #[serial]
+    fn an_uploaded_default_login_keeps_the_only_settings_copy() {
+        let fixture = Phase0Fixture::new("runtime-defaults-default", true);
+        fs::write(
+            fixture
+                .root
+                .join("home")
+                .join(".claude")
+                .join("settings.json"),
+            br#"{"model": "claude-opus-5-5"}"#,
+        )
+        .expect("settings");
+        fixture.set_all_expiries(TimeDuration::hours(3));
+        let (default_account, _) = Phase0Fixture::hashes(DEFAULT_ACCOUNT);
+        let collection = fixture.collect();
+        let carriers = collection
+            .snapshots
+            .iter()
+            .filter(|snapshot| snapshot.runtime_defaults.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(carriers.len(), 1, "exactly one carrier");
+        assert_eq!(
+            carriers[0]
+                .account
+                .as_ref()
+                .and_then(|account| account.account_identifier_hash.as_deref()),
+            Some(default_account.as_str())
         );
     }
 
