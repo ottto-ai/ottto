@@ -863,6 +863,11 @@ fn handle_command(
                 refresh_agent_status_for(daemon, &authorization, None)?;
             }
             let mut status = status_for(daemon, &authorization)?;
+            // Keep the optional observation's second projection and owned
+            // Value conversion paid until response transfer. No transport/C
+            // lifetime change or public response metadata is introduced.
+            let _copy_status_output =
+                crate::snapshots::prepay_control_status(&daemon.transcript_cache, &mut status);
             status.update.install_owner = detect_install_owner();
             status.service_owner = service_owner_state(client_install_owner);
             crate::refresh_canonical_local_health(&mut status);

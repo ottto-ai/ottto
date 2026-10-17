@@ -373,6 +373,30 @@ impl FileClaudeConfigSlotSettingsStore {
             .collect())
     }
 
+    /// Read-only semantic input for transcript wake detection, not an account
+    /// approval or upload permit. Unlike discovery's missing-is-empty policy,
+    /// absent required approval storage is UNKNOWN. Reuse the existing bounded
+    /// regular-file decoder without reading credentials or the retired sidecar.
+    pub fn transcript_binding_fingerprint(&self) -> Result<String, ClaudeConfigSlotSettingsError> {
+        let persisted = self.load_persisted_with_policy(Some(1024 * 1024), false, false)?;
+        Ok(transcript_binding_fingerprint(&persisted))
+    }
+
+    /// Additive required-owner entry: caller credit stays alive through this
+    /// call and the returned digest's transfer into its paid context. Size is
+    /// only allocation preflight, never revision/identity or wake permission.
+    /// Caller also prepays path/input-free errors before entry. Callback sizes
+    /// include decoded graph/scratch/errors, not just input bytes. Existing
+    /// readers keep their original policy and decoder/validator.
+    pub fn transcript_binding_fingerprint_prepaid(
+        &self,
+        mut prepay: impl FnMut(usize) -> bool,
+    ) -> Result<String, ClaudeConfigSlotSettingsError> {
+        let persisted =
+            self.load_persisted_with_preflight(Some(1024 * 1024), false, false, Some(&mut prepay))?;
+        Ok(transcript_binding_fingerprint(&persisted))
+    }
+
     /// Inspect the current registry while holding the same process and
     /// cross-process transaction lock used by consent/registration mutations.
     /// This lets a caller serialize a final consent check with a bounded
@@ -1445,6 +1469,32 @@ impl FileClaudeConfigSlotSettingsStore {
         limit: Option<usize>,
         include_retired_reconnect_filter: bool,
     ) -> Result<PersistedClaudeConfigSlotSettingsV1, ClaudeConfigSlotSettingsError> {
+        self.load_persisted_with_policy(limit, include_retired_reconnect_filter, true)
+    }
+
+    fn load_persisted_with_policy(
+        &self,
+        limit: Option<usize>,
+        include_retired_reconnect_filter: bool,
+        allow_missing: bool,
+    ) -> Result<PersistedClaudeConfigSlotSettingsV1, ClaudeConfigSlotSettingsError> {
+        self.load_persisted_with_preflight(
+            limit,
+            include_retired_reconnect_filter,
+            allow_missing,
+            None,
+        )
+    }
+
+    fn load_persisted_with_preflight(
+        &self,
+        limit: Option<usize>,
+        include_retired_reconnect_filter: bool,
+        allow_missing: bool,
+        mut prepay: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<PersistedClaudeConfigSlotSettingsV1, ClaudeConfigSlotSettingsError> {
+        let mut decode_charge = 0usize;
+        let mut opened_read = None;
         let present = if limit.is_some() {
             match fs::symlink_metadata(&self.path) {
                 Ok(metadata) => {
@@ -1465,6 +1515,11 @@ impl FileClaudeConfigSlotSettingsStore {
         } else {
             self.path.exists()
         };
+        if !present && !allow_missing {
+            return Err(ClaudeConfigSlotSettingsError::State(
+                "required transcript approval settings are absent".into(),
+            ));
+        }
         let mut persisted = if present {
             let body = if let Some(limit) = limit {
                 let mut options = fs::OpenOptions::new();
@@ -1485,16 +1540,47 @@ impl FileClaudeConfigSlotSettingsStore {
                         "registration settings exceed regular-file read limit".into(),
                     ));
                 }
+                let read_limit = if let Some(prepay) = prepay.as_mut() {
+                    let opened =
+                        usize::try_from(metadata.len()).map_err(|_| registry_credit_refused())?;
+                    // Include the sentinel BEFORE read_to_string can allocate.
+                    decode_charge = transcript_decode_charge(
+                        opened.checked_add(1).ok_or_else(registry_credit_refused)?,
+                    )
+                    .ok_or_else(registry_credit_refused)?;
+                    if !prepay(decode_charge) {
+                        return Err(registry_credit_refused());
+                    }
+                    opened
+                } else {
+                    limit
+                };
                 let mut body = String::new();
-                file.take(limit as u64 + 1)
+                (&file)
+                    .take(read_limit as u64 + 1)
                     .read_to_string(&mut body)
                     .map_err(|error| {
                         ClaudeConfigSlotSettingsError::State(format!("read settings: {error}"))
                     })?;
-                if body.len() > limit {
+                if body.len() > read_limit {
                     return Err(ClaudeConfigSlotSettingsError::State(
                         "registration settings grew beyond read limit".into(),
                     ));
+                }
+                if prepay.is_some() {
+                    let same_open = file
+                        .metadata()
+                        .ok()
+                        .is_some_and(|now| same_registry_read(&metadata, &now));
+                    let same_path = fs::symlink_metadata(&self.path)
+                        .ok()
+                        .is_some_and(|now| same_registry_read(&metadata, &now));
+                    if body.len() != read_limit || !same_open || !same_path {
+                        return Err(ClaudeConfigSlotSettingsError::State(
+                            "registration settings changed during read".into(),
+                        ));
+                    }
+                    opened_read = Some((file, metadata));
                 }
                 body
             } else {
@@ -1534,7 +1620,29 @@ impl FileClaudeConfigSlotSettingsStore {
                 }
             }
         }
+        if let Some(prepay) = prepay.as_mut() {
+            let bytes = transcript_validation_charge(&persisted)
+                .and_then(|validation| decode_charge.checked_add(validation))
+                .ok_or_else(registry_credit_refused)?;
+            if !prepay(bytes) {
+                return Err(registry_credit_refused());
+            }
+        }
         validate_persisted(&persisted)?;
+        if let Some((file, metadata)) = opened_read {
+            let same_open = file
+                .metadata()
+                .ok()
+                .is_some_and(|now| same_registry_read(&metadata, &now));
+            let same_path = fs::symlink_metadata(&self.path)
+                .ok()
+                .is_some_and(|now| same_registry_read(&metadata, &now));
+            if !same_open || !same_path {
+                return Err(ClaudeConfigSlotSettingsError::State(
+                    "registration settings changed during read".into(),
+                ));
+            }
+        }
         Ok(persisted)
     }
 
@@ -2362,6 +2470,234 @@ fn slot_operations<'a>(
         })
 }
 
+fn registry_credit_refused() -> ClaudeConfigSlotSettingsError {
+    ClaudeConfigSlotSettingsError::State("required registry allocation refused".into())
+}
+
+fn same_registry_read(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    if !after.is_file() || after.file_type().is_symlink() || before.len() != after.len() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        matches!((before.modified().ok(), after.modified().ok()), (Some(a),Some(b)) if a == b)
+    }
+}
+
+fn transcript_decode_charge(bytes: usize) -> Option<usize> {
+    // JSON SeqAccess supplies no attacker capacity hint. At most one completed
+    // value per input byte, plus the four initial Vec allocations. 8 covers
+    // doubling with old+new simultaneous capacity, not just final len. String
+    // payloads total <=input bytes; raw/scratch each4n, owned strings2n, and
+    // canonical+outer error construction40n (10n escaped Debug, old/new peak).
+    // No allocation or canonical-validity decision occurs in this model.
+    let element = std::mem::size_of::<PersistedClaudeConfigSlotV1>()
+        .max(std::mem::size_of::<PersistedClaudeAccountSetupOperationV1>())
+        .max(std::mem::size_of::<u64>());
+    let vectors = bytes
+        .checked_add(16)?
+        .checked_mul(8)?
+        .checked_mul(element)?;
+    vectors
+        .checked_add(bytes.max(32).checked_mul(50)?)?
+        .checked_add(8 * 146)
+}
+
+fn transcript_validation_charge(settings: &PersistedClaudeConfigSlotSettingsV1) -> Option<usize> {
+    // Exhaustive ownership inventory: additions cannot silently inherit this
+    // preflight. Decoder graph is already prepaid and stays live throughout.
+    let PersistedClaudeConfigSlotSettingsV1 {
+        schema_version: _,
+        background_upkeep_consent: _,
+        background_upkeep_consent_chosen: _,
+        registered_slots,
+        setup_operations,
+        reconnect_operations,
+        retired_reconnect_operation_filter: _,
+    } = settings;
+    let mut normalization = 0usize;
+    if registered_slots.len() <= MAX_REGISTERED_CLAUDE_CONFIG_SLOTS {
+        for slot in registered_slots {
+            let PersistedClaudeConfigSlotV1 {
+                slot_id: _,
+                ownership: _,
+                config_dir,
+                approved_account_identifier_hash: _,
+                approved_organization_identifier_hash: _,
+                approved_from: _,
+            } = slot;
+            // The validator rejects longer dirs before normalization. Canonical
+            // decomposition emits static-table chars without allocating. Count
+            // a full decomposition upper bound for NFC (composition cannot add).
+            if config_dir.len() > MAX_CLAUDE_CONFIG_DIR_BYTES {
+                continue;
+            }
+            let mut chars = Some(0usize);
+            let mut utf8 = Some(0usize);
+            for ch in config_dir.chars() {
+                unicode_normalization::char::decompose_canonical(ch, |c| {
+                    chars = chars.and_then(|n| n.checked_add(1));
+                    utf8 = utf8.and_then(|n| n.checked_add(c.len_utf8()));
+                });
+            }
+            let slots = chars?.checked_add(4)?.checked_mul(8)?;
+            // unicode-normalization0.1.25 has decomposition (u8,char) and
+            // recomposition char TinyVec buffers. Include growth overlap and
+            // owned normalized String, plus the input slot clone.
+            let buffers = slots.checked_mul(
+                std::mem::size_of::<(u8, char)>().checked_add(std::mem::size_of::<char>())?,
+            )?;
+            normalization = normalization
+                .checked_add(buffers)?
+                .checked_add(utf8?.max(8).checked_mul(4)?)?
+                .checked_add(config_dir.len())?;
+        }
+    }
+    for operation in setup_operations.iter().chain(reconnect_operations.iter()) {
+        let PersistedClaudeAccountSetupOperationV1 {
+            kind: _,
+            created_sequence: _,
+            operation_id: _,
+            slot_id: _,
+            config_dir: _,
+            state: _,
+            target_id: _,
+            requested_expected_account_identifier_hash: _,
+            requested_expected_organization_identifier_hash: _,
+            expected_account_identifier_hash: _,
+            expected_organization_identifier_hash: _,
+            account_identifier_hash: _,
+            organization_identifier_hash: _,
+            message: _,
+        } = operation;
+    }
+    // Validation never allocates these sets beyond the pre-existing9/18 caps;
+    // excess rows fail before their loops. Charge full old/new tree nodes and
+    // borrowed sorted-reference staging, plus every retained service String.
+    let n = MAX_REGISTERED_CLAUDE_CONFIG_SLOTS;
+    let node = 256usize
+        .checked_add(12 * std::mem::size_of::<usize>())?
+        .checked_add(11 * std::mem::size_of::<String>())?;
+    let trees = n
+        .checked_mul(7)?
+        .checked_add(6)?
+        .checked_mul(2)?
+        .checked_mul(node)?;
+    let staging = n
+        .max(48)
+        .checked_mul(4)?
+        .checked_mul(std::mem::size_of::<&str>())?;
+    let services = n
+        .checked_mul(CLAUDE_OAUTH_KEYCHAIN_SERVICE.len().checked_add(65)?)?
+        .checked_mul(4)?;
+    normalization
+        .checked_add(trees)?
+        .checked_add(staging)?
+        .checked_add(services)?
+        .checked_add(8 * 146)
+}
+
+/// Validation bounds this to nine registered slots/eighteen operations. Sort
+/// borrowed references only; stream length-delimited semantic fields into the
+/// digest instead of copying a settings graph or serializing another buffer.
+fn transcript_binding_fingerprint(settings: &PersistedClaudeConfigSlotSettingsV1) -> String {
+    fn field(digest: &mut Sha256, value: &str) {
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+    fn optional(digest: &mut Sha256, value: Option<&str>) {
+        digest.update([u8::from(value.is_some())]);
+        if let Some(value) = value {
+            field(digest, value);
+        }
+    }
+    fn approval_source(value: ClaudeSlotApprovalSource) -> u8 {
+        match value {
+            ClaudeSlotApprovalSource::Observed => 1,
+            ClaudeSlotApprovalSource::Setup => 2,
+            ClaudeSlotApprovalSource::Reconnect => 3,
+        }
+    }
+    let mut digest = Sha256::new();
+    field(&mut digest, "claude_transcript_registered_bindings:v1");
+    let mut slots = settings.registered_slots.iter().collect::<Vec<_>>();
+    slots.sort_unstable_by(|a, b| a.slot_id.cmp(&b.slot_id));
+    digest.update((slots.len() as u64).to_le_bytes());
+    for slot in slots {
+        field(&mut digest, &slot.slot_id);
+        // Exact config spelling is part of the existing credential scope.
+        field(&mut digest, &slot.config_dir);
+        digest.update([match slot.ownership {
+            ClaudeConfigSlotOwnership::Managed => 1,
+            ClaudeConfigSlotOwnership::External => 2,
+        }]);
+        optional(
+            &mut digest,
+            slot.approved_account_identifier_hash.as_deref(),
+        );
+        optional(
+            &mut digest,
+            slot.approved_organization_identifier_hash.as_deref(),
+        );
+        digest.update([if slot.approved_account_identifier_hash.is_some() {
+            approval_source(
+                slot.approved_from
+                    .unwrap_or(ClaudeSlotApprovalSource::Observed),
+            )
+        } else {
+            0
+        }]);
+        let pending = slot_operations(settings, slot)
+            .filter(|operation| operation_is_nonterminal(operation))
+            .max_by_key(|operation| operation.created_sequence);
+        digest.update([u8::from(pending.is_some())]);
+        if let Some(pending) = pending {
+            digest.update([match pending.kind {
+                ClaudeAccountSetupOperationKind::ConnectManagedAccount => 1,
+                ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot => 2,
+            }]);
+            optional(&mut digest, pending.target_id.as_deref());
+            optional(
+                &mut digest,
+                pending.expected_account_identifier_hash.as_deref(),
+            );
+            optional(
+                &mut digest,
+                pending.expected_organization_identifier_hash.as_deref(),
+            );
+        }
+        match effective_slot_binding(settings, &slot.slot_id) {
+            Some((binding, source)) => {
+                digest.update([match source {
+                    EffectiveSlotBindingSource::PendingOperation => 1,
+                    EffectiveSlotBindingSource::Approved => 2,
+                    EffectiveSlotBindingSource::CompletedOperation(value) => {
+                        2 + approval_source(value)
+                    }
+                }]);
+                field(&mut digest, &binding.account_identifier_hash);
+                field(&mut digest, &binding.organization_identifier_hash);
+            }
+            None => digest.update([0]),
+        }
+        digest.update([u8::from(slot_allows_first_use_binding(
+            settings,
+            &slot.slot_id,
+        ))]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
 fn effective_slot_binding(
     settings: &PersistedClaudeConfigSlotSettingsV1,
     slot_id: &str,
@@ -2667,6 +3003,168 @@ fn status_contract_with_selected_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn copy_binding_settings() -> PersistedClaudeConfigSlotSettingsV1 {
+        let mut settings = PersistedClaudeConfigSlotSettingsV1 {
+            registered_slots: vec![
+                PersistedClaudeConfigSlotV1::new(
+                    "claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    ClaudeConfigSlotOwnership::External,
+                    "/synthetic/claude-one".into(),
+                ),
+                PersistedClaudeConfigSlotV1::new(
+                    "claude_slot_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    ClaudeConfigSlotOwnership::External,
+                    "/synthetic/claude-two".into(),
+                ),
+            ],
+            ..Default::default()
+        };
+        settings.registered_slots[0]
+            .approve(&binding('a', 'b'), ClaudeSlotApprovalSource::Observed);
+        settings
+    }
+
+    fn copy_binding_write(path: &Path, settings: &PersistedClaudeConfigSlotSettingsV1) {
+        validate_persisted(settings).unwrap();
+        fs::write(path, serde_json::to_vec(settings).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn copy_containment_registered_binding_missing_is_unknown_explicit_empty_is_known() {
+        let path = temp_path("copy-binding-missing");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        assert!(store.transcript_binding_fingerprint().is_err());
+        assert!(
+            store.registered_config_dirs().unwrap().is_empty(),
+            "discovery contract unchanged"
+        );
+        copy_binding_write(&path, &PersistedClaudeConfigSlotSettingsV1::default());
+        let before = fs::read(&path).unwrap();
+        assert_eq!(store.transcript_binding_fingerprint().unwrap().len(), 64);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "read must not rewrite approvals"
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn copy_containment_registered_binding_rejects_malformed_oversize_and_nonfile_state() {
+        let path = temp_path("copy-binding-invalid");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        for bytes in [b"not JSON".to_vec(), vec![b' '; 1024 * 1024 + 1]] {
+            fs::write(&path, &bytes).unwrap();
+            assert!(store.transcript_binding_fingerprint().is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(store.transcript_binding_fingerprint().is_err());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_containment_registered_binding_rejects_symlink_and_unreadable_state() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("copy-binding-io");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let target = path.with_extension("target");
+        copy_binding_write(&target, &copy_binding_settings());
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        assert!(store.transcript_binding_fingerprint().is_err());
+        fs::remove_file(&path).unwrap();
+        copy_binding_write(&path, &copy_binding_settings());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
+        let denied = fs::read(&path).is_err();
+        if denied {
+            assert!(store.transcript_binding_fingerprint().is_err());
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(store.transcript_binding_fingerprint().is_ok());
+        writeln!(std::io::stderr().lock(), "copy_containment_registered_binding_io: symlink_rejected=true permission_denial_exercised={denied} unknown_never_defaulted=true").unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn copy_containment_registered_binding_canonicalizes_scope_and_ignores_maintenance() {
+        let path = temp_path("copy-binding-canonical");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let mut settings = copy_binding_settings();
+        copy_binding_write(&path, &settings);
+        let first = store.transcript_binding_fingerprint().unwrap();
+        settings.registered_slots.reverse();
+        settings.background_upkeep_consent = true;
+        settings.background_upkeep_consent_chosen = true;
+        copy_binding_write(&path, &settings);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["last_poll_at"] = serde_json::json!("2026-10-16T22:00:00Z");
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        fs::write(
+            store.retired_reconnect_filter_path(),
+            b"unrelated corrupt retired filter",
+        )
+        .unwrap();
+        assert_eq!(store.transcript_binding_fingerprint().unwrap(), first);
+        assert!(
+            store.load().is_err(),
+            "normal retired-filter policy unchanged"
+        );
+        settings.registered_slots[1].approved_from = Some(ClaudeSlotApprovalSource::Setup);
+        copy_binding_write(&path, &settings);
+        let stronger = store.transcript_binding_fingerprint().unwrap();
+        assert_ne!(stronger, first);
+        assert_eq!(store.transcript_binding_fingerprint().unwrap(), stronger);
+        settings.registered_slots[1].approve(&binding('c', 'd'), ClaudeSlotApprovalSource::Setup);
+        copy_binding_write(&path, &settings);
+        assert_ne!(store.transcript_binding_fingerprint().unwrap(), stronger);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn copy_containment_registered_binding_tracks_pending_identity_not_progress_or_nonce() {
+        let path = temp_path("copy-binding-pending");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let mut settings = copy_binding_settings();
+        let slot = &settings.registered_slots[0];
+        settings.reconnect_operations.push(serde_json::from_value(serde_json::json!({
+            "kind":"reconnect_registered_slot", "created_sequence":1,
+            "operation_id":"claude_setup_11111111111111111111111111111111",
+            "slot_id":slot.slot_id, "config_dir":slot.config_dir, "state":"waiting_for_user_login",
+            "requested_expected_account_identifier_hash":"c".repeat(64),
+            "requested_expected_organization_identifier_hash":"d".repeat(64),
+            "expected_account_identifier_hash":"c".repeat(64),
+            "expected_organization_identifier_hash":"d".repeat(64)
+        })).unwrap());
+        copy_binding_write(&path, &settings);
+        let waiting = store.transcript_binding_fingerprint().unwrap();
+        let pending = &mut settings.reconnect_operations[0];
+        pending.operation_id = "claude_setup_22222222222222222222222222222222".into();
+        pending.created_sequence = 42;
+        pending.state = ClaudeAccountSetupOperationState::Validating;
+        pending.message = Some("different progress message".into());
+        copy_binding_write(&path, &settings);
+        assert_eq!(store.transcript_binding_fingerprint().unwrap(), waiting);
+        settings.reconnect_operations[0].expected_organization_identifier_hash =
+            Some("e".repeat(64));
+        copy_binding_write(&path, &settings);
+        let changed = store.transcript_binding_fingerprint().unwrap();
+        assert_ne!(changed, waiting);
+        assert_eq!(store.transcript_binding_fingerprint().unwrap(), changed);
+        settings.reconnect_operations[0].state = ClaudeAccountSetupOperationState::SetupStopped;
+        copy_binding_write(&path, &settings);
+        assert_ne!(store.transcript_binding_fingerprint().unwrap(), changed);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 
     #[test]
     fn transcript_registration_paths_ignore_upkeep_and_retired_sidecar() {

@@ -147,6 +147,60 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             .unwrap_or_default();
         self.insert_at(key, retained, live_bytes, now)
     }
+    /// Shared-owner admission must also cover the incoming owned graph and
+    /// map/key insertion peak while another optional graph remains resident.
+    /// The caller still preflights creation of `retained`; this method never
+    /// grants an allocation or measures a graph that has not arrived yet.
+    pub(crate) fn insert_reserving_peak(
+        &mut self,
+        key: String,
+        retained: Retained<S>,
+        live_bytes: usize,
+    ) -> bool {
+        if self.count_limit == 0
+            || !heap_layout_bound::layout_supported()
+            || !retained.state.supports_frozen_charge()
+        {
+            return false;
+        }
+        // Optional replacement/eviction cannot change source/ACK authority.
+        // Remove a previous copy first, as the ordinary admission does.
+        self.entries.remove(&key);
+        let Some(input) = heap_layout_bound::bound(&retained, self.byte_limit).and_then(|state| {
+            heap_layout_bound::bound(&key, self.byte_limit)
+                .and_then(|key_bytes| state.checked_add(key_bytes))
+        }) else {
+            return false;
+        };
+        loop {
+            let fits = (|| {
+                let resident = heap_layout_bound::bound(self, self.byte_limit)?;
+                let mut peak = Counter::new(self.byte_limit);
+                peak.add(resident)?;
+                peak.add(live_bytes)?;
+                peak.add(input)?;
+                // Count the full prospective node set in addition to the old
+                // nodes: this conservatively covers nodes coexisting in splits.
+                heap_layout_bound::tree_nodes::<String, Entry<S>>(
+                    self.entries.len().checked_add(1)?,
+                    &mut peak,
+                )?;
+                // Ordinary admission clones the key before moving it into the
+                // map; its temporary incoming allocation still exists then.
+                peak.add(key.capacity())?;
+                Some(())
+            })()
+            .is_some();
+            if fits && self.entries.len() < self.count_limit {
+                return self.insert_reserving(key, retained, live_bytes);
+            }
+            // No cloned victim key or second temporary owner graph. Strict
+            // shared-pressure eviction need not preserve optional LRU order.
+            if self.entries.pop_first().is_none() {
+                return false;
+            }
+        }
+    }
     fn insert_at(
         &mut self,
         key: String,
@@ -474,5 +528,78 @@ mod tests {
         ));
         value.lock().unwrap().reserve(1024 * 1024);
         assert!(cache.take("shared").is_none());
+    }
+
+    #[test]
+    fn copy_containment_cache_shared_peak_refusal_allocates_no_entry() {
+        let checkpoint = retained(String::new()).checkpoint;
+        let mut cache = TranscriptCache::<String>::new(128 * 1024, 64 * 1024, 1);
+        let ((admitted, admission_allocations), allocations) =
+            crate::retry_allocation_probe::measure(|| {
+                let key = "new".to_string();
+                let input = Retained {
+                    checkpoint: checkpoint.clone(),
+                    state: "x".repeat(1024),
+                };
+                let before = crate::retry_allocation_probe::stats().allocations;
+                let admitted = cache.insert_reserving_peak(key, input, 128 * 1024);
+                (
+                    admitted,
+                    crate::retry_allocation_probe::stats().allocations - before,
+                )
+            });
+        assert!(!admitted);
+        assert_eq!(admission_allocations, 0);
+        assert_eq!(allocations.requested_live, 0);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn copy_containment_cache_shared_peak_counts_input_resident_and_allocation_free_eviction() {
+        use std::io::Write;
+        let checkpoint = retained(String::new()).checkpoint;
+        let limit = 128 * 1024; // Synthetic shared owner budget, not a new runtime cap.
+        if !heap_layout_bound::layout_supported() {
+            let mut cache = TranscriptCache::<String>::new(limit, 64 * 1024, 1);
+            assert!(!cache.insert_reserving_peak(
+                "new".into(),
+                Retained {
+                    checkpoint,
+                    state: "x".repeat(1024),
+                },
+                0
+            ));
+            assert!(cache.entries.is_empty());
+            writeln!(std::io::stderr().lock(), "copy_containment_cache_peak: layout_unavailable=true positive_peak_path_executed=false no_guard_bypass=true").unwrap();
+            return;
+        }
+        let (resident_bound, allocations) = crate::retry_allocation_probe::measure(|| {
+            let sibling = vec![1_u8; 64 * 1024];
+            let mut cache = TranscriptCache::<String>::new(limit, 64 * 1024, 1);
+            assert!(cache.insert_reserving_peak(
+                "old".repeat(2048),
+                Retained {
+                    checkpoint: checkpoint.clone(),
+                    state: "a".repeat(8 * 1024),
+                },
+                sibling.capacity()
+            ));
+            assert!(cache.insert_reserving_peak(
+                "new".into(),
+                Retained {
+                    checkpoint: checkpoint.clone(),
+                    state: "b".repeat(16 * 1024),
+                },
+                sibling.capacity()
+            ));
+            assert_eq!(cache.entries.len(), 1);
+            assert!(cache.entries.contains_key("new"));
+            let resident = cache.resident_bound().unwrap() + sibling.capacity();
+            assert!(resident <= limit);
+            resident
+        });
+        assert_eq!(allocations.requested_live, 0);
+        assert!(allocations.requested_peak <= limit);
+        writeln!(std::io::stderr().lock(), "copy_containment_cache_peak: layout_unavailable=false positive_peak_path_executed=true shared_budget={limit} resident_bound={resident_bound} requested_peak={} input_creation_preflight_is_callers_job=true full_scan_index_peak_unproved=true", allocations.requested_peak).unwrap();
     }
 }

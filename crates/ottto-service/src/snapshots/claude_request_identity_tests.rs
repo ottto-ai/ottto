@@ -3644,6 +3644,256 @@ fn transcript_markers_tag_only_requests_a_settled_census_shows_unduplicated() {
 
 // --- Zero-usage responses -----------------------------------------------------
 
+/// A parked transcript is still uncompared. Matching the base's uncompared
+/// census must preserve healthy telemetry tags byte-for-byte while neither a
+/// healthy marker nor a copied prefix can borrow uniqueness from the hold.
+#[test]
+fn copy_containment_parked_debt_preserves_matched_unsettled_identity_and_own_telemetry() {
+    let dir = temp_dir("claude-copy-held-identity");
+    let mut lines = email_session(false, false);
+    lines.push(owned_response("req_2", "2026-08-02T07:00:02Z", 20, 2));
+    let org = org_hash(ORG_1);
+    let mut member = complete_api_row(ROOT, "req_member", 9, 10, 1, 0);
+    member.request_identity = Some(org_identity(&org));
+    let (api, trace) = reports(
+        vec![
+            signed(member),
+            signed(complete_api_row(ROOT, "req_2", 2, 20, 2, 0)),
+        ],
+        vec![
+            complete_trace_row(ROOT, "req_member", ""),
+            complete_trace_row(ROOT, "req_2", ""),
+        ],
+    );
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let clean = ScanIndex::default();
+    let mut encoded = serde_json::to_value(&clean).unwrap();
+    encoded["claude_copy_holds"] = json!({"synthetic-parked-copy": {
+        "revision": {"version": 1, "reason": "copied_overlap_unproven",
+            "source_revision": "c".repeat(64), "comparison_context": "d".repeat(64),
+            "first_observed_unix_seconds": null},
+        "peers": ["e".repeat(64)]
+    }});
+    let held: ScanIndex = serde_json::from_value(encoded).unwrap();
+    assert_eq!(held.copy_hold_count(), 1);
+    let run = |index: &ScanIndex, compared: bool| {
+        let mut items = parse_session(&dir, &lines);
+        let disposition = ClaudeUsageAuthorityDisposition {
+            duplicate_census: ClaudeDuplicateCensusCounts {
+                census_complete: true,
+                coverage_complete: true,
+                ..Default::default()
+            },
+            transcript_ownership_complete: compared,
+            ..Default::default()
+        };
+        let ownership = identity::TranscriptOwnership::after_census(index, &disposition);
+        identity::apply_scan_with_ownership(&mut items, &evidence, BTreeMap::new(), &ownership);
+        items.remove(0)
+    };
+    let baseline = run(&clean, false);
+    let parked = run(&held, true); // Even optimistic census flags cannot bless parked debt.
+    assert_eq!(
+        serde_json::to_vec(&parked).unwrap(),
+        serde_json::to_vec(&baseline).unwrap()
+    );
+    let bases = |item: &SnapshotItem| {
+        item.request_evidence
+            .iter()
+            .map(|part| {
+                (
+                    part.identity_basis.clone(),
+                    part.provider_workspace_hash.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        bases(&parked),
+        BTreeSet::from([(identity::TELEMETRY_LOGIN.to_string(), None)])
+    );
+    assert_eq!(parked.request_identity_refusals, 0);
+    let settled_control = run(&clean, true);
+    assert!(bases(&settled_control)
+        .iter()
+        .any(|(basis, _)| basis == identity::TRANSCRIPT_ORG));
+    assert_eq!(parked.input_tokens, settled_control.input_tokens);
+    assert_eq!(parked.output_tokens, settled_control.output_tokens);
+    assert_eq!(parked.cost, settled_control.cost);
+
+    // A root with copied markers and no own telemetry gets no tag from the
+    // original's rows, even with optimistic census flags and a complete parse.
+    let mut fork_lines = lines.clone();
+    for line in &mut fork_lines {
+        if line.get("sessionId").is_some() {
+            line["sessionId"] = json!(OTHER_ROOT);
+        }
+    }
+    let fork_path = dir.join(format!("{OTHER_ROOT}.jsonl"));
+    fs::write(
+        &fork_path,
+        fork_lines
+            .iter()
+            .map(|line| line.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    let mut fork =
+        parse_claude_code_jsonl_file(&fork_path, "2026-08-02T07:01:00Z", "f".repeat(64)).unwrap();
+    let disposition = ClaudeUsageAuthorityDisposition {
+        duplicate_census: ClaudeDuplicateCensusCounts {
+            census_complete: true,
+            coverage_complete: true,
+            ..Default::default()
+        },
+        transcript_ownership_complete: true,
+        ..Default::default()
+    };
+    identity::apply_scan_with_ownership(
+        &mut fork,
+        &evidence,
+        BTreeMap::new(),
+        &identity::TranscriptOwnership::after_census(&held, &disposition),
+    );
+    assert!(fork.iter().all(|item| item.request_evidence.is_empty()));
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// A full account-hold ledger can refuse a new copy record. The actual native
+/// conflict must still withhold the copy and suppress transcript marker tags.
+#[test]
+fn copy_containment_unrecorded_overflow_preserves_unsettled_identity_and_own_telemetry() {
+    let dir = temp_dir("claude-copy-overflow-identity");
+    let mut lines = email_session(false, false);
+    lines.push(owned_response("req_2", "2026-08-02T07:00:02Z", 20, 2));
+    let mut copied_line = owned_response("req_copy_overlap", "2026-08-02T07:00:03Z", 30, 3);
+    copied_line["sessionId"] = json!(OTHER_ROOT);
+    let copied_path = dir.join(format!("{OTHER_ROOT}.jsonl"));
+    fs::write(&copied_path, copied_line.to_string() + "\n").unwrap();
+    let revision = "f".repeat(64);
+    let copied =
+        parse_claude_code_jsonl_file(&copied_path, "2026-08-02T07:01:00Z", revision.clone())
+            .unwrap();
+    assert_eq!(copied.len(), 1);
+    assert!(copied[0]
+        .claude_usage_request_ids
+        .contains("req_copy_overlap"));
+    let copied_bytes = serde_json::to_vec(&copied).unwrap();
+    let key = local_index_key(&copied_path);
+    let mut index = ScanIndex::default();
+    index.attach_unknown_copy_owner("a".repeat(64)).unwrap();
+    index.claude_account_deferred_holds = (0..MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS)
+        .map(|n| (format!("synthetic-account-held-{n}"), "b".repeat(64)))
+        .collect();
+    index.claude_duplicate_request_owners.insert(
+        format!("{:x}", Sha256::digest(b"req_copy_overlap")),
+        BTreeSet::from([
+            claude_duplicate_request_owner(OTHER_ROOT, OTHER_ROOT),
+            claude_duplicate_request_owner(THIRD_ROOT, THIRD_ROOT),
+        ]),
+    );
+    // An accepted local body witness is never lowered or changed by containment.
+    index.accepted_snapshot_fingerprints.insert("c".repeat(64));
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::from(["c".repeat(64)]));
+    let accepted = index.accepted_snapshot_fingerprints.clone();
+    let accepted_files = index.file_snapshot_fingerprints.clone();
+    let withheld = index.try_record_known_copy_holds(
+        &copied,
+        claude_copy_containment::producer::OpenedFiles::pairs(&[(&key, &revision)]),
+        |_, _| false,
+    );
+    assert_eq!(withheld, BTreeSet::from([OTHER_ROOT.to_string()]));
+    assert_eq!(index.copy_hold_count(), 0);
+    assert_eq!(
+        index.claude_account_deferred_holds.len(),
+        MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS
+    );
+    assert_eq!(index.accepted_snapshot_fingerprints, accepted);
+    assert_eq!(index.file_snapshot_fingerprints, accepted_files);
+    assert_eq!(serde_json::to_vec(&copied).unwrap(), copied_bytes);
+    let status = serde_json::to_value(index.copy_containment_status(None)).unwrap();
+    assert_eq!(status["hold_record_limit_refusals"], 1);
+    assert_eq!(status["withheld_candidates_observed"], true);
+    assert!(status["unrecorded_held_revision_count"].is_null());
+
+    let org = org_hash(ORG_1);
+    let mut member = complete_api_row(ROOT, "req_member", 9, 10, 1, 0);
+    member.request_identity = Some(org_identity(&org));
+    let (api, trace) = reports(
+        vec![
+            signed(member),
+            signed(complete_api_row(ROOT, "req_2", 2, 20, 2, 0)),
+        ],
+        vec![
+            complete_trace_row(ROOT, "req_member", ""),
+            complete_trace_row(ROOT, "req_2", ""),
+        ],
+    );
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let mut disposition = ClaudeUsageAuthorityDisposition {
+        duplicate_census: ClaudeDuplicateCensusCounts {
+            census_complete: true,
+            coverage_complete: true,
+            ..Default::default()
+        },
+        transcript_ownership_complete: true,
+        copied_source_session_ids: withheld.clone(),
+        ..Default::default()
+    };
+    let run = |state: &ClaudeUsageAuthorityDisposition| {
+        let mut items = parse_session(&dir, &lines);
+        identity::apply_scan_with_ownership(
+            &mut items,
+            &evidence,
+            BTreeMap::new(),
+            &identity::TranscriptOwnership::after_census(&index, state),
+        );
+        items.remove(0)
+    };
+    let overflow = run(&disposition);
+    let mut base = disposition.clone();
+    base.copied_source_session_ids.clear();
+    base.transcript_ownership_complete = false;
+    assert_eq!(
+        serde_json::to_vec(&overflow).unwrap(),
+        serde_json::to_vec(&run(&base)).unwrap()
+    );
+    assert!(overflow
+        .request_evidence
+        .iter()
+        .all(|part| part.identity_basis == identity::TELEMETRY_LOGIN));
+    assert!(!overflow.request_evidence.is_empty());
+    let mut complete = base;
+    complete.transcript_ownership_complete = true;
+    let control = run(&complete);
+    assert!(control
+        .request_evidence
+        .iter()
+        .any(|part| part.identity_basis == identity::TRANSCRIPT_ORG));
+    assert_eq!(overflow.input_tokens, control.input_tokens);
+    assert_eq!(overflow.output_tokens, control.output_tokens);
+    assert_eq!(overflow.cost, control.cost);
+
+    // Independent account deferral and both upload filters cannot erase the
+    // withheld-copy fact before the marker ownership decision.
+    disposition.defer_sessions(BTreeSet::from([THIRD_ROOT.to_string()]));
+    let mut uploads = parse_session(&dir, &lines);
+    uploads.extend(copied);
+    disposition.retain_uploadable(&mut uploads);
+    disposition.retain_copy_uploadable(&mut uploads).unwrap();
+    assert_eq!(disposition.copied_source_session_ids, withheld);
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].source_session_id, ROOT);
+    assert_eq!(
+        serde_json::to_vec(&run(&disposition)).unwrap(),
+        serde_json::to_vec(&overflow).unwrap()
+    );
+    writeln!(std::io::stderr().lock(), "copy_containment_overflow_identity: actual_account_hold_cap={} recorded_copy_holds=0 withheld_native_copy=1 marker_suppressed=true own_telemetry_base_bytes_equal=true accepted_witness_unchanged=true", MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS).unwrap();
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// One owned response of `ROOT` with its own request id.
 fn owned_response(request_id: &str, timestamp: &str, input: u64, output: u64) -> Value {
     json!({"timestamp": timestamp, "type": "assistant", "sessionId": ROOT,

@@ -722,13 +722,13 @@ impl ApcFixture {
         }
         let settlement = match result {
             ResumableUploadResult::Completed => {
-                settle_completed_upload(index, &committed_index, &progress, &holds)
+                settle_completed_upload(index, &committed_index, &progress, &holds).unwrap()
             }
             ResumableUploadResult::Rejected { .. } => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, true).unwrap()
             }
             ResumableUploadResult::Deferred { .. } => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
+                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false).unwrap()
             }
             other => panic!("unexpected synthetic upload {other:?}"),
         };
@@ -742,7 +742,7 @@ impl ApcFixture {
             &candidates,
             &cutoff_candidates,
             settlement.fully_settled,
-        );
+        ).unwrap();
         let census_complete = scan.census_complete;
         settle_context_curve_replay_state(
             &mut index,
@@ -2239,7 +2239,7 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
                 progress_blocking: false,
             };
             let selected = if outcome == "completed" {
-                settle_completed_upload(current, &committed, &progress, &holds)
+                settle_completed_upload(current, &committed, &progress, &holds).unwrap()
             } else {
                 settle_checkpointed_upload(
                     current,
@@ -2247,7 +2247,7 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
                     &progress,
                     &holds,
                     outcome == "permanent",
-                )
+                ).unwrap()
             };
             assert_eq!(selected.fully_settled, expected_transport);
             let mut index = selected.index;
@@ -2260,7 +2260,7 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
                 &[],
                 &[],
                 selected.fully_settled,
-            );
+            ).unwrap();
             assert_eq!(
                 settled,
                 complete && expected_transport,

@@ -47,6 +47,56 @@ use zeroize::Zeroize;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
+pub(crate) const COPY_CONTAINMENT_EVENT_TYPE: &str = "ClaudeCopyContainmentObserved";
+
+/// Existing local event envelope only. The canonical health projection omits
+/// this event's evidence reference, so neither status path uploads a new field.
+/// Replace one current observation; never accumulate an event for each scan.
+fn record_copy_containment_status(
+    daemon: &LocalDaemon,
+    index: &ScanIndex,
+    basis: &'static str,
+) -> Result<()> {
+    if !daemon.transcript_cache.copy_containment_required() {
+        return Ok(());
+    }
+    let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).ok();
+    let observation = index.copy_containment_status(now);
+    let payload = serde_json::json!({
+        "kind": "claude_copy_containment", "current": true,
+        "basis": basis, "observation": observation,
+        "message": "Claude copy containment source checkpoint; held usage remains unresolved, never zero."
+    });
+    let mut state = daemon.state()?;
+    if state
+        .local_health_events
+        .iter()
+        .any(|event| event.event_type == COPY_CONTAINMENT_EVENT_TYPE && event.payload == payload)
+    {
+        return Ok(());
+    }
+    // Keep the old sequence visible while constructing the new event. The
+    // same mutex makes replacement atomic to every local status reader.
+    crate::push_local_health_event(
+        &mut state,
+        COPY_CONTAINMENT_EVENT_TYPE,
+        "claude_copy_containment",
+        ottto_protocol::LocalHealthAuthority::Runtime,
+        payload,
+    );
+    if let Some(sequence) = state.local_health_events.last().map(|event| event.sequence) {
+        state.local_health_events.retain(|event| {
+            event.event_type != COPY_CONTAINMENT_EVENT_TYPE || event.sequence == sequence
+        });
+    }
+    Ok(())
+}
+
+fn observe_copy_containment_status(daemon: &LocalDaemon, index: &ScanIndex, basis: &'static str) {
+    if record_copy_containment_status(daemon, index, basis).is_err() {
+        eprintln!("local copied-request status observation unavailable");
+    }
+}
 const SNAPSHOT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 // Non-terminal collector check-in cadence. The sync loop sleeps a fixed
 // SNAPSHOT_SYNC_INTERVAL AFTER a cycle completes, so terminal status receipts
@@ -277,7 +327,7 @@ fn commit_completed_with_local_holds(
     locally_held_fingerprints: &BTreeSet<String>,
     account_deferred_held_fingerprints: &BTreeSet<String>,
     progress_blocking: bool,
-) -> ScanIndex {
+) -> Result<ScanIndex> {
     if !progress_blocking
         && index.locally_held_keys_restorable(
             committed_index,
@@ -285,20 +335,23 @@ fn commit_completed_with_local_holds(
             account_deferred_held_fingerprints,
         )
     {
-        return index.into_locally_held_keys_reverted(
+        return Ok(index.into_locally_held_keys_reverted(
             committed_index,
             locally_held_fingerprints,
             account_deferred_held_fingerprints,
-        );
+        ));
     }
     let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
     accepted_fingerprints.retain(|fingerprint| !locally_held_fingerprints.contains(fingerprint));
     let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
     server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
-    let mut index =
-        index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine);
+    let mut index = index.try_committable_subset(
+        committed_index,
+        &accepted_fingerprints,
+        &server_quarantine,
+    )?;
     index.mark_bounded_sweep_unsettled();
-    index
+    Ok(index)
 }
 
 /// Local holds classified once per page, after finalization and before upload.
@@ -366,7 +419,7 @@ struct UploadIndexSettlement {
 /// A persisted account hold was never uploaded, so the backfill and replay it
 /// belongs to stay pending even on a page that did not revisit it.
 fn upload_settled_without_account_holds(index: &ScanIndex, settled: bool) -> bool {
-    settled && index.claude_account_deferred_hold_count() == 0
+    settled && index.claude_account_deferred_hold_count() == 0 && index.copy_hold_count() == 0
 }
 
 /// Settle a `Completed` upload: every uploaded entity was accepted or
@@ -376,13 +429,13 @@ fn settle_completed_upload(
     committed_index: &ScanIndex,
     upload_progress: &SnapshotUploadProgress,
     holds: &LocalHoldSettlement,
-) -> UploadIndexSettlement {
+) -> Result<UploadIndexSettlement> {
     if !holds.any() {
         let fully_settled = upload_settled_without_account_holds(&index, true);
-        return UploadIndexSettlement {
+        return Ok(UploadIndexSettlement {
             index,
             fully_settled,
-        };
+        });
     }
     let index = commit_completed_with_local_holds(
         index,
@@ -391,17 +444,17 @@ fn settle_completed_upload(
         &holds.held_fingerprints,
         &holds.account_deferred_fingerprints,
         holds.progress_blocking,
-    );
+    )?;
     eprintln!(
         "local snapshot sync retained {} Claude usage family/families and {} revised \
          entity/entities with unproven authority or session ownership; healthy siblings settled \
          and the retained revisions remain pending for bounded retry",
         holds.retry_pending_family_count, holds.held_entity_count
     );
-    UploadIndexSettlement {
+    Ok(UploadIndexSettlement {
         index,
         fully_settled: false,
-    }
+    })
 }
 
 /// Settle a `Deferred` or `Rejected` upload. Retryable or locally unproven
@@ -414,13 +467,13 @@ fn settle_checkpointed_upload(
     upload_progress: &SnapshotUploadProgress,
     holds: &LocalHoldSettlement,
     resolved_permanent_rejections: bool,
-) -> UploadIndexSettlement {
+) -> Result<UploadIndexSettlement> {
     let mut index = if holds.any() {
         let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
         accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
         let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
         server_quarantine.retain(|fingerprint, _| !holds.held_fingerprints.contains(fingerprint));
-        index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine)
+        index.try_committable_subset(committed_index, &accepted_fingerprints, &server_quarantine)?
     } else {
         index
     };
@@ -429,10 +482,10 @@ fn settle_checkpointed_upload(
         index.mark_bounded_sweep_unsettled();
     }
     let fully_settled = upload_settled_without_account_holds(&index, settled);
-    UploadIndexSettlement {
+    Ok(UploadIndexSettlement {
         index,
         fully_settled,
-    }
+    })
 }
 
 /// Fold the upload ledger into the index after any outcome that reaches the
@@ -460,7 +513,8 @@ fn settle_upload_corrections_after_selection(
     candidates: &[crate::snapshots::ClaudeProofCorrectionCandidate],
     cutoff_candidates: &[crate::snapshots::ClaudeCutoffCorrectionCandidate],
     transport_fully_settled: bool,
-) -> bool {
+) -> Result<bool> {
+    index.try_restore_copy_held_checkpoint(committed_index)?;
     // D1 is deliberately unavailable to partial/deferred/shed/error outcomes.
     // Both existing durable refusal carriers must bind the exact current body.
     if transport_fully_settled {
@@ -486,7 +540,7 @@ fn settle_upload_corrections_after_selection(
     }
     index.settle_cutoff_claude_proof_corrections(cutoff_candidates);
     index.settle_empty_claude_proof_corrections(scan);
-    transport_fully_settled && !index.claude_authority_proof_correction_pending()
+    Ok(transport_fully_settled && !index.claude_authority_proof_correction_pending())
 }
 
 fn apply_backfill_cutoff_with_claude_corrections(
@@ -1757,7 +1811,8 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
         })
         .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
         .collect();
-    let mut committable = index.committable_subset(committed_index, &accepted, &quarantined);
+    let mut committable = index.try_committable_subset(committed_index, &accepted, &quarantined)?;
+    committable.try_restore_copy_held_checkpoint(committed_index)?;
     if let Some(scan) = correction_scan {
         // A2: settle no-body grants only against the file/empty/map facts
         // actually selected for this save, after any old-entry restoration.
@@ -3690,7 +3745,13 @@ fn prepare_sync_source(
         &upload_destination_namespace,
         snapshot_quarantine_witness(source),
     )?;
-    let mut index = ScanIndex::load(&index_path)?;
+    let copy_containment_required =
+        source == SnapshotSource::ClaudeCode && daemon.transcript_cache.copy_containment_required();
+    let mut index = if copy_containment_required {
+        ScanIndex::load_required_copy_index(&index_path, &daemon.transcript_cache)?
+    } else {
+        ScanIndex::load(&index_path)?
+    };
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
@@ -3794,7 +3855,7 @@ fn prepare_sync_source(
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
     index.activate_effective_upload_body_witness_revision(EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION);
-    let committed_index = index.clone();
+    let committed_index = index.try_clone_for_copy()?;
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
     let watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     if watcher_hints.overflowed {
@@ -3830,6 +3891,19 @@ fn prepare_sync_source(
         // A retained parser never crosses capture modes; the dark scope bytes
         // are unchanged.
         sampled_scope.push_str(":request_identity");
+    }
+    if copy_containment_required {
+        // Attach after the committed baseline clone: process context is not
+        // persisted/accepted evidence. Source/destination/account/capture bind
+        // the owner, but are NOT complete Claude slot/peer/W1-W5 witnesses.
+        // Missing witnesses stay UNKNOWN; no per-cycle/restart read allowance.
+        index.attach_prepaid_copy_owner(
+            support_dir,
+            &sampled_scope,
+            &upload_destination_namespace,
+            source.api_slug(),
+            &index_path,
+        )?;
     }
     let scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
         source,
@@ -4017,19 +4091,25 @@ fn finish_sync_source(
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
     if source == SnapshotSource::ClaudeCode {
         let evidence_started = Instant::now();
-        let (disposition, census_withheld, stats) = apply_claude_local_evidence_to_scan_with_permit(
-            support_dir,
-            &mut scan_result,
-            &mut index,
-            cycle_request_identity_permit(source, &activity_hint),
-        );
+        let (disposition, census_withheld, stats, native_completion) =
+            apply_claude_local_evidence_with_native_completion(
+                support_dir,
+                &mut scan_result,
+                &mut index,
+                cycle_request_identity_permit(source, &activity_hint),
+            );
+        // F3 owns the moved input through this return. Cache admission remains
+        // unqualified; retire it BEFORE later required upload/selection growth.
+        drop(native_completion);
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
                 "local snapshot sync: claude local evidence duration_ms={} counts={counts}",
                 evidence_started.elapsed().as_millis()
             );
         }
+        disposition.ensure_copy_preparation_available()?;
         claude_authority_disposition = disposition;
+        observe_copy_containment_status(daemon, &index, "uncommitted_scan_observation");
         if census_withheld {
             backfill_succeeded = false;
         }
@@ -4475,7 +4555,7 @@ fn finish_sync_source(
         Ok(ResumableUploadResult::Completed) => {
             clear_shed_streak(source);
             let settlement =
-                settle_completed_upload(index, &committed_index, &upload_progress, &local_holds);
+                settle_completed_upload(index, &committed_index, &upload_progress, &local_holds)?;
             index = settlement.index;
             if !settlement.fully_settled {
                 backfill_succeeded = false;
@@ -4501,7 +4581,7 @@ fn finish_sync_source(
                 &upload_progress,
                 &local_holds,
                 resolved_permanent_rejections,
-            );
+            )?;
             index = settlement.index;
             if !settlement.fully_settled {
                 backfill_succeeded = false;
@@ -4518,7 +4598,6 @@ fn finish_sync_source(
             let first_shed = Instant::now();
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
-            let mut checkpoint_succeeded = true;
             let committable = match checkpoint_partial_snapshot_index(
                 &index,
                 &committed_index,
@@ -4533,17 +4612,23 @@ fn finish_sync_source(
                     scan_result.validate_codex_checkpoint()
                 },
             ) {
-                Ok(committable) => committable,
+                Ok(committable) => Some(committable),
                 Err(error) => {
-                    checkpoint_succeeded = false;
                     eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",
                         source.api_slug(),
                         safe_error(&error)
                     );
-                    committed_index.clone()
+                    None
                 }
             };
+            let checkpoint_succeeded = committable.is_some();
+            // A failed save borrows its unchanged durable baseline for status.
+            // Never deep-clone an unpaid required ledger merely to report it.
+            let committable = committable.as_ref().unwrap_or(&committed_index);
+            if checkpoint_succeeded && source == SnapshotSource::ClaudeCode {
+                observe_copy_containment_status(daemon, committable, "durable_partial_selection");
+            }
             if retry.enabled()
                 && checkpoint_succeeded
                 && locally_held_fingerprints.is_empty()
@@ -4560,7 +4645,7 @@ fn finish_sync_source(
                         account_witness,
                         &scan_result.snapshots,
                         &mut index,
-                        &committable,
+                        committable,
                         &upload_progress,
                         &index_path,
                         &upload_progress_path,
@@ -4585,7 +4670,7 @@ fn finish_sync_source(
                         accepted,
                         receipt_window_days,
                     )
-                    .with_snapshot_terminal_counts(&committable),
+                    .with_snapshot_terminal_counts(committable),
                     // `server_error` is the closest code the receipt contract
                     // carries; the loss report is where the shed is named
                     // precisely.
@@ -4642,7 +4727,16 @@ fn finish_sync_source(
                         scan_result.validate_codex_checkpoint()
                     },
                 ) {
-                    Ok(committable) => index = committable,
+                    Ok(committable) => {
+                        if source == SnapshotSource::ClaudeCode {
+                            observe_copy_containment_status(
+                                daemon,
+                                &committable,
+                                "durable_partial_selection",
+                            );
+                        }
+                        index = committable;
+                    }
                     Err(checkpoint_error) => eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",
                         source.api_slug(),
@@ -4807,7 +4901,7 @@ fn finish_sync_source(
         &claude_proof_correction_candidates,
         &claude_cutoff_corrections,
         upload_fully_settled,
-    );
+    )?;
     backfill_succeeded &= upload_fully_settled;
     // A quiet/delta-only scan still discloses current permanent refusals even
     // though no body needed another upload. The committed census owns scope.
@@ -4839,6 +4933,9 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    if source == SnapshotSource::ClaudeCode {
+        observe_copy_containment_status(daemon, &index, "durable_selected_index");
+    }
     // A completed cycle is what moves the tier: uploads keep a source warm, a
     // quiet cycle lets it fall to idle and then cold. A conflict pass has still
     // durably committed its accepted siblings, but remains a source failure so
@@ -5108,6 +5205,24 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
     bool,
     ClaudeLocalEvidenceStats,
 ) {
+    let (disposition, withheld, stats, completion) =
+        apply_claude_local_evidence_with_native_completion(support_dir, scan_result, index, permit);
+    drop(completion); // Standalone callers retain no optional input after F3.
+    (disposition, withheld, stats)
+}
+
+/// Contract-5 evidence is built only under this cycle's emission permit.
+fn apply_claude_local_evidence_with_native_completion(
+    support_dir: &Path,
+    scan_result: &mut crate::snapshots::SourceScanResult,
+    index: &mut ScanIndex,
+    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
+) -> (
+    crate::snapshots::ClaudeUsageAuthorityDisposition,
+    bool,
+    ClaudeLocalEvidenceStats,
+    crate::snapshots::HeldNativeCompletion,
+) {
     let emission_permitted = permit.is_some();
     let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
@@ -5235,6 +5350,9 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
             trace_report.evidence.insert(root_session_id, rows);
         }
     }
+    // Every selected root completed its strict generation check above. This
+    // owner is no longer used; drop retained map nodes before observation.
+    drop(api_read);
     // Contract-5 evidence exists only under this cycle's permit; the reported
     // rebuild then classifies and groups each request as it places it.
     let identity_evidence = emission_permitted.then(|| {
@@ -5253,6 +5371,36 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
         index,
         identity_evidence.as_ref(),
     );
+    // Observation only at the real fold/filter boundary. Missing process
+    // context/layout is None before walking. This omits preparation owners and
+    // future C5 scratch/output, so it MUST NOT authorize optional cache capture.
+    if index.copy_completion_observation_enabled() {
+        let _owned_observation = crate::snapshots::observe_owned_completion(
+            crate::snapshots::BorrowedClaudeCompletion {
+                index,
+                scan: scan_result,
+                disposition: &disposition,
+                api: &api_report,
+                trace: &trace_report,
+                evidence: identity_evidence.as_ref(),
+                originals: &originals,
+            },
+            crate::source_rotation::OVERLAP_BUDGET,
+        );
+    }
+    // At F1 move only complete withheld native sets, after their full extended
+    // lifetime is paid. Healthy sets stay in place through C5. No cache permit.
+    let native_completion = index.capture_copy_native_completion(scan_result, &disposition);
+    // Keep all actual native observations through the authoritative fold;
+    // withheld copies never reach C5 construction, name/account binding or POST.
+    if disposition
+        .retain_copy_uploadable(&mut scan_result.snapshots)
+        .is_err()
+    {
+        // Explicit pre-offer refusal is consumed by finish_sync_source before
+        // binding, selection, upload or save. No C5/tag/identity work follows.
+        return (disposition, true, stats, native_completion);
+    }
     if let Some(evidence) = &identity_evidence {
         // Contract 5 first: D1 below leaves new-collector items untouched. The
         // rebuild above has just settled this pass's duplicate census.
@@ -5339,7 +5487,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_permit(
         scan_result.scan_cap_hit = true;
         index.mark_bounded_sweep_unsettled();
     }
-    (disposition, census_withheld, stats)
+    (disposition, census_withheld, stats, native_completion)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -14772,7 +14920,8 @@ mod tests {
             &held,
             &BTreeSet::new(),
             false,
-        );
+        )
+        .unwrap();
         assert!(!settled.bounded_sweep_had_unsettled_upload());
         assert_eq!(
             settled.files["/opaque/held.jsonl"]
@@ -14801,7 +14950,8 @@ mod tests {
             &held,
             &held,
             false,
-        );
+        )
+        .unwrap();
         assert!(!deferred.bounded_sweep_had_unsettled_upload());
         assert!(deferred.files["/opaque/held.jsonl"]
             .source_file_fingerprint
@@ -14814,7 +14964,8 @@ mod tests {
             &held,
             &BTreeSet::new(),
             true,
-        );
+        )
+        .unwrap();
         assert!(blocked.bounded_sweep_had_unsettled_upload());
         assert_eq!(
             blocked.files["/opaque/held.jsonl"]
@@ -16821,6 +16972,7 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
+    include!("snapshot_sync/copy_containment_owner_tests.rs");
     mod authority_proof_correction_pipeline_tests {
         include!("snapshot_sync/authority_proof_correction_pipeline_tests.rs");
     }

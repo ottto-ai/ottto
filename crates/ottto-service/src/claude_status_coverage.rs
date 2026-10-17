@@ -104,6 +104,20 @@ pub(crate) struct Ledger {
     lost_overflow: bool,
 }
 
+// Additive requested-layout observation of the scan's owned clone. The
+// existing retained_bytes policy and all identity/history decisions are intact.
+crate::heap_layout_bound::fields!(Segment; login, org, start, end);
+crate::heap_layout_bound::fields!(SlotHistory; slot, segments, open, last_at);
+crate::heap_layout_bound::fields!(Ledger; slots, registered, known_since, lost, lost_overflow);
+impl Ledger {
+    pub(crate) fn completion_owned_heap_bound(
+        &self,
+        c: &mut crate::heap_layout_bound::Counter,
+    ) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(self, c)
+    }
+}
+
 /// Whether a folder was a registered slot, as far as this process knows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Registration {
@@ -490,3 +504,56 @@ impl Ledger {
 #[cfg(test)]
 #[path = "claude_status_coverage_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod completion_accounting_tests {
+    use super::*;
+    #[test]
+    fn copy_containment_completion_accounting_ledger_clone_and_spare_capacity() {
+        let mut segments = Vec::with_capacity(8);
+        let mut login = "component-login".to_string();
+        login.reserve_exact(1024);
+        segments.push(Segment {
+            login,
+            org: "component-org".into(),
+            start: 1,
+            end: 2,
+        });
+        let ledger = Ledger {
+            slots: BTreeMap::from([(
+                [1; 32],
+                SlotHistory {
+                    slot: [2; 32],
+                    segments,
+                    open: true,
+                    last_at: Some(2),
+                },
+            )]),
+            registered: Some(BTreeSet::from([[1; 32]])),
+            ..Default::default()
+        };
+        let policy_bytes = ledger.retained_bytes();
+        let baseline = ledger.clone();
+        let mut c = crate::heap_layout_bound::Counter::new(crate::source_rotation::OVERLAP_BUDGET);
+        ledger.completion_owned_heap_bound(&mut c).unwrap();
+        let history = &ledger.slots[&[1; 32]];
+        assert!(
+            c.bytes
+                >= history.segments.capacity() * std::mem::size_of::<Segment>()
+                    + history.segments[0].login.capacity()
+                    + history.segments[0].org.capacity()
+        );
+        assert_eq!(ledger, baseline);
+        assert_eq!(
+            ledger.retained_bytes(),
+            policy_bytes,
+            "policy metric unchanged"
+        );
+        let (_, allocations) = crate::retry_allocation_probe::measure(|| {
+            let mut c =
+                crate::heap_layout_bound::Counter::new(crate::source_rotation::OVERLAP_BUDGET);
+            ledger.completion_owned_heap_bound(&mut c)
+        });
+        assert_eq!(allocations.allocations, 0);
+    }
+}
