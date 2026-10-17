@@ -1,39 +1,52 @@
 # Read-only historical candidate exporter (`h527_candidates:v1`)
 
-`snapshots/h527_candidates.rs` turns one operator manifest of exactly 18 Claude sessions into a candidate packet for a separate, reviewed admission writer. It has no runtime caller and no CLI. It does not scan, parse, upload, call a provider or the backend, or write scan index, upload progress, quarantine, status or ACK state. Its inputs are the production pipeline's own values, borrowed read-only: the post-policy upload set, `ClaudeUsageAuthorityDisposition` and `ScanIndex`.
+`snapshots/h527_candidates.rs` turns one operator manifest of exactly 18 Claude sessions into a candidate packet for a separate, reviewed admission writer. It is a non-functional core: there is no runtime caller or CLI, and today every member is held without a body. It does not scan, parse, upload, call a provider or the backend, fetch an activity hint, or write scan index, upload progress, quarantine, status or ACK state. Its inputs are the production pipeline's own values, borrowed read-only: the post-policy upload set, `ClaudeUsageAuthorityDisposition` and `ScanIndex`.
 
 ## Packet
 
 ```
 {contract_version:"h527_candidates:v1", operation_id, user_id, organization_id, device_id,
- machine_id, producer_revision, collector_version, scope_session_keys:[18],
+ machine_id, producer_revision, producer_revision_source:"operator_supplied_unverified",
+ producer_binary_sha256, collector_version, unresolved_fields:["prior_refusal_body_witness"],
+ scope_session_keys:[18],
  members:[{source_session_id, session_key_sha256, prior_refusal_body_witness,
-           disposition:"eligible"|"held", reason, qualification_report_sha256,
-           cross_session_conservation:"qualified"|"unknown",
-           batch_request_json?, batch_request_sha256?}]}
+           disposition:"held", reason, qualification_report_sha256,
+           cross_session_conservation:"unknown"}]}
 ```
 
-- `session_key_sha256` is SHA-256 of the UTF-8 `session_key:v1` string: (`claude_code`, machine id, full source session id), backslash doubled, pipe as `\p`, joined by `|`. This matches the backend's `session_entity_key`, not the unit-separated storage locator. Tests pin four backend-computed vectors.
-- Scope ids must be lowercase canonical UUIDs, `producer_revision` a 40-hex commit, `collector_version` this binary's own version. Every member must be a full Claude session id (UUID, optionally `_agent-` suffixed), its key must bind that id, and its refusal witness must be 64 hex. Members and keys are distinct; anything else refuses the whole export. The refusal witness is copied, not verified.
-- An eligible member carries `batch_request_json`, the exact bytes of the ordinary `SnapshotBatchRequest` serializer for one cloned pipeline item (semantic envelope, entity-ACK declaration, head-CAS rule, `validate_snapshot_batch_request`), and `batch_request_sha256` of those bytes. The client report is `ClientReport::empty()`, as in the snapshot audit's offline reproduction. A held member omits both fields. The packet does not canonicalize bodies; post-policy canonical witnesses stay with the server plan.
-- Each member has a content-free qualification report (RFC 8785, `h527_candidate_qualification:v1`) with census, fence, hold and request-set facts, the body hash, and `conservation_scope: local_complete_census:v1`. Only its SHA travels in the packet; the report stays with the operator.
+- `session_key_sha256` is SHA-256 of the UTF-8 `session_key:v1` string: (`claude_code`, machine id, full source session id), with backslash doubled and pipe written as `\p`, joined by `|`. This matches the backend's `session_entity_key`, not the unit-separated storage locator. Tests pin four backend-computed vectors.
+- Scope and member validation:
+  - Scope ids must be lowercase canonical UUIDs.
+  - `producer_revision` must be a 40-hex commit. The operator supplies it and the binary cannot prove it.
+  - Every member must be a full Claude session id: a UUID, optionally with an `_agent-` suffix.
+  - Each member's key must bind its id, and its refusal value must be 64 hex.
+  - Members and keys must be distinct.
+  - Anything else refuses the whole export.
+- `collector_version` and `producer_binary_sha256` describe the build that actually ran the export: its own compiled version and the SHA-256 of its executable. They never claim to be the installed daemon's version.
+- `prior_refusal_body_witness` is opaque diagnostic metadata, copied and not verified. The daemon's additive upload body witness covers only additive evidence, so it does not identify a refused body. `unresolved_fields` keeps that gate explicit until a retained refusal record is defined and qualified.
+- Each member has a content-free qualification report (RFC 8785, `h527_candidate_qualification:v1`) with local hold, census, fence and request-set facts, `local_checks_passed`, and `global_conservation_evidence: "unavailable"`. Only the report's SHA travels in the packet; the report stays with the operator.
 
 ## Verdicts
 
-Reasons are closed: eligible `qualified_source_ownership`, `exact_exclusion`, `exact_previous_ack_membership`; held `unknown_owner`, `incomplete_census`, `cap_overflow`, `creator_hold`, `missing_evidence`, `money_decrease`. Checks run in this order:
+Reasons are a closed set:
 
-1. Account deferral of the session → `creator_hold`. Other authority quarantine, or more than one upload item for the id → `unknown_owner`. No upload item → `missing_evidence`.
-2. Census not complete, invalid, missing coverage, or with unobserved family members → `incomplete_census`.
-3. Duplicate-witness overflow, either census fence, or a page cap invalidation → `cap_overflow`.
-4. No `session_exclusive_reported_usage:v1` from the pipeline, or counted requests without request ids → `missing_evidence`.
-5. A request hash in the durable duplicate witness that the member's exact legacy exclusion does not remove → `unknown_owner`.
-6. Otherwise eligible: `exact_exclusion` when an existing legacy exclusion removed one of the member's requests, else `qualified_source_ownership`.
+- eligible: `qualified_source_ownership`, `exact_exclusion`, `exact_previous_ack_membership`
+- held: `unknown_owner`, `incomplete_census`, `cap_overflow`, `creator_hold`, `missing_evidence`, `money_decrease`
 
-The exporter never emits `exact_previous_ack_membership` (no retained per-request membership of an acknowledged revision exists) or `money_decrease` (pricing belongs to the server plan). It never sets a contract, tag or fingerprint on an item. Contract-5 rows and the untagged no-evidence fallback are whatever the ordinary pipeline produced.
+No member is eligible today. Cross-session conservation has to cover the target set and every already-counted accepted session. That includes accepted bodies whose transcripts were deleted or left the census window. A complete local census cannot prove absence there, and no interface supplies qualified historical evidence. So conservation stays `unknown`, and no caller flag or report hash can change that.
 
-## Limits
+Local checks still run, first failure wins:
 
-- The local census cannot see an accepted body whose transcript was deleted or left the window. `qualified` means qualified within `local_complete_census:v1` only.
-- There is no production caller. Producing real inputs needs a read-only split of the sync cycle's pre-upload phase (local evidence with the cycle's ordinary contract-5 permit, account binding, upload policy, backfill cutoff) that runs on in-memory copies and never saves. That phase lives in the scan/sync owner's files and is not changed here.
+1. If the session is account-deferred, the reason is `creator_hold`.
+2. If it is in another authority quarantine, or has more than one upload item, the reason is `unknown_owner`.
+3. If it has no upload item, the reason is `missing_evidence`.
+4. If the local census is incomplete, invalid, missing coverage, or has unobserved family members, the reason is `incomplete_census`.
+5. If the duplicate witness overflowed, either census fence tripped, or a page cap invalidation happened, the reason is `cap_overflow`.
+6. If counted requests have no provider request ids, the reason is `missing_evidence`.
+7. If a request hash is in the durable duplicate witness and the member's exact legacy exclusion does not remove it, the reason is `unknown_owner`.
 
-Fixture `fixtures/h527-candidates/held-mixed.v1.json` is the exact packet for a synthetic census with every member-scoped hold class. Tests drive real parser items from synthetic transcripts. Validation is hosted Public CI only; no local Cargo was run.
+A member that passes every local check is held as `incomplete_census`, with `local_checks_passed: true`. Session-exclusive proof is not required: a truthful unproven transcript body passes the local checks the same way a proven one does.
+
+Items are never changed. Contract-5 rows can only come from the ordinary sync cycle's own fresh permit. The exporter neither forces nor fakes one, and a body built without that permit stays untagged.
+
+Fixture `fixtures/h527-candidates/held-mixed.v1.json` is the exact packet for a synthetic census covering every member-scoped hold class and the global hold. Tests drive real parser items from synthetic transcripts. Validation is hosted Public CI only; no local Cargo was run. A green CI does not make this core releasable.

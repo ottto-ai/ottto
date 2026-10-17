@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 666,
-  "content_sha256": "c32ed7a64fd306cdb3aa1c3355437f34c7d496548efbf4a58d0df7b60b44e9ee",
+  "content_sha256": "3ce968529a69c9bc455430dca54f108f598301d29a79882a58d31fe1516c6422",
   "files": [
     {
       "executable": false,
@@ -1350,15 +1350,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/h527_candidates.rs",
-      "sha256": "4149a23c7609206e43a8f98059487ca55e0a44d82fba2a058cd0c1c6e8a44659",
-      "size_bytes": 21490
+      "sha256": "75cc157b8189e0d6c47a8fec1da01815ba37eded101ceeeedaf35903d2da2fd1",
+      "size_bytes": 20131
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/h527_candidates/tests.rs",
-      "sha256": "c3524984ace262a1ca0b1969afca0534c4948b22bf6fc9eae5106b57f3ed7966",
-      "size_bytes": 19038
+      "sha256": "9859dd98b825fb657473b171664587271348a5dc88bc6584049c83109cb0c1ff",
+      "size_bytes": 17781
     },
     {
       "executable": false,
@@ -2897,8 +2897,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-17-h527-candidate-exporter.md",
-      "sha256": "70dc871ad0e99046fb56cd8434b4e102aa793fc93904a835c24a10997600f0e7",
-      "size_bytes": 4692
+      "sha256": "2b8f3a341e761216e563eb38ab6b19deb2992448e6b46e952f3f1ca12450dd9e",
+      "size_bytes": 4969
     },
     {
       "executable": false,
@@ -3548,8 +3548,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/h527-candidates/held-mixed.v1.json",
-      "sha256": "1718d6eebab7aea69d8814b18a3cb00c436c9f7b063d916874ad633397a22ebd",
-      "size_bytes": 9333
+      "sha256": "88740c38f155c1ee9bf64c296fb8de1c40a034d8bbf977610fef893ea8331cc3",
+      "size_bytes": 9537
     },
     {
       "executable": false,

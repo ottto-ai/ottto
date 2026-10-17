@@ -9,7 +9,7 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MACHINE: &str = "m4-fixture-machine";
-const FIXTURE_COLLECTOR: &str = "0.0.0-h527-fixture";
+const SESSION_EXCLUSIVE: &str = "session_exclusive_reported_usage:v1";
 const SHARED_COPY_REQUEST: &str = "req-shared-copy";
 const HELD_MIXED_FIXTURE: &str =
     include_str!("../../../../../fixtures/h527-candidates/held-mixed.v1.json");
@@ -18,7 +18,7 @@ fn session_id(ordinal: u64) -> String {
     format!("{ordinal:08x}-0000-4000-8000-{ordinal:012x}")
 }
 
-fn scope(collector: &str) -> OperatorScope {
+fn scope() -> OperatorScope {
     OperatorScope {
         operation_id: "00000000-0000-4000-8000-000000000527".to_string(),
         user_id: "10000000-0000-4000-8000-000000000001".to_string(),
@@ -26,7 +26,13 @@ fn scope(collector: &str) -> OperatorScope {
         device_id: "30000000-0000-4000-8000-000000000003".to_string(),
         machine_id: MACHINE.to_string(),
         producer_revision: "22f1d61acff69a705c03935aa2d591745569f4c8".to_string(),
-        collector_version: collector.to_string(),
+    }
+}
+
+fn fixture_build() -> ProducerBuild {
+    ProducerBuild {
+        collector_version: "0.0.0-h527-fixture".to_string(),
+        binary_sha256: sha256_hex(b"h527-fixture-binary"),
     }
 }
 
@@ -43,7 +49,8 @@ fn members() -> Vec<ApprovedMember> {
     (1..=18).map(member).collect()
 }
 
-/// One real parser item from a synthetic transcript.
+/// One real parser item from a synthetic transcript. The parser leaves the
+/// usage unproven; nothing here claims session-exclusive ownership.
 fn parsed_item(source_session_id: &str, request_ids: &[&str]) -> SnapshotItem {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -95,7 +102,7 @@ fn parsed_item(source_session_id: &str, request_ids: &[&str]) -> SnapshotItem {
 
 /// The pipeline's own exclusive-usage promotion: contract then fingerprint.
 fn exclusive(mut item: SnapshotItem) -> SnapshotItem {
-    item.usage_accounting_contract = Some(SESSION_EXCLUSIVE_USAGE_CONTRACT.to_string());
+    item.usage_accounting_contract = Some(SESSION_EXCLUSIVE.to_string());
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
     item
 }
@@ -106,16 +113,6 @@ fn complete_census() -> ClaudeUsageAuthorityDisposition {
     disposition.duplicate_census.coverage_complete = true;
     disposition.transcript_ownership_complete = true;
     disposition
-}
-
-fn upload_policy() -> SnapshotUploadPolicy {
-    SnapshotUploadPolicy {
-        session_titles_enabled: false,
-        workspace_labels_enabled: false,
-        session_artifacts_enabled: false,
-        session_attribution_enabled: false,
-        session_attribution_labels_enabled: false,
-    }
 }
 
 fn mark_duplicate(index: &mut ScanIndex, request_id: &str, owner_session_id: &str) {
@@ -138,15 +135,14 @@ fn run_export(
     index: &ScanIndex,
 ) -> CandidateExport {
     build_candidate_export(
-        &scope(FIXTURE_COLLECTOR),
+        &scope(),
         &members(),
         &PipelineEvidence {
             upload_snapshots: snapshots,
             disposition,
             index,
-            upload_policy: upload_policy(),
         },
-        FIXTURE_COLLECTOR,
+        &fixture_build(),
     )
     .expect("export")
 }
@@ -156,6 +152,12 @@ fn packet_member(export: &CandidateExport, ordinal: u64) -> Value {
     packet["members"][usize::try_from(ordinal - 1).expect("ordinal")].clone()
 }
 
+fn report(export: &CandidateExport, ordinal: u64) -> Value {
+    let report = &export.qualification_reports[usize::try_from(ordinal - 1).expect("ordinal")];
+    serde_json::from_slice(&report.canonical_json).expect("report json")
+}
+
+/// Held, conservation unknown, and no body field of any kind.
 fn assert_held_without_body(member: &Value, reason: &str) {
     assert_eq!(member["disposition"], "held");
     assert_eq!(member["reason"], reason);
@@ -163,6 +165,7 @@ fn assert_held_without_body(member: &Value, reason: &str) {
     let fields = member.as_object().expect("member object");
     assert!(!fields.contains_key("batch_request_json"));
     assert!(!fields.contains_key("batch_request_sha256"));
+    assert!(!fields.contains_key("batch_request"));
 }
 
 #[test]
@@ -257,30 +260,29 @@ fn held_mixed_packet_matches_committed_fixture() {
     }
     for ordinal in 16..=18 {
         let request_a = format!("req-{ordinal}-a");
-        let item = exclusive(parsed_item(&session_id(ordinal), &[request_a.as_str()]));
+        let item = parsed_item(&session_id(ordinal), &[request_a.as_str()]);
         snapshots.push(item.clone());
         snapshots.push(item);
     }
 
     let export = run_export(&snapshots, &disposition, &index);
 
-    assert_eq!(
-        export.packet_json,
-        HELD_MIXED_FIXTURE.trim_end_matches('\n')
-    );
-    assert_eq!(
-        export.packet_sha256,
-        sha256_hex(HELD_MIXED_FIXTURE.trim_end_matches('\n').as_bytes())
-    );
-    for (ordinal, reason) in [
-        (1, "missing_evidence"),
-        (4, "creator_hold"),
-        (7, "unknown_owner"),
-        (10, "missing_evidence"),
-        (13, "unknown_owner"),
-        (16, "unknown_owner"),
+    let fixture = HELD_MIXED_FIXTURE.trim_end_matches('\n');
+    assert_eq!(export.packet_json, fixture);
+    assert_eq!(export.packet_sha256, sha256_hex(fixture.as_bytes()));
+    for (ordinal, reason, local_checks_passed) in [
+        (1, "missing_evidence", false),
+        (4, "creator_hold", false),
+        (7, "unknown_owner", false),
+        (10, "incomplete_census", true),
+        (13, "unknown_owner", false),
+        (16, "unknown_owner", false),
     ] {
         assert_held_without_body(&packet_member(&export, ordinal), reason);
+        assert_eq!(
+            report(&export, ordinal)["local_checks_passed"],
+            Value::Bool(local_checks_passed)
+        );
     }
     for (report, member) in export.qualification_reports.iter().zip(members()) {
         assert_eq!(report.session_key_sha256, member.session_key_sha256);
@@ -292,105 +294,62 @@ fn held_mixed_packet_matches_committed_fixture() {
 }
 
 #[test]
-fn eligible_member_carries_the_exact_ordinary_batch_body() {
-    let disposition = complete_census();
-    let index = ScanIndex::default();
-    let item = exclusive(parsed_item(&session_id(1), &["req-1-a", "req-1-b"]));
-    let before = serde_json::to_value(&item).expect("item json");
-    let snapshots = vec![item.clone()];
-
-    let export = run_export(&snapshots, &disposition, &index);
-
-    let eligible = packet_member(&export, 1);
-    assert_eq!(eligible["disposition"], "eligible");
-    assert_eq!(eligible["reason"], "qualified_source_ownership");
-    assert_eq!(eligible["cross_session_conservation"], "qualified");
-    let body = eligible["batch_request_json"].as_str().expect("body text");
-    assert_eq!(
-        eligible["batch_request_sha256"],
-        sha256_hex(body.as_bytes())
-    );
-    let ordinary = SnapshotBatchRequest {
-        schema_version: SNAPSHOT_SCHEMA_VERSION,
-        source: "claude_code".to_string(),
-        machine_id: MACHINE.to_string(),
-        collector_version: Some(FIXTURE_COLLECTOR.to_string()),
-        snapshots: vec![item.clone()],
-        upload_policy: upload_policy(),
-        client_report: crate::client_report::ClientReport::empty(),
-    };
-    assert_eq!(body, serde_json::to_string(&ordinary).expect("ordinary"));
-    let wire: Value = serde_json::from_str(body).expect("body json");
-    assert_eq!(wire["source"], "claude_code");
-    assert_eq!(wire["machine_id"], MACHINE);
-    assert_eq!(wire["collector_version"], FIXTURE_COLLECTOR);
-    assert_eq!(wire["snapshots"].as_array().expect("snapshots").len(), 1);
-    assert_eq!(wire["snapshots"][0]["source_session_id"], session_id(1));
-    assert!(wire["snapshots"][0]["semantic_envelope"].is_object());
-    assert!(wire["entity_ack_contract"].is_string());
-    assert!(wire["client_report"].is_object());
-    assert_eq!(
-        serde_json::to_value(&snapshots[0]).expect("item json"),
-        before
-    );
-    // Every other approved member is absent from the upload set.
-    for ordinal in 2..=18 {
-        assert_held_without_body(&packet_member(&export, ordinal), "missing_evidence");
-    }
-    let report: Value =
-        serde_json::from_slice(&export.qualification_reports[0].canonical_json).expect("report");
-    assert_eq!(
-        report["batch_request_sha256"],
-        eligible["batch_request_sha256"]
-    );
-    assert_eq!(report["conservation_scope"], CONSERVATION_SCOPE);
-    assert_eq!(
-        eligible["qualification_report_sha256"],
-        export.qualification_reports[0].sha256
-    );
-}
-
-#[test]
-fn only_an_exact_legacy_exclusion_resolves_a_duplicated_request() {
-    let disposition = complete_census();
-    let excluded_item = exclusive(parsed_item(
-        &session_id(1),
-        &["req-1-a", SHARED_COPY_REQUEST],
-    ));
-    let unexcluded_item = exclusive(parsed_item(
-        &session_id(2),
-        &["req-2-a", SHARED_COPY_REQUEST],
-    ));
+fn unproven_usage_is_not_disqualifying_but_global_conservation_still_holds() {
+    let unproven = parsed_item(&session_id(1), &["req-1-a", "req-1-b"]);
+    let proven = exclusive(parsed_item(&session_id(2), &["req-2-a"]));
+    let excluded = parsed_item(&session_id(3), &["req-3-a", SHARED_COPY_REQUEST]);
+    let overlapping = parsed_item(&session_id(4), &["req-4-a", SHARED_COPY_REQUEST]);
     let mut index = ScanIndex::default();
-    mark_duplicate(&mut index, SHARED_COPY_REQUEST, &session_id(1));
+    mark_duplicate(&mut index, SHARED_COPY_REQUEST, &session_id(3));
     index.claude_usage_family_witnesses.insert(
-        claude_snapshot_family_root(&excluded_item),
+        claude_snapshot_family_root(&excluded),
         ClaudeUsageFamilyWitness {
             evidence_fingerprint: "fixture".to_string(),
             member_request_id_fingerprints: BTreeMap::new(),
             member_occurrence_fingerprints: BTreeMap::new(),
             assigned_request_id_fingerprints: BTreeMap::new(),
             legacy_excluded_request_id_hashes: BTreeMap::from([(
-                session_id(1),
+                session_id(3),
                 BTreeSet::from([sha256_hex(SHARED_COPY_REQUEST.as_bytes())]),
             )]),
             legacy_exclusion_evidence_fingerprint: Some("fixture".to_string()),
             legacy_owner_roots: BTreeSet::new(),
         },
     );
+    let before = serde_json::to_value(&unproven).expect("item json");
+    let snapshots = vec![unproven, proven, excluded, overlapping];
 
-    let export = run_export(&[excluded_item, unexcluded_item], &disposition, &index);
+    let export = run_export(&snapshots, &complete_census(), &index);
 
-    let excluded = packet_member(&export, 1);
-    assert_eq!(excluded["disposition"], "eligible");
-    assert_eq!(excluded["reason"], "exact_exclusion");
-    assert!(excluded["batch_request_json"].is_string());
-    assert_held_without_body(&packet_member(&export, 2), "unknown_owner");
+    // Unproven, proven and exactly excluded bodies all pass every local check,
+    // and all stay held: no evidence covers historical accepted bodies.
+    for ordinal in 1..=3 {
+        assert_held_without_body(&packet_member(&export, ordinal), "incomplete_census");
+        let report = report(&export, ordinal);
+        assert_eq!(report["local_checks_passed"], Value::Bool(true));
+        assert_eq!(report["global_conservation_evidence"], "unavailable");
+    }
+    assert_eq!(report(&export, 1)["usage_accounting_contract"], Value::Null);
+    assert_eq!(
+        report(&export, 2)["usage_accounting_contract"],
+        SESSION_EXCLUSIVE
+    );
+    assert_eq!(report(&export, 3)["exactly_excluded_request_count"], 1);
+    assert_held_without_body(&packet_member(&export, 4), "unknown_owner");
+    assert_eq!(
+        report(&export, 4)["local_checks_passed"],
+        Value::Bool(false)
+    );
+    assert_eq!(report(&export, 4)["unresolved_duplicate_request_count"], 1);
+    assert_eq!(
+        serde_json::to_value(&snapshots[0]).expect("item json"),
+        before
+    );
 }
 
 #[test]
-fn census_gaps_hold_members_that_would_otherwise_qualify() {
-    let item = exclusive(parsed_item(&session_id(1), &["req-1-a"]));
+fn local_census_gaps_are_reported_as_local_failures() {
+    let item = parsed_item(&session_id(1), &["req-1-a"]);
     let index = ScanIndex::default();
     let snapshots = vec![item];
 
@@ -405,6 +364,10 @@ fn census_gaps_hold_members_that_would_otherwise_qualify() {
     for disposition in [incomplete, invalid, uncovered, unobserved] {
         let export = run_export(&snapshots, &disposition, &index);
         assert_held_without_body(&packet_member(&export, 1), "incomplete_census");
+        assert_eq!(
+            report(&export, 1)["local_checks_passed"],
+            Value::Bool(false)
+        );
     }
 
     let mut fenced = complete_census();
@@ -414,6 +377,10 @@ fn census_gaps_hold_members_that_would_otherwise_qualify() {
     for disposition in [fenced, capped] {
         let export = run_export(&snapshots, &disposition, &index);
         assert_held_without_body(&packet_member(&export, 1), "cap_overflow");
+        assert_eq!(
+            report(&export, 1)["local_checks_passed"],
+            Value::Bool(false)
+        );
     }
     let overflowed = ScanIndex {
         claude_duplicate_request_witness_overflowed: true,
@@ -421,11 +388,6 @@ fn census_gaps_hold_members_that_would_otherwise_qualify() {
     };
     let export = run_export(&snapshots, &complete_census(), &overflowed);
     assert_held_without_body(&packet_member(&export, 1), "cap_overflow");
-
-    // A caller cannot promote a body that lacks the pipeline's own contract.
-    let plain = vec![parsed_item(&session_id(1), &["req-1-a"])];
-    let export = run_export(&plain, &complete_census(), &index);
-    assert_held_without_body(&packet_member(&export, 1), "missing_evidence");
 }
 
 #[test]
@@ -436,66 +398,67 @@ fn manifest_scope_must_be_exact() {
         upload_snapshots: &[],
         disposition: &disposition,
         index: &index,
-        upload_policy: upload_policy(),
     };
     let refuse = |scope: OperatorScope, members: Vec<ApprovedMember>, expected: &str| {
-        let error = build_candidate_export(&scope, &members, &evidence, FIXTURE_COLLECTOR)
+        let error = build_candidate_export(&scope, &members, &evidence, &fixture_build())
             .expect_err("refused");
         assert!(error.contains(expected), "{error}");
     };
 
     refuse(
-        scope(FIXTURE_COLLECTOR),
+        scope(),
         members().into_iter().take(17).collect(),
         "exactly 18",
     );
     let mut duplicated = members();
     duplicated[17] = duplicated[0].clone();
-    refuse(scope(FIXTURE_COLLECTOR), duplicated, "distinct");
+    refuse(scope(), duplicated, "distinct");
     let mut short = members();
     short[0].source_session_id = session_id(1)[..8].to_string();
     short[0].session_key_sha256 =
         session_key_sha256("claude_code", MACHINE, &short[0].source_session_id);
-    refuse(scope(FIXTURE_COLLECTOR), short, "full Claude session id");
+    refuse(scope(), short, "full Claude session id");
     let mut unbound = members();
     unbound[0].session_key_sha256 = members()[1].session_key_sha256.clone();
-    refuse(scope(FIXTURE_COLLECTOR), unbound, "does not bind");
+    refuse(scope(), unbound, "does not bind");
     let mut witness = members();
     witness[0].prior_refusal_body_witness = "abc".to_string();
-    refuse(
-        scope(FIXTURE_COLLECTOR),
-        witness,
-        "prior_refusal_body_witness",
-    );
-    let mut operation = scope(FIXTURE_COLLECTOR);
+    refuse(scope(), witness, "prior_refusal_body_witness");
+    let mut operation = scope();
     operation.operation_id = "not-a-uuid".to_string();
     refuse(operation, members(), "operation_id");
-    let mut revision = scope(FIXTURE_COLLECTOR);
+    let mut revision = scope();
     revision.producer_revision = "22f1d61a".to_string();
     refuse(revision, members(), "producer_revision");
-    let mut machine = scope(FIXTURE_COLLECTOR);
+    let mut machine = scope();
     machine.machine_id = "short".to_string();
     refuse(machine, members(), "machine_id");
 }
 
 #[test]
-fn export_binds_this_producers_collector_version() {
+fn export_binds_the_running_build_and_marks_unproven_fields() {
     let disposition = complete_census();
     let index = ScanIndex::default();
     let evidence = PipelineEvidence {
         upload_snapshots: &[],
         disposition: &disposition,
         index: &index,
-        upload_policy: upload_policy(),
     };
-    let error =
-        export_candidates(&scope(FIXTURE_COLLECTOR), &members(), &evidence).expect_err("refused");
-    assert!(error.contains("is not this producer's"), "{error}");
 
-    let export =
-        export_candidates(&scope(&collector_version()), &members(), &evidence).expect("export");
+    let export = export_candidates(&scope(), &members(), &evidence).expect("export");
+
     let packet: Value = serde_json::from_str(&export.packet_json).expect("packet");
+    let binary = fs::read(std::env::current_exe().expect("current exe")).expect("binary");
     assert_eq!(packet["collector_version"], collector_version());
+    assert_eq!(packet["producer_binary_sha256"], sha256_hex(&binary));
+    assert_eq!(
+        packet["producer_revision_source"],
+        "operator_supplied_unverified"
+    );
+    assert_eq!(
+        packet["unresolved_fields"],
+        json!(["prior_refusal_body_witness"])
+    );
     assert_eq!(packet["contract_version"], CANDIDATES_CONTRACT_VERSION);
     assert_eq!(
         packet["scope_session_keys"],
@@ -504,4 +467,7 @@ fn export_binds_this_producers_collector_version() {
             .map(|member| member.session_key_sha256.clone())
             .collect::<Vec<_>>())
     );
+    for ordinal in 1..=18 {
+        assert_held_without_body(&packet_member(&export, ordinal), "missing_evidence");
+    }
 }

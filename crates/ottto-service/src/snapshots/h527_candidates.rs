@@ -3,25 +3,27 @@
 //!
 //! The exporter never scans, parses, uploads, or persists anything. It reads
 //! the production pipeline's own post-policy upload set, authority disposition
-//! and scan index by shared reference, and turns each approved member into
-//! either one exact ordinary batch body or a held row that carries no body.
+//! and scan index by shared reference.
 //!
-//! The operator manifest names members; it is never ownership proof. Every
-//! eligible verdict comes from evidence those pipeline values already carry:
-//! the session-exclusive usage contract, the complete duplicate-request census,
-//! its overflow fence, and the existing exact legacy exclusions. Anything the
-//! exporter cannot bind to that evidence is held. Items are cloned into the
-//! ordinary request unchanged, so contract-5 tags and the untagged no-evidence
-//! fallback are whatever the normal pipeline produced.
+//! Every member is held without a body today. Cross-session conservation has to
+//! cover the target set and every already-counted accepted session, including
+//! accepted bodies whose transcripts were deleted or left the census window.
+//! No qualified historical evidence for that exists, and a complete local
+//! census cannot prove absence there, so conservation stays `unknown`. The local
+//! checks still run so the operator sees which members also fail on local
+//! evidence. A transcript body without session-exclusive proof is not
+//! disqualified by that alone: truthful unproven bodies are the operation's
+//! targets.
+//!
+//! The operator manifest names members; it is never ownership proof, and no
+//! caller flag or report hash can upgrade conservation.
 // The operator entry has no runtime caller until a reviewed read-only pipeline
 // seam supplies its inputs; tests drive it with synthetic pipeline values.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use super::{
     claude_request_id_set_fingerprint, claude_snapshot_family_root, collector_version,
-    validate_snapshot_batch_request, ClaudeUsageAuthorityDisposition, ScanIndex,
-    SnapshotBatchRequest, SnapshotItem, SnapshotSource, SnapshotUploadPolicy,
-    SNAPSHOT_SCHEMA_VERSION,
+    ClaudeUsageAuthorityDisposition, ScanIndex, SnapshotItem, SnapshotSource,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -30,22 +32,25 @@ use std::collections::BTreeSet;
 
 pub(crate) const CANDIDATES_CONTRACT_VERSION: &str = "h527_candidates:v1";
 pub(crate) const QUALIFICATION_REPORT_CONTRACT_VERSION: &str = "h527_candidate_qualification:v1";
-/// What the conservation proof covers. A complete local census cannot see an
-/// accepted body whose transcript was deleted or left the census window; the
-/// planner decides whether this scope suffices for a member.
-pub(crate) const CONSERVATION_SCOPE: &str = "local_complete_census:v1";
 pub(crate) const MANIFEST_MEMBER_COUNT: usize = 18;
-const SESSION_EXCLUSIVE_USAGE_CONTRACT: &str = "session_exclusive_reported_usage:v1";
+/// No interface supplies qualified evidence about historical accepted bodies.
+const GLOBAL_CONSERVATION_EVIDENCE: &str = "unavailable";
+/// The operator supplies the commit; this binary cannot prove it.
+const PRODUCER_REVISION_SOURCE: &str = "operator_supplied_unverified";
+/// Manifest fields whose definition is still open. The refusal value is copied
+/// as opaque diagnostic metadata: the daemon's additive body witness does not
+/// identify a refused body, and no retained refusal record is qualified yet.
+const UNRESOLVED_FIELDS: [&str; 1] = ["prior_refusal_body_witness"];
 const MIN_MACHINE_ID_CHARS: usize = 8;
 const MAX_MACHINE_ID_CHARS: usize = 128;
 const SNAPSHOT_STORAGE_SEPARATOR: char = '\u{1f}';
 
+/// Closed vocabulary only. No member qualifies while global conservation
+/// evidence is unavailable, so the exporter emits none of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EligibleReason {
     QualifiedSourceOwnership,
     ExactExclusion,
-    /// Closed vocabulary only: no retained per-request membership of a
-    /// previously acknowledged revision exists, so the exporter never emits it.
     ExactPreviousAckMembership,
 }
 
@@ -108,15 +113,32 @@ pub(crate) struct OperatorScope {
     pub(crate) device_id: String,
     pub(crate) machine_id: String,
     pub(crate) producer_revision: String,
-    pub(crate) collector_version: String,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ApprovedMember {
     pub(crate) source_session_id: String,
     pub(crate) session_key_sha256: String,
-    /// Copied from the manifest. The exporter cannot verify it.
+    /// Copied from the manifest as opaque diagnostic metadata; unverified.
     pub(crate) prior_refusal_body_witness: String,
+}
+
+/// The build that actually ran the export, never the installed daemon's.
+#[derive(Debug, Clone)]
+pub(crate) struct ProducerBuild {
+    pub(crate) collector_version: String,
+    pub(crate) binary_sha256: String,
+}
+
+impl ProducerBuild {
+    fn current() -> Result<Self, String> {
+        let path = std::env::current_exe().map_err(|error| format!("producer binary: {error}"))?;
+        let bytes = std::fs::read(&path).map_err(|error| format!("producer binary: {error}"))?;
+        Ok(Self {
+            collector_version: collector_version(),
+            binary_sha256: sha256_hex(&bytes),
+        })
+    }
 }
 
 /// The production pipeline's values after local evidence, account binding,
@@ -126,7 +148,6 @@ pub(crate) struct PipelineEvidence<'a> {
     pub(crate) upload_snapshots: &'a [SnapshotItem],
     pub(crate) disposition: &'a ClaudeUsageAuthorityDisposition,
     pub(crate) index: &'a ScanIndex,
-    pub(crate) upload_policy: SnapshotUploadPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -154,11 +175,16 @@ struct Packet<'a> {
     device_id: &'a str,
     machine_id: &'a str,
     producer_revision: &'a str,
+    producer_revision_source: &'static str,
+    producer_binary_sha256: &'a str,
     collector_version: &'a str,
+    unresolved_fields: [&'static str; 1],
     scope_session_keys: Vec<&'a str>,
     members: Vec<PacketMember<'a>>,
 }
 
+/// Held members only: no batch body fields exist until conservation can be
+/// qualified.
 #[derive(Serialize)]
 struct PacketMember<'a> {
     source_session_id: &'a str,
@@ -168,15 +194,6 @@ struct PacketMember<'a> {
     reason: &'static str,
     qualification_report_sha256: String,
     cross_session_conservation: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    batch_request_json: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    batch_request_sha256: Option<String>,
-}
-
-enum Verdict {
-    Eligible(EligibleReason),
-    Held(HeldReason),
 }
 
 /// `session_key:v1`: the backend's escaped, pipe-joined
@@ -197,61 +214,37 @@ pub(crate) fn session_key_sha256(
     sha256_hex(session_key_v1(source, machine_id, source_session_id).as_bytes())
 }
 
-/// Export with this binary's own collector version.
+/// Export with this running binary's own version and digest.
 pub(crate) fn export_candidates(
     scope: &OperatorScope,
     members: &[ApprovedMember],
     evidence: &PipelineEvidence<'_>,
 ) -> Result<CandidateExport, String> {
-    build_candidate_export(scope, members, evidence, &collector_version())
+    build_candidate_export(scope, members, evidence, &ProducerBuild::current()?)
 }
 
 fn build_candidate_export(
     scope: &OperatorScope,
     members: &[ApprovedMember],
     evidence: &PipelineEvidence<'_>,
-    producer_collector_version: &str,
+    producer: &ProducerBuild,
 ) -> Result<CandidateExport, String> {
-    validate_scope(scope, producer_collector_version)?;
+    validate_scope(scope)?;
     validate_members(scope, members)?;
     let mut packet_members = Vec::with_capacity(members.len());
     let mut reports = Vec::with_capacity(members.len());
     for member in members {
-        let (verdict, facts) = qualify(member, evidence);
-        let body = match (&verdict, facts.item) {
-            (Verdict::Eligible(_), Some(item)) => Some(ordinary_batch_body(
-                scope,
-                item,
-                evidence.upload_policy,
-                producer_collector_version,
-            )?),
-            _ => None,
-        };
-        let body_sha256 = body.as_deref().map(|json| sha256_hex(json.as_bytes()));
-        let (disposition, reason, conservation) = match verdict {
-            Verdict::Eligible(reason) => ("eligible", reason.as_str(), "qualified"),
-            Verdict::Held(reason) => ("held", reason.as_str(), "unknown"),
-        };
-        let report = qualification_report(
-            scope,
-            member,
-            evidence,
-            &facts,
-            disposition,
-            reason,
-            conservation,
-            body_sha256.as_deref(),
-        )?;
+        let facts = local_facts(member, evidence);
+        let reason = held_reason(&facts, evidence);
+        let report = qualification_report(scope, member, evidence, &facts, reason)?;
         packet_members.push(PacketMember {
             source_session_id: &member.source_session_id,
             session_key_sha256: &member.session_key_sha256,
             prior_refusal_body_witness: &member.prior_refusal_body_witness,
-            disposition,
-            reason,
+            disposition: "held",
+            reason: reason.as_str(),
             qualification_report_sha256: report.sha256.clone(),
-            cross_session_conservation: conservation,
-            batch_request_json: body,
-            batch_request_sha256: body_sha256,
+            cross_session_conservation: "unknown",
         });
         reports.push(report);
     }
@@ -263,7 +256,10 @@ fn build_candidate_export(
         device_id: &scope.device_id,
         machine_id: &scope.machine_id,
         producer_revision: &scope.producer_revision,
-        collector_version: producer_collector_version,
+        producer_revision_source: PRODUCER_REVISION_SOURCE,
+        producer_binary_sha256: &producer.binary_sha256,
+        collector_version: &producer.collector_version,
+        unresolved_fields: UNRESOLVED_FIELDS,
         scope_session_keys: members
             .iter()
             .map(|member| member.session_key_sha256.as_str())
@@ -292,10 +288,7 @@ struct MemberFacts<'a> {
     exactly_excluded_request_count: usize,
 }
 
-fn qualify<'a>(
-    member: &ApprovedMember,
-    evidence: &PipelineEvidence<'a>,
-) -> (Verdict, MemberFacts<'a>) {
+fn local_facts<'a>(member: &ApprovedMember, evidence: &PipelineEvidence<'a>) -> MemberFacts<'a> {
     let session_id = member.source_session_id.as_str();
     let disposition = evidence.disposition;
     let mut facts = MemberFacts {
@@ -318,45 +311,49 @@ fn qualify<'a>(
         facts.item = Some(*item);
         record_request_facts(item, evidence.index, &mut facts);
     }
+    facts
+}
 
+/// The first local failure, else the global conservation gap. Local evidence
+/// can only disqualify; it never qualifies a member.
+fn held_reason(facts: &MemberFacts<'_>, evidence: &PipelineEvidence<'_>) -> HeldReason {
+    local_failure(facts, evidence).unwrap_or(HeldReason::IncompleteCensus)
+}
+
+fn local_failure(facts: &MemberFacts<'_>, evidence: &PipelineEvidence<'_>) -> Option<HeldReason> {
     if facts.account_deferred {
-        return (Verdict::Held(HeldReason::CreatorHold), facts);
+        return Some(HeldReason::CreatorHold);
     }
     if facts.authority_quarantined || facts.item_match_count > 1 {
-        return (Verdict::Held(HeldReason::UnknownOwner), facts);
+        return Some(HeldReason::UnknownOwner);
     }
     let Some(item) = facts.item else {
-        return (Verdict::Held(HeldReason::MissingEvidence), facts);
+        return Some(HeldReason::MissingEvidence);
     };
+    let disposition = evidence.disposition;
     let census = &disposition.duplicate_census;
     if !census.census_complete
         || census.census_invalid
         || !census.coverage_complete
         || !disposition.transcript_ownership_complete
     {
-        return (Verdict::Held(HeldReason::IncompleteCensus), facts);
+        return Some(HeldReason::IncompleteCensus);
     }
     if census.fence_before
         || census.fence_after
         || census.page_invalidated_cap_count > 0
         || evidence.index.claude_duplicate_request_witness_overflowed
     {
-        return (Verdict::Held(HeldReason::CapOverflow), facts);
+        return Some(HeldReason::CapOverflow);
     }
-    if item.usage_accounting_contract.as_deref() != Some(SESSION_EXCLUSIVE_USAGE_CONTRACT)
-        || (item.request_count > 0 && facts.request_id_hash_count == 0)
-    {
-        return (Verdict::Held(HeldReason::MissingEvidence), facts);
+    // Overlap cannot be checked for counted requests without provider ids.
+    if item.request_count > 0 && facts.request_id_hash_count == 0 {
+        return Some(HeldReason::MissingEvidence);
     }
     if facts.unresolved_duplicate_request_count > 0 {
-        return (Verdict::Held(HeldReason::UnknownOwner), facts);
+        return Some(HeldReason::UnknownOwner);
     }
-    let reason = if facts.exactly_excluded_request_count > 0 {
-        EligibleReason::ExactExclusion
-    } else {
-        EligibleReason::QualifiedSourceOwnership
-    };
-    (Verdict::Eligible(reason), facts)
+    None
 }
 
 /// Mirrors the pipeline's own duplicate test: a request hash is unresolved
@@ -395,50 +392,23 @@ fn record_request_facts(item: &SnapshotItem, index: &ScanIndex, facts: &mut Memb
         .count();
 }
 
-/// One item through the ordinary daemon request and serializer: the same
-/// semantic envelope, entity-ACK declaration, head-CAS rule and validation as
-/// a live upload. The offline client report is empty, as in the snapshot
-/// audit's reproduction, because this process observed no delivery losses.
-fn ordinary_batch_body(
-    scope: &OperatorScope,
-    item: &SnapshotItem,
-    upload_policy: SnapshotUploadPolicy,
-    producer_collector_version: &str,
-) -> Result<String, String> {
-    let request = SnapshotBatchRequest {
-        schema_version: SNAPSHOT_SCHEMA_VERSION,
-        source: SnapshotSource::ClaudeCode.api_slug().to_string(),
-        machine_id: scope.machine_id.clone(),
-        collector_version: Some(producer_collector_version.to_string()),
-        snapshots: vec![item.clone()],
-        upload_policy,
-        client_report: crate::client_report::ClientReport::empty(),
-    };
-    validate_snapshot_batch_request(&request)
-        .map_err(|error| format!("member body failed ordinary validation: {error}"))?;
-    serde_json::to_string(&request).map_err(|error| format!("member body encoding: {error}"))
-}
-
-#[allow(clippy::too_many_arguments)]
 fn qualification_report(
     scope: &OperatorScope,
     member: &ApprovedMember,
     evidence: &PipelineEvidence<'_>,
     facts: &MemberFacts<'_>,
-    disposition: &str,
-    reason: &str,
-    conservation: &str,
-    batch_request_sha256: Option<&str>,
+    reason: HeldReason,
 ) -> Result<MemberQualificationReport, String> {
     let census = &evidence.disposition.duplicate_census;
     let report = json!({
         "contract_version": QUALIFICATION_REPORT_CONTRACT_VERSION,
         "operation_id": scope.operation_id,
         "session_key_sha256": member.session_key_sha256,
-        "disposition": disposition,
-        "reason": reason,
-        "cross_session_conservation": conservation,
-        "conservation_scope": CONSERVATION_SCOPE,
+        "disposition": "held",
+        "reason": reason.as_str(),
+        "cross_session_conservation": "unknown",
+        "global_conservation_evidence": GLOBAL_CONSERVATION_EVIDENCE,
+        "local_checks_passed": local_failure(facts, evidence).is_none(),
         "item_match_count": facts.item_match_count,
         "usage_accounting_contract": facts.item.and_then(|item| item.usage_accounting_contract.as_deref()),
         "account_deferred": facts.account_deferred,
@@ -456,7 +426,6 @@ fn qualification_report(
         "request_id_set_fingerprint": facts.request_id_set_fingerprint,
         "unresolved_duplicate_request_count": facts.unresolved_duplicate_request_count,
         "exactly_excluded_request_count": facts.exactly_excluded_request_count,
-        "batch_request_sha256": batch_request_sha256,
     });
     let canonical_json = crate::canonical_json::canonicalize(&report)
         .map_err(|error| format!("qualification report: {error}"))?;
@@ -467,7 +436,7 @@ fn qualification_report(
     })
 }
 
-fn validate_scope(scope: &OperatorScope, producer_collector_version: &str) -> Result<(), String> {
+fn validate_scope(scope: &OperatorScope) -> Result<(), String> {
     for (field, value) in [
         ("operation_id", &scope.operation_id),
         ("user_id", &scope.user_id),
@@ -486,12 +455,6 @@ fn validate_scope(scope: &OperatorScope, producer_collector_version: &str) -> Re
     }
     if !is_lower_hex(&scope.producer_revision, 40) {
         return Err("producer_revision must be a full 40-character commit".to_string());
-    }
-    if scope.collector_version != producer_collector_version {
-        return Err(format!(
-            "collector_version {} is not this producer's {producer_collector_version}",
-            scope.collector_version
-        ));
     }
     Ok(())
 }
